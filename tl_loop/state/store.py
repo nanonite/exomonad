@@ -24,6 +24,7 @@ from tl_loop.fsm.phase import (
     TLPRFiled,
     TLWaiting,
 )
+from tl_loop.fsm.recovery import decode_recovery, encode_recovery
 from tl_loop.ordered import IntegrationLifecycle
 
 from .migration import (
@@ -704,6 +705,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["task_timeout_seconds"] = value.task_timeout_seconds
         if value.task_timeout_source is not None:
             record["task_timeout_source"] = value.task_timeout_source
+        if value.recovery is not None:
+            record["recovery"] = encode_recovery(value.recovery)
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -1103,6 +1106,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         ),
         task_timeout_seconds=cast(float | None, value.get("task_timeout_seconds")),
         task_timeout_source=cast(str | None, value.get("task_timeout_source")),
+        recovery=decode_recovery(value.get("recovery")),
     )
 
 

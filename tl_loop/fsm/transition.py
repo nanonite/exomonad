@@ -55,7 +55,7 @@ def transition(phase: PhaseValue, event: TLEvent) -> PhaseValue:
     if isinstance(event, ChildFailed):
         return TLFailed(f"{event.slug}: {event.reason}")
     if isinstance(event, ChildBlocked):
-        # External blockers are parked behind a human gate; they are not a
+        # External blockers enter pre-publication recovery; they are not a
         # controller failure and must leave unrelated siblings runnable.
         if isinstance(phase, TLWaiting):
             children = dict(phase.children)

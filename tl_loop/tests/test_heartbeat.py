@@ -378,7 +378,7 @@ def test_missing_worker_identity_is_recorded_in_reconciliation_evidence(tmp_path
     assert result.events[0].payload["poll_workers_missing"] is True
 
 
-def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: Path) -> None:
+def test_missing_worker_row_after_invocation_finished_enters_recovery_once(tmp_path: Path) -> None:
     store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
     invocation_dir = tmp_path / ".exo" / "agents" / "agent-slice-a"
     invocation_dir.mkdir(parents=True)
@@ -415,10 +415,13 @@ def test_missing_worker_row_after_invocation_finished_is_parked_once(tmp_path: P
         project_root=tmp_path,
     )
 
-    parked = result.state.slices["slice-a"]
-    assert parked.status is SliceStatus.PARKED
-    assert parked.park_cause is ParkCause.MISSING_HANDOFF
-    assert result.parked_slice_ids == ("slice-a",)
+    recovered = result.state.slices["slice-a"]
+    assert recovered.status is SliceStatus.SPAWNED
+    assert recovered.park_cause is None
+    assert recovered.recovery is not None
+    assert recovered.recovery.cause == ParkCause.HUMAN_DECISION_REQUIRED.value
+    assert recovered.recovery.phase.value == "diagnosing"
+    assert result.parked_slice_ids == ()
     assert result.events[0].kind == "worker.terminal_reconciled"
     assert result.events[0].payload["generation"] == 3
     assert result.events[0].payload["stderr_tail"] == "worker crashed"
@@ -520,7 +523,10 @@ def test_missing_worker_evidence_uses_project_root_not_tl_state_root(tmp_path: P
         project_root=project_root,
     )
 
-    assert result.state.slices["slice-a"].status is SliceStatus.PARKED
+    recovered = result.state.slices["slice-a"]
+    assert recovered.status is SliceStatus.SPAWNED
+    assert recovered.recovery is not None
+    assert recovered.recovery.cause == ParkCause.HUMAN_DECISION_REQUIRED.value
     assert result.events[0].payload["invocation_id"] == "inv-project-root"
 
 

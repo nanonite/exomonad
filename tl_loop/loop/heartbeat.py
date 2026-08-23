@@ -14,6 +14,7 @@ from typing import TypeAlias
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.reader import LedgerReader, LedgerReadError
+from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
@@ -154,6 +155,8 @@ def heartbeat_once(
                 continue
             current = store.load()
             current_slice = current.slices[slice_state.id]
+            if terminal and evidence.get("missing_handoff") and current_slice.recovery is not None:
+                continue
             reconciliation = _missing_worker_reconciliation(terminal, evidence)
             if current_slice.reconciliation == reconciliation and not (
                 terminal and current_slice.status in _active_statuses()
@@ -163,7 +166,7 @@ def heartbeat_once(
                 if isinstance(effects, ReadOnlyEffectClient):
                     raise HeartbeatError(
                         f"terminal evidence for missing slice {slice_state.id!r} requires "
-                        "an active effect client to park"
+                        "an active effect client to reconcile"
                     )
                 emit_controller_event(
                     effects,
@@ -171,21 +174,50 @@ def heartbeat_once(
                     _worker_event_payload(evidence),
                 )
                 missing_handoff = bool(evidence.get("missing_handoff"))
-                park(
-                    current_slice,
-                    ParkCause.MISSING_HANDOFF if missing_handoff else ParkCause.WORKER_TERMINAL,
-                    store=store,
-                    issue_creator=effects,
-                    ledger=current.budgets,
-                    audit=evidence,
-                )
                 if missing_handoff:
+                    recovery = current_slice.recovery or begin_recovery(
+                        cause=ParkCause.HUMAN_DECISION_REQUIRED.value,
+                        owner_run_id=current.run_id,
+                        slice_attempt=current_slice.attempts,
+                        owner_agent_id=current_slice.dispatch_agent_id,
+                        invocation_generation=(
+                            evidence.get("generation")
+                            if type(evidence.get("generation")) is int
+                            and evidence.get("generation") >= 0
+                            else 0
+                        ),
+                        plan_revision=current.revision,
+                        evidence=evidence,
+                        next_action="diagnose",
+                    )
+                    if current_slice.recovery is None:
+                        current = store.checkpoint(
+                            current.fsm,
+                            {
+                                **current.slices,
+                                slice_state.id: replace(
+                                    current_slice,
+                                    recovery=recovery,
+                                ),
+                            },
+                            current.budgets,
+                            current.events.last_consumed_offset,
+                        )
                     emit_controller_event(
                         effects,
                         "agent.task_blocked",
                         _missing_handoff_payload(evidence),
                     )
-                parked.append(slice_state.id)
+                else:
+                    park(
+                        current_slice,
+                        ParkCause.WORKER_TERMINAL,
+                        store=store,
+                        issue_creator=effects,
+                        ledger=current.budgets,
+                        audit=evidence,
+                    )
+                    parked.append(slice_state.id)
                 progress = True
                 events.append(
                     _event(

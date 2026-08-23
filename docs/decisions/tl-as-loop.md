@@ -62,6 +62,23 @@ for the same heartbeat tick. This rule amends the older liveness wording in
 #893 so silence remains observational while declared resource budgets remain
 auditable enforcement.
 
+### Pre-publication execution recovery
+
+Execution recovery is independent of the review FSM. A typed
+`agent.task_blocked` event or a confirmed invocation exit without an
+authoritative handoff records a `RecoveryState` on the slice and starts in
+`DIAGNOSING`; the slice remains nonterminal and does not become a parked
+human-gate or failed controller state merely because its process disappeared.
+Recovery may move through `WAITING_SIGNAL`, `REVALIDATING`, `RESUME_INTENDED`,
+`RESUMING`, or `HUMAN_GATE` only through the explicit legal transition table.
+Recovery identity, attempt/generation, plan revision, evidence, and next action
+are checkpointed so replay and restart preserve the same diagnosis.
+
+The only handoff from this pre-publication state into review is an authoritative
+`pr.filed` event. That event clears the recovery record and establishes the
+normal `IN_REVIEW` state; review, merge, or process-exit observations cannot
+silently perform that handoff.
+
 The conceptual hylomorphism remains useful: a plan and checkpoint are the
 unfold boundary, while event-driven review, merge, and upward PR effects are
 the fold boundary. The controller makes those transitions executable and

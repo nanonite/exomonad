@@ -13,9 +13,10 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
-from tl_loop.fsm.event import ChildBlocked, ChildSpawned
+from tl_loop.fsm.event import ChildBlocked, ChildSpawned, PRFiled
 from tl_loop.fsm.phase import ChildHandle
-from tl_loop.loop.shadow import ShadowLoop, TLEventDecoder
+from tl_loop.loop.shadow import ShadowLoop, TLEventDecoder, _update_slices
+from tl_loop.state.schema import SliceState, SliceStatus
 from tl_loop.state.store import create
 
 
@@ -96,6 +97,40 @@ def test_shadow_decoder_accepts_typed_task_blocked_payload() -> None:
     decoded = TLEventDecoder().decode(project(raw))
 
     assert decoded == ChildBlocked("slice-a", "base_ci_unstable", True, "repair base CI", 2)
+
+
+def test_shadow_recovery_stays_nonterminal_until_pr_is_filed() -> None:
+    current = SliceState(
+        id="slice-a",
+        status=SliceStatus.SPAWNED,
+        paths=("src",),
+        depends_on=(),
+        base_ref="main",
+        test_plan=(),
+        agent_type="codex",
+        model="gpt-5",
+        branch="task/slice-a",
+        worktree=".worktrees/slice-a",
+        pr_number=None,
+        reviewed_head=None,
+        attempts=1,
+        verdict=None,
+    )
+
+    recovering = _update_slices(
+        {"slice-a": current},
+        ChildBlocked("slice-a", "base_ci_unstable", True, "repair base CI", 1),
+        run_id="run-1",
+    )["slice-a"]
+    assert recovering.status is SliceStatus.SPAWNED
+    assert recovering.recovery is not None
+
+    reviewed = _update_slices(
+        {"slice-a": recovering},
+        PRFiled(42, "head-1", "slice-a"),
+    )["slice-a"]
+    assert reviewed.status is SliceStatus.IN_REVIEW
+    assert reviewed.recovery is None
 
 
 def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Literal, TypeAlias, cast
 
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState
 from tl_loop.ordered import CI_STATUSES, IntegrationLifecycle
 
 SCHEMA_VERSION = 2
@@ -206,6 +207,7 @@ SLICE_KEYS = frozenset(
         "reconciliation",
         "task_timeout_seconds",
         "task_timeout_source",
+        "recovery",
     }
 )
 RECONCILIATION_KEYS = frozenset(
@@ -242,6 +244,21 @@ PARK_AUDIT_KEYS = frozenset(
         "retryable",
         "declared_difficulty",
         "matched_difficulty_rule",
+    }
+)
+RECOVERY_KEYS = frozenset(
+    {
+        "cause",
+        "phase",
+        "recovery_round",
+        "next_action",
+        "owner_run_id",
+        "entered_at",
+        "slice_attempt",
+        "owner_agent_id",
+        "invocation_generation",
+        "plan_revision",
+        "evidence",
     }
 )
 BUDGET_KEYS = frozenset({"ledger"})
@@ -323,6 +340,7 @@ class SliceState:
     reconciliation: Mapping[str, object] | None = None
     task_timeout_seconds: float | None = None
     task_timeout_source: str | None = None
+    recovery: RecoveryState | None = None
 
 
 @dataclass(frozen=True)
@@ -747,6 +765,7 @@ def _validate_slice(
     _reconciliation(value.get("reconciliation"), path, errors)
     _nullable_number(value, "task_timeout_seconds", path, errors)
     _nullable_string(value, "task_timeout_source", path, errors)
+    _validate_recovery(value.get("recovery"), path, errors)
     if value.get("status") == SliceStatus.SPAWNED.value:
         _non_empty_string(value, "dispatch_intent_id", path, errors)
         _non_empty_string(value, "dispatch_agent_id", path, errors)
@@ -897,6 +916,27 @@ def _reconciliation(value: object, path: str, errors: list[tuple[str, str]]) -> 
         _non_empty_string(reconciliation, key, f"{path}.reconciliation", errors)
     for key in ("authoritative_evidence", "missing_evidence", "conflicts"):
         _string_list(reconciliation, key, f"{path}.reconciliation", errors, allow_empty=True)
+
+
+def _validate_recovery(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    recovery = _object(value, f"{path}.recovery", RECOVERY_KEYS, errors)
+    if recovery is None:
+        return
+    _non_empty_string(recovery, "cause", f"{path}.recovery", errors)
+    _enum_value(recovery, "phase", f"{path}.recovery", RecoveryPhase, errors)
+    _non_negative_int(recovery, "recovery_round", f"{path}.recovery", errors)
+    _non_empty_string(recovery, "next_action", f"{path}.recovery", errors)
+    _non_empty_string(recovery, "owner_run_id", f"{path}.recovery", errors)
+    _nullable_number(recovery, "entered_at", f"{path}.recovery", errors)
+    _non_negative_int(recovery, "slice_attempt", f"{path}.recovery", errors)
+    _nullable_string(recovery, "owner_agent_id", f"{path}.recovery", errors)
+    _non_negative_int(recovery, "invocation_generation", f"{path}.recovery", errors)
+    _non_negative_int(recovery, "plan_revision", f"{path}.recovery", errors)
+    evidence = recovery.get("evidence", {})
+    if not isinstance(evidence, dict):
+        errors.append((f"{path}.recovery.evidence", "must be an object"))
 
 
 def _budgets(value: object, errors: list[tuple[str, str]]) -> None:

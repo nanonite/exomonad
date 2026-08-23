@@ -465,7 +465,7 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert source.acknowledged == [1, 2, 3, 4, 5]
 
 
-def test_active_loop_parks_typed_task_block_without_failing_controller(
+def test_active_loop_records_typed_task_block_without_failing_controller(
     tmp_path: Path,
 ) -> None:
     run_id = "task-blocked-run"
@@ -515,9 +515,11 @@ def test_active_loop_parks_typed_task_block_without_failing_controller(
     state = RunStore(run_id, tmp_path).load()
     assert isinstance(outcome.get("error"), LoopCancelled)
     assert state.fsm.phase is not TLPhase.TLFailed
-    assert state.slices["leaf-a"].status is SliceStatus.PARKED
-    assert state.slices["leaf-a"].park_cause is ParkCause.BASE_CI_UNSTABLE
-    assert any(gate.name.startswith("task-blocked:") for gate in state.gates)
+    assert state.slices["leaf-a"].status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert state.slices["leaf-a"].park_cause is ParkCause.DISPATCH_UNCONFIRMED
+    assert state.slices["leaf-a"].recovery is not None
+    assert state.slices["leaf-a"].recovery.phase.value == "diagnosing"
+    assert state.slices["leaf-a"].recovery.cause == ParkCause.BASE_CI_UNSTABLE.value
 
 
 def _blocked_event(run_seq: int, slug: str, run_id: str) -> EventEnvelope:

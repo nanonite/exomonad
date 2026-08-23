@@ -38,9 +38,10 @@ from tl_loop.fsm.phase import (
     TLPRFiled,
     TLWaiting,
 )
+from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import blocked_gate_name
-from tl_loop.state.schema import GateStatus, ParkCause, RunState, SliceState, SliceStatus
+from tl_loop.state.schema import GateStatus, RunState, SliceState, SliceStatus
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 DEFAULT_SHADOW_ROOT = DEFAULT_ROOT / "shadow"
@@ -410,7 +411,11 @@ def _update_slices(
         if current is None:
             return updated
         if current.reviewed_head == event.head_sha:
-            updated[target_id] = replace(current, pr_number=event.pr_number)
+            updated[target_id] = replace(
+                current,
+                pr_number=event.pr_number,
+                recovery=None,
+            )
             return updated
         updated[target_id] = replace(
             current,
@@ -423,6 +428,7 @@ def _update_slices(
             verdict=None,
             verdict_at=None,
             stall_classification=None,
+            recovery=None,
         )
     elif isinstance(event, ChildSpawned):
         if not allow_spawn_confirmation:
@@ -464,16 +470,22 @@ def _update_slices(
     elif isinstance(event, ChildBlocked):
         current = updated.get(event.slug)
         if current is not None:
+            audit = {
+                "attempt": event.attempt,
+                "recovery_action": event.recovery_action,
+                "needs_human": event.needs_human,
+            }
             updated[event.slug] = replace(
                 current,
-                status=SliceStatus.PARKED,
-                park_cause=ParkCause(event.cause),
-                park_audit={
-                    "gate_name": blocked_gate_name(run_id, event.slug, event.attempt, event.cause),
-                    "attempt": event.attempt,
-                    "recovery_action": event.recovery_action,
-                    "needs_human": event.needs_human,
-                },
+                recovery=begin_recovery(
+                    cause=event.cause,
+                    owner_run_id=run_id,
+                    slice_attempt=event.attempt or current.attempts,
+                    owner_agent_id=current.dispatch_agent_id,
+                    plan_revision=0,
+                    evidence=audit,
+                    next_action=event.recovery_action or "diagnose",
+                ),
             )
     return updated
 

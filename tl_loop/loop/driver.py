@@ -49,6 +49,7 @@ from tl_loop.fsm.phase import (
     TLPlanning,
     TLWaiting,
 )
+from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
@@ -1118,7 +1119,13 @@ def _run_loop(
         except Exception as error:
             raise TLLoopError(str(error)) from error
         if event.kind is EventKind.AGENT_TASK_BLOCKED:
-            state = _park_task_blocked_event(event, state, store, effects)
+            state = _record_task_blocked_recovery(
+                event,
+                state,
+                store,
+                phase,
+                checkpoint_seq,
+            )
             phase = _phase_from_state(state)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
@@ -4869,18 +4876,17 @@ def _next_event(
         return None
 
 
-def _park_task_blocked_event(
+def _record_task_blocked_recovery(
     event: EventEnvelope,
     state: RunState,
     store: RunStore,
-    effects: EffectClient | ReadOnlyEffectClient,
+    phase: PhaseValue,
+    event_seq: int,
 ) -> RunState:
-    """Durably park one externally blocked slice without failing its TL."""
+    """Record one externally blocked slice in nonterminal DIAGNOSING state."""
     blocked = event.task_blocked
     if blocked is None:
         raise TLLoopError("agent.task_blocked has no typed blocked payload")
-    if not isinstance(effects, EffectClient):
-        raise TLLoopError("agent.task_blocked requires active effect capabilities")
     slice_id = blocked.slice_id or event.slice_id or event.agent_id
     if not isinstance(slice_id, str) or slice_id not in state.slices:
         raise TLLoopError(f"agent.task_blocked names unknown slice {slice_id!r}")
@@ -4906,14 +4912,25 @@ def _park_task_blocked_event(
             "matched_difficulty_rule": blocked.matched_difficulty_rule,
         }
     )
-    park(
-        state.slices[slice_id],
-        cause,
-        store=store,
-        issue_creator=effects,
-        audit=audit,
+    current = state.slices[slice_id]
+    if current.recovery is not None:
+        if current.recovery.cause != cause.value:
+            raise TLLoopError(
+                f"slice {slice_id!r} already recovers cause {current.recovery.cause!r}"
+            )
+        return store.checkpoint(phase, state.slices, state.budgets, event_seq)
+    generation = audit.get("generation")
+    recovery = begin_recovery(
+        cause=cause.value,
+        owner_run_id=state.run_id,
+        slice_attempt=blocked.attempt or current.attempts,
+        owner_agent_id=current.dispatch_agent_id,
+        invocation_generation=generation if type(generation) is int and generation >= 0 else 0,
+        plan_revision=state.revision,
+        evidence=audit,
     )
-    return store.load()
+    updated = {**state.slices, slice_id: replace(current, recovery=recovery)}
+    return store.checkpoint(phase, updated, state.budgets, event_seq)
 
 
 def _checkpoint_and_ack(
