@@ -400,12 +400,15 @@ def _print_plan_proposal(args: argparse.Namespace) -> None:
     if not isinstance(plan, Mapping):
         raise LauncherError("validated plan proposal is not an object")
     _emit_plan_proposal(args, True)
-    print(
-        json.dumps(
-            {"run_id": args.run_id, "plan": dict(plan), "inert": True, "status": "proposed"},
-            sort_keys=True,
-        )
-    )
+    response: dict[str, object] = {
+        "run_id": args.run_id,
+        "plan": dict(plan),
+        "inert": True,
+        "status": "proposed",
+    }
+    if "clarification" in proposal:
+        response["clarification"] = proposal["clarification"]
+    print(json.dumps(response, sort_keys=True))
 
 
 def _emit_plan_proposal(

@@ -26,6 +26,15 @@ module-level contracts.
 
 The structured work plan lives separately at `.exo/tl-loop/plan.json`.
 
+An externally blocked leaf may receive one bounded continuation clarification.
+The clarification carries the prior and proposed plan revision plus a
+SHA-256 invariant digest. It may change only the continuation task; paths,
+dependencies, ownership, harness selection, verification, Definition of Done,
+base, or timeout fields are authority-bearing and require an explicit human
+gate. The validator compares the digest before a same-owner resume and records
+only revision, digest, changed-field categories, and the gate decision in
+telemetry; raw continuation prompts are never aggregate event fields.
+
 A missing or invalid `harness_policy.toml` is a startup error. The controller
 never synthesizes a permissive default, and it never widens an allowlist or a
 ceiling to make a run continue.

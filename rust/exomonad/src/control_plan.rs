@@ -13,6 +13,8 @@ const PYTHON_ENV: &str = "EXOMONAD_TL_LOOP_PYTHON";
 #[serde(deny_unknown_fields)]
 pub struct PlanProposalRequest {
     pub plan: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clarification: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -174,6 +176,7 @@ mod tests {
             "root",
             PlanProposalRequest {
                 plan: serde_json::json!({"leaves": []}),
+                clarification: None,
             },
             validator.to_str().unwrap(),
         )

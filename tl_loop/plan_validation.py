@@ -7,8 +7,10 @@ from copy import deepcopy
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+from tl_loop.plan_clarification import PlanClarification, PlanClarificationError
+
 _PLAN_KEYS = frozenset({"run_id", "budgets", "plan", "workers", "leaves", "sub_tls"})
-_PROPOSAL_KEYS = frozenset({"plan", "workers", "leaves", "sub_tls"})
+_PROPOSAL_KEYS = frozenset({"plan", "workers", "leaves", "sub_tls", "clarification"})
 _TASK_KEYS = {
     "workers": frozenset({"name", "task", "agent_type", "task_timeout_seconds"}),
     "leaves": frozenset(
@@ -78,11 +80,48 @@ def validate_plan_document(value: object, *, proposal: bool = False) -> dict[str
     _validate_work_plan(plan_value, "plan")
 
     result: dict[str, object] = {"plan": _normalize_work_plan_mapping(plan_value, "plan")}
+    if proposal and "clarification" in value:
+        result["clarification"] = _validate_clarification(value["clarification"])
     if not proposal:
         for key in ("run_id", "budgets"):
             if key in value:
                 result[key] = deepcopy(value[key])
     return result
+
+
+def _validate_clarification(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise PlanValidationError("clarification must be an object")
+    fields = {
+        "prior_revision",
+        "proposed_revision",
+        "invariant_digest",
+        "continuation_task",
+        "changed_fields",
+        "requires_human",
+    }
+    unknown = sorted(set(value) - fields)
+    if unknown:
+        raise PlanValidationError(f"clarification contains unknown keys: {', '.join(unknown)}")
+    try:
+        clarification = PlanClarification(
+            prior_revision=value.get("prior_revision"),
+            proposed_revision=value.get("proposed_revision"),
+            invariant_digest=value.get("invariant_digest"),
+            continuation_task=value.get("continuation_task"),
+            changed_fields=tuple(value.get("changed_fields", ())),
+            requires_human=value.get("requires_human"),
+        )
+    except (PlanClarificationError, TypeError, ValueError) as error:
+        raise PlanValidationError(f"invalid clarification: {error}") from error
+    return {
+        "prior_revision": clarification.prior_revision,
+        "proposed_revision": clarification.proposed_revision,
+        "invariant_digest": clarification.invariant_digest,
+        "continuation_task": clarification.continuation_task,
+        "changed_fields": list(clarification.changed_fields),
+        "requires_human": clarification.requires_human,
+    }
 
 
 def validate_plan_proposal(value: object) -> dict[str, object]:
