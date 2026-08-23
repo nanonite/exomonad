@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Make replay review freshness tests use a frozen clock (#963)
 - Fail closed when dev leaves exit without authoritative handoff (#950)
 - Fix CI-blocked notifications and attribute unstable base failures (#948)
 - TL controller dies on unserializable mappingproxy in durable writes, orphaning the worker (#934)
