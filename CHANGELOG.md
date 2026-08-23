@@ -181,7 +181,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add bounded recovery policy and orchestration probes (#955)
 - Add replay-safe recovery intents and invocation lineage (#954)
 - Add the pre-publication execution recovery FSM (#953)
-- Add real-server acceptance coverage for unstable-base escalation (#951)
+- Add real-server transport acceptance for blocked-handoff persistence and same-owner resume
+  (#951, partial; controller parking and watcher CI attribution tracked in #964)
 - Add same-owner resumption for blocked leaves without PRs (#949)
 - Park externally blocked TL slices behind durable human gates (#947)
 - Add canonical task-blocked telemetry and outcome attribution (#946)
