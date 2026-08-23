@@ -220,6 +220,7 @@ check-no-gemini:
         --glob '!dist-newstyle/**' \
         --glob '!vendor/**' \
         --glob '!archive/**' \
+        --glob '!.chainlink/issues.json' \
         --glob '!.git/**' \
         --glob '!justfile' || true)"
     unexpected="$(printf '%s\n' "$hits" | grep -vF "$canonical" || true)"

@@ -8,7 +8,11 @@ operator commands are real.
 The run must prove, in order, that a closed-unmerged PR is preserved as
 publication evidence, the live attempt is parked and disposed, a repeated
 abandon is idempotent, and redispatch creates a fresh attempt from the plan
-without inheriting PR identity. It runs the complete case three times.
+without inheriting PR identity. Each of the three complete cases executes this
+sequence twice: once for the root run and once for a real nested-sub-TL run
+with parent_run_id=root. The nested sequence uses its own slice, agent,
+worktree, branch, invocation, checkpoint, and filtered ledger evidence while
+sharing the real server.
 
 Negative controls are part of the acceptance contract. The role-registration
 mutation must fail the source-derived tool-surface check; the event, cleanup,

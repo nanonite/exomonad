@@ -77,7 +77,7 @@ Leaving them in place is harmless; relying on them is not.
 | `tl_effort_level` | Ignored |
 | `spawn_agent_type` | **Still live.** Default harness for workers, leaves, companions |
 | `worker_effort_level` | **Still live.** Inherited by leaves, sub-TLs, companions |
-| `agent_type = "gemini"` | **Fails closed.** Use `codex` (model `gpt-luna`) |
+| retired provider setting | **Fails closed.** Use `codex` (model `gpt-luna`) |
 
 ### New files the project now requires
 
