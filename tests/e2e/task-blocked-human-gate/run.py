@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Real-server acceptance for a base-CI blocked handoff and same-owner resume."""
+"""Real-server transport acceptance for blocked handoff and same-owner resume.
+
+The harness deliberately injects the typed blocked and parked events through the
+real MCP transport. It validates persistence, restart, and owner resumption;
+the TL controller and CI watcher decision are covered by their focused tests.
+"""
 
 from __future__ import annotations
 
@@ -229,6 +234,11 @@ def run_case(index: int) -> dict[str, Any]:
                 ),
                 "blocked invocation to become terminal",
             )
+            terminal = invocation(owner_dir)
+            if terminal.get("status") not in {"exited", "failed", "killed"}:
+                raise real.HarnessError(
+                    f"blocked invocation is not terminal: {terminal!r}"
+                )
 
             parked = effects.emit_controller_event(
                 event_type="tl.slice_parked",
@@ -273,11 +283,8 @@ def run_case(index: int) -> dict[str, Any]:
                 raise real.HarnessError(
                     f"difficulty attribution was not external: {payload!r}"
                 )
-            if (
-                invocation(owner_dir).get("exit_code") == 0
-                and payload.get("outcome") != "blocked"
-            ):
-                raise real.HarnessError("exit code 0 was inferred as completion")
+            if terminal.get("exit_code") == 0:
+                raise real.HarnessError("killed invocation unexpectedly exited cleanly")
             if len(typed_events(repo, "agent.task_blocked")) != 1:
                 raise real.HarnessError("blocked telemetry was duplicated")
 
@@ -303,6 +310,22 @@ def run_case(index: int) -> dict[str, Any]:
             ):
                 raise real.HarnessError(
                     "restart did not retain an open human gate issue"
+                )
+            open_gate_rows = list(
+                real.json_objects(
+                    restarted_effects.chainlink_issue_list(status="open").raw
+                )
+            )
+            gate_reused = any(
+                any(
+                    candidate.get(key) == blocked_issue_id
+                    for key in ("issue_id", "number", "id", "cicoIssueId")
+                )
+                for candidate in open_gate_rows
+            )
+            if not gate_reused:
+                raise real.HarnessError(
+                    "restart did not retain the original human gate identity"
                 )
 
             stale = resume_blocked_leaf(
@@ -346,6 +369,9 @@ def run_case(index: int) -> dict[str, Any]:
                 or worktree_for(repo, owner_dir) != worktree
             ):
                 raise real.HarnessError("resume changed owner branch or worktree")
+            same_owner = owner_for(repo) == owner_dir
+            same_branch = identity(owner_dir)["birth_branch"] == branch
+            same_worktree = worktree_for(repo, owner_dir) == worktree
             (worktree / "base-ci-fixed.txt").write_text(
                 "base CI stabilized\n", encoding="utf-8"
             )
@@ -374,26 +400,35 @@ def run_case(index: int) -> dict[str, Any]:
                 raise real.HarnessError(
                     "resume publication did not persist verified PR evidence"
                 )
+            published_after_resume = published.success and (
+                repo / ".exo/published-heads.json"
+            ).is_file()
             result = {
                 "run": index,
                 "blocked_event": {
                     "cause": payload["cause"],
                     "needs_human": payload["needs_human"],
                 },
-                "slice_states": ["spawned", "parked", "spawned", "in_review"],
-                "same_owner": True,
-                "same_branch": True,
-                "same_worktree": True,
-                "human_gate_reused": True,
-                "pr_published_after_resume": True,
-                "difficulty_attribution": "external_not_intrinsic",
-                "negative_controls": [
-                    "watcher-success",
-                    "message-keyword",
-                    "exit-0",
-                    "stale-resume",
-                    "head-introduced-ci",
-                ],
+                "observed": {
+                    "initial_invocation_running": initial.get("status") == "running",
+                    "terminal_invocation_status": terminal.get("status"),
+                    "parked_event_effect_succeeded": parked.success,
+                    "same_owner": same_owner,
+                    "same_branch": same_branch,
+                    "same_worktree": same_worktree,
+                    "human_gate_reused": gate_reused,
+                    "resumed_invocation_running": fresh.get("status") == "running",
+                    "pr_published_after_resume": published_after_resume,
+                    "difficulty_scope": payload.get("scope_attribution"),
+                },
+                "negative_controls": {
+                    "stale_resume_rejected": stale.success is False,
+                    "not_exercised": [
+                        "watcher-success",
+                        "message-keyword",
+                        "head-introduced-ci",
+                    ],
+                },
             }
             return result
         finally:
