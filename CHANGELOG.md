@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Execute derived direct-leaf actions through the effect journal (#993)
 - Route one-shot reviewer verdicts into exact-head TL decisions (#992)
 - Recover existing Forgejo PR ownership and handoff after restart (#991)
 - Prevent recreated controllers from adopting historical dispatch events (#990)
