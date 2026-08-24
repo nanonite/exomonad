@@ -117,6 +117,7 @@ from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 from .journal import MUTATING_OPERATIONS, EffectJournal, stable_action_key
 from .reconcile import (
     ExternalIntent,
+    InternalTransition,
     Quiescent,
     ReconciliationResult,
     derive_next_action,
@@ -130,6 +131,7 @@ DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
+MAX_CONVERGENCE_STEPS = 8
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
 
 
@@ -736,6 +738,7 @@ def run_tl_loop(
             state,
             store,
             effects_log,
+            effects=effects,
             project_root=selected.project_root,
             ledger_run_id=effective_ledger_run_id,
         )
@@ -1333,28 +1336,109 @@ def _apply_convergence(
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
 ) -> RunState:
-    """Run one post-reduction convergence step for every event branch."""
-    try:
-        result = tracker.reduce(state)
-    except ConvergenceInvariantError as error:
-        for event in error.events:
-            _record_convergence_event(error.key, event, config, effects, effects_log)
-        raise TLLoopError(str(error)) from error
-    if isinstance(result.state, RunState) and result.state.state_version > state.state_version:
-        state = store.set_state_version(result.state.state_version)
-    for event in result.events:
-        _record_convergence_event(_event_target(event.payload), event, config, effects, effects_log)
-    if isinstance(result.decision, ExternalIntent):
-        state = _execute_external_intent(
-            state,
-            result.decision,
-            tracker,
-            store,
-            config,
-            effects,
-            effects_log,
+    """Run bounded post-reduction convergence until the next effect or wait."""
+    for _ in range(MAX_CONVERGENCE_STEPS):
+        try:
+            result = tracker.reduce(state)
+        except ConvergenceInvariantError as error:
+            for event in error.events:
+                _record_convergence_event(error.key, event, config, effects, effects_log)
+            raise TLLoopError(str(error)) from error
+        if isinstance(result.state, RunState) and result.state.state_version > state.state_version:
+            state = store.set_state_version(result.state.state_version)
+        for event in result.events:
+            _record_convergence_event(
+                _event_target(event.payload), event, config, effects, effects_log
+            )
+        if isinstance(result.decision, InternalTransition):
+            prior = state
+            state = _apply_internal_transition(state, result.decision, store)
+            if result.decision.transition == "terminal" or state == prior:
+                return state
+            continue
+        if isinstance(result.decision, ExternalIntent):
+            return _execute_external_intent(
+                state,
+                result.decision,
+                tracker,
+                store,
+                config,
+                effects,
+                effects_log,
+            )
+        return state
+    raise TLLoopError("convergence did not reach a stable action or wait state")
+
+
+def _apply_internal_transition(
+    state: RunState,
+    decision: InternalTransition,
+    store: RunStore,
+) -> RunState:
+    """Persist lifecycle changes derived from durable evidence on restart."""
+    if decision.transition == "terminal":
+        return state
+    candidates = tuple(
+        current
+        for _, current in sorted(state.slices.items())
+        if current.status not in {SliceStatus.MERGED, SliceStatus.FAILED}
+    )
+    target: SliceState | None = None
+    if decision.reason == "head_reset":
+        target = next(
+            (
+                current
+                for current in candidates
+                if current.reviewed_head is not None
+                and _persisted_slice_head(current) is not None
+                and current.reviewed_head != _persisted_slice_head(current)
+            ),
+            None,
         )
-    return state
+        if target is None:
+            return state
+        updated = replace(
+            target,
+            status=SliceStatus.IN_REVIEW,
+            reviewed_head=None,
+            verdict=None,
+            verdict_at=None,
+            action=None,
+            dispatch_last_boundary="restart_head_reset",
+            dispatch_error=None,
+        )
+    elif decision.transition == "repairing":
+        target = next((current for current in candidates if _slice_has_conflict(current)), None)
+        if target is None:
+            return state
+        updated = replace(
+            target,
+            status=SliceStatus.REPAIRING,
+            verdict=Verdict.NO_GO,
+            action=None,
+            dispatch_last_boundary="restart_repair_queued",
+            dispatch_error=None,
+        )
+    else:
+        return state
+    return _checkpoint_slice_action(store, state, target.id, None, slice_state=updated)
+
+
+def _persisted_slice_head(current: SliceState) -> str | None:
+    """Read the publication/handoff head without importing policy internals."""
+    if current.publication is not None:
+        return current.publication.head_sha
+    if current.handoff is not None:
+        return current.handoff.head_sha
+    return current.reviewed_head
+
+
+def _slice_has_conflict(current: SliceState) -> bool:
+    """Match the reducer's conflict predicate for transition targeting."""
+    if current.dispatch_error is not None and "conflict" in current.dispatch_error.lower():
+        return True
+    reconciliation = current.reconciliation
+    return isinstance(reconciliation, Mapping) and bool(reconciliation.get("conflicts"))
 
 
 def _execute_external_intent(
@@ -2099,6 +2183,7 @@ def _reconcile_action_journal(
     store: RunStore,
     effects_log: list[EffectIntent],
     *,
+    effects: EffectClient | ReadOnlyEffectClient | None = None,
     project_root: str | Path | None = None,
     ledger_run_id: str | None = None,
 ) -> RunState:
@@ -2128,6 +2213,15 @@ def _reconcile_action_journal(
     for entry in effects_log.pending_entries():
         key = entry.get("key")
         if not isinstance(key, str) or not key:
+            continue
+        if effects is not None and _reconcile_pending_merge_entry(
+            entry,
+            state,
+            store,
+            effects_log,
+            effects,
+        ):
+            state = store.load()
             continue
         if _controller_event_was_committed(
             entry,
@@ -2167,6 +2261,62 @@ def _reconcile_action_journal(
                 },
             )
     return state
+
+
+def _reconcile_pending_merge_entry(
+    entry: Mapping[str, object],
+    state: RunState,
+    store: RunStore,
+    effects_log: EffectJournal,
+    effects: EffectClient | ReadOnlyEffectClient,
+) -> bool:
+    """Adopt a merge that completed before restart but lost its response."""
+    if entry.get("operation") != "merge_pr":
+        return False
+    arguments = entry.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return False
+    pr_number = arguments.get("pr_number")
+    target = entry.get("target")
+    if type(pr_number) is not int or not isinstance(target, str) or target not in state.slices:
+        return False
+    try:
+        watcher = effects.watcher_pr_state(pr_number=pr_number)
+    except (ConnectionError, OSError, RuntimeError, TimeoutError):
+        return False
+    if (
+        watcher.success is not True
+        or not isinstance(watcher.result, Mapping)
+        or watcher.result.get("merged") is not True
+    ):
+        return False
+    key = entry.get("key")
+    if not isinstance(key, str) or not key:
+        return False
+    effects_log.resolve_by_key(
+        key,
+        status="confirmed",
+        result={"success": True, "result": {"merged": True, "reconciled": True}},
+    )
+    current = state.slices[target]
+    store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            target: replace(
+                current,
+                status=SliceStatus.MERGED,
+                action=None,
+                dispatch_last_boundary="restart_merge_reconciled",
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    return True
 
 
 def _controller_event_was_committed(

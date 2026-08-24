@@ -19,8 +19,9 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.client.effects import ToolResult
-from tl_loop.state.schema import GateStatus
+from tl_loop.state.schema import GateStatus, SliceStatus
 from tl_loop.state.store import RunStore, create
+from tl_loop.tests.test_reconcile import _slice
 
 
 @dataclass
@@ -198,3 +199,33 @@ def test_invoke_error_points_to_the_attempt_scoped_gate(tmp_path) -> None:
             call,  # type: ignore[arg-type]
             journal,
         )
+
+
+def test_restart_adopts_an_authoritative_merge_for_a_pending_intent(tmp_path) -> None:
+    journal, intent, _ = _journal_with_unknown_entry(tmp_path)
+    store, state = _store_and_state(tmp_path)
+    state = store.checkpoint(
+        state.fsm,
+        {"slice-a": _slice(SliceStatus.IN_REVIEW)},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    class Watcher:
+        def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
+            assert pr_number == 42
+            return ToolResult.from_raw(
+                {"success": True, "result": {"merged": True, "pr_state": "closed"}}
+            )
+
+    reconciled = _reconcile_action_journal(
+        state,
+        store,
+        journal,
+        effects=Watcher(),
+    )
+
+    assert journal.pending_entries() == []
+    assert journal.existing(intent)["status"] == "confirmed"
+    assert reconciled.slices["slice-a"].status is SliceStatus.MERGED
+    assert reconciled.slices["slice-a"].action is None

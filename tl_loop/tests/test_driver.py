@@ -4011,3 +4011,37 @@ __all__ = [
     "SyntheticQueue",
     "test_active_loop_dispatches_direct_children_and_merges_leaf",
 ]
+
+
+def test_restart_internal_head_reset_is_persisted_before_next_action(tmp_path: Path) -> None:
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                publication=PublicationBinding(42, "head-b", "main.leaf-a", "main", 2),
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+    transport = RecordingTransport()
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+
+    result = _apply_convergence(
+        store.load(),
+        ConvergenceTracker(),
+        store,
+        TLLoopConfig(active=True),
+        EffectClient(transport),
+        journal,
+    )
+
+    restored = result.slices["leaf-a"]
+    assert result.state_version == 1
+    assert restored.status is SliceStatus.IN_REVIEW
+    assert restored.reviewed_head is None
+    assert restored.verdict is None
+    assert any(name == "emit_controller_event" for name, _ in transport.calls)

@@ -258,17 +258,17 @@ def _derive_slice_action(state: SliceState) -> MergeDecision:
         SliceStatus.BLOCKED,
     }:
         return Quiescent(f"closed_{state.status.value}")
+    current_head = _persisted_head(state)
+    if state.status is SliceStatus.REPAIRING:
+        return ExternalIntent("repair", state.id, {"head_sha": current_head})
     if _has_conflict(state):
         return InternalTransition("repairing", "conflict")
-    current_head = _persisted_head(state)
     if (
         state.reviewed_head is not None
         and current_head is not None
         and state.reviewed_head != current_head
     ):
         return InternalTransition("in_review", "head_reset")
-    if state.status is SliceStatus.REPAIRING:
-        return ExternalIntent("repair", state.id, {"head_sha": current_head})
     if state.pr_number is None or current_head is None:
         return Quiescent("await_publication")
     if (
