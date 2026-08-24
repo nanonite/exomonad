@@ -165,6 +165,7 @@ def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) ->
     assert captured["ledger_queue"]["active_tail_timeout"] == 60.0
     assert captured["tlloop_config"]["task_timeout_seconds"] == 90.0
     assert captured["tlloop_config"]["task_timeout_source"] == "project"
+    assert captured["tlloop_config"]["enable_reviewer_spawn"] is True
 
 
 def test_run_defaults_preserve_current_values() -> None:

@@ -299,6 +299,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         run_id=run_id,
         ledger_run_id=ledger_run_id,
         role="worker",
+        enable_reviewer_spawn=True,
         review_policy_path=project_root / ".exo" / "review-policy.toml",
         policy=policy,
         capabilities=capabilities,

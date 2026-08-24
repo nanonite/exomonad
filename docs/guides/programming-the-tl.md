@@ -845,6 +845,25 @@ stages and unknown integration evidence.
 `pending` → `ready` → `spawned` → `in_review` → (`repairing` →) `merged`.
 Terminal alternatives: `failed`, `parked`, `blocked`.
 
+### Recovering a slice already in review
+
+If a controller was started before reviewer spawning was enabled, a slice can
+remain `in_review` with an open PR but no reviewer claim. Do not edit the
+checkpoint or create a reviewer manually. Rebuild/install the TL controller,
+then restart the same run so startup reconciliation can claim the exact PR
+head idempotently:
+
+~~~bash
+just tl-loop-archive
+cp tl_loop.pyz ~/.exo/tl_loop.pyz
+python3 -m tl_loop status --project-root /path/to/project --run-id root
+python3 -m tl_loop run --project-root /path/to/project --run-id root
+~~~
+
+The run must retain its existing state root and ledger identity. Verify that
+the slice's `reviewer_attempt` contains the PR head and that exactly one
+reviewer spawn event exists before continuing the normal review/CI flow.
+
 For an ordered run, inspect these fields first:
 
 | Status output | Diagnose |
