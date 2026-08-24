@@ -365,8 +365,10 @@ def run_case(index: int) -> dict[str, object]:
             issue_id = _issue_id(created)
             swarm_id = real.server_run_id(repo)
             recovery_trace = real.run_recursive_checkpoint_probe(
-                client, root, repo, swarm_id
+                client, root, repo, swarm_id, exercise_recovery=True
             )
+            if recovery_trace is None:
+                raise HarnessError("recovery probe returned no authoritative trace")
             real.run_real_watcher_routing_probe(client, root, repo, forgejo, swarm_id)
             marker.write_bytes(b"dirty recovery content\n")
             traces = real.run_delayed_restart_probe(client, root, repo, forgejo)

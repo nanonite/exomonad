@@ -53,6 +53,7 @@ from tl_loop.loop.driver import (  # noqa: E402
     _supervise_live_sub_tl,
     run_tl_loop,  # noqa: E402
 )
+from tl_loop.loop.heartbeat import HeartbeatConfig  # noqa: E402
 from tl_loop.ordered import IntegrationLifecycle  # noqa: E402
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse  # noqa: E402
 from tl_loop.state.schema import (  # noqa: E402
@@ -1422,6 +1423,7 @@ def _run_recursive_checkpoint_controller(
     repo: Path,
     swarm_id: str,
     cancel_event: Any,
+    exercise_recovery: bool,
 ) -> None:
     """Run the nested controller until the probe observes its live boundary."""
     state_root = root / "lifecycle-state"
@@ -1469,6 +1471,16 @@ def _run_recursive_checkpoint_controller(
                 branch="main",
                 worktree=state_root / "recursive-owner",
                 working_dir=str(repo),
+                project_root=repo if exercise_recovery else None,
+                heartbeat=(
+                    HeartbeatConfig(
+                        interval_seconds=0.05,
+                        stall_threshold_seconds=300.0,
+                        task_timeout_seconds=None,
+                    )
+                    if exercise_recovery
+                    else None
+                ),
                 cancel_event=cancel_event,
             ),
             root_dir=state_root,
@@ -1482,17 +1494,76 @@ def _run_recursive_checkpoint_controller(
         sub_tl_source.close()
 
 
+def _drive_nested_recovery(
+    client: TransportClient,
+    repo: Path,
+    state_root: Path,
+    attempt: int,
+    trace: RecoveryTrace,
+) -> None:
+    blocked = EffectClient(client, role="tl", name="root").emit_controller_event(
+        event_type="agent.task_blocked",
+        payload={
+            "outcome": "blocked",
+            "slice_id": "nested-leaf",
+            "cause": "base_ci_unstable",
+            "scope_attribution": "base",
+            "needs_human": False,
+            "retryable": True,
+            "recovery_action": "probe base CI before same-owner resume",
+            "declared_difficulty": "standard",
+            "matched_difficulty_rule": "standard_slice",
+            "attempt": attempt,
+        },
+    )
+    if not blocked.success:
+        raise HarnessError(f"nested blocked evidence was rejected: {blocked.raw!r}")
+    recovery_deadline = time.monotonic() + 20
+    previous_phase: str | None = None
+    while time.monotonic() < recovery_deadline:
+        try:
+            nested_state = RunStore("sub-a", state_root / "recursive-root").load()
+            recovery = nested_state.slices["nested-leaf"].recovery
+            if recovery is not None and recovery.phase.value != previous_phase:
+                trace.record(
+                    boundary="nested_recovery",
+                    point=recovery.phase.value,
+                    run_id="sub-a",
+                    state_root=state_root / "recursive-root",
+                    repo=repo,
+                )
+                previous_phase = recovery.phase.value
+                if len(trace.records) >= 2:
+                    return
+        except (CorruptCheckpoint, FileNotFoundError, KeyError, ValueError):
+            pass
+        time.sleep(0.1)
+    raise HarnessError(
+        "nested controller did not persist two authoritative recovery phases: "
+        f"{trace.records!r}"
+    )
+
+
 def run_recursive_checkpoint_probe(
-    client: TransportClient, root: Path, repo: Path, swarm_id: str
-) -> RecoveryTrace:
+    client: TransportClient,
+    root: Path,
+    repo: Path,
+    swarm_id: str,
+    *,
+    exercise_recovery: bool = False,
+) -> RecoveryTrace | None:
     """Observe nested live controllers before cancelling the disposable probe."""
     state_root = root / "lifecycle-state"
-    trace = RecoveryTrace.open(root / "recursive-recovery-trace.json")
+    trace = (
+        RecoveryTrace.open(root / "recursive-recovery-trace.json")
+        if exercise_recovery
+        else None
+    )
     context = multiprocessing.get_context("fork")
     cancel_event = context.Event()
     controller = context.Process(
         target=_run_recursive_checkpoint_controller,
-        args=(root, repo, swarm_id, cancel_event),
+        args=(root, repo, swarm_id, cancel_event, exercise_recovery),
         name="recursive-checkpoint-controller",
     )
     controller.start()
@@ -1531,47 +1602,10 @@ def run_recursive_checkpoint_probe(
             )
         if not controller.is_alive():
             raise HarnessError("recursive controller exited before the nested boundary")
-        blocked = EffectClient(client, role="tl", name="root").emit_controller_event(
-            event_type="agent.task_blocked",
-            payload={
-                "outcome": "blocked",
-                "slice_id": "nested-leaf",
-                "cause": "base_ci_unstable",
-                "scope_attribution": "base",
-                "needs_human": False,
-                "retryable": True,
-                "recovery_action": "probe base CI before same-owner resume",
-                "declared_difficulty": "standard",
-                "matched_difficulty_rule": "standard_slice",
-                "attempt": nested_leaf.attempts,
-            },
-        )
-        if not blocked.success:
-            raise HarnessError(f"nested blocked evidence was rejected: {blocked.raw!r}")
-        recovery_deadline = time.monotonic() + 20
-        previous_phase: str | None = None
-        while time.monotonic() < recovery_deadline:
-            try:
-                nested_state = RunStore("sub-a", state_root / "recursive-root").load()
-                recovery = nested_state.slices["nested-leaf"].recovery
-                if recovery is not None and recovery.phase.value != previous_phase:
-                    trace.record(
-                        boundary="nested_recovery",
-                        point=recovery.phase.value,
-                        run_id="sub-a",
-                        state_root=state_root / "recursive-root",
-                        repo=repo,
-                    )
-                    previous_phase = recovery.phase.value
-                    if len(trace.records) >= 2:
-                        break
-            except (CorruptCheckpoint, FileNotFoundError, KeyError, ValueError):
-                pass
-            time.sleep(0.1)
-        if len(trace.records) < 2:
-            raise HarnessError(
-                "nested controller did not persist two authoritative recovery "
-                f"phases: {trace.records!r}"
+        if exercise_recovery:
+            assert trace is not None
+            _drive_nested_recovery(
+                client, repo, state_root, nested_leaf.attempts, trace
             )
     finally:
         cancel_event.set()
