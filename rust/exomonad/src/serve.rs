@@ -936,12 +936,17 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         "unknown".to_string()
     };
+    let runtime_manifest = exomonad_core::services::runtime_manifest::RuntimeManifest::new(
+        env!("EXOMONAD_BUILD_GIT_COMMIT"),
+        env!("EXOMONAD_TL_LOOP_GIT_COMMIT"),
+    );
 
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "role": state.default_role.as_str(),
         "wasm_hash": wasm_hash,
+        "runtime_manifest": runtime_manifest,
     }))
 }
 

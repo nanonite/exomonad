@@ -4,16 +4,20 @@ use exomonad::config::{
     Config, EffortLevel, ResolvedEffort, REVIEWER_EFFORT_ENV, REVIEWER_MAX_ROUNDS_ENV,
     REVIEWER_MODEL_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV,
 };
+use exomonad_core::services::runtime_manifest::PUBLICATION_REGISTRY_SCHEMA_VERSION;
 use exomonad_core::services::AgentType;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
 const TL_LOOP_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tl_loop.pyz"));
 const TL_LOOP_PYPROJECT: &str = include_str!("../../../tl_loop/pyproject.toml");
 const TL_LOOP_INTERPRETER_POLICY: &str = include_str!("../../../tl_loop/interpreter_policy.toml");
 const TL_CONTROLLER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const EXOMONAD_BUILD_GIT_COMMIT: &str = env!("EXOMONAD_BUILD_GIT_COMMIT");
+const EXOMONAD_TL_LOOP_GIT_COMMIT: &str = env!("EXOMONAD_TL_LOOP_GIT_COMMIT");
 
 fn read_root_tl_protocol(cwd: &Path, wasm_name: &str) -> Option<String> {
     exomonad_core::services::agent_control::load_role_context(cwd, wasm_name, "root")
@@ -931,28 +935,105 @@ fn run_tl_loop_preflight(cwd: &Path, package_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn checkout_git_commit(cwd: &Path) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .context("failed to resolve the project checkout revision")?;
+    if !output.status.success() {
+        anyhow::bail!("git rev-parse HEAD failed with {}", output.status);
+    }
+    let commit = String::from_utf8(output.stdout)
+        .context("git returned a non-UTF-8 checkout revision")?
+        .trim()
+        .to_owned();
+    if commit.is_empty() {
+        anyhow::bail!("git rev-parse HEAD returned an empty checkout revision");
+    }
+    Ok(commit)
+}
+
+fn validate_publication_registry_schema(cwd: &Path) -> Result<()> {
+    let path = cwd.join(".exo/published-heads.json");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read publication registry {}", path.display()))?;
+    let document: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("invalid publication registry {}", path.display()))?;
+    let object = document.as_object().with_context(|| {
+        format!(
+            "publication registry {} must be a JSON object",
+            path.display()
+        )
+    })?;
+    let schema = object
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if schema > u64::from(PUBLICATION_REGISTRY_SCHEMA_VERSION) {
+        anyhow::bail!(
+            "publication registry {} uses unsupported schema version {}; supported through {}. Upgrade ExoMonad before restarting; --recreate does not migrate runtime artifacts",
+            path.display(),
+            schema,
+            PUBLICATION_REGISTRY_SCHEMA_VERSION,
+        );
+    }
+    Ok(())
+}
+
+fn validate_runtime_builds(
+    checkout: &str,
+    server_build: &str,
+    controller_build: &str,
+) -> Result<()> {
+    if server_build == "unknown"
+        || controller_build == "unknown"
+        || server_build != checkout
+        || controller_build != checkout
+    {
+        anyhow::bail!(
+            "incompatible ExoMonad runtime artifacts: checkout={checkout}, server_build={}, controller_build={}. Rebuild and install with just install-all-dev; --recreate resets orchestration state but does not update artifacts",
+            server_build,
+            controller_build,
+        );
+    }
+    Ok(())
+}
+
+fn validate_runtime_compatibility(cwd: &Path) -> Result<()> {
+    let checkout = checkout_git_commit(cwd)?;
+    validate_runtime_builds(
+        &checkout,
+        EXOMONAD_BUILD_GIT_COMMIT,
+        EXOMONAD_TL_LOOP_GIT_COMMIT,
+    )?;
+    validate_publication_registry_schema(cwd)?;
+    info!(
+        checkout,
+        server_build = EXOMONAD_BUILD_GIT_COMMIT,
+        controller_build = EXOMONAD_TL_LOOP_GIT_COMMIT,
+        protocol_version = exomonad_core::services::runtime_manifest::RUNTIME_PROTOCOL_VERSION,
+        publication_registry_schema = PUBLICATION_REGISTRY_SCHEMA_VERSION,
+        "Validated ExoMonad runtime compatibility"
+    );
+    Ok(())
+}
+
 fn tl_loop_package_root() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is required to install the TL controller")?;
-    let install_dir = PathBuf::from(home).join(".exo");
+    tl_loop_package_root_at(&PathBuf::from(home).join(".exo"))
+}
+
+fn tl_loop_package_root_at(install_dir: &Path) -> Result<PathBuf> {
     let archive = install_dir.join("tl_loop.pyz");
-    let legacy_package = install_dir.join("tl_loop");
-    if legacy_package.exists() {
-        std::fs::remove_dir_all(&legacy_package).with_context(|| {
-            format!(
-                "failed to remove legacy TL package {}",
-                legacy_package.display()
-            )
-        })?;
-    }
-    std::fs::create_dir_all(&install_dir)?;
-    let current = std::fs::read(&archive).ok();
-    if current.as_deref() != Some(TL_LOOP_ARCHIVE) {
-        let temporary = install_dir.join("tl_loop.pyz.new");
-        std::fs::write(&temporary, TL_LOOP_ARCHIVE)
-            .with_context(|| format!("failed to write {}", temporary.display()))?;
-        std::fs::rename(&temporary, &archive)
-            .with_context(|| format!("failed to install {}", archive.display()))?;
-        info!(path = %archive.display(), "Installed embedded TL controller archive");
+    if !archive.is_file() {
+        anyhow::bail!(
+            "installed TL controller archive is missing at {}; run just install-all-dev before restarting",
+            archive.display()
+        );
     }
     Ok(archive)
 }
@@ -1711,6 +1792,7 @@ pub async fn run(
     let runtime_paths = config.tl_preflight_runtime_paths.join(",");
     std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, &runtime_paths);
     ensure_harness_capability(&cwd)?;
+    validate_runtime_compatibility(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
     write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
     if skip_preflight {
@@ -3889,6 +3971,39 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("Python 3.10.9"));
         assert!(message.contains("Python >= 3.11"));
+    }
+
+    #[test]
+    fn runtime_build_validation_fails_closed_with_rebuild_instruction() {
+        let error = validate_runtime_builds("new", "old", "new").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("server_build=old"));
+        assert!(message.contains("just install-all-dev"));
+    }
+
+    #[test]
+    fn publication_registry_schema_accepts_legacy_and_current_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".exo");
+        std::fs::create_dir_all(&path).unwrap();
+        let registry = path.join("published-heads.json");
+        for document in [r#"{"heads":[]}"#, r#"{"schema_version":2,"heads":[]}"#] {
+            std::fs::write(&registry, document).unwrap();
+            validate_publication_registry_schema(directory.path()).unwrap();
+        }
+        std::fs::write(&registry, r#"{"schema_version":3,"heads":[]}"#).unwrap();
+        let error = validate_publication_registry_schema(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("unsupported schema version 3"));
+    }
+
+    #[test]
+    fn missing_controller_archive_is_rejected_without_implicit_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = tl_loop_package_root_at(directory.path()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("installed TL controller archive is missing"));
+        assert!(!directory.path().join("tl_loop.pyz").exists());
     }
 
     #[test]

@@ -51,6 +51,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "exomonad must be nested under the repository root",
             )
         })?;
+    let server_build = Command::new("git")
+        .args([
+            "-C",
+            repository_root.to_str().unwrap_or_default(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=EXOMONAD_BUILD_GIT_COMMIT={server_build}");
     let tl_loop_source = repository_root.join("tl_loop");
     let archive_builder = repository_root.join("scripts/build_tl_loop_archive.py");
     let interpreter_resolver = repository_root.join("scripts/resolve_tl_loop_python.py");
@@ -115,6 +129,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .into());
     }
+
+    let controller_build = Command::new(&controller)
+        .arg("-c")
+        .arg("import json,sys,zipfile; print(json.loads(zipfile.ZipFile(sys.argv[1]).read('tl_loop/_build_fingerprint.json'))['git_commit'])")
+        .arg(&archive_output)
+        .current_dir(repository_root)
+        .output()?;
+    if !controller_build.status.success() {
+        return Err(Error::other(format!(
+            "failed to read TL controller build identity: {}",
+            String::from_utf8_lossy(&controller_build.stderr)
+        ))
+        .into());
+    }
+    let controller_commit = String::from_utf8(controller_build.stdout)?
+        .trim()
+        .to_owned();
+    if controller_commit.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "TL controller archive contains an empty build identity",
+        )
+        .into());
+    }
+    println!("cargo:rustc-env=EXOMONAD_TL_LOOP_GIT_COMMIT={controller_commit}");
 
     Ok(())
 }

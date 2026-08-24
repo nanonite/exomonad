@@ -40,6 +40,7 @@ pub mod pr_registry;
 pub mod repo;
 pub mod resilience;
 pub mod review_policy;
+pub mod runtime_manifest;
 pub mod secrets;
 mod session_memory;
 mod session_memory_capture;

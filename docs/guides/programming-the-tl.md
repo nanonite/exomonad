@@ -871,7 +871,10 @@ repeat the check before restarting the run:
 python3 scripts/check_tl_loop_archive.py ~/.exo/tl_loop.pyz --source "$PWD/tl_loop"
 ~~~
 
-The controller reports the same mismatch at startup and never rebuilds itself.
+Controller preflight rejects the mismatch before any leaf or reviewer is
+spawned. The Rust launcher also checks that the installed server and embedded
+controller were built from the checkout revision; --recreate resets state but
+never updates either artifact. Run just install-all-dev to repair a mismatch.
 
 The run must retain its existing state root and ledger identity. Verify that
 the slice's `reviewer_attempt` contains the PR head and that exactly one

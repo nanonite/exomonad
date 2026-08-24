@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from tl_loop.fingerprint import fingerprint_report
 from tl_loop.plan_validation import PlanValidationError, validate_plan_document
 from tl_loop.rlm.review_input import load_review_policy
 from tl_loop.select.agent_type import parse_harness_identifier
@@ -44,6 +45,14 @@ def run_preflight(project_root: str | Path) -> PreflightReport:
     review_path = exo / "review-policy.toml"
     capability_path = exo / "harness_capability.toml"
     plan_path = root / PLAN_PATH
+
+    fingerprint = fingerprint_report(root)
+    if fingerprint["status"] in {"stale", "invalid"}:
+        raise PreflightError(
+            "incompatible TL controller archive: "
+            f"{fingerprint}. Rebuild and install with just install-all-dev; "
+            "--recreate does not update runtime artifacts"
+        )
 
     _require_files((config_path, policy_path, review_path, plan_path))
     try:

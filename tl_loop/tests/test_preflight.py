@@ -5,6 +5,7 @@ import pytest
 
 from tl_loop import __main__ as tl_main
 from tl_loop.preflight import PreflightError, capability_example, run_preflight
+import tl_loop.preflight as preflight_module
 from tl_loop.select.policy import load_policy
 from tl_loop.state.store import RunStore
 
@@ -74,6 +75,21 @@ def test_missing_and_invalid_policy_fail_preflight(tmp_path: Path) -> None:
         run_preflight(project)
     policy.write_text("roles = [", encoding="utf-8")
     with pytest.raises(PreflightError, match="invalid"):
+        run_preflight(project)
+
+
+@pytest.mark.parametrize("status", ["stale", "invalid"])
+def test_incompatible_controller_archive_fails_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    project = _project(tmp_path)
+    monkeypatch.setattr(
+        preflight_module,
+        "fingerprint_report",
+        lambda _root: {"status": status, "source": {"git_commit": "new"}, "archive": None},
+    )
+
+    with pytest.raises(PreflightError, match="incompatible TL controller archive"):
         run_preflight(project)
 
 
