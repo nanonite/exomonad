@@ -17,6 +17,7 @@ source or pretending that a source copy is a real-server run.
 from __future__ import annotations
 
 import copy
+import importlib
 import json
 import os
 import subprocess
@@ -26,13 +27,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from tl_loop.state.store import RunStore
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ORDERED_DIR = PROJECT_ROOT / "tests/e2e/ordered-recursive"
 sys.path.insert(0, str(ORDERED_DIR))
-
-import real_server_transport as real  # noqa: E402
-
-from tl_loop.state.store import RunStore  # noqa: E402
+real = importlib.import_module("real_server_transport")
 
 
 class HarnessError(RuntimeError):
@@ -140,20 +140,31 @@ def _validate_evidence(evidence: Mapping[str, object]) -> None:
     if type(attempt) is not int or attempt < 1:
         raise HarnessError(f"slice attempt was charged unexpectedly: {evidence!r}")
     generations = evidence.get("invocation_generations")
+    lineage_generations = [
+        item["invocation_generation"]
+        for item in lineage
+        if type(item.get("invocation_generation")) is int
+    ]
     if (
         not isinstance(generations, list)
         or len(generations) < 2
         or not all(type(item) is int and item >= 0 for item in generations)
-        or generations != sorted(set(generations))
-        or generations
-        != [
-            item["invocation_generation"]
-            for item in lineage
-            if type(item.get("invocation_generation")) is int
-        ]
+        or len(lineage_generations) != len(lineage)
+        or generations != lineage_generations
+        or any(left > right for left, right in zip(generations, generations[1:]))
     ):
         raise HarnessError(
-            f"recovery did not produce a unique authoritative lineage: {evidence!r}"
+            f"recovery lineage generations were not monotonic and authoritative: {evidence!r}"
+        )
+    resume_generation = evidence.get("resume_generation")
+    if (
+        evidence.get("same_owner_resume_confirmed") is not True
+        or type(resume_generation) is not int
+        or not generations
+        or resume_generation <= min(generations)
+    ):
+        raise HarnessError(
+            f"same-owner resume did not create a new invocation generation: {evidence!r}"
         )
     round_count = evidence.get("recovery_round")
     rounds = [
@@ -165,6 +176,7 @@ def _validate_evidence(evidence: Mapping[str, object]) -> None:
         type(round_count) is not int
         or round_count < 0
         or not rounds
+        or len(rounds) != len(lineage)
         or round_count != max(rounds)
         or any(item.get("slice_attempt") != attempt for item in lineage)
     ):
@@ -172,6 +184,7 @@ def _validate_evidence(evidence: Mapping[str, object]) -> None:
     for key in (
         "unrelated_sibling_completed_while_waiting",
         "same_owner_worktree_preserved",
+        "same_owner_resume_confirmed",
         "review_fsm_entered_only_after_pr_filed",
     ):
         if evidence.get(key) is not True:
@@ -278,6 +291,35 @@ def _collect_evidence(
         for snapshot in lineage
         if type(recovery_round := snapshot.get("recovery_round")) is int
     ]
+    confirmations = [
+        record.get("resume_confirmation")
+        for trace in traces.values()
+        for record in trace.records
+        if isinstance(record.get("resume_confirmation"), Mapping)
+    ]
+    if len(confirmations) != 1:
+        raise HarnessError(
+            "recovery trace did not contain exactly one authoritative resume "
+            f"confirmation: {confirmations!r}"
+        )
+    confirmation_data = confirmations[0].get("data")
+    if not isinstance(confirmation_data, Mapping):
+        raise HarnessError(f"resume confirmation omitted its data: {confirmations!r}")
+    resumed_invocation = next(
+        (
+            record.get("resume_invocation")
+            for trace in traces.values()
+            for record in trace.records
+            if isinstance(record.get("resume_invocation"), Mapping)
+        ),
+        None,
+    )
+    if not isinstance(resumed_invocation, Mapping):
+        raise HarnessError(
+            "resume confirmation omitted the fresh invocation record: "
+            f"{confirmations!r}"
+        )
+    resume_generation = resumed_invocation.get("generation")
     owner_records = [
         (
             snapshot.get("owner_run_id"),
@@ -295,6 +337,13 @@ def _collect_evidence(
         )
         and len(set(owner_records)) == 1
     )
+    same_owner_resume = (
+        isinstance(resumed_invocation.get("runtime_agent_id"), str)
+        and resumed_invocation.get("runtime_agent_id") == owner_records[-1][1]
+        and resumed_invocation.get("slice_id") == nested_leaf
+        and resumed_invocation.get("branch") == owner_records[-1][2]
+        and resumed_invocation.get("worktree") == owner_records[-1][3]
+    )
     for run_id in (
         "ordered-server-dispatch-restart",
         "ordered-server-aggregate_review-restart",
@@ -311,6 +360,8 @@ def _collect_evidence(
         "invocation_generations": generations,
         "recovery_round": max(rounds, default=-1),
         "recovery_lineage": lineage,
+        "same_owner_resume_confirmed": same_owner_resume,
+        "resume_generation": resume_generation,
         "unrelated_sibling_completed_while_waiting": sibling_progress,
         "same_owner_worktree_preserved": owner_preserved,
         "review_fsm_entered_only_after_pr_filed": _review_handoff_is_ordered(

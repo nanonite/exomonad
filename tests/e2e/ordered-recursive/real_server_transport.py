@@ -121,6 +121,8 @@ class RecoveryTrace:
         run_id: str,
         state_root: Path,
         repo: Path,
+        resume_confirmation: Mapping[str, Any] | None = None,
+        resume_invocation: Mapping[str, Any] | None = None,
     ) -> None:
         state = RunStore(run_id, state_root).load()
         journal_path = state_root / run_id / "action-journal.json"
@@ -170,6 +172,12 @@ class RecoveryTrace:
                 for slice_id, slice_state in sorted(state.slices.items())
                 if (recovery := slice_state.recovery) is not None
             },
+            "resume_confirmation": (
+                dict(resume_confirmation) if resume_confirmation is not None else None
+            ),
+            "resume_invocation": (
+                dict(resume_invocation) if resume_invocation is not None else None
+            ),
             "action_keys": [
                 {
                     "key": entry.get("key"),
@@ -1518,12 +1526,21 @@ def _drive_nested_recovery(
     )
     if not blocked.success:
         raise HarnessError(f"nested blocked evidence was rejected: {blocked.raw!r}")
-    recovery_deadline = time.monotonic() + 20
+    recovery_deadline = time.monotonic() + 60
     previous_phase: str | None = None
+    initial_generation: int | None = None
     while time.monotonic() < recovery_deadline:
         try:
             nested_state = RunStore("sub-a", state_root / "recursive-root").load()
-            recovery = nested_state.slices["nested-leaf"].recovery
+            nested_slice = nested_state.slices["nested-leaf"]
+            recovery = nested_slice.recovery
+            invocation = _read_nested_invocation(repo, nested_slice)
+            if invocation is not None and type(invocation.get("generation")) is int:
+                initial_generation = (
+                    invocation["generation"]
+                    if initial_generation is None
+                    else initial_generation
+                )
             if recovery is not None and recovery.phase.value != previous_phase:
                 trace.record(
                     boundary="nested_recovery",
@@ -1533,15 +1550,57 @@ def _drive_nested_recovery(
                     repo=repo,
                 )
                 previous_phase = recovery.phase.value
-                if len(trace.records) >= 2:
-                    return
+            resume_events = [
+                event
+                for event in server_ledger_events(repo)
+                if event.get("type") == "agent.recovery.outcome"
+                and event.get("run_id") == nested_state.ledger_run_id
+                and isinstance(event.get("data"), Mapping)
+                and event["data"].get("slice_id") == "nested-leaf"
+                and event["data"].get("outcome") == "recovered"
+            ]
+            resumed_invocation = (
+                invocation
+                if invocation is not None
+                and type(invocation.get("generation")) is int
+                and initial_generation is not None
+                and invocation["generation"] > initial_generation
+                and invocation.get("status") == "running"
+                and invocation.get("slice_id") == "nested-leaf"
+                else None
+            )
+            if resume_events and resumed_invocation is not None:
+                trace.record(
+                    boundary="nested_recovery",
+                    point="resume_confirmed",
+                    run_id="sub-a",
+                    state_root=state_root / "recursive-root",
+                    repo=repo,
+                    resume_confirmation=resume_events[-1],
+                    resume_invocation=resumed_invocation,
+                )
+                return
         except (CorruptCheckpoint, FileNotFoundError, KeyError, ValueError):
             pass
         time.sleep(0.1)
     raise HarnessError(
-        "nested controller did not persist two authoritative recovery phases: "
+        "nested controller did not persist recovery through an authoritative "
+        "same-owner resume confirmation: "
         f"{trace.records!r}"
     )
+
+
+def _read_nested_invocation(repo: Path, slice_state: Any) -> dict[str, Any] | None:
+    """Read the current invocation from the persisted runtime-agent identity."""
+    agent_id = slice_state.dispatch_agent_id
+    if not isinstance(agent_id, str) or not agent_id:
+        return None
+    path = repo / ".exo" / "agents" / agent_id / "invocation.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return dict(value) if isinstance(value, Mapping) else None
 
 
 def run_recursive_checkpoint_probe(
