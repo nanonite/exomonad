@@ -350,6 +350,21 @@
     {
       "operation": "emit_controller_event",
       "arguments": {
+        "event_type": "tl.wait_reason_changed",
+        "payload": {
+          "reason": "await_publication",
+          "run_id": "replay-clean",
+          "state_version": 0,
+          "target_id": "replay-clean"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
         "event_type": "tl.slice_status_changed",
         "payload": {
           "from_status": "dispatch_unconfirmed",

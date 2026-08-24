@@ -153,7 +153,14 @@
     {"type": "event.superseded", "payload_class": "pointer_only", "producers": ["rust", "sqlite"]},
     {"type": "ledger.segment.dropped", "payload_class": "aggregate_dimensions", "producers": ["rust"]},
     {"type": "sink.health", "payload_class": "aggregate_dimensions", "producers": ["rust", "sqlite"]},
-    {"type": "custom", "payload_class": "local_sensitive", "producers": ["custom", "haskell"]}
+    {"type": "custom", "payload_class": "local_sensitive", "producers": ["custom", "haskell"]},
+    {"type": "tl.action_queued", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.action_started", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.action_unknown", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.action_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.wait_reason_changed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.transition_applied", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.transition_invariant_failed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]}
   ],
   "dynamic_event_rule": {
     "allowed_namespace": "custom.",

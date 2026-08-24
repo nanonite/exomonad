@@ -406,6 +406,21 @@
     {
       "operation": "emit_controller_event",
       "arguments": {
+        "event_type": "tl.wait_reason_changed",
+        "payload": {
+          "reason": "await_publication",
+          "run_id": "replay-repair",
+          "state_version": 0,
+          "target_id": "replay-repair"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
         "event_type": "tl.slice_status_changed",
         "payload": {
           "from_status": "dispatch_unconfirmed",
@@ -428,6 +443,22 @@
           "intent_id": "<intent-id>",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
+        "event_type": "tl.wait_reason_changed",
+        "payload": {
+          "previous_reason": "await_publication",
+          "reason": "await_handoff",
+          "run_id": "replay-repair",
+          "state_version": 0,
+          "target_id": "replay-repair"
         },
         "force": false,
         "include_dead": false,

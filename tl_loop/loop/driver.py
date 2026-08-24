@@ -51,6 +51,10 @@ from tl_loop.fsm.phase import (
 )
 from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
 from tl_loop.fsm.transition import IllegalTransition, transition
+from tl_loop.loop.convergence import (
+    ConvergenceInvariantError,
+    ConvergenceTracker,
+)
 from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
 from tl_loop.loop.observability import emit_controller_event
@@ -108,7 +112,7 @@ from tl_loop.state.serialization import DurableWriteError
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .journal import MUTATING_OPERATIONS, EffectJournal
-from .reconcile import ReconciliationResult, reconcile_slice
+from .reconcile import Quiescent, ReconciliationResult, reconcile_slice
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
@@ -869,6 +873,7 @@ def _run_loop(
     )
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
+    convergence = ConvergenceTracker()
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
     diagnostics = EventDiagnostics(
         task_started_at={
@@ -913,6 +918,19 @@ def _run_loop(
     while not config.test_harness or len(consumed) < config.max_events:
         if isinstance(phase, (TLDone, TLFailed)):
             break
+        if (
+            isinstance(convergence.last_decision, Quiescent)
+            and not config.keep_alive_on_waiting
+            and not _source_has_pending(source)
+        ):
+            return TLRunResult(
+                state,
+                tuple(effects_log),
+                tuple(transitions),
+                tuple(consumed),
+                tuple(heartbeat_events),
+                diagnostics.snapshot(),
+            )
         if config.cancel_event is not None and config.cancel_event.is_set():
             raise LoopCancelled(f"TL controller {run_id!r} was cancelled")
         _record_reader_findings(source, diagnostics)
@@ -1030,6 +1048,7 @@ def _run_loop(
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
+            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
             if isinstance(phase, (TLDone, TLFailed)):
@@ -1043,6 +1062,7 @@ def _run_loop(
             if plan.sub_tls:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
+            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
             if isinstance(phase, (TLDone, TLFailed)):
@@ -1106,6 +1126,7 @@ def _run_loop(
                 effects,
                 effects_log,
             )
+            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
             diagnostics.correlated += 1
@@ -1136,6 +1157,7 @@ def _run_loop(
                 effects,
             )
             phase = _phase_from_state(state)
+            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
             diagnostics.correlated += 1
@@ -1206,6 +1228,7 @@ def _run_loop(
         phase = next_phase
         if config.policy is not None and config.max_parallel_slices is not None:
             state = _dispatch_children(plan, state, config, effects, effects_log, store)
+        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
         if isinstance(phase, (TLDone, TLFailed)):
             break
     else:
@@ -1236,6 +1259,172 @@ def _run_loop(
         tuple(heartbeat_events),
         diagnostics.snapshot(),
     )
+
+
+def _apply_convergence(
+    state: RunState,
+    tracker: ConvergenceTracker,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Run one post-reduction convergence step for every event branch."""
+    try:
+        result = tracker.reduce(state)
+    except ConvergenceInvariantError as error:
+        for event in error.events:
+            _record_convergence_event(error.key, event, config, effects, effects_log)
+        raise TLLoopError(str(error)) from error
+    if isinstance(result.state, RunState) and result.state.state_version > state.state_version:
+        state = store.set_state_version(result.state.state_version)
+    for event in result.events:
+        _record_convergence_event(_event_target(event.payload), event, config, effects, effects_log)
+    return state
+
+
+def _record_convergence_event(
+    target: str,
+    event: object,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Emit a statically declared convergence event for contract checking."""
+    event_type = getattr(event, "event_type", None)
+    payload = getattr(event, "payload", None)
+    if not isinstance(payload, Mapping):
+        raise TLLoopError("convergence event payload must be an object")
+    if event_type == "tl.action_queued":
+        _record_controller_event(
+            target,
+            "tl.action_queued",
+            {
+                "run_id": payload.get("run_id"),
+                "target_id": payload.get("target_id"),
+                "state_version": payload.get("state_version"),
+                "action": payload.get("action"),
+                "action_key": payload.get("action_key"),
+                "arguments": payload.get("arguments"),
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    elif event_type == "tl.action_started":
+        _record_controller_event(
+            target,
+            "tl.action_started",
+            {
+                "run_id": payload.get("run_id"),
+                "target_id": payload.get("target_id"),
+                "state_version": payload.get("state_version"),
+                "action": payload.get("action"),
+                "action_key": payload.get("action_key"),
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    elif event_type == "tl.action_unknown":
+        _record_controller_event(
+            target,
+            "tl.action_unknown",
+            {
+                "run_id": payload.get("run_id"),
+                "target_id": payload.get("target_id"),
+                "state_version": payload.get("state_version"),
+                "action": payload.get("action"),
+                "action_key": payload.get("action_key"),
+                "outcome": payload.get("outcome"),
+                "error": payload.get("error"),
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    elif event_type == "tl.action_reconciled":
+        _record_controller_event(
+            target,
+            "tl.action_reconciled",
+            {
+                "run_id": payload.get("run_id"),
+                "target_id": payload.get("target_id"),
+                "state_version": payload.get("state_version"),
+                "action": payload.get("action"),
+                "action_key": payload.get("action_key"),
+                "outcome": payload.get("outcome"),
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    elif event_type == "tl.wait_reason_changed":
+        _record_controller_event(
+            target,
+            "tl.wait_reason_changed",
+            {
+                "run_id": payload.get("run_id"),
+                "target_id": payload.get("target_id"),
+                "state_version": payload.get("state_version"),
+                "reason": payload.get("reason"),
+                "previous_reason": payload.get("previous_reason"),
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    elif event_type == "tl.transition_applied":
+        _record_controller_event(
+            target,
+            "tl.transition_applied",
+            {
+                "run_id": payload.get("run_id"),
+                "target_id": payload.get("target_id"),
+                "state_version": payload.get("state_version"),
+                "transition": payload.get("transition"),
+                "reason": payload.get("reason"),
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    elif event_type == "tl.transition_invariant_failed":
+        _record_controller_event(
+            target,
+            "tl.transition_invariant_failed",
+            {
+                "run_id": payload.get("run_id"),
+                "target_id": payload.get("target_id"),
+                "state_version": payload.get("state_version"),
+                "invariant": payload.get("invariant"),
+                "action_key": payload.get("action_key"),
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    else:
+        raise TLLoopError(f"unknown convergence event {event_type!r}")
+
+
+def _event_target(payload: Mapping[str, object]) -> str:
+    target = payload.get("target_id", payload.get("run_id", "controller"))
+    return target if isinstance(target, str) and target else "controller"
+
+
+def _source_has_pending(source: EventQueue) -> bool:
+    """Inspect only explicit in-memory source queues before honoring WAIT."""
+    events = getattr(source, "events", None)
+    if isinstance(events, (list, tuple, set, frozenset)):
+        return bool(events)
+    pending = getattr(source, "queue", None)
+    if pending is not None:
+        try:
+            return not pending.empty()
+        except (AttributeError, TypeError):
+            return True
+    return True
 
 
 def _record_reader_findings(source: EventQueue, diagnostics: EventDiagnostics) -> None:
@@ -4578,6 +4767,16 @@ def _route_review_event(
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     updated = dict(state.slices)
+    authorized_exact_verdict = (
+        result.verdict in {Verdict.GO, Verdict.GO_WITH_NITS}
+        and _reviewer_identity_authorized(event, current)
+        and result.reviewed_head == head_sha
+    )
+    next_stall_classification = (
+        None
+        if authorized_exact_verdict and current.stall_classification == "reviewer_not_responding"
+        else stall_classification or current.stall_classification
+    )
     updated[slice_id] = replace(
         current,
         pr_number=event.pr_number or current.pr_number,
@@ -4587,7 +4786,7 @@ def _route_review_event(
         review_findings=review_findings,
         review_patch_digests=patch_digests,
         ci_state={} if current.reviewed_head != result.reviewed_head else current.ci_state,
-        stall_classification=stall_classification or current.stall_classification,
+        stall_classification=next_stall_classification,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     if _is_aggregate_slice(updated[slice_id]):

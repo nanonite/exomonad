@@ -285,6 +285,27 @@
     },
     "agent.recovery.outcome": {
       "fields": ["slice_id", "invocation_id", "generation", "cause", "slice_attempt", "invocation_generation", "recovery_round", "authorization_source", "outcome", "recursive_depth", "parallel_impact", "policy_decision", "execution_seconds", "recovery_wait_seconds", "human_wait_seconds", "review_seconds", "declared_difficulty", "matched_difficulty_rule"]
+    },
+    "tl.action_queued": {
+      "fields": ["run_id", "target_id", "state_version", "action", "action_key", "arguments"]
+    },
+    "tl.action_started": {
+      "fields": ["run_id", "target_id", "state_version", "action", "action_key"]
+    },
+    "tl.action_unknown": {
+      "fields": ["run_id", "target_id", "state_version", "action", "action_key", "outcome", "error"]
+    },
+    "tl.action_reconciled": {
+      "fields": ["run_id", "target_id", "state_version", "action", "action_key", "outcome"]
+    },
+    "tl.wait_reason_changed": {
+      "fields": ["run_id", "target_id", "state_version", "reason", "previous_reason"]
+    },
+    "tl.transition_applied": {
+      "fields": ["run_id", "target_id", "state_version", "transition", "reason"]
+    },
+    "tl.transition_invariant_failed": {
+      "fields": ["run_id", "target_id", "state_version", "invariant", "action_key"]
     }
   }
 }

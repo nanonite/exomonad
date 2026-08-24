@@ -363,6 +363,21 @@ class RunStore:
         """Return local replay state without contacting the runtime."""
         return resume(self.run_id, root_dir=self.root_dir)
 
+    def set_state_version(self, state_version: int) -> RunState:
+        """Persist a convergence transition version monotonically."""
+        if type(state_version) is not int or state_version < 0:
+            raise ValueError("state_version must be a non-negative integer")
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            current = document.get("state_version", 0)
+            if type(current) is not int or state_version < current:
+                raise ValueError("state_version must not regress")
+            document["state_version"] = state_version
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
     def set_goals(self, goals: GoalState) -> RunState:
         """Persist goal and heartbeat metadata through the atomic writer."""
         encoded = _encode_goals(goals)
