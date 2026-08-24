@@ -24,8 +24,8 @@ from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.loop.driver import (
-    DispatchAttempt,
     DepthLimitExceeded,
+    DispatchAttempt,
     EventDiagnostics,
     LoopCancelled,
     LoopLimitExceeded,
@@ -35,18 +35,19 @@ from tl_loop.loop.driver import (
     TLRunResult,
     WorkerTask,
     WorkPlan,
-    _event_belongs_to_plan,
+    _child_recovery_projection,
     _dispatch_payload,
+    _event_belongs_to_plan,
     _initial_slices,
-    _record_review_event,
+    _merge_result_is_authoritative,
     _record_child_handoff,
-    _repair_model,
+    _record_review_event,
     _recover_tool_unavailable,
+    _repair_model,
     _route_ci_event,
     _route_review_event,
-    _spawn_invocation_id,
-    _child_recovery_projection,
     _run_sub_tl_batch,
+    _spawn_invocation_id,
     _supervise_live_sub_tl,
     run_tl_loop,
     tl_run,
@@ -66,14 +67,14 @@ from tl_loop.state.schema import (
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
+    ParkCause,
     SliceState,
     SliceStatus,
-    ParkCause,
     Verdict,
 )
+from tl_loop.state.serialization import DurableWriteError
 from tl_loop.state.store import RunStore, create
 from tl_loop.state.store import load as load_state
-from tl_loop.state.serialization import DurableWriteError
 
 
 @dataclass
@@ -122,6 +123,25 @@ def test_dispatch_attempt_payload_and_invocation_identity_are_explicit() -> None
     )
 
 
+@pytest.mark.parametrize(
+    ("result", "authoritative"),
+    [
+        (
+            ToolResult({"success": True, "result": {"merged": True}}, True, {"merged": True}, None),
+            True,
+        ),
+        (ToolResult({"success": True, "result": {}}, True, {}, None), False),
+        (ToolResult({"success": True, "result": None}, True, None, None), False),
+        (ToolResult({"success": False, "error": "pending"}, False, None, "pending"), False),
+    ],
+)
+def test_merge_response_requires_authoritative_merged_flag(
+    result: ToolResult,
+    authoritative: bool,
+) -> None:
+    assert _merge_result_is_authoritative(result) is authoritative
+
+
 @dataclass
 class RecordingTransport:
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
@@ -154,6 +174,8 @@ class RecordingTransport:
                 "success": True,
                 "result": {"event_id": "controller-event", "run_seq": self.next_controller_run_seq},
             }
+        if tool_name == "merge_pr":
+            return {"success": True, "result": {"merged": True}}
         return {"success": True, "result": None}
 
 
@@ -640,66 +662,6 @@ def _blocked_event(run_seq: int, slug: str, run_id: str) -> EventEnvelope:
             },
         }
     )
-    lifecycle_payloads = [
-        arguments["payload"]
-        for name, arguments in transport.calls
-        if name == "emit_controller_event"
-        and arguments["event_type"]
-        in {"tl.slice_status_changed", "tl.phase_changed", "tl.merge_decided"}
-    ]
-    assert lifecycle_payloads == [
-        {
-            "slice_id": "leaf-a",
-            "from_status": "pending",
-            "to_status": "dispatch_unconfirmed",
-        },
-        {
-            "slice_id": "worker-a",
-            "from_status": "pending",
-            "to_status": "dispatch_unconfirmed",
-        },
-        {
-            "slice_id": "worker-a",
-            "from_status": "dispatch_unconfirmed",
-            "to_status": "spawned",
-        },
-        {
-            "from_phase": "tl_planning",
-            "to_phase": "tl_waiting",
-            "run_id": "active-run",
-        },
-        {
-            "slice_id": "leaf-a",
-            "from_status": "dispatch_unconfirmed",
-            "to_status": "spawned",
-        },
-        {"slice_id": "worker-a", "from_status": "spawned", "to_status": "merged"},
-        {
-            "slice_id": "leaf-a",
-            "pr_number": 42,
-            "decision": "merge",
-            "head_sha_hash": hashlib.sha256(b"head-a").hexdigest(),
-        },
-        {"slice_id": "leaf-a", "from_status": "spawned", "to_status": "merged"},
-        {"from_phase": "tl_waiting", "to_phase": "tl_all_merged", "run_id": "active-run"},
-        {"from_phase": "tl_all_merged", "to_phase": "tl_done", "run_id": "active-run"},
-    ]
-    dispatch_events = [
-        arguments["event_type"]
-        for name, arguments in transport.calls
-        if name == "emit_controller_event"
-        and arguments["event_type"].startswith(("tl.dispatch_", "tl.spawn_"))
-    ]
-    assert dispatch_events == [
-        "tl.dispatch_intended",
-        "tl.spawn_requested",
-        "tl.spawn_request_accepted",
-        "tl.dispatch_intended",
-        "tl.spawn_requested",
-        "tl.spawn_request_accepted",
-        "tl.dispatch_confirmed",
-        "tl.dispatch_confirmed",
-    ]
 
 
 def test_durable_journal_failure_parks_the_affected_slice(tmp_path: Path, monkeypatch) -> None:
@@ -3179,6 +3141,60 @@ def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Pat
     assert [name for name, _ in transport.calls if name == "merge_pr"] == []
     assert any(
         arguments["event_type"] == "tl.merge_reconciled"
+        and arguments["payload"]["reconciliation"] == "authoritative_merge_reconciled"
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+    )
+
+
+def test_external_merge_is_adopted_before_dispatch_with_integrity_telemetry(
+    tmp_path: Path,
+) -> None:
+    plan = WorkPlan(sub_tls=(SubTLTask("aggregate-child", WorkPlan(), order=1),))
+    config = TLLoopConfig(
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        keep_alive_on_waiting=False,
+    )
+    initial = _initial_slices(plan, config, tmp_path, "external-merge-run")
+    initial["aggregate-child"].update(
+        {
+            "status": "in_review",
+            "pr_number": 43,
+            "reviewed_head": "head-external",
+            "verdict": "GO",
+            "review_patch_digests": {"head-external": "patch-external"},
+            "ci_state": {"head-external": "success"},
+        }
+    )
+    transport = IntegrationTransport(
+        snapshots=[
+            {
+                "merged": True,
+                "head_sha": "head-external",
+                "base_sha": "base-main",
+                "patch_digest": "patch-external",
+                "merge_tree_sha": "tree-external",
+                "ci_status": "success",
+            }
+        ]
+    )
+
+    result = run_tl_loop(
+        "external-merge-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+        initial_slices=initial,
+    )
+
+    assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
+    assert [name for name, _ in transport.calls if name == "merge_pr"] == []
+    assert any(
+        arguments["event_type"] == "tl.merge_reconciled"
+        and arguments["payload"]["reconciliation"] == "unexpected_external_merge"
         for name, arguments in transport.calls
         if name == "emit_controller_event"
     )

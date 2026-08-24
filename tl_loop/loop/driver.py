@@ -95,6 +95,9 @@ from tl_loop.select.model import ModelCatalog, select_model, select_model_for_di
 from tl_loop.select.policy import HarnessPolicy, load_policy
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
+    ActionKind,
+    ActionPhase,
+    ActionState,
     BudgetLedger,
     GateStatus,
     GoalState,
@@ -111,7 +114,7 @@ from tl_loop.state.schema import (
 from tl_loop.state.serialization import DurableWriteError
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
-from .journal import MUTATING_OPERATIONS, EffectJournal
+from .journal import MUTATING_OPERATIONS, EffectJournal, stable_action_key
 from .reconcile import Quiescent, ReconciliationResult, reconcile_slice
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
@@ -1731,7 +1734,7 @@ def _reconcile_dispatches(
             current.dispatch_intent_id,
             current.dispatch_started_at,
             current.agent_type or "",
-            attempt=current.attempts,
+            attempt=max(1, current.attempts),
         )
         _record_controller_event(
             current.id,
@@ -3207,6 +3210,16 @@ def _integrate_stage_candidates(
     return state
 
 
+def _merge_result_is_authoritative(result: ToolResult | None) -> bool:
+    """Accept a merge response as terminal only with an explicit merged flag."""
+    return (
+        result is not None
+        and result.success is True
+        and isinstance(result.result, Mapping)
+        and result.result.get("merged") is True
+    )
+
+
 def _merge_failure_classification(result: ToolResult | None) -> str | None:
     if result is None or result.success is not False:
         return None
@@ -3276,6 +3289,7 @@ def _open_integration_gate(
         status=SliceStatus.IN_REVIEW,
         dispatch_last_boundary="integration_gate",
         dispatch_error=reason[:500],
+        action=None,
     )
     previous = next((gate for gate in state.gates if gate.name == gate_name), None)
     candidate_runtime = replace(
@@ -3378,6 +3392,7 @@ def _handle_external_base_change(
             current,
             dispatch_last_boundary="base_revalidation",
             dispatch_error=reason[:500],
+            action=None,
         ),
     )
 
@@ -3430,6 +3445,7 @@ def _handle_integration_revalidation(
             current,
             dispatch_last_boundary="integration_revalidation",
             dispatch_error=reason[:500],
+            action=None,
         ),
     )
 
@@ -3482,6 +3498,7 @@ def _handle_integration_conflict(
         ci_state={},
         dispatch_last_boundary="integration_conflict",
         dispatch_error=reason[:500],
+        action=None,
     )
     state = store.checkpoint(
         _phase_from_state(state),
@@ -3584,15 +3601,54 @@ def _integrate_one_candidate(
                     "slice_id": task.name,
                     "pr_number": current.pr_number,
                     "head_sha": candidate_runtime.head_sha,
+                    "reconciliation": "authoritative_merge_reconciled",
                 },
                 config,
                 effects,
                 effects_log,
             )
             return _checkpoint_aggregate_merged(task, state, store, candidate_runtime)
+        # A successful merge response is not terminal. Keep the action in
+        # flight and wait for an authoritative merged observation instead of
+        # issuing a second request while the remote operation settles.
+        return state
     first = first or _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if first is None:
         return state
+    if _snapshot_bool(first, "merged"):
+        merged_head = _snapshot_text(first, "head_sha") or candidate_runtime.head_sha
+        merged_patch = (
+            _snapshot_text(first, "patch_digest")
+            or candidate_runtime.patch_digest
+            or current.review_patch_digests.get(merged_head or "")
+        )
+        merged_base = _snapshot_text(first, "base_sha") or candidate_runtime.validated_base_sha
+        reconciled = replace(
+            candidate_runtime,
+            lifecycle=IntegrationLifecycle.MERGED,
+            head_sha=merged_head,
+            patch_digest=merged_patch,
+            validated_base_sha=merged_base,
+            merge_tree_sha=(
+                _snapshot_text(first, "merge_tree_sha") or candidate_runtime.merge_tree_sha
+            ),
+            ci_status=_snapshot_text(first, "ci_status") or candidate_runtime.ci_status,
+            stage_verification=candidate_runtime.stage_verification or "passed",
+        )
+        _record_controller_event(
+            task.name,
+            "tl.merge_reconciled",
+            {
+                "slice_id": task.name,
+                "pr_number": current.pr_number,
+                "head_sha": merged_head,
+                "reconciliation": "unexpected_external_merge",
+            },
+            config,
+            effects,
+            effects_log,
+        )
+        return _checkpoint_aggregate_merged(task, state, store, reconciled)
     head_sha = _snapshot_text(first, "head_sha")
     base_sha = _snapshot_text(first, "base_sha")
     patch_digest = _snapshot_text(first, "patch_digest") or current.review_patch_digests.get(
@@ -3715,9 +3771,26 @@ def _integrate_one_candidate(
         effects,
         effects_log,
     )
+    merge_arguments = {
+        "pr_number": current.pr_number,
+        "strategy": config.merge_strategy or task.integration.merge_strategy,
+        "working_dir": config.working_dir,
+        "base_sha": base_sha,
+    }
+    merge_intent_id = stable_action_key(state.run_id, "merge_pr", task.name, merge_arguments)
+    merge_slice = replace(
+        current,
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.IN_FLIGHT,
+            intent_id=merge_intent_id,
+            head_sha=head_sha,
+            attempt=max(1, current.attempts),
+        ),
+    )
     state = store.checkpoint(
         _phase_from_state(state),
-        state.slices,
+        {**state.slices, task.name: merge_slice},
         state.budgets,
         state.events.last_consumed_offset,
         current_order=state.current_order,
@@ -3737,16 +3810,10 @@ def _integrate_one_candidate(
         effects,
         effects_log,
     )
-    arguments = {
-        "pr_number": current.pr_number,
-        "strategy": config.merge_strategy or task.integration.merge_strategy,
-        "working_dir": config.working_dir,
-        "base_sha": base_sha,
-    }
     merge_result = _invoke(
         "merge_pr",
         task.name,
-        arguments,
+        merge_arguments,
         config.active,
         cast(EffectClient, effects),
         lambda client: client.merge_pr(
@@ -3762,6 +3829,8 @@ def _integrate_one_candidate(
         raise_on_failure=False,
     )
     failure = _merge_failure_classification(merge_result)
+    if _merge_result_is_authoritative(merge_result):
+        return _checkpoint_aggregate_merged(task, state, store, integration)
     if failure == "conflict":
         return _handle_integration_conflict(
             task,
@@ -3789,7 +3858,7 @@ def _integrate_one_candidate(
         )
     if failure is not None:
         raise EffectFailed(f"merge_pr for {task.name!r}: {_merge_failure_reason(merge_result)}")
-    return _checkpoint_aggregate_merged(task, state, store, integration)
+    return state
 
 
 def _checkpoint_aggregate_merged(
@@ -3805,6 +3874,7 @@ def _checkpoint_aggregate_merged(
         current,
         status=SliceStatus.MERGED,
         dispatch_last_boundary="aggregate_merged",
+        action=None,
     )
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[task.name] = IntegrationLifecycle.MERGED

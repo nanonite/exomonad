@@ -201,7 +201,7 @@
       ]
     },
     "tl.merge_reconciled": {
-      "fields": ["slice_id", "pr_number", "head_sha"]
+      "fields": ["slice_id", "pr_number", "head_sha", "reconciliation"]
     },
     "agent.task_budget_exceeded": {
       "fields": [
