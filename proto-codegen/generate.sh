@@ -101,6 +101,19 @@ if [ -d "$OUTPUT_ROOT/Exomonad" ]; then
     fi
 fi
 
+# proto3-suite can place effect modules below the core namespace when the
+# output tree already contains generated core modules.  The package and the
+# tracked tree expose these modules as Effects.*, so normalize that path after
+# every generation instead of letting a seeded output tree drift.
+if [ -d "$OUTPUT_ROOT/ExoMonad/Effects" ]; then
+    mkdir -p "$OUTPUT_ROOT/Effects"
+    for f in "$OUTPUT_ROOT"/ExoMonad/Effects/*.hs; do
+        [[ -f "$f" ]] || continue
+        mv "$f" "$OUTPUT_ROOT/Effects/$(basename "$f")"
+    done
+    rmdir "$OUTPUT_ROOT/ExoMonad/Effects" 2>/dev/null || true
+fi
+
 echo ">>> Formatting generated Haskell with Ormolu..."
 mapfile -t generated_haskell < <(find "$OUTPUT_ROOT" -name '*.hs' -print)
 if ((${#generated_haskell[@]} > 0)); then
