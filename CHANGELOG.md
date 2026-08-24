@@ -393,6 +393,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Document non-atomic merge comparison boundary (#985)
 - Fix proto generation reproducibility in pre-commit (#968)
 - Epic: slice/attempt/PR ownership - abandon an attempt and re-dispatch planned work (#935)
 - Real-server E2E proving the abandon and re-dispatch acceptance scenario (#943)
