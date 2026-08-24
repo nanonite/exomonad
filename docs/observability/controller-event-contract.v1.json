@@ -56,7 +56,9 @@
         "error",
         "harness",
         "agent_type",
-        "model"
+        "model",
+        "controller_epoch",
+        "dispatch_generation"
       ]
     },
     "tl.spawn_requested": {
@@ -69,7 +71,9 @@
         "error",
         "harness",
         "agent_type",
-        "model"
+        "model",
+        "controller_epoch",
+        "dispatch_generation"
       ]
     },
     "tl.spawn_request_accepted": {
@@ -82,7 +86,9 @@
         "error",
         "harness",
         "agent_type",
-        "model"
+        "model",
+        "controller_epoch",
+        "dispatch_generation"
       ]
     },
     "tl.spawn_request_failed": {
@@ -95,7 +101,9 @@
         "error",
         "harness",
         "agent_type",
-        "model"
+        "model",
+        "controller_epoch",
+        "dispatch_generation"
       ]
     },
     "tl.dispatch_confirmed": {
@@ -108,7 +116,9 @@
         "error",
         "harness",
         "agent_type",
-        "model"
+        "model",
+        "controller_epoch",
+        "dispatch_generation"
       ]
     },
     "tl.dispatch_reconciliation_started": {
@@ -121,7 +131,9 @@
         "error",
         "harness",
         "agent_type",
-        "model"
+        "model",
+        "controller_epoch",
+        "dispatch_generation"
       ]
     },
     "tl.dispatch_reconciliation_completed": {
@@ -134,7 +146,21 @@
         "error",
         "harness",
         "agent_type",
-        "model"
+        "model",
+        "controller_epoch",
+        "dispatch_generation"
+      ]
+    },
+    "tl.dispatch_event_rejected": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "attempt",
+        "controller_epoch",
+        "dispatch_generation",
+        "classification",
+        "reason",
+        "event_run_seq"
       ]
     },
     "tl.stage_started": {

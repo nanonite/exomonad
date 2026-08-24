@@ -115,6 +115,7 @@
     {"type": "tl.dispatch_confirmed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.dispatch_reconciliation_started", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.dispatch_reconciliation_completed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.dispatch_event_rejected", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.stage_started", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.stage_completed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.aggregate_pr_opened", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},

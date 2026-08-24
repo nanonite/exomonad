@@ -332,6 +332,7 @@ RUN_KEYS = frozenset(
         "integration",
         "repository_identity",
         "state_version",
+        "controller_epoch",
     }
 )
 ORDERED_STAGE_KEYS = frozenset({"order", "sub_tls"})
@@ -428,6 +429,7 @@ SLICE_KEYS = frozenset(
         "dispatch_agent_id",
         "dispatch_invocation_id",
         "dispatch_authoritative_event_seq",
+        "dispatch_generation",
         "reconciliation",
         "task_timeout_seconds",
         "task_timeout_source",
@@ -602,6 +604,7 @@ class SliceState:
     dispatch_agent_id: str | None = None
     dispatch_invocation_id: str | None = None
     dispatch_authoritative_event_seq: int | None = None
+    dispatch_generation: int = 0
     reconciliation: Mapping[str, object] | None = None
     task_timeout_seconds: float | None = None
     task_timeout_source: str | None = None
@@ -768,6 +771,7 @@ class RunState:
     integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
     repository_identity: RepositoryIdentity | None = None
     state_version: int = 0
+    controller_epoch: str | None = None
 
 
 class SchemaError(ValueError):
@@ -801,6 +805,7 @@ def validate(doc: object) -> None:
     if "depth" in root:
         _non_negative_int(root, "depth", "run", errors)
     _nullable_non_negative_int(root, "state_version", "run", errors)
+    _nullable_string(root, "controller_epoch", "run", errors)
     _validate_repository_identity(root.get("repository_identity"), "run", errors)
 
     fsm = _object(root.get("fsm"), "run.fsm", FSM_KEYS, errors)
@@ -1058,6 +1063,8 @@ def _validate_slice(
     _nullable_string(value, "dispatch_error", path, errors)
     _nullable_string(value, "dispatch_agent_id", path, errors)
     _nullable_non_negative_int(value, "dispatch_authoritative_event_seq", path, errors)
+    if "dispatch_generation" in value:
+        _non_negative_int(value, "dispatch_generation", path, errors)
     _reconciliation(value.get("reconciliation"), path, errors)
     _nullable_number(value, "task_timeout_seconds", path, errors)
     _nullable_string(value, "task_timeout_source", path, errors)

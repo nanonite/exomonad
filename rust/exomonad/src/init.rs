@@ -1448,6 +1448,19 @@ fn clear_controller_exit_reason(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_recreate_controller_epoch(project_dir: &Path) -> Result<()> {
+    let marker = project_dir.join(".exo/tl-loop/root.controller-epoch");
+    let epoch = format!("recreate-{}-{}", current_time_millis(), std::process::id());
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&marker, format!("{epoch}\n"))
+        .with_context(|| format!("failed to write {}", marker.display()))?;
+    info!(path = %marker.display(), "Wrote new controller epoch for --recreate");
+    Ok(())
+}
+
 fn archive_root_tl_run(project_dir: &Path) -> Result<Option<PathBuf>> {
     archive_root_tl_run_at(project_dir, current_time_millis())
 }
@@ -2092,6 +2105,7 @@ pub async fn run(
         }
 
         archive_root_tl_run(&cwd)?;
+        write_recreate_controller_epoch(&cwd)?;
         clear_controller_exit_reason(&cwd)?;
     }
 

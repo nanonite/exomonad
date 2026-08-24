@@ -216,6 +216,18 @@ class RunStore:
         apply(self.run_dir, mutate)
         return self.load()
 
+    def set_controller_epoch(self, epoch: str) -> RunState:
+        """Persist the controller lifecycle identity without touching the plan."""
+        if not isinstance(epoch, str) or not epoch:
+            raise ValueError("controller epoch must be a non-empty string")
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            document["controller_epoch"] = epoch
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
     def load(self) -> RunState:
         """Load and verify this run's checkpoint."""
         return load(self.path)
@@ -578,6 +590,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "integration",
         "repository_identity",
         "state_version",
+        "controller_epoch",
     }
     unknown = sorted(set(root_spec) - allowed)
     if unknown:
@@ -729,6 +742,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["dispatch_invocation_id"] = value.dispatch_invocation_id
         if value.dispatch_authoritative_event_seq is not None:
             record["dispatch_authoritative_event_seq"] = value.dispatch_authoritative_event_seq
+        if value.dispatch_generation:
+            record["dispatch_generation"] = value.dispatch_generation
         if value.reconciliation is not None:
             record["reconciliation"] = copy.deepcopy(dict(value.reconciliation))
         if value.task_timeout_seconds is not None:
@@ -984,6 +999,7 @@ def _decode(document: dict[str, object]) -> RunState:
         integration=_decode_integration(document.get("integration")),
         repository_identity=_decode_repository_identity(document.get("repository_identity")),
         state_version=cast(int, document.get("state_version", 0)),
+        controller_epoch=cast(str | None, document.get("controller_epoch")),
     )
 
 
@@ -1247,6 +1263,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         dispatch_authoritative_event_seq=cast(
             int | None, value.get("dispatch_authoritative_event_seq")
         ),
+        dispatch_generation=cast(int, value.get("dispatch_generation", 0)),
         reconciliation=(
             MappingProxyType(copy.deepcopy(cast(dict[str, object], value["reconciliation"])))
             if isinstance(value.get("reconciliation"), dict)

@@ -36,6 +36,10 @@ from tl_loop.loop.driver import (
     WorkerTask,
     WorkPlan,
     _child_recovery_projection,
+    DISPATCH_CORRELATED,
+    DISPATCH_HISTORICAL_AUDIT,
+    DISPATCH_INTEGRITY_CONFLICT,
+    correlate_dispatch_event,
     _dispatch_payload,
     _event_belongs_to_plan,
     _initial_slices,
@@ -121,6 +125,55 @@ def test_dispatch_attempt_payload_and_invocation_identity_are_explicit() -> None
         _spawn_invocation_id(SimpleNamespace(result={"invocation": {"invocation_id": "inv-3"}}))
         == "inv-3"
     )
+
+
+def test_dispatch_correlation_rejects_historical_epoch_and_stale_generation(
+    tmp_path: Path,
+) -> None:
+    run_id = "dispatch-correlation-run"
+    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "task"}]})
+    create(
+        run_id,
+        {
+            "controller_epoch": "epoch-new",
+            "slices": _initial_slices(plan, TLLoopConfig(), tmp_path, run_id),
+        },
+        root_dir=tmp_path,
+    )
+    state = RunStore(run_id, tmp_path).load()
+    current = replace(
+        state.slices["leaf-a"],
+        status=SliceStatus.DISPATCHING,
+        attempts=1,
+        dispatch_intent_id=_dispatch_intent(run_id, "leaf-a"),
+        dispatch_generation=2,
+    )
+    state = replace(state, slices={"leaf-a": current})
+    base = _canonical_event(
+        1,
+        "agent.spawned",
+        "leaf-a",
+        run_id,
+        intent_id=current.dispatch_intent_id,
+    )
+
+    historical = replace(
+        base,
+        data={**base.data, "controller_epoch": "epoch-old", "dispatch_generation": 2},
+    )
+    assert correlate_dispatch_event(state, historical).classification == DISPATCH_HISTORICAL_AUDIT
+
+    stale = replace(
+        base,
+        data={**base.data, "controller_epoch": "epoch-new", "dispatch_generation": 1},
+    )
+    assert correlate_dispatch_event(state, stale).classification == DISPATCH_INTEGRITY_CONFLICT
+
+    current_event = replace(
+        base,
+        data={**base.data, "controller_epoch": "epoch-new", "dispatch_generation": 2},
+    )
+    assert correlate_dispatch_event(state, current_event).classification == DISPATCH_CORRELATED
 
 
 @pytest.mark.parametrize(

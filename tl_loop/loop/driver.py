@@ -275,6 +275,22 @@ class DispatchAttempt:
     agent_type: str = ""
     model: str | None = None
     attempt: int = 0
+    controller_epoch: str | None = None
+    dispatch_generation: int = 0
+
+
+@dataclass(frozen=True)
+class DispatchCorrelation:
+    """Classify a spawn observation without inferring ownership from history."""
+
+    classification: str
+    slice_id: str | None = None
+    reason: str | None = None
+
+
+DISPATCH_CORRELATED = "correlated"
+DISPATCH_HISTORICAL_AUDIT = "historical_audit"
+DISPATCH_INTEGRITY_CONFLICT = "integrity_conflict"
 
 
 @dataclass
@@ -662,6 +678,7 @@ def run_tl_loop(
     if len(work_plan.leaves) > selected.max_leaves:
         raise LoopLimitExceeded("work plan exceeds max_leaves")
     initial_slices = initial_slices or _initial_slices(work_plan, selected, root_dir, run_id)
+    epoch_enabled = selected.active and selected.review_clock is None
 
     store = RunStore(run_id, Path(root_dir))
     if not store.path.exists():
@@ -688,8 +705,12 @@ def run_tl_loop(
             root_state["budgets"] = _budget_root(budgets)
         if selected.ledger_run_id is not None:
             root_state["ledger_run_id"] = selected.ledger_run_id
+        if epoch_enabled:
+            root_state["controller_epoch"] = _controller_epoch(store.root_dir, run_id)
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
+    if state.controller_epoch is None and epoch_enabled:
+        state = store.set_controller_epoch(_controller_epoch(store.root_dir, run_id))
     if (
         state.ledger_run_id
         and selected.ledger_run_id
@@ -1079,13 +1100,25 @@ def _run_loop(
         # Rust's direct agent.spawned records carry the canonical branch and
         # child identity; shadowed replay records use the normal decoder path.
         if event.kind is EventKind.AGENT_SPAWNED:
-            if not _dispatch_confirmation_matches(state.slices, event):
+            correlation = correlate_dispatch_event(state, event)
+            if correlation.classification != DISPATCH_CORRELATED:
                 diagnostics.filtered += 1
                 diagnostics.rejected += 1
                 LOGGER.warning(
-                    "Ignoring uncorrelated agent.spawned event run_id=%s event_seq=%s",
+                    "Ignoring %s agent.spawned event run_id=%s event_seq=%s reason=%s",
+                    correlation.classification,
                     run_id,
                     event_seq,
+                    correlation.reason,
+                )
+                _record_dispatch_correlation_failure(
+                    store,
+                    state,
+                    event,
+                    correlation,
+                    config,
+                    effects,
+                    effects_log,
                 )
                 _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
                 if not replaying:
@@ -1110,7 +1143,12 @@ def _run_loop(
             except IllegalTransition as error:
                 raise TLLoopError(str(error)) from error
             next_slices = _confirm_dispatch_event(
-                state.slices, state.slices, event, event_slice_id, event_seq
+                state.slices,
+                state.slices,
+                event,
+                event_slice_id,
+                event_seq,
+                state.controller_epoch,
             )
             next_slices[event_slice_id] = replace(
                 next_slices[event_slice_id],
@@ -1188,11 +1226,18 @@ def _run_loop(
             state.slices,
             fsm_event,
             slice_id=event_slice_id,
-            allow_spawn_confirmation=_dispatch_confirmation_matches(state.slices, event),
+            allow_spawn_confirmation=_dispatch_confirmation_matches(
+                state.slices, event, controller_epoch=state.controller_epoch
+            ),
         )
         if _is_spawn_confirmation_event(event):
             next_slices = _confirm_dispatch_event(
-                state.slices, next_slices, event, event_slice_id, event_seq
+                state.slices,
+                next_slices,
+                event,
+                event_slice_id,
+                event_seq,
+                state.controller_epoch,
             )
         head_changed = _pr_head_changed(state.slices, fsm_event, event_slice_id)
         if head_changed and config.enable_reviewer_spawn:
@@ -1740,6 +1785,8 @@ def _reconcile_dispatches(
             current.dispatch_started_at,
             current.agent_type or "",
             attempt=max(1, current.attempts),
+            controller_epoch=state.controller_epoch,
+            dispatch_generation=current.dispatch_generation,
         )
         _record_controller_event(
             current.id,
@@ -2170,6 +2217,9 @@ def _dispatch_payload(
         "started_at": attempt.started_at,
         "attempt": attempt.attempt,
     }
+    if attempt.controller_epoch is not None:
+        payload["controller_epoch"] = attempt.controller_epoch
+        payload["dispatch_generation"] = attempt.dispatch_generation
     if error is not None:
         payload["error"] = error
     if attempt.harness:
@@ -2199,11 +2249,14 @@ def _confirm_dispatch_event(
     event: EventEnvelope,
     slice_id: str | None,
     event_seq: int,
+    controller_epoch: str | None = None,
 ) -> dict[str, SliceState]:
     if (
         not _is_spawn_confirmation_event(event)
         or slice_id is None
-        or not _dispatch_confirmation_matches(previous_slices, event)
+        or not _dispatch_confirmation_matches(
+            previous_slices, event, controller_epoch=controller_epoch
+        )
     ):
         return dict(updated_slices)
     current = updated_slices.get(slice_id)
@@ -2240,7 +2293,111 @@ def _event_dispatch_intent_id(event: EventEnvelope) -> str | None:
     return None
 
 
-def _dispatch_confirmation_matches(slices: Mapping[str, SliceState], event: EventEnvelope) -> bool:
+def _event_dispatch_epoch(event: EventEnvelope) -> str | None:
+    value = event.data.get("controller_epoch")
+    return value if isinstance(value, str) and value else None
+
+
+def _event_dispatch_generation(event: EventEnvelope) -> int | None:
+    value = event.data.get("dispatch_generation")
+    return value if type(value) is int and value >= 0 else None
+
+
+def _event_slice_hint(event: EventEnvelope) -> str | None:
+    value = event.data.get("slice_id") or event.slice_id
+    return value if isinstance(value, str) and value else None
+
+
+def _record_dispatch_correlation_failure(
+    store: RunStore,
+    state: RunState,
+    event: EventEnvelope,
+    correlation: DispatchCorrelation,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Retain rejected observations and emit one deduplicated integrity fact."""
+    run_seq = event.run_seq
+    prior = store.quarantined_events()
+    if run_seq is not None and any(item.get("run_seq") == run_seq for item in prior):
+        return
+    document = dict(envelope_document(event))
+    document["correlation"] = correlation.classification
+    document["correlation_reason"] = correlation.reason
+    store.quarantine_event(document)
+    payload = {
+        "slice_id": correlation.slice_id,
+        "intent_id": _event_dispatch_intent_id(event),
+        "attempt": event.data.get("attempt"),
+        "controller_epoch": _event_dispatch_epoch(event),
+        "dispatch_generation": _event_dispatch_generation(event),
+        "classification": correlation.classification,
+        "reason": correlation.reason,
+        "event_run_seq": event.run_seq,
+    }
+    _record_controller_event(
+        correlation.slice_id or state.run_id,
+        "tl.dispatch_event_rejected",
+        payload,
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def correlate_dispatch_event(state: RunState, event: EventEnvelope) -> DispatchCorrelation:
+    """Correlate a spawn observation using the current controller epoch.
+
+    Events from an earlier controller epoch remain queryable for audit but
+    can never confirm a current dispatch or charge a new owner. A matching
+    epoch with a stale generation is an integrity conflict, not evidence of
+    a new worker.
+    """
+    if not _is_spawn_confirmation_event(event):
+        return DispatchCorrelation(DISPATCH_CORRELATED)
+    intent_id = _event_dispatch_intent_id(event)
+    matches = [
+        slice_state
+        for slice_state in state.slices.values()
+        if intent_id is not None
+        and slice_state.dispatch_intent_id == intent_id
+        and slice_state.status in DISPATCHING_STATUSES
+    ]
+    candidate = matches[0] if len(matches) == 1 else None
+    event_epoch = _event_dispatch_epoch(event)
+    if candidate is not None:
+        if event_epoch is not None and event_epoch != state.controller_epoch:
+            return DispatchCorrelation(
+                DISPATCH_HISTORICAL_AUDIT,
+                candidate.id,
+                "controller_epoch_mismatch",
+            )
+        event_generation = _event_dispatch_generation(event)
+        if event_generation is not None and event_generation != candidate.dispatch_generation:
+            return DispatchCorrelation(
+                DISPATCH_INTEGRITY_CONFLICT,
+                candidate.id,
+                "dispatch_generation_mismatch",
+            )
+        return DispatchCorrelation(DISPATCH_CORRELATED, candidate.id)
+    hint = _event_slice_hint(event)
+    current = state.slices.get(hint) if hint is not None else None
+    if current is not None and event_epoch is not None and event_epoch != state.controller_epoch:
+        return DispatchCorrelation(
+            DISPATCH_HISTORICAL_AUDIT,
+            current.id,
+            "controller_epoch_mismatch",
+        )
+    return DispatchCorrelation(DISPATCH_INTEGRITY_CONFLICT, hint, "intent_mismatch")
+
+
+def _dispatch_confirmation_matches(
+    slices: Mapping[str, SliceState],
+    event: EventEnvelope,
+    *,
+    controller_epoch: str | None = None,
+) -> bool:
     if not _is_spawn_confirmation_event(event):
         return True
     intent_id = _event_dispatch_intent_id(event)
@@ -2252,7 +2409,17 @@ def _dispatch_confirmation_matches(slices: Mapping[str, SliceState], event: Even
         if slice_state.dispatch_intent_id == intent_id
         and slice_state.status in DISPATCHING_STATUSES
     ]
-    return len(matches) == 1
+    if len(matches) != 1:
+        return False
+    current = matches[0]
+    if (
+        controller_epoch is not None
+        and _event_dispatch_epoch(event) is not None
+        and _event_dispatch_epoch(event) != controller_epoch
+    ):
+        return False
+    generation = _event_dispatch_generation(event)
+    return generation is None or generation == current.dispatch_generation
 
 
 def _emit_dispatch_confirmation(
@@ -2768,6 +2935,7 @@ def _prepare_sub_tl_stage(
                 dispatch_last_boundary="sub_tl_started",
                 dispatch_agent_id=task.name,
                 dispatch_authoritative_event_seq=authoritative_seq,
+                dispatch_generation=internal_attempt.dispatch_generation,
             )
         prepared.append(task)
     states = dict(state.integration.sub_tl_states)
@@ -4363,10 +4531,38 @@ def _prepare_spawn(
 def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> DispatchAttempt:
     current = state.slices.get(name)
     attempt = (current.attempts if current is not None else 0) + 1
+    # Keep the public intent stable for legacy event readers. The controller
+    # epoch and generation are part of the persisted dispatch payload and
+    # journal key, so a recreated controller cannot adopt the old observation.
     identity = f"{state.run_id}:{name}:{attempt}"
     intent_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
     started_at = time.time() if config.active else 0.0
-    return DispatchAttempt(intent_id, started_at, "", attempt=attempt)
+    return DispatchAttempt(
+        intent_id,
+        started_at,
+        "",
+        attempt=attempt,
+        controller_epoch=state.controller_epoch,
+        dispatch_generation=attempt if state.controller_epoch is not None else 0,
+    )
+
+
+def _controller_epoch(root_dir: Path, run_id: str) -> str:
+    """Read the init-owned epoch marker, with a deterministic first-run value."""
+    marker = Path(root_dir) / f"{run_id}.controller-epoch"
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        value = ""
+    if value:
+        return value
+    value = hashlib.sha256(f"controller:{run_id}".encode()).hexdigest()[:32]
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(value + "\n", encoding="utf-8")
+    except OSError:
+        LOGGER.warning("unable to persist controller epoch marker path=%s", marker)
+    return value
 
 
 def _worker_call(
