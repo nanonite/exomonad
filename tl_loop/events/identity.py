@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from urllib.parse import urlsplit
 
 from tl_loop.state.schema import RunState, SliceState
 
@@ -28,6 +29,10 @@ class IdentityResolution:
     @property
     def reason(self) -> str:
         """Return a stable diagnostic classification for the result."""
+        if "repository_identity_conflict" in self.rejected_aliases:
+            return "repository_identity_conflict"
+        if "pr_number_only" in self.rejected_aliases:
+            return "pr_number_only"
         if self.rejected_aliases:
             return "unknown_alias"
         if not self.candidates:
@@ -54,6 +59,9 @@ def resolve_event_slice(
     allowed = set(allowed_ids) if allowed_ids else set(state.slices)
     evidence: dict[str, set[str]] = {}
     rejected: set[str] = set()
+    repository_conflict = _repository_identity_conflict(event, state)
+    if repository_conflict is not None:
+        rejected.add(repository_conflict)
 
     def add_alias(kind: str, value: object, *, reject_unknown: bool = True) -> None:
         if not isinstance(value, str) or not value:
@@ -87,8 +95,19 @@ def resolve_event_slice(
         }
         if matches:
             evidence.setdefault("pr_number", set()).update(matches)
+        if event.head_sha is not None:
+            head_matches = {
+                slice_id
+                for slice_id, current in state.slices.items()
+                if slice_id in allowed
+                and _published_head_matches(current, event.pr_number, event.head_sha)
+            }
+            if head_matches:
+                evidence.setdefault("published_head", set()).update(head_matches)
 
     candidates = tuple(sorted({slice_id for values in evidence.values() for slice_id in values}))
+    if len(candidates) == 1 and set(evidence) == {"pr_number"}:
+        rejected.add("pr_number_only")
     slice_id = candidates[0] if len(candidates) == 1 and not rejected else None
     return IdentityResolution(
         slice_id=slice_id,
@@ -110,6 +129,61 @@ def _alias_matches(kind: str, value: str, slice_id: str, current: SliceState) ->
     if kind == "branch":
         return value == getattr(current, "branch", None)
     raise ValueError(f"unsupported ownership alias {kind!r}")
+
+
+def _published_head_matches(current: SliceState, pr_number: int, head_sha: str) -> bool:
+    publication = getattr(current, "publication", None)
+    expected_pr = (
+        publication.pr_number if publication is not None else getattr(current, "pr_number", None)
+    )
+    expected_head = (
+        publication.head_sha if publication is not None else getattr(current, "reviewed_head", None)
+    )
+    return expected_pr == pr_number and expected_head == head_sha
+
+
+def _repository_identity_conflict(event: EventEnvelope, state: RunState) -> str | None:
+    """Reject watcher facts that contradict the persisted Forgejo identity."""
+    identity = getattr(state, "repository_identity", None)
+    if identity is None:
+        return None
+    payload: Mapping[str, object] = event.data
+    nested = payload.get("repository")
+    if isinstance(nested, Mapping):
+        payload = {**nested, **payload}
+    owner = _first_text(payload, "owner", "repository_owner", "repo_owner")
+    repo = _first_text(payload, "repo", "repository", "repo_name")
+    host = _first_text(payload, "forge_host", "host", "forgejo_host")
+    remote_url = _first_text(payload, "remote_url", "repository_url", "forge_url")
+    if owner is not None and owner != getattr(identity, "owner", None):
+        return "repository_identity_conflict"
+    if repo is not None and repo != getattr(identity, "repo", None):
+        return "repository_identity_conflict"
+    expected_host = getattr(identity, "forge_host", None) or _url_host(
+        getattr(identity, "remote_url", None)
+    )
+    actual_host = host or _url_host(remote_url)
+    if (
+        expected_host is not None
+        and actual_host is not None
+        and actual_host.lower() != expected_host.lower()
+    ):
+        return "repository_identity_conflict"
+    return None
+
+
+def _first_text(payload: Mapping[str, object], *keys: str) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _url_host(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return urlsplit(value).hostname
 
 
 def envelope_document(event: EventEnvelope) -> dict[str, object]:

@@ -20,7 +20,7 @@ from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader
-from tl_loop.fsm.event import PRFiled, PRUpdated
+from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.loop.driver import (
@@ -39,6 +39,7 @@ from tl_loop.loop.driver import (
     _dispatch_payload,
     _initial_slices,
     _record_review_event,
+    _record_child_handoff,
     _repair_model,
     _recover_tool_unavailable,
     _route_ci_event,
@@ -531,20 +532,18 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
-        "merge_pr",
     ]
     assert _effect_operations(result) == [
         "spawn_worker",
         "spawn_leaf",
-        "merge_pr",
     ]
     assert all(intent.executed for intent in result.effects)
     assert result.final_state.fsm.phase is TLPhase.TLDone
     assert result.final_state.events.last_consumed_offset == 5
-    assert result.final_state.slices["worker-a"].status.value == "merged"
-    assert result.final_state.slices["leaf-a"].pr_number == 42
-    assert result.final_state.slices["leaf-a"].reviewed_head == "head-a"
-    assert result.final_state.slices["leaf-a"].status.value == "merged"
+    assert result.final_state.slices["worker-a"].status.value == "spawned"
+    assert result.final_state.slices["leaf-a"].pr_number is None
+    assert result.final_state.slices["leaf-a"].reviewed_head is None
+    assert result.final_state.slices["leaf-a"].status.value == "spawned"
     assert result.final_state.slices["worker-a"].dispatch_authoritative_event_seq == 1
     assert result.final_state.slices["leaf-a"].dispatch_authoritative_event_seq == 2
     assert result.final_state.slices["worker-a"].dispatch_last_boundary == "agent.spawned"
@@ -773,11 +772,10 @@ def test_observability_failure_does_not_change_terminal_state(
     assert (
         result.final_state.slices["leaf-a"].status is baseline.final_state.slices["leaf-a"].status
     )
-    assert result.final_state.slices["leaf-a"].status is SliceStatus.MERGED
-    assert "merge_pr" in _effect_names(failed_transport)
-    assert _merge_decisions(failed_transport) == _merge_decisions(baseline_transport)
-    assert _merge_decisions(failed_transport)[0]["decision"] == "merge"
-    assert "controller event tl.merge_decided failed: ledger unavailable" in caplog.text
+    assert result.final_state.slices["leaf-a"].status is SliceStatus.SPAWNED
+    assert "merge_pr" not in _effect_names(failed_transport)
+    assert _merge_decisions(failed_transport) == []
+    assert _merge_decisions(baseline_transport) == []
 
 
 def test_dispatch_waits_for_delayed_authoritative_confirmation(tmp_path: Path) -> None:
@@ -1797,6 +1795,130 @@ def _review_store(
     return store
 
 
+def test_child_completion_records_exact_head_handoff_without_merging(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                dispatch_agent_id="leaf-a",
+                dispatch_invocation_id="inv-1",
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+    event = project(
+        {
+            "type": "agent.notify_parent",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "invocation_id": "inv-1",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "shadow_event": {"kind": "child_completed", "slug": "leaf-a"},
+            },
+        }
+    )
+
+    updated = _record_child_handoff(
+        store,
+        store.load(),
+        TLPlanning(),
+        event,
+        ChildCompleted("leaf-a"),
+        1,
+    )
+
+    handoff = updated.slices["leaf-a"].handoff
+    assert handoff is not None
+    assert handoff.pr_number == 42
+    assert handoff.head_sha == "head-a"
+    assert handoff.invocation_id == "inv-1"
+    assert updated.slices["leaf-a"].reviewed_head == "head-a"
+    assert updated.slices["leaf-a"].status is SliceStatus.IN_REVIEW
+    assert (
+        _record_child_handoff(
+            store,
+            updated,
+            TLPlanning(),
+            event,
+            ChildCompleted("leaf-a"),
+            1,
+        )
+        == updated
+    )
+
+
+def test_child_completion_with_wrong_head_does_not_create_handoff(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = store.load().slices["leaf-a"]
+    current = replace(current, dispatch_agent_id="leaf-a", dispatch_invocation_id="inv-1")
+    store.checkpoint(TLPlanning(), {"leaf-a": current}, BudgetLedger(0, 0), offset=0)
+    event = project(
+        {
+            "type": "agent.notify_parent",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "invocation_id": "inv-1",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-b",
+            },
+        }
+    )
+
+    updated = _record_child_handoff(
+        store,
+        store.load(),
+        TLPlanning(),
+        event,
+        ChildCompleted("leaf-a"),
+        1,
+    )
+
+    assert updated.slices["leaf-a"].handoff is None
+
+
+def test_worker_self_approval_is_not_gate_evidence(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(store.load().slices["leaf-a"], dispatch_agent_id="leaf-a")
+    store.checkpoint(TLPlanning(), {"leaf-a": current}, BudgetLedger(0, 0), offset=0)
+    event = project(
+        {
+            "type": "pr.review",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "role": "worker",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "kind": "approved",
+                "findings": [],
+            },
+        }
+    )
+
+    _record_review_event(store, store.load(), TLPlanning(), event, 1)
+
+    assert store.load().slices["leaf-a"].verdict is None
+
+
 def test_tool_unavailable_recovery_parks_without_consuming_attempts(tmp_path: Path) -> None:
     class IssueTransport(RecordingTransport):
         def call_tool(
@@ -1961,7 +2083,6 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
     assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
-        "merge_pr",
     ]
     spawn_worker_call = next(
         arguments for name, arguments in transport.calls if name == "spawn_worker"
@@ -2027,7 +2148,6 @@ def test_shadow_loop_uses_the_same_driver_without_mutating_transport(
     assert _effect_operations(result) == [
         "spawn_worker",
         "spawn_leaf",
-        "merge_pr",
     ]
     assert not any(intent.executed for intent in result.effects)
     assert result.final_state.fsm.phase is TLPhase.TLDone
@@ -2056,7 +2176,6 @@ def test_canonical_completion_and_parent_notification_are_idempotent(
     assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
-        "merge_pr",
     ]
     assert result.final_state.fsm.phase is TLPhase.TLDone
     assert source.acknowledged == [1, 2, 3, 4, 5, 6]
@@ -2331,7 +2450,15 @@ def test_aggregate_review_and_ci_events_route_by_persisted_pr(
             "data": payload,
         }
     )
-    state = SimpleNamespace(slices={"alpha": SimpleNamespace(pr_number=77)})
+    state = SimpleNamespace(
+        slices={
+            "alpha": SimpleNamespace(
+                pr_number=77,
+                reviewed_head="aggregate-head",
+                dispatch_agent_id="aggregate-run:alpha:integration",
+            )
+        }
+    )
 
     assert _event_belongs_to_plan(event, set(), state)
 
@@ -2614,7 +2741,7 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
         arguments["pr_number"] for name, arguments in transport.calls if name == "merge_pr"
     ]
     assert merge_pr_numbers[-2:] == [101, 102]
-    assert len(merge_pr_numbers) == 6
+    assert len(merge_pr_numbers) == 2
     assert [
         arguments["pr_number"] for name, arguments in transport.calls if name == "watcher_pr_state"
     ] == [

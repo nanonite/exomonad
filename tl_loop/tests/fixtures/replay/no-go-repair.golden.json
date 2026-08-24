@@ -1,13 +1,4 @@
 {
-  "goals": {
-    "completion_predicate": "",
-    "controller_started_at": "<timestamp>",
-    "deadline": 0.0,
-    "last_authoritative_event_seq": 8,
-    "last_heartbeat_at": null,
-    "last_progress_at": "<timestamp>",
-    "objective": ""
-  },
   "budgets": {
     "ledger": {
       "charges": [
@@ -52,6 +43,15 @@
     "waiting": []
   },
   "gates": [],
+  "goals": {
+    "completion_predicate": "",
+    "controller_started_at": "<timestamp>",
+    "deadline": 0.0,
+    "last_authoritative_event_seq": 8,
+    "last_heartbeat_at": null,
+    "last_progress_at": "<timestamp>",
+    "objective": ""
+  },
   "revision": 21,
   "run_id": "<run-id>",
   "slices": {
@@ -79,13 +79,13 @@
       "review_findings": {},
       "reviewed_head": "head-a",
       "reviewer_attempt": {},
-      "status": "merged",
+      "status": "spawned",
+      "task_timeout_seconds": 3600.0,
+      "task_timeout_source": "built_in",
       "test_plan": [
         "just tl-loop-test"
       ],
-      "task_timeout_seconds": 3600.0,
-      "task_timeout_source": "built_in",
-      "verdict": "GO",
+      "verdict": "NO-GO",
       "verdict_at": "<timestamp>",
       "worktree": null
     },
@@ -111,12 +111,12 @@
       "review_findings": {},
       "reviewed_head": null,
       "reviewer_attempt": {},
-      "status": "merged",
+      "status": "spawned",
+      "task_timeout_seconds": 3600.0,
+      "task_timeout_source": "built_in",
       "test_plan": [
         "controller"
       ],
-      "task_timeout_seconds": 3600.0,
-      "task_timeout_source": "built_in",
       "verdict": null,
       "worktree": null
     }

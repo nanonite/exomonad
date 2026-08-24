@@ -467,7 +467,7 @@ def _update_slices(
                 agent_type=handle.agent_type,
                 branch=handle.branch,
             )
-    elif isinstance(event, (ChildCompleted, PRMerged)):
+    elif isinstance(event, PRMerged):
         current = updated.get(event.slug)
         if current is not None:
             updated[event.slug] = replace(current, status=SliceStatus.MERGED)

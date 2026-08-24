@@ -14,7 +14,7 @@ from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.phase import ChildHandle, TLWaiting
 from tl_loop.loop.driver import LeafTask, TLLoopConfig, WorkPlan, run_tl_loop
-from tl_loop.state.schema import BudgetLedger, SliceState, SliceStatus
+from tl_loop.state.schema import BudgetLedger, RepositoryIdentity, SliceState, SliceStatus
 from tl_loop.state.store import QuarantineStorageError, RunStore, create
 
 
@@ -99,6 +99,47 @@ def test_ambiguous_pr_is_rejected_without_first_match() -> None:
     assert result.slice_id is None
     assert result.reason == "ambiguous"
     assert result.candidates == ("other", "tunable-operator-body")
+
+
+def test_unique_pr_without_persisted_alias_is_rejected() -> None:
+    event = _event("ci.status_changed", agent_id="unknown-owner", branch=None)
+
+    result = resolve_event_slice(event, _state())
+
+    assert not result.resolved
+    assert result.reason == "pr_number_only"
+    assert result.rejected_aliases == ("pr_number_only",)
+
+
+def test_repository_identity_mismatch_is_rejected_even_with_slice_alias() -> None:
+    event = project(
+        {
+            "type": "ci.status_changed",
+            "run_seq": 7,
+            "run_id": "swarm-uuid",
+            "agent_id": "tunable-operator-body-opencode",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-18T00:00:00Z",
+            "data": {
+                "slice_id": "tunable-operator-body",
+                "pr_number": 42,
+                "owner": "other-owner",
+                "repo": "exomonad",
+            },
+        }
+    )
+    state = _state()
+    state.repository_identity = RepositoryIdentity(
+        owner="acme",
+        repo="exomonad",
+        base_branch="main",
+        forge_host="forgejo.local",
+    )
+
+    result = resolve_event_slice(event, state)
+
+    assert not result.resolved
+    assert result.reason == "repository_identity_conflict"
 
 
 def test_quarantine_round_trip_preserves_observation_for_replay(tmp_path) -> None:

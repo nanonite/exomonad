@@ -437,67 +437,6 @@
     {
       "operation": "emit_controller_event",
       "arguments": {
-        "event_type": "tl.slice_status_changed",
-        "payload": {
-          "from_status": "spawned",
-          "slice_id": "worker-a",
-          "to_status": "merged"
-        },
-        "force": false,
-        "include_dead": false,
-        "sweep": false
-      }
-    },
-    {
-      "operation": "watcher_pr_state",
-      "arguments": {
-        "pr_number": 42,
-        "force": false,
-        "include_dead": false,
-        "sweep": false
-      }
-    },
-    {
-      "operation": "emit_controller_event",
-      "arguments": {
-        "event_type": "tl.merge_decided",
-        "payload": {
-          "decision": "merge",
-          "head_sha_hash": "d3a3d7295bcf00bda335a69b6bdc103071045844f70dff6716c823206d60fba7",
-          "pr_number": 42,
-          "slice_id": "leaf-a"
-        },
-        "force": false,
-        "include_dead": false,
-        "sweep": false
-      }
-    },
-    {
-      "operation": "merge_pr",
-      "arguments": {
-        "pr_number": 42,
-        "force": false,
-        "include_dead": false,
-        "sweep": false
-      }
-    },
-    {
-      "operation": "emit_controller_event",
-      "arguments": {
-        "event_type": "tl.slice_status_changed",
-        "payload": {
-          "from_status": "spawned",
-          "slice_id": "leaf-a",
-          "to_status": "merged"
-        },
-        "force": false,
-        "include_dead": false,
-        "sweep": false
-      }
-    },
-    {
-      "operation": "emit_controller_event",
-      "arguments": {
         "event_type": "tl.phase_changed",
         "payload": {
           "from_phase": "tl_waiting",

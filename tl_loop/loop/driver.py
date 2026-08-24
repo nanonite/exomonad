@@ -94,6 +94,7 @@ from tl_loop.state.schema import (
     BudgetLedger,
     GateStatus,
     GoalState,
+    HandoffEvidence,
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
@@ -866,8 +867,6 @@ def _run_loop(
         | {task.name for task in plan.leaves}
         | {task.name for task in plan.sub_tls}
     )
-    leaf_names = {task.name for task in plan.leaves}
-    merged: set[str] = set()
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
@@ -1149,22 +1148,7 @@ def _run_loop(
             state = store.load()
             continue
         if isinstance(fsm_event, ChildCompleted):
-            merge_allowed = _merge_completed_leaf(
-                event,
-                fsm_event,
-                leaf_names,
-                merged,
-                effects,
-                config,
-                effects_log,
-                state,
-            )
-            if not merge_allowed:
-                next_slices = _discard_review(state.slices, fsm_event.slug)
-                state = store.checkpoint(phase, next_slices, state.budgets, checkpoint_seq)
-                _ack_event(source, event, replaying, diagnostics)
-                _release_replayed_event(store, event, replaying)
-                continue
+            state = _record_child_handoff(store, state, phase, event, fsm_event, checkpoint_seq)
         try:
             next_phase = transition(phase, fsm_event)
         except IllegalTransition as error:
@@ -1176,18 +1160,6 @@ def _run_loop(
             slice_id=event_slice_id,
             allow_spawn_confirmation=_dispatch_confirmation_matches(state.slices, event),
         )
-        if (
-            isinstance(fsm_event, ChildCompleted)
-            and event_slice_id is not None
-            and event.pr_number is not None
-            and event.head_sha is not None
-            and event_slice_id in next_slices
-        ):
-            next_slices[event_slice_id] = replace(
-                next_slices[event_slice_id],
-                pr_number=event.pr_number,
-                reviewed_head=event.head_sha,
-            )
         if _is_spawn_confirmation_event(event):
             next_slices = _confirm_dispatch_event(
                 state.slices, next_slices, event, event_slice_id, event_seq
@@ -4257,6 +4229,63 @@ def _merge_completed_leaf(
     return True
 
 
+def _record_child_handoff(
+    store: RunStore,
+    state: RunState,
+    phase: PhaseValue,
+    event: EventEnvelope,
+    completion: ChildCompleted,
+    event_seq: int,
+) -> RunState:
+    """Persist a child handoff only when its PR and head match persisted state."""
+    current = state.slices.get(completion.slug)
+    if current is None or event.pr_number is None or event.head_sha is None:
+        return state
+    publication = current.publication
+    expected_pr = publication.pr_number if publication is not None else current.pr_number
+    expected_head = publication.head_sha if publication is not None else current.reviewed_head
+    if expected_pr != event.pr_number or expected_head != event.head_sha:
+        LOGGER.warning(
+            "[TL loop] ignoring child handoff with mismatched publication target=%s",
+            completion.slug,
+        )
+        return state
+    owner = current.dispatch_agent_id
+    if owner is None or event.agent_id not in {owner, current.id}:
+        LOGGER.warning(
+            "[TL loop] ignoring child handoff from untrusted owner target=%s agent=%s",
+            completion.slug,
+            event.agent_id,
+        )
+        return state
+    invocation_id = event.invocation_id or current.dispatch_invocation_id
+    if invocation_id is None:
+        LOGGER.warning(
+            "[TL loop] ignoring child handoff without invocation target=%s",
+            completion.slug,
+        )
+        return state
+    attempt = publication.attempt if publication is not None else current.attempts
+    handoff = HandoffEvidence(
+        pr_number=event.pr_number,
+        head_sha=event.head_sha,
+        attempt=attempt,
+        invocation_id=invocation_id,
+        agent_id=owner,
+        observed_at=event.observed_at,
+    )
+    if current.handoff == handoff:
+        return state
+    updated = dict(state.slices)
+    updated[completion.slug] = replace(
+        current,
+        handoff=handoff,
+        pr_number=event.pr_number,
+        status=SliceStatus.IN_REVIEW,
+    )
+    return store.checkpoint(phase, updated, state.budgets, event_seq)
+
+
 def _emit_merge_decision(
     slice_id: str,
     pr_number: int,
@@ -4337,6 +4366,15 @@ def _record_review_event(
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     verdict = _review_verdict(event)
+    if verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and not _reviewer_identity_authorized(
+        event, current
+    ):
+        LOGGER.warning(
+            "[TL loop] ignoring unauthorized approval evidence target=%s agent=%s",
+            slice_id,
+            event.agent_id,
+        )
+        verdict = None
     if verdict is None:
         updated = dict(state.slices)
         updated[slice_id] = replace(
@@ -4368,6 +4406,22 @@ def _record_review_event(
 
 def _review_workflow_enabled(config: TLLoopConfig) -> bool:
     return config.active and config.review_model_choice is not None
+
+
+def _reviewer_identity_authorized(event: EventEnvelope, current: SliceState) -> bool:
+    """Accept reviewer or human evidence, never a persisted worker self-approval."""
+    actor_role = event.role or event.data.get("actor_role") or event.data.get("actor_type")
+    if isinstance(actor_role, str):
+        normalized = actor_role.strip().lower()
+        if normalized in {"worker", "dev", "developer", "agent"}:
+            return False
+        if normalized in {"reviewer", "human", "operator"}:
+            return True
+    actor_id = event.agent_id
+    owner_id = current.dispatch_agent_id
+    if owner_id is not None and actor_id == owner_id:
+        return False
+    return actor_id is not None
 
 
 def _review_slice_id(event: EventEnvelope, state: RunState) -> str | None:
@@ -4506,6 +4560,23 @@ def _route_review_event(
         policy_path=config.review_policy_path or Path(".exo/review-policy.toml"),
     )
     review_findings = _persist_adjudication_nits(review_findings, head_sha, result.reasons)
+    if result.verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and not _reviewer_identity_authorized(
+        event, current
+    ):
+        LOGGER.warning(
+            "[TL loop] ignoring unauthorized approval evidence target=%s agent=%s",
+            slice_id,
+            event.agent_id,
+        )
+        updated = dict(state.slices)
+        updated[slice_id] = replace(
+            current,
+            pr_number=event.pr_number or current.pr_number,
+            review_findings=review_findings,
+            review_patch_digests=patch_digests,
+            stall_classification=stall_classification or current.stall_classification,
+        )
+        return store.checkpoint(phase, updated, state.budgets, event_seq)
     updated = dict(state.slices)
     updated[slice_id] = replace(
         current,

@@ -167,14 +167,17 @@ class RepositoryIdentity:
     owner: str
     repo: str
     base_branch: str
+    forge_host: str | None = None
     remote_url: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("owner", "repo", "base_branch"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"repository identity {name} must be non-empty")
-        if self.remote_url is not None and not self.remote_url:
-            raise ValueError("repository identity remote_url must be non-empty or null")
+        for name in ("forge_host", "remote_url"):
+            value = getattr(self, name)
+            if value is not None and not value:
+                raise ValueError(f"repository identity {name} must be non-empty or null")
 
 
 @dataclass(frozen=True)
@@ -501,7 +504,7 @@ DEADLINE_LEDGER_KEYS = frozenset(
         "recovery_wait_seconds",
     }
 )
-REPOSITORY_IDENTITY_KEYS = frozenset({"owner", "repo", "base_branch", "remote_url"})
+REPOSITORY_IDENTITY_KEYS = frozenset({"owner", "repo", "base_branch", "forge_host", "remote_url"})
 PUBLICATION_KEYS = frozenset(
     {"pr_number", "head_sha", "head_branch", "base_branch", "attempt", "invocation_id"}
 )
@@ -1270,6 +1273,7 @@ def _validate_repository_identity(value: object, path: str, errors: list[tuple[s
         return
     for key in ("owner", "repo", "base_branch"):
         _non_empty_string(identity, key, f"{path}.repository_identity", errors)
+    _nullable_string(identity, "forge_host", f"{path}.repository_identity", errors)
     _nullable_string(identity, "remote_url", f"{path}.repository_identity", errors)
 
 

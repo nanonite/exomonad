@@ -34,10 +34,10 @@ from .migration import (
     record_migration_failure,
 )
 from .schema import (
+    SCHEMA_VERSION,
     ActionKind,
     ActionPhase,
     ActionState,
-    SCHEMA_VERSION,
     ActualTokens,
     BudgetCharge,
     BudgetLedger,
@@ -47,12 +47,12 @@ from .schema import (
     GateState,
     GateStatus,
     GoalState,
+    HandoffEvidence,
     IntegrationCandidateState,
     IntegrationRuntimeState,
-    HandoffEvidence,
+    ObservationProvenance,
     OrderedStageState,
     ParkCause,
-    ObservationProvenance,
     PublicationBinding,
     RepositoryIdentity,
     RunState,
@@ -1256,6 +1256,7 @@ def _decode_repository_identity(value: object) -> RepositoryIdentity | None:
         owner=cast(str, value["owner"]),
         repo=cast(str, value["repo"]),
         base_branch=cast(str, value["base_branch"]),
+        forge_host=cast(str | None, value.get("forge_host")),
         remote_url=cast(str | None, value.get("remote_url")),
     )
 
