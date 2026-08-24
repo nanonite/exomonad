@@ -17,7 +17,6 @@ source or pretending that a source copy is a real-server run.
 from __future__ import annotations
 
 import copy
-import datetime
 import json
 import os
 import subprocess
@@ -53,17 +52,6 @@ def _nested_state(root: Path) -> Any:
     ).load()
 
 
-def _event_sequence(repo: Path, run_id: str, event_type: str) -> list[int]:
-    sequences: list[int] = []
-    for event in real.server_ledger_events(repo):
-        if event.get("run_id") != run_id or event.get("type") != event_type:
-            continue
-        sequence = event.get("run_seq")
-        if type(sequence) is int:
-            sequences.append(sequence)
-    return sequences
-
-
 def _issue_id(result: Any) -> int:
     for candidate in real.json_objects(result.raw):
         for key in ("id", "number", "issue_id", "cicoIssueId"):
@@ -74,54 +62,53 @@ def _issue_id(result: Any) -> int:
 
 
 def _review_handoff_is_ordered(repo: Path, run_id: str) -> bool:
-    def sequences(event_type: str) -> list[int]:
-        scoped = _event_sequence(repo, run_id, event_type)
-        if scoped:
-            return scoped
-        return sorted(
-            int(event["run_seq"])
-            for event in real.server_ledger_events(repo)
-            if event.get("type") == event_type and type(event.get("run_seq")) is int
-        )
+    """Require one UUID-scoped, identity-matched publication handoff.
 
-    filed = sequences("pr.filed")
-    if not filed:
-        filed = sequences("pr.updated")
-    if not filed:
-        filed = sequences("tl.aggregate_pr_opened")
-    review = sequences("copilot.review")
-    if not review:
-        review = sequences("pr.review")
-    if not review:
-        review = sequences("tl.integration_validated")
-    ci = sequences("ci.status_changed")
-    if not ci:
-        ci = sequences("tl.integration_validated")
-    if not filed:
-        pull_times: list[datetime.datetime] = []
-        mock_log = repo.parent / "mock.log"
-        if mock_log.is_file():
-            for line in mock_log.read_text(encoding="utf-8").splitlines():
-                try:
-                    request = json.loads(line)
-                    path = request.get("path", "")
-                    if request.get("method") == "POST" and path.endswith("/pulls"):
-                        pull_times.append(
-                            datetime.datetime.fromisoformat(request["timestamp"])
-                        )
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    continue
-        integration_times = [
-            datetime.datetime.fromisoformat(str(event["event_time"]))
-            for event in real.server_ledger_events(repo)
-            if event.get("type") == "tl.integration_validated"
-            and isinstance(event.get("event_time"), str)
+    Forgejo requests, aggregate-opened events, and rows from another swarm
+    are not evidence that this run entered review. The watcher emits
+    pr.filed before its copilot.review and ci.status_changed rows, so the
+    acceptance check consumes only that canonical event chain.
+    """
+    events = [
+        event
+        for event in real.server_ledger_events(repo)
+        if event.get("run_id") == run_id and type(event.get("run_seq")) is int
+    ]
+    filed = [event for event in events if event.get("type") == "pr.filed"]
+    reviews = [event for event in events if event.get("type") == "copilot.review"]
+    ci = [event for event in events if event.get("type") == "ci.status_changed"]
+
+    def identity(event: Mapping[str, object]) -> dict[str, object]:
+        data = event.get("data")
+        if not isinstance(data, Mapping):
+            return {}
+        return {
+            key: data[key]
+            for key in ("slice_id", "owner_id", "pr_number", "head_sha")
+            if data.get(key) is not None
+        }
+
+    def matches(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+        left_id = identity(left)
+        right_id = identity(right)
+        shared = set(left_id) & set(right_id)
+        return bool(shared) and all(left_id[key] == right_id[key] for key in shared)
+
+    for filed_event in filed:
+        filed_seq = filed_event["run_seq"]
+        matching_reviews = [
+            event
+            for event in reviews
+            if matches(filed_event, event) and event["run_seq"] > filed_seq
         ]
-        if pull_times and integration_times:
-            return min(integration_times) > min(pull_times)
-    if not filed or not review or not ci:
-        return False
-    return min(review + ci) > max(filed)
+        matching_ci = [
+            event
+            for event in ci
+            if matches(filed_event, event) and event["run_seq"] > filed_seq
+        ]
+        if matching_reviews and matching_ci:
+            return True
+    return False
 
 
 def _validate_evidence(evidence: Mapping[str, object]) -> None:
@@ -142,6 +129,13 @@ def _validate_evidence(evidence: Mapping[str, object]) -> None:
         or phases[0] == phases[-1]
     ):
         raise HarnessError(f"recovery phases did not converge: {evidence!r}")
+    lineage = evidence.get("recovery_lineage")
+    if (
+        not isinstance(lineage, list)
+        or len(lineage) < 2
+        or not all(isinstance(item, Mapping) for item in lineage)
+    ):
+        raise HarnessError(f"recovery lineage was not observed: {evidence!r}")
     attempt = evidence.get("slice_attempt")
     if type(attempt) is not int or attempt < 1:
         raise HarnessError(f"slice attempt was charged unexpectedly: {evidence!r}")
@@ -149,13 +143,31 @@ def _validate_evidence(evidence: Mapping[str, object]) -> None:
     if (
         not isinstance(generations, list)
         or len(generations) < 2
-        or generations != list(range(1, len(generations) + 1))
+        or not all(type(item) is int and item >= 0 for item in generations)
+        or generations != sorted(set(generations))
+        or generations
+        != [
+            item["invocation_generation"]
+            for item in lineage
+            if type(item.get("invocation_generation")) is int
+        ]
     ):
         raise HarnessError(
-            f"restart did not produce exactly two generations: {evidence!r}"
+            f"recovery did not produce a unique authoritative lineage: {evidence!r}"
         )
     round_count = evidence.get("recovery_round")
-    if type(round_count) is not int or round_count != len(phases) - 1:
+    rounds = [
+        item.get("recovery_round")
+        for item in lineage
+        if type(item.get("recovery_round")) is int
+    ]
+    if (
+        type(round_count) is not int
+        or round_count < 0
+        or not rounds
+        or round_count != max(rounds)
+        or any(item.get("slice_attempt") != attempt for item in lineage)
+    ):
         raise HarnessError(f"recovery round was not bounded: {evidence!r}")
     for key in (
         "unrelated_sibling_completed_while_waiting",
@@ -237,20 +249,43 @@ def _collect_evidence(
         raise HarnessError(
             f"nested leaf was not left at the live recovery boundary: {nested.slices!r}"
         )
-    phases = [
-        str(record["phase"])
-        for record in traces["aggregate_review"].records
-        if isinstance(record.get("phase"), str)
+    lineage = [
+        snapshot
+        for trace in traces.values()
+        for record in trace.records
+        for snapshot in [
+            record.get("recovery", {}).get(nested_leaf)
+            if isinstance(record.get("recovery"), Mapping)
+            else None
+        ]
+        if isinstance(snapshot, Mapping)
     ]
-    if len(phases) < 2:
+    if len(lineage) < 2:
         raise HarnessError(
-            f"restart trace did not contain two controller phases: {traces!r}"
+            "recovery trace did not contain two authoritative checkpoints for "
+            f"{nested_leaf!r}: {traces!r}"
         )
-    generations = list(range(1, len(phases) + 1))
-    dispatch = _state(root, "ordered-server-dispatch-restart")
+    phases = [
+        phase for snapshot in lineage if isinstance(phase := snapshot.get("phase"), str)
+    ]
+    generations = [
+        generation
+        for snapshot in lineage
+        if type(generation := snapshot.get("invocation_generation")) is int
+    ]
+    rounds = [
+        recovery_round
+        for snapshot in lineage
+        if type(recovery_round := snapshot.get("recovery_round")) is int
+    ]
     owner_records = [
-        (state.dispatch_agent_id, state.branch, state.worktree)
-        for state in dispatch.slices.values()
+        (
+            snapshot.get("owner_run_id"),
+            snapshot.get("owner_agent_id"),
+            snapshot.get("branch"),
+            snapshot.get("worktree"),
+        )
+        for snapshot in lineage
     ]
     owner_preserved = (
         marker.read_bytes() == b"dirty recovery content\n"
@@ -258,7 +293,7 @@ def _collect_evidence(
             all(isinstance(item, str) and item for item in record)
             for record in owner_records
         )
-        and len({record[0] for record in owner_records}) == len(owner_records)
+        and len(set(owner_records)) == 1
     )
     for run_id in (
         "ordered-server-dispatch-restart",
@@ -274,7 +309,8 @@ def _collect_evidence(
         "phases": phases,
         "slice_attempt": nested.slices[nested_leaf].attempts,
         "invocation_generations": generations,
-        "recovery_round": len(phases) - 1,
+        "recovery_round": max(rounds, default=-1),
+        "recovery_lineage": lineage,
         "unrelated_sibling_completed_while_waiting": sibling_progress,
         "same_owner_worktree_preserved": owner_preserved,
         "review_fsm_entered_only_after_pr_filed": _review_handoff_is_ordered(
@@ -328,9 +364,13 @@ def run_case(index: int) -> dict[str, object]:
                 )
             issue_id = _issue_id(created)
             swarm_id = real.server_run_id(repo)
-            real.run_recursive_checkpoint_probe(client, root, repo, swarm_id)
+            recovery_trace = real.run_recursive_checkpoint_probe(
+                client, root, repo, swarm_id
+            )
+            real.run_real_watcher_routing_probe(client, root, repo, forgejo, swarm_id)
             marker.write_bytes(b"dirty recovery content\n")
             traces = real.run_delayed_restart_probe(client, root, repo, forgejo)
+            traces["nested_recovery"] = recovery_trace
             real.run_live_ordered_probe(client, root, repo, swarm_id)
             real.assert_stage_events(repo, swarm_id)
             evidence = _collect_evidence(root, repo, traces, marker, swarm_id)

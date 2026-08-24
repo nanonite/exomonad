@@ -7,10 +7,15 @@ through nested dispatch, sibling scheduling, restart barriers, base
 revalidation, PR publication, watcher delivery, and review handoff.
 
 The harness records a recovery trace at dispatch, aggregate-review,
-base-revalidation, and merge boundaries. It asserts that a sibling completes
-while the blocked path waits, the same owner and dirty worktree survive the
-restart, action journals converge without duplicate keys, and review/CI events
-follow PR publication. The complete scenario runs three consecutive disposable
+base-revalidation, and merge boundaries. Recovery generations, rounds, phases,
+and owner identity are copied from persisted SliceState.recovery checkpoints;
+the harness never derives them from generic controller phases. It asserts that
+a sibling completes while the blocked path waits, the same owner and dirty
+worktree survive the restart, action journals converge without duplicate keys,
+and one identity-matched, UUID-scoped pr.filed → copilot.review/CI chain proves
+the review handoff. If two authoritative recovery checkpoints or that event
+chain are absent, the run fails instead of substituting Forgejo requests or
+unscoped ledger rows. The complete scenario runs three consecutive disposable
 sessions and cleans every server, tmux session, worktree, and mock API.
 
 Mutation smoke checks operate only on the captured evidence object. They cover
