@@ -4,9 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import cast
 
-from tl_loop.state.schema import ObservationProvenance, SliceState, SliceStatus
+from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.state.schema import (
+    CI_STATUS_VALUES,
+    ActionKind,
+    ActionPhase,
+    ObservationProvenance,
+    RunState,
+    SliceState,
+    SliceStatus,
+    Verdict,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +50,223 @@ class ObservationReduction:
     changed: bool
     accepted: bool
     reason: str
+
+
+@dataclass(frozen=True)
+class InternalTransition:
+    """A persisted lifecycle transition derived without issuing an effect."""
+
+    transition: str
+    reason: str
+
+    @property
+    def name(self) -> str:
+        return self.transition
+
+
+@dataclass(frozen=True)
+class ExternalIntent:
+    """An effect request whose arguments come only from persisted state."""
+
+    operation: str
+    target_id: str
+    arguments: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "arguments", MappingProxyType(dict(self.arguments)))
+
+    @property
+    def kind(self) -> str:
+        return self.operation
+
+    @property
+    def target(self) -> str:
+        return self.target_id
+
+
+@dataclass(frozen=True)
+class Quiescent:
+    """A deterministic wait reason; no effect is safe from current evidence."""
+
+    reason: str
+
+
+MergeDecision = InternalTransition | ExternalIntent | Quiescent
+
+
+def derive_next_action(persisted_state: SliceState | RunState) -> MergeDecision:
+    """Derive one merge/review action from durable evidence only.
+
+    The function deliberately accepts no watcher response or effect client.
+    Repeated calls over the same checkpoint therefore produce the same result,
+    independent of event arrival order.
+    """
+    if isinstance(persisted_state, RunState):
+        return _derive_run_action(persisted_state)
+    return _derive_slice_action(persisted_state)
+
+
+def _derive_run_action(state: RunState) -> MergeDecision:
+    active = tuple(
+        current
+        for _, current in sorted(state.slices.items())
+        if current.status not in {SliceStatus.MERGED, SliceStatus.FAILED}
+    )
+    integration = state.integration
+    if integration.lifecycle is IntegrationLifecycle.MERGED:
+        return InternalTransition("terminal", "aggregate_merged")
+    if integration.lifecycle in {IntegrationLifecycle.FAILED, IntegrationLifecycle.PARKED}:
+        return Quiescent(f"aggregate_{integration.lifecycle.value.lower()}")
+    if integration.lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT:
+        return ExternalIntent(
+            "repair_aggregate",
+            integration.integration_owner_id or state.run_id,
+            {"reason": "integration_conflict"},
+        )
+    if integration.lifecycle is IntegrationLifecycle.NEEDS_BASE_REVALIDATION:
+        return ExternalIntent(
+            "revalidate_base",
+            integration.integration_owner_id or state.run_id,
+            {"base_sha": integration.validated_base_sha},
+        )
+    if integration.lifecycle is IntegrationLifecycle.REPAIRING_AGGREGATE:
+        return ExternalIntent(
+            "repair_aggregate",
+            integration.integration_owner_id or state.run_id,
+            {"reason": "aggregate_repair"},
+        )
+    if integration.lifecycle is IntegrationLifecycle.INTEGRATION_VALIDATED:
+        if not _aggregate_merge_gates_ready(integration):
+            return Quiescent("await_integration_evidence")
+        return ExternalIntent(
+            "merge_aggregate",
+            integration.integration_owner_id or state.run_id,
+            {"pr_number": integration.aggregate_pr_number, "head_sha": integration.head_sha},
+        )
+    if integration.lifecycle is IntegrationLifecycle.READY_FOR_INTEGRATION:
+        return ExternalIntent(
+            "validate_integration",
+            integration.integration_owner_id or state.run_id,
+            {"head_sha": integration.head_sha},
+        )
+    if integration.lifecycle is IntegrationLifecycle.AGGREGATE_PR_OPEN:
+        return Quiescent("await_aggregate_review")
+    if integration.lifecycle is IntegrationLifecycle.CODE_REVIEWED:
+        return Quiescent("await_integration_validation")
+    if integration.lifecycle is IntegrationLifecycle.MERGING:
+        return Quiescent("await_merge_recovery")
+    if integration.lifecycle is IntegrationLifecycle.CHILDREN_MERGED:
+        return ExternalIntent(
+            "publish_aggregate",
+            integration.integration_owner_id or state.run_id,
+            {"patch_digest": integration.aggregate_patch_digest},
+        )
+    if active:
+        return _derive_slice_action(active[0])
+    return Quiescent("no_active_slices")
+
+
+def _derive_slice_action(state: SliceState) -> MergeDecision:
+    if state.status is SliceStatus.MERGED:
+        return InternalTransition("terminal", "merged")
+    if state.status in {
+        SliceStatus.DISPATCH_FAILED,
+        SliceStatus.FAILED,
+        SliceStatus.PARKED,
+        SliceStatus.BLOCKED,
+    }:
+        return Quiescent(f"closed_{state.status.value}")
+    if _has_conflict(state):
+        return InternalTransition("repairing", "conflict")
+    current_head = _persisted_head(state)
+    if (
+        state.reviewed_head is not None
+        and current_head is not None
+        and state.reviewed_head != current_head
+    ):
+        return InternalTransition("in_review", "head_reset")
+    if state.status is SliceStatus.REPAIRING:
+        return ExternalIntent("repair", state.id, {"head_sha": current_head})
+    if state.pr_number is None or current_head is None:
+        return Quiescent("await_publication")
+    if (
+        state.handoff is None
+        or state.handoff.pr_number != state.pr_number
+        or state.handoff.head_sha != current_head
+    ):
+        return Quiescent("await_handoff")
+    if state.publication is not None and state.publication.pr_number != state.pr_number:
+        return Quiescent("await_publication")
+    if state.reviewer_attempt.get(current_head, 0) == 0:
+        return ExternalIntent(
+            "spawn_reviewer",
+            state.id,
+            {"pr_number": state.pr_number, "head_sha": current_head},
+        )
+    if state.verdict is None or state.reviewed_head != current_head:
+        return Quiescent("await_review")
+    ci_status = state.ci_state.get(current_head, "unknown")
+    if ci_status not in CI_STATUS_VALUES:
+        return Quiescent("await_ci")
+    if ci_status in {"unknown", "pending"}:
+        return Quiescent("await_ci")
+    if ci_status == "failure" or state.verdict is Verdict.NO_GO:
+        return ExternalIntent("repair", state.id, {"head_sha": current_head})
+    if state.action is not None and state.action.kind is ActionKind.MERGE:
+        if state.action.phase in {
+            ActionPhase.INTENDED,
+            ActionPhase.IN_FLIGHT,
+            ActionPhase.UNKNOWN,
+        }:
+            return Quiescent("await_merge_recovery")
+        if state.action.phase in {ActionPhase.CONFIRMED, ActionPhase.RECONCILED}:
+            return InternalTransition("terminal", "merge_confirmed")
+    if state.verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and ci_status in {
+        "success",
+        "neutral",
+    }:
+        return ExternalIntent(
+            "merge",
+            state.id,
+            {"pr_number": state.pr_number, "head_sha": current_head},
+        )
+    return Quiescent("await_merge_gate")
+
+
+def _persisted_head(state: SliceState) -> str | None:
+    if state.publication is not None:
+        return state.publication.head_sha
+    if state.handoff is not None:
+        return state.handoff.head_sha
+    return state.reviewed_head
+
+
+def _has_conflict(state: SliceState) -> bool:
+    if state.dispatch_error is not None and "conflict" in state.dispatch_error.lower():
+        return True
+    reconciliation = state.reconciliation
+    return isinstance(reconciliation, Mapping) and bool(reconciliation.get("conflicts"))
+
+
+def _aggregate_merge_gates_ready(state: object) -> bool:
+    required_text = (
+        "head_sha",
+        "aggregate_patch_digest",
+        "patch_digest",
+        "merge_tree_sha",
+        "validated_base_sha",
+        "integration_owner_id",
+        "integration_owner_run_id",
+        "integration_owner_branch",
+        "integration_owner_worktree",
+    )
+    if any(not isinstance(getattr(state, name, None), str) for name in required_text):
+        return False
+    if not isinstance(getattr(state, "aggregate_pr_number", None), int):
+        return False
+    if getattr(state, "ci_status", "unknown") not in {"success", "neutral"}:
+        return False
+    return getattr(state, "stage_verification", "pending") == "passed"
 
 
 def reduce_observation(
