@@ -1810,6 +1810,158 @@ def _review_store(
     return store
 
 
+def _direct_reviewer_event(*, verdict: str, agent_id: str = "review-pr-42-codex") -> EventEnvelope:
+    return project(
+        {
+            "type": "pr.review",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": agent_id,
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "kind": "approved" if verdict == "GO" else "changes_requested",
+                "verdict": verdict,
+                "findings": []
+                if verdict == "GO"
+                else [
+                    {
+                        "severity": "blocking",
+                        "path": "src/leaf.py",
+                        "rationale": "The failure path is unhandled",
+                    }
+                ],
+            },
+        }
+    )
+
+
+def test_direct_reviewer_approval_is_reduced_for_exact_head_without_model(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                reviewer_attempt={"head-a": 1},
+                reviewer_agent_id="review-pr-42-codex",
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+
+    _route_review_event(
+        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+        store,
+        store.load(),
+        TLPlanning(),
+        _direct_reviewer_event(verdict="GO"),
+        1,
+        TLLoopConfig(active=True),
+        EffectClient(RecordingTransport()),
+        [],
+    )
+
+    restored = store.load().slices["leaf-a"]
+    assert restored.verdict is Verdict.GO
+    assert restored.reviewed_head == "head-a"
+    assert restored.reviewer_agent_id == "review-pr-42-codex"
+
+
+def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path: Path) -> None:
+    backend = ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "root_cause": "The failure path is unhandled in src/leaf.py",
+                    "proposed_solution": "Handle the failure in src/leaf.py",
+                    "read_first": ["src/leaf.py"],
+                    "steps": ["Update src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "boundary": ["Only edit src/leaf.py"],
+                    "done_criteria": ["The failure path is covered"],
+                }
+            )
+        ]
+    )
+    transport = ReviewRepairTransport()
+    store = _review_store(tmp_path)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                reviewer_attempt={"head-a": 1},
+                reviewer_agent_id="review-pr-42-codex",
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "implement",
+                    "boundary": ["src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                }
+            ]
+        }
+    )
+    config = TLLoopConfig(
+        active=True,
+        review_model_choice=_review_choice(backend),
+        review_policy_path=Path(".exo/review-policy.toml"),
+    )
+    event = _direct_reviewer_event(verdict="NO-GO")
+    _route_review_event(plan, store, store.load(), TLPlanning(), event, 1, config, EffectClient(transport), [])
+    _route_review_event(plan, store, store.load(), TLPlanning(), event, 2, config, EffectClient(transport), [])
+
+    restored = store.load().slices["leaf-a"]
+    assert restored.verdict is Verdict.NO_GO
+    assert restored.status is SliceStatus.REPAIRING
+    assert len([name for name, _ in transport.calls if name == "resume_pr"]) == 1
+
+
+def test_direct_reviewer_verdict_rejects_unregistered_actor(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                reviewer_attempt={"head-a": 1},
+                reviewer_agent_id="review-pr-42-codex",
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+
+    _route_review_event(
+        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+        store,
+        store.load(),
+        TLPlanning(),
+        _direct_reviewer_event(verdict="GO", agent_id="leaf-a"),
+        1,
+        TLLoopConfig(active=True),
+        EffectClient(RecordingTransport()),
+        [],
+    )
+
+    assert store.load().slices["leaf-a"].verdict is None
+
+
 def test_child_completion_records_exact_head_handoff_without_merging(tmp_path: Path) -> None:
     store = _review_store(tmp_path)
     current = store.load().slices["leaf-a"]

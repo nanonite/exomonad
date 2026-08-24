@@ -168,6 +168,7 @@ def _migrate_slices(value: object) -> list[str]:
             ("review_findings", {}),
             ("ci_state", {}),
             ("reviewer_attempt", {}),
+            ("reviewer_agent_id", None),
             ("repair_attempts", 0),
         ):
             if key not in raw:

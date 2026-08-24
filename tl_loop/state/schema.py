@@ -412,6 +412,7 @@ SLICE_KEYS = frozenset(
         "review_patch_digests",
         "ci_state",
         "reviewer_attempt",
+        "reviewer_agent_id",
         "repair_attempts",
         "reviewed_head",
         "verdict_at",
@@ -590,6 +591,7 @@ class SliceState:
     review_patch_digests: Mapping[str, str] = field(default_factory=dict)
     ci_state: Mapping[str, str] = field(default_factory=dict)
     reviewer_attempt: Mapping[str, int] = field(default_factory=dict)
+    reviewer_agent_id: str | None = None
     repair_attempts: int = 0
     verdict_at: str | None = None
     park_cause: ParkCause | None = None
@@ -1051,6 +1053,7 @@ def _validate_slice(
     _string_map(value.get("review_patch_digests"), f"{path}.review_patch_digests", errors)
     _ci_state(value.get("ci_state"), path, errors)
     _reviewer_attempt(value.get("reviewer_attempt"), path, errors)
+    _nullable_string(value, "reviewer_agent_id", path, errors)
     if "repair_attempts" in value:
         _non_negative_int(value, "repair_attempts", path, errors)
     _nullable_enum_value(value, "park_cause", path, ParkCause, errors)

@@ -714,6 +714,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             "attempts": value.attempts,
             "verdict": value.verdict.value if value.verdict else None,
         }
+        if value.reviewer_agent_id is not None:
+            record["reviewer_agent_id"] = value.reviewer_agent_id
         if value.review_patch_digests:
             record["review_patch_digests"] = dict(value.review_patch_digests)
         if value.verdict_at is not None:
@@ -1237,6 +1239,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         review_patch_digests=_decode_string_map(value.get("review_patch_digests")),
         ci_state=_decode_string_map(value.get("ci_state")),
         reviewer_attempt=_decode_int_map(value.get("reviewer_attempt")),
+        reviewer_agent_id=cast(str | None, value.get("reviewer_agent_id")),
         repair_attempts=cast(int, value.get("repair_attempts", 0)),
         attempts=cast(int, value["attempts"]),
         verdict=Verdict(cast(str, value["verdict"])) if value["verdict"] is not None else None,

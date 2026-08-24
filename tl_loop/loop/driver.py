@@ -1066,9 +1066,10 @@ def _run_loop(
         diagnostics.last_observed_progress_at = state.goals.last_progress_at
         if config.heartbeat is not None:
             state = _note_heartbeat_progress(store, state)
+        direct_reviewer_verdict = event.event_type == "pr.review" and "verdict" in event.data
         if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW}:
             diagnostics.correlated += 1
-            if _review_workflow_enabled(config):
+            if _review_workflow_enabled(config) or direct_reviewer_verdict:
                 state = _route_review_event(
                     plan, store, state, phase, event, checkpoint_seq, config, effects, effects_log
                 )
@@ -1263,7 +1264,9 @@ def _run_loop(
             effects_log,
         )
         if head_changed and config.enable_reviewer_spawn:
-            _spawn_reviewer_for_head(plan, state, fsm_event, event, config, effects, effects_log)
+            _spawn_reviewer_for_head(
+                plan, state, fsm_event, event, config, effects, effects_log, store
+            )
         _ack_event(source, event, replaying, diagnostics)
         _release_replayed_event(store, event, replaying)
         diagnostics.correlated += 1
@@ -2085,7 +2088,7 @@ def _reconcile_nonterminal_slices(
         state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
     for target_id, pr_number, head_sha in pending_reviewer_spawns:
         _spawn_reviewer_for_slice(
-            plan, state, target_id, pr_number, head_sha, config, effects, effects_log
+            plan, state, target_id, pr_number, head_sha, config, effects, effects_log, store
         )
     return state
 
@@ -4944,7 +4947,9 @@ def _record_review_event(
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     verdict = _review_verdict(event)
     if verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and not _reviewer_identity_authorized(
-        event, current
+        event,
+        current,
+        strict=event.event_type == "pr.review" and "verdict" in event.data,
     ):
         LOGGER.warning(
             "[TL loop] ignoring unauthorized approval evidence target=%s agent=%s",
@@ -4985,8 +4990,29 @@ def _review_workflow_enabled(config: TLLoopConfig) -> bool:
     return config.active and config.review_model_choice is not None
 
 
-def _reviewer_identity_authorized(event: EventEnvelope, current: SliceState) -> bool:
-    """Accept reviewer or human evidence, never a persisted worker self-approval."""
+def _reviewer_identity_authorized(
+    event: EventEnvelope,
+    current: SliceState,
+    *,
+    strict: bool = False,
+) -> bool:
+    """Accept authorized reviewer/human evidence, never a worker self-approval."""
+    if strict:
+        if current.pr_number is not None and event.pr_number != current.pr_number:
+            return False
+        if event.head_sha is None:
+            return False
+        if current.reviewed_head is not None and current.reviewed_head != event.head_sha:
+            return False
+        actor_id = event.agent_id
+        expected = current.reviewer_agent_id
+        if expected is not None:
+            return actor_id == expected
+        if current.reviewer_attempt.get(event.head_sha, 0) <= 0 or actor_id is None:
+            return False
+        return actor_id.startswith(f"review-pr-{event.pr_number}-") or actor_id == (
+            f"review-pr-{event.pr_number}"
+        )
     actor_role = event.role or event.data.get("actor_role") or event.data.get("actor_type")
     if isinstance(actor_role, str):
         normalized = actor_role.strip().lower()
@@ -5086,6 +5112,20 @@ def _route_review_event(
     findings = _event_findings(event)
     if head_sha is None:
         raise TLLoopError(f"{event.event_type!r} findings have no head SHA")
+    incoming_verdict = _review_verdict(event)
+    if (
+        incoming_verdict is not None
+        and current.reviewed_head == head_sha
+        and current.verdict is not None
+    ):
+        LOGGER.info(
+            "[TL loop] ignoring repeated reviewer verdict target=%s head=%s existing=%s incoming=%s",
+            slice_id,
+            head_sha,
+            current.verdict.value,
+            incoming_verdict.value,
+        )
+        return state
     review_findings = _review_findings(current, head_sha, findings)
     patch_digest = _event_patch_digest(event)
     patch_digests = dict(current.review_patch_digests)
@@ -5128,37 +5168,71 @@ def _route_review_event(
     if leaf is None and not _is_aggregate_slice(current):
         raise TLLoopError(f"review event references non-leaf slice {slice_id!r}")
     criteria = compose_acceptance_criteria(current, leaf or {})
-    result = adjudicate_review(
-        _review_diff(event),
-        findings,
-        list(criteria),
-        head_sha,
-        model_choice=config.review_model_choice,
-        policy_path=config.review_policy_path or Path(".exo/review-policy.toml"),
-    )
-    review_findings = _persist_adjudication_nits(review_findings, head_sha, result.reasons)
-    if result.verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and not _reviewer_identity_authorized(
-        event, current
-    ):
-        LOGGER.warning(
-            "[TL loop] ignoring unauthorized approval evidence target=%s agent=%s",
-            slice_id,
-            event.agent_id,
+    direct_reviewer_event = event.event_type == "pr.review" and "verdict" in event.data
+    reviewer_agent_id = current.reviewer_agent_id
+    if direct_reviewer_event:
+        if incoming_verdict is None or not _reviewer_identity_authorized(
+            event, current, strict=True
+        ):
+            LOGGER.warning(
+                "[TL loop] ignoring unauthorized reviewer verdict target=%s agent=%s head=%s",
+                slice_id,
+                event.agent_id,
+                head_sha,
+            )
+            return state
+        decision_verdict = incoming_verdict
+        decision_head = head_sha
+        decision_reasons = tuple(
+            {
+                "severity": finding["severity"],
+                "file": finding["path"],
+                "line": 0,
+                "claim": finding["rationale"],
+            }
+            for finding in findings
         )
-        updated = dict(state.slices)
-        updated[slice_id] = replace(
-            current,
-            pr_number=event.pr_number or current.pr_number,
-            review_findings=review_findings,
-            review_patch_digests=patch_digests,
-            stall_classification=stall_classification or current.stall_classification,
+        if reviewer_agent_id is None:
+            reviewer_agent_id = event.agent_id
+    else:
+        result = adjudicate_review(
+            _review_diff(event),
+            findings,
+            list(criteria),
+            head_sha,
+            model_choice=config.review_model_choice,
+            policy_path=config.review_policy_path or Path(".exo/review-policy.toml"),
         )
-        return store.checkpoint(phase, updated, state.budgets, event_seq)
+        decision_verdict = result.verdict
+        decision_head = result.reviewed_head
+        decision_reasons = result.reasons
+        if decision_verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and not _reviewer_identity_authorized(
+            event, current
+        ):
+            LOGGER.warning(
+                "[TL loop] ignoring unauthorized approval evidence target=%s agent=%s",
+                slice_id,
+                event.agent_id,
+            )
+            updated = dict(state.slices)
+            updated[slice_id] = replace(
+                current,
+                pr_number=event.pr_number or current.pr_number,
+                review_findings=review_findings,
+                review_patch_digests=patch_digests,
+                stall_classification=stall_classification or current.stall_classification,
+            )
+            return store.checkpoint(phase, updated, state.budgets, event_seq)
+    review_findings = _persist_adjudication_nits(review_findings, head_sha, decision_reasons)
     updated = dict(state.slices)
     authorized_exact_verdict = (
-        result.verdict in {Verdict.GO, Verdict.GO_WITH_NITS}
-        and _reviewer_identity_authorized(event, current)
-        and result.reviewed_head == head_sha
+        decision_verdict in {Verdict.GO, Verdict.GO_WITH_NITS}
+        and _reviewer_identity_authorized(
+            event,
+            current,
+            strict=direct_reviewer_event,
+        )
+        and decision_head == head_sha
     )
     next_stall_classification = (
         None
@@ -5168,27 +5242,28 @@ def _route_review_event(
     updated[slice_id] = replace(
         current,
         pr_number=event.pr_number or current.pr_number,
-        reviewed_head=result.reviewed_head,
-        verdict=result.verdict,
+        reviewed_head=decision_head,
+        verdict=decision_verdict,
         verdict_at=event.observed_at,
         review_findings=review_findings,
         review_patch_digests=patch_digests,
-        ci_state={} if current.reviewed_head != result.reviewed_head else current.ci_state,
+        ci_state={} if current.reviewed_head != decision_head else current.ci_state,
+        reviewer_agent_id=reviewer_agent_id,
         stall_classification=next_stall_classification,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     if _is_aggregate_slice(updated[slice_id]):
         state = _record_aggregate_review_lifecycle(
-            store, state, phase, event_seq, slice_id, result.verdict
+            store, state, phase, event_seq, slice_id, decision_verdict
         )
-    if result.verdict is Verdict.NO_GO:
+    if decision_verdict is Verdict.NO_GO:
         return _route_repair(
             store,
             state,
             phase,
             event_seq,
             slice_id,
-            result,
+            {"verdict": decision_verdict.value, "reasons": list(decision_reasons)},
             config,
             effects,
             effects_log,
@@ -5499,6 +5574,15 @@ def _repair_arguments(
 
 
 def _review_verdict(event: EventEnvelope) -> Verdict | None:
+    explicit = event.data.get("verdict")
+    if isinstance(explicit, str):
+        normalized = explicit.strip().upper().replace("_", "-")
+        if normalized in {"GO", "APPROVED"}:
+            return Verdict.GO
+        if normalized in {"GO-WITH-NITS", "APPROVED-WITH-NITS"}:
+            return Verdict.GO_WITH_NITS
+        if normalized in {"NO-GO", "CHANGES-REQUESTED", "REQUESTED-CHANGES"}:
+            return Verdict.NO_GO
     if event.review_kind in {"merge_ready", "approved"}:
         return Verdict.GO
     if event.review_state in {"approved", "approve"}:
@@ -5972,6 +6056,7 @@ def _spawn_reviewer_for_head(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    store: RunStore,
 ) -> None:
     if not isinstance(event, (PRFiled, PRUpdated)):
         return
@@ -5979,7 +6064,7 @@ def _spawn_reviewer_for_head(
     if target_id is None:
         return
     _spawn_reviewer_for_slice(
-        plan, state, target_id, event.pr_number, event.head_sha, config, effects, effects_log
+        plan, state, target_id, event.pr_number, event.head_sha, config, effects, effects_log, store
     )
 
 
@@ -5992,6 +6077,7 @@ def _spawn_reviewer_for_slice(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    store: RunStore,
 ) -> None:
     """Spawn a reviewer for a known PR head.
 
@@ -6012,7 +6098,7 @@ def _spawn_reviewer_for_slice(
         "force": False,
     }
     live = cast(EffectClient, effects) if config.active else None
-    _invoke(
+    result = _invoke(
         "spawn_reviewer",
         target_id,
         arguments,
@@ -6026,6 +6112,24 @@ def _spawn_reviewer_for_slice(
         ),
         effects_log,
     )
+    reviewer_name = (
+        result.result.get("reviewer_name")
+        if result is not None and isinstance(result.result, Mapping)
+        else None
+    )
+    if isinstance(reviewer_name, str) and reviewer_name:
+        latest = store.load()
+        latest_slice = latest.slices.get(target_id)
+        if latest_slice is not None and latest_slice.reviewer_agent_id != reviewer_name:
+            store.checkpoint(
+                latest.fsm,
+                {**latest.slices, target_id: replace(latest_slice, reviewer_agent_id=reviewer_name)},
+                latest.budgets,
+                latest.events.last_consumed_offset,
+                current_order=latest.current_order,
+                ordered_stages=latest.ordered_stages,
+                integration=latest.integration,
+            )
 
 
 def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool:
