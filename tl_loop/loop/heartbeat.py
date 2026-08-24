@@ -18,6 +18,7 @@ from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recov
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.loop.reconcile import reconcile_merge_observation
 from tl_loop.loop.recovery_policy import (
     ProbeResult,
     RecoveryAction,
@@ -398,6 +399,7 @@ def heartbeat_once(
             )
             continue
         updated, observed = _reconcile_pr(slice_state, watcher)
+        updated = reconcile_merge_observation(updated, watcher)
         if updated == slice_state:
             continue
         current = store.checkpoint(

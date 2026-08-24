@@ -115,7 +115,12 @@ from tl_loop.state.serialization import DurableWriteError
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .journal import MUTATING_OPERATIONS, EffectJournal, stable_action_key
-from .reconcile import Quiescent, ReconciliationResult, reconcile_slice
+from .reconcile import (
+    Quiescent,
+    ReconciliationResult,
+    reconcile_merge_observation,
+    reconcile_slice,
+)
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
@@ -1920,6 +1925,8 @@ def _reconcile_nonterminal_slices(
             watcher,
             owner_id,
         )
+        if watcher is not None:
+            reconciled = reconcile_merge_observation(reconciled, watcher)
         if result.next_action in {"park_closed_unmerged_pr", "park_unreachable_pr_head"}:
             if isinstance(effects, ReadOnlyEffectClient):
                 raise TLLoopError(

@@ -6,8 +6,18 @@ from dataclasses import replace
 
 import pytest
 
-from tl_loop.loop.reconcile import reduce_observation, reconcile_slice
-from tl_loop.state.schema import ObservationProvenance, SliceState, SliceStatus
+from tl_loop.loop.reconcile import (
+    reconcile_merge_observation,
+    reduce_observation,
+    reconcile_slice,
+)
+from tl_loop.state.schema import (
+    HandoffEvidence,
+    ObservationProvenance,
+    SliceState,
+    SliceStatus,
+    Verdict,
+)
 from tl_loop.state.store import RunStore, _encode_slice, create
 
 
@@ -391,3 +401,41 @@ def test_reconciliation_evidence_round_trips_through_checkpoint(tmp_path) -> Non
     )
 
     assert store.load().slices["slice-a"].reconciliation == evidence
+
+
+def test_merge_ready_snapshot_queues_merge_once_for_matching_handoff() -> None:
+    head = "head-a"
+    state = replace(
+        _slice(SliceStatus.IN_REVIEW),
+        reviewed_head=head,
+        verdict=Verdict.GO,
+        reviewer_attempt={head: 1},
+        handoff=HandoffEvidence(42, head, 1, "inv-1", "agent-a", "2026-08-24T00:00:00Z"),
+    )
+    watcher = {
+        "found": True,
+        "head_sha": head,
+        "review_state": "approved",
+        "ci_status": "success",
+        "pr_state": "open",
+        "merged": False,
+    }
+
+    result = reconcile_slice(state, authoritative_owner_id="agent-a", watcher=watcher)
+    reconciled = reconcile_merge_observation(state, watcher)
+
+    assert result.next_action == "queue_merge"
+    assert reconciled.reconciliation is not None
+    assert reconciled.reconciliation["next_action"] == "queue_merge"
+    assert reconcile_merge_observation(reconciled, watcher) is reconciled
+
+
+def test_merged_snapshot_is_adopted_without_waiting_for_edge() -> None:
+    state = replace(_slice(SliceStatus.IN_REVIEW), reviewed_head="head-a")
+    watcher = {"found": True, "head_sha": "head-a", "merged": True, "pr_state": "open"}
+
+    reconciled = reconcile_merge_observation(state, watcher)
+
+    assert reconciled.status is SliceStatus.MERGED
+    assert reconciled.reconciliation is not None
+    assert reconciled.reconciliation["next_action"] == "adopt_merged"

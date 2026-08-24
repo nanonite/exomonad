@@ -41,6 +41,67 @@ class ReconciliationResult:
         }
 
 
+def reconcile_merge_observation(
+    state: SliceState,
+    watcher: Mapping[str, object],
+) -> SliceState:
+    """Fold one authoritative PR snapshot into merge readiness evidence.
+
+    A snapshot is sufficient to queue a merge only when the persisted review,
+    CI, publication, and owner handoff all refer to the same head.  The fold
+    is deliberately idempotent: unchanged snapshots return the same state.
+    """
+    head_sha = watcher.get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha:
+        return state
+    if watcher.get("merged") is True:
+        reconciliation = {
+            "confirmed_stage": "merge",
+            "authoritative_evidence": ["published_pr", "pr_state", "merged"],
+            "missing_evidence": [],
+            "conflicts": [],
+            "next_action": "adopt_merged",
+        }
+        if state.status is SliceStatus.MERGED and state.reconciliation == reconciliation:
+            return state
+        return replace(
+            state,
+            status=SliceStatus.MERGED,
+            action=None,
+            reconciliation=reconciliation,
+        )
+    if state.status is not SliceStatus.IN_REVIEW:
+        return state
+    if state.reviewed_head != head_sha:
+        return state
+    if state.handoff is None or state.handoff.head_sha != head_sha:
+        return state
+    if state.reviewer_attempt.get(head_sha, 0) <= 0:
+        return state
+    if state.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
+        return state
+    ci_status = watcher.get("ci_status", state.ci_state.get(head_sha, "unknown"))
+    if ci_status not in {"success", "neutral"}:
+        return state
+    if watcher.get("pr_state", "open") == "closed":
+        return state
+    reconciliation = {
+        "confirmed_stage": "merge",
+        "authoritative_evidence": [
+            "published_pr",
+            "review_verdict",
+            "ci_status",
+            "handoff",
+        ],
+        "missing_evidence": [],
+        "conflicts": [],
+        "next_action": "queue_merge",
+    }
+    if state.reconciliation == reconciliation:
+        return state
+    return replace(state, reconciliation=reconciliation)
+
+
 @dataclass(frozen=True)
 class ObservationReduction:
     """Deterministic fold result for one watcher edge or snapshot."""
@@ -490,6 +551,11 @@ def reconcile_slice(
         and watcher.get("found") is True
         and watcher.get("head_reachable") is False
     )
+    merge_observation = (
+        reconcile_merge_observation(slice_state, watcher)
+        if watcher is not None
+        else None
+    )
     if closed_unmerged:
         action = "park_closed_unmerged_pr"
     elif head_unreachable:
@@ -500,6 +566,13 @@ def reconcile_slice(
         action = "await_authoritative_evidence"
     elif watcher and watcher.get("merged") is True:
         action = "adopt_merged_state"
+    elif (
+        slice_state.status is SliceStatus.IN_REVIEW
+        and merge_observation is not None
+        and merge_observation.reconciliation is not None
+        and merge_observation.reconciliation.get("next_action") == "queue_merge"
+    ):
+        action = "queue_merge"
     elif slice_state.status is SliceStatus.SPAWNED:
         action = "await_review_event"
     elif slice_state.status is SliceStatus.REPAIRING:
