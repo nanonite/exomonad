@@ -27,7 +27,9 @@ def _ignore_termination() -> None:
 def test_multiprocessing_cleanup_kills_and_reaps_stubborn_controller() -> None:
     process = multiprocessing.get_context("fork").Process(target=_ignore_termination)
     process.start()
-    harness.stop_multiprocessing_process(process, "stubborn test controller", timeout=0.05)
+    harness.stop_multiprocessing_process(
+        process, "stubborn test controller", timeout=0.05
+    )
     assert not process.is_alive()
     assert process.exitcode is not None
 
@@ -80,7 +82,9 @@ def test_recovery_trace_persists_checkpoint_cursor_and_action_keys(
     ]
 
 
-def test_recovery_action_journal_rejects_unresolved_or_duplicate_keys(tmp_path: Path) -> None:
+def test_recovery_action_journal_rejects_unresolved_or_duplicate_keys(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "actions.json"
     path.write_text(
         json.dumps(
@@ -102,7 +106,9 @@ def test_recovery_action_journal_rejects_unresolved_or_duplicate_keys(tmp_path: 
         harness.assert_action_journal_converged(path)
 
 
-def test_real_server_mismatched_runtime_name_retains_terminal_exit_context(tmp_path: Path) -> None:
+def test_real_server_mismatched_runtime_name_retains_terminal_exit_context(
+    tmp_path: Path,
+) -> None:
     """Production-shaped fixture for a slice slug and suffixed runtime owner.
 
     The server writes the terminal invocation record under the runtime agent
@@ -159,11 +165,15 @@ def test_real_server_mismatched_runtime_name_retains_terminal_exit_context(tmp_p
     )
 
     events = harness.server_ledger_events(repo)
-    finished = next(event for event in events if event["type"] == "agent.invocation.finished")
+    finished = next(
+        event for event in events if event["type"] == "agent.invocation.finished"
+    )
     assert finished["agent_id"] == runtime_name
     assert finished["data"]["slice_id"] == slice_id
     assert finished["data"]["exit_classification"] == "missing_exit_marker"
-    assert worktree.is_dir(), "recovery must preserve the worktree before reconciliation"
+    assert worktree.is_dir(), (
+        "recovery must preserve the worktree before reconciliation"
+    )
 
 
 def test_routing_cleanup_attempts_every_owned_worker_after_failure(
@@ -184,9 +194,7 @@ def test_routing_cleanup_attempts_every_owned_worker_after_failure(
     monkeypatch.setattr(
         harness,
         "reviewer_spawn_events",
-        lambda repo, swarm_id, pr_number: {
-            1: {"data": {"child_agent": "reviewer"}}
-        },
+        lambda repo, swarm_id, pr_number: {1: {"data": {"child_agent": "reviewer"}}},
     )
     try:
         with pytest.raises(harness.HarnessError, match="cleanup failed"):
@@ -204,7 +212,13 @@ def test_routing_cleanup_attempts_every_owned_worker_after_failure(
             process.join(timeout=5)
 
 
-_PROBE_PHASES = ("dispatch", "publication", "watcher_delivery", "checkpoint", "stabilization")
+_PROBE_PHASES = (
+    "dispatch",
+    "publication",
+    "watcher_delivery",
+    "checkpoint",
+    "stabilization",
+)
 
 
 def _install_fake_probe_phases(
@@ -222,7 +236,10 @@ def _install_fake_probe_phases(
         return "owner"
 
     def publication(
-        client: object, forgejo_url: str, owner_id: str, cleanup_state: dict[str, object]
+        client: object,
+        forgejo_url: str,
+        owner_id: str,
+        cleanup_state: dict[str, object],
     ) -> tuple[int, str, str]:
         # Mirrors the real phase: the PR number is known (and a reviewer
         # may already exist for it) as soon as it is filed, before this
@@ -295,7 +312,9 @@ def test_probe_failure_at_each_phase_disposes_controller_and_owned_workers(
 
     stopped: list[str] = []
     monkeypatch.setattr(
-        harness, "stop_spawned_worker", lambda repo, worker_name: stopped.append(worker_name)
+        harness,
+        "stop_spawned_worker",
+        lambda repo, worker_name: stopped.append(worker_name),
     )
     monkeypatch.setattr(
         harness,
@@ -313,7 +332,9 @@ def test_probe_failure_at_each_phase_disposes_controller_and_owned_workers(
                 forgejo_url="http://forgejo.invalid",
                 swarm_id="swarm",
             )
-        assert not process.is_alive(), "controller process must be disposed after probe failure"
+        assert not process.is_alive(), (
+            "controller process must be disposed after probe failure"
+        )
 
         phase_index = _PROBE_PHASES.index(phase)
         expected_workers: set[str] = set()
@@ -337,3 +358,37 @@ def test_probe_failure_at_each_phase_disposes_controller_and_owned_workers(
         if process.is_alive():
             process.kill()
             process.join(timeout=5)
+
+
+def test_merge_convergence_assertion_requires_intent_decision_and_reconciliation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events = [
+        {
+            "type": "tl.action_queued",
+            "run_id": "swarm",
+            "data": {
+                "payload": {
+                    "action": "merge_aggregate",
+                    "action_key": "merge-key-1",
+                }
+            },
+        },
+        {
+            "type": "tl.merge_decided",
+            "run_id": "swarm",
+            "data": {"payload": {"decision": "merge"}},
+        },
+        {
+            "type": "tl.merge_reconciled",
+            "run_id": "swarm",
+            "data": {"payload": {"reconciliation": "authoritative_merge_reconciled"}},
+        },
+    ]
+    monkeypatch.setattr(harness, "server_ledger_events", lambda _: events)
+
+    harness.assert_merge_convergence_events(tmp_path, "swarm")
+
+    monkeypatch.setattr(harness, "server_ledger_events", lambda _: events[:1])
+    with pytest.raises(harness.HarnessError, match="merge decision"):
+        harness.assert_merge_convergence_events(tmp_path, "swarm")

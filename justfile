@@ -102,6 +102,29 @@ tl-loop-ordered-server-e2e:
     nix develop --command cargo build -p exomonad
     {{py}} tests/e2e/ordered-recursive/real_server_transport.py
 
+# Run only the bounded merge-restart acceptance probes against the real server.
+tl-loop-merge-convergence-e2e:
+    nix develop --command cargo build -p exomonad
+    EXOMONAD_MERGE_CONVERGENCE_ONLY=1 {{py}} tests/e2e/ordered-recursive/real_server_transport.py
+
+# Require three consecutive clean real-server convergence runs. Each run uses
+# fresh disposable Git, Forgejo-shaped, tmux, and controller state.
+tl-loop-ordered-server-e2e-3x:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for attempt in 1 2 3; do
+        echo ">>> ordered server merge convergence run ${attempt}/3"
+        just tl-loop-ordered-server-e2e
+    done
+
+tl-loop-merge-convergence-e2e-3x:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for attempt in 1 2 3; do
+        echo ">>> merge convergence server run ${attempt}/3"
+        just tl-loop-merge-convergence-e2e
+    done
+
 # Lint the programmatic TL controller
 tl-loop-lint:
     {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py

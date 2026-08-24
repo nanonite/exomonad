@@ -1034,7 +1034,11 @@ def run_root_recursive_lifecycle_probe(
             config=TLLoopConfig(
                 active=True,
                 keep_alive_on_waiting=False,
-                max_events=256,
+                # StopAfterSpawnQueue intentionally exposes one authoritative
+                # event; a one-event budget prevents the controller from
+                # spinning on the closed queue while the spawned pane is
+                # being cleaned up.
+                max_events=1,
                 poll_interval=0.01,
                 root_dir=state_root,
                 run_id="root",
@@ -2504,6 +2508,48 @@ def assert_stage_events(repo: Path, expected_run_id: str | None = None) -> None:
         )
 
 
+def assert_merge_convergence_events(repo: Path, expected_run_id: str) -> None:
+    """Require durable merge intent, decision, and reconciliation evidence."""
+    events = server_ledger_events(repo)
+    queued: list[Mapping[str, Any]] = []
+    decisions: list[Mapping[str, Any]] = []
+    reconciled: list[Mapping[str, Any]] = []
+    action_keys: set[str] = set()
+    for event in events:
+        if event.get("run_id") != expected_run_id:
+            continue
+        event_type = event.get("type", event.get("event_type"))
+        data = event.get("data")
+        payload = data.get("payload") if isinstance(data, Mapping) else data
+        if not isinstance(payload, Mapping):
+            payload = event
+        if event_type == "tl.action_queued" and payload.get("action") in {
+            "merge",
+            "merge_aggregate",
+        }:
+            queued.append(payload)
+            action_key = payload.get("action_key")
+            if not isinstance(action_key, str) or not action_key:
+                raise HarnessError(f"merge intent has no stable action key: {event!r}")
+            if action_key in action_keys:
+                raise HarnessError(
+                    f"duplicate merge action key in ledger: {action_key}"
+                )
+            action_keys.add(action_key)
+        elif event_type == "tl.merge_decided" and payload.get("decision") == "merge":
+            decisions.append(payload)
+        elif event_type == "tl.merge_reconciled":
+            reconciled.append(payload)
+    if not queued:
+        raise HarnessError("real-server run emitted no durable merge intent")
+    if not decisions:
+        raise HarnessError("real-server run emitted no merge decision")
+    if not reconciled:
+        raise HarnessError(
+            "real-server run emitted no authoritative merge reconciliation"
+        )
+
+
 def waiting_child(run_root: str) -> None:
     create("waiting-child", {}, root_dir=Path(run_root))
     waiting_slice = SliceState(
@@ -2568,6 +2614,11 @@ def main() -> None:
         server: subprocess.Popen[str] | None = None
         try:
             server, client = start_server(root, repo, forgejo_url, project_root)
+            if os.environ.get("EXOMONAD_MERGE_CONVERGENCE_ONLY") == "1":
+                run_delayed_restart_probe(client, root, repo, forgejo_url)
+                assert_merge_convergence_events(repo, server_run_id(repo))
+                print("real server merge convergence: passed")
+                return
             swarm_id = run_root_recursive_lifecycle_probe(client, root, repo)
             run_real_watcher_routing_probe(client, root, repo, forgejo_url, swarm_id)
             run_recursive_checkpoint_probe(client, root, repo, swarm_id)
@@ -2575,6 +2626,7 @@ def main() -> None:
             check_pr_evidence(client, branch, repo, forgejo_url)
             run_delayed_restart_probe(client, root, repo, forgejo_url)
             assert_stage_events(repo, swarm_id)
+            assert_merge_convergence_events(repo, swarm_id)
             run_waiting_supervision_probe(root / "waiting-state")
             print("real server TransportClient ordered recursion: passed")
         finally:
