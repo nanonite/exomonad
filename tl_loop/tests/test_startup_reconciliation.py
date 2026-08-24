@@ -64,6 +64,7 @@ class FakeClient:
     pr_state: str = "open"
     merged: bool = False
     head_reachable: bool = True
+    publication_ownership_verified: bool | None = None
 
     def list_agents(self, *, filter_type: str | None = None) -> ToolResult:
         return ToolResult(
@@ -103,19 +104,24 @@ class FakeClient:
     def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
         self.watcher_calls.append({"pr_number": pr_number})
         if pr_number == self.resolved_pr_number and self.resolved_pr_number is not None:
+            result = {
+                "found": True,
+                "pr_number": self.resolved_pr_number,
+                "head_sha": "head-a",
+                "review_state": self.review_state,
+                "ci_status": "success",
+                "pr_state": self.pr_state,
+                "merged": self.merged,
+                "head_reachable": self.head_reachable,
+            }
+            if self.publication_ownership_verified is not None:
+                result["publication_ownership_verified"] = (
+                    self.publication_ownership_verified
+                )
             return ToolResult(
                 raw={"success": True},
                 success=True,
-                result={
-                    "found": True,
-                    "pr_number": self.resolved_pr_number,
-                    "head_sha": "head-a",
-                    "review_state": self.review_state,
-                    "ci_status": "success",
-                    "pr_state": self.pr_state,
-                    "merged": self.merged,
-                    "head_reachable": self.head_reachable,
-                },
+                result=result,
                 error=None,
             )
         return ToolResult(
@@ -205,6 +211,36 @@ def test_reconciliation_recovers_and_persists_missing_pr_number(tmp_path) -> Non
     ]
     assert new_state.slices["slice-a"].reviewer_attempt == {"head-a": 1}
     assert store.load().slices["slice-a"].reviewer_attempt == {"head-a": 1}
+
+
+def test_reconciliation_adopts_authoritative_publication_handoff_after_restart(
+    tmp_path,
+) -> None:
+    store, state = _load_state(tmp_path)
+    restarted_slice = replace(
+        state.slices["slice-a"],
+        pr_number=99,
+        dispatch_invocation_id="inv-new",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": restarted_slice},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    client = FakeClient(publication_ownership_verified=True)
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
+
+    new_state = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+
+    recovered = new_state.slices["slice-a"]
+    assert recovered.status is SliceStatus.IN_REVIEW
+    assert recovered.handoff is not None
+    assert recovered.handoff.pr_number == 99
+    assert recovered.handoff.head_sha == "head-a"
+    assert recovered.handoff.invocation_id == "inv-new"
+    assert recovered.handoff.agent_id == "agent-a"
+    assert store.load().slices["slice-a"].handoff == recovered.handoff
 
 
 def test_reconciliation_does_not_respawn_reviewer_when_head_already_claimed(

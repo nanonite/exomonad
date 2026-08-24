@@ -870,6 +870,42 @@ where
             &current.invocation_id,
         )
     {
+        let adoptions = match crate::services::pr_registry::adopt_publication_for_invocation(
+            ctx.project_dir(),
+            owner_name.as_str(),
+            &publication.head_branch,
+            &publication.base_branch,
+            publication.slice_id.as_deref().unwrap_or_default(),
+            original,
+            &current.invocation_id,
+        )
+        .await
+        {
+            Ok(adoptions) => adoptions,
+            Err(error) => {
+                return (
+                    false,
+                    format!("publication succession adoption failed: {error}"),
+                )
+            }
+        };
+        for adoption in &adoptions {
+            crate::services::lifecycle::record_invocation_succession(
+                ctx.project_dir(),
+                owner_name.as_str(),
+                adoption,
+            );
+        }
+        if adoptions
+            .iter()
+            .any(|adoption| adoption.pr_number == publication.pr_number)
+            || crate::services::pr_registry::invocation_succession_reaches_current(
+                publication,
+                &current.invocation_id,
+            )
+        {
+            return (true, String::new());
+        }
         return (
             false,
             format!(

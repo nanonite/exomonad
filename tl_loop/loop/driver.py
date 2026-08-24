@@ -2146,6 +2146,31 @@ def _apply_reconciliation_observations(
                 if review_state in {"go-with-nits", "go_with_nits"}
                 else Verdict.GO
             )
+        if (
+            watcher.get("publication_ownership_verified") is True
+            and head_sha
+            and current.pr_number is not None
+            and current.dispatch_agent_id
+            and current.dispatch_invocation_id
+            and (
+                current.publication is None
+                or (
+                    current.publication.pr_number == current.pr_number
+                    and current.publication.head_sha == head_sha
+                )
+            )
+        ):
+            attempt = current.publication.attempt if current.publication else current.attempts
+            updates["handoff"] = HandoffEvidence(
+                pr_number=current.pr_number,
+                head_sha=head_sha,
+                attempt=attempt,
+                invocation_id=current.dispatch_invocation_id,
+                agent_id=current.dispatch_agent_id,
+                observed_at=_now_timestamp(),
+            )
+            if current.status is SliceStatus.SPAWNED:
+                updates["status"] = SliceStatus.IN_REVIEW
         if watcher.get("merged") is True:
             updates["status"] = SliceStatus.MERGED
     if owner_id is not None and current.dispatch_agent_id is None:
@@ -4228,8 +4253,16 @@ def _watcher_snapshot_for_slice(
     if result is None or result.success is not True or not isinstance(result.result, Mapping):
         return None
     resolution = result.result.get("resolution")
-    if resolution != "live":
+    if resolution == "never_published":
         return None
+    if resolution != "live":
+        return {
+            "found": False,
+            "resolution": resolution,
+            "publication_ownership_verified": False,
+            "publication_ownership_error": result.result.get("error")
+            or f"slice publication resolution is {resolution!r}",
+        }
     pr_number = result.result.get("pr_number")
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         return None
