@@ -198,14 +198,22 @@ def test_integration_evidence_rejects_each_changed_dimension(field: str, value: 
 
 
 def test_base_movement_only_requires_integration_revalidation() -> None:
-    state = IntegrationRuntimeState(head_sha="head-a", patch_digest="patch-a", validated_base_sha="base-a")
+    state = IntegrationRuntimeState(
+        head_sha="head-a", patch_digest="patch-a", validated_base_sha="base-a"
+    )
 
-    assert integration_needs_revalidation(
-        state, base_sha="base-b", head_sha="head-a", patch_digest="patch-a"
-    ) == "base_invalidated"
-    assert integration_needs_revalidation(
-        state, base_sha="base-a", head_sha="head-a", patch_digest="patch-b"
-    ) == "head_invalidated"
+    assert (
+        integration_needs_revalidation(
+            state, base_sha="base-b", head_sha="head-a", patch_digest="patch-a"
+        )
+        == "base_invalidated"
+    )
+    assert (
+        integration_needs_revalidation(
+            state, base_sha="base-a", head_sha="head-a", patch_digest="patch-b"
+        )
+        == "head_invalidated"
+    )
 
 
 def test_base_movement_clears_only_integration_authority() -> None:
@@ -318,6 +326,36 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
         "watcher_pr_state",
         "merge_pr",
     ]
+    merge_arguments = next(arguments for name, arguments in transport.calls if name == "merge_pr")
+    assert merge_arguments == {
+        "pr_number": 42,
+        "expected_base_sha": "base-a",
+        "expected_head_sha": "abc123",
+        "expected_patch_digest": "patch-a",
+        "expected_merge_tree_sha": "tree-a",
+    }
+
+
+def test_missing_direct_compare_evidence_opens_integrity_gate(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    transport = RecordingTransport(current_head="abc123", merge_tree_sha=None)
+    effects_log: list[EffectIntent] = []
+
+    allowed = _merge_completed_leaf(
+        _event(),
+        _completion(),
+        {"leaf"},
+        set(),
+        EffectClient(transport),
+        TLLoopConfig(poll_interval=0.001),
+        effects_log,
+        state,
+        store=store,
+    )
+
+    assert allowed is False
+    assert [name for name, _ in transport.calls if name == "merge_pr"] == []
+    assert any(gate.name == "tl-integrity-reconciliation" for gate in store.load().gates)
 
 
 def test_expired_matching_head_is_refused_before_merge(tmp_path: Path) -> None:
@@ -411,10 +449,7 @@ def _state(tmp_path: Path, head: str, verdict_at: str) -> tuple[RunState, RunSto
     record["verdict"] = Verdict.GO.value
     record["ci_state"] = {head: "success"}
     record["verdict_at"] = verdict_at
-    root_spec = {
-        key: document[key]
-        for key in ("fsm", "slices", "budgets", "gates", "events")
-    }
+    root_spec = {key: document[key] for key in ("fsm", "slices", "budgets", "gates", "events")}
     create("review-test", root_spec, root_dir=tmp_path)
     store = RunStore("review-test", root_dir=tmp_path)
     return store.load(), store
@@ -445,6 +480,10 @@ def _completion() -> ChildCompleted:
 @dataclass
 class RecordingTransport:
     current_head: str
+    base_sha: str | None = "base-a"
+    patch_digest: str | None = "patch-a"
+    merge_tree_sha: str | None = "tree-a"
+    ci_status: str | None = "success"
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -462,6 +501,10 @@ class RecordingTransport:
                 "result": {
                     "found": True,
                     "head_sha": self.current_head,
+                    "base_sha": self.base_sha,
+                    "patch_digest": self.patch_digest,
+                    "merge_tree_sha": self.merge_tree_sha,
+                    "ci_status": self.ci_status,
                 },
             }
         return {"success": True, "result": None}

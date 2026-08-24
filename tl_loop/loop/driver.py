@@ -3260,6 +3260,14 @@ def _merge_failure_reason(result: ToolResult | None) -> str:
     return "merge_pr returned failure"
 
 
+def _watcher_evidence_text(result: ToolResult, key: str) -> str | None:
+    """Read one non-empty compare field from a watcher response."""
+    if result.success is not True or not isinstance(result.result, Mapping):
+        return None
+    value = result.result.get(key)
+    return value if isinstance(value, str) and value else None
+
+
 def _integration_gate_pending(state: RunState) -> bool:
     return any(
         gate.name in {INTEGRATION_REVALIDATION_GATE_NAME, INTEGRATION_CONFLICT_GATE_NAME}
@@ -4397,12 +4405,18 @@ def _merge_completed_leaf(
     config: TLLoopConfig,
     effects_log: list[EffectIntent],
     state: RunState,
+    *,
+    store: RunStore | None = None,
 ) -> bool:
     pr_number = event.pr_number
     if completion.slug not in leaf_names or pr_number is None or completion.slug in merged:
         return True
     current = state.slices.get(completion.slug)
     head_sha = event.head_sha or (current.reviewed_head if current is not None else None)
+    current_patch_digest: str | None = None
+    expected_base_sha: str | None = None
+    expected_merge_tree_sha: str | None = None
+    expected_ci_status: str | None = None
     live = cast(EffectClient, effects) if config.active else None
     if (
         config.active
@@ -4433,6 +4447,9 @@ def _merge_completed_leaf(
             )
             current_head = watcher_head(watcher_result)
             current_patch_digest = watcher_patch_digest(watcher_result)
+            expected_base_sha = _watcher_evidence_text(watcher_result, "base_sha")
+            expected_merge_tree_sha = _watcher_evidence_text(watcher_result, "merge_tree_sha")
+            expected_ci_status = _watcher_evidence_text(watcher_result, "ci_status")
             verify_review(
                 current,
                 current_head,
@@ -4441,6 +4458,42 @@ def _merge_completed_leaf(
                 current_patch_digest=current_patch_digest,
             )
             head_sha = current_head
+            if not all(
+                (
+                    current_patch_digest,
+                    expected_base_sha,
+                    expected_merge_tree_sha,
+                    expected_ci_status,
+                )
+            ):
+                reason = (
+                    "direct merge requires complete watcher evidence: "
+                    "base_sha, head_sha, patch_digest, merge_tree_sha, and ci_status"
+                )
+                if store is not None:
+                    store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
+                _record_controller_event(
+                    "controller",
+                    "tl.gate_opened",
+                    {
+                        "gate_name": INTEGRITY_RECONCILIATION_GATE_NAME,
+                        "run_id": state.run_id,
+                        "reason": reason,
+                    },
+                    config,
+                    effects,
+                    effects_log,
+                )
+                _emit_merge_decision(
+                    completion.slug,
+                    pr_number,
+                    "blocked",
+                    head_sha,
+                    config,
+                    effects,
+                    effects_log,
+                )
+                return False
         except ReviewGateError as error:
             LOGGER.warning(
                 "[TL loop] refusing merge target=%s reason=%s",
@@ -4457,6 +4510,16 @@ def _merge_completed_leaf(
                 effects_log,
             )
             return False
+    if not all(
+        (
+            head_sha,
+            current_patch_digest,
+            expected_base_sha,
+            expected_merge_tree_sha,
+            expected_ci_status,
+        )
+    ):
+        return False
     _emit_merge_decision(
         completion.slug,
         pr_number,
@@ -4466,7 +4529,13 @@ def _merge_completed_leaf(
         effects,
         effects_log,
     )
-    arguments: dict[str, object] = {"pr_number": pr_number}
+    arguments: dict[str, object] = {
+        "pr_number": pr_number,
+        "expected_base_sha": expected_base_sha,
+        "expected_head_sha": head_sha,
+        "expected_patch_digest": current_patch_digest,
+        "expected_merge_tree_sha": expected_merge_tree_sha,
+    }
     _optional_argument(arguments, "chainlink_issue_id", config.chainlink_issue_id)
     _optional_argument(arguments, "strategy", config.merge_strategy)
     _optional_argument(arguments, "working_dir", config.working_dir)
@@ -4481,6 +4550,10 @@ def _merge_completed_leaf(
             chainlink_issue_id=config.chainlink_issue_id,
             strategy=config.merge_strategy,
             working_dir=config.working_dir,
+            expected_base_sha=expected_base_sha,
+            expected_head_sha=head_sha,
+            expected_patch_digest=current_patch_digest,
+            expected_merge_tree_sha=expected_merge_tree_sha,
         ),
         effects_log,
     )

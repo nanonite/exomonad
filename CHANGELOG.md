@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Add compare evidence to direct leaf merges (#982)
 - Integrate journaled merge action recovery (#981)
 - Add terminating controller convergence and telemetry (#980)
 - Add deterministic direct and aggregate merge policies (#979)
