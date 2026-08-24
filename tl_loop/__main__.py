@@ -18,6 +18,7 @@ from tl_loop.client.transport import DEFAULT_TIMEOUT_SECONDS, TransportClient
 from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS, LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
+from tl_loop.fingerprint import fingerprint_report
 from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.heartbeat import HeartbeatConfig
@@ -252,6 +253,16 @@ def _add_project_options(parser: argparse.ArgumentParser) -> None:
 def _run(args: argparse.Namespace) -> TLRunResult:
     task_timeout = getattr(args, "task_timeout", DEFAULT_TASK_TIMEOUT_SECONDS)
     project_root = args.project_root.expanduser().resolve()
+    controller_fingerprint = fingerprint_report(project_root)
+    LOGGER.info(
+        "[TL loop] controller fingerprint=%s",
+        json.dumps(controller_fingerprint, sort_keys=True),
+    )
+    if controller_fingerprint["status"] in {"stale", "invalid"}:
+        LOGGER.warning(
+            "[TL loop] controller archive does not match source: %s",
+            controller_fingerprint,
+        )
     plan_path = _resolve_under_project(project_root, args.plan)
     plan_document = _load_plan(plan_path, args.wait_for_plan)
     plan = _plan_from_document(plan_document)
@@ -539,11 +550,15 @@ def _status_snapshot(
     run_id: str,
 ) -> str:
     """Render one race-tolerant, read-only status snapshot."""
+    controller_fingerprint = fingerprint_report(project_root)
     reason = store.exit_reason()
     if reason:
-        return f"controller exited: {reason}"
+        return _status_message(f"controller exited: {reason}", controller_fingerprint)
     if not store.path.exists():
-        return f"no run yet; controller is waiting for .exo/tl-loop/plan.json (path: {plan_path})"
+        return _status_message(
+            f"no run yet; controller is waiting for .exo/tl-loop/plan.json (path: {plan_path})",
+            controller_fingerprint,
+        )
     try:
         state = store.load()
         reader = LedgerReader(
@@ -554,12 +569,23 @@ def _status_snapshot(
         )
         replay = reader.read_from(0)
     except (CorruptCheckpoint, OSError, ValueError) as error:
-        return f"checkpoint is currently unavailable; retrying: {error}"
+        return _status_message(
+            f"checkpoint is currently unavailable; retrying: {error}",
+            controller_fingerprint,
+        )
     document = _state_document(state, replay.events, replay.sequence_status)
+    document["controller_fingerprint"] = controller_fingerprint
     summary = store.terminal_summary()
     if summary is not None:
         document["terminal_summary"] = dict(summary)
     return json.dumps(document, indent=2, sort_keys=True)
+
+
+def _status_message(message: str, controller_fingerprint: Mapping[str, object]) -> str:
+    """Keep text status diagnostics readable while exposing the build stamp."""
+    return (
+        f"{message}\ncontroller fingerprint: {json.dumps(controller_fingerprint, sort_keys=True)}"
+    )
 
 
 def _set_gate(args: argparse.Namespace) -> None:

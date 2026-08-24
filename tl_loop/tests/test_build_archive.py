@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import uuid
 import zipfile
 from pathlib import Path
+
+import pytest
+
+from scripts.build_tl_loop_archive import build_archive
+from scripts.check_tl_loop_archive import ArchiveFingerprintError, check_archive_fingerprint
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 SOURCE_MODULE = REPOSITORY_ROOT / "tl_loop/preflight.py"
@@ -118,3 +124,20 @@ def test_archive_excludes_interpreter_artifacts_and_tests(tmp_path: Path) -> Non
         for name in names
         if any(part in {"__pycache__", ".venv", "tests"} for part in Path(name).parts)
     ]
+
+
+def test_archive_fingerprint_detects_source_edit(tmp_path: Path) -> None:
+    source = tmp_path / "tl_loop"
+    shutil.copytree(REPOSITORY_ROOT / "tl_loop", source)
+    archive = tmp_path / "tl_loop.pyz"
+
+    build_archive(source, archive)
+    check_archive_fingerprint(archive, source)
+
+    target = source / "preflight.py"
+    target.write_text(
+        target.read_text(encoding="utf-8") + "\n# stale-archive-regression\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ArchiveFingerprintError, match="stale TL controller archive"):
+        check_archive_fingerprint(archive, source)

@@ -232,6 +232,13 @@ cargo build -p exomonad
 # Hot reload: server checks WASM mtime per tool call, so after recompile
 # the next MCP call picks up the new WASM automatically.
 # For immediate reload: `exomonad reload` clears the plugin cache explicitly.
+
+# Verify that the installed TL archive is built from this checkout.
+just tl-loop-archive-test
+python3 scripts/check_tl_loop_archive.py "$HOME/.exo/tl_loop.pyz" --source "$PWD/tl_loop"
+# The archive stamp contains the Git commit and deterministic tl_loop tree hash.
+# `tl_loop status` reports the same fingerprint, and controller startup warns
+# when an installed archive is stale; install again with `just install-all-dev`.
 ```
 
 **What `just install-all-dev` does:**

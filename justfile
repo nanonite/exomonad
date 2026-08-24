@@ -165,7 +165,7 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
 # Run tests: Python checks, formatting, Rust check, WASM build/tests, Rust tests, proto freshness
-test: tl-loop-replay tl-loop-test tl-loop-lint tool-surface-check controller-event-contract-check
+test: tl-loop-replay tl-loop-test tl-loop-lint tl-loop-archive-test tool-surface-check controller-event-contract-check
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/8] Observability contract checks..."
@@ -347,7 +347,15 @@ tl-loop-python-check:
     "$controller" scripts/check_tl_loop_python.py
 
 tl-loop-archive-test: tl-loop-archive
-    python3 scripts/check_tl_loop_archive.py "$(pwd)/tl_loop.pyz"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    python3 scripts/check_tl_loop_archive.py "$(pwd)/tl_loop.pyz" --source "$(pwd)/tl_loop"
+    installed="${EXOMONAD_TL_LOOP_ARCHIVE:-$HOME/.exo/tl_loop.pyz}"
+    if test -f "$installed"; then
+        python3 scripts/check_tl_loop_archive.py "$installed" --source "$(pwd)/tl_loop"
+    else
+        echo "TL controller installed archive not found at $installed; local archive check passed"
+    fi
 
 # Compatibility entry point for profile-based install commands
 install profile:

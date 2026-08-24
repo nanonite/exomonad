@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Detect stale tl_loop.pyz: fingerprint the controller archive against source (#970)
 - Wire reviewer spawning into the tl_loop entry point (#965 fix) (#967)
 - Make replay review freshness tests use a frozen clock (#963)
 - Fail closed when dev leaves exit without authoritative handoff (#950)

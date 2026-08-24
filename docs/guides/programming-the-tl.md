@@ -856,9 +856,22 @@ head idempotently:
 ~~~bash
 just tl-loop-archive
 cp tl_loop.pyz ~/.exo/tl_loop.pyz
+python3 scripts/check_tl_loop_archive.py ~/.exo/tl_loop.pyz --source "$PWD/tl_loop"
 python3 -m tl_loop status --project-root /path/to/project --run-id root
 python3 -m tl_loop run --project-root /path/to/project --run-id root
 ~~~
+
+Every archive carries a source fingerprint containing the Git commit and a
+deterministic hash of the archived `tl_loop/` tree. The status output includes
+`controller_fingerprint`; a `stale` status means the running archive is not the
+same source as the checkout. After source edits, run `just install-all-dev`, then
+repeat the check before restarting the run:
+
+~~~bash
+python3 scripts/check_tl_loop_archive.py ~/.exo/tl_loop.pyz --source "$PWD/tl_loop"
+~~~
+
+The controller reports the same mismatch at startup and never rebuilds itself.
 
 The run must retain its existing state root and ledger identity. Verify that
 the slice's `reviewer_attempt` contains the PR head and that exactly one

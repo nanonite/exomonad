@@ -32,7 +32,9 @@ def test_status_reports_durable_controller_failure(tmp_path: Path, capsys) -> No
     )
 
     assert main(["status", "--project-root", str(tmp_path)]) == 0
-    assert capsys.readouterr().out.strip() == "controller exited: capability file is missing"
+    output = capsys.readouterr().out
+    assert "controller exited: capability file is missing" in output
+    assert "controller fingerprint:" in output
 
 
 def test_status_tolerates_partial_checkpoint(tmp_path: Path, capsys) -> None:
@@ -93,6 +95,7 @@ def test_status_renders_live_state_without_watch_controls(tmp_path: Path, capsys
     assert document["gates"] == [{"name": "review", "status": "pending"}]
     assert document["park_causes"] == {"task-a": "review_stuck"}
     assert document["last_consumed_offset"] == 112
+    assert document["controller_fingerprint"]["status"] == "source"
 
 
 def test_status_watch_redraws_until_interrupted(tmp_path: Path, capsys, monkeypatch) -> None:
