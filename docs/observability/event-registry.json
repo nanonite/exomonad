@@ -92,6 +92,7 @@
     {"type": "agent.stop_check", "payload_class": "aggregate_dimensions", "producers": ["haskell"]},
     {"type": "agent.invocation.started", "payload_class": "aggregate_dimensions", "producers": ["lifecycle"]},
     {"type": "agent.invocation.finished", "payload_class": "aggregate_dimensions", "producers": ["lifecycle"]},
+    {"type": "agent.invocation.succession", "payload_class": "aggregate_dimensions", "producers": ["lifecycle"]},
     {"type": "agent.task_blocked", "payload_class": "aggregate_dimensions", "producers": ["haskell"]},
     {"type": "agent.recovery.started", "payload_class": "aggregate_dimensions", "producers": ["tl_loop", "lifecycle"]},
     {"type": "agent.recovery.outcome", "payload_class": "aggregate_dimensions", "producers": ["tl_loop", "lifecycle"]},

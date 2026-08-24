@@ -39,6 +39,8 @@ class HeartbeatTransport:
     pr_state: str = "open"
     merged: bool = False
     head_reachable: bool = True
+    publication_ownership_verified: bool | None = None
+    publication_ownership_error: str = ""
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -98,6 +100,8 @@ class HeartbeatTransport:
                         "evidence_error": (
                             "pr_head_unreachable: object missing" if not self.head_reachable else ""
                         ),
+                        "publication_ownership_verified": self.publication_ownership_verified,
+                        "publication_ownership_error": self.publication_ownership_error,
                     },
                 },
             )
@@ -310,6 +314,33 @@ def test_heartbeat_parks_unreachable_pr_head_without_raising(tmp_path: Path) -> 
     assert parked.status is SliceStatus.PARKED
     assert parked.park_cause is ParkCause.PR_HEAD_UNREACHABLE
     assert result.events[0].kind == "pr.head_unreachable"
+
+
+def test_heartbeat_parks_unresolved_publication_ownership(tmp_path: Path) -> None:
+    store, state = _state(
+        tmp_path,
+        status="in_review",
+        heartbeat_at=0.0,
+        pr_number=42,
+        reviewed_head="head-new",
+    )
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(
+            HeartbeatTransport(
+                publication_ownership_verified=False,
+                publication_ownership_error="invocation succession is missing",
+            )
+        ),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    parked = result.state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED
 
 
 def test_poll_workers_uses_persisted_runtime_identity(tmp_path: Path) -> None:

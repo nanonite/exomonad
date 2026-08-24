@@ -424,6 +424,10 @@ message WatcherPrStateResponse {
     // after the bounded refs/pull/<n>/head recovery attempt.
     bool head_reachable = 18;
     string evidence_error = 19;
+    // Publication ownership is verified by the effect boundary, including
+    // invocation succession across a session restart.
+    bool publication_ownership_verified = 20;
+    string publication_ownership_error = 21;
   }
 
 // ============================================================================

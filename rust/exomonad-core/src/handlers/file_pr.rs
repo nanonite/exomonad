@@ -165,6 +165,7 @@ impl<
             invocation_id: Some(invocation.invocation_id.clone()),
             invocation_trigger: Some(format!("{:?}", invocation.trigger).to_ascii_lowercase()),
             invocation_runtime: Some(format!("{:?}", invocation.runtime).to_ascii_lowercase()),
+            invocation_succession: Vec::new(),
         };
         let disposition = publish_verified_head(self.ctx.project_dir(), publication)
             .await

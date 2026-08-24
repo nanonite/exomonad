@@ -1110,6 +1110,14 @@ impl<
             ));
         }
         routing.write_to_dir(&agent_config_dir).await?;
+        let prior_invocation = read_invocation_conservatively(&agent_config_dir).await;
+        let adoption_identity = identity.as_ref().map(|record| {
+            (
+                record.birth_branch.to_string(),
+                record.parent_branch.to_string(),
+                record.slice_id.clone(),
+            )
+        });
         let identity_context = metadata.identity.or_else(|| {
             Some(InvocationIdentityContext {
                 runtime_agent_id: Some(agent_name.to_string()),
@@ -1135,6 +1143,27 @@ impl<
             metadata.recovery_lineage,
         )
         .await?;
+        if let (Some(previous), Some((head_branch, base_branch, Some(slice_id)))) =
+            (prior_invocation, adoption_identity)
+        {
+            let adoptions = crate::services::pr_registry::adopt_publication_for_invocation(
+                self.project_dir(),
+                agent_name.as_str(),
+                &head_branch,
+                &base_branch,
+                &slice_id,
+                &previous.invocation_id,
+                &invocation.invocation_id,
+            )
+            .await?;
+            for adoption in adoptions {
+                crate::services::lifecycle::record_invocation_succession(
+                    self.project_dir(),
+                    agent_name.as_str(),
+                    &adoption,
+                );
+            }
+        }
         let effective_routing = RoutingInfo::read_from_dir(&agent_config_dir).await?;
         if effective_routing.window_id.is_some() || effective_routing.pane_id.is_some() {
             match self.tmux() {

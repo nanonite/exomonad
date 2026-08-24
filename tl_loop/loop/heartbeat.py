@@ -828,6 +828,8 @@ def _pr_payload(payload: JsonMapping) -> dict[str, object]:
             "merged",
             "head_reachable",
             "evidence_error",
+            "publication_ownership_verified",
+            "publication_ownership_error",
         )
         if key in payload
     }
@@ -835,6 +837,11 @@ def _pr_payload(payload: JsonMapping) -> dict[str, object]:
 
 def _pr_terminal_cause(payload: JsonMapping) -> ParkCause | None:
     """Classify only explicit Forgejo/head observations as terminal."""
+    if payload.get("publication_ownership_verified") is False or (
+        isinstance(payload.get("publication_ownership_error"), str)
+        and bool(payload.get("publication_ownership_error"))
+    ):
+        return ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED
     pr_state = payload.get("pr_state")
     if (
         isinstance(pr_state, str)

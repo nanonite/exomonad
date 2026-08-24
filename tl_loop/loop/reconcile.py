@@ -540,6 +540,11 @@ def reconcile_slice(
         missing.append("published_pr")
 
     pr_state = _pr_state(watcher)
+    ownership_unresolved = watcher is not None and (
+        watcher.get("publication_ownership_verified") is False
+        or isinstance(watcher.get("publication_ownership_error"), str)
+        and bool(watcher.get("publication_ownership_error"))
+    )
     closed_unmerged = (
         watcher is not None
         and watcher.get("found") is True
@@ -556,7 +561,10 @@ def reconcile_slice(
         if watcher is not None
         else None
     )
-    if closed_unmerged:
+    if ownership_unresolved:
+        conflicts.append("publication ownership is unresolved")
+        action = "park_publication_ownership_unresolved"
+    elif closed_unmerged:
         action = "park_closed_unmerged_pr"
     elif head_unreachable:
         action = "park_unreachable_pr_head"

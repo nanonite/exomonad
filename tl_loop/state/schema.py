@@ -112,6 +112,7 @@ class ParkCause(str, Enum):
     ATTEMPT_ABANDONED = "attempt_abandoned"
     PR_CLOSED_UNMERGED = "pr_closed_unmerged"
     PR_HEAD_UNREACHABLE = "pr_head_unreachable"
+    PUBLICATION_OWNERSHIP_UNRESOLVED = "publication_ownership_unresolved"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
     DISPATCH_FAILED = "dispatch_failed"
     CORRUPT_STATE = "corrupt_state"

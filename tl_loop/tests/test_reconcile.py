@@ -302,6 +302,26 @@ def test_missing_pr_head_is_a_typed_terminal_reconciliation_observation() -> Non
     assert "pr_head_unreachable" in result.authoritative_evidence
 
 
+def test_unresolved_publication_ownership_requires_named_park_action() -> None:
+    result = reconcile_slice(
+        _slice(SliceStatus.IN_REVIEW),
+        authoritative_owner_id="agent-a",
+        watcher={
+            "found": True,
+            "head_sha": "head-a",
+            "review_state": "approved",
+            "ci_status": "success",
+            "pr_state": "open",
+            "merged": False,
+            "publication_ownership_verified": False,
+            "publication_ownership_error": "invocation succession is missing",
+        },
+    )
+
+    assert result.next_action == "park_publication_ownership_unresolved"
+    assert "publication ownership is unresolved" in result.conflicts
+
+
 def test_reconciliation_quarantines_conflicting_owner_and_head() -> None:
     slice_state = _slice(SliceStatus.IN_REVIEW)
     slice_state = slice_state.__class__(

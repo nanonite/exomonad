@@ -7,6 +7,7 @@
 use super::agent_control::{AgentType, InvocationRecord, InvocationStatus, InvocationTrigger};
 use super::event_log::EventLog;
 use super::guidance_queue::GuidanceBatch;
+use super::pr_registry::PublicationAdoption;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::warn;
@@ -95,6 +96,7 @@ pub const fn provider_delivery_contract(agent_type: AgentType) -> &'static str {
 pub enum LifecycleEventKind {
     InvocationStarted,
     InvocationFinished,
+    InvocationSuccession,
     RecoveryStarted,
     RecoveryOutcome,
     TaskBudgetExceeded,
@@ -106,6 +108,7 @@ impl LifecycleEventKind {
         match self {
             Self::InvocationStarted => "agent.invocation.started",
             Self::InvocationFinished => "agent.invocation.finished",
+            Self::InvocationSuccession => "agent.invocation.succession",
             Self::RecoveryStarted => "agent.recovery.started",
             Self::RecoveryOutcome => "agent.recovery.outcome",
             Self::TaskBudgetExceeded => "agent.task_budget_exceeded",
@@ -275,6 +278,33 @@ pub fn record_invocation_finished(agent_dir: &Path, record: &InvocationRecord) {
         LifecycleEventKind::InvocationFinished,
         LifecycleTelemetry::from_invocation(record, "finished"),
     );
+}
+
+/// Record an explicit publication ownership succession without rewriting the
+/// original publication invocation ID.
+pub fn record_invocation_succession(
+    project_dir: &Path,
+    agent_id: &str,
+    adoption: &PublicationAdoption,
+) {
+    let event_dir = project_dir.join(".exo/events");
+    let Ok(log) = EventLog::open(event_dir) else {
+        return;
+    };
+    let data = serde_json::json!({
+        "pr_number": adoption.pr_number,
+        "from_invocation_id": adoption.succession.from_invocation_id,
+        "to_invocation_id": adoption.succession.to_invocation_id,
+        "reason": adoption.succession.reason,
+        "recorded_at": adoption.succession.recorded_at,
+    });
+    if let Err(error) = log.append(
+        LifecycleEventKind::InvocationSuccession.event_type(),
+        agent_id,
+        &data,
+    ) {
+        warn!(%error, agent = agent_id, "Failed to append invocation succession telemetry");
+    }
 }
 
 /// Record the result of guidance delivery. This is intentionally separate from

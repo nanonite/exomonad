@@ -28,7 +28,7 @@ use crate::services::pr_registry::PrRegistry;
 use crate::services::pr_registry::{
     publication_history_for_slice, read_published_heads,
     resolve_live_pr_for_slice_with_abandonments, AbandonedAttempt, LivePrResolution, PrEntry,
-    PrState,
+    PrState, PublicationProvenance,
 };
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
@@ -781,7 +781,104 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
         review_count: 0,
         head_reachable: false,
         evidence_error: error,
+        publication_ownership_verified: false,
+        publication_ownership_error: String::new(),
     }
+}
+
+async fn publication_ownership_status<C>(
+    ctx: &C,
+    pr_number: u64,
+    head_branch: &str,
+    base_branch: &str,
+    head_sha: &str,
+) -> (bool, String)
+where
+    C: HasAgentResolver + HasProjectDir,
+{
+    let heads = match read_published_heads(ctx.project_dir()).await {
+        Ok(heads) => heads,
+        Err(error) => return (false, format!("publication registry unavailable: {error}")),
+    };
+    let Some(publication) = heads
+        .iter()
+        .filter(|head| head.matches_current(pr_number, head_branch, base_branch, head_sha))
+        .max_by_key(|head| {
+            (
+                head.provenance == PublicationProvenance::LedgerOwned,
+                head.invocation_succession.len(),
+            )
+        })
+    else {
+        return (
+            false,
+            format!("no verified publication matches PR #{pr_number} and head {head_sha}"),
+        );
+    };
+    let Some(owner) = publication.author_agent.as_deref() else {
+        return (false, "publication is missing author_agent".to_string());
+    };
+    let Ok(owner_name) = AgentName::try_from_str(owner) else {
+        return (false, format!("publication owner '{owner}' is invalid"));
+    };
+    let Some(identity) = ctx.agent_resolver().get(&owner_name).await else {
+        return (
+            false,
+            format!("publication owner '{owner}' has no identity"),
+        );
+    };
+    if identity.birth_branch.to_string() != publication.head_branch
+        || identity.parent_branch.to_string() != publication.base_branch
+    {
+        return (
+            false,
+            "publication branch identity does not match owner identity".to_string(),
+        );
+    }
+    if publication.provenance == PublicationProvenance::LedgerOwned
+        && identity.slice_id != publication.slice_id
+    {
+        return (
+            false,
+            "publication slice identity does not match owner identity".to_string(),
+        );
+    }
+    if publication.provenance == PublicationProvenance::Legacy {
+        return (true, String::new());
+    }
+    let invocation_dir = ctx
+        .project_dir()
+        .join(".exo/agents")
+        .join(owner_name.as_str());
+    let Some(current) =
+        crate::services::agent_control::read_invocation_conservatively(&invocation_dir).await
+    else {
+        return (
+            false,
+            "publication owner has no durable invocation record".to_string(),
+        );
+    };
+    let Some(original) = publication.invocation_id.as_deref() else {
+        return (
+            false,
+            "ledger-owned publication is missing invocation provenance".to_string(),
+        );
+    };
+    if current.invocation_id != original
+        && !crate::services::pr_registry::invocation_succession_reaches_current(
+            publication,
+            &current.invocation_id,
+        )
+    {
+        return (
+            false,
+            format!(
+                "publication invocation '{original}' has no succession to current invocation '{}'",
+                current.invocation_id
+            ),
+        );
+    }
+    (true, String::new())
 }
 
 fn review_state_from_forgejo_reviews(
@@ -1859,6 +1956,15 @@ impl<
                 .await
                 .unwrap_or(CIStatus::Unknown)
         };
+        let (publication_ownership_verified, publication_ownership_error) =
+            publication_ownership_status(
+                self.ctx.as_ref(),
+                pr_number,
+                pr.head_ref.as_str(),
+                pr.base_ref.as_str(),
+                &head_sha,
+            )
+            .await;
         Ok(WatcherPrStateResponse {
             success: true,
             error: String::new(),
@@ -1886,6 +1992,8 @@ impl<
             review_count,
             head_reachable,
             evidence_error,
+            publication_ownership_verified,
+            publication_ownership_error,
         })
     }
 

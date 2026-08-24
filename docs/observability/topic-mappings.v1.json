@@ -19,6 +19,7 @@
     {"topic": "obs/event/agent.stop_check", "event_type": "agent.stop_check"},
     {"topic": "obs/event/agent.invocation.started", "event_type": "agent.invocation.started"},
     {"topic": "obs/event/agent.invocation.finished", "event_type": "agent.invocation.finished"},
+    {"topic": "obs/event/agent.invocation.succession", "event_type": "agent.invocation.succession"},
     {"topic": "obs/event/agent.guidance.delivery", "event_type": "agent.guidance.delivery"},
     {"topic": "obs/event/pr.filed", "event_type": "pr.filed"},
     {"topic": "obs/event/pr.updated", "event_type": "pr.updated"},

@@ -1927,16 +1927,22 @@ def _reconcile_nonterminal_slices(
         )
         if watcher is not None:
             reconciled = reconcile_merge_observation(reconciled, watcher)
-        if result.next_action in {"park_closed_unmerged_pr", "park_unreachable_pr_head"}:
+        if result.next_action in {
+            "park_closed_unmerged_pr",
+            "park_unreachable_pr_head",
+            "park_publication_ownership_unresolved",
+        }:
             if isinstance(effects, ReadOnlyEffectClient):
                 raise TLLoopError(
                     f"reconciliation for {current.id!r} requires an active effect client to park"
                 )
-            cause = (
-                ParkCause.PR_CLOSED_UNMERGED
-                if result.next_action == "park_closed_unmerged_pr"
-                else ParkCause.PR_HEAD_UNREACHABLE
-            )
+            cause = {
+                "park_closed_unmerged_pr": ParkCause.PR_CLOSED_UNMERGED,
+                "park_unreachable_pr_head": ParkCause.PR_HEAD_UNREACHABLE,
+                "park_publication_ownership_unresolved": (
+                    ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED
+                ),
+            }[result.next_action]
             park_audit = {
                 "reconciliation": result.as_state(),
                 "pr_number": (current.pr_number or (watcher.get("pr_number") if watcher else None)),
@@ -1944,6 +1950,9 @@ def _reconcile_nonterminal_slices(
                 "branch": _snapshot_text(watcher, "head_branch") if watcher else current.branch,
                 "observed_at": _now_timestamp(),
                 "observation_error": _snapshot_text(watcher, "evidence_error") if watcher else None,
+                "publication_ownership_error": (
+                    _snapshot_text(watcher, "publication_ownership_error") if watcher else None
+                ),
             }
             if reconciled != current:
                 state = store.checkpoint(

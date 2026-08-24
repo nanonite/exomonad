@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 pub const PUBLISHED_HEADS_FILENAME: &str = "published-heads.json";
-const PUBLISHED_HEADS_SCHEMA_VERSION: u32 = 1;
+const PUBLISHED_HEADS_SCHEMA_VERSION: u32 = 2;
 
 /// Identifies whether publication metadata came from the current ledger-owned
 /// filing boundary or from a migrated pre-provenance record.
@@ -17,6 +17,29 @@ const PUBLISHED_HEADS_SCHEMA_VERSION: u32 = 1;
 pub enum PublicationProvenance {
     Legacy,
     LedgerOwned,
+}
+
+/// Why a new invocation was allowed to continue owning an existing
+/// publication.  This is intentionally closed: a publication may only cross
+/// the session boundary through an explicit, auditable reason.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SuccessionReason {
+    SessionRecreate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvocationSuccession {
+    pub from_invocation_id: String,
+    pub to_invocation_id: String,
+    pub reason: SuccessionReason,
+    pub recorded_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicationAdoption {
+    pub pr_number: u64,
+    pub succession: InvocationSuccession,
 }
 
 /// The controller-facing result of resolving a slice's current publication.
@@ -69,6 +92,11 @@ pub struct PublishedHead {
     pub invocation_trigger: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_runtime: Option<String>,
+    /// Append-only invocation lineage.  The original publication invocation
+    /// remains authoritative; current invocations are accepted only when they
+    /// are reachable through this chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invocation_succession: Vec<InvocationSuccession>,
 }
 
 impl PublishedHead {
@@ -124,6 +152,36 @@ impl PublishedHead {
             }
         }
         Ok(())
+    }
+}
+
+/// Return whether a current invocation is reachable from the invocation that
+/// originally published a head through the append-only succession chain.
+pub fn invocation_succession_reaches_current(
+    publication: &PublishedHead,
+    current_id: &str,
+) -> bool {
+    let Some(original_id) = publication.invocation_id.as_deref() else {
+        return false;
+    };
+    let mut seen = HashSet::new();
+    let mut candidate = original_id;
+    loop {
+        if candidate == current_id {
+            return true;
+        }
+        if !seen.insert(candidate.to_string()) {
+            return false;
+        }
+        let Some(next) = publication
+            .invocation_succession
+            .iter()
+            .find(|succession| succession.from_invocation_id == candidate)
+            .map(|succession| succession.to_invocation_id.as_str())
+        else {
+            return false;
+        };
+        candidate = next;
     }
 }
 
@@ -352,12 +410,17 @@ pub async fn publish_verified_head(
         file.heads.push(publication);
         PublicationDisposition::Added
     };
+    write_published_heads_locked(project_dir, &file).await?;
+    Ok(disposition)
+}
+
+async fn write_published_heads_locked(project_dir: &Path, file: &PublishedHeadsFile) -> Result<()> {
     let path = published_heads_path(project_dir);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let temporary = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(&file)?;
+    let bytes = serde_json::to_vec_pretty(file)?;
     if let Err(error) = tokio::fs::write(&temporary, bytes).await {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error).with_context(|| format!("failed to write {}", temporary.display()));
@@ -366,7 +429,78 @@ pub async fn publish_verified_head(
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error).with_context(|| format!("failed to replace {}", path.display()));
     }
-    Ok(disposition)
+    Ok(())
+}
+
+/// Adopt a ledger-owned publication when a same-owner invocation is recreated.
+///
+/// Every identity dimension other than invocation ID must match exactly.  The
+/// operation is append-only and idempotent: repeated startup reconciliation
+/// never creates duplicate succession records or changes the original
+/// publication invocation.
+pub async fn adopt_publication_for_invocation(
+    project_dir: &Path,
+    agent_name: &str,
+    head_branch: &str,
+    base_branch: &str,
+    slice_id: &str,
+    from_invocation_id: &str,
+    to_invocation_id: &str,
+) -> Result<Vec<PublicationAdoption>> {
+    if agent_name.trim().is_empty()
+        || head_branch.trim().is_empty()
+        || base_branch.trim().is_empty()
+        || slice_id.trim().is_empty()
+        || from_invocation_id.trim().is_empty()
+        || to_invocation_id.trim().is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    if from_invocation_id == to_invocation_id {
+        return Ok(Vec::new());
+    }
+    let _guard = published_heads_lock().lock().await;
+    let mut file = PublishedHeadsFile {
+        schema_version: PUBLISHED_HEADS_SCHEMA_VERSION,
+        heads: read_published_heads_locked(project_dir).await?,
+    };
+    let recorded_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut adoptions = Vec::new();
+    for head in &mut file.heads {
+        if head.provenance != PublicationProvenance::LedgerOwned
+            || head.author_agent.as_deref() != Some(agent_name)
+            || head.head_branch != head_branch
+            || head.base_branch != base_branch
+            || head.slice_id.as_deref() != Some(slice_id)
+            || head.invocation_id.as_deref() != Some(from_invocation_id)
+        {
+            continue;
+        }
+        if head.invocation_succession.iter().any(|succession| {
+            succession.from_invocation_id == from_invocation_id
+                && succession.to_invocation_id == to_invocation_id
+        }) {
+            continue;
+        }
+        let succession = InvocationSuccession {
+            from_invocation_id: from_invocation_id.to_string(),
+            to_invocation_id: to_invocation_id.to_string(),
+            reason: SuccessionReason::SessionRecreate,
+            recorded_at,
+        };
+        head.invocation_succession.push(succession.clone());
+        adoptions.push(PublicationAdoption {
+            pr_number: head.pr_number,
+            succession,
+        });
+    }
+    if !adoptions.is_empty() {
+        write_published_heads_locked(project_dir, &file).await?;
+    }
+    Ok(adoptions)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -524,6 +658,7 @@ mod tests {
             invocation_id: Some("invocation-1".to_string()),
             invocation_trigger: Some("resume_pr".to_string()),
             invocation_runtime: Some("codex".to_string()),
+            invocation_succession: Vec::new(),
         }
     }
 
@@ -680,6 +815,68 @@ mod tests {
         .unwrap();
         assert_eq!(document["schema_version"], PUBLISHED_HEADS_SCHEMA_VERSION);
         assert_eq!(document["heads"][0]["provenance"], "ledger_owned");
+    }
+
+    #[tokio::test]
+    async fn publication_adoption_is_identity_bound_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut publication = publication("sha-1");
+        publication.provenance = PublicationProvenance::LedgerOwned;
+        publication.slice_id = Some("slice-a".to_string());
+        publish_verified_head(directory.path(), publication)
+            .await
+            .unwrap();
+
+        let adoptions = adopt_publication_for_invocation(
+            directory.path(),
+            "feature-codex",
+            "main.feature-codex",
+            "main",
+            "slice-a",
+            "invocation-1",
+            "invocation-2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(adoptions.len(), 1);
+        assert_eq!(
+            adoptions[0].succession.reason,
+            SuccessionReason::SessionRecreate
+        );
+        let heads = read_published_heads(directory.path()).await.unwrap();
+        assert_eq!(heads[0].invocation_id.as_deref(), Some("invocation-1"));
+        assert_eq!(heads[0].invocation_succession.len(), 1);
+
+        assert!(adopt_publication_for_invocation(
+            directory.path(),
+            "feature-codex",
+            "main.other-branch",
+            "main",
+            "slice-a",
+            "invocation-1",
+            "invocation-3",
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert!(adopt_publication_for_invocation(
+            directory.path(),
+            "feature-codex",
+            "main.feature-codex",
+            "main",
+            "slice-a",
+            "invocation-1",
+            "invocation-2",
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            read_published_heads(directory.path()).await.unwrap()[0]
+                .invocation_succession
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

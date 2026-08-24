@@ -877,6 +877,20 @@ where
         let identity = self.ctx.agent_resolver().get(&owner_name).await;
         validate_publication_slice(publication, identity.as_ref())?;
         validate_publication_invocation(publication)?;
+        if let Some(identity) = identity.as_ref() {
+            if identity.birth_branch.as_str() != publication.head_branch {
+                return Err(format!(
+                    "publication branch '{}' conflicts with owner branch '{}'",
+                    publication.head_branch, identity.birth_branch
+                ));
+            }
+            if identity.parent_branch.as_str() != publication.base_branch {
+                return Err(format!(
+                    "publication base branch '{}' conflicts with owner parent branch '{}'",
+                    publication.base_branch, identity.parent_branch
+                ));
+            }
+        }
         if let Some(publication_invocation) = publication.invocation_id.as_deref() {
             let invocation_dir = self
                 .ctx
@@ -891,9 +905,14 @@ where
                             "publication invocation '{publication_invocation}' has no durable owner record"
                         )
                     })?;
-            if current_invocation.invocation_id != publication_invocation {
+            if current_invocation.invocation_id != publication_invocation
+                && !crate::services::pr_registry::invocation_succession_reaches_current(
+                    publication,
+                    &current_invocation.invocation_id,
+                )
+            {
                 return Err(format!(
-                    "publication invocation '{publication_invocation}' conflicts with current invocation '{}'",
+                    "publication invocation '{publication_invocation}' conflicts with current invocation '{}' and has no recorded succession",
                     current_invocation.invocation_id
                 ));
             }
@@ -1598,6 +1617,7 @@ where
             invocation_id: None,
             invocation_trigger: Some("debug_mock_watcher".to_string()),
             invocation_runtime: None,
+            invocation_succession: Vec::new(),
         };
         let pr_number = pr.number;
         let mut registry = PrRegistry::default();
@@ -5521,6 +5541,7 @@ mod tests {
             invocation_id: None,
             invocation_trigger: None,
             invocation_runtime: None,
+            invocation_succession: Vec::new(),
         }
     }
 
@@ -5569,6 +5590,40 @@ mod tests {
         assert!(
             validate_publication_invocation(&legacy).is_ok(),
             "legacy publications without a proven slice remain migratable"
+        );
+    }
+
+    #[test]
+    fn invocation_succession_accepts_only_reachable_current_invocation() {
+        let mut publication = publication_for_owner(Some("feat-codex"));
+        publication.invocation_id = Some("invocation-1".to_string());
+        publication.invocation_succession.push(
+            crate::services::pr_registry::InvocationSuccession {
+                from_invocation_id: "invocation-1".to_string(),
+                to_invocation_id: "invocation-2".to_string(),
+                reason: crate::services::pr_registry::SuccessionReason::SessionRecreate,
+                recorded_at: 1,
+            },
+        );
+        assert!(
+            crate::services::pr_registry::invocation_succession_reaches_current(
+                &publication,
+                "invocation-2"
+            )
+        );
+        assert!(
+            !crate::services::pr_registry::invocation_succession_reaches_current(
+                &publication,
+                "unrelated"
+            )
+        );
+
+        publication.invocation_succession[0].to_invocation_id = "invocation-1".to_string();
+        assert!(
+            !crate::services::pr_registry::invocation_succession_reaches_current(
+                &publication,
+                "invocation-2"
+            )
         );
     }
 
@@ -5633,6 +5688,7 @@ mod tests {
                 invocation_id: None,
                 invocation_trigger: None,
                 invocation_runtime: None,
+                invocation_succession: Vec::new(),
             }),
             head_sha: sha.to_string(),
             review_state: crate::services::pr_registry::ForgejoReviewState::PendingReview,
@@ -5659,6 +5715,7 @@ mod tests {
                 invocation_id: None,
                 invocation_trigger: None,
                 invocation_runtime: None,
+                invocation_succession: Vec::new(),
             }),
             head_sha: sha.to_string(),
             review_state: crate::services::pr_registry::ForgejoReviewState::ChangesRequested,
@@ -5902,6 +5959,7 @@ mod tests {
                     invocation_id: None,
                     invocation_trigger: None,
                     invocation_runtime: None,
+                    invocation_succession: Vec::new(),
                 }),
                 head_sha: "abc123".to_string(),
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
@@ -6101,6 +6159,7 @@ mod tests {
                     invocation_id: None,
                     invocation_trigger: None,
                     invocation_runtime: None,
+                    invocation_succession: Vec::new(),
                 }),
                 head_sha: "abc123".to_string(),
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
@@ -6221,6 +6280,7 @@ mod tests {
                     invocation_id: None,
                     invocation_trigger: None,
                     invocation_runtime: None,
+                    invocation_succession: Vec::new(),
                 }),
                 head_sha: "abc123".to_string(),
                 review_state: crate::services::pr_registry::ForgejoReviewState::Approved,
