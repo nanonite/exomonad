@@ -123,6 +123,7 @@ class RecoveryTrace:
         repo: Path,
         resume_confirmation: Mapping[str, Any] | None = None,
         resume_invocation: Mapping[str, Any] | None = None,
+        invocation_snapshot: Mapping[str, Any] | None = None,
     ) -> None:
         state = RunStore(run_id, state_root).load()
         journal_path = state_root / run_id / "action-journal.json"
@@ -177,6 +178,9 @@ class RecoveryTrace:
             ),
             "resume_invocation": (
                 dict(resume_invocation) if resume_invocation is not None else None
+            ),
+            "invocation": (
+                dict(invocation_snapshot) if invocation_snapshot is not None else None
             ),
             "action_keys": [
                 {
@@ -1548,6 +1552,7 @@ def _drive_nested_recovery(
                     run_id="sub-a",
                     state_root=state_root / "recursive-root",
                     repo=repo,
+                    invocation_snapshot=invocation,
                 )
                 previous_phase = recovery.phase.value
             resume_events = [

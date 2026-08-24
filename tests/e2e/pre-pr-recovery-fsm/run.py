@@ -320,6 +320,19 @@ def _collect_evidence(
             f"{confirmations!r}"
         )
     resume_generation = resumed_invocation.get("generation")
+    initial_invocation = next(
+        (
+            record.get("invocation")
+            for trace in traces.values()
+            for record in trace.records
+            if isinstance(record.get("invocation"), Mapping)
+        ),
+        None,
+    )
+    if not isinstance(initial_invocation, Mapping):
+        raise HarnessError(
+            f"recovery trace omitted the initial invocation identity: {traces!r}"
+        )
     owner_records = [
         (
             snapshot.get("owner_run_id"),
@@ -338,11 +351,15 @@ def _collect_evidence(
         and len(set(owner_records)) == 1
     )
     same_owner_resume = (
-        isinstance(resumed_invocation.get("runtime_agent_id"), str)
+        isinstance(initial_invocation.get("runtime_agent_id"), str)
+        and isinstance(resumed_invocation.get("runtime_agent_id"), str)
+        and resumed_invocation.get("runtime_agent_id")
+        == initial_invocation.get("runtime_agent_id")
         and resumed_invocation.get("runtime_agent_id") == owner_records[-1][1]
         and resumed_invocation.get("slice_id") == nested_leaf
-        and resumed_invocation.get("branch") == owner_records[-1][2]
-        and resumed_invocation.get("worktree") == owner_records[-1][3]
+        and resumed_invocation.get("slice_id") == initial_invocation.get("slice_id")
+        and resumed_invocation.get("branch") == initial_invocation.get("branch")
+        and resumed_invocation.get("worktree") == initial_invocation.get("worktree")
     )
     for run_id in (
         "ordered-server-dispatch-restart",
