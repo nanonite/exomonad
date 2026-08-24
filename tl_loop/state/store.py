@@ -789,6 +789,11 @@ def _encode_observation_provenance(value: ObservationProvenance) -> dict[str, ob
         "observed_at": value.observed_at,
         "event_seq": value.event_seq,
         "snapshot_id": value.snapshot_id,
+        "ledger_run_seq": value.ledger_run_seq,
+        "snapshot_high_watermark": value.snapshot_high_watermark,
+        "source_epoch": value.source_epoch,
+        "source_revision": value.source_revision,
+        "coverage": list(value.coverage),
     }
 
 
@@ -1289,6 +1294,11 @@ def _decode_observation_provenance(value: object) -> ObservationProvenance | Non
         observed_at=cast(str, value["observed_at"]),
         event_seq=cast(int | None, value.get("event_seq")),
         snapshot_id=cast(str | None, value.get("snapshot_id")),
+        ledger_run_seq=cast(int | None, value.get("ledger_run_seq")),
+        snapshot_high_watermark=cast(int | None, value.get("snapshot_high_watermark")),
+        source_epoch=cast(int, value.get("source_epoch", 0)),
+        source_revision=cast(int, value.get("source_revision", 0)),
+        coverage=tuple(cast(list[str], value.get("coverage", []))),
     )
 
 

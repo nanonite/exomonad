@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import cast
 
-from tl_loop.state.schema import SliceState, SliceStatus
+from tl_loop.state.schema import ObservationProvenance, SliceState, SliceStatus
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,158 @@ class ReconciliationResult:
             "conflicts": list(self.conflicts),
             "next_action": self.next_action,
         }
+
+
+@dataclass(frozen=True)
+class ObservationReduction:
+    """Deterministic fold result for one watcher edge or snapshot."""
+
+    state: SliceState
+    provenance: ObservationProvenance
+    changed: bool
+    accepted: bool
+    reason: str
+
+
+def reduce_observation(
+    slice_state: SliceState,
+    observation: Mapping[str, object],
+) -> ObservationReduction:
+    """Fold one watcher observation without allowing delayed edges to regress state."""
+    provenance = _observation_provenance(observation)
+    current = slice_state.observation_provenance
+    is_snapshot = observation.get("kind") == "snapshot" or observation.get("is_snapshot") is True
+    reason = _ordering_reason(current, provenance, is_snapshot=is_snapshot)
+    if reason != "accepted":
+        return ObservationReduction(slice_state, provenance, False, False, reason)
+
+    pr_number = observation.get("pr_number")
+    if (
+        pr_number is not None
+        and pr_number != slice_state.pr_number
+        and slice_state.pr_number is not None
+    ):
+        return ObservationReduction(slice_state, provenance, False, False, "identity_conflict")
+    updated = _apply_head_evidence(slice_state, observation)
+    updated = replace(updated, observation_provenance=provenance)
+    return ObservationReduction(updated, provenance, updated != slice_state, True, "accepted")
+
+
+def _observation_provenance(observation: Mapping[str, object]) -> ObservationProvenance:
+    source = observation.get("source", "watcher")
+    observed_at = observation.get("observed_at")
+    if not isinstance(source, str) or not source:
+        raise ValueError("observation source must be a non-empty string")
+    if not isinstance(observed_at, str) or not observed_at:
+        raise ValueError("observation observed_at must be a non-empty string")
+    coverage = observation.get("coverage", ())
+    if isinstance(coverage, list):
+        coverage = tuple(coverage)
+    if not isinstance(coverage, tuple):
+        raise TypeError("observation coverage must be an array")
+    return ObservationProvenance(
+        source=source,
+        observed_at=observed_at,
+        event_seq=_optional_non_negative(observation.get("event_seq")),
+        snapshot_id=_optional_text(observation.get("snapshot_id")),
+        ledger_run_seq=_optional_non_negative(
+            observation.get("ledger_run_seq", observation.get("run_seq"))
+        ),
+        snapshot_high_watermark=_optional_non_negative(observation.get("snapshot_high_watermark")),
+        source_epoch=_non_negative(observation.get("source_epoch", 0), "source_epoch"),
+        source_revision=_non_negative(observation.get("source_revision", 0), "source_revision"),
+        coverage=cast(tuple[str, ...], coverage),
+    )
+
+
+def _ordering_reason(
+    current: ObservationProvenance | None,
+    incoming: ObservationProvenance,
+    *,
+    is_snapshot: bool,
+) -> str:
+    if current is None:
+        return "accepted"
+    if incoming.source_epoch < current.source_epoch:
+        return "dominated_epoch"
+    if incoming.source_epoch > current.source_epoch and not is_snapshot:
+        return "baseline_required"
+    if incoming.source_epoch == current.source_epoch:
+        if (
+            incoming.snapshot_high_watermark is not None
+            and current.snapshot_high_watermark is not None
+            and incoming.snapshot_high_watermark <= current.snapshot_high_watermark
+        ):
+            return "dominated_snapshot"
+        if (
+            incoming.ledger_run_seq is not None
+            and current.ledger_run_seq is not None
+            and incoming.ledger_run_seq <= current.ledger_run_seq
+        ):
+            return "dominated_sequence"
+        if (
+            current.snapshot_high_watermark is not None
+            and incoming.ledger_run_seq is not None
+            and incoming.ledger_run_seq <= current.snapshot_high_watermark
+        ):
+            return "dominated_sequence"
+        if incoming.source_revision < current.source_revision:
+            return "dominated_revision"
+    return "accepted"
+
+
+def _apply_head_evidence(slice_state: SliceState, observation: Mapping[str, object]) -> SliceState:
+    head_sha = observation.get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha:
+        return slice_state
+    ci_status = observation.get("ci_status")
+    ci_state = dict(slice_state.ci_state)
+    if isinstance(ci_status, str) and ci_status:
+        ci_state[head_sha] = ci_status
+    findings = observation.get("review_findings")
+    review_findings = dict(slice_state.review_findings)
+    if isinstance(findings, list):
+        review_findings[head_sha] = tuple(
+            dict(item) for item in findings if isinstance(item, Mapping)
+        )
+    current_head = slice_state.reviewed_head
+    if current_head is not None and head_sha != current_head:
+        return replace(
+            slice_state,
+            review_findings=review_findings,
+            ci_state=ci_state,
+        )
+    return replace(
+        slice_state,
+        pr_number=(
+            cast(int, observation["pr_number"])
+            if type(observation.get("pr_number")) is int
+            else slice_state.pr_number
+        ),
+        reviewed_head=head_sha,
+        review_findings=review_findings,
+        ci_state=ci_state,
+    )
+
+
+def _optional_non_negative(value: object) -> int | None:
+    if value is None:
+        return None
+    return _non_negative(value, "observation sequence")
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("observation text must be non-empty or null")
+    return value
+
+
+def _non_negative(value: object, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
 
 
 def reconcile_slice(
@@ -80,9 +233,7 @@ def reconcile_slice(
             slice_state.dispatch_agent_id
             and authoritative_owner_id != slice_state.dispatch_agent_id
         ):
-            conflicts.append(
-                "authoritative owner disagrees with persisted dispatch owner"
-            )
+            conflicts.append("authoritative owner disagrees with persisted dispatch owner")
         else:
             evidence.append("runtime_owner")
     else:

@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Add deterministic watcher observation reduction (#977)
 - Add persisted merge evidence and action state (#976)
 - Detect stale tl_loop.pyz: fingerprint the controller archive against source (#970)
 - Wire reviewer spawning into the tl_loop entry point (#965 fix) (#967)

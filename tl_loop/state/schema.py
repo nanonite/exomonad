@@ -229,15 +229,30 @@ class ObservationProvenance:
     observed_at: str
     event_seq: int | None = None
     snapshot_id: str | None = None
+    ledger_run_seq: int | None = None
+    snapshot_high_watermark: int | None = None
+    source_epoch: int = 0
+    source_revision: int = 0
+    coverage: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("source", "observed_at"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"observation provenance {name} must be non-empty")
-        if self.event_seq is not None and (type(self.event_seq) is not int or self.event_seq < 0):
-            raise ValueError("observation provenance event_seq must be non-negative or null")
+        for name in ("event_seq", "ledger_run_seq", "snapshot_high_watermark"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"observation provenance {name} must be non-negative or null")
+        for name in ("source_epoch", "source_revision"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"observation provenance {name} must be non-negative")
         if self.snapshot_id is not None and not self.snapshot_id:
             raise ValueError("observation provenance snapshot_id must be non-empty or null")
+        if any(not isinstance(item, str) or not item for item in self.coverage):
+            raise ValueError("observation provenance coverage must contain non-empty strings")
+        if len(set(self.coverage)) != len(self.coverage):
+            raise ValueError("observation provenance coverage must be unique")
 
 
 @dataclass(frozen=True)
@@ -493,7 +508,19 @@ PUBLICATION_KEYS = frozenset(
 HANDOFF_KEYS = frozenset(
     {"pr_number", "head_sha", "attempt", "invocation_id", "agent_id", "observed_at"}
 )
-OBSERVATION_PROVENANCE_KEYS = frozenset({"source", "observed_at", "event_seq", "snapshot_id"})
+OBSERVATION_PROVENANCE_KEYS = frozenset(
+    {
+        "source",
+        "observed_at",
+        "event_seq",
+        "snapshot_id",
+        "ledger_run_seq",
+        "snapshot_high_watermark",
+        "source_epoch",
+        "source_revision",
+        "coverage",
+    }
+)
 ACTION_KEYS = frozenset({"kind", "phase", "state_version", "intent_id", "head_sha", "attempt"})
 BUDGET_KEYS = frozenset({"ledger"})
 LEDGER_KEYS = frozenset(
@@ -1286,8 +1313,25 @@ def _validate_observation_provenance(
         return
     for key in ("source", "observed_at"):
         _non_empty_string(provenance, key, f"{path}.observation_provenance", errors)
-    _nullable_non_negative_int(provenance, "event_seq", f"{path}.observation_provenance", errors)
+    for key in ("event_seq", "ledger_run_seq", "snapshot_high_watermark"):
+        _nullable_non_negative_int(provenance, key, f"{path}.observation_provenance", errors)
+    for key in ("source_epoch", "source_revision"):
+        if key in provenance:
+            _non_negative_int(provenance, key, f"{path}.observation_provenance", errors)
     _nullable_string(provenance, "snapshot_id", f"{path}.observation_provenance", errors)
+    if "coverage" in provenance:
+        _string_list(
+            provenance,
+            "coverage",
+            f"{path}.observation_provenance",
+            errors,
+            allow_empty=True,
+        )
+        _unique_strings(
+            provenance.get("coverage"),
+            f"{path}.observation_provenance.coverage",
+            errors,
+        )
 
 
 def _validate_action(value: object, path: str, errors: list[tuple[str, str]]) -> None:

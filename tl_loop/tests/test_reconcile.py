@@ -6,8 +6,8 @@ from dataclasses import replace
 
 import pytest
 
-from tl_loop.loop.reconcile import reconcile_slice
-from tl_loop.state.schema import SliceState, SliceStatus
+from tl_loop.loop.reconcile import reduce_observation, reconcile_slice
+from tl_loop.state.schema import ObservationProvenance, SliceState, SliceStatus
 from tl_loop.state.store import RunStore, _encode_slice, create
 
 
@@ -38,6 +38,15 @@ def _slice(status: SliceStatus) -> SliceState:
     )
 
 
+def _observation(**fields: object) -> dict[str, object]:
+    observation: dict[str, object] = {
+        "source": "forge-watcher",
+        "observed_at": "2026-08-24T00:00:00Z",
+    }
+    observation.update(fields)
+    return observation
+
+
 @pytest.mark.parametrize("status", list(SliceStatus))
 def test_reconciliation_is_defined_for_every_slice_status(status: SliceStatus) -> None:
     result = reconcile_slice(
@@ -62,6 +71,141 @@ def test_reconciliation_is_defined_for_every_slice_status(status: SliceStatus) -
     }.get(status, "no_action")
     assert result.next_action == expected_action
     assert result.as_state()["next_action"] == result.next_action
+
+
+def test_observation_reducer_rejects_edges_already_covered_by_snapshot() -> None:
+    state = replace(
+        _slice(SliceStatus.IN_REVIEW),
+        reviewed_head="head-a",
+        observation_provenance=ObservationProvenance(
+            source="forge-watcher",
+            observed_at="2026-08-24T00:00:00Z",
+            ledger_run_seq=10,
+            snapshot_high_watermark=10,
+            source_epoch=4,
+        ),
+    )
+
+    delayed = reduce_observation(
+        state,
+        _observation(head_sha="head-b", ledger_run_seq=10, source_epoch=4),
+    )
+
+    assert delayed.accepted is False
+    assert delayed.reason == "dominated_sequence"
+    assert delayed.changed is False
+    assert delayed.state == state
+
+
+def test_observation_reducer_requires_snapshot_after_watcher_restart() -> None:
+    state = replace(
+        _slice(SliceStatus.IN_REVIEW),
+        observation_provenance=ObservationProvenance(
+            source="forge-watcher",
+            observed_at="2026-08-24T00:00:00Z",
+            ledger_run_seq=20,
+            source_epoch=4,
+        ),
+    )
+
+    edge = reduce_observation(
+        state,
+        _observation(head_sha="head-a", ledger_run_seq=1, source_epoch=5),
+    )
+    snapshot = reduce_observation(
+        state,
+        _observation(
+            kind="snapshot",
+            is_snapshot=True,
+            head_sha="head-a",
+            ledger_run_seq=1,
+            snapshot_high_watermark=1,
+            snapshot_id="snapshot-5-1",
+            source_epoch=5,
+        ),
+    )
+
+    assert edge.accepted is False
+    assert edge.reason == "baseline_required"
+    assert snapshot.accepted is True
+    assert snapshot.state.observation_provenance == snapshot.provenance
+    assert snapshot.provenance.source_epoch == 5
+
+
+def test_observation_reducer_retains_newer_facts_for_stale_head_without_switching_head() -> None:
+    state = replace(
+        _slice(SliceStatus.IN_REVIEW),
+        reviewed_head="head-a",
+        ci_state={"head-a": "success"},
+        observation_provenance=ObservationProvenance(
+            source="forge-watcher",
+            observed_at="2026-08-24T00:00:00Z",
+            ledger_run_seq=1,
+            source_epoch=1,
+        ),
+    )
+
+    reduced = reduce_observation(
+        state,
+        _observation(
+            head_sha="head-b",
+            ci_status="failure",
+            review_findings=[{"code": "needs-repair"}],
+            pr_number=42,
+            ledger_run_seq=2,
+            source_epoch=1,
+        ),
+    )
+
+    assert reduced.accepted is True
+    assert reduced.changed is True
+    assert reduced.state.reviewed_head == "head-a"
+    assert reduced.state.ci_state == {"head-a": "success", "head-b": "failure"}
+    assert reduced.state.review_findings["head-b"] == ({"code": "needs-repair"},)
+
+
+def test_observation_reducer_rejects_pr_identity_conflict() -> None:
+    state = _slice(SliceStatus.IN_REVIEW)
+
+    reduced = reduce_observation(
+        state,
+        _observation(head_sha="head-a", pr_number=99, ledger_run_seq=1),
+    )
+
+    assert reduced.accepted is False
+    assert reduced.reason == "identity_conflict"
+    assert reduced.state == state
+
+
+def test_observation_reducer_is_idempotent_for_duplicate_fact() -> None:
+    state = replace(
+        _slice(SliceStatus.IN_REVIEW),
+        pr_number=42,
+        reviewed_head="head-a",
+        ci_state={"head-a": "success"},
+        observation_provenance=ObservationProvenance(
+            source="forge-watcher",
+            observed_at="2026-08-24T00:00:00Z",
+            ledger_run_seq=1,
+            source_epoch=1,
+        ),
+    )
+
+    reduced = reduce_observation(
+        state,
+        _observation(
+            head_sha="head-a",
+            ci_status="success",
+            pr_number=42,
+            ledger_run_seq=1,
+            source_epoch=1,
+        ),
+    )
+
+    assert reduced.accepted is False
+    assert reduced.reason == "dominated_sequence"
+    assert reduced.changed is False
+    assert reduced.state == state
 
 
 def test_reconciliation_adopts_authoritative_review_and_ci_evidence() -> None:
