@@ -34,6 +34,9 @@ from .migration import (
     record_migration_failure,
 )
 from .schema import (
+    ActionKind,
+    ActionPhase,
+    ActionState,
     SCHEMA_VERSION,
     ActualTokens,
     BudgetCharge,
@@ -46,8 +49,12 @@ from .schema import (
     GoalState,
     IntegrationCandidateState,
     IntegrationRuntimeState,
+    HandoffEvidence,
     OrderedStageState,
     ParkCause,
+    ObservationProvenance,
+    PublicationBinding,
+    RepositoryIdentity,
     RunState,
     SchemaError,
     SliceMap,
@@ -137,6 +144,8 @@ class ResumeState:
     current_order: int = 1
     ordered_stages: tuple[OrderedStageState, ...] = ()
     integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
+    repository_identity: RepositoryIdentity | None = None
+    state_version: int = 0
 
     @property
     def phase(self) -> TLPhase:
@@ -529,6 +538,8 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
         integration=state.integration,
+        repository_identity=state.repository_identity,
+        state_version=state.state_version,
     )
 
 
@@ -550,6 +561,8 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "current_order",
         "ordered_stages",
         "integration",
+        "repository_identity",
+        "state_version",
     }
     unknown = sorted(set(root_spec) - allowed)
     if unknown:
@@ -724,6 +737,16 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
                 "execution_seconds": value.deadline_ledger.execution_seconds,
                 "recovery_wait_seconds": value.deadline_ledger.recovery_wait_seconds,
             }
+        if value.publication is not None:
+            record["publication"] = _encode_publication(value.publication)
+        if value.handoff is not None:
+            record["handoff"] = _encode_handoff(value.handoff)
+        if value.observation_provenance is not None:
+            record["observation_provenance"] = _encode_observation_provenance(
+                value.observation_provenance
+            )
+        if value.action is not None:
+            record["action"] = _encode_action(value.action)
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -735,6 +758,48 @@ def _encode_review_findings(
 ) -> dict[str, list[dict[str, str]]]:
     return {
         head_sha: [dict(finding) for finding in values] for head_sha, values in findings.items()
+    }
+
+
+def _encode_publication(value: PublicationBinding) -> dict[str, object]:
+    return {
+        "pr_number": value.pr_number,
+        "head_sha": value.head_sha,
+        "head_branch": value.head_branch,
+        "base_branch": value.base_branch,
+        "attempt": value.attempt,
+        "invocation_id": value.invocation_id,
+    }
+
+
+def _encode_handoff(value: HandoffEvidence) -> dict[str, object]:
+    return {
+        "pr_number": value.pr_number,
+        "head_sha": value.head_sha,
+        "attempt": value.attempt,
+        "invocation_id": value.invocation_id,
+        "agent_id": value.agent_id,
+        "observed_at": value.observed_at,
+    }
+
+
+def _encode_observation_provenance(value: ObservationProvenance) -> dict[str, object]:
+    return {
+        "source": value.source,
+        "observed_at": value.observed_at,
+        "event_seq": value.event_seq,
+        "snapshot_id": value.snapshot_id,
+    }
+
+
+def _encode_action(value: ActionState) -> dict[str, object]:
+    return {
+        "kind": value.kind.value,
+        "phase": value.phase.value,
+        "state_version": value.state_version,
+        "intent_id": value.intent_id,
+        "head_sha": value.head_sha,
+        "attempt": value.attempt,
     }
 
 
@@ -897,6 +962,8 @@ def _decode(document: dict[str, object]) -> RunState:
         current_order=cast(int, document.get("current_order", 1)),
         ordered_stages=_decode_ordered_stages(document.get("ordered_stages")),
         integration=_decode_integration(document.get("integration")),
+        repository_identity=_decode_repository_identity(document.get("repository_identity")),
+        state_version=cast(int, document.get("state_version", 0)),
     )
 
 
@@ -1170,6 +1237,71 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         recovery=decode_recovery(value.get("recovery")),
         suspended_dependency=_decode_suspended_dependency(value.get("suspended_dependency")),
         deadline_ledger=_decode_deadline_ledger(value.get("deadline_ledger")),
+        publication=_decode_publication(value.get("publication")),
+        handoff=_decode_handoff(value.get("handoff")),
+        observation_provenance=_decode_observation_provenance(value.get("observation_provenance")),
+        action=_decode_action(value.get("action")),
+    )
+
+
+def _decode_repository_identity(value: object) -> RepositoryIdentity | None:
+    if not isinstance(value, Mapping):
+        return None
+    return RepositoryIdentity(
+        owner=cast(str, value["owner"]),
+        repo=cast(str, value["repo"]),
+        base_branch=cast(str, value["base_branch"]),
+        remote_url=cast(str | None, value.get("remote_url")),
+    )
+
+
+def _decode_publication(value: object) -> PublicationBinding | None:
+    if not isinstance(value, Mapping):
+        return None
+    return PublicationBinding(
+        pr_number=cast(int, value["pr_number"]),
+        head_sha=cast(str, value["head_sha"]),
+        head_branch=cast(str, value["head_branch"]),
+        base_branch=cast(str, value["base_branch"]),
+        attempt=cast(int, value["attempt"]),
+        invocation_id=cast(str | None, value.get("invocation_id")),
+    )
+
+
+def _decode_handoff(value: object) -> HandoffEvidence | None:
+    if not isinstance(value, Mapping):
+        return None
+    return HandoffEvidence(
+        pr_number=cast(int, value["pr_number"]),
+        head_sha=cast(str, value["head_sha"]),
+        attempt=cast(int, value["attempt"]),
+        invocation_id=cast(str, value["invocation_id"]),
+        agent_id=cast(str, value["agent_id"]),
+        observed_at=cast(str, value["observed_at"]),
+    )
+
+
+def _decode_observation_provenance(value: object) -> ObservationProvenance | None:
+    if not isinstance(value, Mapping):
+        return None
+    return ObservationProvenance(
+        source=cast(str, value["source"]),
+        observed_at=cast(str, value["observed_at"]),
+        event_seq=cast(int | None, value.get("event_seq")),
+        snapshot_id=cast(str | None, value.get("snapshot_id")),
+    )
+
+
+def _decode_action(value: object) -> ActionState | None:
+    if not isinstance(value, Mapping):
+        return None
+    return ActionState(
+        kind=ActionKind(cast(str, value["kind"])),
+        phase=ActionPhase(cast(str, value["phase"])),
+        state_version=cast(int, value["state_version"]),
+        intent_id=cast(str | None, value.get("intent_id")),
+        head_sha=cast(str | None, value.get("head_sha")),
+        attempt=cast(int | None, value.get("attempt")),
     )
 
 

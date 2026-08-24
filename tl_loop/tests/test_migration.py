@@ -99,6 +99,17 @@ def test_deployed_pre_898_version_1_checkpoint_is_migrated(tmp_path) -> None:
     assert report["target_version"] == SCHEMA_VERSION
 
 
+def test_legacy_reviewed_head_never_becomes_handoff_evidence() -> None:
+    legacy = _legacy_spawned()
+    legacy["slices"]["slice-a"].update({"reviewed_head": "head-from-review", "verdict": "GO"})
+
+    result = migrate_checkpoint_document(legacy, run_id="legacy")
+
+    migrated = result.document["slices"]["slice-a"]
+    assert "handoff" not in migrated
+    assert migrated["reviewed_head"] == "head-from-review"
+
+
 def test_install_migration_interrupted_before_report_leaves_checkpoint_untouched_and_retries_cleanly(
     tmp_path, monkeypatch
 ) -> None:

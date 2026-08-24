@@ -12,13 +12,20 @@ from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 from tl_loop.state.schema import (
+    ActionKind,
+    ActionPhase,
+    ActionState,
     BudgetLedger,
     DeadlineLedger,
     FSMState,
     GateStatus,
+    HandoffEvidence,
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
+    ObservationProvenance,
+    PublicationBinding,
+    RepositoryIdentity,
     SliceState,
     SliceStatus,
     SuspendedDependencyState,
@@ -142,6 +149,53 @@ def test_deadline_ledger_round_trips(tmp_path: Path) -> None:
     )
 
     assert load(store.path).slices["leaf"].deadline_ledger == value.deadline_ledger
+
+
+def test_merge_evidence_and_action_state_round_trip_across_resume(tmp_path: Path) -> None:
+    store = RunStore("merge-run", tmp_path)
+    identity = RepositoryIdentity("acme", "exomonad", "main", "https://forgejo.local/acme/exomonad")
+    value = replace(
+        _slice("leaf", SliceStatus.IN_REVIEW, "src/leaf.py"),
+        pr_number=42,
+        publication=PublicationBinding(42, "head-a", "task/leaf", "main", 1, "inv-1"),
+        handoff=HandoffEvidence(42, "head-a", 1, "inv-1", "agent-leaf", "2026-08-24T00:00:00Z"),
+        observation_provenance=ObservationProvenance(
+            "watcher", "2026-08-24T00:00:01Z", event_seq=7, snapshot_id="snap-7"
+        ),
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.INTENDED,
+            state_version=2,
+            intent_id="merge-intent",
+            head_sha="head-a",
+            attempt=1,
+        ),
+    )
+    state = create(
+        "merge-run",
+        {
+            "repository_identity": identity.__dict__,
+            "state_version": 3,
+        },
+        root_dir=tmp_path,
+    )
+    assert state.repository_identity == identity
+    assert state.state_version == 3
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("leaf",)),
+        {"leaf": value},
+        BudgetLedger(tokens=0, wall_seconds=0),
+        offset=7,
+    )
+
+    restored = store.load()
+    resumed = store.resume()
+    assert restored.slices["leaf"].publication == value.publication
+    assert restored.slices["leaf"].handoff == value.handoff
+    assert restored.slices["leaf"].observation_provenance == value.observation_provenance
+    assert restored.slices["leaf"].action == value.action
+    assert resumed.repository_identity == identity
+    assert resumed.state_version == 3
 
 
 def test_nested_child_recovery_projection_round_trips(tmp_path: Path) -> None:

@@ -135,6 +135,58 @@ def test_spawned_slice_requires_authoritative_dispatch_evidence() -> None:
     _assert_rejected(missing_evidence, "dispatch_intent_id")
 
 
+def test_merge_evidence_is_typed_and_exact_head_bound() -> None:
+    document = _valid_document()
+    document["state_version"] = 3
+    document["repository_identity"] = {
+        "owner": "acme",
+        "repo": "exomonad",
+        "base_branch": "main",
+        "remote_url": "https://forgejo.local/acme/exomonad",
+    }
+    _slice(document, "slice-a").update(
+        {
+            "publication": {
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "head_branch": "task/a",
+                "base_branch": "main",
+                "attempt": 1,
+                "invocation_id": "inv-1",
+            },
+            "handoff": {
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "attempt": 1,
+                "invocation_id": "inv-1",
+                "agent_id": "agent-a",
+                "observed_at": "2026-08-24T00:00:00Z",
+            },
+            "observation_provenance": {
+                "source": "watcher",
+                "observed_at": "2026-08-24T00:00:01Z",
+                "event_seq": 7,
+                "snapshot_id": "snap-7",
+            },
+            "action": {
+                "kind": "merge",
+                "phase": "intended",
+                "state_version": 2,
+                "intent_id": "merge-intent",
+                "head_sha": "head-a",
+                "attempt": 1,
+            },
+        }
+    )
+    validate(document)
+
+    stale_handoff = deepcopy(document)
+    cast(dict[str, object], cast(dict[str, object], stale_handoff["slices"])["slice-a"])[
+        "handoff"
+    ] = {"pr_number": 42, "head_sha": "head-a"}
+    _assert_rejected(stale_handoff, "run.slices['slice-a'].handoff")
+
+
 def test_unknown_version_is_rejected_without_migration() -> None:
     document = _valid_document()
     document["version"] = 99
@@ -211,7 +263,9 @@ def test_ordered_runtime_state_is_closed_and_validated() -> None:
     validate(document)
 
     invalid_candidate = deepcopy(document)
-    candidate_map = cast(dict[str, object], cast(dict[str, object], invalid_candidate["integration"])["candidates"])
+    candidate_map = cast(
+        dict[str, object], cast(dict[str, object], invalid_candidate["integration"])["candidates"]
+    )
     cast(dict[str, object], candidate_map["auth"])["lifecycle"] = IntegrationLifecycle.MERGED.value
     cast(dict[str, object], candidate_map["auth"]).pop("integration_owner_id")
     _assert_rejected(invalid_candidate, "run.integration.candidates['auth'].integration_owner_id")

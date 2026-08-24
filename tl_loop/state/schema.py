@@ -139,6 +139,133 @@ class GateStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class ActionKind(str, Enum):
+    """The controller effect represented by orthogonal action state."""
+
+    DISPATCH = "dispatch"
+    PUBLISH = "publish"
+    REVIEWER_SPAWN = "reviewer_spawn"
+    REPAIR = "repair"
+    MERGE = "merge"
+
+
+class ActionPhase(str, Enum):
+    """Durable before/after phase for one controller action."""
+
+    INTENDED = "intended"
+    IN_FLIGHT = "in_flight"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+    RECONCILED = "reconciled"
+
+
+@dataclass(frozen=True)
+class RepositoryIdentity:
+    """Stable Forgejo repository identity for persisted observations."""
+
+    owner: str
+    repo: str
+    base_branch: str
+    remote_url: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("owner", "repo", "base_branch"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"repository identity {name} must be non-empty")
+        if self.remote_url is not None and not self.remote_url:
+            raise ValueError("repository identity remote_url must be non-empty or null")
+
+
+@dataclass(frozen=True)
+class PublicationBinding:
+    """A PR publication bound to one exact attempt and head."""
+
+    pr_number: int
+    head_sha: str
+    head_branch: str
+    base_branch: str
+    attempt: int
+    invocation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.pr_number) is not int or self.pr_number <= 0:
+            raise ValueError("publication pr_number must be positive")
+        if type(self.attempt) is not int or self.attempt <= 0:
+            raise ValueError("publication attempt must be positive")
+        for name in ("head_sha", "head_branch", "base_branch"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"publication {name} must be non-empty")
+        if self.invocation_id is not None and not self.invocation_id:
+            raise ValueError("publication invocation_id must be non-empty or null")
+
+
+@dataclass(frozen=True)
+class HandoffEvidence:
+    """Authoritative implementation completion evidence for one exact head."""
+
+    pr_number: int
+    head_sha: str
+    attempt: int
+    invocation_id: str
+    agent_id: str
+    observed_at: str
+
+    def __post_init__(self) -> None:
+        if type(self.pr_number) is not int or self.pr_number <= 0:
+            raise ValueError("handoff pr_number must be positive")
+        if type(self.attempt) is not int or self.attempt <= 0:
+            raise ValueError("handoff attempt must be positive")
+        for name in ("head_sha", "invocation_id", "agent_id", "observed_at"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"handoff {name} must be non-empty")
+
+
+@dataclass(frozen=True)
+class ObservationProvenance:
+    """Source and cursor for the latest persisted repository observation."""
+
+    source: str
+    observed_at: str
+    event_seq: int | None = None
+    snapshot_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("source", "observed_at"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"observation provenance {name} must be non-empty")
+        if self.event_seq is not None and (type(self.event_seq) is not int or self.event_seq < 0):
+            raise ValueError("observation provenance event_seq must be non-negative or null")
+        if self.snapshot_id is not None and not self.snapshot_id:
+            raise ValueError("observation provenance snapshot_id must be non-empty or null")
+
+
+@dataclass(frozen=True)
+class ActionState:
+    """Action identity and phase, kept separate from slice lifecycle."""
+
+    kind: ActionKind
+    phase: ActionPhase
+    state_version: int = 1
+    intent_id: str | None = None
+    head_sha: str | None = None
+    attempt: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ActionKind):
+            raise TypeError("action kind must be an ActionKind")
+        if not isinstance(self.phase, ActionPhase):
+            raise TypeError("action phase must be an ActionPhase")
+        if type(self.state_version) is not int or self.state_version < 1:
+            raise ValueError("action state_version must be a positive integer")
+        for name in ("intent_id", "head_sha"):
+            value = getattr(self, name)
+            if value is not None and not value:
+                raise ValueError(f"action {name} must be non-empty or null")
+        if self.attempt is not None and (type(self.attempt) is not int or self.attempt <= 0):
+            raise ValueError("action attempt must be positive or null")
+
+
 REVIEW_FINDING_KEYS = frozenset({"severity", "path", "rationale"})
 CI_STATUS_VALUES = frozenset({"unknown", "pending", "success", "failure", "neutral"})
 STALL_CLASSIFICATION_VALUES = frozenset(
@@ -184,6 +311,8 @@ RUN_KEYS = frozenset(
         "current_order",
         "ordered_stages",
         "integration",
+        "repository_identity",
+        "state_version",
     }
 )
 ORDERED_STAGE_KEYS = frozenset({"order", "sub_tls"})
@@ -286,6 +415,10 @@ SLICE_KEYS = frozenset(
         "recovery",
         "suspended_dependency",
         "deadline_ledger",
+        "publication",
+        "handoff",
+        "observation_provenance",
+        "action",
     }
 )
 RECONCILIATION_KEYS = frozenset(
@@ -353,6 +486,15 @@ DEADLINE_LEDGER_KEYS = frozenset(
         "recovery_wait_seconds",
     }
 )
+REPOSITORY_IDENTITY_KEYS = frozenset({"owner", "repo", "base_branch", "remote_url"})
+PUBLICATION_KEYS = frozenset(
+    {"pr_number", "head_sha", "head_branch", "base_branch", "attempt", "invocation_id"}
+)
+HANDOFF_KEYS = frozenset(
+    {"pr_number", "head_sha", "attempt", "invocation_id", "agent_id", "observed_at"}
+)
+OBSERVATION_PROVENANCE_KEYS = frozenset({"source", "observed_at", "event_seq", "snapshot_id"})
+ACTION_KEYS = frozenset({"kind", "phase", "state_version", "intent_id", "head_sha", "attempt"})
 BUDGET_KEYS = frozenset({"ledger"})
 LEDGER_KEYS = frozenset(
     {
@@ -435,6 +577,10 @@ class SliceState:
     recovery: RecoveryState | None = None
     suspended_dependency: SuspendedDependencyState | None = None
     deadline_ledger: DeadlineLedger | None = None
+    publication: PublicationBinding | None = None
+    handoff: HandoffEvidence | None = None
+    observation_provenance: ObservationProvenance | None = None
+    action: ActionState | None = None
 
 
 @dataclass(frozen=True)
@@ -589,6 +735,8 @@ class RunState:
     current_order: int = 1
     ordered_stages: tuple[OrderedStageState, ...] = ()
     integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
+    repository_identity: RepositoryIdentity | None = None
+    state_version: int = 0
 
 
 class SchemaError(ValueError):
@@ -621,6 +769,8 @@ def validate(doc: object) -> None:
         _nullable_string(root, key, "run", errors)
     if "depth" in root:
         _non_negative_int(root, "depth", "run", errors)
+    _nullable_non_negative_int(root, "state_version", "run", errors)
+    _validate_repository_identity(root.get("repository_identity"), "run", errors)
 
     fsm = _object(root.get("fsm"), "run.fsm", FSM_KEYS, errors)
     if fsm is not None:
@@ -883,6 +1033,10 @@ def _validate_slice(
     _validate_recovery(value.get("recovery"), path, errors)
     _validate_suspended_dependency(value.get("suspended_dependency"), path, errors)
     _validate_deadline_ledger(value.get("deadline_ledger"), path, errors)
+    _validate_publication(value.get("publication"), path, errors)
+    _validate_handoff(value.get("handoff"), path, errors)
+    _validate_observation_provenance(value.get("observation_provenance"), path, errors)
+    _validate_action(value.get("action"), path, errors)
     if value.get("status") == SliceStatus.SPAWNED.value:
         _non_empty_string(value, "dispatch_intent_id", path, errors)
         _non_empty_string(value, "dispatch_agent_id", path, errors)
@@ -1079,6 +1233,75 @@ def _validate_suspended_dependency(value: object, path: str, errors: list[tuple[
         f"{path}.suspended_dependency",
         errors,
     )
+
+
+def _validate_repository_identity(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    identity = _object(value, f"{path}.repository_identity", REPOSITORY_IDENTITY_KEYS, errors)
+    if identity is None:
+        return
+    for key in ("owner", "repo", "base_branch"):
+        _non_empty_string(identity, key, f"{path}.repository_identity", errors)
+    _nullable_string(identity, "remote_url", f"{path}.repository_identity", errors)
+
+
+def _validate_publication(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    publication = _object(value, f"{path}.publication", PUBLICATION_KEYS, errors)
+    if publication is None:
+        return
+    _positive_int(publication, "pr_number", f"{path}.publication", errors)
+    _positive_int(publication, "attempt", f"{path}.publication", errors)
+    for key in ("head_sha", "head_branch", "base_branch"):
+        _non_empty_string(publication, key, f"{path}.publication", errors)
+    _nullable_string(publication, "invocation_id", f"{path}.publication", errors)
+
+
+def _validate_handoff(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    handoff = _object(value, f"{path}.handoff", HANDOFF_KEYS, errors)
+    if handoff is None:
+        return
+    _positive_int(handoff, "pr_number", f"{path}.handoff", errors)
+    _positive_int(handoff, "attempt", f"{path}.handoff", errors)
+    for key in ("head_sha", "invocation_id", "agent_id", "observed_at"):
+        _non_empty_string(handoff, key, f"{path}.handoff", errors)
+
+
+def _validate_observation_provenance(
+    value: object, path: str, errors: list[tuple[str, str]]
+) -> None:
+    if value is None:
+        return
+    provenance = _object(
+        value,
+        f"{path}.observation_provenance",
+        OBSERVATION_PROVENANCE_KEYS,
+        errors,
+    )
+    if provenance is None:
+        return
+    for key in ("source", "observed_at"):
+        _non_empty_string(provenance, key, f"{path}.observation_provenance", errors)
+    _nullable_non_negative_int(provenance, "event_seq", f"{path}.observation_provenance", errors)
+    _nullable_string(provenance, "snapshot_id", f"{path}.observation_provenance", errors)
+
+
+def _validate_action(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    action = _object(value, f"{path}.action", ACTION_KEYS, errors)
+    if action is None:
+        return
+    _enum_value(action, "kind", f"{path}.action", ActionKind, errors)
+    _enum_value(action, "phase", f"{path}.action", ActionPhase, errors)
+    _positive_int(action, "state_version", f"{path}.action", errors)
+    _nullable_string(action, "intent_id", f"{path}.action", errors)
+    _nullable_string(action, "head_sha", f"{path}.action", errors)
+    _nullable_positive_int(action, "attempt", f"{path}.action", errors)
 
 
 def _validate_deadline_ledger(value: object, path: str, errors: list[tuple[str, str]]) -> None:
