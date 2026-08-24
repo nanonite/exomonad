@@ -116,8 +116,10 @@ from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .journal import MUTATING_OPERATIONS, EffectJournal, stable_action_key
 from .reconcile import (
+    ExternalIntent,
     Quiescent,
     ReconciliationResult,
+    derive_next_action,
     reconcile_merge_observation,
     reconcile_slice,
 )
@@ -944,6 +946,10 @@ def _run_loop(
             diagnostics=diagnostics.snapshot(),
         )
 
+    if not isinstance(derive_next_action(state), Quiescent):
+        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+        phase = _phase_from_state(state)
+
     while not config.test_harness or len(consumed) < config.max_events:
         if isinstance(phase, (TLDone, TLFailed)):
             break
@@ -995,6 +1001,8 @@ def _run_loop(
                         state.goals.last_progress_at,
                     )
                     _emit_phase_change(run_id, before_phase, phase, config, effects, effects_log)
+                    state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+                    phase = _phase_from_state(state)
                     if heartbeat.parked_slice_ids and _all_expected_terminal(state, expected):
                         before_phase = phase
                         state = store.checkpoint(
@@ -1336,7 +1344,447 @@ def _apply_convergence(
         state = store.set_state_version(result.state.state_version)
     for event in result.events:
         _record_convergence_event(_event_target(event.payload), event, config, effects, effects_log)
+    if isinstance(result.decision, ExternalIntent):
+        state = _execute_external_intent(
+            state,
+            result.decision,
+            tracker,
+            store,
+            config,
+            effects,
+            effects_log,
+        )
     return state
+
+
+def _execute_external_intent(
+    state: RunState,
+    intent: ExternalIntent,
+    tracker: ConvergenceTracker,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Execute one direct-leaf intent after its durable convergence event."""
+    if intent.target_id not in state.slices:
+        return state
+    if intent.operation == "merge":
+        return _execute_direct_merge_intent(state, intent, tracker, store, config, effects, effects_log)
+    if intent.operation == "repair":
+        return _execute_direct_repair_intent(state, intent, tracker, store, config, effects, effects_log)
+    if intent.operation == "spawn_reviewer":
+        return _execute_direct_reviewer_intent(state, intent, tracker, store, config, effects, effects_log)
+    return state
+
+
+def _execute_direct_reviewer_intent(
+    state: RunState,
+    intent: ExternalIntent,
+    tracker: ConvergenceTracker,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Persist and execute a reviewer spawn derived from a direct leaf."""
+    current = state.slices[intent.target_id]
+    head_sha = intent.arguments.get("head_sha")
+    pr_number = intent.arguments.get("pr_number")
+    if not isinstance(head_sha, str) or not isinstance(pr_number, int):
+        return state
+    claimed = replace(
+        current,
+        reviewer_attempt={**current.reviewer_attempt, head_sha: 1},
+    )
+    action = ActionState(
+        ActionKind.REVIEWER_SPAWN,
+        ActionPhase.IN_FLIGHT,
+        intent_id=stable_action_key(state.run_id, "spawn_reviewer", current.id, intent.arguments),
+        head_sha=head_sha,
+        attempt=max(1, current.attempts),
+    )
+    state = _checkpoint_slice_action(
+        store,
+        state,
+        current.id,
+        action,
+        slice_state=replace(claimed, action=action),
+    )
+    current = state.slices[current.id]
+    _record_convergence_event(
+        current.id,
+        tracker.action_started(state, intent),
+        config,
+        effects,
+        effects_log,
+    )
+    criteria = compose_acceptance_criteria(
+        current,
+        {"verify": current.test_plan, "boundary": current.paths},
+    )
+    result = _invoke(
+        "spawn_reviewer",
+        current.id,
+        {"pr_number": pr_number, "head_sha": head_sha, "force": False},
+        config.active,
+        cast(EffectClient, effects) if config.active else None,
+        lambda client: client.spawn_reviewer(
+            pr_number=pr_number,
+            head_sha=head_sha,
+            acceptance_criteria=criteria,
+            force=False,
+        ),
+        effects_log,
+    )
+    reviewer_name = (
+        result.result.get("reviewer_name")
+        if result is not None and isinstance(result.result, Mapping)
+        else None
+    )
+    refreshed = store.load()
+    latest = refreshed.slices[current.id]
+    updated = replace(
+        latest,
+        reviewer_agent_id=reviewer_name if isinstance(reviewer_name, str) else latest.reviewer_agent_id,
+        action=replace(action, phase=ActionPhase.CONFIRMED),
+    )
+    return _checkpoint_slice_action(store, refreshed, current.id, updated.action, slice_state=updated)
+
+
+def _execute_direct_repair_intent(
+    state: RunState,
+    intent: ExternalIntent,
+    tracker: ConvergenceTracker,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Route direct-leaf repair through the existing same-owner handoff path."""
+    current = state.slices[intent.target_id]
+    reasons = _repair_reasons(current)
+    review = {"verdict": Verdict.NO_GO.value, "reasons": reasons}
+    _record_convergence_event(
+        current.id,
+        tracker.action_started(state, intent),
+        config,
+        effects,
+        effects_log,
+    )
+    return _route_repair(
+        store,
+        state,
+        state.fsm,
+        state.events.last_consumed_offset,
+        current.id,
+        review,
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _execute_direct_merge_intent(
+    state: RunState,
+    intent: ExternalIntent,
+    tracker: ConvergenceTracker,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Compare, journal, merge, and re-read one direct PR before adoption."""
+    current = state.slices[intent.target_id]
+    if current.pr_number is None or not config.active:
+        return state
+    live = cast(EffectClient, effects)
+    watcher = _invoke(
+        "watcher_pr_state",
+        current.id,
+        {"pr_number": current.pr_number},
+        True,
+        live,
+        lambda client: client.watcher_pr_state(pr_number=current.pr_number or 0),
+        effects_log,
+        raise_on_failure=False,
+    )
+    if (
+        watcher is not None
+        and watcher.success is True
+        and isinstance(watcher.result, Mapping)
+        and watcher.result.get("merged") is True
+    ):
+        refreshed = store.load()
+        return _checkpoint_slice_action(
+            store,
+            refreshed,
+            current.id,
+            None,
+            slice_state=replace(
+                refreshed.slices[current.id],
+                status=SliceStatus.MERGED,
+                dispatch_last_boundary="direct_merge_adopted",
+            ),
+        )
+    evidence = _direct_merge_evidence(current, watcher)
+    if evidence is None:
+        return _clear_action_for_reduction(store, state, current.id)
+    arguments = {
+        "pr_number": current.pr_number,
+        "expected_base_sha": evidence["base_sha"],
+        "expected_head_sha": evidence["head_sha"],
+        "expected_patch_digest": evidence["patch_digest"],
+        "expected_merge_tree_sha": evidence["merge_tree_sha"],
+    }
+    action = ActionState(
+        ActionKind.MERGE,
+        ActionPhase.IN_FLIGHT,
+        intent_id=stable_action_key(state.run_id, "merge_pr", current.id, arguments),
+        head_sha=cast(str, evidence["head_sha"]),
+        attempt=max(1, current.attempts),
+    )
+    state = _checkpoint_slice_action(store, state, current.id, action)
+    _record_convergence_event(
+        current.id,
+        tracker.action_started(state, intent),
+        config,
+        effects,
+        effects_log,
+    )
+    try:
+        merge_result = _invoke(
+            "merge_pr",
+            current.id,
+            arguments,
+            True,
+            live,
+            lambda client: client.merge_pr(
+                pr_number=current.pr_number or 0,
+                chainlink_issue_id=config.chainlink_issue_id,
+                strategy=config.merge_strategy,
+                working_dir=config.working_dir,
+                expected_base_sha=cast(str, evidence["base_sha"]),
+                expected_head_sha=cast(str, evidence["head_sha"]),
+                expected_patch_digest=cast(str, evidence["patch_digest"]),
+                expected_merge_tree_sha=cast(str, evidence["merge_tree_sha"]),
+            ),
+            effects_log,
+            raise_on_failure=False,
+        )
+    except ToolUnavailableError:
+        raise
+    except (ConnectionError, OSError, RuntimeError, TimeoutError) as error:
+        return _reconcile_unknown_merge(
+            state,
+            intent,
+            action,
+            arguments,
+            error,
+            tracker,
+            store,
+            config,
+            effects,
+            effects_log,
+        )
+    return _adopt_direct_merge_result(
+        state,
+        current.id,
+        action,
+        merge_result,
+        store,
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _reconcile_unknown_merge(
+    state: RunState,
+    intent: ExternalIntent,
+    action: ActionState,
+    arguments: Mapping[str, object],
+    error: BaseException,
+    tracker: ConvergenceTracker,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Probe Forgejo after a lost merge response before leaving an unknown intent."""
+    current = state.slices[intent.target_id]
+    watcher = _invoke(
+        "watcher_pr_state",
+        current.id,
+        {"pr_number": current.pr_number or 0},
+        config.active,
+        cast(EffectClient, effects) if config.active else None,
+        lambda client: client.watcher_pr_state(pr_number=current.pr_number or 0),
+        effects_log,
+        raise_on_failure=False,
+    )
+    if (
+        watcher is not None
+        and watcher.success is True
+        and isinstance(watcher.result, Mapping)
+        and watcher.result.get("merged") is True
+    ):
+        if isinstance(effects_log, EffectJournal):
+            key = stable_action_key(state.run_id, "merge_pr", current.id, arguments)
+            effects_log.resolve_by_key(
+                key,
+                status="confirmed",
+                result={"success": True, "result": {"merged": True, "reconciled": True}},
+            )
+        refreshed = store.load()
+        return _checkpoint_slice_action(
+            store,
+            refreshed,
+            current.id,
+            None,
+            slice_state=replace(
+                refreshed.slices[current.id],
+                status=SliceStatus.MERGED,
+                dispatch_last_boundary="direct_merge_reconciled",
+            ),
+        )
+    refreshed = store.load()
+    unknown = replace(action, phase=ActionPhase.UNKNOWN)
+    updated = _checkpoint_slice_action(store, refreshed, current.id, unknown)
+    _record_convergence_event(
+        current.id,
+        tracker.action_outcome(updated, intent, outcome="unknown", error=str(error)),
+        config,
+        effects,
+        effects_log,
+    )
+    return updated
+
+
+def _direct_merge_evidence(
+    current: SliceState,
+    watcher: ToolResult | None,
+) -> dict[str, str] | None:
+    """Validate the watcher snapshot used as the direct merge compare."""
+    if (
+        watcher is None
+        or watcher.success is not True
+        or not isinstance(watcher.result, Mapping)
+    ):
+        return None
+    head_sha = watcher_head(watcher)
+    evidence = {
+        "base_sha": _watcher_evidence_text(watcher, "base_sha"),
+        "head_sha": head_sha,
+        "patch_digest": watcher_patch_digest(watcher),
+        "merge_tree_sha": _watcher_evidence_text(watcher, "merge_tree_sha"),
+    }
+    if any(not isinstance(value, str) or not value for value in evidence.values()):
+        return None
+    if current.reviewed_head != head_sha or current.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
+        return None
+    if watcher.result.get("ci_status") not in {"success", "neutral"}:
+        return None
+    return cast(dict[str, str], evidence)
+
+
+def _adopt_direct_merge_result(
+    state: RunState,
+    slice_id: str,
+    action: ActionState,
+    result: ToolResult | None,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Adopt a merge only after a second authoritative merged snapshot."""
+    current = state.slices[slice_id]
+    if result is not None and result.success is False:
+        return _clear_action_for_reduction(store, state, slice_id)
+    watcher = _invoke(
+        "watcher_pr_state",
+        slice_id,
+        {"pr_number": current.pr_number or 0},
+        config.active,
+        cast(EffectClient, effects) if config.active else None,
+        lambda client: client.watcher_pr_state(pr_number=current.pr_number or 0),
+        effects_log,
+        raise_on_failure=False,
+    )
+    if (
+        watcher is not None
+        and watcher.success is True
+        and isinstance(watcher.result, Mapping)
+        and watcher.result.get("merged") is True
+    ):
+        refreshed = store.load()
+        return _checkpoint_slice_action(
+            store,
+            refreshed,
+            slice_id,
+            None,
+            slice_state=replace(
+                refreshed.slices[slice_id],
+                status=SliceStatus.MERGED,
+                dispatch_last_boundary="direct_merge_confirmed",
+            ),
+        )
+    return _checkpoint_slice_action(
+        store,
+        store.load(),
+        slice_id,
+        replace(action, phase=ActionPhase.CONFIRMED),
+    )
+
+
+def _checkpoint_slice_action(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    action: ActionState | None,
+    *,
+    slice_state: SliceState | None = None,
+) -> RunState:
+    """Persist one direct action phase without changing unrelated run state."""
+    current = slice_state or state.slices[slice_id]
+    if slice_state is None:
+        current = replace(current, action=action)
+    return store.checkpoint(
+        state.fsm,
+        {**state.slices, slice_id: current},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+
+def _clear_action_for_reduction(store: RunStore, state: RunState, slice_id: str) -> RunState:
+    """Clear a stale direct intent so the next authoritative reduction can act."""
+    return _checkpoint_slice_action(store, state, slice_id, None)
+
+
+def _repair_reasons(current: SliceState) -> list[dict[str, object]]:
+    """Convert persisted reviewer findings into the repair contract."""
+    findings = current.review_findings.get(current.reviewed_head or "", ())
+    return [
+        {
+            "severity": finding.get("severity", "blocking"),
+            "file": finding.get("path", "review"),
+            "line": 0,
+            "claim": finding.get("rationale", "Reviewer requested changes"),
+        }
+        for finding in findings
+    ] or [
+        {
+            "severity": "blocking",
+            "file": "review",
+            "line": 0,
+            "claim": "Reviewer requested changes",
+        }
+    ]
 
 
 def _record_convergence_event(
@@ -5448,6 +5896,27 @@ def _route_repair(
     current = state.slices.get(slice_id)
     if current is None or current.pr_number is None:
         raise TLLoopError(f"repair event references slice without PR {slice_id!r}")
+    repair_arguments = {
+        "pr_number": current.pr_number,
+        "head_sha": current.reviewed_head,
+    }
+    repair_action = ActionState(
+        ActionKind.REPAIR,
+        ActionPhase.IN_FLIGHT,
+        intent_id=stable_action_key(state.run_id, "resume_pr", slice_id, repair_arguments),
+        head_sha=current.reviewed_head,
+        attempt=max(1, current.attempts),
+    )
+    state = store.checkpoint(
+        phase,
+        {**state.slices, slice_id: replace(current, action=repair_action)},
+        state.budgets,
+        event_seq,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    current = state.slices[slice_id]
     live = cast(EffectClient, effects)
     repair_model = _repair_model(current, config)
     pr = {
@@ -5493,6 +5962,7 @@ def _route_repair(
         parked = replace(
             current,
             status=SliceStatus.PARKED,
+            action=None,
             park_cause=ParkCause.REVIEW_STUCK,
             stall_classification="review_stuck",
             dispatch_last_boundary="repair_exhausted",
@@ -5530,7 +6000,19 @@ def _route_repair(
         )
         return state
     refreshed = store.load()
-    return store.checkpoint(phase, refreshed.slices, refreshed.budgets, event_seq)
+    resumed = replace(
+        refreshed.slices[slice_id],
+        action=replace(repair_action, phase=ActionPhase.CONFIRMED),
+    )
+    return store.checkpoint(
+        phase,
+        {**refreshed.slices, slice_id: resumed},
+        refreshed.budgets,
+        event_seq,
+        current_order=refreshed.current_order,
+        ordered_stages=refreshed.ordered_stages,
+        integration=refreshed.integration,
+    )
 
 
 def _repair_model(current: SliceState, config: TLLoopConfig) -> str | None:

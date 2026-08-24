@@ -36,6 +36,7 @@ from tl_loop.loop.driver import (
     WorkerTask,
     WorkPlan,
     _child_recovery_projection,
+    _apply_convergence,
     DISPATCH_CORRELATED,
     DISPATCH_HISTORICAL_AUDIT,
     DISPATCH_INTEGRITY_CONFLICT,
@@ -57,6 +58,7 @@ from tl_loop.loop.driver import (
     tl_run,
 )
 from tl_loop.loop.journal import EffectJournal
+from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
 from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
@@ -68,10 +70,12 @@ from tl_loop.state.schema import (
     BudgetLedger,
     GateState,
     GateStatus,
+    HandoffEvidence,
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
     ParkCause,
+    PublicationBinding,
     SliceState,
     SliceStatus,
     Verdict,
@@ -1960,6 +1964,130 @@ def test_direct_reviewer_verdict_rejects_unregistered_actor(tmp_path: Path) -> N
     )
 
     assert store.load().slices["leaf-a"].verdict is None
+
+
+def test_convergence_executes_journaled_direct_merge_with_compare_evidence(tmp_path: Path) -> None:
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                publication=PublicationBinding(42, "head-a", "main.leaf-a", "main", 1),
+                handoff=HandoffEvidence(
+                    42,
+                    "head-a",
+                    1,
+                    "inv-1",
+                    "leaf-a",
+                    "2026-08-12T00:00:00Z",
+                ),
+                reviewer_attempt={"head-a": 1},
+                ci_state={"head-a": "success"},
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+    transport = IntegrationTransport(
+        snapshots=[
+            {
+                "merged": False,
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {"merged": True, "head_sha": "head-a", "pr_state": "closed"},
+        ],
+        merge_response={"success": True, "result": {"merged": True}},
+    )
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+
+    result = _apply_convergence(
+        store.load(),
+        ConvergenceTracker(),
+        store,
+        TLLoopConfig(active=True),
+        EffectClient(transport),
+        journal,
+    )
+
+    assert result.slices["leaf-a"].status is SliceStatus.MERGED
+    merge_arguments = next(args for name, args in transport.calls if name == "merge_pr")
+    assert merge_arguments["expected_base_sha"] == "base-a"
+    assert merge_arguments["expected_head_sha"] == "head-a"
+    assert merge_arguments["expected_patch_digest"] == "patch-a"
+    assert merge_arguments["expected_merge_tree_sha"] == "tree-a"
+    merge_entries = journal.confirmed_entries("merge_pr", "leaf-a")
+    assert len(merge_entries) == 1
+
+
+def test_unknown_direct_merge_reconciles_authoritative_merged_snapshot(tmp_path: Path) -> None:
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                publication=PublicationBinding(42, "head-a", "main.leaf-a", "main", 1),
+                handoff=HandoffEvidence(
+                    42,
+                    "head-a",
+                    1,
+                    "inv-1",
+                    "leaf-a",
+                    "2026-08-12T00:00:00Z",
+                ),
+                reviewer_attempt={"head-a": 1},
+                ci_state={"head-a": "success"},
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+
+    class UnknownMergeTransport(IntegrationTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            if tool_name == "merge_pr":
+                raise RuntimeError("transport lost after merge dispatch")
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = UnknownMergeTransport(
+        snapshots=[
+            {
+                "merged": False,
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {"merged": True, "head_sha": "head-a", "pr_state": "closed"},
+        ]
+    )
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+
+    result = _apply_convergence(
+        store.load(),
+        ConvergenceTracker(),
+        store,
+        TLLoopConfig(active=True),
+        EffectClient(transport),
+        journal,
+    )
+
+    assert result.slices["leaf-a"].status is SliceStatus.MERGED
+    assert len(journal.confirmed_entries("merge_pr", "leaf-a")) == 1
 
 
 def test_child_completion_records_exact_head_handoff_without_merging(tmp_path: Path) -> None:

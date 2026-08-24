@@ -230,6 +230,27 @@ def _derive_run_action(state: RunState) -> MergeDecision:
 def _derive_slice_action(state: SliceState) -> MergeDecision:
     if state.status is SliceStatus.MERGED:
         return InternalTransition("terminal", "merged")
+    if state.action is not None:
+        if state.action.kind in {
+            ActionKind.REPAIR,
+            ActionKind.REVIEWER_SPAWN,
+        } and state.action.phase in {
+            ActionPhase.INTENDED,
+            ActionPhase.IN_FLIGHT,
+            ActionPhase.UNKNOWN,
+            ActionPhase.CONFIRMED,
+            ActionPhase.RECONCILED,
+        }:
+            return Quiescent(f"await_{state.action.kind.value}_reconciliation")
+        if state.action.kind is ActionKind.MERGE:
+            if state.action.phase in {
+                ActionPhase.INTENDED,
+                ActionPhase.IN_FLIGHT,
+                ActionPhase.UNKNOWN,
+            }:
+                return Quiescent("await_merge_recovery")
+            if state.action.phase in {ActionPhase.CONFIRMED, ActionPhase.RECONCILED}:
+                return Quiescent("await_merge_reconciliation")
     if state.status in {
         SliceStatus.DISPATCH_FAILED,
         SliceStatus.FAILED,
@@ -273,15 +294,6 @@ def _derive_slice_action(state: SliceState) -> MergeDecision:
         return Quiescent("await_ci")
     if ci_status == "failure" or state.verdict is Verdict.NO_GO:
         return ExternalIntent("repair", state.id, {"head_sha": current_head})
-    if state.action is not None and state.action.kind is ActionKind.MERGE:
-        if state.action.phase in {
-            ActionPhase.INTENDED,
-            ActionPhase.IN_FLIGHT,
-            ActionPhase.UNKNOWN,
-        }:
-            return Quiescent("await_merge_recovery")
-        if state.action.phase in {ActionPhase.CONFIRMED, ActionPhase.RECONCILED}:
-            return InternalTransition("terminal", "merge_confirmed")
     if state.verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and ci_status in {
         "success",
         "neutral",
