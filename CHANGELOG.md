@@ -7,7 +7,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
-- Document and prove single-path review orchestration (#1006)
 - Route one-shot verdicts to merge or same-owner repair (#1005)
 - Journal one canonical reviewer effect and review contract (#1004)
 - Make reviewer spawning a reducer-derived action (#1003)
