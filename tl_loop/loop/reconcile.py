@@ -223,24 +223,54 @@ def _derive_run_action(state: RunState) -> MergeDecision:
             {"patch_digest": integration.aggregate_patch_digest},
         )
     if active:
-        return _derive_slice_action(active[0])
+        repository_identity = (
+            {
+                "owner": state.repository_identity.owner,
+                "repo": state.repository_identity.repo,
+                "base_branch": state.repository_identity.base_branch,
+            }
+            if state.repository_identity is not None
+            else None
+        )
+        return _derive_slice_action(active[0], repository_identity=repository_identity)
     return Quiescent("no_active_slices")
 
 
-def _derive_slice_action(state: SliceState) -> MergeDecision:
+def _derive_slice_action(
+    state: SliceState,
+    *,
+    repository_identity: Mapping[str, object] | None = None,
+) -> MergeDecision:
+    current_head = _persisted_head(state)
+    current_contract_digest = (
+        state.review_contract.get("digest") if state.review_contract is not None else None
+    )
+    contract_changed = (
+        state.action is not None
+        and state.action.kind is ActionKind.REVIEWER_SPAWN
+        and state.action.contract_digest is not None
+        and current_contract_digest is not None
+        and state.action.contract_digest != current_contract_digest
+    )
     if state.status is SliceStatus.MERGED:
         return InternalTransition("terminal", "merged")
     if state.action is not None:
-        if state.action.kind in {
-            ActionKind.REPAIR,
-            ActionKind.REVIEWER_SPAWN,
-        } and state.action.phase in {
-            ActionPhase.INTENDED,
-            ActionPhase.IN_FLIGHT,
-            ActionPhase.UNKNOWN,
-            ActionPhase.CONFIRMED,
-            ActionPhase.RECONCILED,
-        }:
+        if (
+            state.action.kind
+            in {
+                ActionKind.REPAIR,
+                ActionKind.REVIEWER_SPAWN,
+            }
+            and state.action.phase
+            in {
+                ActionPhase.INTENDED,
+                ActionPhase.IN_FLIGHT,
+                ActionPhase.UNKNOWN,
+                ActionPhase.CONFIRMED,
+                ActionPhase.RECONCILED,
+            }
+            and not contract_changed
+        ):
             return Quiescent(f"await_{state.action.kind.value}_reconciliation")
         if state.action.kind is ActionKind.MERGE:
             if state.action.phase in {
@@ -258,7 +288,6 @@ def _derive_slice_action(state: SliceState) -> MergeDecision:
         SliceStatus.BLOCKED,
     }:
         return Quiescent(f"closed_{state.status.value}")
-    current_head = _persisted_head(state)
     if state.status is SliceStatus.REPAIRING:
         return ExternalIntent("repair", state.id, {"head_sha": current_head})
     if _has_conflict(state):
@@ -279,11 +308,21 @@ def _derive_slice_action(state: SliceState) -> MergeDecision:
         return Quiescent("await_handoff")
     if state.publication is not None and state.publication.pr_number != state.pr_number:
         return Quiescent("await_publication")
-    if state.reviewer_attempt.get(current_head, 0) == 0:
+    if contract_changed or state.reviewer_attempt.get(current_head, 0) == 0:
+        arguments: dict[str, object] = {
+            "pr_number": state.pr_number,
+            "head_sha": current_head,
+        }
+        if state.review_contract is not None:
+            digest = state.review_contract.get("digest")
+            if isinstance(digest, str) and digest:
+                arguments["review_contract_digest"] = digest
+        if repository_identity is not None:
+            arguments["repository_identity"] = dict(repository_identity)
         return ExternalIntent(
             "spawn_reviewer",
             state.id,
-            {"pr_number": state.pr_number, "head_sha": current_head},
+            arguments,
         )
     if state.verdict is None or state.reviewed_head != current_head:
         return Quiescent("await_review")
@@ -569,9 +608,7 @@ def reconcile_slice(
         and watcher.get("head_reachable") is False
     )
     merge_observation = (
-        reconcile_merge_observation(slice_state, watcher)
-        if watcher is not None
-        else None
+        reconcile_merge_observation(slice_state, watcher) if watcher is not None else None
     )
     if ownership_unresolved:
         conflicts.append("publication ownership is unresolved")

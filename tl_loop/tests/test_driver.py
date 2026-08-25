@@ -38,6 +38,7 @@ from tl_loop.loop.driver import (
     _child_recovery_projection,
     _apply_convergence,
     _bind_publication_evidence,
+    _execute_direct_reviewer_intent,
     DISPATCH_CORRELATED,
     DISPATCH_HISTORICAL_AUDIT,
     DISPATCH_INTEGRITY_CONFLICT,
@@ -59,6 +60,7 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.convergence import ConvergenceTracker
+from tl_loop.loop.reconcile import ExternalIntent
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
 from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
@@ -76,6 +78,7 @@ from tl_loop.state.schema import (
     OrderedStageState,
     ParkCause,
     PublicationBinding,
+    ActionPhase,
     SliceState,
     SliceStatus,
     Verdict,
@@ -1332,6 +1335,43 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
     slice_state = result.final_state.slices["tunable-operator-body"]
     assert slice_state.reviewer_attempt == {"head-a": 1}
     assert source.acknowledged == [1, 2, 3]
+
+
+def test_reviewer_unknown_outcome_persists_gate_without_retry(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+
+    class UnknownReviewerTransport(RecordingTransport):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            if tool_name == "spawn_reviewer":
+                raise RuntimeError("reviewer service disconnected")
+            return super().call_tool(role, name, tool_name, arguments)
+
+    journal = EffectJournal("review-run", tmp_path / "action-journal.json")
+    transport = UnknownReviewerTransport()
+    intent = ExternalIntent(
+        "spawn_reviewer",
+        "leaf-a",
+        {"pr_number": 42, "head_sha": "head-a"},
+    )
+
+    with pytest.raises(RuntimeError, match="disconnected"):
+        _execute_direct_reviewer_intent(
+            store.load(),
+            intent,
+            ConvergenceTracker(),
+            store,
+            TLLoopConfig(active=True, enable_reviewer_spawn=True),
+            EffectClient(transport),
+            journal,
+        )
+
+    recovered = store.load().slices["leaf-a"]
+    assert recovered.action is not None
+    assert recovered.action.phase is ActionPhase.UNKNOWN
+    assert any(gate.name.startswith("tl-action-journal-") for gate in store.load().gates)
+    assert journal.pending_entries()[0]["status"] == "unknown"
 
 
 def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -> None:

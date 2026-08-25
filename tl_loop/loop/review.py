@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -17,6 +19,48 @@ DEFAULT_REVIEW_POLICY = Path(".exo/review-policy.toml")
 
 class AcceptanceCriteriaError(ValueError):
     """The TL cannot compose a complete reviewer acceptance contract."""
+
+
+@dataclass(frozen=True)
+class ReviewContract:
+    """Normalized reviewer input and its stable content identity."""
+
+    acceptance_criteria: tuple[str, ...]
+    digest: str
+
+    @classmethod
+    def from_criteria(cls, criteria: Sequence[str]) -> "ReviewContract":
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in criteria:
+            if not isinstance(value, str) or not value.strip():
+                raise AcceptanceCriteriaError("review criteria must contain non-empty strings")
+            item = value.strip()
+            if item not in seen:
+                normalized.append(item)
+                seen.add(item)
+        if not normalized:
+            raise AcceptanceCriteriaError("review contract requires at least one criterion")
+        encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return cls(tuple(normalized), digest)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "ReviewContract":
+        criteria = value.get("acceptance_criteria")
+        digest = value.get("digest")
+        if not isinstance(criteria, (list, tuple)) or not isinstance(digest, str):
+            raise AcceptanceCriteriaError("review contract has an invalid shape")
+        contract = cls.from_criteria(criteria)
+        if contract.digest != digest:
+            raise AcceptanceCriteriaError("review contract digest does not match its criteria")
+        return contract
+
+    def as_mapping(self) -> dict[str, object]:
+        return {
+            "acceptance_criteria": list(self.acceptance_criteria),
+            "digest": self.digest,
+        }
 
 
 def compose_acceptance_criteria(
@@ -51,23 +95,25 @@ def compose_acceptance_criteria(
     return tuple(criteria)
 
 
+def compose_review_contract(
+    slice_state: SliceState,
+    plan: Mapping[str, object] | object,
+) -> ReviewContract:
+    """Compose one normalized contract shared by every reviewer path."""
+    return ReviewContract.from_criteria(compose_acceptance_criteria(slice_state, plan))
+
+
 def _plan_values(
     plan: Mapping[str, object] | object,
     field_name: str,
 ) -> tuple[str, ...]:
-    value = (
-        plan.get(field_name, ())
-        if isinstance(plan, Mapping)
-        else getattr(plan, field_name, ())
-    )
+    value = plan.get(field_name, ()) if isinstance(plan, Mapping) else getattr(plan, field_name, ())
     if value is None:
         return ()
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise AcceptanceCriteriaError(f"plan {field_name} must be an array")
     if any(not isinstance(item, str) or not item.strip() for item in value):
-        raise AcceptanceCriteriaError(
-            f"plan {field_name} must contain non-empty strings"
-        )
+        raise AcceptanceCriteriaError(f"plan {field_name} must contain non-empty strings")
     return tuple(item.strip() for item in value)
 
 
@@ -150,9 +196,7 @@ def verify_review(
     if slice.verdict is None:
         raise MissingVerdict(f"slice {slice.id!r} has no review verdict")
     if slice.reviewed_head is None:
-        raise MissingReviewedHead(
-            f"slice {slice.id!r} verdict has no reviewed_head"
-        )
+        raise MissingReviewedHead(f"slice {slice.id!r} verdict has no reviewed_head")
     if slice.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
         raise VerdictNotApproved(f"slice {slice.id!r} verdict is {slice.verdict.value}")
     if not current_head:
@@ -174,17 +218,13 @@ def verify_review(
             )
     ci_status = slice.ci_state.get(slice.reviewed_head)
     if ci_status is None:
-        raise MissingCIStatus(
-            f"slice {slice.id!r} has no CI status for {slice.reviewed_head}"
-        )
+        raise MissingCIStatus(f"slice {slice.id!r} has no CI status for {slice.reviewed_head}")
     if ci_status not in {"success", "neutral"}:
         raise CIStatusNotApproved(
             f"slice {slice.id!r} CI status for {slice.reviewed_head} is {ci_status}"
         )
     if policy_predicate is not None and policy_predicate(slice) is not True:
-        raise OptionalPolicyRejected(
-            f"optional review policy rejected slice {slice.id!r}"
-        )
+        raise OptionalPolicyRejected(f"optional review policy rejected slice {slice.id!r}")
     age_seconds = _freshness_age(
         slice,
         now=now,
@@ -309,8 +349,7 @@ def _freshness_age(
     age_seconds = max(0.0, (current - observed).total_seconds())
     if age_seconds > freshness_window_secs:
         raise StaleVerdict(
-            f"slice {slice.id!r} verdict age {age_seconds:g}s exceeds "
-            f"{freshness_window_secs}s"
+            f"slice {slice.id!r} verdict age {age_seconds:g}s exceeds {freshness_window_secs}s"
         )
     return age_seconds
 
@@ -345,9 +384,7 @@ def load_freshness_window(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
         raise ReviewGateError(f"could not load review policy {path}: {error}") from error
     value = document.get("review_freshness_window_secs")
     if type(value) is not int or value < 0:
-        raise ReviewGateError(
-            "review_freshness_window_secs must be a non-negative integer"
-        )
+        raise ReviewGateError("review_freshness_window_secs must be a non-negative integer")
     return value
 
 

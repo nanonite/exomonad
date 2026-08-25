@@ -26,6 +26,7 @@ from tl_loop.loop.review import (
     MissingPatchDigest,
     OptionalPolicyRejected,
     PatchDigestMismatch,
+    ReviewContract,
     ReviewHeadMismatch,
     StaleVerdict,
     integration_needs_revalidation,
@@ -47,6 +48,17 @@ from tl_loop.state.schema import (
 from tl_loop.state.store import RunStore, create
 
 NOW = datetime(2026, 8, 11, 17, 0, tzinfo=UTC)
+
+
+def test_review_contract_normalizes_criteria_and_binds_digest() -> None:
+    contract = ReviewContract.from_criteria((" verify ", "verify", "boundary"))
+
+    assert contract.acceptance_criteria == ("verify", "boundary")
+    assert ReviewContract.from_mapping(contract.as_mapping()) == contract
+    with pytest.raises(ValueError, match="digest"):
+        ReviewContract.from_mapping(
+            {"acceptance_criteria": ["verify", "boundary"], "digest": "stale"}
+        )
 
 
 def test_verdict_without_reviewed_head_fails_schema_validation() -> None:
@@ -338,9 +350,7 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
 
 def test_missing_direct_compare_evidence_opens_integrity_gate(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
-    transport = DirectMergeTransport(
-        snapshots=[_snapshot(head_sha="abc123", merge_tree_sha=None)]
-    )
+    transport = DirectMergeTransport(snapshots=[_snapshot(head_sha="abc123", merge_tree_sha=None)])
     effects_log: list[EffectIntent] = []
 
     result = _run_direct_merge(

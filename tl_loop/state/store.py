@@ -718,6 +718,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["reviewer_agent_id"] = value.reviewer_agent_id
         if value.review_patch_digests:
             record["review_patch_digests"] = dict(value.review_patch_digests)
+        if value.review_contract is not None:
+            record["review_contract"] = copy.deepcopy(dict(value.review_contract))
         if value.verdict_at is not None:
             record["verdict_at"] = value.verdict_at
         if value.park_cause is not None:
@@ -830,7 +832,7 @@ def _encode_observation_provenance(value: ObservationProvenance) -> dict[str, ob
 
 
 def _encode_action(value: ActionState) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "kind": value.kind.value,
         "phase": value.phase.value,
         "state_version": value.state_version,
@@ -838,6 +840,9 @@ def _encode_action(value: ActionState) -> dict[str, object]:
         "head_sha": value.head_sha,
         "attempt": value.attempt,
     }
+    if value.contract_digest is not None:
+        record["contract_digest"] = value.contract_digest
+    return record
 
 
 def _encode_budgets(budgets: BudgetInput) -> dict[str, object]:
@@ -1237,6 +1242,11 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         reviewed_head=cast(str | None, value["reviewed_head"]),
         review_findings=_decode_review_findings(value.get("review_findings")),
         review_patch_digests=_decode_string_map(value.get("review_patch_digests")),
+        review_contract=(
+            MappingProxyType(copy.deepcopy(cast(dict[str, object], value["review_contract"])))
+            if isinstance(value.get("review_contract"), dict)
+            else None
+        ),
         ci_state=_decode_string_map(value.get("ci_state")),
         reviewer_attempt=_decode_int_map(value.get("reviewer_attempt")),
         reviewer_agent_id=cast(str | None, value.get("reviewer_agent_id")),
@@ -1348,6 +1358,7 @@ def _decode_action(value: object) -> ActionState | None:
         intent_id=cast(str | None, value.get("intent_id")),
         head_sha=cast(str | None, value.get("head_sha")),
         attempt=cast(int | None, value.get("attempt")),
+        contract_digest=cast(str | None, value.get("contract_digest")),
     )
 
 

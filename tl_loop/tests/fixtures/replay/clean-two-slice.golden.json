@@ -75,6 +75,15 @@
       "pr_number": null,
       "repair_attempts": 0,
       "review_findings": {},
+      "review_contract": {
+        "acceptance_criteria": [
+          "Run-state test plan: just tl-loop-test",
+          "Plan verification: just tl-loop-test",
+          "Owned paths: src/leaf.py",
+          "Plan boundary: src/leaf.py"
+        ],
+        "digest": "8b8f11362e3aa144fc0dc4777705bc3d431b7dc47d65e1334ea365432051ff3b"
+      },
       "reviewed_head": null,
       "reviewer_attempt": {},
       "status": "spawned",

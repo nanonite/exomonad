@@ -61,8 +61,10 @@ from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.loop.review import (
     IntegrationEvidenceMismatch,
+    ReviewContract,
     ReviewGateError,
     compose_acceptance_criteria,
+    compose_review_contract,
     invalidate_integration_evidence,
     load_freshness_window,
     verify_integration,
@@ -1489,16 +1491,32 @@ def _execute_direct_reviewer_intent(
     pr_number = intent.arguments.get("pr_number")
     if not isinstance(head_sha, str) or not isinstance(pr_number, int):
         return state
+    contract = _review_contract_for_slice(current)
+    requested_digest = intent.arguments.get("review_contract_digest")
+    if isinstance(requested_digest, str) and requested_digest != contract.digest:
+        raise TLLoopError(
+            f"review contract changed for {current.id!r} head {head_sha!r}; "
+            "reduction must produce a fresh reviewer action"
+        )
+    repository_identity = _review_repository_identity(current, state, config, store)
+    review_arguments: dict[str, object] = {
+        "repository_identity": repository_identity,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "review_contract_digest": contract.digest,
+    }
     claimed = replace(
         current,
         reviewer_attempt={**current.reviewer_attempt, head_sha: 1},
+        review_contract=contract.as_mapping(),
     )
     action = ActionState(
         ActionKind.REVIEWER_SPAWN,
         ActionPhase.IN_FLIGHT,
-        intent_id=stable_action_key(state.run_id, "spawn_reviewer", current.id, intent.arguments),
+        intent_id=stable_action_key(state.run_id, "spawn_reviewer", current.id, review_arguments),
         head_sha=head_sha,
         attempt=max(1, current.attempts),
+        contract_digest=contract.digest,
     )
     state = _checkpoint_slice_action(
         store,
@@ -1515,24 +1533,52 @@ def _execute_direct_reviewer_intent(
         effects,
         effects_log,
     )
-    criteria = compose_acceptance_criteria(
-        current,
-        {"verify": current.test_plan, "boundary": current.paths},
-    )
-    result = _invoke(
-        "spawn_reviewer",
-        current.id,
-        {"pr_number": pr_number, "head_sha": head_sha, "force": False},
-        config.active,
-        cast(EffectClient, effects) if config.active else None,
-        lambda client: client.spawn_reviewer(
-            pr_number=pr_number,
-            head_sha=head_sha,
-            acceptance_criteria=criteria,
-            force=False,
-        ),
-        effects_log,
-    )
+    journal_intent = EffectIntent("spawn_reviewer", current.id, review_arguments, config.active)
+    try:
+        result = _invoke(
+            "spawn_reviewer",
+            current.id,
+            review_arguments,
+            config.active,
+            cast(EffectClient, effects) if config.active else None,
+            lambda client: client.spawn_reviewer(
+                pr_number=pr_number,
+                head_sha=head_sha,
+                acceptance_criteria=contract.acceptance_criteria,
+                force=False,
+            ),
+            effects_log,
+        )
+    except EffectFailed:
+        refreshed = store.load()
+        _checkpoint_slice_action(
+            store,
+            refreshed,
+            current.id,
+            replace(action, phase=ActionPhase.REJECTED),
+        )
+        raise
+    except BaseException as error:
+        refreshed = store.load()
+        unknown = _checkpoint_slice_action(
+            store,
+            refreshed,
+            current.id,
+            replace(action, phase=ActionPhase.UNKNOWN),
+        )
+        _record_convergence_event(
+            current.id,
+            tracker.action_outcome(unknown, intent, outcome="unknown", error=str(error)),
+            config,
+            effects,
+            effects_log,
+        )
+        if isinstance(effects_log, EffectJournal):
+            key = effects_log.key_for(journal_intent)
+            gate_name = _action_journal_gate_name(key)
+            if not any(gate.name == gate_name for gate in unknown.gates):
+                store.set_gate(gate_name, GateStatus.PENDING)
+        raise
     reviewer_name = (
         result.result.get("reviewer_name")
         if result is not None and isinstance(result.result, Mapping)
@@ -1550,6 +1596,39 @@ def _execute_direct_reviewer_intent(
     return _checkpoint_slice_action(
         store, refreshed, current.id, updated.action, slice_state=updated
     )
+
+
+def _review_contract_for_slice(current: SliceState) -> ReviewContract:
+    if current.review_contract is not None:
+        try:
+            return ReviewContract.from_mapping(current.review_contract)
+        except ValueError as error:
+            raise TLLoopError(f"invalid persisted review contract for {current.id!r}") from error
+    return compose_review_contract(
+        current,
+        {"verify": current.test_plan, "boundary": current.paths},
+    )
+
+
+def _review_repository_identity(
+    current: SliceState,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> dict[str, object]:
+    if state.repository_identity is not None:
+        return {
+            "owner": state.repository_identity.owner,
+            "repo": state.repository_identity.repo,
+            "base_branch": state.repository_identity.base_branch,
+        }
+    root = Path(config.project_root or store.root_dir.parent).resolve()
+    base_branch = (
+        current.publication.base_branch
+        if current.publication is not None
+        else current.base_ref or config.branch
+    )
+    return {"owner": "local", "repo": root.name or "project", "base_branch": base_branch}
 
 
 def _execute_direct_repair_intent(
@@ -6638,6 +6717,7 @@ def _initial_slices(
     for leaf in plan.leaves:
         paths = leaf.boundary or (f"tl-loop/{leaf.name}",)
         test_plan = leaf.verify or leaf.steps or ("controller",)
+        review_contract = _materialize_leaf_review_contract(leaf, paths, test_plan)
         result[leaf.name] = _initial_slice_record(
             leaf.name,
             paths,
@@ -6649,6 +6729,7 @@ def _initial_slices(
             config=selected,
             task_timeout_seconds=leaf.task_timeout_seconds,
             task_timeout_declared=leaf.task_timeout_declared,
+            review_contract=review_contract.as_mapping(),
         )
     for task in plan.sub_tls:
         result[task.name] = _initial_slice_record(
@@ -6709,6 +6790,22 @@ def _encode_goals(goals: GoalState) -> dict[str, object]:
     return encoded
 
 
+def _materialize_leaf_review_contract(
+    leaf: LeafTask,
+    paths: Sequence[str],
+    test_plan: Sequence[str],
+) -> ReviewContract:
+    values = (
+        ("Run-state test plan", test_plan),
+        ("Plan verification", leaf.verify),
+        ("Owned paths", paths),
+        ("Plan boundary", leaf.boundary),
+        ("DONE CRITERIA", leaf.done_criteria),
+    )
+    criteria = [f"{label}: {value}" for label, items in values for value in items]
+    return ReviewContract.from_criteria(criteria)
+
+
 def _initial_slice_record(
     name: str,
     paths: Sequence[str],
@@ -6721,11 +6818,12 @@ def _initial_slice_record(
     config: TLLoopConfig | None = None,
     task_timeout_seconds: float | None = None,
     task_timeout_declared: bool = False,
+    review_contract: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     resolved_timeout, timeout_source = _resolve_task_timeout(
         config or TLLoopConfig(), task_timeout_seconds, task_timeout_declared
     )
-    return {
+    record: dict[str, object] = {
         "id": name,
         "status": SliceStatus.PENDING.value,
         "paths": list(paths),
@@ -6747,6 +6845,9 @@ def _initial_slice_record(
         "task_timeout_seconds": resolved_timeout,
         "task_timeout_source": timeout_source,
     }
+    if review_contract is not None:
+        record["review_contract"] = copy.deepcopy(dict(review_contract))
+    return record
 
 
 def _resolve_task_timeout(

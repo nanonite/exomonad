@@ -269,6 +269,7 @@ class ActionState:
     intent_id: str | None = None
     head_sha: str | None = None
     attempt: int | None = None
+    contract_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ActionKind):
@@ -277,7 +278,7 @@ class ActionState:
             raise TypeError("action phase must be an ActionPhase")
         if type(self.state_version) is not int or self.state_version < 1:
             raise ValueError("action state_version must be a positive integer")
-        for name in ("intent_id", "head_sha"):
+        for name in ("intent_id", "head_sha", "contract_digest"):
             value = getattr(self, name)
             if value is not None and not value:
                 raise ValueError(f"action {name} must be non-empty or null")
@@ -286,6 +287,7 @@ class ActionState:
 
 
 REVIEW_FINDING_KEYS = frozenset({"severity", "path", "rationale"})
+REVIEW_CONTRACT_KEYS = frozenset({"acceptance_criteria", "digest"})
 CI_STATUS_VALUES = frozenset({"unknown", "pending", "success", "failure", "neutral"})
 STALL_CLASSIFICATION_VALUES = frozenset(
     {
@@ -410,6 +412,7 @@ SLICE_KEYS = frozenset(
         "pr_number",
         "review_findings",
         "review_patch_digests",
+        "review_contract",
         "ci_state",
         "reviewer_attempt",
         "reviewer_agent_id",
@@ -528,7 +531,9 @@ OBSERVATION_PROVENANCE_KEYS = frozenset(
         "coverage",
     }
 )
-ACTION_KEYS = frozenset({"kind", "phase", "state_version", "intent_id", "head_sha", "attempt"})
+ACTION_KEYS = frozenset(
+    {"kind", "phase", "state_version", "intent_id", "head_sha", "attempt", "contract_digest"}
+)
 BUDGET_KEYS = frozenset({"ledger"})
 LEDGER_KEYS = frozenset(
     {
@@ -589,6 +594,7 @@ class SliceState:
     verdict: Verdict | None
     review_findings: Mapping[str, tuple[Mapping[str, str], ...]] = field(default_factory=dict)
     review_patch_digests: Mapping[str, str] = field(default_factory=dict)
+    review_contract: Mapping[str, object] | None = None
     ci_state: Mapping[str, str] = field(default_factory=dict)
     reviewer_attempt: Mapping[str, int] = field(default_factory=dict)
     reviewer_agent_id: str | None = None
@@ -1051,6 +1057,7 @@ def _validate_slice(
         errors.append((f"{path}.reviewed_head", "is required when verdict is present"))
     _review_findings(value.get("review_findings"), path, errors)
     _string_map(value.get("review_patch_digests"), f"{path}.review_patch_digests", errors)
+    _review_contract(value.get("review_contract"), path, errors)
     _ci_state(value.get("ci_state"), path, errors)
     _reviewer_attempt(value.get("reviewer_attempt"), path, errors)
     _nullable_string(value, "reviewer_agent_id", path, errors)
@@ -1121,6 +1128,26 @@ def _review_findings(
                 continue
             for key in REVIEW_FINDING_KEYS:
                 _non_empty_string(finding, key, finding_path, errors)
+
+
+def _review_contract(
+    value: object,
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    if value is None:
+        return
+    contract = _object(value, f"{path}.review_contract", REVIEW_CONTRACT_KEYS, errors)
+    if contract is None:
+        return
+    _string_list(
+        contract,
+        "acceptance_criteria",
+        f"{path}.review_contract",
+        errors,
+        allow_empty=False,
+    )
+    _non_empty_string(contract, "digest", f"{path}.review_contract", errors)
 
 
 def _string_map(
@@ -1361,6 +1388,7 @@ def _validate_action(value: object, path: str, errors: list[tuple[str, str]]) ->
     _nullable_string(action, "intent_id", f"{path}.action", errors)
     _nullable_string(action, "head_sha", f"{path}.action", errors)
     _nullable_positive_int(action, "attempt", f"{path}.action", errors)
+    _nullable_string(action, "contract_digest", f"{path}.action", errors)
 
 
 def _validate_deadline_ledger(value: object, path: str, errors: list[tuple[str, str]]) -> None:
