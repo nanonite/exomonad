@@ -7,7 +7,11 @@ use exomonad::config::{
 use exomonad_core::services::runtime_manifest::{
     PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
 };
-use exomonad_core::services::AgentType;
+use exomonad_core::services::{
+    agent_control::InvocationRecord,
+    pr_registry::{invocation_succession_reaches_current, read_published_heads, PublishedHead},
+    AgentType,
+};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,6 +59,24 @@ impl SessionMode {
             Self::Start => "start",
             Self::Continue => "continue",
             Self::Recreate => "recreate",
+        }
+    }
+}
+
+/// The durable decision made for an existing agent when a session continues.
+/// The invocation ID is never rewritten by this classifier; a new ID is only
+/// created later if the controller explicitly recreates the invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentContinuation {
+    Preserve { invocation_id: String },
+    Recreate { reason: &'static str },
+}
+
+impl AgentContinuation {
+    fn classification(&self) -> &'static str {
+        match self {
+            Self::Preserve { .. } => "preserve",
+            Self::Recreate { .. } => "recreate",
         }
     }
 }
@@ -178,6 +200,204 @@ fn record_session_mode(cwd: &Path, mode: SessionMode) -> Result<()> {
     std::fs::write(&temporary, serde_json::to_string_pretty(&payload)?)?;
     std::fs::rename(temporary, path)?;
     Ok(())
+}
+
+fn plan_snapshot_path(cwd: &Path) -> PathBuf {
+    cwd.join(".exo/tl-loop/plan.snapshot")
+}
+
+/// Preserve the original plan bytes so continue can fail closed on drift.
+/// The snapshot is separate from plan.json and is never used as a replacement
+/// plan, which keeps the authoritative plan untouched.
+fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()> {
+    let plan_path = cwd.join(".exo/tl-loop/plan.json");
+    let snapshot_path = plan_snapshot_path(cwd);
+    let plan_exists = plan_path.is_file();
+    let snapshot_exists = snapshot_path.is_file();
+
+    if mode == SessionMode::Continue {
+        if !plan_exists && !snapshot_exists {
+            return Ok(());
+        }
+        if !plan_exists || !snapshot_exists {
+            anyhow::bail!(
+                "cannot continue: plan.json and its byte-identical snapshot must both exist"
+            );
+        }
+        let current = std::fs::read(&plan_path)
+            .with_context(|| format!("failed to read {}", plan_path.display()))?;
+        let original = std::fs::read(&snapshot_path)
+            .with_context(|| format!("failed to read {}", snapshot_path.display()))?;
+        if current != original {
+            anyhow::bail!(
+                "cannot continue: {} differs from its persisted session snapshot; use --start or explicitly reconcile the plan",
+                plan_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    if plan_exists && !snapshot_exists {
+        let original = std::fs::read(&plan_path)
+            .with_context(|| format!("failed to read {}", plan_path.display()))?;
+        let parent = snapshot_path
+            .parent()
+            .context("plan snapshot has no parent directory")?;
+        std::fs::create_dir_all(parent)?;
+        let temporary = snapshot_path.with_extension("tmp");
+        std::fs::write(&temporary, original)?;
+        std::fs::rename(&temporary, &snapshot_path)?;
+        info!(path = %snapshot_path.display(), "Recorded initial TL plan snapshot");
+    }
+    Ok(())
+}
+
+fn publication_matches_agent(
+    agent_name: &str,
+    record: &InvocationRecord,
+    publication: &PublishedHead,
+) -> bool {
+    let owner_matches = publication.author_agent.as_deref() == Some(agent_name)
+        || record
+            .runtime_agent_id
+            .as_deref()
+            .is_some_and(|runtime_id| publication.author_agent.as_deref() == Some(runtime_id));
+    if !owner_matches {
+        return false;
+    }
+
+    let invocation_matches = publication.invocation_id.as_deref()
+        == Some(record.invocation_id.as_str())
+        || invocation_succession_reaches_current(publication, &record.invocation_id);
+    if !invocation_matches {
+        return false;
+    }
+
+    let branch_matches = record
+        .branch
+        .as_deref()
+        .is_none_or(|branch| branch == publication.head_branch);
+    let slice_matches = record
+        .slice_id
+        .as_deref()
+        .is_none_or(|slice| publication.slice_id.as_deref() == Some(slice));
+    branch_matches && slice_matches
+}
+
+fn classify_agent(agent_dir: &Path, registry: &[PublishedHead]) -> AgentContinuation {
+    let agent_name = agent_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty());
+    let Some(agent_name) = agent_name else {
+        return AgentContinuation::Recreate {
+            reason: "agent directory has no usable name",
+        };
+    };
+    let invocation_path =
+        agent_dir.join(exomonad_core::services::agent_control::INVOCATION_FILENAME);
+    let contents = match std::fs::read_to_string(&invocation_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return AgentContinuation::Recreate {
+                reason: "invocation record is missing",
+            };
+        }
+        Err(_) => {
+            return AgentContinuation::Recreate {
+                reason: "invocation record is unreadable",
+            };
+        }
+    };
+    let record = match serde_json::from_str::<InvocationRecord>(&contents) {
+        Ok(record) => record,
+        Err(_) => {
+            return AgentContinuation::Recreate {
+                reason: "invocation record is malformed",
+            };
+        }
+    };
+    if record.invocation_id.trim().is_empty() {
+        return AgentContinuation::Recreate {
+            reason: "invocation record has an empty invocation_id",
+        };
+    }
+    if registry
+        .iter()
+        .any(|publication| publication_matches_agent(agent_name, &record, publication))
+    {
+        AgentContinuation::Preserve {
+            invocation_id: record.invocation_id,
+        }
+    } else {
+        AgentContinuation::Recreate {
+            reason: "invocation has no matching verified publication ownership",
+        }
+    }
+}
+
+fn write_continuation_decision(agent_dir: &Path, decision: &AgentContinuation) -> Result<()> {
+    let path = agent_dir.join("continuation.json");
+    let payload = match decision {
+        AgentContinuation::Preserve { invocation_id } => serde_json::json!({
+            "schema_version": 1,
+            "classification": decision.classification(),
+            "invocation_id": invocation_id,
+        }),
+        AgentContinuation::Recreate { reason } => serde_json::json!({
+            "schema_version": 1,
+            "classification": decision.classification(),
+            "reason": reason,
+        }),
+    };
+    let bytes = serde_json::to_vec_pretty(&payload)?;
+    if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+        return Ok(());
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+async fn reconcile_agent_continuations(project_dir: &Path) -> Result<(usize, usize)> {
+    let agents_dir = project_dir.join(".exo/agents");
+    if !agents_dir.is_dir() {
+        return Ok((0, 0));
+    }
+    let registry = read_published_heads(project_dir).await?;
+    let mut agents = std::fs::read_dir(&agents_dir)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter(|entry| entry.file_name().to_string_lossy() != "root")
+        .collect::<Vec<_>>();
+    agents.sort_by_key(|entry| entry.file_name());
+
+    let mut preserved = 0;
+    let mut recreated = 0;
+    for entry in agents {
+        let decision = classify_agent(&entry.path(), &registry);
+        match &decision {
+            AgentContinuation::Preserve { invocation_id } => {
+                preserved += 1;
+                info!(
+                    agent = %entry.file_name().to_string_lossy(),
+                    invocation_id,
+                    "Preserving agent invocation for --continue"
+                );
+            }
+            AgentContinuation::Recreate { reason } => {
+                recreated += 1;
+                warn!(
+                    agent = %entry.file_name().to_string_lossy(),
+                    reason,
+                    "Classifying agent invocation for explicit recreation"
+                );
+            }
+        }
+        write_continuation_decision(&entry.path(), &decision)?;
+    }
+    Ok((preserved, recreated))
 }
 
 const WATCHER_WINDOW_NAME: &str = "Watcher";
@@ -1867,7 +2087,12 @@ pub async fn run(
     std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, &runtime_paths);
     ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
-    write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
+    if mode == SessionMode::Continue {
+        validate_or_record_plan_snapshot(&cwd, mode)?;
+    } else {
+        write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
+        validate_or_record_plan_snapshot(&cwd, mode)?;
+    }
     if skip_preflight {
         warn!("Skipping TL controller preflight by explicit request");
     } else {
@@ -1969,6 +2194,14 @@ pub async fn run(
         );
     }
     record_session_mode(&cwd, mode)?;
+
+    if mode == SessionMode::Continue {
+        let (preserved, recreated) = reconcile_agent_continuations(&cwd).await?;
+        info!(
+            preserved,
+            recreated, "Reconciled existing agent invocation identities for --continue"
+        );
+    }
 
     // Check OTel endpoint reachability if configured
     if let Some(ref endpoint) = config.otlp_endpoint {
@@ -3310,6 +3543,204 @@ mod tests {
         .unwrap();
         assert_eq!(value["session_mode"], "start");
         assert!(!tmp.path().join(".exo/tl-loop/session-mode.tmp").exists());
+    }
+
+    fn write_test_invocation(
+        agent_dir: &Path,
+        invocation_id: &str,
+        runtime_agent_id: &str,
+        branch: &str,
+        slice_id: &str,
+    ) {
+        std::fs::create_dir_all(agent_dir).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let record = runtime
+            .block_on(exomonad_core::services::agent_control::start_invocation(
+                agent_dir,
+                AgentType::Codex,
+                exomonad_core::services::agent_control::InvocationTrigger::Spawn,
+                exomonad_core::domain::RoutingInfo::window(
+                    exomonad_core::services::tmux_ipc::WindowId::parse("@42").unwrap(),
+                ),
+                None,
+                None,
+            ))
+            .unwrap();
+        let mut value = serde_json::to_value(record).unwrap();
+        value["invocation_id"] = serde_json::json!(invocation_id);
+        value["runtime_agent_id"] = serde_json::json!(runtime_agent_id);
+        value["branch"] = serde_json::json!(branch);
+        value["slice_id"] = serde_json::json!(slice_id);
+        std::fs::write(
+            agent_dir.join(exomonad_core::services::agent_control::INVOCATION_FILENAME),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn test_publication(
+        agent_name: &str,
+        invocation_id: &str,
+        branch: &str,
+        slice_id: &str,
+    ) -> PublishedHead {
+        PublishedHead {
+            pr_number: 43,
+            head_branch: branch.to_owned(),
+            base_branch: "main".to_owned(),
+            head_sha: "head-sha".to_owned(),
+            author_agent: Some(agent_name.to_owned()),
+            author_role: Some("dev".to_owned()),
+            provenance: exomonad_core::services::pr_registry::PublicationProvenance::LedgerOwned,
+            slice_id: Some(slice_id.to_owned()),
+            invocation_id: Some(invocation_id.to_owned()),
+            invocation_trigger: None,
+            invocation_runtime: None,
+            invocation_succession: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn continue_preserves_matching_invocation_identity_even_when_pane_is_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("leaf-codex");
+        write_test_invocation(
+            &agent_dir,
+            "invocation-1",
+            "leaf-codex",
+            "feature/leaf",
+            "slice-a",
+        );
+
+        let decision = classify_agent(
+            &agent_dir,
+            &[test_publication(
+                "leaf-codex",
+                "invocation-1",
+                "feature/leaf",
+                "slice-a",
+            )],
+        );
+        assert_eq!(
+            decision,
+            AgentContinuation::Preserve {
+                invocation_id: "invocation-1".to_owned()
+            }
+        );
+        write_continuation_decision(&agent_dir, &decision).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(agent_dir.join("continuation.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["classification"], "preserve");
+        assert_eq!(persisted["invocation_id"], "invocation-1");
+    }
+
+    #[test]
+    fn continue_recreates_missing_or_unverifiable_invocation_with_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing-agent");
+        std::fs::create_dir_all(&missing).unwrap();
+        assert_eq!(
+            classify_agent(&missing, &[]),
+            AgentContinuation::Recreate {
+                reason: "invocation record is missing"
+            }
+        );
+
+        let malformed = tmp.path().join("malformed-agent");
+        std::fs::create_dir_all(&malformed).unwrap();
+        std::fs::write(malformed.join("invocation.json"), b"{not-json").unwrap();
+        assert_eq!(
+            classify_agent(&malformed, &[]),
+            AgentContinuation::Recreate {
+                reason: "invocation record is malformed"
+            }
+        );
+
+        let unmatched = tmp.path().join("unmatched-agent");
+        write_test_invocation(
+            &unmatched,
+            "invocation-2",
+            "unmatched-agent",
+            "feature/other",
+            "slice-b",
+        );
+        let decision = classify_agent(&unmatched, &[]);
+        assert!(matches!(
+            decision,
+            AgentContinuation::Recreate {
+                reason: "invocation has no matching verified publication ownership"
+            }
+        ));
+        write_continuation_decision(&unmatched, &decision).unwrap();
+        let first = std::fs::read(unmatched.join("continuation.json")).unwrap();
+        write_continuation_decision(&unmatched, &decision).unwrap();
+        assert_eq!(
+            first,
+            std::fs::read(unmatched.join("continuation.json")).unwrap()
+        );
+    }
+
+    #[test]
+    fn continue_accepts_invocation_succession_without_rewriting_current_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("leaf-codex");
+        write_test_invocation(
+            &agent_dir,
+            "invocation-2",
+            "leaf-codex",
+            "feature/leaf",
+            "slice-a",
+        );
+        let mut publication =
+            test_publication("leaf-codex", "invocation-1", "feature/leaf", "slice-a");
+        publication.invocation_succession.push(
+            exomonad_core::services::pr_registry::InvocationSuccession {
+                from_invocation_id: "invocation-1".to_owned(),
+                to_invocation_id: "invocation-2".to_owned(),
+                reason: exomonad_core::services::pr_registry::SuccessionReason::SessionRecreate,
+                recorded_at: 1,
+            },
+        );
+        assert_eq!(
+            classify_agent(&agent_dir, &[publication]),
+            AgentContinuation::Preserve {
+                invocation_id: "invocation-2".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn continue_refuses_modified_plan_bytes_and_keeps_snapshot_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = tmp.path().join(".exo/tl-loop/plan.json");
+        std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+        let original = serde_json::to_vec(&serde_json::json!({
+            "plan": {"leaves": []}
+        }))
+        .unwrap();
+        std::fs::write(&plan, &original).unwrap();
+        validate_or_record_plan_snapshot(tmp.path(), SessionMode::Start).unwrap();
+        let snapshot = std::fs::read(plan_snapshot_path(tmp.path())).unwrap();
+        assert_eq!(snapshot, std::fs::read(&plan).unwrap());
+
+        let changed = serde_json::to_vec(&serde_json::json!({
+            "plan": {"leaves": [{"name": "changed"}]}
+        }))
+        .unwrap();
+        std::fs::write(&plan, changed).unwrap();
+        let error =
+            validate_or_record_plan_snapshot(tmp.path(), SessionMode::Continue).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("differs from its persisted session snapshot"));
+        assert_eq!(
+            snapshot,
+            std::fs::read(plan_snapshot_path(tmp.path())).unwrap()
+        );
+
+        std::fs::write(&plan, snapshot).unwrap();
+        validate_or_record_plan_snapshot(tmp.path(), SessionMode::Continue).unwrap();
     }
 
     #[test]

@@ -163,6 +163,14 @@ legacy `--recreate` default; the migration task will make `--continue` the safe
 default. Supplying more than one mode is rejected. `tl_loop status` reports the
 recorded mode alongside the durable state.
 
+When continuing, ExoMonad compares .exo/tl-loop/plan.json byte-for-byte with
+the immutable .exo/tl-loop/plan.snapshot recorded at session creation. Plan
+drift is rejected before orchestration resumes. Existing agent directories are
+classified from their invocation record and verified publication ownership;
+the decision is recorded in each directory's continuation.json. A preserved
+invocation keeps its original ID verbatim, while an invocation classified for
+recreation carries an explicit reason for the later spawn path.
+
 Optional local Forgejo CI stack:
 ```bash
 cd forgejo
