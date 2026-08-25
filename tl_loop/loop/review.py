@@ -29,7 +29,7 @@ class ReviewContract:
     digest: str
 
     @classmethod
-    def from_criteria(cls, criteria: Sequence[str]) -> "ReviewContract":
+    def from_criteria(cls, criteria: Sequence[str]) -> ReviewContract:
         normalized: list[str] = []
         seen: set[str] = set()
         for value in criteria:
@@ -46,7 +46,7 @@ class ReviewContract:
         return cls(tuple(normalized), digest)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> "ReviewContract":
+    def from_mapping(cls, value: Mapping[str, object]) -> ReviewContract:
         criteria = value.get("acceptance_criteria")
         digest = value.get("digest")
         if not isinstance(criteria, (list, tuple)) or not isinstance(digest, str):

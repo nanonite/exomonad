@@ -73,6 +73,9 @@ def test_direct_policy_requires_handoff_review_and_ci_in_order() -> None:
 
 def test_direct_policy_routes_failure_and_inflight_merge_to_durable_actions() -> None:
     state = _mergeable()
+    assert derive_next_action(replace(state, verdict=Verdict.NO_GO, ci_state={})) == ExternalIntent(
+        "repair", "slice-a", {"head_sha": "head-a"}
+    )
     assert derive_next_action(replace(state, ci_state={"head-a": "failure"})) == ExternalIntent(
         "repair", "slice-a", {"head_sha": "head-a"}
     )

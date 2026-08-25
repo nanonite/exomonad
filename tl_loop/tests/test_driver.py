@@ -1963,6 +1963,15 @@ def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path
                 current,
                 reviewer_attempt={"head-a": 1},
                 reviewer_agent_id="review-pr-42-codex",
+                publication=PublicationBinding(42, "head-a", "main.leaf-a", "main", 1, "inv-a"),
+                handoff=HandoffEvidence(
+                    42,
+                    "head-a",
+                    1,
+                    "inv-a",
+                    "leaf-a",
+                    "2026-08-12T00:00:00Z",
+                ),
             )
         },
         BudgetLedger(0, 0),
@@ -1988,6 +1997,14 @@ def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path
     event = _direct_reviewer_event(verdict="NO-GO")
     _route_review_event(
         plan, store, store.load(), TLPlanning(), event, 1, config, EffectClient(transport), []
+    )
+    _apply_convergence(
+        store.load(),
+        ConvergenceTracker(),
+        store,
+        config,
+        EffectClient(transport),
+        [],
     )
     _route_review_event(
         plan, store, store.load(), TLPlanning(), event, 2, config, EffectClient(transport), []

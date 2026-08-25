@@ -326,12 +326,14 @@ def _derive_slice_action(
         )
     if state.verdict is None or state.reviewed_head != current_head:
         return Quiescent("await_review")
+    if state.verdict is Verdict.NO_GO:
+        return ExternalIntent("repair", state.id, {"head_sha": current_head})
     ci_status = state.ci_state.get(current_head, "unknown")
     if ci_status not in CI_STATUS_VALUES:
         return Quiescent("await_ci")
     if ci_status in {"unknown", "pending"}:
         return Quiescent("await_ci")
-    if ci_status == "failure" or state.verdict is Verdict.NO_GO:
+    if ci_status == "failure":
         return ExternalIntent("repair", state.id, {"head_sha": current_head})
     if state.verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and ci_status in {
         "success",

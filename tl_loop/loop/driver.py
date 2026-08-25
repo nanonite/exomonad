@@ -5757,6 +5757,8 @@ def _route_review_event(
         state = _record_aggregate_review_lifecycle(
             store, state, phase, event_seq, slice_id, decision_verdict
         )
+    if decision_verdict is Verdict.NO_GO and direct_reviewer_event:
+        return state
     if decision_verdict is Verdict.NO_GO:
         return _route_repair(
             store,
