@@ -406,6 +406,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Collapse redundant invocation_id provenance routes in handoff backfill (#1011)
 - Backfill handoff during reconciliation when pr.filed is below the cursor (#1009)
 - Enforce review-round ceiling in tl_loop and remove watcher enforcement (#1008)
 - Construct publication evidence so handoff is obtainable (await_handoff deadlock) (#999)
