@@ -5372,6 +5372,7 @@ mod tests {
             invocation_id: "invocation-2".to_string(),
             runtime: ServiceAgentType::Codex,
             trigger: InvocationTrigger::ResumePr,
+            mode: crate::services::agent_control::InvocationMode::Interactive,
             routing: RoutingInfo::window(
                 crate::services::tmux_ipc::WindowId::parse("@43").unwrap(),
             ),

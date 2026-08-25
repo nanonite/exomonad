@@ -14,9 +14,11 @@ pub use invocation::{
     finish_invocation, finish_invocation_and_tombstone,
     finish_invocation_and_tombstone_with_context, read_invocation, read_invocation_conservatively,
     start_invocation, start_invocation_with_provenance,
-    start_invocation_with_provenance_and_context, InvocationExitContext, InvocationFinishResult,
-    InvocationIdentityContext, InvocationMetadata, InvocationRecord, InvocationStatus,
-    InvocationTrigger, RecoveryAuthorization, RecoveryInvocationLineage, INVOCATION_FILENAME,
+    start_invocation_with_provenance_and_context,
+    start_invocation_with_provenance_and_context_and_mode, InvocationExitContext,
+    InvocationFinishResult, InvocationIdentityContext, InvocationMetadata, InvocationMode,
+    InvocationRecord, InvocationStatus, InvocationTrigger, RecoveryAuthorization,
+    RecoveryInvocationLineage, INVOCATION_FILENAME,
 };
 pub use spawn::{
     CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_RUNTIME_NOTES,
@@ -328,7 +330,7 @@ pub(crate) struct AgentMetadata {
 
 pub(crate) const CLAUDE_META: AgentMetadata = AgentMetadata {
     command: "claude",
-    prompt_flag: "",
+    prompt_flag: "-p",
     suffix: "claude",
     emoji: "\u{1F916}", // 🤖
 };
@@ -1057,6 +1059,17 @@ impl<
         routing: RoutingInfo,
         identity: Option<AgentIdentityRecord>,
     ) -> Result<PathBuf> {
+        self.finalize_spawn_with_mode(agent_name, routing, identity, InvocationMode::Interactive)
+            .await
+    }
+
+    pub(crate) async fn finalize_spawn_with_mode(
+        &self,
+        agent_name: &AgentName,
+        routing: RoutingInfo,
+        identity: Option<AgentIdentityRecord>,
+        mode: InvocationMode,
+    ) -> Result<PathBuf> {
         let runtime = identity
             .as_ref()
             .map(|record| record.agent_type)
@@ -1086,6 +1099,7 @@ impl<
                 effort,
                 identity: Some(identity_context),
                 recovery_lineage: None,
+                mode,
             },
         )
         .await
@@ -1130,7 +1144,7 @@ impl<
                     .map(|record| record.working_dir.to_string_lossy().into_owned()),
             })
         });
-        let invocation = invocation::start_invocation_with_provenance_and_context(
+        let invocation = invocation::start_invocation_with_provenance_and_context_and_mode(
             &agent_config_dir,
             metadata.runtime,
             metadata.trigger,
@@ -1141,6 +1155,7 @@ impl<
             metadata.effort,
             identity_context,
             metadata.recovery_lineage,
+            metadata.mode,
         )
         .await?;
         if let (Some(previous), Some((head_branch, base_branch, Some(slice_id)))) =
@@ -1273,6 +1288,11 @@ impl<
                             .as_deref()
                             .and_then(|value| value.trim().parse::<i32>().ok());
                         let (status, classification, reason) = match exit_code {
+                            Some(0) if invocation.mode == InvocationMode::OneShot => (
+                                InvocationStatus::Exited,
+                                "one_shot_complete",
+                                "one_shot_invocation_completed",
+                            ),
                             Some(0) => {
                                 (InvocationStatus::Exited, "clean_exit", "tmux_target_exited")
                             }
@@ -1649,7 +1669,7 @@ mod tests {
 
     #[test]
     fn test_agent_type_prompt_flag() {
-        assert_eq!(AgentType::Claude.prompt_flag(), "");
+        assert_eq!(AgentType::Claude.prompt_flag(), "-p");
     }
 
     #[test]

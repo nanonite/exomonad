@@ -747,8 +747,13 @@ impl<
                 ledger_owned: false,
                 slice_id: None,
             };
-            self.finalize_spawn(&agent_name, routing, Some(identity_record))
-                .await?;
+            self.finalize_spawn_with_mode(
+                &agent_name,
+                routing,
+                Some(identity_record),
+                InvocationMode::OneShot,
+            )
+            .await?;
 
             self.emit_agent_started(&agent_name)?;
 
@@ -1518,6 +1523,7 @@ impl<
                     effort: effort.clone(),
                     recovery_lineage: None,
                     identity: None,
+                    mode: InvocationMode::from_role(options.role.as_ref().map(|role| role.as_str())),
                 },
             )
                 .await?;
@@ -1994,6 +2000,7 @@ impl<
                       effort: effort.clone(),
                       recovery_lineage: options.recovery_lineage.clone(),
                       identity: None,
+                      mode: InvocationMode::from_role(options.role.as_ref().map(|role| role.as_str())),
                   },
             )
                 .await

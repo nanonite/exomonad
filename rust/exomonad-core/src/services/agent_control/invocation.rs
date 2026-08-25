@@ -24,6 +24,43 @@ pub enum InvocationTrigger {
     Review,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationMode {
+    /// Runs one assignment to completion and then exits.
+    OneShot,
+    #[default]
+    /// Remains resident so its caller can deliver live guidance.
+    Interactive,
+}
+
+impl InvocationMode {
+    pub fn from_role(role: Option<&str>) -> Self {
+        match role {
+            Some("dev") | Some("reviewer") | Some("worker") => Self::OneShot,
+            _ => Self::Interactive,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::InvocationMode;
+
+    #[test]
+    fn mode_is_role_scoped() {
+        for role in ["dev", "reviewer", "worker"] {
+            assert_eq!(
+                InvocationMode::from_role(Some(role)),
+                InvocationMode::OneShot
+            );
+        }
+        for role in [None, Some("tl"), Some("companion")] {
+            assert_eq!(InvocationMode::from_role(role), InvocationMode::Interactive);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryAuthorization {
@@ -50,6 +87,7 @@ pub struct InvocationMetadata {
     pub effort: Option<String>,
     pub identity: Option<InvocationIdentityContext>,
     pub recovery_lineage: Option<RecoveryInvocationLineage>,
+    pub mode: InvocationMode,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -82,6 +120,8 @@ pub struct InvocationRecord {
     pub invocation_id: String,
     pub runtime: AgentType,
     pub trigger: InvocationTrigger,
+    #[serde(default)]
+    pub mode: InvocationMode,
     pub routing: RoutingInfo,
     pub started_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,6 +293,7 @@ async fn start_invocation_with_context(
         invocation_id: Uuid::new_v4().to_string(),
         runtime,
         trigger,
+        mode: InvocationMode::Interactive,
         routing,
         started_at: unix_timestamp(),
         ended_at: None,
@@ -325,6 +366,36 @@ pub async fn start_invocation_with_provenance_and_context(
     identity: Option<InvocationIdentityContext>,
     recovery_lineage: Option<RecoveryInvocationLineage>,
 ) -> Result<InvocationRecord> {
+    start_invocation_with_provenance_and_context_and_mode(
+        agent_dir,
+        runtime,
+        trigger,
+        routing,
+        pr_number,
+        head_sha,
+        model,
+        effort,
+        identity,
+        recovery_lineage,
+        InvocationMode::Interactive,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_invocation_with_provenance_and_context_and_mode(
+    agent_dir: &Path,
+    runtime: AgentType,
+    trigger: InvocationTrigger,
+    routing: RoutingInfo,
+    pr_number: Option<u64>,
+    head_sha: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    identity: Option<InvocationIdentityContext>,
+    recovery_lineage: Option<RecoveryInvocationLineage>,
+    mode: InvocationMode,
+) -> Result<InvocationRecord> {
     let _guard = mutation_lock().lock().await;
     let generation = next_generation(agent_dir).await?;
     if let Some(lineage) = recovery_lineage.as_ref() {
@@ -341,6 +412,7 @@ pub async fn start_invocation_with_provenance_and_context(
         invocation_id: Uuid::new_v4().to_string(),
         runtime,
         trigger,
+        mode,
         routing,
         started_at: unix_timestamp(),
         ended_at: None,
@@ -638,6 +710,29 @@ mod tests {
             record.authorization_source,
             Some(RecoveryAuthorization::HumanApproved)
         );
+        assert_eq!(read_invocation(dir.path()).await.unwrap(), Some(record));
+    }
+
+    #[tokio::test]
+    async fn one_shot_mode_is_persisted_and_survives_reload() {
+        let dir = tempdir().expect("tempdir");
+        let record = start_invocation_with_provenance_and_context_and_mode(
+            dir.path(),
+            AgentType::Claude,
+            InvocationTrigger::Review,
+            routing(),
+            Some(43),
+            Some("head-sha".to_string()),
+            None,
+            None,
+            None,
+            None,
+            InvocationMode::OneShot,
+        )
+        .await
+        .expect("one-shot invocation");
+
+        assert_eq!(record.mode, InvocationMode::OneShot);
         assert_eq!(read_invocation(dir.path()).await.unwrap(), Some(record));
     }
 

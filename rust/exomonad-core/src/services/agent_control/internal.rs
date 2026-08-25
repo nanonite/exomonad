@@ -457,6 +457,7 @@ impl<
             yolo,
             model,
             None,
+            super::InvocationMode::Interactive,
         )
     }
 
@@ -471,6 +472,7 @@ impl<
         _yolo: bool,
         model: Option<&str>,
         effort: Option<&str>,
+        mode: super::InvocationMode,
     ) -> String {
         let cmd = agent_type.command();
 
@@ -516,6 +518,16 @@ impl<
         let variant_flag = effort
             .map(|level| format!(" --variant {}", shell_escape::escape(level.into())))
             .unwrap_or_default();
+        let one_shot_flag = if mode == super::InvocationMode::OneShot {
+            agent_type.prompt_flag()
+        } else {
+            ""
+        };
+        let one_shot_flag = if one_shot_flag.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", one_shot_flag)
+        };
 
         let agent_command = match (prompt_file, fork_session_id) {
             (Some(pf), Some(session_id)) => {
@@ -543,8 +555,9 @@ impl<
                     }
                     _ => {
                         format!(
-                            "{}{}{}{} --resume {} --fork-session \"$(cat {})\"",
+                            "{}{}{}{}{} --resume {} --fork-session \"$(cat {})\"",
                             cmd,
+                            one_shot_flag,
                             perms_flags,
                             model_flag,
                             effort_flag,
@@ -571,20 +584,10 @@ impl<
                             cmd, perms_flags, escaped_path, model_flag, variant_flag
                         )
                     }
-                    _ => {
-                        let flag = agent_type.prompt_flag();
-                        if flag.is_empty() {
-                            format!(
-                                "{}{}{}{} \"$(cat {})\"",
-                                cmd, perms_flags, model_flag, effort_flag, escaped_path
-                            )
-                        } else {
-                            format!(
-                                "{}{}{}{} {} \"$(cat {})\"",
-                                cmd, perms_flags, model_flag, effort_flag, flag, escaped_path
-                            )
-                        }
-                    }
+                    _ => format!(
+                        "{}{}{}{}{} \"$(cat {})\"",
+                        cmd, one_shot_flag, perms_flags, model_flag, effort_flag, escaped_path
+                    ),
                 }
             }
             _ => match agent_type {
@@ -859,6 +862,7 @@ impl<
             self.yolo,
             model,
             effort_override.or_else(|| self.default_effort_for_spawn(role)),
+            super::InvocationMode::from_role(role),
         )
     }
 
@@ -1012,6 +1016,7 @@ impl<
             self.yolo,
             model,
             self.effort_for_role("worker"),
+            super::InvocationMode::OneShot,
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let tmux = self.tmux()?;
@@ -2100,7 +2105,7 @@ mod tests {
                 "{agent_type:?} command must receive the assignment prompt: {command}"
             );
             assert!(
-                !command.contains("--print"),
+                !command.contains(" -p "),
                 "{agent_type:?} must keep its interactive stdin path for live guidance: {command}"
             );
         }
@@ -2116,6 +2121,73 @@ mod tests {
             None,
         );
         assert!(opencode.contains("run --interactive"));
+    }
+
+    #[test]
+    fn test_one_shot_claude_uses_print_flag_and_companions_do_not() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let one_shot = ACS::build_agent_command_with_effort(
+            AgentType::Claude,
+            Some(prompt),
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("sonnet"),
+            Some("high"),
+            super::InvocationMode::OneShot,
+        );
+        assert!(one_shot.starts_with("claude -p --dangerously-skip-permissions"));
+
+        let companion = ACS::build_agent_command_with_effort(
+            AgentType::Claude,
+            Some(prompt),
+            None,
+            &empty_env(),
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("sonnet"),
+            Some("high"),
+            super::InvocationMode::Interactive,
+        );
+        assert!(!companion.contains(" -p "));
+    }
+
+    #[test]
+    fn test_one_shot_does_not_change_codex_or_opencode_commands() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        for agent_type in [AgentType::Codex, AgentType::OpenCode] {
+            let interactive = ACS::build_agent_command_with_effort(
+                agent_type,
+                Some(prompt),
+                None,
+                &empty_env(),
+                Path::new("/tmp/test"),
+                None,
+                false,
+                None,
+                None,
+                super::InvocationMode::Interactive,
+            );
+            let one_shot = ACS::build_agent_command_with_effort(
+                agent_type,
+                Some(prompt),
+                None,
+                &empty_env(),
+                Path::new("/tmp/test"),
+                None,
+                false,
+                None,
+                None,
+                super::InvocationMode::OneShot,
+            );
+            assert_eq!(
+                interactive, one_shot,
+                "{agent_type:?} launch must be unchanged"
+            );
+        }
     }
 
     #[test]
@@ -2271,6 +2343,7 @@ mod tests {
             false,
             Some("sonnet"),
             Some("high"),
+            super::InvocationMode::Interactive,
         );
 
         assert!(cmd.contains("--model sonnet --effort high"));
@@ -2288,6 +2361,7 @@ mod tests {
             false,
             Some("opencode-go/deepseek-v4-pro"),
             Some("high"),
+            super::InvocationMode::Interactive,
         );
 
         assert!(cmd.ends_with("--model opencode-go/deepseek-v4-pro --variant high"));
