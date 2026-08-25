@@ -2953,8 +2953,6 @@ def _apply_reconciliation_observations(
         invocation_id = current.dispatch_invocation_id
         if invocation_id is None and publication is not None:
             invocation_id = publication.invocation_id
-        if invocation_id is None:
-            invocation_id = _publication_record_text(watcher, "invocation_id")
         if (
             watcher.get("publication_ownership_verified") is True
             and head_sha

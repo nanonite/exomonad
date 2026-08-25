@@ -19,6 +19,23 @@ is surfaced through the effect response and parks the slice with
 never edits `published-heads.json` directly; registry reads and writes stay
 behind the Rust effect boundary.
 
+## Handoff provenance resolution
+
+The publication registry records the invocation that originally filed a head,
+while dispatch_invocation_id identifies the invocation currently being
+reconciled. Those values can differ after a same-owner succession. The
+existing precedence in _publication_from_watcher is intentional: the
+current dispatch identity wins, followed by an already-bound publication, and
+then the host publication record for a first recovery. This preserves the
+current-owner handoff without rewriting the registry's original evidence.
+
+The reconciliation backfill has one provenance route: it reads
+PublicationBinding.invocation_id after _publication_from_watcher has folded
+the host observation into the binding. It does not read the raw watcher
+record a second time. The raw record is still used by the separate
+tl.handoff_reconciled diagnostic payload when a handoff cannot be built; that
+read explains a missing-evidence report and does not resolve handoff state.
+
 ## Rationale
 
 Restarting a process does not create a new publication owner. Recording an
