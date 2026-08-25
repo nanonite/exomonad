@@ -2782,6 +2782,22 @@ def _reconcile_nonterminal_slices(
         )
         if watcher is not None:
             reconciled = reconcile_merge_observation(reconciled, watcher)
+        if current.handoff is None and watcher is not None:
+            handoff_payload = _handoff_reconciliation_event_payload(
+                current,
+                reconciled,
+                watcher,
+                owner_id,
+            )
+            if handoff_payload is not None:
+                _record_controller_event(
+                    current.id,
+                    "tl.handoff_reconciled",
+                    handoff_payload,
+                    config,
+                    effects,
+                    effects_log,
+                )
         if result.next_action in {
             "park_closed_unmerged_pr",
             "park_unreachable_pr_head",
@@ -2918,23 +2934,29 @@ def _apply_reconciliation_observations(
                 if review_state in {"go-with-nits", "go_with_nits"}
                 else Verdict.GO
             )
-        publication = _publication_from_watcher(current, watcher, head_sha)
+        publication = _publication_from_watcher(current, watcher, head_sha, owner_id)
         if publication is not None:
             updates["publication"] = publication
             updates["pr_number"] = publication.pr_number
         published_pr_number = (
             publication.pr_number if publication is not None else current.pr_number
         )
+        effective_agent_id = current.dispatch_agent_id or owner_id
+        invocation_id = current.dispatch_invocation_id
+        if invocation_id is None and publication is not None:
+            invocation_id = publication.invocation_id
+        if invocation_id is None:
+            invocation_id = _publication_record_text(watcher, "invocation_id")
         if (
             watcher.get("publication_ownership_verified") is True
             and head_sha
             and published_pr_number is not None
-            and current.dispatch_agent_id
-            and current.dispatch_invocation_id
+            and effective_agent_id
+            and invocation_id
             and (
                 current.publication is None
                 or (
-                    current.publication.pr_number == current.pr_number
+                    current.publication.pr_number == published_pr_number
                     and current.publication.head_sha == head_sha
                 )
             )
@@ -2944,12 +2966,35 @@ def _apply_reconciliation_observations(
                 pr_number=published_pr_number,
                 head_sha=head_sha,
                 attempt=attempt,
-                invocation_id=current.dispatch_invocation_id,
-                agent_id=current.dispatch_agent_id,
+                invocation_id=invocation_id,
+                agent_id=effective_agent_id,
                 observed_at=_now_timestamp(),
             )
             if current.status is SliceStatus.SPAWNED:
                 updates["status"] = SliceStatus.IN_REVIEW
+        elif watcher.get("publication_ownership_verified") is True:
+            missing = [
+                name
+                for name, value in (
+                    ("head_sha", head_sha),
+                    ("pr_number", published_pr_number),
+                    ("owner_agent_id", effective_agent_id),
+                    ("invocation_id_provenance", invocation_id),
+                )
+                if not value
+            ]
+            LOGGER.warning(
+                "[TL loop] skipping handoff backfill for %s: missing %s",
+                current.id,
+                ", ".join(missing) or "matching publication identity",
+            )
+        elif watcher.get("found") is True:
+            LOGGER.warning(
+                "[TL loop] skipping handoff backfill for %s: publication ownership is not verified (%s)",
+                current.id,
+                _snapshot_text(watcher, "publication_ownership_error")
+                or "host publication identity unavailable",
+            )
         if watcher.get("merged") is True:
             updates["status"] = SliceStatus.MERGED
     if owner_id is not None and current.dispatch_agent_id is None:
@@ -2961,6 +3006,7 @@ def _publication_from_watcher(
     current: SliceState,
     watcher: Mapping[str, object],
     head_sha: str | None,
+    owner_id: str | None,
 ) -> PublicationBinding | None:
     """Recover a publication only from an ownership-verified watcher snapshot."""
     if watcher.get("publication_ownership_verified") is not True or not head_sha:
@@ -2988,6 +3034,25 @@ def _publication_from_watcher(
             current.id,
         )
         return None
+    publication_record = _publication_evidence(watcher)
+    record_slice_id = _publication_record_text(publication_record, "slice_id")
+    if record_slice_id is not None and record_slice_id != current.id:
+        LOGGER.warning(
+            "[TL loop] refusing publication evidence for %s: slice identity %s disagrees",
+            current.id,
+            record_slice_id,
+        )
+        return None
+    expected_owner = current.dispatch_agent_id or owner_id
+    record_owner = _publication_record_text(publication_record, "author_agent")
+    if record_owner is not None and expected_owner is not None and record_owner != expected_owner:
+        LOGGER.warning(
+            "[TL loop] refusing publication evidence for %s: owner identity %s disagrees",
+            current.id,
+            record_owner,
+        )
+        return None
+    record_invocation_id = _publication_record_text(publication_record, "invocation_id")
     return PublicationBinding(
         pr_number=pr_number,
         head_sha=head_sha,
@@ -2995,7 +3060,9 @@ def _publication_from_watcher(
         base_branch=base_branch,
         attempt=existing.attempt if existing is not None else current.attempts,
         invocation_id=(
-            existing.invocation_id if existing is not None else current.dispatch_invocation_id
+            current.dispatch_invocation_id
+            or (existing.invocation_id if existing is not None else None)
+            or record_invocation_id
         ),
     )
 
@@ -5088,12 +5155,104 @@ def _watcher_snapshot_for_slice(
     pr_number = result.result.get("pr_number")
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         return None
-    return _watcher_snapshot(pr_number, config, effects, effects_log)
+    snapshot = _watcher_snapshot(pr_number, config, effects, effects_log)
+    publication = result.result.get("publication")
+    if snapshot is not None and isinstance(publication, Mapping):
+        return {**snapshot, "publication": publication}
+    return snapshot
 
 
 def _snapshot_text(snapshot: Mapping[str, object], key: str) -> str | None:
     value = snapshot.get(key)
     return value if isinstance(value, str) and value else None
+
+
+def _publication_evidence(watcher: Mapping[str, object]) -> Mapping[str, object] | None:
+    value = watcher.get("publication")
+    return value if isinstance(value, Mapping) else None
+
+
+def _publication_record_text(
+    watcher: Mapping[str, object] | None,
+    key: str,
+) -> str | None:
+    if watcher is None:
+        return None
+    record = watcher if "publication" not in watcher else _publication_evidence(watcher)
+    if record is None:
+        return None
+    value = record.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _handoff_reconciliation_event_payload(
+    current: SliceState,
+    reconciled: SliceState,
+    watcher: Mapping[str, object],
+    owner_id: str | None,
+) -> dict[str, object] | None:
+    if watcher.get("found") is not True:
+        return None
+    if watcher.get("publication_ownership_verified") is not True:
+        return {
+            "slice_id": current.id,
+            "pr_number": watcher.get("pr_number") or 0,
+            "head_sha": _snapshot_text(watcher, "head_sha") or "",
+            "invocation_id": "",
+            "outcome": "skipped",
+            "reason": _snapshot_text(watcher, "publication_ownership_error")
+            or "publication_ownership_unverified",
+            "source": "host_publication",
+        }
+    publication = reconciled.publication or current.publication
+    head_sha = _snapshot_text(watcher, "head_sha") or (
+        publication.head_sha if publication is not None else ""
+    )
+    pr_number = (
+        reconciled.pr_number
+        or (publication.pr_number if publication is not None else None)
+        or watcher.get("pr_number")
+    )
+    handoff = reconciled.handoff
+    if handoff is not None:
+        return {
+            "slice_id": current.id,
+            "pr_number": handoff.pr_number,
+            "head_sha": handoff.head_sha,
+            "invocation_id": handoff.invocation_id,
+            "outcome": "backfilled",
+            "reason": "",
+            "source": "host_publication",
+        }
+    record = _publication_evidence(watcher)
+    expected_owner = current.dispatch_agent_id or owner_id
+    record_slice = _publication_record_text(record, "slice_id")
+    record_owner = _publication_record_text(record, "author_agent")
+    if record_slice is not None and record_slice != current.id:
+        reason = f"slice_id_mismatch:{record_slice}"
+    elif record_owner is not None and expected_owner is not None and record_owner != expected_owner:
+        reason = f"owner_agent_mismatch:{record_owner}"
+    else:
+        missing = [
+            name
+            for name, value in (
+                ("head_sha", head_sha),
+                ("pr_number", pr_number),
+                ("owner_agent_id", expected_owner),
+                ("invocation_id_provenance", _publication_record_text(record, "invocation_id")),
+            )
+            if not value
+        ]
+        reason = "missing " + ", ".join(missing) if missing else "publication_identity"
+    return {
+        "slice_id": current.id,
+        "pr_number": pr_number or 0,
+        "head_sha": head_sha,
+        "invocation_id": "",
+        "outcome": "skipped",
+        "reason": reason,
+        "source": "host_publication",
+    }
 
 
 def _snapshot_bool(snapshot: Mapping[str, object], key: str) -> bool:

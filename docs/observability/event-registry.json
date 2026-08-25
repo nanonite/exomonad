@@ -127,6 +127,7 @@
     {"type": "tl.integration_revalidated", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.integration_validated", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.merge_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.handoff_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "worker.terminal_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "worker.missing", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "pr.filed", "payload_class": "pointer_only", "producers": ["rust", "haskell"]},

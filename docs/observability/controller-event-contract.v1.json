@@ -232,6 +232,9 @@
     "tl.merge_reconciled": {
       "fields": ["slice_id", "pr_number", "head_sha", "reconciliation"]
     },
+    "tl.handoff_reconciled": {
+      "fields": ["slice_id", "pr_number", "head_sha", "invocation_id", "outcome", "reason", "source"]
+    },
     "agent.task_budget_exceeded": {
       "fields": [
         "slice_id",

@@ -37,6 +37,7 @@ from tl_loop.loop.driver import (
     WorkPlan,
     _child_recovery_projection,
     _apply_convergence,
+    _apply_reconciliation_observations,
     _bind_publication_evidence,
     _execute_direct_reviewer_intent,
     DISPATCH_CORRELATED,
@@ -60,7 +61,11 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.convergence import ConvergenceTracker
-from tl_loop.loop.reconcile import ExternalIntent
+from tl_loop.loop.reconcile import (
+    ExternalIntent,
+    ReconciliationResult,
+    reconcile_merge_observation,
+)
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
 from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
@@ -2204,6 +2209,57 @@ def test_publication_derives_handoff_without_completion_event(tmp_path: Path) ->
     assert slice_state.handoff is not None
     assert slice_state.handoff.head_sha == "head-a"
     assert _update_slices(bound, ChildCompleted("leaf-a")) == bound
+
+
+def test_reconciliation_backfills_handoff_from_host_publication_provenance(
+    tmp_path: Path,
+) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id=None,
+        publication=None,
+        handoff=None,
+        verdict=Verdict.GO,
+        reviewer_attempt={"head-a": 1},
+    )
+    result = ReconciliationResult(
+        slice_id="leaf-a",
+        confirmed_stage="review",
+        authoritative_evidence=("published_pr",),
+        missing_evidence=("handoff",),
+        conflicts=(),
+        next_action="await_handoff",
+    )
+    watcher = {
+        "found": True,
+        "pr_number": 42,
+        "head_sha": "head-a",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "review_state": "approved",
+        "ci_status": "success",
+        "publication_ownership_verified": True,
+        "publication": {
+            "invocation_id": "inv-host",
+            "slice_id": "leaf-a",
+            "author_agent": "leaf-a",
+            "succession_invocation_ids": [],
+        },
+    }
+
+    updated = _apply_reconciliation_observations(current, result, watcher, None)
+
+    assert updated.publication is not None
+    assert updated.publication.invocation_id == "inv-host"
+    assert updated.handoff is not None
+    assert updated.handoff.invocation_id == "inv-host"
+    assert updated.handoff.agent_id == "leaf-a"
+    assert updated.status is SliceStatus.IN_REVIEW
+    merge_ready = reconcile_merge_observation(updated, watcher)
+    assert merge_ready.reconciliation is not None
+    assert merge_ready.reconciliation["next_action"] == "queue_merge"
 
 
 def test_pr_filed_binds_host_verified_publication_to_owner(tmp_path: Path) -> None:

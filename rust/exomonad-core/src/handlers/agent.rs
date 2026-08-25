@@ -28,7 +28,7 @@ use crate::services::pr_registry::PrRegistry;
 use crate::services::pr_registry::{
     publication_history_for_slice, read_published_heads,
     resolve_live_pr_for_slice_with_abandonments, AbandonedAttempt, LivePrResolution, PrEntry,
-    PrState, PublicationProvenance,
+    PrState, PublicationProvenance, PublishedHead,
 };
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
@@ -783,7 +783,21 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
         evidence_error: error,
         publication_ownership_verified: false,
         publication_ownership_error: String::new(),
+        publication: None,
     }
+}
+
+fn published_head_evidence(publication: Option<&PublishedHead>) -> Option<PublishedHeadEvidence> {
+    publication.map(|head| PublishedHeadEvidence {
+        invocation_id: head.invocation_id.clone().unwrap_or_default(),
+        slice_id: head.slice_id.clone().unwrap_or_default(),
+        author_agent: head.author_agent.clone().unwrap_or_default(),
+        succession_invocation_ids: head
+            .invocation_succession
+            .iter()
+            .map(|succession| succession.to_invocation_id.clone())
+            .collect(),
+    })
 }
 
 async fn publication_ownership_status<C>(
@@ -1889,6 +1903,7 @@ impl<
                 slice_id: slice_id.to_string(),
                 resolution: LivePrResolutionKind::Unspecified as i32,
                 pr_number: 0,
+                publication: None,
             });
         };
         let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
@@ -1924,12 +1939,20 @@ impl<
             }
             LivePrResolution::Live(pr_number) => (LivePrResolutionKind::Live, pr_number),
         };
+        let publication = if pr_number > 0 {
+            publication_history_for_slice(&heads, slice_id)
+                .into_iter()
+                .find(|head| head.pr_number == pr_number)
+        } else {
+            None
+        };
         Ok(ResolveLivePrForSliceResponse {
             success: true,
             error: String::new(),
             slice_id: slice_id.to_string(),
             resolution: resolution_kind as i32,
             pr_number,
+            publication: published_head_evidence(publication),
         })
     }
 
@@ -2001,6 +2024,23 @@ impl<
                 &head_sha,
             )
             .await;
+        let publication = if publication_ownership_verified {
+            read_published_heads(self.ctx.project_dir())
+                .await
+                .ok()
+                .and_then(|heads| {
+                    heads.into_iter().find(|head| {
+                        head.matches_current(
+                            pr_number,
+                            pr.head_ref.as_str(),
+                            pr.base_ref.as_str(),
+                            &head_sha,
+                        )
+                    })
+                })
+        } else {
+            None
+        };
         Ok(WatcherPrStateResponse {
             success: true,
             error: String::new(),
@@ -2030,6 +2070,7 @@ impl<
             evidence_error,
             publication_ownership_verified,
             publication_ownership_error,
+            publication: published_head_evidence(publication.as_ref()),
         })
     }
 

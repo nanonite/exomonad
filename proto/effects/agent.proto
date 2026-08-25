@@ -390,12 +390,22 @@ message ResolveLivePrForSliceRequest {
   string slice_id = 1;
 }
 
+// Host-verified publication provenance used to recover a TL handoff after a
+// controller restart.  The controller must not infer these identities.
+message PublishedHeadEvidence {
+  string invocation_id = 1;
+  string slice_id = 2;
+  string author_agent = 3;
+  repeated string succession_invocation_ids = 4;
+}
+
 message ResolveLivePrForSliceResponse {
   bool success = 1;
   string error = 2;
   string slice_id = 3;
   LivePrResolutionKind resolution = 4;
   uint64 pr_number = 5;
+  PublishedHeadEvidence publication = 6;
 }
 
 message WatcherPrStateRequest {
@@ -426,9 +436,10 @@ message WatcherPrStateResponse {
     string evidence_error = 19;
     // Publication ownership is verified by the effect boundary, including
     // invocation succession across a session restart.
-    bool publication_ownership_verified = 20;
-    string publication_ownership_error = 21;
-  }
+  bool publication_ownership_verified = 20;
+  string publication_ownership_error = 21;
+  PublishedHeadEvidence publication = 22;
+}
 
 // ============================================================================
 // SpawnLeafSubtree - Spawn a leaf agent in a new git worktree
