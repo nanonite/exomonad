@@ -408,6 +408,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Make --recreate destroy worktrees and their PRs behind a confirmation gate (#1017)
 - Implement --continue preserve-vs-recreate invocation classification (#1016)
 - Define --start/--continue/--recreate session modes and record the choice (#1015)
 - Collapse redundant invocation_id provenance routes in handoff backfill (#1011)
