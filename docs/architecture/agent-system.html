@@ -297,6 +297,21 @@ sequenceDiagram
 
 <p class="note">Repair never creates a new branch, leaf name, agent type, or <code>-2</code> suffix. <code>compose_repair</code> calls <code>watcher_pr_state</code> first and requires the PR to be open, unmerged, and identified by both head branch and SHA.</p>
 
+<h3>Single-path ownership and restart behavior</h3>
+<p>The watcher is a sensor: it appends verified Forgejo, CI, git, and process
+facts to the ledger. The reducer folds those facts into per-head state, policy
+derives one intent or wait reason, and the <code>EffectJournal</code> executor
+performs the effect. The watcher never spawns a reviewer, adjudicates a
+verdict, repairs a leaf, or merges a PR.</p>
+<p>A reviewer is one-shot for an exact <code>head_sha</code>. Its terminal verdict
+is persisted before exit. After restart, GO waits for same-head CI and uses
+compare evidence for <code>merge_pr</code>; NO-GO or same-head CI failure uses
+one same-owner <code>resume_pr</code>. A new head invalidates old evidence before
+one new reviewer is derived. The controller does not message an exited
+reviewer, rewind the ledger, edit <code>plan.json</code>, or create a sibling
+owner. <code>tl.action_queued</code>, <code>tl.action_reconciled</code>, and
+<code>tl.wait_reason_changed</code> provide durable acceptance evidence.</p>
+
 <h3>Event vocabulary</h3>
 <table>
 <tr><th>Event</th><th>Watcher trigger</th><th>Dev / TL handler</th><th>Reviewer handler</th></tr>
