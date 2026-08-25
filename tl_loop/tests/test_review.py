@@ -11,14 +11,14 @@ import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import JsonObject
-from tl_loop.events.envelope import EventEnvelope, project
-from tl_loop.fsm.event import ChildCompleted
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
     EffectIntent,
     TLLoopConfig,
-    _merge_completed_leaf,
+    _execute_direct_merge_intent,
 )
+from tl_loop.loop.reconcile import ExternalIntent
 from tl_loop.loop.review import (
     CIStatusNotApproved,
     IntegrationEvidenceMismatch,
@@ -280,21 +280,18 @@ def test_pre_merge_watcher_recheck_blocks_a_fix_pushed_after_verdict(
     tmp_path: Path,
 ) -> None:
     state, store = _state(tmp_path, "abc123", "2026-08-11T16:55:00Z")
-    transport = RecordingTransport(current_head="def456")
+    transport = DirectMergeTransport(snapshots=[_snapshot(head_sha="def456")])
     effects_log: list[EffectIntent] = []
 
-    allowed = _merge_completed_leaf(
-        _event(),
-        _completion(),
-        {"leaf"},
-        set(),
-        EffectClient(transport),
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
         TLLoopConfig(poll_interval=0.001),
         effects_log,
-        state,
     )
 
-    assert allowed is False
+    assert result.slices["leaf"].status is SliceStatus.IN_REVIEW
     assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
         "watcher_pr_state"
     ]
@@ -303,28 +300,31 @@ def test_pre_merge_watcher_recheck_blocks_a_fix_pushed_after_verdict(
 
 
 def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
-    state, _ = _state(tmp_path, "abc123", _fresh_verdict_at())
-    transport = RecordingTransport(current_head="abc123")
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    transport = DirectMergeTransport(
+        snapshots=[
+            _snapshot(head_sha="abc123"),
+            {"merged": True, "head_sha": "abc123", "pr_state": "closed"},
+        ]
+    )
     effects_log: list[EffectIntent] = []
 
-    allowed = _merge_completed_leaf(
-        _event(),
-        _completion(),
-        {"leaf"},
-        set(),
-        EffectClient(transport),
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
         TLLoopConfig(
             poll_interval=0.001,
             review_policy_path=Path(".exo/review-policy.toml"),
         ),
         effects_log,
-        state,
     )
 
-    assert allowed is True
+    assert result.slices["leaf"].status is SliceStatus.MERGED
     assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
         "watcher_pr_state",
         "merge_pr",
+        "watcher_pr_state",
     ]
     merge_arguments = next(arguments for name, arguments in transport.calls if name == "merge_pr")
     assert merge_arguments == {
@@ -338,46 +338,41 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
 
 def test_missing_direct_compare_evidence_opens_integrity_gate(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
-    transport = RecordingTransport(current_head="abc123", merge_tree_sha=None)
+    transport = DirectMergeTransport(
+        snapshots=[_snapshot(head_sha="abc123", merge_tree_sha=None)]
+    )
     effects_log: list[EffectIntent] = []
 
-    allowed = _merge_completed_leaf(
-        _event(),
-        _completion(),
-        {"leaf"},
-        set(),
-        EffectClient(transport),
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
         TLLoopConfig(poll_interval=0.001),
         effects_log,
-        state,
-        store=store,
     )
 
-    assert allowed is False
+    assert result.slices["leaf"].status is SliceStatus.IN_REVIEW
     assert [name for name, _ in transport.calls if name == "merge_pr"] == []
     assert any(gate.name == "tl-integrity-reconciliation" for gate in store.load().gates)
 
 
 def test_expired_matching_head_is_refused_before_merge(tmp_path: Path) -> None:
-    state, _ = _state(tmp_path, "abc123", "2026-08-11T00:00:00Z")
-    transport = RecordingTransport(current_head="abc123")
+    state, store = _state(tmp_path, "abc123", "2026-08-11T00:00:00Z")
+    transport = DirectMergeTransport(snapshots=[_snapshot(head_sha="abc123")])
     effects_log: list[EffectIntent] = []
 
-    allowed = _merge_completed_leaf(
-        _event(),
-        _completion(),
-        {"leaf"},
-        set(),
-        EffectClient(transport),
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
         TLLoopConfig(
             poll_interval=0.001,
             review_policy_path=Path(".exo/review-policy.toml"),
         ),
         effects_log,
-        state,
     )
 
-    assert allowed is False
+    assert result.slices["leaf"].status is SliceStatus.IN_REVIEW
     assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
         "watcher_pr_state"
     ]
@@ -417,7 +412,7 @@ def _document() -> dict[str, object]:
         "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "review-test",
-        "fsm": {"phase": TLPhase.TLWaiting.value, "waiting": ["leaf"]},
+        "fsm": {"phase": TLPhase.TLPlanning.value, "waiting": []},
         "slices": {
             "leaf": {
                 "id": "leaf",
@@ -455,35 +450,9 @@ def _state(tmp_path: Path, head: str, verdict_at: str) -> tuple[RunState, RunSto
     return store.load(), store
 
 
-def _event() -> EventEnvelope:
-    raw = {
-        "schema_version": 1,
-        "event_id": "review-1",
-        "id": "review-1",
-        "event_time": "2026-08-11T17:00:00Z",
-        "observed_at": "2026-08-11T17:00:00Z",
-        "run_seq": 1,
-        "type": "agent.notify_parent",
-        "agent_id": "leaf",
-        "run_id": "review-test",
-        "session_id": "session-1",
-        "lifecycle_state": "observed",
-        "data": {"pr_number": 42},
-    }
-    return project(cast(dict[str, object], raw))
-
-
-def _completion() -> ChildCompleted:
-    return ChildCompleted("leaf")
-
-
 @dataclass
-class RecordingTransport:
-    current_head: str
-    base_sha: str | None = "base-a"
-    patch_digest: str | None = "patch-a"
-    merge_tree_sha: str | None = "tree-a"
-    ci_status: str | None = "success"
+class DirectMergeTransport:
+    snapshots: list[dict[str, object]] = field(default_factory=list)
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -496,15 +465,47 @@ class RecordingTransport:
         del role, name
         self.calls.append((tool_name, arguments))
         if tool_name == "watcher_pr_state":
-            return {
-                "success": True,
-                "result": {
-                    "found": True,
-                    "head_sha": self.current_head,
-                    "base_sha": self.base_sha,
-                    "patch_digest": self.patch_digest,
-                    "merge_tree_sha": self.merge_tree_sha,
-                    "ci_status": self.ci_status,
-                },
-            }
+            if not self.snapshots:
+                raise AssertionError("unexpected watcher_pr_state call")
+            return {"success": True, "result": self.snapshots.pop(0)}
+        if tool_name == "merge_pr":
+            return {"success": True, "result": {"merged": True}}
         return {"success": True, "result": None}
+
+
+def _snapshot(
+    *,
+    head_sha: str,
+    merge_tree_sha: str | None = "tree-a",
+) -> dict[str, object]:
+    return {
+        "found": True,
+        "head_sha": head_sha,
+        "base_sha": "base-a",
+        "patch_digest": "patch-a",
+        "merge_tree_sha": merge_tree_sha,
+        "ci_status": "success",
+    }
+
+
+def _run_direct_merge(
+    state: RunState,
+    store: RunStore,
+    transport: DirectMergeTransport,
+    config: TLLoopConfig,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    intent = ExternalIntent(
+        "merge",
+        "leaf",
+        {"pr_number": 42, "head_sha": state.slices["leaf"].reviewed_head},
+    )
+    return _execute_direct_merge_intent(
+        state,
+        intent,
+        ConvergenceTracker(),
+        store,
+        config,
+        EffectClient(transport),
+        effects_log,
+    )

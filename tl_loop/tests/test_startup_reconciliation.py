@@ -213,6 +213,24 @@ def test_reconciliation_recovers_and_persists_missing_pr_number(tmp_path) -> Non
     assert store.load().slices["slice-a"].reviewer_attempt == {"head-a": 1}
 
 
+def test_reconciliation_preserves_plan_json_bytes_across_restart(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    plan_path = tmp_path / ".exo" / "tl-loop" / "plan.json"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    original = b'{"leaves":[{"name":"slice-a"}]}\n'
+    plan_path.write_bytes(original)
+    client = FakeClient()
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
+
+    _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+    after_retry = plan_path.read_bytes()
+    _reconcile_nonterminal_slices(_PLAN, store.load(), config, client, store, [])
+    after_restart = plan_path.read_bytes()
+
+    assert after_retry == original
+    assert after_restart == original
+
+
 def test_reconciliation_adopts_authoritative_publication_handoff_after_restart(
     tmp_path,
 ) -> None:

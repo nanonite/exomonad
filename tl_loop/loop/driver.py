@@ -1611,7 +1611,41 @@ def _execute_direct_merge_intent(
                 dispatch_last_boundary="direct_merge_adopted",
             ),
         )
-    evidence = _direct_merge_evidence(current, watcher)
+    if (
+        watcher is not None
+        and watcher.success is True
+        and isinstance(watcher.result, Mapping)
+        and not _direct_compare_evidence_complete(watcher)
+    ):
+        reason = (
+            "direct merge requires complete watcher evidence: "
+            "base_sha, head_sha, patch_digest, merge_tree_sha, and ci_status"
+        )
+        previous_gate = next(
+            (
+                gate
+                for gate in state.gates
+                if gate.name == INTEGRITY_RECONCILIATION_GATE_NAME
+            ),
+            None,
+        )
+        state = _clear_action_for_reduction(store, state, current.id)
+        state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
+        if previous_gate is None or previous_gate.status is not GateStatus.PENDING:
+            _record_controller_event(
+                "controller",
+                "tl.gate_opened",
+                {
+                    "gate_name": INTEGRITY_RECONCILIATION_GATE_NAME,
+                    "run_id": state.run_id,
+                    "reason": reason,
+                },
+                config,
+                effects,
+                effects_log,
+            )
+        return state
+    evidence = _direct_merge_evidence(current, watcher, config)
     if evidence is None:
         return _clear_action_for_reduction(store, state, current.id)
     arguments = {
@@ -1745,9 +1779,19 @@ def _reconcile_unknown_merge(
     return updated
 
 
+def _direct_compare_evidence_complete(watcher: ToolResult) -> bool:
+    if watcher.success is not True or not isinstance(watcher.result, Mapping):
+        return False
+    return all(
+        _watcher_evidence_text(watcher, key) is not None
+        for key in ("base_sha", "head_sha", "patch_digest", "merge_tree_sha", "ci_status")
+    )
+
+
 def _direct_merge_evidence(
     current: SliceState,
     watcher: ToolResult | None,
+    config: TLLoopConfig,
 ) -> dict[str, str] | None:
     """Validate the watcher snapshot used as the direct merge compare."""
     if (
@@ -1765,9 +1809,22 @@ def _direct_merge_evidence(
     }
     if any(not isinstance(value, str) or not value for value in evidence.values()):
         return None
-    if current.reviewed_head != head_sha or current.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
-        return None
     if watcher.result.get("ci_status") not in {"success", "neutral"}:
+        return None
+    try:
+        freshness_window_secs = (
+            load_freshness_window(config.review_policy_path)
+            if config.review_policy_path is not None
+            else None
+        )
+        verify_review(
+            current,
+            head_sha,
+            now=config.review_clock() if config.review_clock is not None else None,
+            freshness_window_secs=freshness_window_secs,
+            current_patch_digest=evidence["patch_digest"],
+        )
+    except ReviewGateError:
         return None
     return cast(dict[str, str], evidence)
 
@@ -5240,171 +5297,6 @@ def _leaf_call(
         )
 
     return invoke
-
-
-def _merge_completed_leaf(
-    event: EventEnvelope,
-    completion: ChildCompleted,
-    leaf_names: set[str],
-    merged: set[str],
-    effects: EffectClient | ReadOnlyEffectClient,
-    config: TLLoopConfig,
-    effects_log: list[EffectIntent],
-    state: RunState,
-    *,
-    store: RunStore | None = None,
-) -> bool:
-    pr_number = event.pr_number
-    if completion.slug not in leaf_names or pr_number is None or completion.slug in merged:
-        return True
-    current = state.slices.get(completion.slug)
-    head_sha = event.head_sha or (current.reviewed_head if current is not None else None)
-    current_patch_digest: str | None = None
-    expected_base_sha: str | None = None
-    expected_merge_tree_sha: str | None = None
-    expected_ci_status: str | None = None
-    live = cast(EffectClient, effects) if config.active else None
-    if (
-        config.active
-        and live is not None
-        and current is not None
-        and (current.verdict is not None or current.reviewed_head is not None)
-    ):
-        watcher_arguments = {"pr_number": pr_number}
-        effects_log.append(
-            EffectIntent("watcher_pr_state", completion.slug, watcher_arguments, True)
-        )
-        LOGGER.info(
-            "[TL loop] effect=watcher_pr_state target=%s active=true",
-            completion.slug,
-        )
-        watcher_result = live.watcher_pr_state(pr_number=pr_number)
-        if watcher_result.success is False:
-            if watcher_result.error_kind == "tool_unavailable":
-                raise ToolUnavailableError(
-                    "watcher_pr_state", watcher_result, target=completion.slug
-                )
-            raise EffectFailed(watcher_result.error or "watcher_pr_state returned failure")
-        try:
-            freshness_window_secs = (
-                load_freshness_window(config.review_policy_path)
-                if config.review_policy_path is not None
-                else None
-            )
-            current_head = watcher_head(watcher_result)
-            current_patch_digest = watcher_patch_digest(watcher_result)
-            expected_base_sha = _watcher_evidence_text(watcher_result, "base_sha")
-            expected_merge_tree_sha = _watcher_evidence_text(watcher_result, "merge_tree_sha")
-            expected_ci_status = _watcher_evidence_text(watcher_result, "ci_status")
-            verify_review(
-                current,
-                current_head,
-                now=config.review_clock() if config.review_clock is not None else None,
-                freshness_window_secs=freshness_window_secs,
-                current_patch_digest=current_patch_digest,
-            )
-            head_sha = current_head
-            if not all(
-                (
-                    current_patch_digest,
-                    expected_base_sha,
-                    expected_merge_tree_sha,
-                    expected_ci_status,
-                )
-            ):
-                reason = (
-                    "direct merge requires complete watcher evidence: "
-                    "base_sha, head_sha, patch_digest, merge_tree_sha, and ci_status"
-                )
-                if store is not None:
-                    store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
-                _record_controller_event(
-                    "controller",
-                    "tl.gate_opened",
-                    {
-                        "gate_name": INTEGRITY_RECONCILIATION_GATE_NAME,
-                        "run_id": state.run_id,
-                        "reason": reason,
-                    },
-                    config,
-                    effects,
-                    effects_log,
-                )
-                _emit_merge_decision(
-                    completion.slug,
-                    pr_number,
-                    "blocked",
-                    head_sha,
-                    config,
-                    effects,
-                    effects_log,
-                )
-                return False
-        except ReviewGateError as error:
-            LOGGER.warning(
-                "[TL loop] refusing merge target=%s reason=%s",
-                completion.slug,
-                error,
-            )
-            _emit_merge_decision(
-                completion.slug,
-                pr_number,
-                "blocked",
-                head_sha,
-                config,
-                effects,
-                effects_log,
-            )
-            return False
-    if not all(
-        (
-            head_sha,
-            current_patch_digest,
-            expected_base_sha,
-            expected_merge_tree_sha,
-            expected_ci_status,
-        )
-    ):
-        return False
-    _emit_merge_decision(
-        completion.slug,
-        pr_number,
-        "merge",
-        head_sha,
-        config,
-        effects,
-        effects_log,
-    )
-    arguments: dict[str, object] = {
-        "pr_number": pr_number,
-        "expected_base_sha": expected_base_sha,
-        "expected_head_sha": head_sha,
-        "expected_patch_digest": current_patch_digest,
-        "expected_merge_tree_sha": expected_merge_tree_sha,
-    }
-    _optional_argument(arguments, "chainlink_issue_id", config.chainlink_issue_id)
-    _optional_argument(arguments, "strategy", config.merge_strategy)
-    _optional_argument(arguments, "working_dir", config.working_dir)
-    _invoke(
-        "merge_pr",
-        completion.slug,
-        arguments,
-        config.active,
-        live,
-        lambda client: client.merge_pr(
-            pr_number=pr_number,
-            chainlink_issue_id=config.chainlink_issue_id,
-            strategy=config.merge_strategy,
-            working_dir=config.working_dir,
-            expected_base_sha=expected_base_sha,
-            expected_head_sha=head_sha,
-            expected_patch_digest=current_patch_digest,
-            expected_merge_tree_sha=expected_merge_tree_sha,
-        ),
-        effects_log,
-    )
-    merged.add(completion.slug)
-    return True
 
 
 def _record_child_handoff(
