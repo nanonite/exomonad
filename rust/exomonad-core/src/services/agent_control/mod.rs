@@ -323,14 +323,18 @@ impl<'de> Deserialize<'de> for AgentType {
 /// Static metadata for each agent type, replacing per-method match dispatch.
 pub(crate) struct AgentMetadata {
     pub(crate) command: &'static str,
+    /// Harness subcommand used when an agent receives a prompt.
     pub(crate) prompt_flag: &'static str,
+    /// Flag that makes a role-scoped invocation one-shot.
+    pub(crate) one_shot_flag: &'static str,
     pub(crate) suffix: &'static str,
     pub(crate) emoji: &'static str,
 }
 
 pub(crate) const CLAUDE_META: AgentMetadata = AgentMetadata {
     command: "claude",
-    prompt_flag: "-p",
+    prompt_flag: "",
+    one_shot_flag: "-p",
     suffix: "claude",
     emoji: "\u{1F916}", // 🤖
 };
@@ -338,6 +342,7 @@ pub(crate) const CLAUDE_META: AgentMetadata = AgentMetadata {
 pub(crate) const SHOAL_META: AgentMetadata = AgentMetadata {
     command: "shoal-agent",
     prompt_flag: "",
+    one_shot_flag: "",
     suffix: "shoal",
     emoji: "\u{1F30A}", // 🌊
 };
@@ -345,6 +350,7 @@ pub(crate) const SHOAL_META: AgentMetadata = AgentMetadata {
 pub(crate) const OPENCODE_META: AgentMetadata = AgentMetadata {
     command: "opencode",
     prompt_flag: "run",
+    one_shot_flag: "",
     suffix: "opencode",
     emoji: "\u{1F4BB}", // 💻
 };
@@ -352,6 +358,7 @@ pub(crate) const OPENCODE_META: AgentMetadata = AgentMetadata {
 pub(crate) const CODEX_META: AgentMetadata = AgentMetadata {
     command: "codex",
     prompt_flag: "",
+    one_shot_flag: "",
     suffix: "codex",
     emoji: "\u{1F916}", // 🤖
 };
@@ -359,6 +366,7 @@ pub(crate) const CODEX_META: AgentMetadata = AgentMetadata {
 pub(crate) const PROCESS_META: AgentMetadata = AgentMetadata {
     command: "",
     prompt_flag: "",
+    one_shot_flag: "",
     suffix: "process",
     emoji: "\u{2699}\u{FE0F}", // ⚙️
 };
@@ -379,6 +387,10 @@ impl AgentType {
     }
     pub(crate) fn prompt_flag(&self) -> &'static str {
         self.meta().prompt_flag
+    }
+    /// Return the agent-specific flag that enables one-shot execution.
+    pub(crate) fn one_shot_flag(&self) -> &'static str {
+        self.meta().one_shot_flag
     }
     /// Agent type suffix for naming (e.g., "claude", "codex").
     pub fn suffix(&self) -> &'static str {
@@ -1669,7 +1681,15 @@ mod tests {
 
     #[test]
     fn test_agent_type_prompt_flag() {
-        assert_eq!(AgentType::Claude.prompt_flag(), "-p");
+        assert_eq!(AgentType::Claude.prompt_flag(), "");
+        assert_eq!(AgentType::OpenCode.prompt_flag(), "run");
+    }
+
+    #[test]
+    fn test_agent_type_one_shot_flag() {
+        assert_eq!(AgentType::Claude.one_shot_flag(), "-p");
+        assert_eq!(AgentType::OpenCode.one_shot_flag(), "");
+        assert_eq!(AgentType::Codex.one_shot_flag(), "");
     }
 
     #[test]

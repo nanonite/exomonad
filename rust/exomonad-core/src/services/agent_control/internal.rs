@@ -519,7 +519,7 @@ impl<
             .map(|level| format!(" --variant {}", shell_escape::escape(level.into())))
             .unwrap_or_default();
         let one_shot_flag = if mode == super::InvocationMode::OneShot {
-            agent_type.prompt_flag()
+            agent_type.one_shot_flag()
         } else {
             ""
         };
@@ -544,8 +544,9 @@ impl<
                     ),
                     AgentType::OpenCode => {
                         format!(
-                            "{} run --interactive{} --session {} --fork \"$(cat {})\"{}{}",
+                            "{} {} --interactive{} --session {} --fork \"$(cat {})\"{}{}",
                             cmd,
+                            agent_type.prompt_flag(),
                             perms_flags,
                             escaped_session,
                             escaped_path,
@@ -580,8 +581,13 @@ impl<
                     ),
                     AgentType::OpenCode => {
                         format!(
-                            "{} run --interactive{} \"$(cat {})\"{}{}",
-                            cmd, perms_flags, escaped_path, model_flag, variant_flag
+                            "{} {} --interactive{} \"$(cat {})\"{}{}",
+                            cmd,
+                            agent_type.prompt_flag(),
+                            perms_flags,
+                            escaped_path,
+                            model_flag,
+                            variant_flag
                         )
                     }
                     _ => format!(
