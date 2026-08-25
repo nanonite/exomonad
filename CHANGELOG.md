@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Reject contradictory persisted review policy snapshots (#1012)
 - Launch one-shot roles non-interactively (claude -p) to match Codex and OpenCode (#1007)
 - Fix durable review ceiling enforcement and parallel slice parking (#1010)
 - Route one-shot verdicts to merge or same-owner repair (#1005)
