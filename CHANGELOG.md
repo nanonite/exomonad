@@ -401,6 +401,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Construct publication evidence so handoff is obtainable (await_handoff deadlock) (#999)
 - Remove dead merge path and repoint gate tests at the live path (#997)
 - Document non-atomic merge comparison boundary (#985)
 - Fix proto generation reproducibility in pre-commit (#968)
