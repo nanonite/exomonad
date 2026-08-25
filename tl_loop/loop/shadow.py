@@ -428,6 +428,8 @@ def _update_slices(
             status=SliceStatus.IN_REVIEW,
             pr_number=event.pr_number,
             reviewed_head=event.head_sha,
+            publication=None,
+            handoff=None,
             review_findings={},
             ci_state={},
             reviewer_attempt={},

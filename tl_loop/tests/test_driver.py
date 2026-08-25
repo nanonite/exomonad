@@ -37,6 +37,7 @@ from tl_loop.loop.driver import (
     WorkPlan,
     _child_recovery_projection,
     _apply_convergence,
+    _bind_publication_evidence,
     DISPATCH_CORRELATED,
     DISPATCH_HISTORICAL_AUDIT,
     DISPATCH_INTEGRITY_CONFLICT,
@@ -1203,6 +1204,21 @@ def test_pr_head_change_clears_per_head_gate_state() -> None:
         ci_state={"head-a": "success"},
         reviewer_attempt={"head-a": 1},
         repair_attempts=3,
+        publication=PublicationBinding(
+            pr_number=42,
+            head_sha="head-a",
+            head_branch="main.leaf-a",
+            base_branch="main",
+            attempt=2,
+        ),
+        handoff=HandoffEvidence(
+            pr_number=42,
+            head_sha="head-a",
+            attempt=2,
+            invocation_id="inv-a",
+            agent_id="leaf-a",
+            observed_at="2026-08-12T00:00:00Z",
+        ),
     )
 
     updated = _update_slices({"leaf-a": current}, PRUpdated(42, "head-b", "leaf-a"))["leaf-a"]
@@ -1214,6 +1230,8 @@ def test_pr_head_change_clears_per_head_gate_state() -> None:
     assert updated.ci_state == {}
     assert updated.reviewer_attempt == {}
     assert updated.repair_attempts == 3
+    assert updated.publication is None
+    assert updated.handoff is None
 
     assert updated.verdict is None
     assert updated.verdict_at is None
@@ -1926,8 +1944,12 @@ def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path
         review_policy_path=Path(".exo/review-policy.toml"),
     )
     event = _direct_reviewer_event(verdict="NO-GO")
-    _route_review_event(plan, store, store.load(), TLPlanning(), event, 1, config, EffectClient(transport), [])
-    _route_review_event(plan, store, store.load(), TLPlanning(), event, 2, config, EffectClient(transport), [])
+    _route_review_event(
+        plan, store, store.load(), TLPlanning(), event, 1, config, EffectClient(transport), []
+    )
+    _route_review_event(
+        plan, store, store.load(), TLPlanning(), event, 2, config, EffectClient(transport), []
+    )
 
     restored = store.load().slices["leaf-a"]
     assert restored.verdict is Verdict.NO_GO
@@ -2184,6 +2206,76 @@ def test_child_completion_with_wrong_head_does_not_create_handoff(tmp_path: Path
     )
 
     assert updated.slices["leaf-a"].handoff is None
+
+
+def test_child_completion_uses_persisted_publication_for_missing_head(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-1",
+        publication=PublicationBinding(
+            pr_number=42,
+            head_sha="head-a",
+            head_branch="main.leaf-a",
+            base_branch="main",
+            attempt=1,
+            invocation_id="inv-1",
+        ),
+    )
+    store.checkpoint(TLPlanning(), {"leaf-a": current}, BudgetLedger(0, 0), offset=0)
+    event = project(
+        {
+            "type": "agent.completed",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "invocation_id": "inv-1",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {"slice_id": "leaf-a", "pr_number": 42, "head_sha": None},
+        }
+    )
+
+    updated = _record_child_handoff(
+        store, store.load(), TLPlanning(), event, ChildCompleted("leaf-a"), 1
+    )
+
+    assert updated.slices["leaf-a"].handoff is not None
+    assert updated.slices["leaf-a"].handoff.head_sha == "head-a"
+
+
+def test_pr_filed_binds_host_verified_publication_to_owner(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(store.load().slices["leaf-a"], dispatch_agent_id="leaf-a")
+    event = project(
+        {
+            "type": "pr.filed",
+            "run_seq": 1,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "invocation_id": "inv-1",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "head_branch": "main.leaf-a",
+                "base_branch": "main",
+            },
+        }
+    )
+    reduced = _update_slices({"leaf-a": current}, PRFiled(42, "head-a", "leaf-a"))
+
+    bound = _bind_publication_evidence(reduced, PRFiled(42, "head-a", "leaf-a"), event, "leaf-a")
+
+    publication = bound["leaf-a"].publication
+    assert publication is not None
+    assert publication.pr_number == 42
+    assert publication.head_branch == "main.leaf-a"
+    assert publication.base_branch == "main"
+    assert publication.invocation_id == "inv-1"
 
 
 def test_worker_self_approval_is_not_gate_evidence(tmp_path: Path) -> None:

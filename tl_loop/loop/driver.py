@@ -106,6 +106,7 @@ from tl_loop.state.schema import (
     IntegrationRuntimeState,
     OrderedStageState,
     ParkCause,
+    PublicationBinding,
     RunState,
     SliceState,
     SliceStatus,
@@ -1004,7 +1005,9 @@ def _run_loop(
                         state.goals.last_progress_at,
                     )
                     _emit_phase_change(run_id, before_phase, phase, config, effects, effects_log)
-                    state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+                    state = _apply_convergence(
+                        state, convergence, store, config, effects, effects_log
+                    )
                     phase = _phase_from_state(state)
                     if heartbeat.parked_slice_ids and _all_expected_terminal(state, expected):
                         before_phase = phase
@@ -1251,6 +1254,13 @@ def _run_loop(
                 event_seq,
                 state.controller_epoch,
             )
+        if isinstance(fsm_event, (PRFiled, PRUpdated)):
+            next_slices = _bind_publication_evidence(
+                next_slices,
+                fsm_event,
+                event,
+                event_slice_id,
+            )
         head_changed = _pr_head_changed(state.slices, fsm_event, event_slice_id)
         if head_changed and config.enable_reviewer_spawn:
             next_slices = _claim_reviewer_attempt(
@@ -1454,11 +1464,17 @@ def _execute_external_intent(
     if intent.target_id not in state.slices:
         return state
     if intent.operation == "merge":
-        return _execute_direct_merge_intent(state, intent, tracker, store, config, effects, effects_log)
+        return _execute_direct_merge_intent(
+            state, intent, tracker, store, config, effects, effects_log
+        )
     if intent.operation == "repair":
-        return _execute_direct_repair_intent(state, intent, tracker, store, config, effects, effects_log)
+        return _execute_direct_repair_intent(
+            state, intent, tracker, store, config, effects, effects_log
+        )
     if intent.operation == "spawn_reviewer":
-        return _execute_direct_reviewer_intent(state, intent, tracker, store, config, effects, effects_log)
+        return _execute_direct_reviewer_intent(
+            state, intent, tracker, store, config, effects, effects_log
+        )
     return state
 
 
@@ -1530,10 +1546,14 @@ def _execute_direct_reviewer_intent(
     latest = refreshed.slices[current.id]
     updated = replace(
         latest,
-        reviewer_agent_id=reviewer_name if isinstance(reviewer_name, str) else latest.reviewer_agent_id,
+        reviewer_agent_id=reviewer_name
+        if isinstance(reviewer_name, str)
+        else latest.reviewer_agent_id,
         action=replace(action, phase=ActionPhase.CONFIRMED),
     )
-    return _checkpoint_slice_action(store, refreshed, current.id, updated.action, slice_state=updated)
+    return _checkpoint_slice_action(
+        store, refreshed, current.id, updated.action, slice_state=updated
+    )
 
 
 def _execute_direct_repair_intent(
@@ -1622,11 +1642,7 @@ def _execute_direct_merge_intent(
             "base_sha, head_sha, patch_digest, merge_tree_sha, and ci_status"
         )
         previous_gate = next(
-            (
-                gate
-                for gate in state.gates
-                if gate.name == INTEGRITY_RECONCILIATION_GATE_NAME
-            ),
+            (gate for gate in state.gates if gate.name == INTEGRITY_RECONCILIATION_GATE_NAME),
             None,
         )
         state = _clear_action_for_reduction(store, state, current.id)
@@ -1794,11 +1810,7 @@ def _direct_merge_evidence(
     config: TLLoopConfig,
 ) -> dict[str, str] | None:
     """Validate the watcher snapshot used as the direct merge compare."""
-    if (
-        watcher is None
-        or watcher.success is not True
-        or not isinstance(watcher.result, Mapping)
-    ):
+    if watcher is None or watcher.success is not True or not isinstance(watcher.result, Mapping):
         return None
     head_sha = watcher_head(watcher)
     evidence = {
@@ -2804,10 +2816,15 @@ def _apply_reconciliation_observations(
                 if review_state in {"go-with-nits", "go_with_nits"}
                 else Verdict.GO
             )
+        publication = _publication_from_watcher(current, watcher, head_sha)
+        if publication is not None:
+            updates["publication"] = publication
+            updates["pr_number"] = publication.pr_number
+        published_pr_number = publication.pr_number if publication is not None else current.pr_number
         if (
             watcher.get("publication_ownership_verified") is True
             and head_sha
-            and current.pr_number is not None
+            and published_pr_number is not None
             and current.dispatch_agent_id
             and current.dispatch_invocation_id
             and (
@@ -2820,7 +2837,7 @@ def _apply_reconciliation_observations(
         ):
             attempt = current.publication.attempt if current.publication else current.attempts
             updates["handoff"] = HandoffEvidence(
-                pr_number=current.pr_number,
+                pr_number=published_pr_number,
                 head_sha=head_sha,
                 attempt=attempt,
                 invocation_id=current.dispatch_invocation_id,
@@ -2834,6 +2851,49 @@ def _apply_reconciliation_observations(
     if owner_id is not None and current.dispatch_agent_id is None:
         updates["dispatch_agent_id"] = owner_id
     return replace(current, **updates)
+
+
+def _publication_from_watcher(
+    current: SliceState,
+    watcher: Mapping[str, object],
+    head_sha: str | None,
+) -> PublicationBinding | None:
+    """Recover a publication only from an ownership-verified watcher snapshot."""
+    if watcher.get("publication_ownership_verified") is not True or not head_sha:
+        return None
+    pr_number = watcher.get("pr_number")
+    head_branch = watcher.get("head_branch")
+    base_branch = watcher.get("base_branch")
+    if (
+        type(pr_number) is not int
+        or pr_number <= 0
+        or not isinstance(head_branch, str)
+        or not head_branch
+        or not isinstance(base_branch, str)
+        or not base_branch
+    ):
+        LOGGER.warning(
+            "[TL loop] cannot recover publication evidence for target=%s: incomplete watcher identity",
+            current.id,
+        )
+        return None
+    existing = current.publication
+    if existing is not None and (existing.pr_number != pr_number or existing.head_sha != head_sha):
+        LOGGER.warning(
+            "[TL loop] refusing watcher publication replacement for target=%s: head changed",
+            current.id,
+        )
+        return None
+    return PublicationBinding(
+        pr_number=pr_number,
+        head_sha=head_sha,
+        head_branch=head_branch,
+        base_branch=base_branch,
+        attempt=existing.attempt if existing is not None else current.attempts,
+        invocation_id=(
+            existing.invocation_id if existing is not None else current.dispatch_invocation_id
+        ),
+    )
 
 
 def _dispatch_waiting_phase(slices: Mapping[str, SliceState]) -> TLWaiting:
@@ -5309,12 +5369,23 @@ def _record_child_handoff(
 ) -> RunState:
     """Persist a child handoff only when its PR and head match persisted state."""
     current = state.slices.get(completion.slug)
-    if current is None or event.pr_number is None or event.head_sha is None:
+    if current is None or event.pr_number is None:
+        LOGGER.warning(
+            "[TL loop] ignoring child handoff without verified publication target=%s",
+            completion.slug,
+        )
         return state
     publication = current.publication
+    head_sha = event.head_sha or (publication.head_sha if publication is not None else None)
+    if head_sha is None:
+        LOGGER.warning(
+            "[TL loop] ignoring child handoff without verified head target=%s",
+            completion.slug,
+        )
+        return state
     expected_pr = publication.pr_number if publication is not None else current.pr_number
     expected_head = publication.head_sha if publication is not None else current.reviewed_head
-    if expected_pr != event.pr_number or expected_head != event.head_sha:
+    if expected_pr != event.pr_number or expected_head != head_sha:
         LOGGER.warning(
             "[TL loop] ignoring child handoff with mismatched publication target=%s",
             completion.slug,
@@ -5338,7 +5409,7 @@ def _record_child_handoff(
     attempt = publication.attempt if publication is not None else current.attempts
     handoff = HandoffEvidence(
         pr_number=event.pr_number,
-        head_sha=event.head_sha,
+        head_sha=head_sha,
         attempt=attempt,
         invocation_id=invocation_id,
         agent_id=owner,
@@ -5696,9 +5767,10 @@ def _route_review_event(
         decision_verdict = result.verdict
         decision_head = result.reviewed_head
         decision_reasons = result.reasons
-        if decision_verdict in {Verdict.GO, Verdict.GO_WITH_NITS} and not _reviewer_identity_authorized(
-            event, current
-        ):
+        if decision_verdict in {
+            Verdict.GO,
+            Verdict.GO_WITH_NITS,
+        } and not _reviewer_identity_authorized(event, current):
             LOGGER.warning(
                 "[TL loop] ignoring unauthorized approval evidence target=%s agent=%s",
                 slice_id,
@@ -6556,6 +6628,63 @@ def _pr_head_changed(
     return current is not None and current.reviewed_head != event.head_sha
 
 
+def _bind_publication_evidence(
+    slices: Mapping[str, SliceState],
+    event: PRFiled | PRUpdated,
+    envelope: EventEnvelope,
+    slice_id: str | None,
+) -> dict[str, SliceState]:
+    """Bind host-verified publication metadata to its persisted owner."""
+    target_id = _pr_event_target(slices, event, slice_id)
+    current = slices.get(target_id) if target_id is not None else None
+    if target_id is None or current is None:
+        LOGGER.warning(
+            "[TL loop] ignoring publication event without an unambiguous owner pr=%s",
+            event.pr_number,
+        )
+        return dict(slices)
+    if current.dispatch_agent_id is None or envelope.agent_id != current.dispatch_agent_id:
+        LOGGER.warning(
+            "[TL loop] ignoring publication event from untrusted owner target=%s agent=%s",
+            target_id,
+            envelope.agent_id,
+        )
+        return dict(slices)
+    head_branch = envelope.data.get("head_branch")
+    base_branch = envelope.data.get("base_branch")
+    if (
+        not isinstance(head_branch, str)
+        or not head_branch
+        or not isinstance(base_branch, str)
+        or not base_branch
+    ):
+        LOGGER.warning(
+            "[TL loop] ignoring publication event with incomplete verified identity target=%s",
+            target_id,
+        )
+        return dict(slices)
+    existing = current.publication
+    if existing is not None and (
+        existing.pr_number != event.pr_number or existing.head_sha != event.head_sha
+    ):
+        LOGGER.warning(
+            "[TL loop] refusing publication replacement for target=%s: existing head differs",
+            target_id,
+        )
+        return dict(slices)
+    publication = PublicationBinding(
+        pr_number=event.pr_number,
+        head_sha=event.head_sha,
+        head_branch=head_branch,
+        base_branch=base_branch,
+        attempt=existing.attempt if existing is not None else current.attempts,
+        invocation_id=envelope.invocation_id or current.dispatch_invocation_id,
+    )
+    if existing == publication:
+        return dict(slices)
+    return {**slices, target_id: replace(current, publication=publication)}
+
+
 def _claim_reviewer_attempt(
     slices: Mapping[str, SliceState], event: TLEvent, slice_id: str | None
 ) -> dict[str, SliceState]:
@@ -6647,7 +6776,10 @@ def _spawn_reviewer_for_slice(
         if latest_slice is not None and latest_slice.reviewer_agent_id != reviewer_name:
             store.checkpoint(
                 latest.fsm,
-                {**latest.slices, target_id: replace(latest_slice, reviewer_agent_id=reviewer_name)},
+                {
+                    **latest.slices,
+                    target_id: replace(latest_slice, reviewer_agent_id=reviewer_name),
+                },
                 latest.budgets,
                 latest.events.last_consumed_offset,
                 current_order=latest.current_order,
