@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Make reviewer spawning a reducer-derived action (#1003)
 - Derive one-shot leaf handoff from verified publication (#1002)
 - Fix runtime validation against managed project commits (#998)
 - Reject incompatible ExoMonad runtime artifacts before restart (#995)
