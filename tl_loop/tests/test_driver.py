@@ -46,7 +46,6 @@ from tl_loop.loop.driver import (
     _event_belongs_to_plan,
     _initial_slices,
     _merge_result_is_authoritative,
-    _record_child_handoff,
     _record_review_event,
     _recover_tool_unavailable,
     _repair_model,
@@ -2112,24 +2111,16 @@ def test_unknown_direct_merge_reconciles_authoritative_merged_snapshot(tmp_path:
     assert len(journal.confirmed_entries("merge_pr", "leaf-a")) == 1
 
 
-def test_child_completion_records_exact_head_handoff_without_merging(tmp_path: Path) -> None:
+def test_publication_derives_handoff_without_completion_event(tmp_path: Path) -> None:
     store = _review_store(tmp_path)
-    current = store.load().slices["leaf-a"]
-    store.checkpoint(
-        TLPlanning(),
-        {
-            "leaf-a": replace(
-                current,
-                dispatch_agent_id="leaf-a",
-                dispatch_invocation_id="inv-1",
-            )
-        },
-        BudgetLedger(0, 0),
-        offset=0,
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-1",
     )
     event = project(
         {
-            "type": "agent.notify_parent",
+            "type": "pr.filed",
             "run_seq": 1,
             "run_id": "review-run",
             "agent_id": "leaf-a",
@@ -2140,109 +2131,19 @@ def test_child_completion_records_exact_head_handoff_without_merging(tmp_path: P
                 "slice_id": "leaf-a",
                 "pr_number": 42,
                 "head_sha": "head-a",
-                "shadow_event": {"kind": "child_completed", "slug": "leaf-a"},
+                "head_branch": "main.leaf-a",
+                "base_branch": "main",
             },
         }
     )
+    reduced = _update_slices({"leaf-a": current}, PRFiled(42, "head-a", "leaf-a"))
+    bound = _bind_publication_evidence(reduced, PRFiled(42, "head-a", "leaf-a"), event, "leaf-a")
 
-    updated = _record_child_handoff(
-        store,
-        store.load(),
-        TLPlanning(),
-        event,
-        ChildCompleted("leaf-a"),
-        1,
-    )
-
-    handoff = updated.slices["leaf-a"].handoff
-    assert handoff is not None
-    assert handoff.pr_number == 42
-    assert handoff.head_sha == "head-a"
-    assert handoff.invocation_id == "inv-1"
-    assert updated.slices["leaf-a"].reviewed_head == "head-a"
-    assert updated.slices["leaf-a"].status is SliceStatus.IN_REVIEW
-    assert (
-        _record_child_handoff(
-            store,
-            updated,
-            TLPlanning(),
-            event,
-            ChildCompleted("leaf-a"),
-            1,
-        )
-        == updated
-    )
-
-
-def test_child_completion_with_wrong_head_does_not_create_handoff(tmp_path: Path) -> None:
-    store = _review_store(tmp_path)
-    current = store.load().slices["leaf-a"]
-    current = replace(current, dispatch_agent_id="leaf-a", dispatch_invocation_id="inv-1")
-    store.checkpoint(TLPlanning(), {"leaf-a": current}, BudgetLedger(0, 0), offset=0)
-    event = project(
-        {
-            "type": "agent.notify_parent",
-            "run_seq": 1,
-            "run_id": "review-run",
-            "agent_id": "leaf-a",
-            "invocation_id": "inv-1",
-            "lifecycle_state": "observed",
-            "observed_at": "2026-08-12T00:00:00Z",
-            "data": {
-                "slice_id": "leaf-a",
-                "pr_number": 42,
-                "head_sha": "head-b",
-            },
-        }
-    )
-
-    updated = _record_child_handoff(
-        store,
-        store.load(),
-        TLPlanning(),
-        event,
-        ChildCompleted("leaf-a"),
-        1,
-    )
-
-    assert updated.slices["leaf-a"].handoff is None
-
-
-def test_child_completion_uses_persisted_publication_for_missing_head(tmp_path: Path) -> None:
-    store = _review_store(tmp_path)
-    current = replace(
-        store.load().slices["leaf-a"],
-        dispatch_agent_id="leaf-a",
-        dispatch_invocation_id="inv-1",
-        publication=PublicationBinding(
-            pr_number=42,
-            head_sha="head-a",
-            head_branch="main.leaf-a",
-            base_branch="main",
-            attempt=1,
-            invocation_id="inv-1",
-        ),
-    )
-    store.checkpoint(TLPlanning(), {"leaf-a": current}, BudgetLedger(0, 0), offset=0)
-    event = project(
-        {
-            "type": "agent.completed",
-            "run_seq": 1,
-            "run_id": "review-run",
-            "agent_id": "leaf-a",
-            "invocation_id": "inv-1",
-            "lifecycle_state": "observed",
-            "observed_at": "2026-08-12T00:00:00Z",
-            "data": {"slice_id": "leaf-a", "pr_number": 42, "head_sha": None},
-        }
-    )
-
-    updated = _record_child_handoff(
-        store, store.load(), TLPlanning(), event, ChildCompleted("leaf-a"), 1
-    )
-
-    assert updated.slices["leaf-a"].handoff is not None
-    assert updated.slices["leaf-a"].handoff.head_sha == "head-a"
+    slice_state = bound["leaf-a"]
+    assert slice_state.publication is not None
+    assert slice_state.handoff is not None
+    assert slice_state.handoff.head_sha == "head-a"
+    assert _update_slices(bound, ChildCompleted("leaf-a")) == bound
 
 
 def test_pr_filed_binds_host_verified_publication_to_owner(tmp_path: Path) -> None:

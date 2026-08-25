@@ -1230,8 +1230,6 @@ def _run_loop(
                 diagnostics.acknowledged += 1
             state = store.load()
             continue
-        if isinstance(fsm_event, ChildCompleted):
-            state = _record_child_handoff(store, state, phase, event, fsm_event, checkpoint_seq)
         try:
             next_phase = transition(phase, fsm_event)
         except IllegalTransition as error:
@@ -2820,7 +2818,9 @@ def _apply_reconciliation_observations(
         if publication is not None:
             updates["publication"] = publication
             updates["pr_number"] = publication.pr_number
-        published_pr_number = publication.pr_number if publication is not None else current.pr_number
+        published_pr_number = (
+            publication.pr_number if publication is not None else current.pr_number
+        )
         if (
             watcher.get("publication_ownership_verified") is True
             and head_sha
@@ -5359,74 +5359,6 @@ def _leaf_call(
     return invoke
 
 
-def _record_child_handoff(
-    store: RunStore,
-    state: RunState,
-    phase: PhaseValue,
-    event: EventEnvelope,
-    completion: ChildCompleted,
-    event_seq: int,
-) -> RunState:
-    """Persist a child handoff only when its PR and head match persisted state."""
-    current = state.slices.get(completion.slug)
-    if current is None or event.pr_number is None:
-        LOGGER.warning(
-            "[TL loop] ignoring child handoff without verified publication target=%s",
-            completion.slug,
-        )
-        return state
-    publication = current.publication
-    head_sha = event.head_sha or (publication.head_sha if publication is not None else None)
-    if head_sha is None:
-        LOGGER.warning(
-            "[TL loop] ignoring child handoff without verified head target=%s",
-            completion.slug,
-        )
-        return state
-    expected_pr = publication.pr_number if publication is not None else current.pr_number
-    expected_head = publication.head_sha if publication is not None else current.reviewed_head
-    if expected_pr != event.pr_number or expected_head != head_sha:
-        LOGGER.warning(
-            "[TL loop] ignoring child handoff with mismatched publication target=%s",
-            completion.slug,
-        )
-        return state
-    owner = current.dispatch_agent_id
-    if owner is None or event.agent_id not in {owner, current.id}:
-        LOGGER.warning(
-            "[TL loop] ignoring child handoff from untrusted owner target=%s agent=%s",
-            completion.slug,
-            event.agent_id,
-        )
-        return state
-    invocation_id = event.invocation_id or current.dispatch_invocation_id
-    if invocation_id is None:
-        LOGGER.warning(
-            "[TL loop] ignoring child handoff without invocation target=%s",
-            completion.slug,
-        )
-        return state
-    attempt = publication.attempt if publication is not None else current.attempts
-    handoff = HandoffEvidence(
-        pr_number=event.pr_number,
-        head_sha=head_sha,
-        attempt=attempt,
-        invocation_id=invocation_id,
-        agent_id=owner,
-        observed_at=event.observed_at,
-    )
-    if current.handoff == handoff:
-        return state
-    updated = dict(state.slices)
-    updated[completion.slug] = replace(
-        current,
-        handoff=handoff,
-        pr_number=event.pr_number,
-        status=SliceStatus.IN_REVIEW,
-    )
-    return store.checkpoint(phase, updated, state.budgets, event_seq)
-
-
 def _emit_merge_decision(
     slice_id: str,
     pr_number: int,
@@ -6672,17 +6604,32 @@ def _bind_publication_evidence(
             target_id,
         )
         return dict(slices)
+    invocation_id = envelope.invocation_id or current.dispatch_invocation_id
     publication = PublicationBinding(
         pr_number=event.pr_number,
         head_sha=event.head_sha,
         head_branch=head_branch,
         base_branch=base_branch,
         attempt=existing.attempt if existing is not None else current.attempts,
-        invocation_id=envelope.invocation_id or current.dispatch_invocation_id,
+        invocation_id=invocation_id,
     )
-    if existing == publication:
+    updated = current
+    if existing != publication:
+        updated = replace(updated, publication=publication)
+    if invocation_id is not None and current.dispatch_agent_id:
+        handoff = HandoffEvidence(
+            pr_number=event.pr_number,
+            head_sha=event.head_sha,
+            attempt=publication.attempt,
+            invocation_id=invocation_id,
+            agent_id=current.dispatch_agent_id,
+            observed_at=envelope.observed_at,
+        )
+        if updated.handoff != handoff:
+            updated = replace(updated, handoff=handoff, status=SliceStatus.IN_REVIEW)
+    if updated == current:
         return dict(slices)
-    return {**slices, target_id: replace(current, publication=publication)}
+    return {**slices, target_id: updated}
 
 
 def _claim_reviewer_attempt(
