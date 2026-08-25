@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix runtime validation against managed project commits (#998)
 - Reject incompatible ExoMonad runtime artifacts before restart (#995)
 - Reconcile retry and restart state without mutating plan.json (#994)
 - Execute derived direct-leaf actions through the effect journal (#993)
