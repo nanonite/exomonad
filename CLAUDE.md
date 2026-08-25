@@ -146,7 +146,9 @@ exomonad init                 # Current default: --recreate (mode is recorded)
 # Explicit lifecycle choices (mutually exclusive):
 exomonad init --start         # Fresh-run intent
 exomonad init --continue      # Resume intent
-exomonad init --recreate      # Tear down and rebuild intent
+exomonad init --recreate --confirm-recreate  # Tear down and rebuild after plan confirmation
+exomonad init --recreate --recreate-dry-run  # Inspect the destruction plan only
+exomonad init --recreate --confirm-recreate --force-recreate  # Also destroy protected PRs
 # The TL window now runs the controller. Give it a JSON WorkPlan:
 python3 ~/.exo/tl_loop.pyz status --project-root .
 python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root --name <gate> --approve

@@ -9,11 +9,17 @@ use exomonad_core::services::runtime_manifest::{
 };
 use exomonad_core::services::{
     agent_control::InvocationRecord,
-    pr_registry::{invocation_succession_reaches_current, read_published_heads, PublishedHead},
-    AgentType,
+    pr_registry::{
+        invocation_succession_reaches_current, read_published_heads,
+        remove_published_heads_for_prs, PublishedHead,
+    },
+    repo::get_repo_info,
+    AgentType, ForgejoClient, GitWorktreeService,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
@@ -79,6 +85,296 @@ impl AgentContinuation {
             Self::Recreate { .. } => "recreate",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProtectedPr {
+    number: u64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RecreatePlan {
+    worktrees: Vec<PathBuf>,
+    prs_to_close: Vec<u64>,
+    prs_to_remove: Vec<u64>,
+    protected: Vec<ProtectedPr>,
+    dirty_worktrees: Vec<PathBuf>,
+}
+
+impl RecreatePlan {
+    fn render(&self) -> String {
+        let mut output = String::from("ExoMonad --recreate destruction plan:");
+        output.push_str("\nWorktrees:");
+        if self.worktrees.is_empty() {
+            output.push_str("\n  (none)");
+        } else {
+            for path in &self.worktrees {
+                let dirty = self.dirty_worktrees.iter().any(|item| item == path);
+                output.push_str(&format!(
+                    "\n  {}{}",
+                    path.display(),
+                    if dirty { " [DIRTY]" } else { "" }
+                ));
+            }
+        }
+        output.push_str("\nPRs to close:");
+        if self.prs_to_close.is_empty() {
+            output.push_str("\n  (none)");
+        } else {
+            for number in &self.prs_to_close {
+                output.push_str(&format!("\n  #{number}"));
+            }
+        }
+        output.push_str("\nPublication records to remove:");
+        if self.prs_to_remove.is_empty() {
+            output.push_str("\n  (none)");
+        } else {
+            for number in &self.prs_to_remove {
+                output.push_str(&format!("\n  #{number}"));
+            }
+        }
+        output.push_str("\nProtected PRs:");
+        if self.protected.is_empty() {
+            output.push_str("\n  (none)");
+        } else {
+            for protected in &self.protected {
+                output.push_str(&format!("\n  #{} ({})", protected.number, protected.reason));
+            }
+        }
+        output
+    }
+}
+
+fn recreate_worktree_paths(project_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for root in [
+        project_dir.join(".exo/worktrees"),
+        project_dir.join(".exo/companions"),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                paths.push(entry.path());
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn worktree_is_dirty(path: &Path) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "-C",
+            path.to_string_lossy().as_ref(),
+            "status",
+            "--porcelain",
+        ])
+        .output()
+        .map(|output| output.status.success() && !output.stdout.is_empty())
+        .unwrap_or(true)
+}
+
+fn recreate_forgejo_client(
+    project_dir: &Path,
+    config: &Config,
+) -> Result<Option<Arc<ForgejoClient>>> {
+    match (
+        config.forgejo_url.as_deref(),
+        config.forgejo_token.as_deref(),
+    ) {
+        (Some(url), Some(token)) => Ok(Some(
+            ForgejoClient::new(url, token).context("failed to create Forgejo client")?,
+        )),
+        (None, None) if ForgejoClient::fj_binary_in_path() => {
+            Ok(Some(ForgejoClient::new_fj(project_dir.to_path_buf())))
+        }
+        (None, None) => Ok(None),
+        _ => anyhow::bail!(
+            "both forgejo_url and forgejo_token are required to close PRs during --recreate"
+        ),
+    }
+}
+
+async fn build_recreate_plan(project_dir: &Path, config: &Config) -> Result<RecreatePlan> {
+    let worktrees = recreate_worktree_paths(project_dir)?;
+    let dirty_worktrees = worktrees
+        .iter()
+        .filter(|path| worktree_is_dirty(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let registry = read_published_heads(project_dir).await?;
+    let client = (!registry.is_empty())
+        .then(|| recreate_forgejo_client(project_dir, config))
+        .transpose()?
+        .flatten();
+    let repo = if client.is_some() {
+        Some(get_repo_info(project_dir).await?)
+    } else {
+        None
+    };
+
+    let mut prs_to_close = Vec::new();
+    let mut prs_to_remove = Vec::new();
+    let mut protected = Vec::new();
+    for publication in registry {
+        let number = publication.pr_number;
+        prs_to_remove.push(number);
+        let Some(client) = client.as_ref() else {
+            prs_to_close.push(number);
+            protected.push(ProtectedPr {
+                number,
+                reason: "Forgejo client unavailable; PR safety cannot be verified".to_owned(),
+            });
+            continue;
+        };
+        let repo = repo
+            .as_ref()
+            .context("repository identity is required for PR cleanup")?;
+        let pr = client
+            .get_pull_request(
+                &repo.owner,
+                &repo.repo,
+                exomonad_core::domain::PRNumber::new(number),
+            )
+            .await?;
+        if pr.merged || pr.state != "open" {
+            continue;
+        }
+        let reviews = client
+            .list_pull_request_reviews(
+                &repo.owner,
+                &repo.repo,
+                exomonad_core::domain::PRNumber::new(number),
+            )
+            .await?;
+        let approved = reviews.iter().any(|review| {
+            review.state.eq_ignore_ascii_case("approved")
+                && review
+                    .commit_id
+                    .as_deref()
+                    .is_none_or(|commit| Some(commit) == pr.head_sha.as_deref())
+        });
+        let statuses = if let Some(head_sha) = pr.head_sha.as_deref() {
+            client
+                .list_commit_statuses(&repo.owner, &repo.repo, head_sha)
+                .await?
+        } else {
+            Vec::new()
+        };
+        let ci_green = !statuses.is_empty()
+            && statuses.iter().all(|status| {
+                matches!(
+                    status.status,
+                    exomonad_core::domain::CIStatus::Success
+                        | exomonad_core::domain::CIStatus::Neutral
+                )
+            });
+        if approved && ci_green {
+            protected.push(ProtectedPr {
+                number,
+                reason: "approved and CI-green".to_owned(),
+            });
+        }
+        prs_to_close.push(number);
+    }
+    prs_to_close.sort_unstable();
+    prs_to_close.dedup();
+    prs_to_remove.sort_unstable();
+    prs_to_remove.dedup();
+    protected.sort_by_key(|item| item.number);
+    Ok(RecreatePlan {
+        worktrees,
+        prs_to_close,
+        prs_to_remove,
+        protected,
+        dirty_worktrees,
+    })
+}
+
+async fn prepare_recreate(
+    project_dir: &Path,
+    config: &Config,
+    confirm: bool,
+    force: bool,
+    dry_run: bool,
+    allow_pending_gate: bool,
+) -> Result<Option<RecreatePlan>> {
+    ensure_recreate_allowed(project_dir, allow_pending_gate)?;
+    let plan = build_recreate_plan(project_dir, config).await?;
+    println!("{}", plan.render());
+    if dry_run {
+        return Ok(None);
+    }
+    if !confirm {
+        anyhow::bail!(
+            "refusing destructive --recreate without --confirm-recreate; use --recreate-dry-run to inspect the plan"
+        );
+    }
+    if !plan.protected.is_empty() && !force {
+        anyhow::bail!(
+            "refusing --recreate because protected PRs are present; pass --force-recreate together with --confirm-recreate to override"
+        );
+    }
+    Ok(Some(plan))
+}
+
+async fn destroy_recreate_resources(
+    project_dir: &Path,
+    config: &Config,
+    plan: &RecreatePlan,
+) -> Result<()> {
+    let client = recreate_forgejo_client(project_dir, config)?;
+    if !plan.prs_to_close.is_empty() {
+        let client = client
+            .as_ref()
+            .context("cannot close published PRs: no Forgejo client is configured")?;
+        let repo = get_repo_info(project_dir).await?;
+        for number in &plan.prs_to_close {
+            client
+                .close_pull_request(
+                    &repo.owner,
+                    &repo.repo,
+                    exomonad_core::domain::PRNumber::new(*number),
+                )
+                .await
+                .with_context(|| format!("failed to close PR #{number}"))?;
+        }
+    }
+
+    let git_wt = Arc::new(GitWorktreeService::new(project_dir.to_path_buf()));
+    for path in &plan.worktrees {
+        if path
+            .parent()
+            .is_some_and(|parent| parent.ends_with(".exo/worktrees"))
+        {
+            if let Some(slug) = path.file_name().and_then(|name| name.to_str()) {
+                exomonad_core::services::agent_resources::dispose_agent_resources(
+                    project_dir,
+                    git_wt.clone(),
+                    slug,
+                )
+                .await;
+            }
+        } else {
+            let path_for_git = path.clone();
+            let git_wt = git_wt.clone();
+            tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path_for_git))
+                .await
+                .context("worktree disposal task failed")??;
+            if path.exists() {
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
+        }
+    }
+    let numbers = plan.prs_to_remove.iter().copied().collect::<HashSet<_>>();
+    remove_published_heads_for_prs(project_dir, &numbers).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2040,6 +2336,9 @@ pub async fn run(
     session_override: Option<String>,
     mode: SessionMode,
     allow_pending_gate: bool,
+    confirm_recreate: bool,
+    force_recreate: bool,
+    recreate_dry_run: bool,
     openrouter: bool,
     worker: Option<String>,
     worker_model: Option<String>,
@@ -2071,6 +2370,28 @@ pub async fn run(
     // inbox, capability, plan, or orchestration side effect.
     let mut config = Config::discover()?;
     validate_runtime_compatibility(&cwd)?;
+    let recreate = mode.is_recreate();
+    if !recreate && (confirm_recreate || force_recreate || recreate_dry_run) {
+        anyhow::bail!(
+            "--confirm-recreate, --force-recreate, and --recreate-dry-run require --recreate"
+        );
+    }
+    let recreate_plan = if recreate {
+        prepare_recreate(
+            &cwd,
+            &config,
+            confirm_recreate,
+            force_recreate,
+            recreate_dry_run,
+            allow_pending_gate,
+        )
+        .await?
+    } else {
+        None
+    };
+    if recreate_dry_run {
+        return Ok(());
+    }
 
     if let Some(ref remote_name) = set_git_remote {
         set_git_remote_override(&cwd, remote_name)?;
@@ -2261,7 +2582,6 @@ pub async fn run(
 
     let session = session_override.unwrap_or(config.tmux_session.clone());
     let session_alive = TmuxIpc::has_session(&session).await?;
-    let recreate = mode.is_recreate();
     let session_transition = if recreate {
         exomonad_core::services::SessionTransition::Recreate
     } else if session_alive {
@@ -2461,7 +2781,10 @@ pub async fn run(
     }
 
     if recreate {
-        ensure_recreate_allowed(&cwd, allow_pending_gate)?;
+        let recreate_plan = recreate_plan
+            .as_ref()
+            .context("recreate plan was not prepared before destructive transition")?;
+        destroy_recreate_resources(&cwd, &config, recreate_plan).await?;
         // Kill the running server process before tearing down the session
         let pid_path = cwd.join(".exo/server.pid");
         if let Ok(content) = std::fs::read_to_string(&pid_path) {
@@ -3741,6 +4064,39 @@ mod tests {
 
         std::fs::write(&plan, snapshot).unwrap();
         validate_or_record_plan_snapshot(tmp.path(), SessionMode::Continue).unwrap();
+    }
+
+    #[test]
+    fn recreate_plan_names_dirty_worktrees_and_protected_prs() {
+        let plan = RecreatePlan {
+            worktrees: vec![PathBuf::from(".exo/worktrees/leaf")],
+            prs_to_close: vec![43],
+            prs_to_remove: vec![43],
+            protected: vec![ProtectedPr {
+                number: 43,
+                reason: "approved and CI-green".to_owned(),
+            }],
+            dirty_worktrees: vec![PathBuf::from(".exo/worktrees/leaf")],
+        };
+        let rendered = plan.render();
+        assert!(rendered.contains(".exo/worktrees/leaf [DIRTY]"));
+        assert!(rendered.contains("#43 (approved and CI-green)"));
+    }
+
+    #[tokio::test]
+    async fn recreate_requires_confirmation_and_dry_run_has_no_mutations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let error = prepare_recreate(tmp.path(), &config, false, false, false, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("--confirm-recreate"));
+
+        let dry_run = prepare_recreate(tmp.path(), &config, false, false, true, false)
+            .await
+            .unwrap();
+        assert!(dry_run.is_none());
+        assert!(!tmp.path().join(".exo/published-heads.json").exists());
     }
 
     #[test]

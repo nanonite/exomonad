@@ -90,6 +90,15 @@ enum Commands {
         /// Allow --recreate to archive an unanswered human gate.
         #[arg(long)]
         allow_pending_gate: bool,
+        /// Confirm the displayed destructive --recreate plan.
+        #[arg(long)]
+        confirm_recreate: bool,
+        /// Allow destroying protected approved and CI-green PRs.
+        #[arg(long)]
+        force_recreate: bool,
+        /// Display the destructive --recreate plan without changing anything.
+        #[arg(long)]
+        recreate_dry_run: bool,
         /// Enable OpenRouter for LLM routing
         #[arg(long)]
         openrouter: bool,
@@ -507,6 +516,9 @@ async fn main() -> Result<()> {
             continue_,
             recreate,
             allow_pending_gate,
+            confirm_recreate,
+            force_recreate,
+            recreate_dry_run,
             openrouter,
             worker,
             worker_model,
@@ -527,6 +539,9 @@ async fn main() -> Result<()> {
                 session,
                 mode,
                 allow_pending_gate,
+                confirm_recreate,
+                force_recreate,
+                recreate_dry_run,
                 openrouter,
                 worker,
                 worker_model,

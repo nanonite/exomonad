@@ -103,6 +103,11 @@ struct UpdatePullRequestBody<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct ClosePullRequestBody {
+    state: &'static str,
+}
+
+#[derive(Debug, Serialize)]
 struct MergePullRequestBody<'a> {
     #[serde(rename = "Do")]
     method: &'a str,
@@ -517,6 +522,18 @@ impl ForgejoClient {
                     .update_pull_request(owner, repo, number, title, body, base)
                     .await
             }
+        }
+    }
+
+    pub async fn close_pull_request(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+    ) -> Result<()> {
+        match &self.backend {
+            ForgejoBackend::Http(client) => client.close_pull_request(owner, repo, number).await,
+            ForgejoBackend::Fj(client) => client.close_pull_request(owner, repo, number).await,
         }
     }
 }
@@ -1109,6 +1126,25 @@ impl HttpForgejoClient {
         ForgejoPullRequest::try_from(pr)
     }
 
+    async fn close_pull_request(
+        &self,
+        owner: &GithubOwner,
+        repo: &GithubRepo,
+        number: PRNumber,
+    ) -> Result<()> {
+        let url = self.repo_pull_url(owner, repo, number)?;
+        let response = self
+            .http
+            .patch(url)
+            .headers(self.auth_headers()?)
+            .json(&ClosePullRequestBody { state: "closed" })
+            .send()
+            .await
+            .context("Forgejo PR close request failed")?;
+        self.expect_success(response, "close Forgejo pull request")
+            .await
+    }
+
     fn repo_pulls_url(&self, owner: &GithubOwner, repo: &GithubRepo) -> Result<Url> {
         self.api_url(&["repos", owner.as_str(), repo.as_str(), "pulls"])
     }
@@ -1492,6 +1528,16 @@ impl FjForgejoClient {
         ])
         .await?;
         self.get_pull_request(_owner, _repo, pr_number).await
+    }
+
+    async fn close_pull_request(
+        &self,
+        _owner: &GithubOwner,
+        _repo: &GithubRepo,
+        number: PRNumber,
+    ) -> Result<()> {
+        let number = number.as_u64().to_string();
+        self.fj_status(["pr", "close", number.as_str()]).await
     }
 
     async fn fj_api_json<T: serde::de::DeserializeOwned>(

@@ -414,6 +414,31 @@ pub async fn publish_verified_head(
     Ok(disposition)
 }
 
+/// Remove publication records for PRs that were explicitly destroyed by a
+/// confirmed session recreation. The operation is idempotent and preserves
+/// every unrelated publication record.
+pub async fn remove_published_heads_for_prs(
+    project_dir: &Path,
+    pr_numbers: &HashSet<u64>,
+) -> Result<usize> {
+    if pr_numbers.is_empty() {
+        return Ok(0);
+    }
+    let _guard = published_heads_lock().lock().await;
+    let mut file = PublishedHeadsFile {
+        schema_version: PUBLISHED_HEADS_SCHEMA_VERSION,
+        heads: read_published_heads_locked(project_dir).await?,
+    };
+    let before = file.heads.len();
+    file.heads
+        .retain(|head| !pr_numbers.contains(&head.pr_number));
+    let removed = before.saturating_sub(file.heads.len());
+    if removed > 0 {
+        write_published_heads_locked(project_dir, &file).await?;
+    }
+    Ok(removed)
+}
+
 async fn write_published_heads_locked(project_dir: &Path, file: &PublishedHeadsFile) -> Result<()> {
     let path = published_heads_path(project_dir);
     if let Some(parent) = path.parent() {
@@ -682,6 +707,31 @@ mod tests {
         assert_eq!(
             read_published_heads(directory.path()).await.unwrap().len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_destroyed_pr_publications_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        publish_verified_head(directory.path(), publication("sha-1"))
+            .await
+            .unwrap();
+        let numbers = HashSet::from([42_u64]);
+        assert_eq!(
+            remove_published_heads_for_prs(directory.path(), &numbers)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(read_published_heads(directory.path())
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            remove_published_heads_for_prs(directory.path(), &numbers)
+                .await
+                .unwrap(),
+            0
         );
     }
 
