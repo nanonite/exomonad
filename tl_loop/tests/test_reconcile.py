@@ -8,16 +8,22 @@ import pytest
 
 from tl_loop.loop.reconcile import (
     InternalTransition,
+    Quiescent,
     derive_next_action,
     reconcile_merge_observation,
     reduce_observation,
     reconcile_slice,
 )
 from tl_loop.state.schema import (
+    BudgetLedger,
+    EventCursor,
+    FSMState,
     HandoffEvidence,
     ObservationProvenance,
+    RunState,
     SliceState,
     SliceStatus,
+    TLPhase,
     Verdict,
 )
 from tl_loop.state.store import RunStore, _encode_slice, create
@@ -138,6 +144,52 @@ def test_review_round_ceiling_is_slice_scoped_and_survives_head_change() -> None
     assert reset_decision.name == "in_review"
     assert reset_decision.reason == "head_reset"
     assert next_head.review_rounds == 2
+
+
+def test_parked_slice_does_not_starve_parallel_actionable_slice() -> None:
+    parked = replace(_slice(SliceStatus.PARKED), id="slice-a")
+    repairing = replace(_slice(SliceStatus.REPAIRING), id="slice-b")
+    state = RunState(
+        version=1,
+        revision=0,
+        run_id="parallel-review",
+        fsm=FSMState(TLPhase.TLWaiting, ("slice-a", "slice-b")),
+        slices={"slice-a": parked, "slice-b": repairing},
+        budgets=BudgetLedger(0, 0),
+        gates=(),
+        events=EventCursor(0),
+    )
+
+    decision = derive_next_action(state, reviewer_max_rounds=2)
+
+    assert decision.target_id == "slice-b"
+    assert decision.operation == "repair"
+
+
+def test_persisted_review_ceiling_wins_over_restart_override() -> None:
+    exhausted = replace(
+        _slice(SliceStatus.IN_REVIEW),
+        reviewed_head="head-a",
+        verdict=Verdict.NO_GO,
+        review_rounds=2,
+    )
+    state = RunState(
+        version=1,
+        revision=0,
+        run_id="durable-review-policy",
+        fsm=FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        slices={"slice-a": exhausted},
+        budgets=BudgetLedger(0, 0),
+        gates=(),
+        events=EventCursor(0),
+        reviewer_max_rounds=3,
+        reviewer_max_rounds_source="environment",
+    )
+
+    decision = derive_next_action(state, reviewer_max_rounds=1)
+
+    assert isinstance(decision, Quiescent)
+    assert decision.reason == "await_handoff"
 
 
 def test_observation_reducer_requires_snapshot_after_watcher_restart() -> None:

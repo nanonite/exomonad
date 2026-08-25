@@ -52,7 +52,9 @@
     "last_progress_at": "<timestamp>",
     "objective": ""
   },
-  "revision": 15,
+  "reviewer_max_rounds": 5,
+  "reviewer_max_rounds_source": "policy_file",
+  "revision": 16,
   "run_id": "<run-id>",
   "slices": {
     "leaf-a": {

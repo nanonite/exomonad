@@ -318,7 +318,7 @@ inspection rather than assuming one payload shape.
 | `event.dispatched` | A watcher/role event is routed | role, event type, action (`inject_message`, `notify_parent`, or `no_action`) |
 | `event.dispatch_failed` | Routing an event fails | role, event type, error |
 | `watcher.poll_cycle` | A worktree watcher poll completes | agent ID `watcher`, PR count |
-| `watcher.pr_observation` | A watcher inspects a PR | PR number, review state, CI status, head SHA, changed-review round count |
+| `watcher.pr_observation` | A watcher inspects a PR | PR number, review state, CI status, and head SHA; review-round counting is controller-owned |
 
 The watcher maps changed-review status to `copilot.review`. CI states `pending`,
 `success`, and `failure` map to `ci.status_changed`; `neutral` and `unknown` are

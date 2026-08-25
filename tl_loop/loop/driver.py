@@ -63,11 +63,13 @@ from tl_loop.loop.review import (
     IntegrationEvidenceMismatch,
     ReviewContract,
     ReviewGateError,
+    ReviewPolicySnapshot,
     compose_acceptance_criteria,
     compose_review_contract,
     invalidate_integration_evidence,
     load_freshness_window,
     load_reviewer_max_rounds,
+    load_reviewer_policy_snapshot,
     verify_integration,
     verify_review,
     watcher_head,
@@ -911,9 +913,9 @@ def _run_loop(
     )
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
-    convergence = ConvergenceTracker(
-        reviewer_max_rounds=_reviewer_max_rounds(config.review_policy_path)
-    )
+    policy = _review_policy_for_state(state, config.review_policy_path, store)
+    state = store.load()
+    convergence = ConvergenceTracker(reviewer_max_rounds=policy.reviewer_max_rounds)
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
     diagnostics = EventDiagnostics(
         task_started_at={
@@ -1406,12 +1408,18 @@ def _park_review_rounds_exhausted(
     reviewer_max_rounds: int | None,
 ) -> RunState:
     """Durably park the first exhausted direct-review slice and open its gate."""
+    effective_reviewer_max_rounds = (
+        state.reviewer_max_rounds
+        if state.reviewer_max_rounds_source is not None
+        else reviewer_max_rounds
+    )
     target = next(
         (
             current
             for _, current in sorted(state.slices.items())
             if current.verdict is Verdict.NO_GO
-            and current.review_rounds >= (reviewer_max_rounds or 1)
+            and effective_reviewer_max_rounds is not None
+            and current.review_rounds >= effective_reviewer_max_rounds
             and not _is_aggregate_slice(current)
             and current.status not in {
                 SliceStatus.MERGED,
@@ -1426,7 +1434,7 @@ def _park_review_rounds_exhausted(
         return state
     audit = {
         "review_rounds": target.review_rounds,
-        "reviewer_max_rounds": reviewer_max_rounds,
+        "reviewer_max_rounds": effective_reviewer_max_rounds,
         "head_sha": _persisted_slice_head(target),
         "pr_number": target.pr_number,
     }
@@ -1464,7 +1472,7 @@ def _park_review_rounds_exhausted(
             "pr_number": target.pr_number,
             "head_sha": _persisted_slice_head(target),
             "review_rounds": target.review_rounds,
-            "reviewer_max_rounds": reviewer_max_rounds,
+            "reviewer_max_rounds": effective_reviewer_max_rounds,
         },
         config,
         effects,
@@ -5758,6 +5766,22 @@ def _reviewer_max_rounds(path: str | Path | None) -> int | None:
     return load_reviewer_max_rounds(path)
 
 
+def _review_policy_for_state(
+    state: RunState,
+    path: str | Path | None,
+    store: RunStore,
+) -> ReviewPolicySnapshot:
+    """Resolve review policy once, then reuse the persisted snapshot on restart."""
+    if state.reviewer_max_rounds_source is not None:
+        return ReviewPolicySnapshot(
+            state.reviewer_max_rounds,
+            state.reviewer_max_rounds_source,
+        )
+    resolved = load_reviewer_policy_snapshot(path)
+    store.set_review_policy(resolved.reviewer_max_rounds, resolved.source)
+    return resolved
+
+
 def _reviewer_identity_authorized(
     event: EventEnvelope,
     current: SliceState,
@@ -6027,7 +6051,11 @@ def _route_review_event(
             store, state, phase, event_seq, slice_id, decision_verdict
         )
     if decision_verdict is Verdict.NO_GO:
-        max_rounds = _reviewer_max_rounds(config.review_policy_path)
+        max_rounds = (
+            state.reviewer_max_rounds
+            if state.reviewer_max_rounds_source is not None
+            else _reviewer_max_rounds(config.review_policy_path)
+        )
         current_rounds = state.slices[slice_id].review_rounds
         if (
             max_rounds is not None

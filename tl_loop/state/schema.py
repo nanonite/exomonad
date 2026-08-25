@@ -336,6 +336,8 @@ RUN_KEYS = frozenset(
         "repository_identity",
         "state_version",
         "controller_epoch",
+        "reviewer_max_rounds",
+        "reviewer_max_rounds_source",
     }
 )
 ORDERED_STAGE_KEYS = frozenset({"order", "sub_tls"})
@@ -783,6 +785,8 @@ class RunState:
     repository_identity: RepositoryIdentity | None = None
     state_version: int = 0
     controller_epoch: str | None = None
+    reviewer_max_rounds: int | None = None
+    reviewer_max_rounds_source: str | None = None
 
 
 class SchemaError(ValueError):
@@ -817,6 +821,8 @@ def validate(doc: object) -> None:
         _non_negative_int(root, "depth", "run", errors)
     _nullable_non_negative_int(root, "state_version", "run", errors)
     _nullable_string(root, "controller_epoch", "run", errors)
+    _nullable_positive_int(root, "reviewer_max_rounds", "run", errors)
+    _nullable_string(root, "reviewer_max_rounds_source", "run", errors)
     _validate_repository_identity(root.get("repository_identity"), "run", errors)
 
     fsm = _object(root.get("fsm"), "run.fsm", FSM_KEYS, errors)

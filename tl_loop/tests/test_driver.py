@@ -59,6 +59,7 @@ from tl_loop.loop.driver import (
     run_tl_loop,
     tl_run,
 )
+from tl_loop.loop.escalate import blocked_gate_name
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.reconcile import (
@@ -2019,6 +2020,82 @@ def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path
     assert restored.verdict is Verdict.NO_GO
     assert restored.status is SliceStatus.REPAIRING
     assert len([name for name, _ in transport.calls if name == "resume_pr"]) == 1
+
+
+def test_review_round_exhaustion_parks_gate_and_emits_once(tmp_path: Path) -> None:
+    class IssueTransport(RecordingTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            if tool_name == "chainlink_issue_create":
+                self.calls.append((tool_name, arguments))
+                return {"success": True, "result": {"issue_id": 1010}}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        verdict=Verdict.NO_GO,
+        review_rounds=2,
+        reviewer_attempt={"head-a": 1},
+    )
+    store.checkpoint(
+        TLPlanning(),
+        {"leaf-a": current},
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+    store.set_review_policy(2, "policy_file")
+    transport = IssueTransport()
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+    config = TLLoopConfig(active=True)
+
+    result = _apply_convergence(
+        store.load(),
+        ConvergenceTracker(reviewer_max_rounds=2),
+        store,
+        config,
+        EffectClient(transport),
+        journal,
+    )
+
+    parked = result.slices["leaf-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.REVIEW_ROUNDS_EXHAUSTED
+    assert any(
+        gate.name == blocked_gate_name("review-run", "leaf-a", 1, "review_rounds_exhausted")
+        and gate.status is GateStatus.PENDING
+        for gate in result.gates
+    )
+    exhaustion_events = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.review_rounds_exhausted"
+    ]
+    assert len(exhaustion_events) == 1
+    assert not any(name in {"resume_pr", "spawn_reviewer"} for name, _ in transport.calls)
+
+    _apply_convergence(
+        result,
+        ConvergenceTracker(reviewer_max_rounds=2),
+        store,
+        config,
+        EffectClient(transport),
+        journal,
+    )
+    assert len(
+        [
+            arguments
+            for name, arguments in transport.calls
+            if name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.review_rounds_exhausted"
+        ]
+    ) == 1
 
 
 def test_direct_reviewer_verdict_rejects_unregistered_actor(tmp_path: Path) -> None:

@@ -179,7 +179,18 @@ def _derive_run_action(
     active = tuple(
         current
         for _, current in sorted(state.slices.items())
-        if current.status not in {SliceStatus.MERGED, SliceStatus.FAILED}
+        if current.status
+        not in {
+            SliceStatus.MERGED,
+            SliceStatus.FAILED,
+            SliceStatus.PARKED,
+            SliceStatus.BLOCKED,
+        }
+    )
+    effective_reviewer_max_rounds = (
+        state.reviewer_max_rounds
+        if state.reviewer_max_rounds_source is not None
+        else reviewer_max_rounds
     )
     integration = state.integration
     if integration.lifecycle is IntegrationLifecycle.MERGED:
@@ -240,11 +251,18 @@ def _derive_run_action(
             if state.repository_identity is not None
             else None
         )
-        return _derive_slice_action(
-            active[0],
-            repository_identity=repository_identity,
-            reviewer_max_rounds=reviewer_max_rounds,
-        )
+        first_wait: Quiescent | None = None
+        for current in active:
+            decision = _derive_slice_action(
+                current,
+                repository_identity=repository_identity,
+                reviewer_max_rounds=effective_reviewer_max_rounds,
+            )
+            if not isinstance(decision, Quiescent):
+                return decision
+            if first_wait is None:
+                first_wait = decision
+        return first_wait or Quiescent("no_active_slices")
     return Quiescent("no_active_slices")
 
 

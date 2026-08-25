@@ -65,6 +65,14 @@ class ReviewContract:
         }
 
 
+@dataclass(frozen=True)
+class ReviewPolicySnapshot:
+    """Resolved review policy persisted with a run for restart determinism."""
+
+    reviewer_max_rounds: int | None
+    source: str
+
+
 def compose_acceptance_criteria(
     slice_state: SliceState,
     plan: Mapping[str, object] | object,
@@ -390,8 +398,10 @@ def load_freshness_window(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
     return value
 
 
-def load_reviewer_max_rounds(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
-    """Load only the controller-owned review ceiling from a policy document."""
+def load_reviewer_policy_snapshot(
+    path: str | Path | None = DEFAULT_REVIEW_POLICY,
+) -> ReviewPolicySnapshot:
+    """Resolve the review ceiling and record whether env or file supplied it."""
     override = os.environ.get(REVIEWER_MAX_ROUNDS_ENV, "").strip()
     if override:
         try:
@@ -408,7 +418,9 @@ def load_reviewer_max_rounds(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
             raise ReviewGateError(
                 f"Invalid {REVIEWER_MAX_ROUNDS_ENV} value `{override}`: expected a positive integer"
             )
-        return value
+        return ReviewPolicySnapshot(value, "environment")
+    if path is None:
+        return ReviewPolicySnapshot(None, "disabled")
     try:
         with Path(path).open("rb") as stream:
             document = tomllib.load(stream)
@@ -417,7 +429,15 @@ def load_reviewer_max_rounds(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
     value = document.get("reviewer_max_rounds", 5)
     if type(value) is not int or value < 1:
         raise ReviewGateError("reviewer_max_rounds must be a positive integer")
-    return value
+    return ReviewPolicySnapshot(value, "policy_file")
+
+
+def load_reviewer_max_rounds(path: str | Path | None = DEFAULT_REVIEW_POLICY) -> int:
+    """Load only the controller-owned review ceiling from a policy document."""
+    snapshot = load_reviewer_policy_snapshot(path)
+    if snapshot.reviewer_max_rounds is None:
+        raise ReviewGateError("reviewer_max_rounds requires a review policy")
+    return snapshot.reviewer_max_rounds
 
 
 def _parse_timestamp(value: str) -> datetime:
@@ -444,6 +464,7 @@ __all__ = [
     "ReviewEvidence",
     "ReviewGateError",
     "ReviewHeadMismatch",
+    "ReviewPolicySnapshot",
     "StaleVerdict",
     "VerdictNotApproved",
     "compose_acceptance_criteria",
@@ -451,6 +472,7 @@ __all__ = [
     "invalidate_integration_evidence",
     "load_freshness_window",
     "load_reviewer_max_rounds",
+    "load_reviewer_policy_snapshot",
     "verify_integration",
     "verify_review",
     "watcher_head",

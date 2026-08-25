@@ -146,6 +146,8 @@ class ResumeState:
     integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
     repository_identity: RepositoryIdentity | None = None
     state_version: int = 0
+    reviewer_max_rounds: int | None = None
+    reviewer_max_rounds_source: str | None = None
 
     @property
     def phase(self) -> TLPhase:
@@ -223,6 +225,21 @@ class RunStore:
 
         def mutate(document: dict[str, object]) -> dict[str, object]:
             document["controller_epoch"] = epoch
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
+    def set_review_policy(self, ceiling: int | None, source: str) -> RunState:
+        """Persist the resolved review ceiling before processing events."""
+        if ceiling is not None and (type(ceiling) is not int or ceiling < 1):
+            raise ValueError("review ceiling must be a positive integer or null")
+        if not isinstance(source, str) or not source:
+            raise ValueError("review policy source must be non-empty")
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            document["reviewer_max_rounds"] = ceiling
+            document["reviewer_max_rounds_source"] = source
             return document
 
         apply(self.run_dir, mutate)
@@ -567,6 +584,8 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
         integration=state.integration,
         repository_identity=state.repository_identity,
         state_version=state.state_version,
+        reviewer_max_rounds=state.reviewer_max_rounds,
+        reviewer_max_rounds_source=state.reviewer_max_rounds_source,
     )
 
 
@@ -591,6 +610,8 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "repository_identity",
         "state_version",
         "controller_epoch",
+        "reviewer_max_rounds",
+        "reviewer_max_rounds_source",
     }
     unknown = sorted(set(root_spec) - allowed)
     if unknown:
@@ -1009,6 +1030,8 @@ def _decode(document: dict[str, object]) -> RunState:
         repository_identity=_decode_repository_identity(document.get("repository_identity")),
         state_version=cast(int, document.get("state_version", 0)),
         controller_epoch=cast(str | None, document.get("controller_epoch")),
+        reviewer_max_rounds=cast(int | None, document.get("reviewer_max_rounds")),
+        reviewer_max_rounds_source=cast(str | None, document.get("reviewer_max_rounds_source")),
     )
 
 

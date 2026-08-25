@@ -326,6 +326,19 @@ def test_answer_gate_requires_an_existing_gate(tmp_path: Path) -> None:
     assert answered.gates[0].status is GateStatus.APPROVED
 
 
+def test_review_policy_snapshot_survives_store_restart(tmp_path: Path) -> None:
+    store = RunStore("run-1", tmp_path)
+    create("run-1", {}, root_dir=tmp_path)
+
+    first = store.set_review_policy(3, "environment")
+    restored = RunStore("run-1", tmp_path).load()
+
+    assert first.reviewer_max_rounds == 3
+    assert first.reviewer_max_rounds_source == "environment"
+    assert restored.reviewer_max_rounds == 3
+    assert restored.reviewer_max_rounds_source == "environment"
+
+
 def test_load_rejects_waiting_slice_with_terminal_status(tmp_path: Path) -> None:
     store = RunStore("run-1", tmp_path)
     create("run-1", {}, root_dir=tmp_path)
