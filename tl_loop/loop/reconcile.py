@@ -155,7 +155,11 @@ class Quiescent:
 MergeDecision = InternalTransition | ExternalIntent | Quiescent
 
 
-def derive_next_action(persisted_state: SliceState | RunState) -> MergeDecision:
+def derive_next_action(
+    persisted_state: SliceState | RunState,
+    *,
+    reviewer_max_rounds: int | None = None,
+) -> MergeDecision:
     """Derive one merge/review action from durable evidence only.
 
     The function deliberately accepts no watcher response or effect client.
@@ -163,11 +167,15 @@ def derive_next_action(persisted_state: SliceState | RunState) -> MergeDecision:
     independent of event arrival order.
     """
     if isinstance(persisted_state, RunState):
-        return _derive_run_action(persisted_state)
-    return _derive_slice_action(persisted_state)
+        return _derive_run_action(persisted_state, reviewer_max_rounds=reviewer_max_rounds)
+    return _derive_slice_action(persisted_state, reviewer_max_rounds=reviewer_max_rounds)
 
 
-def _derive_run_action(state: RunState) -> MergeDecision:
+def _derive_run_action(
+    state: RunState,
+    *,
+    reviewer_max_rounds: int | None = None,
+) -> MergeDecision:
     active = tuple(
         current
         for _, current in sorted(state.slices.items())
@@ -232,7 +240,11 @@ def _derive_run_action(state: RunState) -> MergeDecision:
             if state.repository_identity is not None
             else None
         )
-        return _derive_slice_action(active[0], repository_identity=repository_identity)
+        return _derive_slice_action(
+            active[0],
+            repository_identity=repository_identity,
+            reviewer_max_rounds=reviewer_max_rounds,
+        )
     return Quiescent("no_active_slices")
 
 
@@ -240,8 +252,24 @@ def _derive_slice_action(
     state: SliceState,
     *,
     repository_identity: Mapping[str, object] | None = None,
+    reviewer_max_rounds: int | None = None,
 ) -> MergeDecision:
     current_head = _persisted_head(state)
+    if (
+        reviewer_max_rounds is not None
+        and state.review_rounds >= reviewer_max_rounds
+        and state.verdict is Verdict.NO_GO
+        and state.reviewed_head == current_head
+        and not _is_aggregate_review(state)
+        and state.status
+        not in {
+            SliceStatus.MERGED,
+            SliceStatus.FAILED,
+            SliceStatus.PARKED,
+            SliceStatus.BLOCKED,
+        }
+    ):
+        return InternalTransition("parked", "review_rounds_exhausted")
     current_contract_digest = (
         state.review_contract.get("digest") if state.review_contract is not None else None
     )
@@ -353,6 +381,15 @@ def _persisted_head(state: SliceState) -> str | None:
     if state.handoff is not None:
         return state.handoff.head_sha
     return state.reviewed_head
+
+
+def _is_aggregate_review(state: SliceState) -> bool:
+    """Keep aggregate integration's repair ceiling separate from leaf reviews."""
+    return state.dispatch_agent_id is not None and (
+        state.dispatch_last_boundary
+        in {"aggregate_pr_open", "integration_conflict", "integration_gate"}
+        or state.dispatch_agent_id.endswith(":integration")
+    )
 
 
 def _has_conflict(state: SliceState) -> bool:

@@ -381,7 +381,7 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`. To ov
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `min_review_rounds` | 1 | Minimum review rounds before merge is permitted |
-| `reviewer_max_rounds` | 5 | Max rounds before Stuck — PR surfaced to human |
+| `reviewer_max_rounds` | 5 | Max completed verdicts before `tl_loop` parks and opens a human gate |
 | `reviewer_max_wait_seconds` | 1200 | Max wait for reviewer response (20 min) |
 | `reviewer_max_rate_limit_retries` | 2 | Max rate-limit retries for reviewer agents |
 | `review_freshness_window_secs` | 1200 | Window for a review to be considered "fresh" |
@@ -392,7 +392,7 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`. To ov
 
 **Reviewer identity discipline:** Each reviewer agent operates under a distinct git identity (`user.name=exomonad-reviewer-{name}`). The reviewer never commits to a branch it didn't author — the Authoring-Agent line in the PR body establishes traceability. An agent never reviews under the identity that authored the PR.
 
-**Stuck state:** When a PR exceeds `reviewer_max_rounds` without convergence, the watcher fires the `Stuck` event. The parent TL receives `[STUCK: leaf-id]` and must re-decompose or escalate to a human. The PR cannot be auto-merged from this state.
+**Stuck state:** `tl_loop` counts completed reviewer verdicts in durable `SliceState.review_rounds`, across head resets. When the count reaches `reviewer_max_rounds` without convergence, the controller parks the slice with `review_rounds_exhausted`, opens a named human gate, and emits bounded round/ceiling telemetry. The watcher remains an observation source and never owns this control decision.
 
 ### Notification Vocabulary
 

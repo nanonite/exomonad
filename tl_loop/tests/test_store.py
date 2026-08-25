@@ -86,6 +86,7 @@ def test_legacy_checkpoint_defaults_new_review_state(tmp_path: Path) -> None:
     assert restored.ci_state == {}
     assert restored.reviewer_attempt == {}
     assert restored.repair_attempts == 0
+    assert restored.review_rounds == 0
 
 
 def test_dependency_recovery_suspension_round_trips(tmp_path: Path) -> None:

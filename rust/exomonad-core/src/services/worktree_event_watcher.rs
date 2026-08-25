@@ -154,14 +154,6 @@ enum PendingAction {
     EmitTaskBlocked {
         evidence: CiBlockEvidence,
     },
-    WriteRegistryStuck {
-        pr_number: u64,
-        rounds: u32,
-    },
-    WriteRegistryRounds {
-        pr_number: u64,
-        rounds: u32,
-    },
     TriggerManualCi {
         pr_number: u64,
         branch: String,
@@ -316,32 +308,6 @@ fn review_state_is_terminal(review_state: &ForgejoReviewState) -> bool {
             | ForgejoReviewState::ChangesRequested
             | ForgejoReviewState::Commented
     )
-}
-
-fn distinct_changes_requested_rounds(reviews: &[ForgejoReview]) -> u32 {
-    reviews
-        .iter()
-        .filter(|review| review.state == ForgejoReviewVerdict::ChangesRequested)
-        .map(|review| {
-            format!(
-                "{}\0{}\0{}",
-                review.commit_id.as_deref().unwrap_or_default(),
-                review.author_branch.as_deref().unwrap_or_default(),
-                review.body
-            )
-        })
-        .collect::<BTreeSet<_>>()
-        .len() as u32
-}
-
-fn approved_review_round(old_rounds: u32, changes_requested_rounds: u32) -> u32 {
-    if changes_requested_rounds > 0 {
-        changes_requested_rounds.max(old_rounds)
-    } else if old_rounds == 0 {
-        1
-    } else {
-        old_rounds + 1
-    }
 }
 
 fn reviewer_attempt_is_current(
@@ -1308,31 +1274,6 @@ where
         Ok(registry)
     }
 
-    async fn set_pr_stuck(&self, pr_number: u64, rounds: u32) -> anyhow::Result<()> {
-        let mut state = self.read_watcher_state().await.unwrap_or_default();
-        let entry = state.prs.entry(pr_number).or_default();
-        entry.stuck = true;
-        entry.rounds = rounds;
-        entry.needs_human_review = true;
-        self.write_watcher_state(&state).await?;
-        info!(pr_number, rounds, "Set stuck flag in watcher state");
-        Ok(())
-    }
-
-    async fn set_pr_rounds(&self, pr_number: u64, rounds: u32) -> anyhow::Result<()> {
-        let mut state = self.read_watcher_state().await.unwrap_or_default();
-        let entry = state.prs.entry(pr_number).or_default();
-        if entry.rounds != rounds {
-            entry.rounds = rounds;
-            self.write_watcher_state(&state).await?;
-            info!(
-                pr_number,
-                rounds, "Persisted PR review rounds in watcher state"
-            );
-        }
-        Ok(())
-    }
-
     #[instrument(skip_all, name = "worktree_event_watcher.poll_cycle")]
     async fn poll_cycle(&self) -> Result<()> {
         let registry = self.load_registry_from_forgejo().await?;
@@ -1734,7 +1675,6 @@ where
                 } else {
                     !current_reviews.is_empty()
                 };
-                let stale_reviews = !obs.reviews.is_empty() && current_reviews.is_empty();
                 let stale_terminal_review_after_head_change = head_sha_changed
                     && review_state_is_terminal(&obs.review_state)
                     && !current_review_present;
@@ -1743,12 +1683,7 @@ where
                 } else {
                     current_reviews
                 };
-                let current_changes_requested_rounds = if stale_reviews {
-                    0
-                } else {
-                    obs.changes_requested_rounds
-                        .max(distinct_changes_requested_rounds(&local_reviews))
-                };
+                let current_changes_requested_rounds = obs.changes_requested_rounds;
                 head_sha_updates.push((*pr_number, obs.head_sha.clone()));
                 let actions = if let Some(old_state) = state_guard.get_mut(pr_number) {
                     if head_sha_changed {
@@ -1769,7 +1704,6 @@ where
                         obs.forgejo_review_present,
                         branch.as_str(),
                         &|c, r| format_review_message(c, r),
-                        self.policy.reviewer_max_rounds,
                         self.policy.reviewer_max_wait_seconds,
                     )
                 } else {
@@ -1816,7 +1750,6 @@ where
                         obs.forgejo_review_present,
                         branch.as_str(),
                         &|c, r| format_review_message(c, r),
-                        self.policy.reviewer_max_rounds,
                         self.policy.reviewer_max_wait_seconds,
                     );
                     actions
@@ -1966,16 +1899,6 @@ where
                     }
                     PendingAction::EmitTaskBlocked { evidence } => {
                         self.emit_task_blocked(&pending, &evidence);
-                    }
-                    PendingAction::WriteRegistryStuck { pr_number, rounds } => {
-                        if let Err(e) = self.set_pr_stuck(pr_number, rounds).await {
-                            warn!(pr_number, rounds, error = %e, "Failed to set stuck flag on PR");
-                        }
-                    }
-                    PendingAction::WriteRegistryRounds { pr_number, rounds } => {
-                        if let Err(e) = self.set_pr_rounds(pr_number, rounds).await {
-                            warn!(pr_number, rounds, error = %e, "Failed to persist PR review rounds");
-                        }
                     }
                     PendingAction::TriggerManualCi {
                         pr_number,
@@ -2483,7 +2406,7 @@ where
 
         let review_state = aggregate_review_state(&local_reviews);
 
-        let changes_requested_rounds = distinct_changes_requested_rounds(&local_reviews);
+        let changes_requested_rounds = 0;
         let forgejo_review_present = !local_reviews.is_empty();
 
         let mut inline_comments: Vec<ForgejoReviewComment> = Vec::new();
@@ -2692,7 +2615,7 @@ fn compute_pr_actions(
     merge_blocked_on_ci: bool,
     branch: &str,
     format_message: &dyn Fn(&[ForgejoReviewComment], &[ForgejoReview]) -> String,
-    max_rounds: u32,
+    _max_rounds: u32,
 ) -> Vec<PendingAction> {
     compute_pr_actions_with_context(
         old_state,
@@ -2700,14 +2623,13 @@ fn compute_pr_actions(
         pr_sha,
         comments,
         reviews,
-        distinct_changes_requested_rounds(reviews),
+        0,
         ci_status,
         merge_blocked_on_ci,
         false,
         false,
         branch,
         format_message,
-        max_rounds,
         15 * 60,
     )
 }
@@ -2721,14 +2643,13 @@ fn compute_pr_actions_with_context(
     pr_sha: &str,
     comments: &[ForgejoReviewComment],
     reviews: &[ForgejoReview],
-    observed_request_change_rounds: u32,
+    _observed_request_change_rounds: u32,
     ci_status: CIStatus,
     merge_blocked_on_ci: bool,
     reviewer_registered: bool,
     forgejo_review_present: bool,
     branch: &str,
     format_message: &dyn Fn(&[ForgejoReviewComment], &[ForgejoReview]) -> String,
-    max_rounds: u32,
     max_wait_seconds: u64,
 ) -> Vec<PendingAction> {
     let mut pending_actions = Vec::new();
@@ -2780,12 +2701,7 @@ fn compute_pr_actions_with_context(
         && old_state.review_approved_at.is_some()
         && !old_state.ci_blocked_notified
     {
-        old_state.stuck = true;
         old_state.ci_blocked_notified = true;
-        pending_actions.push(PendingAction::WriteRegistryStuck {
-            pr_number: pr_number.as_u64(),
-            rounds: old_state.rounds,
-        });
         let diagnostic = review_stall_diagnostic(
             old_state,
             pr_sha,
@@ -2805,7 +2721,7 @@ fn compute_pr_actions_with_context(
         });
     }
 
-    let terminal_parent_notified = old_state.notified_parent_timeout || old_state.stuck;
+    let terminal_parent_notified = old_state.notified_parent_timeout;
     if terminal_parent_notified && !recover_after_ci_block {
         return pending_actions;
     }
@@ -2814,24 +2730,10 @@ fn compute_pr_actions_with_context(
         old_state.pr_review_cycle_count = comment_count;
     }
 
-    let observed_request_change_rounds =
-        observed_request_change_rounds.max(distinct_changes_requested_rounds(reviews));
-    let next_review_round = observed_request_change_rounds.max(old_state.rounds + 1);
-
     let approved = reviews.iter().any(|r| {
         r.state == ForgejoReviewVerdict::Approved || r.body.to_lowercase().contains("approved")
     });
     if approved && old_state.last_review_state != ForgejoReviewVerdict::Approved {
-        let approved_round = if old_state.last_review_state == ForgejoReviewVerdict::Approved {
-            old_state.rounds
-        } else {
-            approved_review_round(old_state.rounds, observed_request_change_rounds)
-        };
-        old_state.rounds = approved_round;
-        pending_actions.push(PendingAction::WriteRegistryRounds {
-            pr_number: pr_number.as_u64(),
-            rounds: old_state.rounds,
-        });
         old_state.last_review_state = ForgejoReviewVerdict::Approved;
         old_state.notified_parent_approved = true;
         old_state.review_approved_at = Some(now);
@@ -2877,56 +2779,29 @@ fn compute_pr_actions_with_context(
         old_state.last_review_state = ForgejoReviewVerdict::ChangesRequested;
         old_state.last_review_fingerprint = changes_requested_fingerprint;
         old_state.first_seen = now;
-        old_state.rounds = next_review_round;
-
         let message = format_message(comments, reviews);
-        if old_state.rounds >= max_rounds {
-            old_state.stuck = true;
-            pending_actions.push(PendingAction::WriteRegistryStuck {
-                pr_number: pr_number.as_u64(),
-                rounds: old_state.rounds,
-            });
-            let diagnostic = review_stall_diagnostic(
-                old_state,
-                pr_sha,
-                branch,
-                reviewer_registered,
-                forgejo_review_present,
-                max_wait_seconds,
-                ci_status,
-            );
-            pending_actions.push(PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload: review_stall_observation_payload("stuck", pr_number.as_u64(), &diagnostic),
-            });
-        } else {
-            pending_actions.push(PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload: serde_json::json!({
-                    "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
-                        .expect("changes_requested review state has an event kind"),
-                    "pr_number": pr_number.as_u64(),
-                    "branch": branch,
-                    "comments": message,
-                    "author_branch": review_author_branch(
-                        reviews,
-                        ForgejoReviewVerdict::ChangesRequested,
-                    ),
-                }),
-            });
-            pending_actions.push(PendingAction::WriteRegistryRounds {
-                pr_number: pr_number.as_u64(),
-                rounds: old_state.rounds,
-            });
-            pending_actions.push(PendingAction::EmitEvent {
-                pr_number: pr_number.as_u64(),
-                status: "copilot_review".to_string(),
-                message: message.clone(),
-                head_sha: pr_sha.to_string(),
-                comments: Some(comments.to_vec()),
-                reviews: Some(reviews.to_vec()),
-            });
-        }
+        pending_actions.push(PendingAction::WasmEvent {
+            event_type: "pr_review",
+            payload: serde_json::json!({
+                "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
+                    .expect("changes_requested review state has an event kind"),
+                "pr_number": pr_number.as_u64(),
+                "branch": branch,
+                "comments": message,
+                "author_branch": review_author_branch(
+                    reviews,
+                    ForgejoReviewVerdict::ChangesRequested,
+                ),
+            }),
+        });
+        pending_actions.push(PendingAction::EmitEvent {
+            pr_number: pr_number.as_u64(),
+            status: "copilot_review".to_string(),
+            message,
+            head_sha: pr_sha.to_string(),
+            comments: Some(comments.to_vec()),
+            reviews: Some(reviews.to_vec()),
+        });
     }
 
     let commented = reviews
@@ -2957,35 +2832,6 @@ fn compute_pr_actions_with_context(
                 ),
             }),
         });
-    }
-
-    if !approved && !changes_requested && observed_request_change_rounds > old_state.rounds {
-        old_state.rounds = observed_request_change_rounds;
-        if old_state.rounds >= max_rounds {
-            old_state.stuck = true;
-            pending_actions.push(PendingAction::WriteRegistryStuck {
-                pr_number: pr_number.as_u64(),
-                rounds: old_state.rounds,
-            });
-            let diagnostic = review_stall_diagnostic(
-                old_state,
-                pr_sha,
-                branch,
-                reviewer_registered,
-                forgejo_review_present,
-                max_wait_seconds,
-                ci_status,
-            );
-            pending_actions.push(PendingAction::WasmEvent {
-                event_type: "pr_review",
-                payload: review_stall_observation_payload("stuck", pr_number.as_u64(), &diagnostic),
-            });
-        } else {
-            pending_actions.push(PendingAction::WriteRegistryRounds {
-                pr_number: pr_number.as_u64(),
-                rounds: old_state.rounds,
-            });
-        }
     }
 
     if ci_changed {
@@ -4052,13 +3898,13 @@ mod tests {
     }
 
     #[test]
-    fn test_first_approval_increments_review_rounds() {
+    fn test_first_approval_does_not_track_review_rounds() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
         let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
 
-        let actions = compute_pr_actions(
+        let _ = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
             "abc123",
@@ -4071,18 +3917,11 @@ mod tests {
             5,
         );
 
-        assert_eq!(state.rounds, 1);
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            PendingAction::WriteRegistryRounds {
-                pr_number: 1,
-                rounds: 1
-            }
-        )));
+        assert_eq!(state.rounds, 0);
     }
 
     #[test]
-    fn test_approval_after_new_sha_increments_review_rounds_once() {
+    fn test_approval_after_new_sha_preserves_legacy_round_state() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
@@ -4104,7 +3943,7 @@ mod tests {
             5,
         );
         let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
-        let actions = compute_pr_actions(
+        let _ = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
             "def456",
@@ -4117,14 +3956,7 @@ mod tests {
             5,
         );
 
-        assert_eq!(state.rounds, 2);
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            PendingAction::WriteRegistryRounds {
-                pr_number: 1,
-                rounds: 2
-            }
-        )));
+        assert_eq!(state.rounds, 1);
     }
 
     #[test]
@@ -4218,7 +4050,7 @@ mod tests {
             5,
         );
 
-        assert!(state.stuck);
+        assert!(!state.stuck);
         assert!(state.ci_blocked_notified);
         assert!(actions.iter().any(|action| matches!(
             action,
@@ -4590,7 +4422,7 @@ mod tests {
     }
 
     #[test]
-    fn test_changes_requested_at_max_rounds_fires_stuck() {
+    fn test_changes_requested_at_max_rounds_does_not_fire_stuck() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
@@ -4612,27 +4444,13 @@ mod tests {
             2,
         );
 
-        assert!(state.stuck);
-        assert_eq!(state.rounds, 2);
-        assert!(!actions.iter().any(|action| matches!(
+        assert!(!state.stuck);
+        assert_eq!(state.rounds, 1);
+        assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent { payload, .. }
                 if payload["kind"] == "review_received"
                     && payload["comments"] == "Still needs work"
-        )));
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            PendingAction::WriteRegistryStuck {
-                pr_number: 1,
-                rounds: 2,
-            }
-        )));
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            PendingAction::WasmEvent { payload, .. }
-                if payload["kind"] == "stuck"
-                    && payload["last_review_state"] == "changes_requested"
-                    && payload["rounds"] == 2
         )));
     }
 
@@ -4657,31 +4475,16 @@ mod tests {
             true,
             branch.as_str(),
             &|_, _| String::new(),
-            2,
             15 * 60,
         );
 
         assert_eq!(state.last_sha, "sha3");
         assert!(state.addressed_changes);
-        assert!(state.stuck);
-        assert_eq!(state.rounds, 2);
+        assert!(!state.stuck);
+        assert_eq!(state.rounds, 1);
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent { payload, .. } if payload["kind"] == "fixes_pushed"
-        )));
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            PendingAction::WriteRegistryStuck {
-                pr_number: 1,
-                rounds: 2,
-            }
-        )));
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            PendingAction::WasmEvent { payload, .. }
-                if payload["kind"] == "stuck"
-                    && payload["rounds"] == 2
-                    && payload["head_sha"] == "sha3"
         )));
     }
 
@@ -4708,7 +4511,7 @@ mod tests {
             2,
         );
 
-        assert_eq!(state.rounds, 1);
+        assert_eq!(state.rounds, 0);
         assert!(!state.stuck);
         assert!(actions.iter().any(|action| matches!(
             action,
@@ -4728,7 +4531,7 @@ mod tests {
             2,
         );
 
-        assert_eq!(state.rounds, 1);
+        assert_eq!(state.rounds, 0);
         assert!(!state.stuck);
         assert!(actions.iter().any(|action| matches!(
             action,
@@ -4755,7 +4558,7 @@ mod tests {
             2,
         );
 
-        assert_eq!(state.rounds, 1);
+        assert_eq!(state.rounds, 0);
         assert!(!state.stuck);
         assert_eq!(state.last_review_state, ForgejoReviewVerdict::Approved);
         assert!(actions.iter().any(|action| matches!(
@@ -4795,16 +4598,9 @@ mod tests {
             2,
         );
 
-        assert_eq!(state.rounds, 1);
+        assert_eq!(state.rounds, 0);
         assert!(!state.stuck);
         assert_eq!(state.last_review_state, ForgejoReviewVerdict::Approved);
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            PendingAction::WriteRegistryRounds {
-                pr_number: 1,
-                rounds: 1,
-            }
-        )));
         assert!(actions.iter().any(|action| matches!(
             action,
             PendingAction::WasmEvent { payload, .. }
@@ -4958,9 +4754,9 @@ mod tests {
             2,
         );
 
-        assert!(actions.is_empty());
+        assert!(!actions.is_empty());
         assert!(state.stuck);
-        assert!(!state.notified_parent_approved);
+        assert!(state.notified_parent_approved);
         assert_eq!(state.last_sha, "abc123");
     }
 
@@ -5071,7 +4867,6 @@ mod tests {
             true,
             branch.as_str(),
             &|_, _| String::new(),
-            5,
             5 * 60,
         );
         assert!(actions.iter().any(|a| matches!(
@@ -6040,7 +5835,6 @@ mod tests {
         let mut services = crate::services::Services::test();
         services.project_dir = temp_dir.path().to_path_buf();
         let policy = ReviewPolicy {
-            reviewer_max_rounds: 2,
             ..ReviewPolicy::default()
         };
         let watcher = WorktreeEventWatcher::new(Arc::new(services)).with_policy(policy);
@@ -6063,14 +5857,13 @@ mod tests {
             .lock()
             .await
             .get(&1)
-            .is_some_and(|state| state.stuck));
+            .is_some_and(|state| !state.stuck));
     }
 
     #[tokio::test]
     async fn test_restarted_terminal_review_does_not_replay_handoff() {
         let temp_dir = tempfile::tempdir().unwrap();
         let policy = ReviewPolicy {
-            reviewer_max_rounds: 2,
             ..ReviewPolicy::default()
         };
         let registry = test_registry(test_pr_entry());
@@ -6114,7 +5907,7 @@ mod tests {
             .lock()
             .await
             .get(&1)
-            .is_some_and(|state| state.stuck));
+            .is_some_and(|state| !state.stuck));
     }
 
     #[test]

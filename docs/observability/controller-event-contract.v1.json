@@ -11,6 +11,9 @@
     "tl.slice_parked": {
       "fields": ["slice_id", "park_cause", "attempts", "reason"]
     },
+    "tl.review_rounds_exhausted": {
+      "fields": ["slice_id", "pr_number", "head_sha", "review_rounds", "reviewer_max_rounds"]
+    },
     "tl.slice_abandoned": {
       "fields": [
         "slice_id",

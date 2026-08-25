@@ -27,10 +27,12 @@ from tl_loop.loop.review import (
     OptionalPolicyRejected,
     PatchDigestMismatch,
     ReviewContract,
+    ReviewGateError,
     ReviewHeadMismatch,
     StaleVerdict,
     integration_needs_revalidation,
     invalidate_integration_evidence,
+    load_reviewer_max_rounds,
     verify_integration,
     verify_review,
 )
@@ -48,6 +50,20 @@ from tl_loop.state.schema import (
 from tl_loop.state.store import RunStore, create
 
 NOW = datetime(2026, 8, 11, 17, 0, tzinfo=UTC)
+
+
+def test_reviewer_max_rounds_honors_session_override(monkeypatch, tmp_path: Path) -> None:
+    policy = tmp_path / "review-policy.toml"
+    policy.write_text("reviewer_max_rounds = 7\n", encoding="utf-8")
+
+    assert load_reviewer_max_rounds(policy) == 7
+
+    monkeypatch.setenv("EXOMONAD_REVIEWER_MAX_ROUNDS", "2")
+    assert load_reviewer_max_rounds(policy) == 2
+
+    monkeypatch.setenv("EXOMONAD_REVIEWER_MAX_ROUNDS", "0")
+    with pytest.raises(ReviewGateError, match="must be at least 1"):
+        load_reviewer_max_rounds(policy)
 
 
 def test_review_contract_normalizes_criteria_and_binds_digest() -> None:

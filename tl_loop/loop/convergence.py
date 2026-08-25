@@ -49,7 +49,8 @@ class ConvergenceResult:
 class ConvergenceTracker:
     """In-memory per-invocation guard for deterministic action reduction."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, reviewer_max_rounds: int | None = None) -> None:
+        self.reviewer_max_rounds = reviewer_max_rounds
         self._seen: set[tuple[str, int, str]] = set()
         self._wait_reasons: dict[str, str] = {}
         self.last_decision: MergeDecision | None = None
@@ -57,7 +58,10 @@ class ConvergenceTracker:
 
     def reduce(self, state: PersistedState) -> ConvergenceResult:
         """Reduce persisted state once and return a stable intent or wait."""
-        decision = derive_next_action(state)
+        decision = derive_next_action(
+            state,
+            reviewer_max_rounds=self.reviewer_max_rounds,
+        )
         self.last_decision = decision
         run_id = state.run_id if isinstance(state, RunState) else state.id
         version = getattr(state, "state_version", 0)

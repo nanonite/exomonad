@@ -6,9 +6,9 @@
 # Minimum review rounds before merge is permitted.
 min_review_rounds = 1
 
-# Maximum review rounds before Stuck terminal state.
-# After this many rounds without convergence, the PR is surfaced to a human
-# and cannot be auto-merged.
+# Maximum completed review verdicts per slice before controller parking.
+# After this many rounds without convergence, tl_loop opens a named human gate
+# and cannot auto-merge or dispatch another repair.
 reviewer_max_rounds = 5
 
 # Maximum wait time for a reviewer to respond (seconds).

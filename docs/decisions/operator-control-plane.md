@@ -165,8 +165,9 @@ signal/park/<run_id>/<cause>        -> park cause reaching the operator
 
 `signal/park/<run_id>/<cause>` accepts only the controller's closed park-cause
 set (`retries_exhausted`, `budget_exhausted`, `no_capable_harness`,
-`schedule_deadlock`, `review_stuck`, `harness_switch_requested`, and
-`stall_detected`). It is an immediate view of durable TL state: it is neither
+`schedule_deadlock`, `review_stuck`, `review_rounds_exhausted`,
+`harness_switch_requested`, and `stall_detected`). It is an immediate view of
+durable TL state: it is neither
 an `in/` queue item nor a request to create, answer, or coalesce a named gate.
 The existing controller and `/control` gate route remain the only authorities
 for parking and gate mutation.

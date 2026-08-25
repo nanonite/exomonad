@@ -76,6 +76,7 @@
       ],
       "pr_number": 42,
       "repair_attempts": 0,
+      "review_rounds": 1,
       "review_findings": {},
       "review_contract": {
         "acceptance_criteria": [

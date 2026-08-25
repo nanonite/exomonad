@@ -927,7 +927,7 @@ the only operator mutation; do not manually mark a stage merged.
 | `budget_exhausted` | Role or harness ceiling reached | Raise the ceiling in `harness_policy.toml` or narrow the plan |
 | `no_capable_harness` | No allowed entry meets the capability requirement | Widen `allow` deliberately |
 | `schedule_deadlock` | Nothing dispatchable, or `max_depth` hit | Fix the plan structure |
-| `review_stuck` | Review rounds exceeded without convergence | Human reads the PR |
+| `review_rounds_exhausted` | Controller review-round ceiling reached without convergence | Human reads the PR and answers the named gate |
 | `harness_switch_requested` | The configured harness could not proceed | Approve explicitly; set `EXOMONAD_ALLOW_HARNESS_SWITCH=1` |
 | `stall_detected` | Dead pane or no progress past the heartbeat threshold | Investigate the worker |
 | `task_budget_exceeded` | A declared slice execution ceiling elapsed | Inspect the deadline ledger and adjust the task budget or plan |

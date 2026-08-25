@@ -51,6 +51,7 @@ _BLOCKED_GATE_CAUSES = frozenset(
         ParkCause.HUMAN_DECISION_REQUIRED,
         ParkCause.MISSING_HANDOFF,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        ParkCause.REVIEW_ROUNDS_EXHAUSTED,
     }
 )
 

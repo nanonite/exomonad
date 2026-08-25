@@ -323,8 +323,8 @@ owner. <code>tl.action_queued</code>, <code>tl.action_reconciled</code>, and
 <tr><td><code>CommitsPushed</code></td><td>SHA change outside changes-requested window</td><td><code>CommitsPushedEv</code> -&gt; round++</td><td><code>ReviewerCommitsPushedEv</code></td></tr>
 <tr><td><code>ReviewTimeout</code></td><td>no reviewer response within <code>reviewer_max_wait_seconds</code></td><td>log only</td><td><code>ReviewerTimedOutEv</code> -&gt; Done</td></tr>
 <tr><td><code>MergeReady</code></td><td><strong>Deprecated derived state:</strong> inferred from <code>pr.review</code> + <code>ci.status_changed</code>; not a source event</td><td>compatibility notification only; the TL derives merge eligibility</td><td>no required handler</td></tr>
-<tr><td><code>Stuck</code></td><td>rounds exceed <code>reviewer_max_rounds</code></td><td>notify upward; controller repairs via <code>resume_pr</code></td><td><code>ReviewerStuckEv</code> -&gt; Done</td></tr>
-<tr><td><code>DevNotPushing</code> / <code>ReviewerNotResponding</code> / <code>ReviewerNeverStarted</code></td><td>health probes</td><td>log only (escalated by watcher to chainlink <code>review-stuck</code>)</td><td>n/a</td></tr>
+<tr><td><code>Stuck</code></td><td>controller reaches <code>reviewer_max_rounds</code></td><td>park <code>review_rounds_exhausted</code> and open a named gate</td><td>no watcher decision</td></tr>
+<tr><td><code>DevNotPushing</code> / <code>ReviewerNotResponding</code> / <code>ReviewerNeverStarted</code></td><td>health probes</td><td>log only (the controller may escalate to chainlink <code>review-stuck</code>)</td><td>n/a</td></tr>
 </table>
 
 <h3>CI and review evidence</h3>
@@ -362,7 +362,7 @@ flowchart TD
 <tr><td><code>reviewer_never_started</code></td><td>open chainlink <code>review-stuck</code> issue</td></tr>
 <tr><td><code>Stuck</code> (rounds exceeded)</td><td>notify upward; a later repair uses <code>resume_pr</code>, dev moves to <code>DevNeedsHumanDirection</code></td></tr>
 </table>
-<p class="note">These are human-clarification inputs — do not auto-close them and do not respawn the dev leaf.</p>
+<p class="note">The watcher surfaces health observations; the controller may turn them into human-clarification inputs. Do not auto-close them and do not respawn the dev leaf.</p>
 
 <h2>7. Controller Run State and Human Gates</h2>
 <p>The controller's own state machine is durable at <code>.exo/tl-loop/&lt;run_id&gt;/run.json</code>, guarded by the shared writer lock <code>.exo/tl-loop/run.lock</code>. A sub-TL nests below its parent's directory.</p>
@@ -396,7 +396,7 @@ stateDiagram-v2
 <tr><td><code>budget_exhausted</code></td><td>Role or per-harness ceiling reached</td><td>Raise the ceiling deliberately, or narrow the plan</td></tr>
 <tr><td><code>no_capable_harness</code></td><td>No allowed entry meets the capability requirement</td><td>Widen <code>allow</code> deliberately</td></tr>
 <tr><td><code>schedule_deadlock</code></td><td>Nothing dispatchable, or <code>max_depth</code> exceeded</td><td>Fix plan structure</td></tr>
-<tr><td><code>review_stuck</code></td><td>Review rounds exceeded without convergence</td><td>Read the PR</td></tr>
+<tr><td><code>review_rounds_exhausted</code></td><td>Controller review-round ceiling reached without convergence</td><td>Read the PR and answer the named gate</td></tr>
 <tr><td><code>harness_switch_requested</code></td><td>Configured harness could not proceed</td><td>Approve explicitly; <code>EXOMONAD_ALLOW_HARNESS_SWITCH=1</code></td></tr>
 <tr><td><code>stall_detected</code></td><td>Dead pane or no progress past the heartbeat threshold</td><td>Investigate the worker</td></tr>
 </table>

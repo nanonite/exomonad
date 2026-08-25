@@ -104,6 +104,7 @@ class ParkCause(str, Enum):
     NO_CAPABLE_HARNESS = "no_capable_harness"
     SCHEDULE_DEADLOCK = "schedule_deadlock"
     REVIEW_STUCK = "review_stuck"
+    REVIEW_ROUNDS_EXHAUSTED = "review_rounds_exhausted"
     HARNESS_SWITCH_REQUESTED = "harness_switch_requested"
     STALL_DETECTED = "stall_detected"
     WORKER_TERMINAL = "worker_terminal"
@@ -417,6 +418,7 @@ SLICE_KEYS = frozenset(
         "reviewer_attempt",
         "reviewer_agent_id",
         "repair_attempts",
+        "review_rounds",
         "reviewed_head",
         "verdict_at",
         "attempts",
@@ -599,6 +601,7 @@ class SliceState:
     reviewer_attempt: Mapping[str, int] = field(default_factory=dict)
     reviewer_agent_id: str | None = None
     repair_attempts: int = 0
+    review_rounds: int = 0
     verdict_at: str | None = None
     park_cause: ParkCause | None = None
     park_issue_id: int | None = None
@@ -1063,6 +1066,8 @@ def _validate_slice(
     _nullable_string(value, "reviewer_agent_id", path, errors)
     if "repair_attempts" in value:
         _non_negative_int(value, "repair_attempts", path, errors)
+    if "review_rounds" in value:
+        _non_negative_int(value, "review_rounds", path, errors)
     _nullable_enum_value(value, "park_cause", path, ParkCause, errors)
     _nullable_positive_int(value, "park_issue_id", path, errors)
     _nullable_string(value, "blocked_by", path, errors)

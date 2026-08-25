@@ -174,6 +174,7 @@ const PARK_CAUSES: &[&str] = &[
     "no_capable_harness",
     "schedule_deadlock",
     "review_stuck",
+    "review_rounds_exhausted",
     "harness_switch_requested",
     "stall_detected",
 ];

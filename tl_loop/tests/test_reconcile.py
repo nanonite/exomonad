@@ -7,6 +7,8 @@ from dataclasses import replace
 import pytest
 
 from tl_loop.loop.reconcile import (
+    InternalTransition,
+    derive_next_action,
     reconcile_merge_observation,
     reduce_observation,
     reconcile_slice,
@@ -105,6 +107,37 @@ def test_observation_reducer_rejects_edges_already_covered_by_snapshot() -> None
     assert delayed.reason == "dominated_sequence"
     assert delayed.changed is False
     assert delayed.state == state
+
+
+def test_review_round_ceiling_is_slice_scoped_and_survives_head_change() -> None:
+    exhausted = replace(
+        _slice(SliceStatus.IN_REVIEW),
+        reviewed_head="head-a",
+        verdict=Verdict.NO_GO,
+        review_rounds=2,
+    )
+
+    decision = derive_next_action(exhausted, reviewer_max_rounds=2)
+
+    assert decision == InternalTransition("parked", "review_rounds_exhausted")
+
+    next_head = replace(
+        exhausted,
+        verdict=None,
+        handoff=HandoffEvidence(
+            pr_number=42,
+            head_sha="head-b",
+            attempt=1,
+            invocation_id="invocation-a",
+            agent_id="agent-a",
+            observed_at="2026-08-24T00:00:00Z",
+        ),
+    )
+    reset_decision = derive_next_action(next_head, reviewer_max_rounds=2)
+
+    assert reset_decision.name == "in_review"
+    assert reset_decision.reason == "head_reset"
+    assert next_head.review_rounds == 2
 
 
 def test_observation_reducer_requires_snapshot_after_watcher_restart() -> None:

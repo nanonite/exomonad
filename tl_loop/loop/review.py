@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -15,6 +16,7 @@ from tl_loop.ordered import IntegrationEvidence, IntegrationLifecycle
 from tl_loop.state.schema import IntegrationRuntimeState, SliceState, Verdict
 
 DEFAULT_REVIEW_POLICY = Path(".exo/review-policy.toml")
+REVIEWER_MAX_ROUNDS_ENV = "EXOMONAD_REVIEWER_MAX_ROUNDS"
 
 
 class AcceptanceCriteriaError(ValueError):
@@ -388,6 +390,36 @@ def load_freshness_window(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
     return value
 
 
+def load_reviewer_max_rounds(path: str | Path = DEFAULT_REVIEW_POLICY) -> int:
+    """Load only the controller-owned review ceiling from a policy document."""
+    override = os.environ.get(REVIEWER_MAX_ROUNDS_ENV, "").strip()
+    if override:
+        try:
+            value = int(override)
+        except ValueError as error:
+            raise ReviewGateError(
+                f"Invalid {REVIEWER_MAX_ROUNDS_ENV} value `{override}`: expected a positive integer"
+            ) from error
+        if value == 0:
+            raise ReviewGateError(
+                f"Invalid {REVIEWER_MAX_ROUNDS_ENV} value `0`: must be at least 1"
+            )
+        if value < 1:
+            raise ReviewGateError(
+                f"Invalid {REVIEWER_MAX_ROUNDS_ENV} value `{override}`: expected a positive integer"
+            )
+        return value
+    try:
+        with Path(path).open("rb") as stream:
+            document = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ReviewGateError(f"could not load review policy {path}: {error}") from error
+    value = document.get("reviewer_max_rounds", 5)
+    if type(value) is not int or value < 1:
+        raise ReviewGateError("reviewer_max_rounds must be a positive integer")
+    return value
+
+
 def _parse_timestamp(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value)
@@ -400,6 +432,7 @@ def _parse_timestamp(value: str) -> datetime:
 
 __all__ = [
     "DEFAULT_REVIEW_POLICY",
+    "REVIEWER_MAX_ROUNDS_ENV",
     "AcceptanceCriteriaError",
     "CIStatusNotApproved",
     "MissingCIStatus",
@@ -417,6 +450,7 @@ __all__ = [
     "integration_needs_revalidation",
     "invalidate_integration_evidence",
     "load_freshness_window",
+    "load_reviewer_max_rounds",
     "verify_integration",
     "verify_review",
     "watcher_head",

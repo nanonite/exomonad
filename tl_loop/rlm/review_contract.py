@@ -85,6 +85,7 @@ class ReviewPolicy:
     external_review_paths: tuple[str, ...]
     require_second_reviewer_complexity: bool
     complexity_line_threshold: int
+    reviewer_max_rounds: int = 5
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> ReviewPolicy:
@@ -101,6 +102,7 @@ class ReviewPolicy:
             complexity_line_threshold=_non_negative_int(
                 value, "complexity_line_threshold"
             ),
+            reviewer_max_rounds=_positive_int(value, "reviewer_max_rounds"),
         )
 
 
@@ -110,6 +112,13 @@ def _non_negative_int(value: Mapping[str, object], key: str) -> int:
         raise AdjudicationInputError(
             f"review policy {key} must be a non-negative integer"
         )
+    return candidate
+
+
+def _positive_int(value: Mapping[str, object], key: str) -> int:
+    candidate = value.get(key)
+    if type(candidate) is not int or candidate < 1:
+        raise AdjudicationInputError(f"review policy {key} must be a positive integer")
     return candidate
 
 

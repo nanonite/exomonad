@@ -331,7 +331,7 @@ stateDiagram-v2
   note right of DevNeedsHumanDirection: canExit = Clean\n(TL uses resume_pr for repair)
 ```
 
-Round vocabulary is zero-based and tied to reviewer verdicts. Round 0 is the first reviewer verdict after the PR is filed. If that verdict requests changes, the dev fixes and pushes; `FixesPushedEv` moves the dev to `DevUnderReview` with `review_round=1`. A second `ReviewReceivedEv` in round 1 transitions to `DevNeedsHumanDirection`, and the handler notifies the TL with `[STUCK: PR #N]`. That is an in-band human-clarification signal, not a watcher health failure and not a Chainlink `review-stuck` issue.
+Round vocabulary is zero-based and tied to reviewer verdicts. Round 0 is the first reviewer verdict after the PR is filed. `tl_loop` persists the completed count on `SliceState.review_rounds`; it survives head resets and is compared with `reviewer_max_rounds`. Exhaustion transitions the slice to `review_rounds_exhausted` and opens a named human gate. This is controller-owned human clarification, not a watcher health failure.
 
 ### ReviewerPhase
 
@@ -475,7 +475,7 @@ These are the `PRReviewEvent` constructors the watcher emits. Each role's `prRev
 | `CommitsPushed` | SHA change outside the changes-requested window | `CommitsPushedEv` -> round++ | `ReviewerCommitsPushedEv` |
 | `ReviewTimeout` | no reviewer response within `reviewer_max_wait_seconds` | log only | `ReviewerTimedOutEv` -> Done |
 | `MergeReady` | **Deprecated derived state:** inferred from `pr.review` + `ci.status_changed`; not a source event | compatibility notification only; the TL derives merge eligibility | no required handler |
-| `Stuck` | rounds exceed `reviewer_max_rounds` | notify upward; controller repairs via `resume_pr` | `ReviewerStuckEv` -> Done |
+| `Stuck` | controller reaches `reviewer_max_rounds` in durable `SliceState.review_rounds` | park `review_rounds_exhausted` and open a named human gate | no watcher decision |
 | `DevNotPushing` / `ReviewerNotResponding` / `ReviewerNeverStarted` | health probes | log only (escalated by watcher to chainlink `review-stuck`) | n/a |
 
 ### CI and review evidence
@@ -518,14 +518,17 @@ verifies post-merge state before advancing dependent slices.
 
 ## 6. Watcher Escalation Outputs
 
-Beyond per-PR events, the watcher escalates terminal failure modes to **chainlink `review-stuck` issues** rather than re-trying. These are human-clarification inputs — do not auto-close them and do not respawn the dev leaf.
+Beyond per-PR events, the watcher surfaces health signals to the control plane. The
+controller may turn those observations into **chainlink `review-stuck` issues**
+rather than re-trying. These are human-clarification inputs — do not auto-close
+them and do not respawn the dev leaf.
 
 | Watcher signal | Outcome |
 |----------------|---------|
 | `dev_not_pushing` | open chainlink `review-stuck` issue |
 | `reviewer_not_responding` | open chainlink `review-stuck` issue |
 | `reviewer_never_started` | open chainlink `review-stuck` issue |
-| `Stuck` (rounds exceeded) | notify TL; a later repair uses `resume_pr`, dev moves to `DevNeedsHumanDirection` |
+| `Stuck` (rounds exceeded) | `tl_loop` parks `review_rounds_exhausted` and opens a named gate; the watcher reports only review observations |
 
 ---
 
@@ -567,6 +570,7 @@ Every bounded failure ends in one of these, with an auditable cause recorded in 
 | `no_capable_harness` | No allowed entry meets the capability requirement | Widen `allow` deliberately |
 | `schedule_deadlock` | Nothing dispatchable, or `max_depth` exceeded | Fix plan structure |
 | `review_stuck` | Review rounds exceeded without convergence | Read the PR |
+| `review_rounds_exhausted` | Controller-owned per-slice review ceiling reached across heads | Answer the named gate or re-plan |
 | `harness_switch_requested` | Configured harness could not proceed | Approve explicitly; `EXOMONAD_ALLOW_HARNESS_SWITCH=1` |
 | `stall_detected` | Dead pane or no progress past the heartbeat threshold | Investigate the worker |
 

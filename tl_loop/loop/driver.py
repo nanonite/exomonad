@@ -67,6 +67,7 @@ from tl_loop.loop.review import (
     compose_review_contract,
     invalidate_integration_evidence,
     load_freshness_window,
+    load_reviewer_max_rounds,
     verify_integration,
     verify_review,
     watcher_head,
@@ -910,7 +911,9 @@ def _run_loop(
     )
     transitions: list[LoopTransition] = []
     consumed: list[int] = []
-    convergence = ConvergenceTracker()
+    convergence = ConvergenceTracker(
+        reviewer_max_rounds=_reviewer_max_rounds(config.review_policy_path)
+    )
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
     diagnostics = EventDiagnostics(
         task_started_at={
@@ -952,7 +955,13 @@ def _run_loop(
             diagnostics=diagnostics.snapshot(),
         )
 
-    if not isinstance(derive_next_action(state), Quiescent):
+    if not isinstance(
+        derive_next_action(
+            state,
+            reviewer_max_rounds=convergence.reviewer_max_rounds,
+        ),
+        Quiescent,
+    ):
         state = _apply_convergence(state, convergence, store, config, effects, effects_log)
         phase = _phase_from_state(state)
 
@@ -1339,7 +1348,10 @@ def _apply_convergence(
 ) -> RunState:
     """Run bounded post-reduction convergence until the next effect or wait."""
     if not config.enable_reviewer_spawn:
-        decision = derive_next_action(state)
+        decision = derive_next_action(
+            state,
+            reviewer_max_rounds=tracker.reviewer_max_rounds,
+        )
         if isinstance(decision, ExternalIntent) and decision.operation == "spawn_reviewer":
             tracker.last_decision = Quiescent("reviewer_spawn_disabled")
             return state
@@ -1357,6 +1369,15 @@ def _apply_convergence(
                 _event_target(event.payload), event, config, effects, effects_log
             )
         if isinstance(result.decision, InternalTransition):
+            if result.decision.reason == "review_rounds_exhausted":
+                return _park_review_rounds_exhausted(
+                    state,
+                    store,
+                    config,
+                    effects,
+                    effects_log,
+                    tracker.reviewer_max_rounds,
+                )
             prior = state
             state = _apply_internal_transition(state, result.decision, store)
             if result.decision.transition == "terminal" or state == prior:
@@ -1374,6 +1395,82 @@ def _apply_convergence(
             )
         return state
     raise TLLoopError("convergence did not reach a stable action or wait state")
+
+
+def _park_review_rounds_exhausted(
+    state: RunState,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    reviewer_max_rounds: int | None,
+) -> RunState:
+    """Durably park the first exhausted direct-review slice and open its gate."""
+    target = next(
+        (
+            current
+            for _, current in sorted(state.slices.items())
+            if current.verdict is Verdict.NO_GO
+            and current.review_rounds >= (reviewer_max_rounds or 1)
+            and not _is_aggregate_slice(current)
+            and current.status not in {
+                SliceStatus.MERGED,
+                SliceStatus.FAILED,
+                SliceStatus.PARKED,
+                SliceStatus.BLOCKED,
+            }
+        ),
+        None,
+    )
+    if target is None:
+        return state
+    audit = {
+        "review_rounds": target.review_rounds,
+        "reviewer_max_rounds": reviewer_max_rounds,
+        "head_sha": _persisted_slice_head(target),
+        "pr_number": target.pr_number,
+    }
+    if config.active:
+        park(
+            target,
+            ParkCause.REVIEW_ROUNDS_EXHAUSTED,
+            store=store,
+            issue_creator=cast(EffectClient, effects),
+            audit=audit,
+        )
+    else:
+        parked = replace(
+            target,
+            status=SliceStatus.PARKED,
+            park_cause=ParkCause.REVIEW_ROUNDS_EXHAUSTED,
+            park_audit=audit,
+            action=None,
+        )
+        store.checkpoint(
+            state.fsm,
+            {**state.slices, target.id: parked},
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+        )
+    parked_state = store.load()
+    _record_controller_event(
+        target.id,
+        "tl.review_rounds_exhausted",
+        {
+            "slice_id": target.id,
+            "pr_number": target.pr_number,
+            "head_sha": _persisted_slice_head(target),
+            "review_rounds": target.review_rounds,
+            "reviewer_max_rounds": reviewer_max_rounds,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return parked_state
 
 
 def _apply_internal_transition(
@@ -5479,6 +5576,11 @@ def _record_review_event(
         reviewed_head=event.head_sha,
         verdict=verdict,
         verdict_at=event.observed_at,
+        review_rounds=(
+            current.review_rounds
+            if current.reviewed_head == event.head_sha and current.verdict is not None
+            else current.review_rounds + 1
+        ),
         review_findings=review_findings,
         review_patch_digests=patch_digests,
         stall_classification=stall_classification or current.stall_classification,
@@ -5488,6 +5590,13 @@ def _record_review_event(
 
 def _review_workflow_enabled(config: TLLoopConfig) -> bool:
     return config.active and config.review_model_choice is not None
+
+
+def _reviewer_max_rounds(path: str | Path | None) -> int | None:
+    """Load the configured review ceiling for controller convergence."""
+    if path is None:
+        return None
+    return load_reviewer_max_rounds(path)
 
 
 def _reviewer_identity_authorized(
@@ -5746,6 +5855,7 @@ def _route_review_event(
         reviewed_head=decision_head,
         verdict=decision_verdict,
         verdict_at=event.observed_at,
+        review_rounds=current.review_rounds + 1,
         review_findings=review_findings,
         review_patch_digests=patch_digests,
         ci_state={} if current.reviewed_head != decision_head else current.ci_state,
@@ -5757,9 +5867,15 @@ def _route_review_event(
         state = _record_aggregate_review_lifecycle(
             store, state, phase, event_seq, slice_id, decision_verdict
         )
-    if decision_verdict is Verdict.NO_GO and direct_reviewer_event:
-        return state
     if decision_verdict is Verdict.NO_GO:
+        max_rounds = _reviewer_max_rounds(config.review_policy_path)
+        current_rounds = state.slices[slice_id].review_rounds
+        if (
+            max_rounds is not None
+            and current_rounds >= max_rounds
+            and not _is_aggregate_slice(state.slices[slice_id])
+        ):
+            return state
         return _route_repair(
             store,
             state,
