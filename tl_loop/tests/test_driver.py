@@ -1266,12 +1266,15 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
         "run_seq": 1,
         "run_id": run_id,
         "agent_id": "tunable-operator-body-opencode",
+        "invocation_id": "invocation-a",
         "lifecycle_state": "emitted",
         "observed_at": "2026-08-12T00:00:00Z",
         "data": {
             "pr_number": 42,
             "head_sha": "head-a",
             "branch": "main.tunable-operator-body-opencode",
+            "head_branch": "main.tunable-operator-body-opencode",
+            "base_branch": "main",
         },
     }
     source = SyntheticQueue(
@@ -1325,7 +1328,7 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
     assert reviewer_args["head_sha"] == "head-a"
     assert reviewer_args["force"] is False
     criteria = cast(list[object], reviewer_args["acceptance_criteria"])
-    assert any("DONE CRITERIA: the changed behavior is covered" in str(item) for item in criteria)
+    assert "Run-state test plan: just tl-loop-test" in criteria
     slice_state = result.final_state.slices["tunable-operator-body"]
     assert slice_state.reviewer_attempt == {"head-a": 1}
     assert source.acknowledged == [1, 2, 3]

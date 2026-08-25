@@ -1259,11 +1259,6 @@ def _run_loop(
                 event,
                 event_slice_id,
             )
-        head_changed = _pr_head_changed(state.slices, fsm_event, event_slice_id)
-        if head_changed and config.enable_reviewer_spawn:
-            next_slices = _claim_reviewer_attempt(
-                next_slices, fsm_event, _event_slice_id(event, state)
-            )
         previous_state = state
         state = store.checkpoint(next_phase, next_slices, state.budgets, checkpoint_seq)
         _emit_slice_status_changes(
@@ -1282,10 +1277,6 @@ def _run_loop(
             effects,
             effects_log,
         )
-        if head_changed and config.enable_reviewer_spawn:
-            _spawn_reviewer_for_head(
-                plan, state, fsm_event, event, config, effects, effects_log, store
-            )
         _ack_event(source, event, replaying, diagnostics)
         _release_replayed_event(store, event, replaying)
         diagnostics.correlated += 1
@@ -1345,6 +1336,11 @@ def _apply_convergence(
     effects_log: list[EffectIntent],
 ) -> RunState:
     """Run bounded post-reduction convergence until the next effect or wait."""
+    if not config.enable_reviewer_spawn:
+        decision = derive_next_action(state)
+        if isinstance(decision, ExternalIntent) and decision.operation == "spawn_reviewer":
+            tracker.last_decision = Quiescent("reviewer_spawn_disabled")
+            return state
     for _ in range(MAX_CONVERGENCE_STEPS):
         try:
             result = tracker.reduce(state)
@@ -1486,6 +1482,8 @@ def _execute_direct_reviewer_intent(
     effects_log: list[EffectIntent],
 ) -> RunState:
     """Persist and execute a reviewer spawn derived from a direct leaf."""
+    if not config.enable_reviewer_spawn:
+        return state
     current = state.slices[intent.target_id]
     head_sha = intent.arguments.get("head_sha")
     pr_number = intent.arguments.get("pr_number")
@@ -2529,39 +2527,6 @@ def _reconcile_dispatches(
     return state
 
 
-def _reviewer_spawn_confirmed(
-    effects_log: list[EffectIntent],
-    slice_id: str,
-    pr_number: int,
-    head_sha: str,
-) -> bool | None:
-    """Whether a spawn_reviewer effect for this exact head is journal-confirmed.
-
-    Both the live event path and reconciliation durably checkpoint the
-    reviewer_attempt claim ({head_sha: 1}) before spawn_reviewer is dispatched.
-    A crash between the claim and the dispatch leaves a claim that looks
-    identical to a completed spawn. Consulting the action journal tells them
-    apart: None means "unknown" (effects_log is a plain list, e.g. a unit test
-    with no durable journal) and the caller must conservatively treat a claim
-    as already spawned. False means a journal exists and holds no confirmed
-    spawn_reviewer entry for this PR/head, so the claim was checkpointed but
-    the spawn never landed (or its outcome is unknown) -- re-attempting is
-    journal-safe because _invoke replays a confirmed entry and blocks an
-    unknown one behind the existing action-journal gate.
-    """
-    if not isinstance(effects_log, EffectJournal):
-        return None
-    for entry in effects_log.confirmed_entries("spawn_reviewer", slice_id):
-        arguments = entry.get("arguments")
-        if (
-            isinstance(arguments, Mapping)
-            and arguments.get("pr_number") == pr_number
-            and arguments.get("head_sha") == head_sha
-        ):
-            return True
-    return False
-
-
 def _reconcile_nonterminal_slices(
     plan: WorkPlan,
     state: RunState,
@@ -2600,7 +2565,6 @@ def _reconcile_nonterminal_slices(
     updated = dict(state.slices)
     conflicts_found = False
     changed = False
-    pending_reviewer_spawns: list[tuple[str, int, str]] = []
     for current in candidates:
         watcher = None
         if current.pr_number is not None and config.ledger_run_id is not None:
@@ -2701,38 +2665,6 @@ def _reconcile_nonterminal_slices(
             updated = dict(state.slices)
             changed = False
             continue
-        claimed_pr_number = reconciled.pr_number
-        if (
-            config.enable_reviewer_spawn
-            and watcher is not None
-            and watcher.get("found") is True
-            and reconciled.status is not SliceStatus.MERGED
-            and claimed_pr_number is not None
-        ):
-            recovered_head_sha = _snapshot_text(watcher, "head_sha")
-            if recovered_head_sha and reconciled.reviewed_head != recovered_head_sha:
-                already_claimed = reconciled.reviewer_attempt.get(recovered_head_sha, 0) > 0
-                # A claim checkpointed before a crash between the claim and the
-                # spawn dispatch looks identical to a completed spawn; consult
-                # the action journal instead of assuming claimed means spawned.
-                spawn_confirmed = (
-                    _reviewer_spawn_confirmed(
-                        effects_log, current.id, claimed_pr_number, recovered_head_sha
-                    )
-                    if already_claimed
-                    else None
-                )
-                if not already_claimed or spawn_confirmed is False:
-                    reconciled = replace(
-                        reconciled,
-                        reviewer_attempt={
-                            **reconciled.reviewer_attempt,
-                            recovered_head_sha: 1,
-                        },
-                    )
-                    pending_reviewer_spawns.append(
-                        (current.id, claimed_pr_number, recovered_head_sha)
-                    )
         if reconciled != current:
             updated[current.id] = reconciled
             changed = True
@@ -2751,10 +2683,6 @@ def _reconcile_nonterminal_slices(
         )
     if conflicts_found:
         state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
-    for target_id, pr_number, head_sha in pending_reviewer_spawns:
-        _spawn_reviewer_for_slice(
-            plan, state, target_id, pr_number, head_sha, config, effects, effects_log, store
-        )
     return state
 
 
@@ -6550,16 +6478,6 @@ def _pr_event_target(
     return matches[0] if len(matches) == 1 else None
 
 
-def _pr_head_changed(
-    slices: Mapping[str, SliceState], event: TLEvent, slice_id: str | None
-) -> bool:
-    if not isinstance(event, (PRFiled, PRUpdated)):
-        return False
-    target_id = _pr_event_target(slices, event, slice_id)
-    current = slices.get(target_id) if target_id is not None else None
-    return current is not None and current.reviewed_head != event.head_sha
-
-
 def _bind_publication_evidence(
     slices: Mapping[str, SliceState],
     event: PRFiled | PRUpdated,
@@ -6630,109 +6548,6 @@ def _bind_publication_evidence(
     if updated == current:
         return dict(slices)
     return {**slices, target_id: updated}
-
-
-def _claim_reviewer_attempt(
-    slices: Mapping[str, SliceState], event: TLEvent, slice_id: str | None
-) -> dict[str, SliceState]:
-    if not isinstance(event, (PRFiled, PRUpdated)):
-        return dict(slices)
-    target_id = _pr_event_target(slices, event, slice_id)
-    current = slices.get(target_id) if target_id is not None else None
-    if target_id is None or current is None:
-        return dict(slices)
-    attempts = dict(current.reviewer_attempt)
-    if attempts.get(event.head_sha, 0) > 0:
-        return dict(slices)
-    attempts[event.head_sha] = 1
-    return {**slices, target_id: replace(current, reviewer_attempt=attempts)}
-
-
-def _spawn_reviewer_for_head(
-    plan: WorkPlan,
-    state: RunState,
-    event: TLEvent,
-    envelope: EventEnvelope,
-    config: TLLoopConfig,
-    effects: EffectClient | ReadOnlyEffectClient,
-    effects_log: list[EffectIntent],
-    store: RunStore,
-) -> None:
-    if not isinstance(event, (PRFiled, PRUpdated)):
-        return
-    target_id = _pr_event_target(state.slices, event, envelope.slice_id)
-    if target_id is None:
-        return
-    _spawn_reviewer_for_slice(
-        plan, state, target_id, event.pr_number, event.head_sha, config, effects, effects_log, store
-    )
-
-
-def _spawn_reviewer_for_slice(
-    plan: WorkPlan,
-    state: RunState,
-    target_id: str,
-    pr_number: int,
-    head_sha: str,
-    config: TLLoopConfig,
-    effects: EffectClient | ReadOnlyEffectClient,
-    effects_log: list[EffectIntent],
-    store: RunStore,
-) -> None:
-    """Spawn a reviewer for a known PR head.
-
-    Shared by the live correlated-event path (_spawn_reviewer_for_head) and
-    startup reconciliation, which recovers a filed-but-unreviewed head from
-    watcher evidence after a crash and must act on it the same way a live
-    pr.filed/pr.updated event would (chainlink #904).
-    """
-    current = state.slices.get(target_id)
-    leaf = next((candidate for candidate in plan.leaves if candidate.name == target_id), None)
-    if current is None or leaf is None:
-        return
-    criteria = compose_acceptance_criteria(current, leaf)
-    arguments: dict[str, object] = {
-        "pr_number": pr_number,
-        "head_sha": head_sha,
-        "acceptance_criteria": list(criteria),
-        "force": False,
-    }
-    live = cast(EffectClient, effects) if config.active else None
-    result = _invoke(
-        "spawn_reviewer",
-        target_id,
-        arguments,
-        config.active,
-        live,
-        lambda client: client.spawn_reviewer(
-            pr_number=pr_number,
-            head_sha=head_sha,
-            acceptance_criteria=criteria,
-            force=False,
-        ),
-        effects_log,
-    )
-    reviewer_name = (
-        result.result.get("reviewer_name")
-        if result is not None and isinstance(result.result, Mapping)
-        else None
-    )
-    if isinstance(reviewer_name, str) and reviewer_name:
-        latest = store.load()
-        latest_slice = latest.slices.get(target_id)
-        if latest_slice is not None and latest_slice.reviewer_agent_id != reviewer_name:
-            store.checkpoint(
-                latest.fsm,
-                {
-                    **latest.slices,
-                    target_id: replace(latest_slice, reviewer_agent_id=reviewer_name),
-                },
-                latest.budgets,
-                latest.events.last_consumed_offset,
-                current_order=latest.current_order,
-                ordered_stages=latest.ordered_stages,
-                integration=latest.integration,
-            )
 
 
 def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool:
