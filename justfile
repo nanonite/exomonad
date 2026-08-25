@@ -629,6 +629,20 @@ check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/run.sh
     {{py}} -m py_compile tests/e2e/init-recovery/seed_checkpoint.py tests/e2e/init-recovery/seed_publication.py
 
+# Run the real-server --continue identity-preservation and corruption
+# classification acceptance scenario (chainlink #1019).
+e2e-init-continue:
+    nix develop --command cargo build -p exomonad
+    just wasm devswarm
+    ./tests/e2e/init-continue/run.sh
+
+# Check the --continue acceptance harness without launching tmux or a server.
+check-e2e-init-continue:
+    bash -n tests/e2e/init-continue/run.sh
+    {{py}} -m py_compile tests/e2e/init-continue/run.py
+    test -s tests/e2e/init-continue/e2e-test.md
+    test -s tests/e2e/init-continue/testrunner.md
+
 # Check E2E agent lifecycle scripts without launching the server
 check-e2e-lifecycle:
     bash -n tests/e2e/lifecycle/run.sh
