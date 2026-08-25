@@ -8,7 +8,10 @@ model tokens.
 The validator covers five lifecycle contracts:
 
 1. A clean Codex exit after `file_pr` produces a verified `PublishedHead` and
-   the Forgejo watcher spawns exactly one Codex reviewer.
+   the Forgejo watcher records facts without spawning a reviewer. Reviewer
+   spawning is a TL reducer action and is covered by the ordered real-server
+   controller harness; this test is the negative control for the forbidden
+   watcher-direct path.
 2. A clean Codex exit without `file_pr` produces neither a publication nor a
    reviewer.
 3. Guidance sent after the owner exits is unread durable inbox state and is
@@ -19,4 +22,7 @@ The validator covers five lifecycle contracts:
    matching SHA resumes the same owner worktree and branch without a sibling.
 
 The script starts only `exomonad serve` plus disposable test infrastructure;
-it does not run `exomonad init` or start a user ExoMonad session.
+it does not run `exomonad init` or start a user ExoMonad session. The
+controller-driven reviewer spawn acceptance lives in
+`tests/e2e/ordered-recursive/real_server_transport.py` and
+`just tl-loop-ordered-server-e2e`.

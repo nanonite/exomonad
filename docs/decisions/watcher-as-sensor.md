@@ -29,7 +29,11 @@ binds the reviewed head, and calls `merge_pr`. The old documentation mixed a
 derived watcher signal with the TL decision, optional policy, and head binding,
 which made the authority model unclear.
 
-This ADR narrows the gate set and moves review workflow to the controller.
+This ADR narrows the gate set and moves review workflow to the controller. The
+one-shot review path is now explicit: the watcher observes, the reducer folds
+facts into `SliceState`, the policy derives one intent or wait reason, and the
+executor performs the journaled effect. No watcher callback is allowed to skip
+that sequence.
 
 ## Decision
 
@@ -124,13 +128,31 @@ create an orphan sibling branch and violate the one-agent-one-branch
 invariant. If a distinct repair harness is ever needed, it must be expressed
 as `resume_pr(..., repair_harness="dev")`, never as a new leaf.
 
+### One-shot review and restart contract
+
+The reviewer is an exact-head, one-shot evidence producer. A terminal GO or
+NO-GO verdict is persisted before the reviewer exits; reviewer liveness is not
+a merge or repair predicate. On the next reducer pass, GO waits for CI on the
+same head and then derives the compare-evidence `merge_pr` intent. NO-GO (and a
+failure for the reviewed head) derives exactly one `resume_pr` intent for the
+persisted owner, PR, branch, and worktree. A changed head clears the old
+verdict and CI evidence before a new reviewer intent can be derived.
+
+Every intent has a stable action key and an `EffectJournal` record. Recovery
+replays facts and reconciles `INTENDED`, `IN_FLIGHT`, `UNKNOWN`, and
+`CONFIRMED` action states; it never talks to an exited reviewer, rewinds the
+ledger cursor, edits `plan.json`, or creates a sibling owner. Stable waits
+emit `tl.wait_reason_changed` with the missing predicate, while action
+decisions emit `tl.action_queued`/`tl.action_started`/`tl.action_reconciled`.
+
 ### A timeout is not an approval
 
 A review timeout with passing CI is not mergeable. A timeout means no one
 approved. The controller parks the run at the durable `tl-timeout` gate.
 
-The controller's idle timeout now records `tl-timeout` as pending and returns
-`TLFailed`; no subsequent event or gate approval can enter the merge path.
+Review timeout is a policy observation, not approval and not process-death
+evidence. The controller records a named wait/gate reason; pane silence alone
+does not authorize a merge, repair, or terminal failure.
 
 ### Per-head review state
 

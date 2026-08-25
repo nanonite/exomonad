@@ -26,6 +26,10 @@ e2e_create_work_dir "one-shot-lifecycle"
 
 cleanup() {
     local code=$?
+    if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
     if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
         kill "$MOCK_PID" 2>/dev/null || true
         wait "$MOCK_PID" 2>/dev/null || true
@@ -78,12 +82,16 @@ chmod +x "$WORK_DIR/bin/codex"
 export PATH="$WORK_DIR/bin:$PATH"
 export E2E_FAKE_CODEX_LOG="$FAKE_LOG"
 export E2E_MCP_SOCKET="$REPO_DIR/.exo/server.sock"
+export E2E_FAKE_REMOTE_DIR="$REMOTE_DIR"
+export E2E_FAKE_MOCK_URL="$MOCK_URL"
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -n TL "bash --noprofile --norc"
 tmux set-environment -t "$SESSION" PATH "$PATH"
 tmux set-environment -t "$SESSION" E2E_FAKE_CODEX_LOG "$FAKE_LOG"
 tmux set-environment -t "$SESSION" E2E_MCP_SOCKET "$REPO_DIR/.exo/server.sock"
+tmux set-environment -t "$SESSION" E2E_FAKE_REMOTE_DIR "$REMOTE_DIR"
+tmux set-environment -t "$SESSION" E2E_FAKE_MOCK_URL "$MOCK_URL"
 
 e2e_phase "Phase 2" "Starting the local Forgejo mock and ExoMonad server..."
 REMOTE_DIR="$REMOTE_DIR" MOCK_LOG="$MOCK_LOG" \

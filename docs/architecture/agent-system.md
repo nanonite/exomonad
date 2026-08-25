@@ -436,6 +436,31 @@ sequenceDiagram
 
 Repair never creates a new branch, leaf name, agent type, or `-2` suffix. `compose_repair` calls `watcher_pr_state` first and requires the PR to be open, unmerged, and identified by both head branch and SHA; it dispatches only through `resume_pr`.
 
+### Single-path ownership and restart behavior
+
+Review orchestration has one executable path:
+
+| Layer | Owns | Must not do |
+|---|---|---|
+| watcher / ledger | verified Forgejo, CI, git, and process facts | spawn, merge, adjudicate, or compose repair |
+| reducer | fold facts into per-head `SliceState` | call an effect or infer a missing head |
+| policy | derive one `spawn_reviewer`, `resume_pr`, `merge`, or named wait | bypass persisted evidence or combine heads |
+| executor / journal | intent-before-dispatch, effect call, and outcome reconciliation | create a second owner or duplicate an action key |
+
+The reviewer is one-shot for an exact `head_sha`. Its terminal verdict is
+durable evidence even after the pane exits. On restart, the controller replays
+the ledger and persisted action state: GO waits for same-head CI and then uses
+compare evidence for `merge_pr`; NO-GO or same-head CI failure uses one
+same-owner `resume_pr`; a new head invalidates the verdict and queues one new
+reviewer. No path sends a message to an exited reviewer, rewinds the event
+cursor, edits `plan.json`, or spawns a sibling owner.
+
+The decision/wait stream is also durable telemetry. `tl.action_queued` and
+`tl.action_reconciled` identify the effect key and exact head; stable waits
+emit `tl.wait_reason_changed` with the missing predicate and state version.
+These records are the acceptance evidence for live-event, snapshot, duplicate,
+crash, and recreate cases.
+
 ### Event vocabulary (Rust watcher -> WASM handler)
 
 These are the `PRReviewEvent` constructors the watcher emits. Each role's `prReviewEventHandlers` decides what to do with them.

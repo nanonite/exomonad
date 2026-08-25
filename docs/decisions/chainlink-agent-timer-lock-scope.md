@@ -64,14 +64,21 @@ The lifetime contract is:
 
 - dev leaf files the PR, notifies its parent that review is pending, and stays alive
 - reviewer only produces review output
-- watcher correlates reviewer state and CI state for the original PR branch
-- watcher routes reviewer comments and CI updates back to the original dev leaf
-- watcher releases the dev leaf only after merge-ready: reviewer approval plus CI success or neutral inside the configured merge-readiness window
+- watcher records reviewer and CI observations for the original PR branch
+- the TL reducer derives review, repair, and merge actions from those facts
+- the controller releases the dev leaf only after authoritative merge reconciliation; a reviewer timeout never releases or merges it
 - TL or SubTL owns merge and Chainlink issue close after merge-ready, CI, and review policy are satisfied
 
-`session_end` from a dev leaf means its assigned work is finished only after the merge-ready release has been delivered. Before that point, `session_start`, `session_work`, comments, and PR events are progress telemetry.
+`session_end` from a dev leaf means its assigned work is finished only after the
+controller has reconciled the merge or same-owner repair outcome. Before that
+point, `session_start`, `session_work`, comments, and PR events are progress
+telemetry.
 
-Reviewer comment loops are bounded. When the watcher observes changes requested for `reviewer_max_rounds`, it marks the PR stuck, keeps the dev leaf alive in a changes-requested state, and notifies the TL with `[STUCK: ...]`. The TL must ask the human for clarification before continuing the faulty review process. The TL may then clarify the task, ask the dev leaf to proceed, split the work further, or close/re-scope the effort.
+Reviewer comment loops are bounded. When the watcher observes changes requested
+for `reviewer_max_rounds`, it records the fact and the TL derives a named gate or
+same-owner repair. The watcher does not mark the PR merge-ready, deliver repair
+messages, or respawn a leaf. The TL may ask the human for clarification before
+continuing the review process.
 
 ## Role MCP Surface
 
@@ -130,8 +137,8 @@ Keep:
 Responsibilities:
 
 - call `session_start`, `session_work`, and `session_end` only for issues assigned to the dev leaf
-- file PRs for its own assigned issue and remain alive until watcher-delivered merge-ready release
-- address watcher-delivered reviewer comments in the same worktree
+- file PRs for its own assigned issue and remain alive until controller-delivered merge reconciliation
+- address repair guidance delivered by the controller through `resume_pr` in the same worktree
 - stay alive on stuck review loops until the TL provides human clarification or re-scopes the work
 - close only worker-scoped child subissues after reviewing worker output
 
@@ -168,9 +175,13 @@ Drop:
 
 ### Reviewer
 
-Reviewers should not mutate Chainlink state. Review state flows through PR review tools.
+Reviewers should not mutate Chainlink state. Review state flows through PR review
+tools and the immutable ledger; the TL controller, not the watcher, routes the
+result into merge or same-owner repair.
 
-Keep no Chainlink mutation commands. Reviewers may use only review-specific tools and repository inspection needed for PR review. The watcher translates reviewer output into dev-leaf messages and TL notifications.
+Keep no Chainlink mutation commands. Reviewers may use only review-specific tools
+and repository inspection needed for PR review. The watcher records reviewer
+facts; the TL consumes them and owns all follow-up effects.
 
 ## Agent Identity Findings
 

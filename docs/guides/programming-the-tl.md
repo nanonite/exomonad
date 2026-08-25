@@ -698,6 +698,30 @@ EXOMONAD_FORGEJO_E2E_MOCK=1 just tl-loop-ordered-forgejo
 just tl-loop-ordered-forgejo
 ```
 
+### One-shot review orchestration
+
+The controller owns one review path from observation to effect:
+
+```text
+watcher facts -> ledger projection -> reducer -> policy intent/wait
+             -> EffectJournal -> host effect -> authoritative reconciliation
+```
+
+The watcher is a sensor. It never spawns a reviewer, adjudicates a verdict,
+repairs a leaf, or merges a PR. A reviewer is one-shot for an exact head and
+must persist its terminal GO/NO-GO evidence before exiting. The reducer then
+derives either a compare-guarded `merge_pr` (GO + same-head CI success/neutral)
+or one same-owner `resume_pr` (NO-GO/comments or same-head CI failure). A new
+head clears prior verdict and CI evidence before a new reviewer is derived.
+
+Action intent is journaled before dispatch and keyed by run, slice, operation,
+PR, and head. Restart reconciliation reuses that key and the persisted owner;
+it never rewinds the ledger, edits `plan.json`, messages an exited process, or
+creates a sibling branch. `tl.action_queued`, `tl.action_started`,
+`tl.action_reconciled`, and `tl.wait_reason_changed` expose the decision and
+the exact missing predicate. Treat those records, rather than pane liveness or
+free-form notifications, as the acceptance evidence.
+
 ---
 
 ## Worked example: a documentation step after the code merges

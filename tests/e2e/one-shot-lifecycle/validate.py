@@ -132,10 +132,12 @@ def run_scenarios(repo: Path, socket: str, mock_url: str, fake_log: Path) -> Non
     if first.get("generation") != 1:
         raise AssertionError(f"first one-shot generation was not 1: {first}")
     wait_for(lambda: len(open_prs(mock_url)) == 1, "published PR")
-    wait_for(
-        lambda: "reviewer_spawned=true" in log_text(fake_log),
-        "watcher reviewer spawn",
-    )
+    # The watcher is a sensor. A direct reviewer spawn here is a forbidden
+    # bypass; controller-driven spawning is exercised by the ordered
+    # real-server harness, which runs tl_loop through its reducer/executor.
+    time.sleep(2.0)
+    if "reviewer_spawned=true" in log_text(fake_log):
+        raise AssertionError("watcher directly spawned a reviewer instead of emitting facts")
     heads = published_heads(repo)
     if len(heads) != 1 or heads[0].get("head_branch") != "main.one-shot-codex":
         raise AssertionError(f"unexpected verified PublishedHead records: {heads}")

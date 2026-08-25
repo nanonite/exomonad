@@ -42,6 +42,12 @@ case "$agent" in
             commit_fixture one-shot-output.txt "clean exit with handoff"
             response="$(mcp_call dev "$agent" file_pr '{"title":"One-shot lifecycle fixture","body":"Published by the fake Codex dev."}')"
             printf 'file_pr=%s\n' "$response" >>"$log_file"
+            # Keep the Forgejo URL as the persisted repository identity while
+            # rewriting this disposable fixture's fetches to its local bare
+            # remote. The host therefore exercises its normal Forgejo URL
+            # validation and still has a real fetch source for resume_pr.
+            git config url."file://${E2E_FAKE_REMOTE_DIR:?E2E_FAKE_REMOTE_DIR is required}".insteadOf \
+                "${E2E_FAKE_MOCK_URL:?E2E_FAKE_MOCK_URL is required}/test-owner/one-shot.git"
             sleep 4
         else
             response="$(mcp_call dev "$agent" check_inbox '{}')"
