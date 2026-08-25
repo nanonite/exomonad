@@ -13,7 +13,12 @@ from pathlib import Path
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.ordered import IntegrationEvidence, IntegrationLifecycle
-from tl_loop.state.schema import IntegrationRuntimeState, SliceState, Verdict
+from tl_loop.state.schema import (
+    IntegrationRuntimeState,
+    ReviewPolicySource,
+    SliceState,
+    Verdict,
+)
 
 DEFAULT_REVIEW_POLICY = Path(".exo/review-policy.toml")
 REVIEWER_MAX_ROUNDS_ENV = "EXOMONAD_REVIEWER_MAX_ROUNDS"
@@ -70,7 +75,7 @@ class ReviewPolicySnapshot:
     """Resolved review policy persisted with a run for restart determinism."""
 
     reviewer_max_rounds: int | None
-    source: str
+    source: ReviewPolicySource
 
 
 def compose_acceptance_criteria(
@@ -418,9 +423,9 @@ def load_reviewer_policy_snapshot(
             raise ReviewGateError(
                 f"Invalid {REVIEWER_MAX_ROUNDS_ENV} value `{override}`: expected a positive integer"
             )
-        return ReviewPolicySnapshot(value, "environment")
+        return ReviewPolicySnapshot(value, ReviewPolicySource.ENVIRONMENT)
     if path is None:
-        return ReviewPolicySnapshot(None, "disabled")
+        return ReviewPolicySnapshot(None, ReviewPolicySource.DISABLED)
     try:
         with Path(path).open("rb") as stream:
             document = tomllib.load(stream)
@@ -429,7 +434,7 @@ def load_reviewer_policy_snapshot(
     value = document.get("reviewer_max_rounds", 5)
     if type(value) is not int or value < 1:
         raise ReviewGateError("reviewer_max_rounds must be a positive integer")
-    return ReviewPolicySnapshot(value, "policy_file")
+    return ReviewPolicySnapshot(value, ReviewPolicySource.POLICY_FILE)
 
 
 def load_reviewer_max_rounds(path: str | Path | None = DEFAULT_REVIEW_POLICY) -> int:
@@ -465,6 +470,7 @@ __all__ = [
     "ReviewGateError",
     "ReviewHeadMismatch",
     "ReviewPolicySnapshot",
+    "ReviewPolicySource",
     "StaleVerdict",
     "VerdictNotApproved",
     "compose_acceptance_criteria",

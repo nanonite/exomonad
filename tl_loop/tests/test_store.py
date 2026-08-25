@@ -339,6 +339,46 @@ def test_review_policy_snapshot_survives_store_restart(tmp_path: Path) -> None:
     assert restored.reviewer_max_rounds_source == "environment"
 
 
+@pytest.mark.parametrize(
+    ("ceiling", "source"),
+    [(3, "environment"), (3, "policy_file"), (None, "disabled")],
+)
+def test_review_policy_snapshot_round_trips_canonical_pairs(
+    tmp_path: Path, ceiling: int | None, source: str
+) -> None:
+    store = RunStore("run-1", tmp_path)
+    create("run-1", {}, root_dir=tmp_path)
+
+    store.set_review_policy(ceiling, source)
+    restored = store.load()
+
+    assert restored.reviewer_max_rounds == ceiling
+    assert restored.reviewer_max_rounds_source == source
+
+
+def test_review_policy_snapshot_rejects_invalid_pairs_before_persisting(tmp_path: Path) -> None:
+    store = RunStore("run-1", tmp_path)
+    create("run-1", {}, root_dir=tmp_path)
+
+    with pytest.raises(ValueError, match="disabled"):
+        store.set_review_policy(3, "disabled")
+    with pytest.raises(ValueError, match="positive ceiling"):
+        store.set_review_policy(None, "policy_file")
+    with pytest.raises(ValueError, match="recognised"):
+        store.set_review_policy(3, "banana")
+
+
+def test_corrupt_review_policy_fails_before_resume(tmp_path: Path) -> None:
+    store = RunStore("run-1", tmp_path)
+    create("run-1", {}, root_dir=tmp_path)
+    document = json.loads(store.path.read_text(encoding="utf-8"))
+    document["reviewer_max_rounds"] = 3
+    store.path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(CorruptCheckpoint, match="must be present together"):
+        store.load()
+
+
 def test_load_rejects_waiting_slice_with_terminal_status(tmp_path: Path) -> None:
     store = RunStore("run-1", tmp_path)
     create("run-1", {}, root_dir=tmp_path)

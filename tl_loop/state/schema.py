@@ -29,6 +29,14 @@ BLOCK_CAUSE_VALUES = frozenset(
 SCHEMA_VERSION = 2
 
 
+class ReviewPolicySource(str, Enum):
+    """Closed provenance values emitted by review-policy resolution."""
+
+    ENVIRONMENT = "environment"
+    POLICY_FILE = "policy_file"
+    DISABLED = "disabled"
+
+
 class SliceStatus(str, Enum):
     """Lifecycle status for one implementation slice."""
 
@@ -785,8 +793,10 @@ class RunState:
     repository_identity: RepositoryIdentity | None = None
     state_version: int = 0
     controller_epoch: str | None = None
+    # These two fields are one coupled snapshot. Both absent is the supported
+    # pre-policy legacy form; otherwise validation admits only producer pairs.
     reviewer_max_rounds: int | None = None
-    reviewer_max_rounds_source: str | None = None
+    reviewer_max_rounds_source: ReviewPolicySource | None = None
 
 
 class SchemaError(ValueError):
@@ -821,8 +831,7 @@ def validate(doc: object) -> None:
         _non_negative_int(root, "depth", "run", errors)
     _nullable_non_negative_int(root, "state_version", "run", errors)
     _nullable_string(root, "controller_epoch", "run", errors)
-    _nullable_positive_int(root, "reviewer_max_rounds", "run", errors)
-    _nullable_string(root, "reviewer_max_rounds_source", "run", errors)
+    _validate_review_policy_snapshot(root, "run", errors)
     _validate_repository_identity(root.get("repository_identity"), "run", errors)
 
     fsm = _object(root.get("fsm"), "run.fsm", FSM_KEYS, errors)
@@ -1739,6 +1748,57 @@ def _nullable_positive_int(
     value = holder.get(key)
     if value is not None and (type(value) is not int or value < 1):
         errors.append((f"{path}.{key}", "must be null or a positive integer"))
+
+
+def _validate_review_policy_snapshot(
+    root: dict[str, object], path: str, errors: list[tuple[str, str]]
+) -> None:
+    """Validate the persisted review ceiling and provenance as one value."""
+    ceiling_key = "reviewer_max_rounds"
+    source_key = "reviewer_max_rounds_source"
+    has_ceiling = ceiling_key in root
+    has_source = source_key in root
+    if not has_ceiling and not has_source:
+        return
+    if has_ceiling != has_source:
+        errors.append(
+            (
+                path,
+                f"{ceiling_key} and {source_key} must be present together",
+            )
+        )
+        return
+
+    raw_source = root[source_key]
+    try:
+        source = ReviewPolicySource(raw_source)
+    except (TypeError, ValueError):
+        allowed = ", ".join(item.value for item in ReviewPolicySource)
+        errors.append(
+            (
+                f"{path}.{source_key}",
+                f"must be one of {allowed}",
+            )
+        )
+        return
+
+    ceiling = root[ceiling_key]
+    if source is ReviewPolicySource.DISABLED:
+        if ceiling is not None:
+            errors.append(
+                (
+                    f"{path}.{ceiling_key}",
+                    f"must be null when {source_key} is disabled",
+                )
+            )
+        return
+    if type(ceiling) is not int or ceiling < 1:
+        errors.append(
+            (
+                f"{path}.{ceiling_key}",
+                f"must be a positive integer when {source_key} is {source.value}",
+            )
+        )
 
 
 def _nullable_non_negative_int(

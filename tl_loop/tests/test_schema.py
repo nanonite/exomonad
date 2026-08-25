@@ -319,6 +319,44 @@ def test_waiting_ids_must_reference_slices_without_duplicates() -> None:
     _assert_rejected(duplicate, "run.fsm.waiting")
 
 
+def test_review_policy_snapshot_accepts_only_producer_values() -> None:
+    for ceiling, source in (
+        (3, "environment"),
+        (3, "policy_file"),
+        (None, "disabled"),
+    ):
+        document = _valid_document()
+        document["reviewer_max_rounds"] = ceiling
+        document["reviewer_max_rounds_source"] = source
+        validate(document)
+
+    # Both keys absent is the only supported pre-policy legacy shape.
+    validate(_valid_document())
+
+    invalid_pairs = (
+        (3, None),
+        (None, "environment"),
+        (None, "policy_file"),
+        (None, None),
+        (3, "disabled"),
+        (0, "environment"),
+        (-1, "policy_file"),
+        (True, "environment"),
+        ("3", "environment"),
+        (1.5, "environment"),
+        (3, "banana"),
+    )
+    for ceiling, source in invalid_pairs:
+        document = _valid_document()
+        if ceiling is not None or source is None:
+            document["reviewer_max_rounds"] = ceiling
+        if source is not None or ceiling is None:
+            document["reviewer_max_rounds_source"] = source
+        message = _rejection(document)
+        assert "reviewer_max_rounds" in message
+        assert "reviewer_max_rounds_source" in message
+
+
 def _valid_document() -> dict[str, object]:
     return {
         "version": SCHEMA_VERSION,

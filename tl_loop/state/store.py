@@ -55,6 +55,7 @@ from .schema import (
     ParkCause,
     PublicationBinding,
     RepositoryIdentity,
+    ReviewPolicySource,
     RunState,
     SchemaError,
     SliceMap,
@@ -146,8 +147,9 @@ class ResumeState:
     integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
     repository_identity: RepositoryIdentity | None = None
     state_version: int = 0
+    # Kept as one snapshot so restart cannot silently change policy precedence.
     reviewer_max_rounds: int | None = None
-    reviewer_max_rounds_source: str | None = None
+    reviewer_max_rounds_source: ReviewPolicySource | None = None
 
     @property
     def phase(self) -> TLPhase:
@@ -234,12 +236,18 @@ class RunStore:
         """Persist the resolved review ceiling before processing events."""
         if ceiling is not None and (type(ceiling) is not int or ceiling < 1):
             raise ValueError("review ceiling must be a positive integer or null")
-        if not isinstance(source, str) or not source:
-            raise ValueError("review policy source must be non-empty")
+        try:
+            canonical_source = ReviewPolicySource(source)
+        except (TypeError, ValueError) as error:
+            raise ValueError("review policy source is not recognised") from error
+        if canonical_source is ReviewPolicySource.DISABLED and ceiling is not None:
+            raise ValueError("disabled review policy must have a null ceiling")
+        if canonical_source is not ReviewPolicySource.DISABLED and ceiling is None:
+            raise ValueError("enabled review policy must have a positive ceiling")
 
         def mutate(document: dict[str, object]) -> dict[str, object]:
             document["reviewer_max_rounds"] = ceiling
-            document["reviewer_max_rounds_source"] = source
+            document["reviewer_max_rounds_source"] = canonical_source.value
             return document
 
         apply(self.run_dir, mutate)
@@ -1031,7 +1039,11 @@ def _decode(document: dict[str, object]) -> RunState:
         state_version=cast(int, document.get("state_version", 0)),
         controller_epoch=cast(str | None, document.get("controller_epoch")),
         reviewer_max_rounds=cast(int | None, document.get("reviewer_max_rounds")),
-        reviewer_max_rounds_source=cast(str | None, document.get("reviewer_max_rounds_source")),
+        reviewer_max_rounds_source=(
+            ReviewPolicySource(cast(str, document["reviewer_max_rounds_source"]))
+            if document.get("reviewer_max_rounds_source") is not None
+            else None
+        ),
     )
 
 
