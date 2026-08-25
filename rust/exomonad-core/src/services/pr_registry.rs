@@ -156,7 +156,12 @@ impl PublishedHead {
 }
 
 /// Return whether a current invocation is reachable from the invocation that
-/// originally published a head through the append-only succession chain.
+/// originally published a head through the append-only succession table.
+///
+/// Session recreation records keep the original publisher as the stable
+/// provenance root, so the table is normally a fan-out rather than a linked
+/// list. Traversing every outgoing edge also preserves compatibility with
+/// older chain-shaped records.
 pub fn invocation_succession_reaches_current(
     publication: &PublishedHead,
     current_id: &str,
@@ -165,24 +170,23 @@ pub fn invocation_succession_reaches_current(
         return false;
     };
     let mut seen = HashSet::new();
-    let mut candidate = original_id;
-    loop {
+    let mut pending = vec![original_id];
+    while let Some(candidate) = pending.pop() {
         if candidate == current_id {
             return true;
         }
-        if !seen.insert(candidate.to_string()) {
-            return false;
+        if !seen.insert(candidate) {
+            continue;
         }
-        let Some(next) = publication
-            .invocation_succession
-            .iter()
-            .find(|succession| succession.from_invocation_id == candidate)
-            .map(|succession| succession.to_invocation_id.as_str())
-        else {
-            return false;
-        };
-        candidate = next;
+        pending.extend(
+            publication
+                .invocation_succession
+                .iter()
+                .filter(|succession| succession.from_invocation_id == candidate)
+                .map(|succession| succession.to_invocation_id.as_str()),
+        );
     }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -5400,11 +5400,26 @@ mod tests {
                 recorded_at: 1,
             },
         );
+        publication.invocation_succession.push(
+            crate::services::pr_registry::InvocationSuccession {
+                from_invocation_id: "invocation-1".to_string(),
+                to_invocation_id: "invocation-3".to_string(),
+                reason: crate::services::pr_registry::SuccessionReason::SessionRecreate,
+                recorded_at: 2,
+            },
+        );
         assert!(
             crate::services::pr_registry::invocation_succession_reaches_current(
                 &publication,
                 "invocation-2"
             )
+        );
+        assert!(
+            crate::services::pr_registry::invocation_succession_reaches_current(
+                &publication,
+                "invocation-3"
+            ),
+            "fan-out succession records must all remain reachable from the publisher"
         );
         assert!(
             !crate::services::pr_registry::invocation_succession_reaches_current(
