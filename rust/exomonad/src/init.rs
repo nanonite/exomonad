@@ -42,7 +42,7 @@ impl SessionMode {
         .filter_map(|(enabled, name)| enabled.then_some(name))
         .collect::<Vec<_>>();
         match selected.as_slice() {
-            [] => Ok(Self::Recreate),
+            [] => Ok(Self::Continue),
             [name] => match *name {
                 "--start" => Ok(Self::Start),
                 "--continue" => Ok(Self::Continue),
@@ -496,6 +496,27 @@ fn record_session_mode(cwd: &Path, mode: SessionMode) -> Result<()> {
     std::fs::write(&temporary, serde_json::to_string_pretty(&payload)?)?;
     std::fs::rename(temporary, path)?;
     Ok(())
+}
+
+fn ensure_start_allowed(project_dir: &Path) -> Result<()> {
+    match read_startup_checkpoint(project_dir)? {
+        StartupCheckpoint::Nonterminal { phase } => anyhow::bail!(
+            "refusing --start: existing non-terminal TL run is at phase {phase}; use --continue to resume it or --recreate --confirm-recreate to replace it"
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn report_legacy_session(project_dir: &Path, mode: SessionMode) {
+    if mode != SessionMode::Continue
+        || !project_dir.join(".exo/tl-loop/root/run.json").is_file()
+        || project_dir.join(".exo/tl-loop/session-mode.json").is_file()
+    {
+        return;
+    }
+    info!(
+        "No session-mode record found; continuing legacy runtime state without archiving or reinterpreting it"
+    );
 }
 
 fn plan_snapshot_path(cwd: &Path) -> PathBuf {
@@ -2371,6 +2392,10 @@ pub async fn run(
     let mut config = Config::discover()?;
     validate_runtime_compatibility(&cwd)?;
     let recreate = mode.is_recreate();
+    report_legacy_session(&cwd, mode);
+    if mode == SessionMode::Start {
+        ensure_start_allowed(&cwd)?;
+    }
     if !recreate && (confirm_recreate || force_recreate || recreate_dry_run) {
         anyhow::bail!(
             "--confirm-recreate, --force-recreate, and --recreate-dry-run require --recreate"
@@ -3833,7 +3858,7 @@ mod tests {
     fn session_mode_resolves_default_and_explicit_choices() {
         assert_eq!(
             SessionMode::resolve(false, false, false).unwrap(),
-            SessionMode::Recreate
+            SessionMode::Continue
         );
         assert_eq!(
             SessionMode::resolve(true, false, false).unwrap(),
@@ -4416,6 +4441,30 @@ mod tests {
         let error = ensure_recreate_allowed(dir.path(), false).unwrap_err();
         assert!(error.to_string().contains("--allow-pending-gate"));
         ensure_recreate_allowed(dir.path(), true).unwrap();
+    }
+
+    #[test]
+    fn start_refuses_nonterminal_checkpoint_and_names_safe_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_waiting"}}"#).unwrap();
+        let error = ensure_start_allowed(dir.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("--continue"));
+        assert!(message.contains("--recreate"));
+    }
+
+    #[test]
+    fn start_allows_missing_or_terminal_checkpoint() {
+        let missing = tempfile::tempdir().unwrap();
+        ensure_start_allowed(missing.path()).unwrap();
+
+        let terminal = tempfile::tempdir().unwrap();
+        let root = terminal.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        ensure_start_allowed(terminal.path()).unwrap();
     }
 
     #[test]

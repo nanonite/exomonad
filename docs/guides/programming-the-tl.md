@@ -157,6 +157,11 @@ max_reviewer_session_seconds = 600
 session without editing the file. Precedence is: init override → policy file →
 built-in default.
 
+Session lifecycle is explicit: bare `exomonad init` means `--continue` and
+preserves a non-terminal run; `--start` is only for a missing or terminal run;
+and `--recreate --confirm-recreate` is the destructive replacement path. Use
+`--recreate --recreate-dry-run` to inspect its plan without changing state.
+
 ### What actually gates a merge
 
 The rule has two authorities and one integrity invariant:

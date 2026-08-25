@@ -142,7 +142,7 @@ record.
 ```bash
 cd exomonad/                  # Run from the project root
 exomonad new                  # One-time setup: creates config, WASM, rules
-exomonad init                 # Current default: --recreate (mode is recorded)
+exomonad init                 # Current default: --continue (mode is recorded)
 # Explicit lifecycle choices (mutually exclusive):
 exomonad init --start         # Fresh-run intent
 exomonad init --continue      # Resume intent
@@ -161,9 +161,10 @@ rejected because there is no interactive TL fallback.
 
 The three init modes are explicit and recorded in `.exo/tl-loop/session-mode.json`
 and the run checkpoint. In this surface-only phase, omitting a mode retains the
-legacy `--recreate` default; the migration task will make `--continue` the safe
-default. Supplying more than one mode is rejected. `tl_loop status` reports the
-recorded mode alongside the durable state.
+--continue is the safe default. Supplying more than one mode is rejected.
+--start refuses a non-terminal existing run, while --recreate requires an
+explicit destruction-plan confirmation. tl_loop status reports the recorded
+mode alongside the durable state.
 
 When continuing, ExoMonad compares .exo/tl-loop/plan.json byte-for-byte with
 the immutable .exo/tl-loop/plan.snapshot recorded at session creation. Plan

@@ -245,12 +245,15 @@ $EDITOR .exo/harness_policy.toml
 # 2. Author the plan (no natural-language TL prompt is accepted)
 $EDITOR .exo/tl-loop/plan.json
 
-# 3. Rebuild the session against the new binary and WASM
-exomonad init --recreate
+# 3. Start or continue the session against the new binary and WASM
+exomonad init
 ```
 
-`--recreate` tears down and rebuilds the tmux session. Companion worktrees under
-`.exo/companions/` persist across it — only the session is torn down.
+Bare init continues an existing non-terminal run and is safe to repeat. Use
+`exomonad init --start` only when no non-terminal run exists. To intentionally
+destroy the current session, first inspect `exomonad init --recreate
+--recreate-dry-run`, then pass `exomonad init --recreate --confirm-recreate`;
+protected PRs also require `--force-recreate`.
 
 The TL window now runs `python3 ~/.exo/tl_loop.pyz`, not a harness session. Do not type
 `claude` into it. Init applies a bounded five-second startup liveness gate to
