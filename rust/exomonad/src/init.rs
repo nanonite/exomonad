@@ -4,7 +4,9 @@ use exomonad::config::{
     Config, EffortLevel, ResolvedEffort, REVIEWER_EFFORT_ENV, REVIEWER_MAX_ROUNDS_ENV,
     REVIEWER_MODEL_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV,
 };
-use exomonad_core::services::runtime_manifest::PUBLICATION_REGISTRY_SCHEMA_VERSION;
+use exomonad_core::services::runtime_manifest::{
+    PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
+};
 use exomonad_core::services::AgentType;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -935,25 +937,6 @@ fn run_tl_loop_preflight(cwd: &Path, package_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn checkout_git_commit(cwd: &Path) -> Result<String> {
-    let output = std::process::Command::new("git")
-        .current_dir(cwd)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .context("failed to resolve the project checkout revision")?;
-    if !output.status.success() {
-        anyhow::bail!("git rev-parse HEAD failed with {}", output.status);
-    }
-    let commit = String::from_utf8(output.stdout)
-        .context("git returned a non-UTF-8 checkout revision")?
-        .trim()
-        .to_owned();
-    if commit.is_empty() {
-        anyhow::bail!("git rev-parse HEAD returned an empty checkout revision");
-    }
-    Ok(commit)
-}
-
 fn validate_publication_registry_schema(cwd: &Path) -> Result<()> {
     let path = cwd.join(".exo/published-heads.json");
     if !path.is_file() {
@@ -984,18 +967,17 @@ fn validate_publication_registry_schema(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_runtime_builds(
-    checkout: &str,
-    server_build: &str,
-    controller_build: &str,
-) -> Result<()> {
-    if server_build == "unknown"
-        || controller_build == "unknown"
-        || server_build != checkout
-        || controller_build != checkout
-    {
+fn validate_runtime_builds(server_build: &str, controller_build: &str) -> Result<()> {
+    if server_build == "unknown" || controller_build == "unknown" {
         anyhow::bail!(
-            "incompatible ExoMonad runtime artifacts: checkout={checkout}, server_build={}, controller_build={}. Rebuild and install with just install-all-dev; --recreate resets orchestration state but does not update artifacts",
+            "incompatible ExoMonad runtime artifacts: unknown ExoMonad build identity (server_build={}, controller_build={}). Rebuild and install synchronized artifacts with just install-all-dev; the managed project revision is unrelated",
+            server_build,
+            controller_build,
+        );
+    }
+    if server_build != controller_build {
+        anyhow::bail!(
+            "incompatible ExoMonad runtime artifacts: server/controller build identities differ (server_build={}, controller_build={}). Rebuild and install synchronized artifacts with just install-all-dev; the managed project revision is unrelated",
             server_build,
             controller_build,
         );
@@ -1003,19 +985,38 @@ fn validate_runtime_builds(
     Ok(())
 }
 
+fn validate_runtime_contract(
+    protocol_version: u32,
+    publication_registry_schema: u32,
+) -> Result<()> {
+    if protocol_version != RUNTIME_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "unsupported ExoMonad runtime protocol version {}; supported version is {}. Rebuild and install synchronized artifacts with just install-all-dev",
+            protocol_version,
+            RUNTIME_PROTOCOL_VERSION,
+        );
+    }
+    if publication_registry_schema > PUBLICATION_REGISTRY_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported publication registry schema version {}; supported through {}. Upgrade ExoMonad before restarting",
+            publication_registry_schema,
+            PUBLICATION_REGISTRY_SCHEMA_VERSION,
+        );
+    }
+    Ok(())
+}
+
 fn validate_runtime_compatibility(cwd: &Path) -> Result<()> {
-    let checkout = checkout_git_commit(cwd)?;
-    validate_runtime_builds(
-        &checkout,
-        EXOMONAD_BUILD_GIT_COMMIT,
-        EXOMONAD_TL_LOOP_GIT_COMMIT,
+    validate_runtime_builds(EXOMONAD_BUILD_GIT_COMMIT, EXOMONAD_TL_LOOP_GIT_COMMIT)?;
+    validate_runtime_contract(
+        RUNTIME_PROTOCOL_VERSION,
+        PUBLICATION_REGISTRY_SCHEMA_VERSION,
     )?;
     validate_publication_registry_schema(cwd)?;
     info!(
-        checkout,
         server_build = EXOMONAD_BUILD_GIT_COMMIT,
         controller_build = EXOMONAD_TL_LOOP_GIT_COMMIT,
-        protocol_version = exomonad_core::services::runtime_manifest::RUNTIME_PROTOCOL_VERSION,
+        protocol_version = RUNTIME_PROTOCOL_VERSION,
         publication_registry_schema = PUBLICATION_REGISTRY_SCHEMA_VERSION,
         "Validated ExoMonad runtime compatibility"
     );
@@ -1778,6 +1779,11 @@ pub async fn run(
         anyhow::bail!("No exomonad project found. Run `exomonad new` first.");
     }
 
+    // Validate ExoMonad-owned runtime artifacts before any configuration,
+    // inbox, capability, plan, or orchestration side effect.
+    let mut config = Config::discover()?;
+    validate_runtime_compatibility(&cwd)?;
+
     if let Some(ref remote_name) = set_git_remote {
         set_git_remote_override(&cwd, remote_name)?;
     }
@@ -1787,12 +1793,11 @@ pub async fn run(
         info!("cleared inbox messages and metadata");
     }
 
-    // Resolve config
-    let mut config = Config::discover()?;
+    // Resolve runtime paths and capability configuration after compatibility
+    // has been established.
     let runtime_paths = config.tl_preflight_runtime_paths.join(",");
     std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, &runtime_paths);
     ensure_harness_capability(&cwd)?;
-    validate_runtime_compatibility(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
     write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
     if skip_preflight {
@@ -3975,10 +3980,60 @@ mod tests {
 
     #[test]
     fn runtime_build_validation_fails_closed_with_rebuild_instruction() {
-        let error = validate_runtime_builds("new", "old", "new").unwrap_err();
+        let error = validate_runtime_builds("old", "new").unwrap_err();
         let message = error.to_string();
+        assert!(message.contains("server/controller build identities differ"));
         assert!(message.contains("server_build=old"));
         assert!(message.contains("just install-all-dev"));
+    }
+
+    #[test]
+    fn runtime_validation_ignores_unrelated_managed_project_revision() {
+        let project = tempfile::tempdir().unwrap();
+        validate_runtime_compatibility(project.path()).unwrap();
+    }
+
+    #[test]
+    fn runtime_build_validation_rejects_unknown_identity() {
+        let error = validate_runtime_builds("unknown", "bf89654f").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unknown ExoMonad build identity"));
+        assert!(message.contains("managed project revision is unrelated"));
+    }
+
+    #[test]
+    fn runtime_contract_rejects_unsupported_protocol_and_schema() {
+        let protocol_error =
+            validate_runtime_contract(RUNTIME_PROTOCOL_VERSION + 1, 0).unwrap_err();
+        assert!(protocol_error
+            .to_string()
+            .contains("unsupported ExoMonad runtime protocol version"));
+
+        let schema_error = validate_runtime_contract(
+            RUNTIME_PROTOCOL_VERSION,
+            PUBLICATION_REGISTRY_SCHEMA_VERSION + 1,
+        )
+        .unwrap_err();
+        assert!(schema_error
+            .to_string()
+            .contains("unsupported publication registry schema version"));
+    }
+
+    #[test]
+    fn runtime_validation_precedes_plan_and_recreate_mutations() {
+        let source = include_str!("init.rs");
+        let validation = source
+            .find("validate_runtime_compatibility(&cwd)?")
+            .expect("init must validate runtime compatibility");
+        let plan = source
+            .find("write_tl_loop_plan(&cwd")
+            .expect("init must locate the plan write");
+        let recreate = source
+            .find("archive_root_tl_run(&cwd)?")
+            .expect("init must locate recreation archive");
+
+        assert!(validation < plan);
+        assert!(validation < recreate);
     }
 
     #[test]
