@@ -142,7 +142,11 @@ record.
 ```bash
 cd exomonad/                  # Run from the project root
 exomonad new                  # One-time setup: creates config, WASM, rules
-exomonad init                 # Creates tmux session, starts server
+exomonad init                 # Current default: --recreate (mode is recorded)
+# Explicit lifecycle choices (mutually exclusive):
+exomonad init --start         # Fresh-run intent
+exomonad init --continue      # Resume intent
+exomonad init --recreate      # Tear down and rebuild intent
 # The TL window now runs the controller. Give it a JSON WorkPlan:
 python3 ~/.exo/tl_loop.pyz status --project-root .
 python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root --name <gate> --approve
@@ -153,7 +157,11 @@ The controller waits for `.exo/tl-loop/plan.json` when no structured
 `workers`, `leaves`, and/or `sub_tls`; legacy natural-language TL prompts are
 rejected because there is no interactive TL fallback.
 
-Use `--recreate` to tear down and rebuild the session (e.g., after binary updates).
+The three init modes are explicit and recorded in `.exo/tl-loop/session-mode.json`
+and the run checkpoint. In this surface-only phase, omitting a mode retains the
+legacy `--recreate` default; the migration task will make `--continue` the safe
+default. Supplying more than one mode is rejected. `tl_loop status` reports the
+recorded mode alongside the durable state.
 
 Optional local Forgejo CI stack:
 ```bash

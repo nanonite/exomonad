@@ -528,6 +528,7 @@ class TLLoopConfig:
     root_dir: str | Path = DEFAULT_ROOT
     project_root: str | Path | None = None
     run_id: str = "tl-run"
+    session_mode: str | None = None
     ledger_run_id: str | None = None
     policy: HarnessPolicy | None = None
     learned_policy: LearnedPolicy | None = None
@@ -590,6 +591,12 @@ class TLLoopConfig:
         _optional_text(self.merge_strategy, "merge_strategy")
         _optional_text(self.working_dir, "working_dir")
         _require_text(self.run_id, "run_id")
+        if self.session_mode is not None and self.session_mode not in {
+            "start",
+            "continue",
+            "recreate",
+        }:
+            raise ValueError("session_mode must be start, continue, recreate, or null")
         _optional_text(self.ledger_run_id, "ledger_run_id")
         _require_text(self.role, "role")
         for name in ("depth", "max_depth"):
@@ -715,10 +722,14 @@ def run_tl_loop(
             root_state["budgets"] = _budget_root(budgets)
         if selected.ledger_run_id is not None:
             root_state["ledger_run_id"] = selected.ledger_run_id
+        if selected.session_mode is not None:
+            root_state["session_mode"] = selected.session_mode
         if epoch_enabled:
             root_state["controller_epoch"] = _controller_epoch(store.root_dir, run_id)
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
+    if state.session_mode is None and selected.session_mode is not None:
+        state = store.set_session_mode(selected.session_mode)
     if state.controller_epoch is None and epoch_enabled:
         state = store.set_controller_epoch(_controller_epoch(store.root_dir, run_id))
     if (

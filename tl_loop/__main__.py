@@ -269,6 +269,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     run_id = _run_id(plan_document, args.run_id)
     ledger_run_id = _authoritative_ledger_run_id(project_root)
     state_root = project_root / ".exo" / "tl-loop"
+    session_mode = _read_session_mode(project_root)
     reader = LedgerReader(
         project_root / ".exo" / "ledger" / "segments",
         run_id=run_id,
@@ -308,6 +309,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         root_dir=state_root,
         project_root=project_root,
         run_id=run_id,
+        session_mode=session_mode,
         ledger_run_id=ledger_run_id,
         role="worker",
         enable_reviewer_spawn=True,
@@ -479,6 +481,21 @@ def _authoritative_ledger_run_id(project_root: Path) -> str | None:
     return value or None
 
 
+def _read_session_mode(project_root: Path) -> str | None:
+    """Read the host's explicit lifecycle choice for this run, if recorded."""
+    path = project_root / ".exo" / "tl-loop" / "session-mode.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise LauncherError(f"session mode record is unreadable: {error}") from error
+    mode = value.get("session_mode") if isinstance(value, Mapping) else None
+    if mode not in {"start", "continue", "recreate"}:
+        raise LauncherError("session mode record contains an unsupported mode")
+    return cast(str, mode)
+
+
 def _print_result(result: TLRunResult) -> None:
     state = result.final_state
     LOGGER.info(
@@ -551,13 +568,15 @@ def _status_snapshot(
 ) -> str:
     """Render one race-tolerant, read-only status snapshot."""
     controller_fingerprint = fingerprint_report(project_root)
+    session_mode = _read_session_mode(project_root)
     reason = store.exit_reason()
     if reason:
-        return _status_message(f"controller exited: {reason}", controller_fingerprint)
+        return _status_message(f"controller exited: {reason}", controller_fingerprint, session_mode)
     if not store.path.exists():
         return _status_message(
             f"no run yet; controller is waiting for .exo/tl-loop/plan.json (path: {plan_path})",
             controller_fingerprint,
+            session_mode,
         )
     try:
         state = store.load()
@@ -572,6 +591,7 @@ def _status_snapshot(
         return _status_message(
             f"checkpoint is currently unavailable; retrying: {error}",
             controller_fingerprint,
+            session_mode,
         )
     document = _state_document(state, replay.events, replay.sequence_status)
     document["controller_fingerprint"] = controller_fingerprint
@@ -581,11 +601,14 @@ def _status_snapshot(
     return json.dumps(document, indent=2, sort_keys=True)
 
 
-def _status_message(message: str, controller_fingerprint: Mapping[str, object]) -> str:
+def _status_message(
+    message: str,
+    controller_fingerprint: Mapping[str, object],
+    session_mode: str | None = None,
+) -> str:
     """Keep text status diagnostics readable while exposing the build stamp."""
-    return (
-        f"{message}\ncontroller fingerprint: {json.dumps(controller_fingerprint, sort_keys=True)}"
-    )
+    mode_line = f"\nsession mode: {session_mode}" if session_mode is not None else ""
+    return f"{message}{mode_line}\ncontroller fingerprint: {json.dumps(controller_fingerprint, sort_keys=True)}"
 
 
 def _set_gate(args: argparse.Namespace) -> None:

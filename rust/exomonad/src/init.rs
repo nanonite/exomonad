@@ -13,6 +13,52 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
+/// Explicit lifecycle choice for an `exomonad init` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionMode {
+    Start,
+    Continue,
+    Recreate,
+}
+
+impl SessionMode {
+    pub(crate) fn resolve(start: bool, cont: bool, recreate: bool) -> Result<Self> {
+        let selected = [
+            (start, "--start"),
+            (cont, "--continue"),
+            (recreate, "--recreate"),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, name)| enabled.then_some(name))
+        .collect::<Vec<_>>();
+        match selected.as_slice() {
+            [] => Ok(Self::Recreate),
+            [name] => match *name {
+                "--start" => Ok(Self::Start),
+                "--continue" => Ok(Self::Continue),
+                "--recreate" => Ok(Self::Recreate),
+                _ => unreachable!(),
+            },
+            names => anyhow::bail!(
+                "session modes are mutually exclusive; choose exactly one of {}",
+                names.join(", ")
+            ),
+        }
+    }
+
+    pub(crate) fn is_recreate(self) -> bool {
+        matches!(self, Self::Recreate)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Continue => "continue",
+            Self::Recreate => "recreate",
+        }
+    }
+}
+
 #[cfg(test)]
 const TL_LOOP_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tl_loop.pyz"));
 const TL_LOOP_PYPROJECT: &str = include_str!("../../../tl_loop/pyproject.toml");
@@ -82,7 +128,12 @@ fn redact_init_argv(args: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-fn append_init_invocation_log(cwd: &Path, config: &Config, argv: &[String]) -> Result<()> {
+fn append_init_invocation_log(
+    cwd: &Path,
+    config: &Config,
+    argv: &[String],
+    mode: SessionMode,
+) -> Result<()> {
     let log_dir = cwd.join(".exo/logs");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("failed to create init log directory {}", log_dir.display()))?;
@@ -90,6 +141,7 @@ fn append_init_invocation_log(cwd: &Path, config: &Config, argv: &[String]) -> R
         "timestamp_ms": current_time_millis(),
         "argv": argv,
         "session": config.tmux_session.as_str(),
+        "session_mode": mode.as_str(),
         "resolved": {
             "root_agent_type": agent_type_str(config.root_agent_type),
             "spawn_agent_type": agent_type_str(config.spawn_agent_type),
@@ -109,6 +161,22 @@ fn append_init_invocation_log(cwd: &Path, config: &Config, argv: &[String]) -> R
         .open(log_dir.join("init.jsonl"))?;
     use std::io::Write as _;
     writeln!(file, "{}", serde_json::to_string(&payload)?)?;
+    Ok(())
+}
+
+fn record_session_mode(cwd: &Path, mode: SessionMode) -> Result<()> {
+    let path = cwd.join(".exo/tl-loop/session-mode.json");
+    let parent = path
+        .parent()
+        .context("session mode record has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("tmp");
+    let payload = serde_json::json!({
+        "session_mode": mode.as_str(),
+        "recorded_at_ms": current_time_millis(),
+    });
+    std::fs::write(&temporary, serde_json::to_string_pretty(&payload)?)?;
+    std::fs::rename(temporary, path)?;
     Ok(())
 }
 
@@ -1750,7 +1818,7 @@ fn startup_failure_with_pane_output(fallback_reason: String, output: &str) -> St
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     session_override: Option<String>,
-    recreate: bool,
+    mode: SessionMode,
     allow_pending_gate: bool,
     openrouter: bool,
     worker: Option<String>,
@@ -1881,7 +1949,7 @@ pub async fn run(
         None
     };
     let init_argv = redact_init_argv(std::env::args().collect::<Vec<_>>());
-    if let Err(e) = append_init_invocation_log(&cwd, &config, &init_argv) {
+    if let Err(e) = append_init_invocation_log(&cwd, &config, &init_argv, mode) {
         warn!(error = %e, "Failed to append init invocation log");
     } else {
         info!(
@@ -1900,6 +1968,7 @@ pub async fn run(
             "Resolved exomonad init agent configuration"
         );
     }
+    record_session_mode(&cwd, mode)?;
 
     // Check OTel endpoint reachability if configured
     if let Some(ref endpoint) = config.otlp_endpoint {
@@ -1959,6 +2028,7 @@ pub async fn run(
 
     let session = session_override.unwrap_or(config.tmux_session.clone());
     let session_alive = TmuxIpc::has_session(&session).await?;
+    let recreate = mode.is_recreate();
     let session_transition = if recreate {
         exomonad_core::services::SessionTransition::Recreate
     } else if session_alive {
@@ -3185,6 +3255,7 @@ mod tests {
                 "--worker".to_string(),
                 "opencode".to_string(),
             ],
+            SessionMode::Continue,
         )
         .unwrap();
 
@@ -3194,11 +3265,51 @@ mod tests {
         assert_eq!(value["resolved"]["root_agent_type"], "claude");
         assert_eq!(value["resolved"]["spawn_agent_type"], "opencode");
         assert_eq!(value["resolved"]["reviewer_agent_type"], "codex");
+        assert_eq!(value["session_mode"], "continue");
         assert_eq!(
             value["resolved"]["opencode_worker_model"],
             "opencode-go/deepseek-v4-pro"
         );
         assert_eq!(value["argv"][2], "--worker");
+    }
+
+    #[test]
+    fn session_mode_resolves_default_and_explicit_choices() {
+        assert_eq!(
+            SessionMode::resolve(false, false, false).unwrap(),
+            SessionMode::Recreate
+        );
+        assert_eq!(
+            SessionMode::resolve(true, false, false).unwrap(),
+            SessionMode::Start
+        );
+        assert_eq!(
+            SessionMode::resolve(false, true, false).unwrap(),
+            SessionMode::Continue
+        );
+        assert_eq!(
+            SessionMode::resolve(false, false, true).unwrap(),
+            SessionMode::Recreate
+        );
+    }
+
+    #[test]
+    fn session_mode_rejects_conflicting_flags_by_name() {
+        let error = SessionMode::resolve(true, true, false).unwrap_err();
+        assert!(error.to_string().contains("--start"));
+        assert!(error.to_string().contains("--continue"));
+    }
+
+    #[test]
+    fn session_mode_record_is_atomic_and_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_session_mode(tmp.path(), SessionMode::Start).unwrap();
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".exo/tl-loop/session-mode.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["session_mode"], "start");
+        assert!(!tmp.path().join(".exo/tl-loop/session-mode.tmp").exists());
     }
 
     #[test]

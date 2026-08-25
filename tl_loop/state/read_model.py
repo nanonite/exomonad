@@ -314,6 +314,7 @@ class ReadModel:
     """Immutable operator view built from one durable state cursor."""
 
     run_id: str
+    session_mode: str | None
     revision: int
     phase: str
     waiting: tuple[str, ...]
@@ -352,6 +353,7 @@ class ReadModel:
         return {
             "schema_version": self.schema_version,
             "run_id": self.run_id,
+            "session_mode": self.session_mode,
             "revision": self.revision,
             "phase": self.phase,
             "waiting": list(self.waiting),
@@ -417,6 +419,7 @@ def project_read_model(
     integration = _integration_model(state)
     return ReadModel(
         run_id=state.run_id,
+        session_mode=state.session_mode.value if state.session_mode is not None else None,
         revision=state.revision,
         phase=state.fsm.phase.value,
         waiting=tuple(state.fsm.waiting),

@@ -37,6 +37,14 @@ class ReviewPolicySource(str, Enum):
     DISABLED = "disabled"
 
 
+class SessionMode(str, Enum):
+    """The explicit host lifecycle mode that created or resumed this run."""
+
+    START = "start"
+    CONTINUE = "continue"
+    RECREATE = "recreate"
+
+
 class SliceStatus(str, Enum):
     """Lifecycle status for one implementation slice."""
 
@@ -344,6 +352,7 @@ RUN_KEYS = frozenset(
         "repository_identity",
         "state_version",
         "controller_epoch",
+        "session_mode",
         "reviewer_max_rounds",
         "reviewer_max_rounds_source",
     }
@@ -793,6 +802,7 @@ class RunState:
     repository_identity: RepositoryIdentity | None = None
     state_version: int = 0
     controller_epoch: str | None = None
+    session_mode: SessionMode | None = None
     # These two fields are one coupled snapshot. Both absent is the supported
     # pre-policy legacy form; otherwise validation admits only producer pairs.
     reviewer_max_rounds: int | None = None
@@ -831,6 +841,8 @@ def validate(doc: object) -> None:
         _non_negative_int(root, "depth", "run", errors)
     _nullable_non_negative_int(root, "state_version", "run", errors)
     _nullable_string(root, "controller_epoch", "run", errors)
+    if root.get("session_mode") is not None:
+        _enum_value(root, "session_mode", "run", SessionMode, errors)
     _validate_review_policy_snapshot(root, "run", errors)
     _validate_repository_identity(root.get("repository_identity"), "run", errors)
 

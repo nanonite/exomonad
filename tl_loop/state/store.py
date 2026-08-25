@@ -56,6 +56,7 @@ from .schema import (
     PublicationBinding,
     RepositoryIdentity,
     ReviewPolicySource,
+    SessionMode,
     RunState,
     SchemaError,
     SliceMap,
@@ -150,6 +151,7 @@ class ResumeState:
     # Kept as one snapshot so restart cannot silently change policy precedence.
     reviewer_max_rounds: int | None = None
     reviewer_max_rounds_source: ReviewPolicySource | None = None
+    session_mode: SessionMode | None = None
 
     @property
     def phase(self) -> TLPhase:
@@ -248,6 +250,20 @@ class RunStore:
         def mutate(document: dict[str, object]) -> dict[str, object]:
             document["reviewer_max_rounds"] = ceiling
             document["reviewer_max_rounds_source"] = canonical_source.value
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
+    def set_session_mode(self, mode: str | SessionMode) -> RunState:
+        """Persist the host-selected lifecycle mode on the run checkpoint."""
+        try:
+            canonical_mode = mode if isinstance(mode, SessionMode) else SessionMode(mode)
+        except (TypeError, ValueError) as error:
+            raise ValueError("session mode is not recognised") from error
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            document["session_mode"] = canonical_mode.value
             return document
 
         apply(self.run_dir, mutate)
@@ -594,6 +610,7 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
         state_version=state.state_version,
         reviewer_max_rounds=state.reviewer_max_rounds,
         reviewer_max_rounds_source=state.reviewer_max_rounds_source,
+        session_mode=state.session_mode,
     )
 
 
@@ -618,6 +635,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "repository_identity",
         "state_version",
         "controller_epoch",
+        "session_mode",
         "reviewer_max_rounds",
         "reviewer_max_rounds_source",
     }
@@ -634,6 +652,8 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "gates": [],
         "events": {"last_consumed_offset": 0},
     }
+    if "session_mode" in root_spec:
+        document["session_mode"] = root_spec["session_mode"]
     for key, value in root_spec.items():
         document[key] = copy.deepcopy(value)
     return document
@@ -1042,6 +1062,11 @@ def _decode(document: dict[str, object]) -> RunState:
         reviewer_max_rounds_source=(
             ReviewPolicySource(cast(str, document["reviewer_max_rounds_source"]))
             if document.get("reviewer_max_rounds_source") is not None
+            else None
+        ),
+        session_mode=(
+            SessionMode(cast(str, document["session_mode"]))
+            if document.get("session_mode") is not None
             else None
         ),
     )

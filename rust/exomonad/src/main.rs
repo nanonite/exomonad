@@ -78,7 +78,13 @@ enum Commands {
         /// Optionally override session name (default: from config)
         #[arg(long)]
         session: Option<String>,
-        /// Delete existing session and create fresh
+        /// Start a fresh run.
+        #[arg(long)]
+        start: bool,
+        /// Continue the existing run while preserving durable state.
+        #[arg(long = "continue")]
+        continue_: bool,
+        /// Delete existing session and create fresh.
         #[arg(long)]
         recreate: bool,
         /// Allow --recreate to archive an unanswered human gate.
@@ -497,6 +503,8 @@ async fn main() -> Result<()> {
 
         Commands::Init {
             session,
+            start,
+            continue_,
             recreate,
             allow_pending_gate,
             openrouter,
@@ -514,9 +522,10 @@ async fn main() -> Result<()> {
             import_legacy,
             import_legacy_dry_run,
         } => {
+            let mode = init::SessionMode::resolve(start, continue_, recreate)?;
             if let Err(e) = init::run(
                 session,
-                recreate,
+                mode,
                 allow_pending_gate,
                 openrouter,
                 worker,
