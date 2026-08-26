@@ -200,8 +200,12 @@ struct WorkflowRunResponse {
     name: Option<String>,
     #[serde(default)]
     display_title: Option<String>,
-    #[serde(default, rename = "prettyref", alias = "head_branch")]
-    head_branch_ref: Option<String>,
+    #[serde(default)]
+    head_branch: Option<String>,
+    #[serde(default, rename = "ref")]
+    ref_name: Option<String>,
+    #[serde(default, rename = "prettyref")]
+    pretty_ref: Option<String>,
     #[serde(default, alias = "commit_sha")]
     head_sha: Option<String>,
     #[serde(default)]
@@ -924,24 +928,22 @@ impl HttpForgejoClient {
             .decode_response(response, "list Forgejo Actions runs")
             .await?;
         let total_runs = runs.workflow_runs.len();
-        let Some(run) = runs.workflow_runs.into_iter().find(|run| {
-            let sha_matches = run.head_sha.as_deref() == Some(head_sha);
-            let branch_matches = run
-                .head_branch_ref
-                .as_deref()
-                .map(|ref_name| ref_name.trim_start_matches("refs/heads/"))
-                == Some(branch.as_str());
-            sha_matches && branch_matches
-        }) else {
+        let matching_statuses = runs
+            .workflow_runs
+            .iter()
+            .filter(|run| workflow_run_matches_head(run, branch, head_sha))
+            .map(workflow_status)
+            .collect::<Vec<_>>();
+        if matching_statuses.is_empty() {
             tracing::debug!(
                 head_sha,
                 branch = %branch,
                 total_runs,
-                "[Forgejo] No Actions run matched branch+SHA; CI status unknown"
+                "[Forgejo] No Actions run matched exact head SHA; CI status unknown"
             );
             return Ok(CIStatus::Unknown);
-        };
-        Ok(workflow_status(run))
+        }
+        Ok(combine_workflow_statuses(matching_statuses))
     }
 
     pub async fn latest_actions_status_for_branch(
@@ -967,7 +969,11 @@ impl HttpForgejoClient {
         let runs: WorkflowRunsResponse = self
             .decode_response(response, "list Forgejo Actions runs")
             .await?;
-        Ok(runs.workflow_runs.into_iter().next().map(workflow_status))
+        Ok(runs
+            .workflow_runs
+            .into_iter()
+            .next()
+            .map(|run| workflow_status(&run)))
     }
 
     pub async fn list_workflow_runs_for_branch(
@@ -1226,10 +1232,8 @@ impl HttpForgejoClient {
         if status.is_success() {
             return Ok(ResponseBody(body));
         }
-        Err(anyhow!(
-            "{action} failed with HTTP {status}: {}",
-            body.trim()
-        ))
+        let _ = body;
+        Err(anyhow!("{action} failed with HTTP {status}"))
     }
 }
 
@@ -1634,10 +1638,52 @@ fn combine_commit_statuses(statuses: Vec<ForgejoCommitStatus>) -> CIStatus {
     CIStatus::Unknown
 }
 
-fn workflow_status(run: WorkflowRunResponse) -> CIStatus {
+fn workflow_run_branch(run: &WorkflowRunResponse) -> Option<&str> {
+    run.head_branch
+        .as_deref()
+        .and_then(normalize_workflow_branch)
+        .or_else(|| run.ref_name.as_deref().and_then(normalize_workflow_branch))
+}
+
+fn normalize_workflow_branch(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let branch = value.strip_prefix("refs/heads/").unwrap_or(value);
+    if branch.is_empty() || branch.starts_with('#') || branch.starts_with("refs/") {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
+fn workflow_run_matches_head(
+    run: &WorkflowRunResponse,
+    branch: &BranchName,
+    head_sha: &str,
+) -> bool {
+    run.head_sha.as_deref() == Some(head_sha)
+        && workflow_run_branch(run).is_none_or(|run_branch| run_branch == branch.as_str())
+}
+
+fn combine_workflow_statuses(statuses: impl IntoIterator<Item = CIStatus>) -> CIStatus {
+    let statuses = statuses.into_iter().collect::<Vec<_>>();
+    if statuses.contains(&CIStatus::Failure) {
+        CIStatus::Failure
+    } else if statuses.contains(&CIStatus::Pending) {
+        CIStatus::Pending
+    } else if statuses.contains(&CIStatus::Success) {
+        CIStatus::Success
+    } else if statuses.contains(&CIStatus::Neutral) {
+        CIStatus::Neutral
+    } else {
+        CIStatus::Unknown
+    }
+}
+
+fn workflow_status(run: &WorkflowRunResponse) -> CIStatus {
     run.conclusion
-        .or(run.status)
-        .map(|status| CIStatus::parse(&status))
+        .as_deref()
+        .or(run.status.as_deref())
+        .map(CIStatus::parse)
         .unwrap_or(CIStatus::Unknown)
 }
 
@@ -1716,7 +1762,7 @@ impl From<WorkflowRunResponse> for ForgejoWorkflowRun {
         Self {
             name: value.name.unwrap_or_else(|| "workflow".to_string()),
             display_title: value.display_title.unwrap_or_default(),
-            head_branch: value.head_branch_ref,
+            head_branch: value.head_branch.or(value.ref_name).or(value.pretty_ref),
             head_sha: value.head_sha,
             status,
             conclusion: value.conclusion,
@@ -1824,6 +1870,124 @@ mod tests {
             CIStatus::Success
         );
         assert_eq!(combine_commit_statuses(Vec::new()), CIStatus::Unknown);
+    }
+
+    fn workflow_run(
+        head_branch: Option<&str>,
+        ref_name: Option<&str>,
+        pretty_ref: Option<&str>,
+        head_sha: Option<&str>,
+        status: Option<&str>,
+        conclusion: Option<&str>,
+    ) -> WorkflowRunResponse {
+        WorkflowRunResponse {
+            name: None,
+            display_title: None,
+            head_branch: head_branch.map(str::to_string),
+            ref_name: ref_name.map(str::to_string),
+            pretty_ref: pretty_ref.map(str::to_string),
+            head_sha: head_sha.map(str::to_string),
+            status: status.map(str::to_string),
+            conclusion: conclusion.map(str::to_string),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn actions_matching_uses_exact_sha_before_display_ref() {
+        let display_ref = workflow_run(
+            None,
+            None,
+            Some("#43"),
+            Some("abc123"),
+            Some("completed"),
+            Some("success"),
+        );
+        let stale_display_ref = workflow_run(
+            None,
+            None,
+            Some("#43"),
+            Some("old-sha"),
+            Some("completed"),
+            Some("success"),
+        );
+
+        assert!(workflow_run_matches_head(
+            &display_ref,
+            &branch("main.feature"),
+            "abc123"
+        ));
+        assert!(!workflow_run_matches_head(
+            &stale_display_ref,
+            &branch("main.feature"),
+            "abc123"
+        ));
+    }
+
+    #[test]
+    fn actions_matching_uses_real_branch_or_ref_as_disambiguation() {
+        let matching_branch = workflow_run(
+            Some("refs/heads/main.feature"),
+            None,
+            Some("#43"),
+            Some("abc123"),
+            Some("completed"),
+            Some("success"),
+        );
+        let other_branch = workflow_run(
+            Some("other"),
+            None,
+            Some("#43"),
+            Some("abc123"),
+            Some("completed"),
+            Some("success"),
+        );
+
+        assert!(workflow_run_matches_head(
+            &matching_branch,
+            &branch("main.feature"),
+            "abc123"
+        ));
+        assert!(!workflow_run_matches_head(
+            &other_branch,
+            &branch("main.feature"),
+            "abc123"
+        ));
+    }
+
+    #[test]
+    fn workflow_status_combination_preserves_failure_and_pending_precedence() {
+        assert_eq!(
+            combine_workflow_statuses([CIStatus::Success, CIStatus::Pending]),
+            CIStatus::Pending
+        );
+        assert_eq!(
+            combine_workflow_statuses([CIStatus::Success, CIStatus::Failure]),
+            CIStatus::Failure
+        );
+        assert_eq!(
+            combine_workflow_statuses([CIStatus::Success, CIStatus::Neutral]),
+            CIStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn actions_status_http_errors_omit_response_payloads() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/actions/runs"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("sensitive-forgejo-payload"))
+            .mount(&server)
+            .await;
+
+        let error = client
+            .actions_status_for_head(&owner(), &repo(), &branch("main.feature"), "abc123")
+            .await
+            .expect_err("HTTP failure should be returned to the dashboard");
+
+        assert!(error.to_string().contains("HTTP 500"));
+        assert!(!error.to_string().contains("sensitive-forgejo-payload"));
     }
 
     #[tokio::test]
@@ -1967,13 +2131,14 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "workflow_runs": [
                     {
-                        "prettyref": "refs/heads/other",
+                        "prettyref": "#43",
                         "commit_sha": "abc123",
                         "status": "completed",
                         "conclusion": "success"
                     },
                     {
-                        "prettyref": "refs/heads/main.feature",
+                        "head_branch": "main.feature",
+                        "prettyref": "#43",
                         "commit_sha": "abc123",
                         "status": "completed",
                         "conclusion": "success"
