@@ -1941,10 +1941,13 @@ impl<
                 Err(error) => return Ok(watcher_pr_state_error(pr_number, error.to_string())),
             };
 
-        let reviews = forgejo
+        let reviews = match forgejo
             .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, PRNumber::new(pr_number))
             .await
-            .effect_err("agent")?;
+        {
+            Ok(reviews) => reviews,
+            Err(error) => return Ok(watcher_pr_state_error(pr_number, error.to_string())),
+        };
         let (review_state, review_count) = review_state_from_forgejo_reviews(&reviews, &head_sha);
         let ci_status = if head_sha.is_empty() {
             CIStatus::Unknown
