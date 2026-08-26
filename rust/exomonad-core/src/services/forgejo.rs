@@ -1,6 +1,7 @@
 use crate::domain::{BranchName, CIStatus, GithubOwner, GithubRepo, PRNumber};
 use anyhow::{anyhow, Context, Result};
 use reqwest::{header, StatusCode, Url};
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -218,10 +219,64 @@ struct WorkflowRunResponse {
     updated_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RunnersResponse {
-    #[serde(default)]
-    runners: Vec<RunnerResponse>,
+#[derive(Debug)]
+enum RunnersResponse {
+    Wrapped { runners: Vec<RunnerResponse> },
+    Bare(Vec<RunnerResponse>),
+}
+
+impl<'de> Deserialize<'de> for RunnersResponse {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RunnersResponseVisitor;
+
+        impl<'de> Visitor<'de> for RunnersResponseVisitor {
+            type Value = RunnersResponse;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Forgejo runner array or object containing runners")
+            }
+
+            fn visit_map<A>(self, map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                struct WrappedRunners {
+                    runners: Vec<RunnerResponse>,
+                }
+
+                WrappedRunners::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(
+                    |wrapped| RunnersResponse::Wrapped {
+                        runners: wrapped.runners,
+                    },
+                )
+            }
+
+            fn visit_seq<A>(self, seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Vec::<RunnerResponse>::deserialize(serde::de::value::SeqAccessDeserializer::new(
+                    seq,
+                ))
+                .map(RunnersResponse::Bare)
+            }
+        }
+
+        deserializer.deserialize_any(RunnersResponseVisitor)
+    }
+}
+
+impl RunnersResponse {
+    fn into_runners(self) -> Vec<RunnerResponse> {
+        match self {
+            Self::Wrapped { runners } => runners,
+            Self::Bare(runners) => runners,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1030,7 +1085,7 @@ impl HttpForgejoClient {
             .decode_response(response, "list Forgejo runners")
             .await?;
         Ok(runners
-            .runners
+            .into_runners()
             .into_iter()
             .map(ForgejoRunner::from)
             .collect())
@@ -1459,9 +1514,11 @@ impl FjForgejoClient {
     }
 
     async fn list_global_runners(&self) -> Result<Vec<ForgejoRunner>> {
-        let runners: RunnersResponse = self.fj_api_json("GET", "/admin/actions/runners").await?;
+        let runners: RunnersResponse = self
+            .fj_api_json("GET", "/admin/actions/runners?limit=100")
+            .await?;
         Ok(runners
-            .runners
+            .into_runners()
             .into_iter()
             .map(ForgejoRunner::from)
             .collect())
@@ -2415,5 +2472,58 @@ mod tests {
             runners[0].last_online.as_deref(),
             Some("2026-05-24T03:04:00Z")
         );
+    }
+
+    #[tokio::test]
+    async fn lists_global_runners_from_bare_array_for_dashboard() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/admin/actions/runners"))
+            .and(query_param("limit", "100"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "name": "bare-runner",
+                    "status": "online",
+                    "busy": false,
+                    "disabled": false,
+                    "last_online": "2026-05-24T03:05:00Z"
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let runners = client.list_global_runners().await.unwrap();
+
+        assert_eq!(runners.len(), 1);
+        assert_eq!(runners[0].name, "bare-runner");
+        assert!(!runners[0].busy);
+        assert_eq!(
+            runners[0].last_online.as_deref(),
+            Some("2026-05-24T03:05:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_bare_runner_reports_path_without_response_body() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/admin/actions/runners"))
+            .and(query_param("limit", "100"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"name":["sensitive-runner"],"status":"online"}]"#),
+            )
+            .mount(&server)
+            .await;
+
+        let error = client
+            .list_global_runners()
+            .await
+            .expect_err("malformed runner fields must fail closed");
+        let message = error.to_string();
+
+        assert!(message.contains("path [0].name"), "{message}");
+        assert!(!message.contains("sensitive-runner"), "{message}");
     }
 }
