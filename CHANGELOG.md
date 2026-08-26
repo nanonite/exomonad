@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- agent_dir conflates worktree path and .exo/agents/{name} config dir (#1032)
+- watcher_pr_state hard-fails on Forgejo review JSON parse error (#1031)
 - Proto3 default omission makes unverified publication ownership invisible (#1023)
 - Fix succession validator: fan-out table walked as a linked list (#1020)
 - Reject contradictory persisted review policy snapshots (#1012)
@@ -410,6 +412,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Unify publication ownership verification across watcher and handler (#1024)
 - Single watcher-response projection for tl_loop/loop (63 raw readers) (#1025)
 - Adopt plan.json as the snapshot when continuing a legacy run (#1021)
 - Add real-server acceptance for --continue identity preservation (#1019)
