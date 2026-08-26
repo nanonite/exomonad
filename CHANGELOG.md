@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Accept Forgejo bare-array runner responses (#1038)
 - Fix dashboard CI matching for Forgejo Actions runs (#1037)
 - Fix continuation replay of merge-ready PR state (#1036)
 - stale controller-exit marker replays ancient failure on every --continue (#1035)
