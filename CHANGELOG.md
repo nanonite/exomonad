@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Proto3 default omission makes unverified publication ownership invisible (#1023)
 - Fix succession validator: fan-out table walked as a linked list (#1020)
 - Reject contradictory persisted review policy snapshots (#1012)
 - Launch one-shot roles non-interactively (claude -p) to match Codex and OpenCode (#1007)
