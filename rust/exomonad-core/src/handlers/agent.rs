@@ -4840,9 +4840,8 @@ mod tests {
 
         let mut services = crate::services::Services::test();
         services.project_dir = project_dir.to_path_buf();
-        services.agent_resolver = Arc::new(
-            crate::services::AgentResolver::load(project_dir.to_path_buf()).await,
-        );
+        services.agent_resolver =
+            Arc::new(crate::services::AgentResolver::load(project_dir.to_path_buf()).await);
         (temp_dir, services)
     }
 
@@ -4881,7 +4880,8 @@ mod tests {
                 },
             );
         }
-        let (_temp_dir, services) = ownership_services(&publication, "invocation-5", Some("slice-a")).await;
+        let (_temp_dir, services) =
+            ownership_services(&publication, "invocation-5", Some("slice-a")).await;
         assert_eq!(
             publication_ownership_status(
                 &services,

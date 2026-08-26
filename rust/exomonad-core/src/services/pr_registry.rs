@@ -691,6 +691,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn invocation_succession_fanout_reaches_current_and_rejects_other_graphs() {
+        let mut head = publication("sha-1");
+        head.invocation_succession = [
+            "invocation-2",
+            "invocation-3",
+            "invocation-4",
+            "invocation-5",
+        ]
+        .into_iter()
+        .map(|to_invocation_id| InvocationSuccession {
+            from_invocation_id: "invocation-1".to_string(),
+            to_invocation_id: to_invocation_id.to_string(),
+            reason: SuccessionReason::SessionRecreate,
+            recorded_at: 1,
+        })
+        .collect();
+        head.invocation_succession.extend([
+            InvocationSuccession {
+                from_invocation_id: "invocation-2".to_string(),
+                to_invocation_id: "cycle-a".to_string(),
+                reason: SuccessionReason::SessionRecreate,
+                recorded_at: 2,
+            },
+            InvocationSuccession {
+                from_invocation_id: "cycle-a".to_string(),
+                to_invocation_id: "cycle-b".to_string(),
+                reason: SuccessionReason::SessionRecreate,
+                recorded_at: 3,
+            },
+            InvocationSuccession {
+                from_invocation_id: "cycle-b".to_string(),
+                to_invocation_id: "cycle-a".to_string(),
+                reason: SuccessionReason::SessionRecreate,
+                recorded_at: 4,
+            },
+            InvocationSuccession {
+                from_invocation_id: "unrelated-root".to_string(),
+                to_invocation_id: "invocation-unrelated".to_string(),
+                reason: SuccessionReason::SessionRecreate,
+                recorded_at: 5,
+            },
+        ]);
+
+        assert!(invocation_succession_reaches_current(&head, "invocation-5"));
+        assert!(!invocation_succession_reaches_current(
+            &head,
+            "invocation-unrelated"
+        ));
+        assert!(!invocation_succession_reaches_current(&head, "not-present"));
+    }
+
     #[tokio::test]
     async fn duplicate_publication_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
