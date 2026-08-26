@@ -1880,7 +1880,30 @@ def _review_store(
     return store
 
 
-def _direct_reviewer_event(*, verdict: str, agent_id: str = "review-pr-42-codex") -> EventEnvelope:
+def _direct_reviewer_event(
+    *,
+    verdict: str,
+    agent_id: str = "review-pr-42-codex",
+    reviewer_agent_id: str | None = None,
+) -> EventEnvelope:
+    data: dict[str, object] = {
+        "slice_id": "leaf-a",
+        "pr_number": 42,
+        "head_sha": "head-a",
+        "kind": "approved" if verdict == "GO" else "changes_requested",
+        "verdict": verdict,
+        "findings": []
+        if verdict == "GO"
+        else [
+            {
+                "severity": "blocking",
+                "path": "src/leaf.py",
+                "rationale": "The failure path is unhandled",
+            }
+        ],
+    }
+    if reviewer_agent_id is not None:
+        data["reviewer_agent_id"] = reviewer_agent_id
     return project(
         {
             "type": "pr.review",
@@ -1889,22 +1912,7 @@ def _direct_reviewer_event(*, verdict: str, agent_id: str = "review-pr-42-codex"
             "agent_id": agent_id,
             "lifecycle_state": "observed",
             "observed_at": "2026-08-12T00:00:00Z",
-            "data": {
-                "slice_id": "leaf-a",
-                "pr_number": 42,
-                "head_sha": "head-a",
-                "kind": "approved" if verdict == "GO" else "changes_requested",
-                "verdict": verdict,
-                "findings": []
-                if verdict == "GO"
-                else [
-                    {
-                        "severity": "blocking",
-                        "path": "src/leaf.py",
-                        "rationale": "The failure path is unhandled",
-                    }
-                ],
-            },
+            "data": data,
         }
     )
 
@@ -1930,7 +1938,11 @@ def test_direct_reviewer_approval_is_reduced_for_exact_head_without_model(tmp_pa
         store,
         store.load(),
         TLPlanning(),
-        _direct_reviewer_event(verdict="GO"),
+        _direct_reviewer_event(
+            verdict="GO",
+            agent_id="leaf-owner-opencode",
+            reviewer_agent_id="review-pr-42-codex",
+        ),
         1,
         TLLoopConfig(active=True),
         EffectClient(RecordingTransport()),

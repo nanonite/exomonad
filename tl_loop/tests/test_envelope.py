@@ -83,6 +83,39 @@ def test_review_and_ci_fields_are_projected_from_data_without_synthesis() -> Non
     )
 
 
+def test_review_authority_projects_verified_reviewer_and_fails_closed() -> None:
+    base = {
+        "type": "pr.review",
+        "run_seq": 902,
+        "run_id": "run-a",
+        "agent_id": "leaf-owner-opencode",
+        "lifecycle_state": "observed",
+        "observed_at": "2026-08-23T00:00:00Z",
+        "data": {
+            "slice_id": "slice-a",
+            "pr_number": 43,
+            "head_sha": "head-43",
+            "kind": "approved",
+            "reviewer_agent_id": "review-pr-43-claude",
+        },
+    }
+
+    projected = project(base)
+    assert projected.agent_id == "review-pr-43-claude"
+
+    unresolved = project(
+        {
+            **base,
+            "data": {
+                **cast(dict[str, object], base["data"]),
+                "reviewer_agent_id": None,
+                "reviewer_identity_unresolved": True,
+            },
+        }
+    )
+    assert unresolved.agent_id is None
+
+
 def test_task_blocked_projects_normalized_outcome_without_raw_evidence() -> None:
     events = cast(list[dict[str, object]], json.loads(FIXTURE.read_text(encoding="utf-8")))
     event = next(project(raw) for raw in events if raw["type"] == "agent.task_blocked")

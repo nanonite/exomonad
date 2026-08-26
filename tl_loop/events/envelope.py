@@ -248,7 +248,7 @@ def project(event: LedgerEventInput) -> EventEnvelope:
         event_type=event_type,
         run_seq=_optional_int(event, "run_seq", event_type),
         run_id=_optional_string(event, "run_id", event_type),
-        agent_id=_optional_string(event, "agent_id", event_type),
+        agent_id=_project_agent_id(event_type, event, data),
         slice_id=_optional_string(data, "slice_id", event_type),
         session_id=_optional_string(event, "session_id", event_type),
         invocation_id=_optional_string(event, "invocation_id", event_type),
@@ -284,6 +284,21 @@ def project(event: LedgerEventInput) -> EventEnvelope:
             else None
         ),
     )
+
+
+def _project_agent_id(
+    event_type: str,
+    event: LedgerEventInput,
+    data: Mapping[str, object],
+) -> str | None:
+    """Use verified reviewer attribution for review evidence, never its owner."""
+    if event_type == EventKind.PR_REVIEW.value:
+        reviewer_id = _optional_string(data, "reviewer_agent_id", event_type)
+        if reviewer_id is not None:
+            return reviewer_id
+        if data.get("reviewer_identity_unresolved") is True:
+            return None
+    return _optional_string(event, "agent_id", event_type)
 
 
 def _recovery_dimensions(data: Mapping[str, object], *, generation: object) -> RecoveryDimensions:
