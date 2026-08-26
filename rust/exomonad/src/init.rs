@@ -1989,11 +1989,7 @@ async fn launch_server_recovery(
     config: &Config,
     verbose: bool,
 ) -> Result<()> {
-    let socket_path = project_dir.join(".exo/server.sock");
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("failed to remove stale {}", socket_path.display()))?;
-    }
+    prepare_server_socket_for_start(project_dir)?;
     let server_window = ipc
         .new_window(
             "Server",
@@ -3078,6 +3074,8 @@ pub async fn run(
         }
     }
 
+    prepare_server_socket_for_start(&cwd)?;
+
     let serve_cmd = server_command(&session, &config, verbose);
     let send_status = std::process::Command::new("tmux")
         .args([
@@ -3651,13 +3649,67 @@ pub fn ensure_gitignore(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVER_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVER_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn server_pid_is_alive(pid_path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(pid_path) else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    let Some(pid) = parsed
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| i32::try_from(pid).ok())
+    else {
+        return false;
+    };
+
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+fn remove_server_artifact(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn prepare_server_socket_for_start(project_dir: &Path) -> Result<()> {
+    let socket_path = project_dir.join(".exo/server.sock");
+    if !socket_path.exists() || server_pid_is_alive(&project_dir.join(".exo/server.pid")) {
+        return Ok(());
+    }
+
+    remove_server_artifact(&socket_path)?;
+    remove_server_artifact(&project_dir.join(".exo/server.pid"))?;
+    Ok(())
+}
+
+#[cfg(test)]
 async fn wait_for_socket_path(socket_path: &Path, timeout_dur: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout_dur;
+    wait_for_socket_path_until(socket_path, Instant::now() + timeout_dur, timeout_dur).await
+}
+
+async fn wait_for_socket_path_until(
+    socket_path: &Path,
+    deadline: Instant,
+    timeout_dur: Duration,
+) -> Result<()> {
     while Instant::now() < deadline {
         if socket_path.exists() {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let sleep_duration =
+            SERVER_HEALTH_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
+        if sleep_duration.is_zero() {
+            break;
+        }
+        tokio::time::sleep(sleep_duration).await;
     }
 
     anyhow::bail!(
@@ -3669,17 +3721,31 @@ async fn wait_for_socket_path(socket_path: &Path, timeout_dur: Duration) -> Resu
 
 pub async fn wait_for_server_socket(project_dir: &Path) -> Result<()> {
     let socket_path = project_dir.join(".exo/server.sock");
-    wait_for_socket_path(&socket_path, Duration::from_secs(30)).await?;
+    let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
+    wait_for_socket_path_until(&socket_path, deadline, SERVER_STARTUP_TIMEOUT).await?;
 
     let client = uds_client::ServerClient::new(socket_path.to_path_buf());
-    for _ in 0..5 {
-        if client.is_healthy().await {
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let check_timeout = remaining.min(SERVER_HEALTH_CHECK_TIMEOUT);
+        if tokio::time::timeout(check_timeout, client.is_healthy())
+            .await
+            .unwrap_or(false)
+        {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let sleep_duration =
+            SERVER_HEALTH_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
+        if sleep_duration.is_zero() {
+            break;
+        }
+        tokio::time::sleep(sleep_duration).await;
     }
 
-    anyhow::bail!("Server socket exists but health check failed.")
+    anyhow::bail!(
+        "Server socket exists but health check failed after {}s.",
+        SERVER_STARTUP_TIMEOUT.as_secs()
+    )
 }
 
 fn report_observability_health(project_dir: &Path) {
@@ -4811,6 +4877,38 @@ mod tests {
             .await
             .unwrap();
         creator.abort();
+    }
+
+    #[test]
+    fn stale_server_artifacts_are_removed_when_pid_is_dead() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let socket_path = exo_dir.join("server.sock");
+        let pid_path = exo_dir.join("server.pid");
+        std::fs::write(&socket_path, "stale socket placeholder").unwrap();
+        std::fs::write(&pid_path, r#"{"pid":2147483647}"#).unwrap();
+
+        prepare_server_socket_for_start(project.path()).unwrap();
+
+        assert!(!socket_path.exists());
+        assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn live_server_artifacts_are_preserved_before_start() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let socket_path = exo_dir.join("server.sock");
+        let pid_path = exo_dir.join("server.pid");
+        std::fs::write(&socket_path, "live socket placeholder").unwrap();
+        std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, std::process::id())).unwrap();
+
+        prepare_server_socket_for_start(project.path()).unwrap();
+
+        assert!(socket_path.exists());
+        assert!(pid_path.exists());
     }
 
     #[test]
