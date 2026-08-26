@@ -161,8 +161,10 @@ struct PullRequestReviewResponse {
 
 #[derive(Debug, Deserialize)]
 struct PullRequestReviewAuthor {
-    #[serde(default, alias = "username")]
+    #[serde(default)]
     login: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -759,7 +761,7 @@ impl HttpForgejoClient {
                 state: review.state,
                 body: review.body,
                 commit_id: review.commit_id,
-                author_login: review.user.and_then(|user| user.login),
+                author_login: review.user.and_then(|user| user.login.or(user.username)),
             })
             .collect())
     }
@@ -1304,7 +1306,7 @@ impl FjForgejoClient {
                 state: review.state,
                 body: review.body,
                 commit_id: review.commit_id,
-                author_login: review.user.and_then(|user| user.login),
+                author_login: review.user.and_then(|user| user.login.or(user.username)),
             })
             .collect())
     }
@@ -1864,6 +1866,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pr.head_sha.as_deref(), Some("sha-update"));
+    }
+
+    #[tokio::test]
+    async fn list_reviews_accepts_real_forgejo_author_payload() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/pulls/43/reviews"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("fixtures/forgejo-pr43-reviews.json")),
+            )
+            .mount(&server)
+            .await;
+
+        let reviews = client
+            .list_pull_request_reviews(&owner(), &repo(), PRNumber::new(43))
+            .await
+            .expect("captured Forgejo review response must deserialize");
+
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].id, Some(403));
+        assert_eq!(
+            reviews[0].author_login.as_deref(),
+            Some("exomonad-reviewer")
+        );
     }
 
     #[test]

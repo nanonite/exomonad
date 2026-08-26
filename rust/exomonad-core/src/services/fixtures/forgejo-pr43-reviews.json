@@ -1,0 +1,14 @@
+[
+  {
+    "id": 403,
+    "state": "APPROVED",
+    "body": "<redacted review body>",
+    "commit_id": "090098863e9c9945506e6e25ade35e6f4a3eca4d",
+    "user": {
+      "id": 2,
+      "login": "exomonad-reviewer",
+      "login_name": "exomonad-reviewer",
+      "username": "exomonad-reviewer"
+    }
+  }
+]
