@@ -56,7 +56,7 @@ import TLRole qualified
 import WorkerRole qualified
 
 denyTools :: [Text]
-denyTools = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+denyTools = ["Edit", "Write", "NotebookEdit"]
 
 allowTools :: [Text]
 allowTools = ["Read", "Grep", "Bash", "spawn_leaf", "spawn_worker", "send_tmux_message", "send_mailbox_message"]

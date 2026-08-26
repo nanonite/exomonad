@@ -94,7 +94,6 @@ fn reviewer_harness_denied_tools() -> Vec<String> {
     [
         "Edit",
         "Write",
-        "MultiEdit",
         "NotebookEdit",
         "spawn_leaf",
         "spawn_worker",
@@ -2578,7 +2577,6 @@ mod tests {
         for tool in [
             "Edit",
             "Write",
-            "MultiEdit",
             "NotebookEdit",
             "spawn_leaf",
             "spawn_worker",

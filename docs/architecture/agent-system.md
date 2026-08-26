@@ -236,7 +236,7 @@ Only the controller and its existing control routes can make those decisions.
 
 | Rule | root | tl | dev | reviewer | worker |
 |------|:----:|:--:|:---:|:--------:|:------:|
-| Deny `Edit` / `Write` / `MultiEdit` / `NotebookEdit` (redispatch nudge) | x | x | | | |
+| Deny `Edit` / `Write` / `NotebookEdit` (redispatch nudge) | x | x | | | |
 | Deny `Bash(gh …)` (force MCP tools) | x | x | x | x | x |
 | Deny `Bash(sqlite3 .chainlink/…)` / direct `.chainlink/issues.db` access | x | x | x | x | x |
 | Dev-specific HTTP-context rewriting | | | x | | |

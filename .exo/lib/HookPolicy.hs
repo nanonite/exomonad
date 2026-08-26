@@ -77,7 +77,7 @@ blockImplementationMutation renderMessage hookInput =
     runtime = runtimeFromHookInput hookInput
 
 implementerToolsFor :: Runtime -> [Text]
-implementerToolsFor Claude = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+implementerToolsFor Claude = ["Edit", "Write", "NotebookEdit"]
 implementerToolsFor Codex = ["apply_patch", "str_replace_editor", "edit_file"]
 implementerToolsFor OpenCode = ["edit", "write", "patch"]
 

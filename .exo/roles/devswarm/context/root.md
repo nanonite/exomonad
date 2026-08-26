@@ -44,7 +44,7 @@ the boundary sits here.
 ## Hard boundaries
 
 The `root` and `tl` roles have a PreToolUse guard that denies `Edit`, `Write`,
-`MultiEdit`, and `NotebookEdit`. The denial text is the redispatch nudge:
+`NotebookEdit`. The denial text is the redispatch nudge:
 follow it by steering an existing worker with `send_tmux_message`, letting the
 leaf handle reviewer feedback, or spawning a new `spawn_leaf` / `spawn_worker`.
 
