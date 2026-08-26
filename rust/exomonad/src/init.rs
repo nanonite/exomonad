@@ -523,6 +523,17 @@ fn plan_snapshot_path(cwd: &Path) -> PathBuf {
     cwd.join(".exo/tl-loop/plan.snapshot")
 }
 
+fn write_plan_snapshot(snapshot_path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = snapshot_path
+        .parent()
+        .context("plan snapshot has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = snapshot_path.with_extension("tmp");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, snapshot_path)?;
+    Ok(())
+}
+
 /// Preserve the original plan bytes so continue can fail closed on drift.
 /// The snapshot is separate from plan.json and is never used as a replacement
 /// plan, which keeps the authoritative plan untouched.
@@ -544,13 +555,7 @@ fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()>
         let current = std::fs::read(&plan_path)
             .with_context(|| format!("failed to read {}", plan_path.display()))?;
         if !snapshot_exists {
-            let parent = snapshot_path
-                .parent()
-                .context("plan snapshot has no parent directory")?;
-            std::fs::create_dir_all(parent)?;
-            let temporary = snapshot_path.with_extension("tmp");
-            std::fs::write(&temporary, &current)?;
-            std::fs::rename(&temporary, &snapshot_path)?;
+            write_plan_snapshot(&snapshot_path, &current)?;
             info!(
                 path = %snapshot_path.display(),
                 "Adopted legacy plan bytes as the initial TL plan snapshot"
@@ -571,13 +576,7 @@ fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()>
     if plan_exists && !snapshot_exists {
         let original = std::fs::read(&plan_path)
             .with_context(|| format!("failed to read {}", plan_path.display()))?;
-        let parent = snapshot_path
-            .parent()
-            .context("plan snapshot has no parent directory")?;
-        std::fs::create_dir_all(parent)?;
-        let temporary = snapshot_path.with_extension("tmp");
-        std::fs::write(&temporary, original)?;
-        std::fs::rename(&temporary, &snapshot_path)?;
+        write_plan_snapshot(&snapshot_path, &original)?;
         info!(path = %snapshot_path.display(), "Recorded initial TL plan snapshot");
     }
     Ok(())
