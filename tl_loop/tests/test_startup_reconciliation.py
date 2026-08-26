@@ -58,7 +58,8 @@ class FakeClient:
     pr_state: str = "open"
     merged: bool = False
     head_reachable: bool = True
-    publication_ownership_verified: bool | None = None
+    publication_ownership_verified: bool = True
+    publication_ownership_error: str = ""
 
     def list_agents(self, *, filter_type: str | None = None) -> ToolResult:
         return ToolResult(
@@ -106,8 +107,8 @@ class FakeClient:
                 "merged": self.merged,
                 "head_reachable": self.head_reachable,
             }
-            if self.publication_ownership_verified is not None:
-                result["publication_ownership_verified"] = self.publication_ownership_verified
+            result["publication_ownership_verified"] = self.publication_ownership_verified
+            result["publication_ownership_error"] = self.publication_ownership_error
             return ToolResult(
                 raw={"success": True},
                 success=True,

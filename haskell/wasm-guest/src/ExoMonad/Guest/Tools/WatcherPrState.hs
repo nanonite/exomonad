@@ -77,7 +77,12 @@ watcherPrStateCore args
                     "merged" .= PA.watcherPrStateResponseMerged resp,
                     "review_count" .= PA.watcherPrStateResponseReviewCount resp,
                     "head_reachable" .= PA.watcherPrStateResponseHeadReachable resp,
-                    "evidence_error" .= lazyText (PA.watcherPrStateResponseEvidenceError resp)
+                    "evidence_error" .= lazyText (PA.watcherPrStateResponseEvidenceError resp),
+                    "publication_ownership_verified"
+                      .= PA.watcherPrStateResponsePublicationOwnershipVerified resp,
+                    "publication_ownership_error"
+                      .= lazyText (PA.watcherPrStateResponsePublicationOwnershipError resp),
+                    "publication" .= PA.watcherPrStateResponsePublication resp
                   ]
 
 instance MCPTool WatcherPrState where

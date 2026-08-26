@@ -76,6 +76,8 @@ def test_reconciliation_is_defined_for_every_slice_status(status: SliceStatus) -
             "review_state": "approved",
             "ci_status": "success",
             "merged": status is SliceStatus.MERGED,
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
         },
     )
 
@@ -313,6 +315,8 @@ def test_reconciliation_adopts_authoritative_review_and_ci_evidence() -> None:
             "review_state": "approved",
             "ci_status": "success",
             "merged": False,
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
         },
     )
 
@@ -342,6 +346,8 @@ def test_closed_unmerged_pr_is_terminal_reconciliation_evidence() -> None:
             "pr_state": "closed",
             "merged": False,
             "head_reachable": True,
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
         },
     )
 
@@ -361,6 +367,8 @@ def test_open_unmerged_pr_still_waits_for_merge() -> None:
             "pr_state": "open",
             "merged": False,
             "head_reachable": True,
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
         },
     )
 
@@ -380,6 +388,8 @@ def test_missing_pr_head_is_a_typed_terminal_reconciliation_observation() -> Non
             "merged": False,
             "head_reachable": False,
             "evidence_error": "pr_head_unreachable: object missing",
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
         },
     )
 
@@ -404,7 +414,30 @@ def test_unresolved_publication_ownership_requires_named_park_action() -> None:
     )
 
     assert result.next_action == "park_publication_ownership_unresolved"
-    assert "publication ownership is unresolved" in result.conflicts
+    assert result.conflicts == (
+        "publication ownership is unresolved: invocation succession is missing",
+    )
+
+
+def test_missing_publication_ownership_fields_fail_closed_with_reason() -> None:
+    result = reconcile_slice(
+        _slice(SliceStatus.IN_REVIEW),
+        authoritative_owner_id="agent-a",
+        watcher={
+            "found": True,
+            "head_sha": "head-a",
+            "review_state": "approved",
+            "ci_status": "success",
+            "pr_state": "open",
+            "merged": False,
+        },
+    )
+
+    assert result.next_action == "park_publication_ownership_unresolved"
+    assert result.conflicts == (
+        "publication ownership is unresolved: "
+        "watcher_pr_state omitted publication_ownership_verified",
+    )
 
 
 def test_reconciliation_quarantines_conflicting_owner_and_head() -> None:
@@ -424,6 +457,8 @@ def test_reconciliation_quarantines_conflicting_owner_and_head() -> None:
             "review_state": "approved",
             "ci_status": "success",
             "merged": False,
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
         },
     )
 
@@ -463,6 +498,8 @@ def test_reconciliation_recovers_missing_pr_number_from_watcher_evidence() -> No
             "review_state": "approved",
             "ci_status": "success",
             "merged": False,
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
         },
     )
 
@@ -524,6 +561,8 @@ def test_merge_ready_snapshot_queues_merge_once_for_matching_handoff() -> None:
         "ci_status": "success",
         "pr_state": "open",
         "merged": False,
+        "publication_ownership_verified": True,
+        "publication_ownership_error": "",
     }
 
     result = reconcile_slice(state, authoritative_owner_id="agent-a", watcher=watcher)

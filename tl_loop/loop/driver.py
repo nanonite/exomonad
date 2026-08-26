@@ -126,6 +126,7 @@ from .reconcile import (
     InternalTransition,
     Quiescent,
     ReconciliationResult,
+    _publication_ownership_status,
     derive_next_action,
     reconcile_merge_observation,
     reconcile_slice,
@@ -1432,7 +1433,8 @@ def _park_review_rounds_exhausted(
             and effective_reviewer_max_rounds is not None
             and current.review_rounds >= effective_reviewer_max_rounds
             and not _is_aggregate_slice(current)
-            and current.status not in {
+            and current.status
+            not in {
                 SliceStatus.MERGED,
                 SliceStatus.FAILED,
                 SliceStatus.PARKED,
@@ -2841,7 +2843,12 @@ def _reconcile_nonterminal_slices(
                 "observed_at": _now_timestamp(),
                 "observation_error": _snapshot_text(watcher, "evidence_error") if watcher else None,
                 "publication_ownership_error": (
-                    _snapshot_text(watcher, "publication_ownership_error") if watcher else None
+                    (
+                        _snapshot_text(watcher, "publication_ownership_error")
+                        or _publication_ownership_status(watcher)[1]
+                    )
+                    if watcher
+                    else None
                 ),
             }
             if reconciled != current:
@@ -3006,10 +3013,12 @@ def _apply_reconciliation_observations(
                 ", ".join(missing) or "matching publication identity",
             )
         elif watcher.get("found") is True:
+            _, ownership_reason = _publication_ownership_status(watcher)
             LOGGER.warning(
                 "[TL loop] skipping handoff backfill for %s: publication ownership is not verified (%s)",
                 current.id,
                 _snapshot_text(watcher, "publication_ownership_error")
+                or ownership_reason
                 or "host publication identity unavailable",
             )
         if watcher.get("merged") is True:
@@ -5211,6 +5220,7 @@ def _handoff_reconciliation_event_payload(
     if watcher.get("found") is not True:
         return None
     if watcher.get("publication_ownership_verified") is not True:
+        _, ownership_reason = _publication_ownership_status(watcher)
         return {
             "slice_id": current.id,
             "pr_number": watcher.get("pr_number") or 0,
@@ -5218,6 +5228,7 @@ def _handoff_reconciliation_event_payload(
             "invocation_id": "",
             "outcome": "skipped",
             "reason": _snapshot_text(watcher, "publication_ownership_error")
+            or ownership_reason
             or "publication_ownership_unverified",
             "source": "host_publication",
         }

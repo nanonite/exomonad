@@ -648,11 +648,8 @@ def reconcile_slice(
         missing.append("published_pr")
 
     pr_state = _pr_state(watcher)
-    ownership_unresolved = watcher is not None and (
-        watcher.get("publication_ownership_verified") is False
-        or isinstance(watcher.get("publication_ownership_error"), str)
-        and bool(watcher.get("publication_ownership_error"))
-    )
+    ownership_verified, ownership_reason = _publication_ownership_status(watcher)
+    ownership_unresolved = watcher is not None and not ownership_verified
     closed_unmerged = (
         watcher is not None
         and watcher.get("found") is True
@@ -668,7 +665,10 @@ def reconcile_slice(
         reconcile_merge_observation(slice_state, watcher) if watcher is not None else None
     )
     if ownership_unresolved:
-        conflicts.append("publication ownership is unresolved")
+        conflicts.append(
+            "publication ownership is unresolved"
+            + (f": {ownership_reason}" if ownership_reason else "")
+        )
         action = "park_publication_ownership_unresolved"
     elif closed_unmerged:
         action = "park_closed_unmerged_pr"
@@ -737,6 +737,34 @@ def _pr_state(watcher: Mapping[str, object] | None) -> str:
     if isinstance(value, str) and value.lower() in {"open", "closed"}:
         return value.lower()
     return "unknown"
+
+
+def _publication_ownership_status(
+    watcher: Mapping[str, object] | None,
+) -> tuple[bool, str | None]:
+    """Decode the required ownership contract without proto3 ambiguity.
+
+    The guest serializes default-valued fields deliberately.  Missing fields
+    therefore identify an old or malformed responder and fail closed instead
+    of being mistaken for an uninteresting observation.
+    """
+    if watcher is None:
+        return True, None
+    if "publication_ownership_verified" not in watcher:
+        return False, "watcher_pr_state omitted publication_ownership_verified"
+    verified = watcher["publication_ownership_verified"]
+    if type(verified) is not bool:
+        return False, "watcher_pr_state returned a non-boolean ownership verdict"
+    if "publication_ownership_error" not in watcher:
+        return False, "watcher_pr_state omitted publication_ownership_error"
+    error = watcher["publication_ownership_error"]
+    if not isinstance(error, str):
+        return False, "watcher_pr_state returned a non-string ownership error"
+    if not verified:
+        return False, error or "publication ownership is unverified"
+    if error:
+        return False, "watcher_pr_state marked ownership verified with an error"
+    return True, None
 
 
 def _result(

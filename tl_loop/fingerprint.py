@@ -12,7 +12,16 @@ from typing import Any
 
 FINGERPRINT_FILENAME = "_build_fingerprint.json"
 FINGERPRINT_SCHEMA_VERSION = 1
-EXCLUDED_NAMES = frozenset({".venv", "tests", "__pycache__", FINGERPRINT_FILENAME})
+EXCLUDED_NAMES = frozenset(
+    {
+        ".venv",
+        ".pytest_cache",
+        ".ruff_cache",
+        "tests",
+        "__pycache__",
+        FINGERPRINT_FILENAME,
+    }
+)
 
 
 def _source_files(source: Path) -> list[Path]:
