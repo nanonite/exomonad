@@ -10,6 +10,7 @@ use exomonad_core::services::forgejo::{
     ForgejoClient, ForgejoPullRequest, ForgejoPullRequestReview, ForgejoRunner, ForgejoWorkflowRun,
 };
 use exomonad_core::services::repo::{get_repo_info, RepoInfo};
+use futures_util::future::join_all;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,6 +23,7 @@ use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
 const EVENT_LIMIT: usize = 12;
 const PR_LIMIT: usize = 12;
@@ -32,20 +34,19 @@ pub async fn run(config: &Config, interval: Duration) -> Result<()> {
     let client = forgejo_client(config);
     let repo_info = get_repo_info(&config.project_dir).await.ok();
     let mut state = DashboardState::default();
-    state
-        .refresh(config, client.as_ref(), repo_info.as_ref())
-        .await;
+    state.refresh_local(config);
+    state.start_forgejo_refresh(client.clone(), repo_info.clone());
     let mut last_refresh = Instant::now();
 
     loop {
+        state.complete_forgejo_refresh().await;
         terminal.draw(|frame| draw(frame, &state, config, repo_info.as_ref()))?;
         if should_quit(Duration::from_millis(200))? {
             break;
         }
         if last_refresh.elapsed() >= interval {
-            state
-                .refresh(config, client.as_ref(), repo_info.as_ref())
-                .await;
+            state.refresh_local(config);
+            state.start_forgejo_refresh(client.clone(), repo_info.clone());
             last_refresh = Instant::now();
         }
     }
@@ -91,47 +92,101 @@ struct DashboardState {
     events: Vec<EventRow>,
     error: Option<String>,
     updated_at: String,
+    refresh_started_at: String,
+    refresh_task: Option<JoinHandle<ForgejoRefresh>>,
 }
 
 impl DashboardState {
-    async fn refresh(
-        &mut self,
-        config: &Config,
-        client: Option<&Arc<ForgejoClient>>,
-        repo_info: Option<&RepoInfo>,
-    ) {
-        self.updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
+    fn refresh_local(&mut self, config: &Config) {
         let controller_failure = controller_exit_reason(&config.project_dir);
         self.agents = scan_agents(&config.project_dir, controller_failure.is_some());
         self.ordered = read_ordered_stages(&config.project_dir);
         self.events = read_events(&config.project_dir, EVENT_LIMIT);
         self.error = controller_failure.map(|reason| format!("TL controller failed: {reason}"));
+    }
 
-        if let (Some(client), Some(repo_info)) = (client, repo_info) {
-            self.refresh_forgejo(client, repo_info).await;
-        } else {
+    fn start_forgejo_refresh(
+        &mut self,
+        client: Option<Arc<ForgejoClient>>,
+        repo_info: Option<RepoInfo>,
+    ) {
+        if self.refresh_task.is_some() {
+            return;
+        }
+        let (Some(client), Some(repo_info)) = (client, repo_info) else {
             self.ci_runs.clear();
             self.runners.clear();
             self.prs.clear();
-        }
+            return;
+        };
+        self.refresh_started_at = chrono::Local::now().format("%H:%M:%S").to_string();
+        self.refresh_task = Some(tokio::spawn(refresh_forgejo(client, repo_info)));
     }
 
-    async fn refresh_forgejo(&mut self, client: &ForgejoClient, repo_info: &RepoInfo) {
-        let prs = match client
-            .list_open_pull_requests(&repo_info.owner, &repo_info.repo)
-            .await
-        {
-            Ok(prs) => prs,
-            Err(error) => {
-                if self.error.is_none() {
-                    self.error = Some(error.to_string());
-                }
-                Vec::new()
-            }
+    async fn complete_forgejo_refresh(&mut self) {
+        let Some(task) = self.refresh_task.take() else {
+            return;
         };
-        self.ci_runs = collect_ci_runs(client, repo_info, &prs).await;
-        self.prs = collect_pr_rows(client, repo_info, prs).await;
-        self.runners = collect_runner_rows(client).await;
+        if !task.is_finished() {
+            self.refresh_task = Some(task);
+            return;
+        }
+
+        match task.await {
+            Ok(refresh) => self.apply_forgejo_refresh(refresh),
+            Err(error) => self.record_error(format!("Forgejo refresh task failed: {error}")),
+        }
+        self.refresh_started_at.clear();
+    }
+
+    fn apply_forgejo_refresh(&mut self, refresh: ForgejoRefresh) {
+        self.ci_runs = refresh.ci_runs;
+        self.runners = refresh.runners;
+        self.prs = refresh.prs;
+        if !refresh.errors.is_empty() {
+            self.record_error(refresh.errors.join("; "));
+        }
+        self.updated_at = chrono::Local::now().format("%H:%M:%S").to_string();
+    }
+
+    fn record_error(&mut self, error: String) {
+        self.error = Some(match self.error.take() {
+            Some(existing) => format!("{existing}; {error}"),
+            None => error,
+        });
+    }
+}
+
+struct ForgejoRefresh {
+    ci_runs: Vec<CiRunRow>,
+    runners: Vec<RunnerRow>,
+    prs: Vec<PrRow>,
+    errors: Vec<String>,
+}
+
+async fn refresh_forgejo(client: Arc<ForgejoClient>, repo_info: RepoInfo) -> ForgejoRefresh {
+    let mut errors = Vec::new();
+    let prs = match client
+        .list_open_pull_requests(&repo_info.owner, &repo_info.repo)
+        .await
+    {
+        Ok(prs) => prs,
+        Err(error) => {
+            errors.push(format!("Forgejo PR list failed: {error}"));
+            Vec::new()
+        }
+    };
+    let (ci_runs, ci_errors) = collect_ci_runs(&client, &repo_info, &prs).await;
+    let (pr_rows, pr_errors) = collect_pr_rows(&client, &repo_info, prs).await;
+    let (runners, runner_errors) = collect_runner_rows(&client).await;
+    errors.extend(ci_errors);
+    errors.extend(pr_errors);
+    errors.extend(runner_errors);
+    ForgejoRefresh {
+        ci_runs,
+        runners,
+        prs: pr_rows,
+        errors,
     }
 }
 
@@ -262,6 +317,13 @@ fn draw_header(
         .as_deref()
         .unwrap_or("forgejo unconfigured");
     let status = state.error.as_deref().unwrap_or("ok");
+    let refresh_status = if state.refresh_task.is_some() {
+        format!("refreshing (started {})", state.refresh_started_at)
+    } else if state.updated_at.is_empty() {
+        "never refreshed".to_string()
+    } else {
+        format!("refreshed {}", state.updated_at)
+    };
     let title = Span::styled(
         "ExoMonad Watch",
         Style::default()
@@ -271,8 +333,7 @@ fn draw_header(
     let line = Line::from(vec![
         title,
         Span::raw(format!(
-            "  {repo_label}  {forgejo}  refreshed {}  {status}",
-            state.updated_at
+            "  {repo_label}  {forgejo}  {refresh_status}  {status}"
         )),
     ]);
     frame.render_widget(
@@ -445,50 +506,84 @@ async fn collect_pr_rows(
     client: &ForgejoClient,
     repo_info: &RepoInfo,
     prs: Vec<ForgejoPullRequest>,
-) -> Vec<PrRow> {
-    let mut rows = Vec::new();
-    for pr in prs.into_iter().take(PR_LIMIT) {
-        let reviews = client
-            .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, pr.number)
+) -> (Vec<PrRow>, Vec<String>) {
+    let requests = prs.into_iter().take(PR_LIMIT).map(|pr| async move {
+        let number = pr.number;
+        let (reviews, review_error) = match client
+            .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, number)
             .await
-            .unwrap_or_default();
-        let ci_gate = pr_ci_status(client, repo_info, &pr).await;
-        rows.push(PrRow {
-            agent: pr.head_ref.as_str().to_string(),
-            title: pr.title,
-            review: review_state(&reviews),
-            ci_gate,
-        });
+        {
+            Ok(reviews) => (reviews, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("PR #{number} reviews failed: {error}")),
+            ),
+        };
+        let (ci_gate, ci_error) = pr_ci_status(client, repo_info, &pr).await;
+        let errors: Vec<String> = [review_error, ci_error].into_iter().flatten().collect();
+        (
+            PrRow {
+                agent: pr.head_ref.as_str().to_string(),
+                title: pr.title,
+                review: review_state(&reviews),
+                ci_gate,
+            },
+            errors,
+        )
+    });
+
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for (row, row_errors) in join_all(requests).await {
+        rows.push(row);
+        errors.extend(row_errors);
     }
-    rows
+    (rows, errors)
 }
 
 async fn collect_ci_runs(
     client: &ForgejoClient,
     repo_info: &RepoInfo,
     prs: &[ForgejoPullRequest],
-) -> Vec<CiRunRow> {
+) -> (Vec<CiRunRow>, Vec<String>) {
     let pr_numbers = pr_numbers_by_branch(prs);
     let mut branches = pr_numbers.keys().cloned().collect::<BTreeSet<_>>();
     if branches.is_empty() {
         branches.insert(current_branch(repo_info.repo.as_str()));
     }
+
+    let requests = branches.into_iter().filter_map(|branch| {
+        let branch_name = BranchName::try_from_str(&branch).ok()?;
+        let pr_number = pr_numbers.get(&branch).cloned();
+        Some(async move {
+            match client
+                .list_workflow_runs_for_branch(&repo_info.owner, &repo_info.repo, &branch_name, 4)
+                .await
+            {
+                Ok(runs) => (
+                    runs.into_iter()
+                        .map(|run| ci_run_row(&branch, pr_number.as_ref(), run))
+                        .collect(),
+                    None,
+                ),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!("branch {branch} workflow runs failed: {error}")),
+                ),
+            }
+        })
+    });
+
     let mut rows = Vec::new();
-    for branch in branches {
-        let Ok(branch_name) = BranchName::try_from_str(&branch) else {
-            continue;
-        };
-        let runs = client
-            .list_workflow_runs_for_branch(&repo_info.owner, &repo_info.repo, &branch_name, 4)
-            .await
-            .unwrap_or_default();
-        rows.extend(
-            runs.into_iter()
-                .map(|run| ci_run_row(&branch, pr_numbers.get(&branch), run)),
-        );
+    let mut errors = Vec::new();
+    for (branch_rows, branch_error) in join_all(requests).await {
+        rows.extend(branch_rows);
+        if let Some(error) = branch_error {
+            errors.push(error);
+        }
     }
     rows.truncate(RUN_LIMIT);
-    rows
+    (rows, errors)
 }
 
 fn pr_numbers_by_branch(prs: &[ForgejoPullRequest]) -> BTreeMap<String, String> {
@@ -497,30 +592,34 @@ fn pr_numbers_by_branch(prs: &[ForgejoPullRequest]) -> BTreeMap<String, String> 
         .collect()
 }
 
-async fn collect_runner_rows(client: &ForgejoClient) -> Vec<RunnerRow> {
-    client
-        .list_global_runners()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(runner_row)
-        .collect()
+async fn collect_runner_rows(client: &ForgejoClient) -> (Vec<RunnerRow>, Vec<String>) {
+    match client.list_global_runners().await {
+        Ok(runners) => (runners.into_iter().map(runner_row).collect(), Vec::new()),
+        Err(error) => (
+            Vec::new(),
+            vec![format!("Forgejo runner list failed: {error}")],
+        ),
+    }
 }
 
 async fn pr_ci_status(
     client: &ForgejoClient,
     repo_info: &RepoInfo,
     pr: &ForgejoPullRequest,
-) -> String {
+) -> (String, Option<String>) {
     let Some(head_sha) = pr.head_sha.as_deref() else {
-        return "unknown".to_string();
+        return ("unknown".to_string(), None);
     };
-    client
+    match client
         .actions_status_for_head(&repo_info.owner, &repo_info.repo, &pr.head_ref, head_sha)
         .await
-        .unwrap_or(CIStatus::Unknown)
-        .as_str()
-        .to_string()
+    {
+        Ok(status) => (status.as_str().to_string(), None),
+        Err(error) => (
+            CIStatus::Unknown.as_str().to_string(),
+            Some(format!("PR #{} CI status failed: {error}", pr.number)),
+        ),
+    }
 }
 
 fn review_state(reviews: &[ForgejoPullRequestReview]) -> String {

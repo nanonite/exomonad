@@ -4,6 +4,7 @@ use reqwest::{header, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
 
 #[derive(Clone)]
@@ -234,6 +235,7 @@ struct RunnerResponse {
 }
 
 const PULL_REQUEST_PAGE_SIZE: usize = 50;
+const FORGEJO_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ForgejoClient {
     pub fn new(forgejo_url: &str, forgejo_token: &str) -> Result<Arc<Self>> {
@@ -617,6 +619,7 @@ impl HttpForgejoClient {
         let base_url = Url::parse(&normalized_url).context("invalid forgejo_url")?;
         let http = reqwest::Client::builder()
             .user_agent("exomonad")
+            .timeout(FORGEJO_HTTP_TIMEOUT)
             .build()
             .context("failed to build Forgejo HTTP client")?;
 
@@ -1772,6 +1775,23 @@ mod tests {
         let server = MockServer::start().await;
         let client = ForgejoClient::new(&server.uri(), "token-123").unwrap();
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn http_requests_have_a_bounded_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/pulls"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(FORGEJO_HTTP_TIMEOUT + Duration::from_secs(1)),
+            )
+            .mount(&server)
+            .await;
+        let client = ForgejoClient::new(&server.uri(), "token-123").unwrap();
+
+        let result = client.list_open_pull_requests(&owner(), &repo()).await;
+
+        assert!(result.is_err(), "a slow Forgejo response must time out");
     }
 
     #[test]
