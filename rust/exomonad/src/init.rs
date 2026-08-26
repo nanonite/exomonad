@@ -2011,6 +2011,7 @@ async fn launch_tl_recovery(
     tl_loop_root: &Path,
     config: &Config,
 ) -> Result<()> {
+    let controller_epoch = prepare_controller_spawn(project_dir)?;
     let tl_window = ipc
         .new_window(
             "TL",
@@ -2020,7 +2021,8 @@ async fn launch_tl_recovery(
         )
         .await?;
     ipc.set_window_remain_on_exit(&tl_window, true).await?;
-    let startup = wait_for_tl_controller_startup(ipc, project_dir, &tl_window).await;
+    let startup =
+        wait_for_tl_controller_startup(ipc, project_dir, &tl_window, &controller_epoch).await;
     if startup.is_ok() {
         ipc.set_window_remain_on_exit(&tl_window, false).await?;
     }
@@ -2107,9 +2109,6 @@ async fn reconcile_existing_session(
         ipc.kill_window(&window.window_id).await?;
     }
 
-    if let Some(archive) = archive_controller_exit_reason(project_dir)? {
-        info!(archive = %archive.display(), "Archived prior TL controller exit marker before resuming");
-    }
     launch_tl_recovery(ipc, project_dir, shell, tl_loop_root, config).await
 }
 
@@ -2117,9 +2116,26 @@ fn controller_exit_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".exo/tl-loop/root/controller-exit.json")
 }
 
+#[cfg(test)]
 fn controller_exit_reason(project_dir: &Path) -> Option<String> {
     let payload = std::fs::read_to_string(controller_exit_path(project_dir)).ok()?;
     let value = serde_json::from_str::<Value>(&payload).ok()?;
+    render_controller_exit_reason(&value)
+}
+
+fn controller_epoch_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".exo/tl-loop/root.controller-epoch")
+}
+
+#[cfg(test)]
+fn read_controller_epoch(project_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(controller_epoch_path(project_dir))
+        .ok()
+        .map(|epoch| epoch.trim().to_string())
+        .filter(|epoch| !epoch.is_empty())
+}
+
+fn render_controller_exit_reason(value: &Value) -> Option<String> {
     let reason = value
         .get("reason")
         .and_then(Value::as_str)
@@ -2135,6 +2151,47 @@ fn controller_exit_reason(project_dir: &Path) -> Option<String> {
     })
 }
 
+fn controller_exit_reason_for_attempt(
+    project_dir: &Path,
+    controller_epoch: &str,
+) -> Result<Option<String>> {
+    let path = controller_exit_path(project_dir);
+    let payload = match std::fs::read_to_string(&path) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&payload) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(archive) = archive_controller_exit_reason(project_dir)? {
+                info!(
+                    archive = %archive.display(),
+                    %error,
+                    "Archived invalid controller exit marker before a new spawn attempt"
+                );
+            }
+            return Ok(None);
+        }
+    };
+    let marker_epoch = value.get("controller_epoch").and_then(Value::as_str);
+    if marker_epoch != Some(controller_epoch) {
+        if let Some(archive) = archive_controller_exit_reason(project_dir)? {
+            info!(
+                archive = %archive.display(),
+                expected_epoch = controller_epoch,
+                marker_epoch = ?marker_epoch,
+                "Archived controller exit marker from an earlier spawn attempt"
+            );
+        }
+        return Ok(None);
+    }
+    Ok(render_controller_exit_reason(&value))
+}
+
+#[cfg(test)]
 fn clear_controller_exit_reason(project_dir: &Path) -> Result<()> {
     let path = controller_exit_path(project_dir);
     if path.exists() {
@@ -2144,17 +2201,29 @@ fn clear_controller_exit_reason(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_recreate_controller_epoch(project_dir: &Path) -> Result<()> {
-    let marker = project_dir.join(".exo/tl-loop/root.controller-epoch");
-    let epoch = format!("recreate-{}-{}", current_time_millis(), std::process::id());
+fn write_controller_epoch(project_dir: &Path) -> Result<String> {
+    let marker = controller_epoch_path(project_dir);
+    let epoch = format!(
+        "controller-{}-{}",
+        current_time_millis(),
+        std::process::id()
+    );
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     std::fs::write(&marker, format!("{epoch}\n"))
         .with_context(|| format!("failed to write {}", marker.display()))?;
-    info!(path = %marker.display(), "Wrote new controller epoch for --recreate");
-    Ok(())
+    info!(path = %marker.display(), %epoch, "Wrote new controller spawn epoch");
+    Ok(epoch)
+}
+
+fn prepare_controller_spawn(project_dir: &Path) -> Result<String> {
+    let controller_epoch = write_controller_epoch(project_dir)?;
+    // A marker without this epoch belongs to an older controller process. Archive it
+    // before creating the new window so the first liveness poll cannot misattribute it.
+    let _ = controller_exit_reason_for_attempt(project_dir, &controller_epoch)?;
+    Ok(controller_epoch)
 }
 
 fn archive_root_tl_run(project_dir: &Path) -> Result<Option<PathBuf>> {
@@ -2222,7 +2291,17 @@ fn archive_root_tl_run_at(project_dir: &Path, timestamp_ms: u128) -> Result<Opti
     }
 }
 
+#[cfg(test)]
 fn record_controller_exit_reason(project_dir: &Path, reason: &str) -> Result<()> {
+    let controller_epoch = read_controller_epoch(project_dir);
+    record_controller_exit_reason_for_attempt(project_dir, reason, controller_epoch.as_deref())
+}
+
+fn record_controller_exit_reason_for_attempt(
+    project_dir: &Path,
+    reason: &str,
+    controller_epoch: Option<&str>,
+) -> Result<()> {
     let path = controller_exit_path(project_dir);
     if path.exists() {
         return Ok(());
@@ -2231,11 +2310,14 @@ fn record_controller_exit_reason(project_dir: &Path, reason: &str) -> Result<()>
         .parent()
         .context("controller exit path has no parent directory")?;
     std::fs::create_dir_all(parent)?;
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "reason": reason,
         "recorded_at": current_time_millis() as f64 / 1000.0,
         "source": "exomonad init",
     });
+    if let Some(controller_epoch) = controller_epoch {
+        payload["controller_epoch"] = Value::String(controller_epoch.to_string());
+    }
     let temporary = path.with_extension("tmp");
     std::fs::write(&temporary, serde_json::to_string(&payload)?)?;
     std::fs::rename(&temporary, &path)?;
@@ -2246,6 +2328,7 @@ async fn wait_for_tl_controller_startup(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
     window_id: &exomonad_core::services::tmux_ipc::WindowId,
+    controller_epoch: &str,
 ) -> Result<()> {
     let deadline = Instant::now() + TL_CONTROLLER_STARTUP_TIMEOUT;
     let routing = exomonad_core::domain::RoutingInfo::window(window_id.clone());
@@ -2281,14 +2364,23 @@ async fn wait_for_tl_controller_startup(
                     warn!(%error, "Failed to read TL startup checkpoint; retaining diagnostic");
                 }
             }
-            if let Some(reason) = controller_exit_reason(project_dir) {
-                return tl_controller_startup_failure(ipc, project_dir, window_id, reason).await;
+            if let Some(reason) = controller_exit_reason_for_attempt(project_dir, controller_epoch)?
+            {
+                return tl_controller_startup_failure(
+                    ipc,
+                    project_dir,
+                    window_id,
+                    controller_epoch,
+                    reason,
+                )
+                .await;
             }
             if observed_alive {
                 return tl_controller_startup_failure(
                     ipc,
                     project_dir,
                     window_id,
+                    controller_epoch,
                     format!("tmux window {window_id} exited before TL startup completed"),
                 )
                 .await;
@@ -2296,8 +2388,16 @@ async fn wait_for_tl_controller_startup(
         }
 
         if process_alive {
-            if let Some(reason) = controller_exit_reason(project_dir) {
-                return tl_controller_startup_failure(ipc, project_dir, window_id, reason).await;
+            if let Some(reason) = controller_exit_reason_for_attempt(project_dir, controller_epoch)?
+            {
+                return tl_controller_startup_failure(
+                    ipc,
+                    project_dir,
+                    window_id,
+                    controller_epoch,
+                    reason,
+                )
+                .await;
             }
         }
 
@@ -2309,6 +2409,7 @@ async fn wait_for_tl_controller_startup(
                 ipc,
                 project_dir,
                 window_id,
+                controller_epoch,
                 format!("tmux window {window_id} never became live during TL startup"),
             )
             .await;
@@ -2321,9 +2422,10 @@ async fn tl_controller_startup_failure(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
     window_id: &exomonad_core::services::tmux_ipc::WindowId,
+    controller_epoch: &str,
     fallback_reason: String,
 ) -> Result<()> {
-    let reason = match controller_exit_reason(project_dir) {
+    let reason = match controller_exit_reason_for_attempt(project_dir, controller_epoch)? {
         Some(reason) => reason,
         None => match ipc.capture_pane(window_id.as_str()).await {
             Ok(output) => startup_failure_with_pane_output(fallback_reason, &output),
@@ -2332,7 +2434,9 @@ async fn tl_controller_startup_failure(
             }
         },
     };
-    if let Err(error) = record_controller_exit_reason(project_dir, &reason) {
+    if let Err(error) =
+        record_controller_exit_reason_for_attempt(project_dir, &reason, Some(controller_epoch))
+    {
         warn!(%error, "Failed to persist TL controller startup failure");
     }
     anyhow::bail!("TL controller failed during startup in tmux window {window_id}: {reason}");
@@ -2852,8 +2956,6 @@ pub async fn run(
         }
 
         archive_root_tl_run(&cwd)?;
-        write_recreate_controller_epoch(&cwd)?;
-        clear_controller_exit_reason(&cwd)?;
     }
 
     // Create fresh session
@@ -3109,9 +3211,10 @@ pub async fn run(
         None => base_command,
     };
 
+    let controller_epoch = prepare_controller_spawn(&cwd)?;
     let tl_window = ipc.new_window("TL", &tl_cwd, &shell, &tl_command).await?;
     ipc.set_window_remain_on_exit(&tl_window, true).await?;
-    let startup = wait_for_tl_controller_startup(&ipc, &cwd, &tl_window).await;
+    let startup = wait_for_tl_controller_startup(&ipc, &cwd, &tl_window, &controller_epoch).await;
     if startup.is_ok() {
         ipc.set_window_remain_on_exit(&tl_window, false).await?;
     }
@@ -4603,6 +4706,58 @@ mod tests {
                 ["reason"],
             "controller crashed"
         );
+    }
+
+    #[test]
+    fn controller_exit_marker_from_previous_epoch_is_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = controller_exit_path(dir.path());
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, r#"{"reason":"old controller crashed"}"#).unwrap();
+
+        let current_epoch = prepare_controller_spawn(dir.path()).unwrap();
+
+        assert!(!marker.exists());
+        assert!(
+            controller_exit_reason_for_attempt(dir.path(), &current_epoch)
+                .unwrap()
+                .is_none()
+        );
+        let archives = std::fs::read_dir(marker.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("controller-exit-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(archives[0].path()).unwrap())
+                .unwrap()["reason"],
+            "old controller crashed"
+        );
+    }
+
+    #[test]
+    fn current_controller_exit_marker_is_reported_for_matching_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let current_epoch = prepare_controller_spawn(dir.path()).unwrap();
+        record_controller_exit_reason(dir.path(), "current controller crashed").unwrap();
+
+        assert_eq!(
+            controller_exit_reason_for_attempt(dir.path(), &current_epoch)
+                .unwrap()
+                .as_deref(),
+            Some("current controller crashed")
+        );
+        let payload: Value = serde_json::from_str(
+            &std::fs::read_to_string(controller_exit_path(dir.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["controller_epoch"], current_epoch);
     }
 
     #[test]
