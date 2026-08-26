@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import cast
 
+from tl_loop.loop.observation import WatcherObservation
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
@@ -43,7 +44,7 @@ class ReconciliationResult:
 
 def reconcile_merge_observation(
     state: SliceState,
-    watcher: Mapping[str, object],
+    watcher: WatcherObservation | Mapping[str, object],
 ) -> SliceState:
     """Fold one authoritative PR snapshot into merge readiness evidence.
 
@@ -51,10 +52,12 @@ def reconcile_merge_observation(
     CI, publication, and owner handoff all refer to the same head.  The fold
     is deliberately idempotent: unchanged snapshots return the same state.
     """
-    head_sha = watcher.get("head_sha")
+    watcher = _as_watcher_observation(watcher)
+    assert watcher is not None
+    head_sha = watcher.head_sha
     if not isinstance(head_sha, str) or not head_sha:
         return state
-    if watcher.get("merged") is True:
+    if watcher.merged is True:
         reconciliation = {
             "confirmed_stage": "merge",
             "authoritative_evidence": ["published_pr", "pr_state", "merged"],
@@ -80,10 +83,10 @@ def reconcile_merge_observation(
         return state
     if state.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
         return state
-    ci_status = watcher.get("ci_status", state.ci_state.get(head_sha, "unknown"))
+    ci_status = watcher.ci_status or state.ci_state.get(head_sha, "unknown")
     if ci_status not in {"success", "neutral"}:
         return state
-    if watcher.get("pr_state", "open") == "closed":
+    if watcher.pr_state == "closed":
         return state
     reconciliation = {
         "confirmed_stage": "merge",
@@ -583,12 +586,13 @@ def reconcile_slice(
     slice_state: SliceState,
     *,
     authoritative_owner_id: str | None,
-    watcher: Mapping[str, object] | None,
+    watcher: WatcherObservation | Mapping[str, object] | None,
 ) -> ReconciliationResult:
     """Choose one safe next action without mutating lifecycle state."""
     evidence: list[str] = []
     missing: list[str] = []
     conflicts: list[str] = []
+    watcher = _as_watcher_observation(watcher)
 
     if slice_state.status in {
         SliceStatus.DISPATCHING,
@@ -636,7 +640,7 @@ def reconcile_slice(
     else:
         missing.append("runtime_owner")
 
-    if watcher is not None and watcher.get("found") is True:
+    if watcher is not None and watcher.found is True:
         # Evidence may have been recovered via slice_id lookup even when
         # slice_state.pr_number was never persisted (e.g. a crash between
         # pr.filed being acknowledged and identity association).
@@ -652,14 +656,12 @@ def reconcile_slice(
     ownership_unresolved = watcher is not None and not ownership_verified
     closed_unmerged = (
         watcher is not None
-        and watcher.get("found") is True
+        and watcher.found is True
         and pr_state == "closed"
-        and watcher.get("merged") is False
+        and watcher.merged is False
     )
     head_unreachable = (
-        watcher is not None
-        and watcher.get("found") is True
-        and watcher.get("head_reachable") is False
+        watcher is not None and watcher.found is True and watcher.head_reachable is False
     )
     merge_observation = (
         reconcile_merge_observation(slice_state, watcher) if watcher is not None else None
@@ -678,7 +680,7 @@ def reconcile_slice(
         action = "open_integrity_gate"
     elif missing:
         action = "await_authoritative_evidence"
-    elif watcher and watcher.get("merged") is True:
+    elif watcher and watcher.merged is True:
         action = "adopt_merged_state"
     elif (
         slice_state.status is SliceStatus.IN_REVIEW
@@ -698,24 +700,24 @@ def reconcile_slice(
 
 def _append_watcher_evidence(
     slice_state: SliceState,
-    watcher: Mapping[str, object],
+    watcher: WatcherObservation,
     evidence: list[str],
     missing: list[str],
     conflicts: list[str],
 ) -> None:
-    head_sha = watcher.get("head_sha")
+    head_sha = watcher.head_sha
     if isinstance(head_sha, str) and head_sha:
         evidence.append("published_head")
         if slice_state.reviewed_head and slice_state.reviewed_head != head_sha:
             conflicts.append("authoritative head disagrees with review evidence")
     else:
         missing.append("published_head")
-    review_state = watcher.get("review_state")
+    review_state = watcher.review_state
     if isinstance(review_state, str) and review_state:
         evidence.append("review_state")
     else:
         missing.append("review_state")
-    ci_status = watcher.get("ci_status")
+    ci_status = watcher.ci_status
     if isinstance(ci_status, str) and ci_status:
         evidence.append("ci_state")
     else:
@@ -725,22 +727,22 @@ def _append_watcher_evidence(
         evidence.append("pr_state_unknown")
     else:
         evidence.append("pr_state")
-    if watcher.get("head_reachable") is False:
+    if watcher.head_reachable is False:
         evidence.append("pr_head_unreachable")
 
 
-def _pr_state(watcher: Mapping[str, object] | None) -> str:
+def _pr_state(watcher: WatcherObservation | Mapping[str, object] | None) -> str:
     """Return an explicit compatibility state for older watcher payloads."""
     if watcher is None:
         return "unknown"
-    value = watcher.get("pr_state")
+    value = _as_watcher_observation(watcher).pr_state
     if isinstance(value, str) and value.lower() in {"open", "closed"}:
         return value.lower()
     return "unknown"
 
 
 def _publication_ownership_status(
-    watcher: Mapping[str, object] | None,
+    watcher: WatcherObservation | Mapping[str, object] | None,
 ) -> tuple[bool, str | None]:
     """Decode the required ownership contract without proto3 ambiguity.
 
@@ -750,21 +752,15 @@ def _publication_ownership_status(
     """
     if watcher is None:
         return True, None
-    if "publication_ownership_verified" not in watcher:
-        return False, "watcher_pr_state omitted publication_ownership_verified"
-    verified = watcher["publication_ownership_verified"]
-    if type(verified) is not bool:
-        return False, "watcher_pr_state returned a non-boolean ownership verdict"
-    if "publication_ownership_error" not in watcher:
-        return False, "watcher_pr_state omitted publication_ownership_error"
-    error = watcher["publication_ownership_error"]
-    if not isinstance(error, str):
-        return False, "watcher_pr_state returned a non-string ownership error"
-    if not verified:
-        return False, error or "publication ownership is unverified"
-    if error:
-        return False, "watcher_pr_state marked ownership verified with an error"
-    return True, None
+    return _as_watcher_observation(watcher).ownership_status()
+
+
+def _as_watcher_observation(
+    watcher: WatcherObservation | Mapping[str, object] | None,
+) -> WatcherObservation | None:
+    if watcher is None or isinstance(watcher, WatcherObservation):
+        return watcher
+    return WatcherObservation.from_response(watcher)
 
 
 def _result(

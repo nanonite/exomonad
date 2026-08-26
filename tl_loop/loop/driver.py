@@ -72,8 +72,6 @@ from tl_loop.loop.review import (
     load_reviewer_policy_snapshot,
     verify_integration,
     verify_review,
-    watcher_head,
-    watcher_patch_digest,
 )
 from tl_loop.loop.schedule import ScheduleDeadlock, ready, suspend_dependents
 from tl_loop.ordered import (
@@ -121,6 +119,7 @@ from tl_loop.state.serialization import DurableWriteError
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .journal import MUTATING_OPERATIONS, EffectJournal, stable_action_key
+from .observation import WatcherObservation
 from .reconcile import (
     ExternalIntent,
     InternalTransition,
@@ -1809,8 +1808,8 @@ def _execute_direct_merge_intent(
     if (
         watcher is not None
         and watcher.success is True
-        and isinstance(watcher.result, Mapping)
-        and watcher.result.get("merged") is True
+        and (_watcher_result_observation(watcher) is not None)
+        and _watcher_result_observation(watcher).merged is True
     ):
         refreshed = store.load()
         return _checkpoint_slice_action(
@@ -1953,8 +1952,8 @@ def _reconcile_unknown_merge(
     if (
         watcher is not None
         and watcher.success is True
-        and isinstance(watcher.result, Mapping)
-        and watcher.result.get("merged") is True
+        and (_watcher_result_observation(watcher) is not None)
+        and _watcher_result_observation(watcher).merged is True
     ):
         if isinstance(effects_log, EffectJournal):
             key = stable_action_key(state.run_id, "merge_pr", current.id, arguments)
@@ -1989,10 +1988,11 @@ def _reconcile_unknown_merge(
 
 
 def _direct_compare_evidence_complete(watcher: ToolResult) -> bool:
-    if watcher.success is not True or not isinstance(watcher.result, Mapping):
+    observation = _watcher_result_observation(watcher)
+    if observation is None:
         return False
     return all(
-        _watcher_evidence_text(watcher, key) is not None
+        isinstance(getattr(observation, key), str) and bool(getattr(observation, key))
         for key in ("base_sha", "head_sha", "patch_digest", "merge_tree_sha", "ci_status")
     )
 
@@ -2003,18 +2003,21 @@ def _direct_merge_evidence(
     config: TLLoopConfig,
 ) -> dict[str, str] | None:
     """Validate the watcher snapshot used as the direct merge compare."""
-    if watcher is None or watcher.success is not True or not isinstance(watcher.result, Mapping):
+    if watcher is None:
         return None
-    head_sha = watcher_head(watcher)
+    observation = _watcher_result_observation(watcher)
+    if observation is None:
+        return None
+    head_sha = observation.head_sha or ""
     evidence = {
-        "base_sha": _watcher_evidence_text(watcher, "base_sha"),
+        "base_sha": observation.base_sha,
         "head_sha": head_sha,
-        "patch_digest": watcher_patch_digest(watcher),
-        "merge_tree_sha": _watcher_evidence_text(watcher, "merge_tree_sha"),
+        "patch_digest": observation.patch_digest,
+        "merge_tree_sha": observation.merge_tree_sha,
     }
     if any(not isinstance(value, str) or not value for value in evidence.values()):
         return None
-    if watcher.result.get("ci_status") not in {"success", "neutral"}:
+    if observation.ci_status not in {"success", "neutral"}:
         return None
     try:
         freshness_window_secs = (
@@ -2061,8 +2064,8 @@ def _adopt_direct_merge_result(
     if (
         watcher is not None
         and watcher.success is True
-        and isinstance(watcher.result, Mapping)
-        and watcher.result.get("merged") is True
+        and (_watcher_result_observation(watcher) is not None)
+        and _watcher_result_observation(watcher).merged is True
     ):
         refreshed = store.load()
         return _checkpoint_slice_action(
@@ -2548,8 +2551,8 @@ def _reconcile_pending_merge_entry(
         return False
     if (
         watcher.success is not True
-        or not isinstance(watcher.result, Mapping)
-        or watcher.result.get("merged") is not True
+        or _watcher_result_observation(watcher) is None
+        or _watcher_result_observation(watcher).merged is not True
     ):
         return False
     key = entry.get("key")
@@ -2758,7 +2761,7 @@ def _reconcile_nonterminal_slices(
             effects_log,
             raise_on_failure=False,
         )
-    snapshots: dict[int, Mapping[str, object] | None] = {}
+    snapshots: dict[int, WatcherObservation | None] = {}
     updated = dict(state.slices)
     conflicts_found = False
     changed = False
@@ -2837,14 +2840,14 @@ def _reconcile_nonterminal_slices(
             }[result.next_action]
             park_audit = {
                 "reconciliation": result.as_state(),
-                "pr_number": (current.pr_number or (watcher.get("pr_number") if watcher else None)),
+                "pr_number": current.pr_number or (watcher.pr_number if watcher else None),
                 "head_sha": _snapshot_text(watcher, "head_sha") if watcher else None,
                 "branch": _snapshot_text(watcher, "head_branch") if watcher else current.branch,
                 "observed_at": _now_timestamp(),
                 "observation_error": _snapshot_text(watcher, "evidence_error") if watcher else None,
                 "publication_ownership_error": (
                     (
-                        _snapshot_text(watcher, "publication_ownership_error")
+                        watcher.publication_ownership_error
                         or _publication_ownership_status(watcher)[1]
                     )
                     if watcher
@@ -2930,21 +2933,22 @@ def _reconciliation_phase(
 def _apply_reconciliation_observations(
     current: SliceState,
     result: ReconciliationResult,
-    watcher: Mapping[str, object] | None,
+    watcher: WatcherObservation | Mapping[str, object] | None,
     owner_id: str | None,
 ) -> SliceState:
+    watcher = _as_watcher_observation(watcher)
     updates: dict[str, object] = {"reconciliation": result.as_state()}
     if result.conflicts:
         return replace(current, **updates)
 
-    if watcher is not None and watcher.get("found") is True:
+    if watcher is not None and watcher.found is True:
         if current.pr_number is None:
-            recovered_pr_number = watcher.get("pr_number")
+            recovered_pr_number = watcher.pr_number
             if isinstance(recovered_pr_number, int) and recovered_pr_number > 0:
                 updates["pr_number"] = recovered_pr_number
-        head_sha = _snapshot_text(watcher, "head_sha")
-        ci_status = _snapshot_text(watcher, "ci_status")
-        review_state = _snapshot_text(watcher, "review_state")
+        head_sha = watcher.head_sha
+        ci_status = watcher.ci_status
+        review_state = watcher.review_state
         if head_sha and ci_status in CI_STATUS_VALUES:
             ci_state = dict(current.ci_state)
             ci_state[head_sha] = ci_status
@@ -2972,7 +2976,7 @@ def _apply_reconciliation_observations(
         if invocation_id is None and publication is not None:
             invocation_id = publication.invocation_id
         if (
-            watcher.get("publication_ownership_verified") is True
+            watcher.publication_ownership_verified is True
             and head_sha
             and published_pr_number is not None
             and effective_agent_id
@@ -2996,7 +3000,7 @@ def _apply_reconciliation_observations(
             )
             if current.status is SliceStatus.SPAWNED:
                 updates["status"] = SliceStatus.IN_REVIEW
-        elif watcher.get("publication_ownership_verified") is True:
+        elif watcher.publication_ownership_verified is True:
             missing = [
                 name
                 for name, value in (
@@ -3012,16 +3016,16 @@ def _apply_reconciliation_observations(
                 current.id,
                 ", ".join(missing) or "matching publication identity",
             )
-        elif watcher.get("found") is True:
+        elif watcher.found is True:
             _, ownership_reason = _publication_ownership_status(watcher)
             LOGGER.warning(
                 "[TL loop] skipping handoff backfill for %s: publication ownership is not verified (%s)",
                 current.id,
-                _snapshot_text(watcher, "publication_ownership_error")
+                watcher.publication_ownership_error
                 or ownership_reason
                 or "host publication identity unavailable",
             )
-        if watcher.get("merged") is True:
+        if watcher.merged is True:
             updates["status"] = SliceStatus.MERGED
     if owner_id is not None and current.dispatch_agent_id is None:
         updates["dispatch_agent_id"] = owner_id
@@ -3030,16 +3034,18 @@ def _apply_reconciliation_observations(
 
 def _publication_from_watcher(
     current: SliceState,
-    watcher: Mapping[str, object],
+    watcher: WatcherObservation | Mapping[str, object],
     head_sha: str | None,
     owner_id: str | None,
 ) -> PublicationBinding | None:
     """Recover a publication only from an ownership-verified watcher snapshot."""
-    if watcher.get("publication_ownership_verified") is not True or not head_sha:
+    watcher = _as_watcher_observation(watcher)
+    assert watcher is not None
+    if watcher.publication_ownership_verified is not True or not head_sha:
         return None
-    pr_number = watcher.get("pr_number")
-    head_branch = watcher.get("head_branch")
-    base_branch = watcher.get("base_branch")
+    pr_number = watcher.pr_number
+    head_branch = watcher.head_branch
+    base_branch = watcher.base_branch
     if (
         type(pr_number) is not int
         or pr_number <= 0
@@ -4386,10 +4392,17 @@ def _merge_failure_reason(result: ToolResult | None) -> str:
 
 def _watcher_evidence_text(result: ToolResult, key: str) -> str | None:
     """Read one non-empty compare field from a watcher response."""
-    if result.success is not True or not isinstance(result.result, Mapping):
+    observation = _watcher_result_observation(result)
+    if observation is None:
         return None
-    value = result.result.get(key)
+    value = getattr(observation, key, None)
     return value if isinstance(value, str) and value else None
+
+
+def _watcher_result_observation(result: ToolResult | None) -> WatcherObservation | None:
+    if result is None or result.success is not True or not isinstance(result.result, Mapping):
+        return None
+    return WatcherObservation.from_response(result.result)
 
 
 def _integration_gate_pending(state: RunState) -> bool:
@@ -5132,7 +5145,7 @@ def _watcher_snapshot(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
-) -> Mapping[str, object] | None:
+) -> WatcherObservation | None:
     """Read one live PR/base snapshot through the parent-owned watcher."""
     result = _invoke(
         "watcher_pr_state",
@@ -5145,7 +5158,7 @@ def _watcher_snapshot(
     )
     if result is None or result.success is not True or not isinstance(result.result, Mapping):
         return None
-    return result.result
+    return WatcherObservation.from_response(result.result)
 
 
 def _watcher_snapshot_for_slice(
@@ -5153,7 +5166,7 @@ def _watcher_snapshot_for_slice(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
-) -> Mapping[str, object] | None:
+) -> WatcherObservation | None:
     """Resolve a live PR identity, then read its Forgejo facts."""
     result = _invoke(
         "resolve_live_pr_for_slice",
@@ -5171,63 +5184,78 @@ def _watcher_snapshot_for_slice(
     if resolution == "never_published":
         return None
     if resolution != "live":
-        return {
-            "found": False,
-            "resolution": resolution,
-            "publication_ownership_verified": False,
-            "publication_ownership_error": result.result.get("error")
-            or f"slice publication resolution is {resolution!r}",
-        }
+        return WatcherObservation.from_response(
+            {
+                "found": False,
+                "publication_ownership_verified": False,
+                "publication_ownership_error": result.result.get("error")
+                or f"slice publication resolution is {resolution!r}",
+            }
+        )
     pr_number = result.result.get("pr_number")
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         return None
     snapshot = _watcher_snapshot(pr_number, config, effects, effects_log)
     publication = result.result.get("publication")
     if snapshot is not None and isinstance(publication, Mapping):
-        return {**snapshot, "publication": publication}
+        return snapshot.with_publication(publication)
     return snapshot
 
 
-def _snapshot_text(snapshot: Mapping[str, object], key: str) -> str | None:
-    value = snapshot.get(key)
+def _as_watcher_observation(
+    snapshot: WatcherObservation | Mapping[str, object] | None,
+) -> WatcherObservation | None:
+    if snapshot is None or isinstance(snapshot, WatcherObservation):
+        return snapshot
+    return WatcherObservation.from_response(snapshot)
+
+
+def _snapshot_text(snapshot: WatcherObservation | Mapping[str, object], key: str) -> str | None:
+    observation = _as_watcher_observation(snapshot)
+    assert observation is not None
+    value = getattr(observation, key, None)
     return value if isinstance(value, str) and value else None
 
 
-def _publication_evidence(watcher: Mapping[str, object]) -> Mapping[str, object] | None:
-    value = watcher.get("publication")
-    return value if isinstance(value, Mapping) else None
+def _publication_evidence(
+    watcher: WatcherObservation | Mapping[str, object],
+) -> object | None:
+    observation = _as_watcher_observation(watcher)
+    return observation.publication if observation is not None else None
 
 
 def _publication_record_text(
-    watcher: Mapping[str, object] | None,
+    watcher: WatcherObservation | Mapping[str, object] | object | None,
     key: str,
 ) -> str | None:
     if watcher is None:
         return None
-    record = watcher if "publication" not in watcher else _publication_evidence(watcher)
+    record = watcher if hasattr(watcher, key) else _publication_evidence(watcher)
     if record is None:
         return None
-    value = record.get(key)
+    value = getattr(record, key, None)
     return value if isinstance(value, str) and value else None
 
 
 def _handoff_reconciliation_event_payload(
     current: SliceState,
     reconciled: SliceState,
-    watcher: Mapping[str, object],
+    watcher: WatcherObservation | Mapping[str, object],
     owner_id: str | None,
 ) -> dict[str, object] | None:
-    if watcher.get("found") is not True:
+    watcher = _as_watcher_observation(watcher)
+    assert watcher is not None
+    if watcher.found is not True:
         return None
-    if watcher.get("publication_ownership_verified") is not True:
+    if watcher.publication_ownership_verified is not True:
         _, ownership_reason = _publication_ownership_status(watcher)
         return {
             "slice_id": current.id,
-            "pr_number": watcher.get("pr_number") or 0,
+            "pr_number": watcher.pr_number or 0,
             "head_sha": _snapshot_text(watcher, "head_sha") or "",
             "invocation_id": "",
             "outcome": "skipped",
-            "reason": _snapshot_text(watcher, "publication_ownership_error")
+            "reason": watcher.publication_ownership_error
             or ownership_reason
             or "publication_ownership_unverified",
             "source": "host_publication",
@@ -5239,7 +5267,7 @@ def _handoff_reconciliation_event_payload(
     pr_number = (
         reconciled.pr_number
         or (publication.pr_number if publication is not None else None)
-        or watcher.get("pr_number")
+        or watcher.pr_number
     )
     handoff = reconciled.handoff
     if handoff is not None:

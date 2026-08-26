@@ -18,6 +18,7 @@ from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recov
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.loop.observation import WatcherObservation
 from tl_loop.loop.reconcile import reconcile_merge_observation
 from tl_loop.loop.recovery_policy import (
     ProbeResult,
@@ -763,11 +764,13 @@ def _index_worker_rows(
         indexed[slice_id] = {**row, "pane_alive": False} if dead else row
 
 
-def _watch_pr(effects: LiveEffects, pr_number: int, slice_id: str) -> JsonMapping:
-    return _result_object(
-        effects.watcher_pr_state(pr_number=pr_number),
-        "watcher_pr_state",
-        target=slice_id,
+def _watch_pr(effects: LiveEffects, pr_number: int, slice_id: str) -> WatcherObservation:
+    return WatcherObservation.from_response(
+        _result_object(
+            effects.watcher_pr_state(pr_number=pr_number),
+            "watcher_pr_state",
+            target=slice_id,
+        )
     )
 
 
@@ -806,10 +809,11 @@ def _result_object(
     return result.result
 
 
-def _reconcile_pr(slice_state: SliceState, payload: JsonMapping) -> tuple[SliceState, str]:
-    head_sha = payload.get("head_sha")
-    if head_sha is not None and not isinstance(head_sha, str):
-        raise HeartbeatError("watcher_pr_state head_sha must be a string or null")
+def _reconcile_pr(
+    slice_state: SliceState, payload: WatcherObservation | JsonMapping
+) -> tuple[SliceState, str]:
+    payload = _as_watcher_observation(payload)
+    head_sha = payload.head_sha
     if head_sha and head_sha != slice_state.reviewed_head:
         return replace(
             slice_state, reviewed_head=head_sha, verdict=None, verdict_at=None
@@ -817,41 +821,29 @@ def _reconcile_pr(slice_state: SliceState, payload: JsonMapping) -> tuple[SliceS
     return slice_state, "pr.review"
 
 
-def _pr_payload(payload: JsonMapping) -> dict[str, object]:
-    return {
-        key: payload[key]
-        for key in (
-            "head_sha",
-            "review_state",
-            "ci_status",
-            "pr_state",
-            "merged",
-            "head_reachable",
-            "evidence_error",
-            "publication_ownership_verified",
-            "publication_ownership_error",
-        )
-        if key in payload
-    }
+def _pr_payload(payload: WatcherObservation | JsonMapping) -> dict[str, object]:
+    return _as_watcher_observation(payload).to_payload()
 
 
-def _pr_terminal_cause(payload: JsonMapping) -> ParkCause | None:
+def _pr_terminal_cause(payload: WatcherObservation | JsonMapping) -> ParkCause | None:
     """Classify only explicit Forgejo/head observations as terminal."""
-    if payload.get("publication_ownership_verified") is False or (
-        isinstance(payload.get("publication_ownership_error"), str)
-        and bool(payload.get("publication_ownership_error"))
+    payload = _as_watcher_observation(payload)
+    if payload.ownership_verified_present and (
+        payload.publication_ownership_verified is False or bool(payload.publication_ownership_error)
     ):
         return ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED
-    pr_state = payload.get("pr_state")
-    if (
-        isinstance(pr_state, str)
-        and pr_state.lower() == "closed"
-        and payload.get("merged") is False
-    ):
+    pr_state = payload.pr_state
+    if isinstance(pr_state, str) and pr_state.lower() == "closed" and payload.merged is False:
         return ParkCause.PR_CLOSED_UNMERGED
-    if payload.get("head_reachable") is False:
+    if payload.head_reachable is False:
         return ParkCause.PR_HEAD_UNREACHABLE
     return None
+
+
+def _as_watcher_observation(payload: WatcherObservation | JsonMapping) -> WatcherObservation:
+    if isinstance(payload, WatcherObservation):
+        return payload
+    return WatcherObservation.from_response(payload)
 
 
 def _retired_or_unrouted(row: JsonMapping) -> bool:

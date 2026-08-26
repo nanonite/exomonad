@@ -129,6 +129,10 @@ tl-loop-merge-convergence-e2e-3x:
 tl-loop-lint:
     {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py
 
+# Ensure ownership decisions consume the typed watcher projection.
+watcher-projection-check:
+    {{py}} scripts/check_watcher_projection.py --project-root .
+
 # Verify every declared tool is role-registered and controller-callable tools
 # are exposed by the TL role.
 tool-surface-check:
@@ -188,7 +192,7 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
 # Run tests: Python checks, formatting, Rust check, WASM build/tests, Rust tests, proto freshness
-test: tl-loop-replay tl-loop-test tl-loop-lint tl-loop-archive-test tool-surface-check controller-event-contract-check
+test: tl-loop-replay tl-loop-test tl-loop-lint watcher-projection-check tl-loop-archive-test tool-surface-check controller-event-contract-check
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/8] Observability contract checks..."
