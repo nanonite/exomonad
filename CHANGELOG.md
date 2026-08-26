@@ -409,6 +409,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Adopt plan.json as the snapshot when continuing a legacy run (#1021)
 - Add real-server acceptance for --continue identity preservation (#1019)
 - Make --continue the default and migrate existing sessions (#1018)
 - Make --recreate destroy worktrees and their PRs behind a confirmation gate (#1017)
