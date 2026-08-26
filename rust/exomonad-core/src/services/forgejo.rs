@@ -1572,7 +1572,7 @@ impl FjForgejoClient {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        serde_json::from_slice(&output.stdout).context("fj returned invalid JSON")
+        parse_json_bytes(&output.stdout, "fj")
     }
 
     async fn fj_status<I, S>(&self, args: I) -> Result<()>
@@ -1640,8 +1640,50 @@ struct ResponseBody(String);
 
 impl ResponseBody {
     fn parse_json<T: serde::de::DeserializeOwned>(self, action: &str) -> Result<T> {
-        serde_json::from_str(&self.0).with_context(|| format!("{action} returned invalid JSON"))
+        parse_json_bytes(self.0.as_bytes(), action)
     }
+}
+
+fn parse_json_bytes<T: serde::de::DeserializeOwned>(body: &[u8], action: &str) -> Result<T> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
+        let path = error.path().to_string();
+        let source = error.into_inner();
+        anyhow!(
+            "{action} returned unparseable JSON at path {path} (line {}, column {}): {}",
+            source.line(),
+            source.column(),
+            redact_serde_error(&source.to_string()),
+        )
+    })
+}
+
+fn redact_serde_error(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for character in message.chars() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && delimiter == '"' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+                redacted.push_str("<redacted>");
+            }
+            continue;
+        }
+        if character == '"' || character == '\'' {
+            quote = Some(character);
+        } else {
+            redacted.push(character);
+        }
+    }
+    if quote.is_some() {
+        redacted.push_str("<redacted>");
+    }
+    redacted
 }
 
 impl TryFrom<PullRequestResponse> for ForgejoPullRequest {
@@ -1845,6 +1887,25 @@ mod tests {
         };
 
         assert!(ForgejoPullRequest::try_from(response).is_err());
+    }
+
+    #[test]
+    fn parse_json_reports_path_and_position_without_response_body() {
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct Payload {
+            count: u64,
+        }
+
+        let body = br#"{"count":"sensitive-sentinel"}"#;
+        let error = parse_json_bytes::<Payload>(body, "decode test payload")
+            .expect_err("string count must not deserialize as u64")
+            .to_string();
+
+        assert!(error.contains("path count"), "{error}");
+        assert!(error.contains("line 1"), "{error}");
+        assert!(error.contains("column"), "{error}");
+        assert!(!error.contains("sensitive-sentinel"), "{error}");
     }
 
     #[tokio::test]
