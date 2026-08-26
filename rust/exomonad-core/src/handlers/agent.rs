@@ -4775,6 +4775,151 @@ mod tests {
         AgentHandler::new(service, services)
     }
 
+    async fn ownership_services(
+        publication: &PublishedHead,
+        current_invocation_id: &str,
+        identity_slice_id: Option<&str>,
+    ) -> (tempfile::TempDir, crate::services::Services) {
+        let temp_dir = tempfile::tempdir().expect("ownership fixture directory");
+        let project_dir = temp_dir.path();
+        let agent_dir = project_dir.join(".exo/agents/leaf-codex");
+        std::fs::create_dir_all(&agent_dir).expect("create ownership agent directory");
+        let identity = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("leaf-codex").expect("agent name"),
+            slug: Slug::try_from_str("feat-codex").expect("agent slug"),
+            agent_type: ServiceAgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.feature-codex").expect("birth branch"),
+            parent_branch: BirthBranch::try_from_str("main").expect("parent branch"),
+            working_dir: PathBuf::from(".exo/worktrees/leaf-codex"),
+            display_name: "leaf-codex".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: identity_slice_id.map(str::to_owned),
+        };
+        std::fs::write(
+            agent_dir.join("identity.json"),
+            serde_json::to_vec_pretty(&identity).expect("serialize identity"),
+        )
+        .expect("write identity");
+
+        let record = crate::services::agent_control::start_invocation(
+            &agent_dir,
+            ServiceAgentType::Codex,
+            InvocationTrigger::Spawn,
+            RoutingInfo::window(
+                crate::services::tmux_ipc::WindowId::parse("@42").expect("window id"),
+            ),
+            Some(publication.pr_number),
+            Some(publication.head_sha.clone()),
+        )
+        .await
+        .expect("start fixture invocation");
+        let mut record = serde_json::to_value(record).expect("serialize invocation");
+        record["invocation_id"] = serde_json::json!(current_invocation_id);
+        record["runtime_agent_id"] = serde_json::json!("leaf-codex");
+        record["slice_id"] = serde_json::to_value(identity_slice_id).expect("serialize slice");
+        record["branch"] = serde_json::json!("main.feature-codex");
+        std::fs::write(
+            agent_dir.join("invocation.json"),
+            serde_json::to_vec_pretty(&record).expect("serialize fixture invocation"),
+        )
+        .expect("write invocation");
+
+        std::fs::create_dir_all(project_dir.join(".exo")).expect("create project Exo directory");
+        std::fs::write(
+            project_dir.join(".exo/published-heads.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 2,
+                "heads": [publication],
+            }))
+            .expect("serialize publication"),
+        )
+        .expect("write publication");
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        services.agent_resolver = Arc::new(
+            crate::services::AgentResolver::load(project_dir.to_path_buf()).await,
+        );
+        (temp_dir, services)
+    }
+
+    fn ownership_publication(slice_id: Option<&str>) -> PublishedHead {
+        PublishedHead {
+            pr_number: 43,
+            head_branch: "main.feature-codex".to_string(),
+            base_branch: "main".to_string(),
+            head_sha: "head-sha".to_string(),
+            author_agent: Some("leaf-codex".to_string()),
+            author_role: Some("dev".to_string()),
+            provenance: PublicationProvenance::LedgerOwned,
+            slice_id: slice_id.map(str::to_owned),
+            invocation_id: Some("invocation-1".to_string()),
+            invocation_trigger: None,
+            invocation_runtime: None,
+            invocation_succession: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_ownership_status_accepts_fanout_current_invocation() {
+        let mut publication = ownership_publication(Some("slice-a"));
+        for (recorded_at, to_invocation_id) in [
+            (1, "invocation-2"),
+            (2, "invocation-3"),
+            (3, "invocation-4"),
+            (4, "invocation-5"),
+        ] {
+            publication.invocation_succession.push(
+                crate::services::pr_registry::InvocationSuccession {
+                    from_invocation_id: "invocation-1".to_string(),
+                    to_invocation_id: to_invocation_id.to_string(),
+                    reason: crate::services::pr_registry::SuccessionReason::SessionRecreate,
+                    recorded_at,
+                },
+            );
+        }
+        let (_temp_dir, services) = ownership_services(&publication, "invocation-5", Some("slice-a")).await;
+        assert_eq!(
+            publication_ownership_status(
+                &services,
+                publication.pr_number,
+                &publication.head_branch,
+                &publication.base_branch,
+                &publication.head_sha,
+            )
+            .await,
+            (true, String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_ownership_status_rejects_unrelated_successor_component() {
+        let mut publication = ownership_publication(None);
+        publication.invocation_succession.push(
+            crate::services::pr_registry::InvocationSuccession {
+                from_invocation_id: "unrelated-root".to_string(),
+                to_invocation_id: "invocation-unrelated".to_string(),
+                reason: crate::services::pr_registry::SuccessionReason::SessionRecreate,
+                recorded_at: 1,
+            },
+        );
+        let (_temp_dir, services) =
+            ownership_services(&publication, "invocation-unrelated", None).await;
+        let (verified, error) = publication_ownership_status(
+            &services,
+            publication.pr_number,
+            &publication.head_branch,
+            &publication.base_branch,
+            &publication.head_sha,
+        )
+        .await;
+        assert!(!verified);
+        assert!(error.contains("no succession to current invocation"));
+    }
+
     #[test]
     fn tl_spawn_preflight_excludes_runtime_state_but_blocks_source_changes() {
         let report = classify_spawn_preflight_entries(

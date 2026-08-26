@@ -5392,22 +5392,21 @@ mod tests {
     fn invocation_succession_accepts_only_reachable_current_invocation() {
         let mut publication = publication_for_owner(Some("feat-codex"));
         publication.invocation_id = Some("invocation-1".to_string());
-        publication.invocation_succession.push(
-            crate::services::pr_registry::InvocationSuccession {
-                from_invocation_id: "invocation-1".to_string(),
-                to_invocation_id: "invocation-2".to_string(),
-                reason: crate::services::pr_registry::SuccessionReason::SessionRecreate,
-                recorded_at: 1,
-            },
-        );
-        publication.invocation_succession.push(
-            crate::services::pr_registry::InvocationSuccession {
-                from_invocation_id: "invocation-1".to_string(),
-                to_invocation_id: "invocation-3".to_string(),
-                reason: crate::services::pr_registry::SuccessionReason::SessionRecreate,
-                recorded_at: 2,
-            },
-        );
+        for (recorded_at, to_invocation_id) in [
+            (1, "invocation-2"),
+            (2, "invocation-3"),
+            (3, "invocation-4"),
+            (4, "invocation-5"),
+        ] {
+            publication.invocation_succession.push(
+                crate::services::pr_registry::InvocationSuccession {
+                    from_invocation_id: "invocation-1".to_string(),
+                    to_invocation_id: to_invocation_id.to_string(),
+                    reason: crate::services::pr_registry::SuccessionReason::SessionRecreate,
+                    recorded_at,
+                },
+            );
+        }
         assert!(
             crate::services::pr_registry::invocation_succession_reaches_current(
                 &publication,
@@ -5417,14 +5416,22 @@ mod tests {
         assert!(
             crate::services::pr_registry::invocation_succession_reaches_current(
                 &publication,
-                "invocation-3"
+                "invocation-5"
             ),
             "fan-out succession records must all remain reachable from the publisher"
+        );
+        publication.invocation_succession.push(
+            crate::services::pr_registry::InvocationSuccession {
+                from_invocation_id: "unrelated-root".to_string(),
+                to_invocation_id: "invocation-unrelated".to_string(),
+                reason: crate::services::pr_registry::SuccessionReason::SessionRecreate,
+                recorded_at: 5,
+            },
         );
         assert!(
             !crate::services::pr_registry::invocation_succession_reaches_current(
                 &publication,
-                "unrelated"
+                "invocation-unrelated"
             )
         );
 
