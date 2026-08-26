@@ -189,6 +189,29 @@ def test_dispatch_correlation_rejects_historical_epoch_and_stale_generation(
     assert correlate_dispatch_event(state, current_event).classification == DISPATCH_CORRELATED
 
 
+def test_continue_adopts_the_new_controller_reconciliation_epoch(tmp_path: Path) -> None:
+    run_id = "continued-epoch"
+    epoch_path = tmp_path / f"{run_id}.controller-epoch"
+    epoch_path.write_text("epoch-new\n", encoding="utf-8")
+    create(run_id, {"controller_epoch": "epoch-old"}, root_dir=tmp_path)
+
+    result = tl_run(
+        {"run_id": run_id, "plan": WorkPlan()},
+        TLLoopConfig(
+            active=True,
+            session_mode="continue",
+            root_dir=tmp_path,
+            max_events=1,
+            source=SyntheticQueue([]),
+            effects=EffectClient(RecordingTransport()),
+        ),
+        BudgetLedger(0, 0),
+    )
+
+    assert result.final_state.controller_epoch == "epoch-new"
+    assert RunStore(run_id, tmp_path).load().controller_epoch == "epoch-new"
+
+
 @pytest.mark.parametrize(
     ("result", "authoritative"),
     [

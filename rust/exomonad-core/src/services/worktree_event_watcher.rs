@@ -342,6 +342,8 @@ struct ReviewStallDiagnostic {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct WatcherStateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notification_epoch: Option<String>,
     #[serde(default)]
     prs: HashMap<u64, WatcherPrState>,
 }
@@ -1028,6 +1030,18 @@ where
         Ok(())
     }
 
+    async fn controller_epoch(&self) -> Option<String> {
+        let path = self
+            .ctx
+            .project_dir()
+            .join(".exo/tl-loop/root.controller-epoch");
+        tokio::fs::read_to_string(path)
+            .await
+            .ok()
+            .map(|epoch| epoch.trim().to_string())
+            .filter(|epoch| !epoch.is_empty())
+    }
+
     async fn reconcile_reviewer_attempts(&self) -> Result<()> {
         let mut persisted = self.read_watcher_state().await.unwrap_or_default();
         let mut changed = false;
@@ -1524,6 +1538,9 @@ where
         let mut pending_actions: Vec<PendingPrActions> = Vec::new();
         let mut head_sha_updates: Vec<(u64, String)> = Vec::new();
         let watcher_state = self.read_watcher_state().await.unwrap_or_default();
+        let controller_epoch = self.controller_epoch().await;
+        let replay_notifications = controller_epoch.is_some()
+            && watcher_state.notification_epoch.as_deref() != controller_epoch.as_deref();
 
         {
             let mut state_guard = self.state.prs.lock().await;
@@ -1635,6 +1652,7 @@ where
                         pr.merge_blocked_on_ci,
                         pr.reviewer_agent.is_some(),
                         obs.forgejo_review_present,
+                        replay_notifications,
                         branch.as_str(),
                         &|c, r| format_review_message(c, r),
                         self.policy.reviewer_max_wait_seconds,
@@ -1681,6 +1699,7 @@ where
                         pr.merge_blocked_on_ci,
                         pr.reviewer_agent.is_some(),
                         obs.forgejo_review_present,
+                        replay_notifications,
                         branch.as_str(),
                         &|c, r| format_review_message(c, r),
                         self.policy.reviewer_max_wait_seconds,
@@ -1720,7 +1739,8 @@ where
             }
         }
 
-        self.persist_runtime_pr_state(&head_sha_updates).await?;
+        self.persist_runtime_pr_state(&head_sha_updates, controller_epoch.as_deref())
+            .await?;
 
         for pending in pending_actions {
             for action in pending.actions.iter().cloned() {
@@ -1848,12 +1868,19 @@ where
     }
 
     /// Persist the complete runtime projection for the supplied PRs.
-    async fn persist_runtime_pr_state(&self, updates: &[(u64, String)]) -> Result<()> {
+    async fn persist_runtime_pr_state(
+        &self,
+        updates: &[(u64, String)],
+        notification_epoch: Option<&str>,
+    ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
 
         let mut state = self.read_watcher_state().await.unwrap_or_default();
+        if let Some(notification_epoch) = notification_epoch {
+            state.notification_epoch = Some(notification_epoch.to_string());
+        }
         let runtime_state = self.state.prs.lock().await;
         for (pr_number, head_sha) in updates {
             let entry = state.prs.entry(*pr_number).or_default();
@@ -2585,6 +2612,7 @@ fn compute_pr_actions(
         merge_blocked_on_ci,
         false,
         false,
+        false,
         branch,
         format_message,
         15 * 60,
@@ -2605,6 +2633,7 @@ fn compute_pr_actions_with_context(
     merge_blocked_on_ci: bool,
     reviewer_registered: bool,
     forgejo_review_present: bool,
+    replay_notifications: bool,
     branch: &str,
     format_message: &dyn Fn(&[ForgejoReviewComment], &[ForgejoReview]) -> String,
     max_wait_seconds: u64,
@@ -2679,7 +2708,7 @@ fn compute_pr_actions_with_context(
     }
 
     let terminal_parent_notified = old_state.notified_parent_timeout;
-    if terminal_parent_notified && !recover_after_ci_block {
+    if terminal_parent_notified && !recover_after_ci_block && !replay_notifications {
         return pending_actions;
     }
 
@@ -2690,7 +2719,9 @@ fn compute_pr_actions_with_context(
     let approved = reviews.iter().any(|r| {
         r.state == ForgejoReviewVerdict::Approved || r.body.to_lowercase().contains("approved")
     });
-    if approved && old_state.last_review_state != ForgejoReviewVerdict::Approved {
+    if approved
+        && (old_state.last_review_state != ForgejoReviewVerdict::Approved || replay_notifications)
+    {
         old_state.last_review_state = ForgejoReviewVerdict::Approved;
         old_state.notified_parent_approved = true;
         old_state.review_approved_at = Some(now);
@@ -2824,7 +2855,7 @@ fn compute_pr_actions_with_context(
         old_state.last_ci_status = ci_status;
     }
 
-    if !old_state.notified_parent_timeout
+    if (!old_state.notified_parent_timeout || replay_notifications)
         && old_state.first_seen.elapsed() > Duration::from_secs(max_wait_seconds)
     {
         old_state.notified_parent_timeout = true;
@@ -4505,6 +4536,7 @@ mod tests {
             false,
             true,
             true,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             15 * 60,
@@ -4881,6 +4913,39 @@ mod tests {
     }
 
     #[test]
+    fn test_new_controller_epoch_replays_approval_after_prior_terminal_notifications() {
+        let branch = BranchName::try_from_str("main.feat-codex")
+            .expect("literal validated string is non-empty");
+        let mut state = test_state(&branch, AgentType::Codex, "abc123");
+        state.last_review_state = ForgejoReviewVerdict::Approved;
+        state.notified_parent_timeout = true;
+        state.notified_parent_approved = true;
+        let reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
+
+        let actions = compute_pr_actions_with_context(
+            &mut state,
+            PRNumber::new(1),
+            "abc123",
+            &[],
+            &reviews,
+            0,
+            CIStatus::Success,
+            false,
+            false,
+            true,
+            true,
+            branch.as_str(),
+            &|_, _| String::new(),
+            15 * 60,
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            PendingAction::WasmEvent { payload, .. } if payload["kind"] == "approved"
+        )));
+    }
+
+    #[test]
     fn test_timeout_shorter_after_addressed_changes() {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
@@ -4898,6 +4963,7 @@ mod tests {
             false,
             true,
             true,
+            false,
             branch.as_str(),
             &|_, _| String::new(),
             5 * 60,
@@ -6229,5 +6295,53 @@ mod tests {
                 .and_then(|state| state.last_head_sha.as_deref()),
             Some("def456")
         );
+    }
+
+    #[tokio::test]
+    async fn test_continuation_epoch_is_persisted_after_notification_replay() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp_dir.path().to_path_buf();
+        tokio::fs::create_dir_all(temp_dir.path().join(".exo/tl-loop"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            temp_dir.path().join(".exo/tl-loop/root.controller-epoch"),
+            "continue-2\n",
+        )
+        .await
+        .unwrap();
+
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let mut persisted = WatcherStateFile {
+            notification_epoch: Some("continue-1".to_string()),
+            ..Default::default()
+        };
+        persisted.prs.insert(
+            1,
+            WatcherPrState {
+                last_head_sha: Some("abc123".to_string()),
+                last_review_state: ForgejoReviewVerdict::Approved,
+                notified_parent_timeout: true,
+                notified_parent_approved: true,
+                ..Default::default()
+            },
+        );
+        watcher.write_watcher_state(&persisted).await.unwrap();
+
+        let registry = test_registry(test_pr_entry());
+        let mut observation = test_observation("abc123");
+        observation.review_state = ForgejoReviewState::Approved;
+        observation.reviews = vec![test_review("approved", ForgejoReviewVerdict::Approved)];
+        observation.forgejo_review_present = true;
+        observation.ci_status = CIStatus::Success;
+
+        watcher
+            .process_observations(&registry, &HashMap::from([(1u64, observation)]))
+            .await
+            .unwrap();
+
+        let persisted = watcher.read_watcher_state().await.unwrap();
+        assert_eq!(persisted.notification_epoch.as_deref(), Some("continue-2"));
     }
 }

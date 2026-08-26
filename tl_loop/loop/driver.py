@@ -730,8 +730,13 @@ def run_tl_loop(
     state = store.load()
     if state.session_mode is None and selected.session_mode is not None:
         state = store.set_session_mode(selected.session_mode)
-    if state.controller_epoch is None and epoch_enabled:
-        state = store.set_controller_epoch(_controller_epoch(store.root_dir, run_id))
+    if epoch_enabled:
+        current_controller_epoch = _controller_epoch(store.root_dir, run_id)
+        if state.controller_epoch is None or (
+            selected.session_mode == "continue"
+            and state.controller_epoch != current_controller_epoch
+        ):
+            state = store.set_controller_epoch(current_controller_epoch)
     if (
         state.ledger_run_id
         and selected.ledger_run_id

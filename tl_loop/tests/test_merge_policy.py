@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from tl_loop.loop.reconcile import ExternalIntent, InternalTransition, Quiescent, derive_next_action
+from tl_loop.loop.reconcile import (
+    ExternalIntent,
+    InternalTransition,
+    Quiescent,
+    derive_next_action,
+    reconcile_merge_observation,
+)
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
     ActionKind,
@@ -69,6 +75,25 @@ def test_direct_policy_requires_handoff_review_and_ci_in_order() -> None:
     assert derive_next_action(replace(state, ci_state={"head-a": "pending"})) == Quiescent(
         "await_ci"
     )
+
+
+def test_authoritative_snapshot_merge_does_not_require_reviewer_liveness() -> None:
+    state = replace(_mergeable(), reviewer_attempt={})
+    watcher = {
+        "found": True,
+        "head_sha": "head-a",
+        "ci_status": "success",
+        "pr_state": "open",
+        "merged": False,
+    }
+
+    reconciled = reconcile_merge_observation(state, watcher)
+
+    assert reconciled.reconciliation is not None
+    assert reconciled.reconciliation["next_action"] == "queue_merge"
+    decision = derive_next_action(reconciled)
+    assert isinstance(decision, ExternalIntent)
+    assert decision.operation == "merge"
 
 
 def test_direct_policy_routes_failure_and_inflight_merge_to_durable_actions() -> None:

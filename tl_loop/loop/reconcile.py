@@ -79,8 +79,6 @@ def reconcile_merge_observation(
         return state
     if state.handoff is None or state.handoff.head_sha != head_sha:
         return state
-    if state.reviewer_attempt.get(head_sha, 0) <= 0:
-        return state
     if state.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
         return state
     ci_status = watcher.ci_status or state.ci_state.get(head_sha, "unknown")
@@ -357,7 +355,13 @@ def _derive_slice_action(
         return Quiescent("await_handoff")
     if state.publication is not None and state.publication.pr_number != state.pr_number:
         return Quiescent("await_publication")
-    if contract_changed or state.reviewer_attempt.get(current_head, 0) == 0:
+    snapshot_merge_ready = (
+        isinstance(state.reconciliation, Mapping)
+        and state.reconciliation.get("next_action") == "queue_merge"
+    )
+    if contract_changed or (
+        state.reviewer_attempt.get(current_head, 0) == 0 and not snapshot_merge_ready
+    ):
         arguments: dict[str, object] = {
             "pr_number": state.pr_number,
             "head_sha": current_head,
