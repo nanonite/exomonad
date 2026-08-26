@@ -35,6 +35,17 @@ program that:
    decisions; and
 6. parks bounded failures or waits for an explicitly named human gate.
 
+### Single input alphabet
+
+The controller is a Mealy machine over one typed input alphabet. Ledger rows
+are projected into `EventEnvelope`, host watcher observations use
+`WatcherObservationEvent`, and the idle scheduler supplies `HeartbeatTick`.
+The pure `step(state, event)` boundary returns a `Transition` containing the
+next durable state, authorised intents, or an explicit ignored reason. Effect
+clients are outside this boundary. Migration is incremental: legacy lifecycle
+events remain acknowledged by the driver until their corresponding `step` arm
+is moved, but they are never silently discarded.
+
 The human-facing tmux TL window is an operator surface for controller logs and
 gate commands. It does not launch Claude, Codex, OpenCode, or a second
 interactive coordinator. Agent harnesses remain bounded implementation and

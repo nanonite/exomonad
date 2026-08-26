@@ -30,10 +30,12 @@ derived watcher signal with the TL decision, optional policy, and head binding,
 which made the authority model unclear.
 
 This ADR narrows the gate set and moves review workflow to the controller. The
-one-shot review path is now explicit: the watcher observes, the reducer folds
-facts into `SliceState`, the policy derives one intent or wait reason, and the
-executor performs the journaled effect. No watcher callback is allowed to skip
-that sequence.
+one-shot review path is now explicit: the watcher observes, the ledger projects
+facts into the controller's typed input alphabet, `step(state, event)` derives
+one intent or wait reason, and the executor performs the journaled effect. No
+watcher callback is allowed to skip that sequence. During the incremental
+migration, legacy event arms remain in the driver but do not define a second
+decision path.
 
 ## Decision
 

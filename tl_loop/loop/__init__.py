@@ -31,6 +31,7 @@ from .escalate import (
     park,
     switch_harness,
 )
+from .fsm import HeartbeatTick, Transition, WatcherObservationEvent, step
 from .heartbeat import (
     HeartbeatConfig,
     HeartbeatDeadlineExceeded,
@@ -87,6 +88,7 @@ __all__ = [
     "HeartbeatDeadlineExceeded",
     "HeartbeatError",
     "HeartbeatResult",
+    "HeartbeatTick",
     "IntegrationContract",
     "IntendedAction",
     "IssueCreationError",
@@ -116,7 +118,9 @@ __all__ = [
     "TLLoopConfig",
     "TLLoopError",
     "TLRunResult",
+    "Transition",
     "VerdictNotApproved",
+    "WatcherObservationEvent",
     "WorkPlan",
     "WorkerTask",
     "active_count",
@@ -131,6 +135,7 @@ __all__ = [
     "park",
     "ready",
     "run_tl_loop",
+    "step",
     "switch_harness",
     "tl_run",
     "verify_review",

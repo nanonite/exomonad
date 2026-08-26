@@ -793,9 +793,9 @@ in Python and the state writer, not in a free-form prompt.
    CI, permits `merge_pr`. Review timeout parks the slice. The controller
    verifies the post-merge state before advancing dependents.
 
-Review orchestration has one path: watcher facts are projected into durable
-state, `derive_next_action` selects one intent or wait reason, and the
-`EffectJournal` executor performs the effect. A reviewer is one-shot for an
+Review orchestration has one path: watcher facts are projected into the typed
+controller input alphabet, `step(state, event)` selects one intent or wait
+reason, and the `EffectJournal` executor performs the effect. A reviewer is one-shot for an
 exact head. Its terminal verdict is persisted before exit; GO waits for
 same-head CI and then uses compare evidence for `merge_pr`, while NO-GO or
 same-head CI failure uses one same-owner `resume_pr`. A head change invalidates

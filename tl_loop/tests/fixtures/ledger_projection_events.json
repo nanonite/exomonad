@@ -446,5 +446,75 @@
       "branch": "DO NOT EXPORT branch",
       "head_sha": "DO NOT EXPORT SHA"
     }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "watcher-observation-event",
+    "id": "watcher-observation-event",
+    "event_time": "2026-08-12T15:03:00Z",
+    "observed_at": "2026-08-12T15:03:00Z",
+    "run_seq": 102,
+    "type": "watcher.pr_observation",
+    "agent_id": "watcher",
+    "run_id": "run-a",
+    "session_id": "session-a",
+    "invocation_id": "inv-a",
+    "generation": 1,
+    "harness": "host",
+    "role": "watcher",
+    "source": "watcher",
+    "lifecycle_state": "observed",
+    "data": {
+      "slice_id": "slice-a",
+      "pr_number": 101,
+      "found": true,
+      "head_sha": "bbb222",
+      "publication_ownership_verified": true,
+      "publication_ownership_error": ""
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "watcher-ownership-event",
+    "id": "watcher-ownership-event",
+    "event_time": "2026-08-12T15:04:00Z",
+    "observed_at": "2026-08-12T15:04:00Z",
+    "run_seq": 103,
+    "type": "watcher.ownership_unresolved",
+    "agent_id": "watcher",
+    "run_id": "run-a",
+    "session_id": "session-a",
+    "invocation_id": "inv-a",
+    "generation": 1,
+    "harness": "host",
+    "role": "watcher",
+    "source": "watcher",
+    "lifecycle_state": "observed",
+    "data": {
+      "slice_id": "slice-a",
+      "pr_number": 101,
+      "found": true,
+      "publication_ownership_verified": false,
+      "publication_ownership_error": "invocation succession is missing"
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "watcher-poll-event",
+    "id": "watcher-poll-event",
+    "event_time": "2026-08-12T15:05:00Z",
+    "observed_at": "2026-08-12T15:05:00Z",
+    "run_seq": 104,
+    "type": "watcher.poll_cycle",
+    "agent_id": "watcher",
+    "run_id": "run-a",
+    "session_id": "session-a",
+    "invocation_id": "inv-a",
+    "generation": 1,
+    "harness": "host",
+    "role": "watcher",
+    "source": "watcher",
+    "lifecycle_state": "observed",
+    "data": {"slice_id": "slice-a", "active_slices": 1}
   }
 ]
