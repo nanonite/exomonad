@@ -49,6 +49,7 @@ pub struct ForgejoPullRequestReview {
     pub state: String,
     pub body: String,
     pub commit_id: Option<String>,
+    pub author_login: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +155,14 @@ struct PullRequestReviewResponse {
     body: String,
     #[serde(default)]
     commit_id: Option<String>,
+    #[serde(default)]
+    user: Option<PullRequestReviewAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestReviewAuthor {
+    #[serde(default, alias = "username")]
+    login: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -750,6 +759,7 @@ impl HttpForgejoClient {
                 state: review.state,
                 body: review.body,
                 commit_id: review.commit_id,
+                author_login: review.user.and_then(|user| user.login),
             })
             .collect())
     }
@@ -1294,6 +1304,7 @@ impl FjForgejoClient {
                 state: review.state,
                 body: review.body,
                 commit_id: review.commit_id,
+                author_login: review.user.and_then(|user| user.login),
             })
             .collect())
     }

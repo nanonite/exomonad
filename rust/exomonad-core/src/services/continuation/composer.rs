@@ -468,12 +468,14 @@ mod tests {
                 state: "changes_requested".to_string(),
                 body: "stale".to_string(),
                 commit_id: Some("old".to_string()),
+                author_login: None,
             },
             ForgejoPullRequestReview {
                 id: Some(2),
                 state: "approved".to_string(),
                 body: "current".to_string(),
                 commit_id: Some("head".to_string()),
+                author_login: None,
             },
         ];
         assert_eq!(review_state_for_head(&reviews, "head"), "approved");

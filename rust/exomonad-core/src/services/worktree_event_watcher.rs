@@ -1,4 +1,4 @@
-use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
+use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber, Slug};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::event_log::{
@@ -136,6 +136,7 @@ struct ForgejoReview {
     state: ForgejoReviewVerdict,
     author_branch: Option<String>,
     commit_id: Option<String>,
+    author_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1272,7 +1273,18 @@ where
                 );
             }
         }
-        if let Err(error) = log.append(PR_REVIEW_EVENT_TYPE, &pending.agent_name, &data) {
+        let event_agent = payload
+            .get("reviewer_agent_id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .get("reviewer_identity_unresolved")
+                    .and_then(serde_json::Value::as_bool)
+                    .filter(|unresolved| *unresolved)
+                    .map(|_| "reviewer-unresolved")
+            })
+            .unwrap_or(&pending.agent_name);
+        if let Err(error) = log.append(PR_REVIEW_EVENT_TYPE, event_agent, &data) {
             warn!(
                 pr_number = pending.pr_number,
                 branch = %pending.branch,
@@ -2308,6 +2320,9 @@ where
                 state,
                 author_branch: None,
                 commit_id: review.commit_id,
+                author_agent_id: self
+                    .resolve_review_author(review.author_login.as_deref())
+                    .await,
             };
             if let Some(review_commit) = local_review
                 .commit_id
@@ -2369,6 +2384,27 @@ where
             changes_requested_rounds,
             forgejo_review_present,
         )
+    }
+
+    async fn resolve_review_author(&self, login: Option<&str>) -> Option<String> {
+        let login = login?.trim();
+        if login.is_empty() {
+            return None;
+        }
+        let candidates = [login, login.strip_prefix("exomonad-").unwrap_or(login)];
+        for candidate in candidates {
+            if let Ok(agent_name) = AgentName::try_from_str(candidate) {
+                if self.ctx.agent_resolver().get(&agent_name).await.is_some() {
+                    return Some(agent_name.to_string());
+                }
+            }
+            if let Ok(slug) = Slug::try_from_str(candidate) {
+                if let Some(record) = self.ctx.agent_resolver().lookup_by_slug(&slug).await {
+                    return Some(record.agent_name.to_string());
+                }
+            }
+        }
+        None
     }
 }
 
@@ -2658,15 +2694,17 @@ fn compute_pr_actions_with_context(
         old_state.last_review_state = ForgejoReviewVerdict::Approved;
         old_state.notified_parent_approved = true;
         old_state.review_approved_at = Some(now);
+        let mut payload = serde_json::json!({
+            "kind": review_event_kind_for_state(&ForgejoReviewVerdict::Approved)
+                .expect("approved review state has an event kind"),
+            "pr_number": pr_number.as_u64(),
+            "ci_status": ci_status.as_str(),
+            "branch": branch,
+        });
+        attach_review_authority(&mut payload, reviews, ForgejoReviewVerdict::Approved);
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": review_event_kind_for_state(&ForgejoReviewVerdict::Approved)
-                    .expect("approved review state has an event kind"),
-                "pr_number": pr_number.as_u64(),
-                "ci_status": ci_status.as_str(),
-                "branch": branch,
-            }),
+            payload,
         });
         if old_state.ci_triggered_sha.as_deref() != Some(pr_sha) {
             old_state.ci_triggered_sha = Some(pr_sha.to_string());
@@ -2701,19 +2739,25 @@ fn compute_pr_actions_with_context(
         old_state.last_review_fingerprint = changes_requested_fingerprint;
         old_state.first_seen = now;
         let message = format_message(comments, reviews);
+        let mut payload = serde_json::json!({
+            "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
+                .expect("changes_requested review state has an event kind"),
+            "pr_number": pr_number.as_u64(),
+            "branch": branch,
+            "comments": message,
+            "author_branch": review_author_branch(
+                reviews,
+                ForgejoReviewVerdict::ChangesRequested,
+            ),
+        });
+        attach_review_authority(
+            &mut payload,
+            reviews,
+            ForgejoReviewVerdict::ChangesRequested,
+        );
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": review_event_kind_for_state(&ForgejoReviewVerdict::ChangesRequested)
-                    .expect("changes_requested review state has an event kind"),
-                "pr_number": pr_number.as_u64(),
-                "branch": branch,
-                "comments": message,
-                "author_branch": review_author_branch(
-                    reviews,
-                    ForgejoReviewVerdict::ChangesRequested,
-                ),
-            }),
+            payload,
         });
         pending_actions.push(PendingAction::EmitEvent {
             pr_number: pr_number.as_u64(),
@@ -2739,19 +2783,21 @@ fn compute_pr_actions_with_context(
         old_state.last_review_state = ForgejoReviewVerdict::Commented;
         old_state.last_review_fingerprint = commented_fingerprint;
         let message = format_message(comments, reviews);
+        let mut payload = serde_json::json!({
+            "kind": review_event_kind_for_state(&ForgejoReviewVerdict::Commented)
+                .expect("commented review state has an event kind"),
+            "pr_number": pr_number.as_u64(),
+            "branch": branch,
+            "comments": message,
+            "author_branch": review_author_branch(
+                reviews,
+                ForgejoReviewVerdict::Commented,
+            ),
+        });
+        attach_review_authority(&mut payload, reviews, ForgejoReviewVerdict::Commented);
         pending_actions.push(PendingAction::WasmEvent {
             event_type: "pr_review",
-            payload: serde_json::json!({
-                "kind": review_event_kind_for_state(&ForgejoReviewVerdict::Commented)
-                    .expect("commented review state has an event kind"),
-                "pr_number": pr_number.as_u64(),
-                "branch": branch,
-                "comments": message,
-                "author_branch": review_author_branch(
-                    reviews,
-                    ForgejoReviewVerdict::Commented,
-                ),
-            }),
+            payload,
         });
     }
 
@@ -2829,6 +2875,44 @@ fn review_event_kind_for_state(state: &ForgejoReviewVerdict) -> Option<&'static 
     }
 }
 
+fn attach_review_authority(
+    payload: &mut serde_json::Value,
+    reviews: &[ForgejoReview],
+    state: ForgejoReviewVerdict,
+) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let Some(review) = reviews.iter().rev().find(|review| review.state == state) else {
+        object.insert(
+            "reviewer_identity_unresolved".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert(
+            "reviewer_identity_reason".to_string(),
+            serde_json::Value::String("Forgejo review author was not observed".to_string()),
+        );
+        return;
+    };
+    if let Some(agent_id) = review.author_agent_id.as_deref() {
+        object.insert(
+            "reviewer_agent_id".to_string(),
+            serde_json::Value::String(agent_id.to_string()),
+        );
+    } else {
+        object.insert(
+            "reviewer_identity_unresolved".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert(
+            "reviewer_identity_reason".to_string(),
+            serde_json::Value::String(
+                "Forgejo review author did not resolve to a registered agent".to_string(),
+            ),
+        );
+    }
+}
+
 fn aggregate_review_state(reviews: &[ForgejoReview]) -> ForgejoReviewState {
     if reviews
         .iter()
@@ -2874,6 +2958,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             state: state.clone(),
             author_branch: c.author_branch.clone(),
             commit_id: None,
+            author_agent_id: None,
         })
         .collect();
 
@@ -2884,6 +2969,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             state: ForgejoReviewVerdict::Approved,
             author_branch: None,
             commit_id: None,
+            author_agent_id: None,
         });
     } else if obs.review_state == ForgejoReviewState::ChangesRequested && reviews.is_empty() {
         reviews.push(ForgejoReview {
@@ -2892,6 +2978,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: None,
             commit_id: None,
+            author_agent_id: None,
         });
     } else if obs.review_state == ForgejoReviewState::Commented && reviews.is_empty() {
         reviews.push(ForgejoReview {
@@ -2900,6 +2987,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             state: ForgejoReviewVerdict::Commented,
             author_branch: None,
             commit_id: None,
+            author_agent_id: None,
         });
     }
 
@@ -3617,6 +3705,7 @@ mod tests {
             state,
             author_branch: None,
             commit_id: None,
+            author_agent_id: None,
         }
     }
 
@@ -4112,6 +4201,7 @@ mod tests {
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: Some("review-pr-1".to_string()),
             commit_id: None,
+            author_agent_id: None,
         }];
 
         let actions = compute_pr_actions(
@@ -4147,6 +4237,7 @@ mod tests {
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: Some("main.review-pr-10-codex".to_string()),
             commit_id: Some("abc123".to_string()),
+            author_agent_id: None,
         };
         let first_actions = compute_pr_actions(
             &mut state,
@@ -4220,7 +4311,14 @@ mod tests {
         let branch = BranchName::try_from_str("main.feat-codex")
             .expect("literal validated string is non-empty");
         let mut state = test_state(&branch, AgentType::Codex, "abc123");
-        let reviews = vec![test_review("LGTM!", ForgejoReviewVerdict::Approved)];
+        let reviews = vec![ForgejoReview {
+            review_id: Some(7),
+            body: "LGTM!".to_string(),
+            state: ForgejoReviewVerdict::Approved,
+            author_branch: None,
+            commit_id: Some("abc123".to_string()),
+            author_agent_id: Some("review-pr-1-claude".to_string()),
+        }];
         let actions = compute_pr_actions(
             &mut state,
             PRNumber::new(1),
@@ -4236,8 +4334,21 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, PendingAction::WasmEvent { payload, .. }
-            if payload["kind"] == "approved")));
+            if payload["kind"] == "approved"
+                && payload["reviewer_agent_id"] == "review-pr-1-claude")));
         assert!(state.notified_parent_approved);
+    }
+
+    #[test]
+    fn unresolved_review_author_is_explicit_and_never_owner_attributed() {
+        let mut payload = serde_json::json!({"kind": "approved"});
+        let reviews = vec![test_review("LGTM", ForgejoReviewVerdict::Approved)];
+
+        attach_review_authority(&mut payload, &reviews, ForgejoReviewVerdict::Approved);
+
+        assert_eq!(payload["reviewer_identity_unresolved"], true);
+        assert!(payload["reviewer_identity_reason"].as_str().is_some());
+        assert!(payload.get("reviewer_agent_id").is_none());
     }
 
     #[tokio::test]
@@ -4749,6 +4860,7 @@ mod tests {
             state: ForgejoReviewVerdict::None,
             author_branch: None,
             commit_id: None,
+            author_agent_id: None,
         }];
         let actions = compute_pr_actions(
             &mut state,
@@ -4890,6 +5002,7 @@ mod tests {
             state: ForgejoReviewVerdict::Commented,
             author_branch: Some("main.review-pr-1-codex".to_string()),
             commit_id: None,
+            author_agent_id: None,
         };
         let obs = Observation {
             publication: None,
@@ -4967,6 +5080,7 @@ mod tests {
                 state: ForgejoReviewVerdict::Approved,
                 author_branch: None,
                 commit_id: None,
+                author_agent_id: None,
             },
             ForgejoReview {
                 review_id: None,
@@ -4974,6 +5088,7 @@ mod tests {
                 state: ForgejoReviewVerdict::None,
                 author_branch: None,
                 commit_id: None,
+                author_agent_id: None,
             },
         ];
         let msg = format_review_message(&[], &reviews);
@@ -5142,6 +5257,7 @@ mod tests {
             state: ForgejoReviewVerdict::Approved,
             author_branch: None,
             commit_id: Some("sha-old".to_string()),
+            author_agent_id: None,
         }];
         let mut observations = HashMap::new();
         observations.insert(1u64, observation);

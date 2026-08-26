@@ -5799,6 +5799,7 @@ mod tests {
             state: state.to_string(),
             body: String::new(),
             commit_id: commit_id.map(str::to_string),
+            author_login: None,
         }
     }
 
