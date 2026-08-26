@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- exomonad init fails on stale server.sock during legitimate server startup (#1034)
 - exomonad watch dashboard freezes on slow/unbounded Forgejo calls (#1033)
 - agent_dir conflates worktree path and .exo/agents/{name} config dir (#1032)
 - watcher_pr_state hard-fails on Forgejo review JSON parse error (#1031)
