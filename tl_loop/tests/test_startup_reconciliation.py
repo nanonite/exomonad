@@ -53,6 +53,7 @@ def _spawned_slice_without_pr() -> SliceState:
 class FakeClient:
     watcher_calls: list[dict[str, object]] = field(default_factory=list)
     spawn_reviewer_calls: list[dict[str, object]] = field(default_factory=list)
+    merge_calls: list[dict[str, object]] = field(default_factory=list)
     resolved_pr_number: int | None = 99
     review_state: str = "pending"
     pr_state: str = "open"
@@ -60,6 +61,11 @@ class FakeClient:
     head_reachable: bool = True
     publication_ownership_verified: bool = True
     publication_ownership_error: str = ""
+    review_id: int | None = None
+    review_verdict: str | None = None
+    review_head_sha: str | None = None
+    reviewer_agent_id: str | None = None
+    reviewer_identity_error: str | None = None
 
     def list_agents(self, *, filter_type: str | None = None) -> ToolResult:
         return ToolResult(
@@ -101,6 +107,9 @@ class FakeClient:
                 "head_sha": "head-a",
                 "head_branch": "main.slice-a",
                 "base_branch": "main",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
                 "review_state": self.review_state,
                 "ci_status": "success",
                 "pr_state": self.pr_state,
@@ -109,6 +118,16 @@ class FakeClient:
             }
             result["publication_ownership_verified"] = self.publication_ownership_verified
             result["publication_ownership_error"] = self.publication_ownership_error
+            if self.review_id is not None:
+                result["review_id"] = self.review_id
+            if self.review_verdict is not None:
+                result["review_verdict"] = self.review_verdict
+            if self.review_head_sha is not None:
+                result["review_head_sha"] = self.review_head_sha
+            if self.reviewer_agent_id is not None:
+                result["reviewer_agent_id"] = self.reviewer_agent_id
+            if self.reviewer_identity_error is not None:
+                result["reviewer_identity_error"] = self.reviewer_identity_error
             return ToolResult(
                 raw={"success": True},
                 success=True,
@@ -139,6 +158,16 @@ class FakeClient:
             }
         )
         return ToolResult(raw={"success": True}, success=True, result={}, error=None)
+
+    def merge_pr(self, **arguments: object) -> ToolResult:
+        self.merge_calls.append(arguments)
+        self.merged = True
+        return ToolResult(
+            raw={"success": True},
+            success=True,
+            result={"merged": True},
+            error=None,
+        )
 
     def chainlink_issue_create(
         self,
@@ -366,3 +395,88 @@ def test_reconciliation_skips_slice_id_lookup_when_ledger_run_id_unset(tmp_path)
 
     assert client.watcher_calls == []
     assert client.spawn_reviewer_calls == []
+
+
+def _review_recovery_state(store: RunStore):
+    state = store.load()
+    return store.checkpoint(
+        state.fsm,
+        {
+            "slice-a": replace(
+                state.slices["slice-a"],
+                status=SliceStatus.IN_REVIEW,
+                pr_number=99,
+                reviewed_head="head-a",
+                dispatch_invocation_id="invocation-a",
+                reviewer_attempt={"head-a": 1},
+                reviewer_agent_id="review-pr-99-codex",
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+
+def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    client = FakeClient(
+        review_id=7,
+        review_verdict="APPROVED",
+        review_head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+
+    slice_state = recovered.slices["slice-a"]
+    assert slice_state.reviewed_head == "head-a"
+    assert slice_state.verdict is not None
+    assert slice_state.verdict.value == "GO"
+    assert slice_state.reconciliation["next_action"] == "queue_merge"
+    assert client.spawn_reviewer_calls == []
+
+    merged = _apply_convergence(
+        recovered,
+        ConvergenceTracker(),
+        store,
+        config,
+        client,
+        [],
+    )
+    assert len(client.merge_calls) == 1
+    assert client.merge_calls[0]["expected_head_sha"] == "head-a"
+    assert merged.slices["slice-a"].status is SliceStatus.MERGED
+
+    repeated = _reconcile_nonterminal_slices(
+        _PLAN,
+        store.load(),
+        config,
+        client,
+        store,
+        [],
+    )
+    _apply_convergence(repeated, ConvergenceTracker(), store, config, client, [])
+    assert len(client.merge_calls) == 1
+
+
+def test_reconciliation_rejects_stale_or_unresolved_review_evidence(tmp_path) -> None:
+    cases = (
+        {"review_id": 7, "review_verdict": "approved", "review_head_sha": "old-head", "reviewer_agent_id": "review-pr-99-codex"},
+        {"review_id": 7, "review_verdict": "approved", "review_head_sha": "head-a", "reviewer_agent_id": "review-pr-99-codex", "reviewer_identity_error": "unresolved"},
+        {"review_id": 7, "review_verdict": "approved", "review_head_sha": "head-a", "reviewer_agent_id": "agent-a"},
+        {"review_id": 0, "review_verdict": "approved", "review_head_sha": "head-a", "reviewer_agent_id": "review-pr-99-codex"},
+    )
+    for evidence in cases:
+        case_dir = tmp_path / str(len(list(tmp_path.iterdir())))
+        case_dir.mkdir()
+        store, _ = _load_state(case_dir)
+        state = _review_recovery_state(store)
+        client = FakeClient(**evidence)
+        config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+        recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+
+        assert recovered.slices["slice-a"].verdict is None
+        assert client.merge_calls == []

@@ -215,7 +215,14 @@ fn canonical_watcher_event_data(
     comments: Option<Vec<ForgejoReviewComment>>,
     reviews: Option<Vec<ForgejoReview>>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let review = reviews.as_ref().and_then(|items| {
+        items
+            .iter()
+            .rev()
+            .find(|review| review.state != ForgejoReviewVerdict::None)
+            .cloned()
+    });
+    let mut data = serde_json::json!({
         "agent_id": agent_id,
         "owner_id": agent_id,
         "branch": branch,
@@ -226,7 +233,52 @@ fn canonical_watcher_event_data(
         "message": message,
         "comments": comments,
         "reviews": reviews,
-    })
+    });
+    if let Some(review) = review {
+        if let Some(object) = data.as_object_mut() {
+            object.insert(
+                "review_id".to_string(),
+                review
+                    .review_id
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            object.insert(
+                "verdict".to_string(),
+                serde_json::Value::String(state_name(&review.state).to_string()),
+            );
+            object.insert(
+                "review_head_sha".to_string(),
+                review
+                    .commit_id
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            if let Some(agent_id) = review.author_agent_id.as_deref() {
+                object.insert(
+                    "reviewer_agent_id".to_string(),
+                    serde_json::Value::String(agent_id.to_string()),
+                );
+                object.insert(
+                    "reviewer_identity_unresolved".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            } else {
+                object.insert(
+                    "reviewer_identity_unresolved".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                object.insert(
+                    "reviewer_identity_reason".to_string(),
+                    serde_json::Value::String(
+                        "Forgejo review author did not resolve to a registered agent".to_string(),
+                    ),
+                );
+            }
+        }
+    }
+    data
 }
 
 fn watcher_agent_message(agent_id: &str, status: &str, message: &str) -> Event {
@@ -1435,7 +1487,13 @@ where
             }
 
             let (review_state, comments, reviews, changes_requested_rounds, forgejo_review_present) =
-                self.forgejo_review_parts(*number, &head_sha).await;
+                self.forgejo_review_parts(
+                    *number,
+                    &head_sha,
+                    pr.reviewer_agent.as_deref(),
+                    Some(pr.author_agent.as_str()),
+                )
+                .await;
 
             let branch = BranchName::try_from_str(pr.head_branch.as_str())
                 .expect("validated string input is non-empty");
@@ -1744,6 +1802,21 @@ where
 
         for pending in pending_actions {
             for action in pending.actions.iter().cloned() {
+                let action = match action {
+                    PendingAction::WasmEvent {
+                        event_type,
+                        mut payload,
+                    } => {
+                        if event_type == "pr_review" {
+                            attach_review_correlation(&mut payload, &pending);
+                        }
+                        PendingAction::WasmEvent {
+                            event_type,
+                            payload,
+                        }
+                    }
+                    other => other,
+                };
                 self.capture_pending_memory(&pending, &action);
                 match action {
                     PendingAction::WasmEvent {
@@ -2303,6 +2376,8 @@ where
         &self,
         pr_number: u64,
         head_sha: &str,
+        expected_reviewer: Option<&str>,
+        owner_agent: Option<&str>,
     ) -> (
         ForgejoReviewState,
         Vec<ForgejoReviewComment>,
@@ -2348,20 +2423,22 @@ where
                 author_branch: None,
                 commit_id: review.commit_id,
                 author_agent_id: self
-                    .resolve_review_author(review.author_login.as_deref())
+                    .resolve_review_author(
+                        review.author_login.as_deref(),
+                        expected_reviewer,
+                        owner_agent,
+                    )
                     .await,
             };
-            if let Some(review_commit) = local_review
-                .commit_id
-                .as_deref()
-                .filter(|commit| !head_sha.is_empty() && *commit != head_sha)
-            {
-                self.append_watcher_log(&dropped_review_by_sha_log_line(
-                    pr_number,
-                    review_commit,
-                    head_sha,
-                ))
-                .await;
+            if local_review.commit_id.as_deref() != Some(head_sha) {
+                if let Some(review_commit) = local_review.commit_id.as_deref() {
+                    self.append_watcher_log(&dropped_review_by_sha_log_line(
+                        pr_number,
+                        review_commit,
+                        head_sha,
+                    ))
+                    .await;
+                }
                 continue;
             }
             local_reviews.push(local_review);
@@ -2413,7 +2490,12 @@ where
         )
     }
 
-    async fn resolve_review_author(&self, login: Option<&str>) -> Option<String> {
+    async fn resolve_review_author(
+        &self,
+        login: Option<&str>,
+        expected_reviewer: Option<&str>,
+        owner_agent: Option<&str>,
+    ) -> Option<String> {
         let login = login?.trim();
         if login.is_empty() {
             return None;
@@ -2422,12 +2504,24 @@ where
         for candidate in candidates {
             if let Ok(agent_name) = AgentName::try_from_str(candidate) {
                 if self.ctx.agent_resolver().get(&agent_name).await.is_some() {
-                    return Some(agent_name.to_string());
+                    let resolved = agent_name.to_string();
+                    if owner_agent == Some(resolved.as_str())
+                        || expected_reviewer.is_some_and(|expected| expected != resolved)
+                    {
+                        return None;
+                    }
+                    return Some(resolved);
                 }
             }
             if let Ok(slug) = Slug::try_from_str(candidate) {
                 if let Some(record) = self.ctx.agent_resolver().lookup_by_slug(&slug).await {
-                    return Some(record.agent_name.to_string());
+                    let resolved = record.agent_name.to_string();
+                    if owner_agent == Some(resolved.as_str())
+                        || expected_reviewer.is_some_and(|expected| expected != resolved)
+                    {
+                        return None;
+                    }
+                    return Some(resolved);
                 }
             }
         }
@@ -2915,6 +3009,7 @@ fn attach_review_authority(
         return;
     };
     let Some(review) = reviews.iter().rev().find(|review| review.state == state) else {
+        attach_review_correlation_fields(object, None);
         object.insert(
             "reviewer_identity_unresolved".to_string(),
             serde_json::Value::Bool(true),
@@ -2925,10 +3020,15 @@ fn attach_review_authority(
         );
         return;
     };
+    attach_review_correlation_fields(object, Some(review));
     if let Some(agent_id) = review.author_agent_id.as_deref() {
         object.insert(
             "reviewer_agent_id".to_string(),
             serde_json::Value::String(agent_id.to_string()),
+        );
+        object.insert(
+            "reviewer_identity_unresolved".to_string(),
+            serde_json::Value::Bool(false),
         );
     } else {
         object.insert(
@@ -2942,6 +3042,54 @@ fn attach_review_authority(
             ),
         );
     }
+}
+
+fn attach_review_correlation(payload: &mut serde_json::Value, pending: &PendingPrActions) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "slice_id".to_string(),
+        pending
+            .slice_id
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    object.insert(
+        "pr_number".to_string(),
+        serde_json::Value::from(pending.pr_number),
+    );
+    object.insert(
+        "head_sha".to_string(),
+        serde_json::Value::String(pending.head_sha.clone()),
+    );
+}
+
+fn attach_review_correlation_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    review: Option<&ForgejoReview>,
+) {
+    object.insert(
+        "review_id".to_string(),
+        review
+            .and_then(|value| value.review_id)
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    object.insert(
+        "verdict".to_string(),
+        review
+            .map(|value| serde_json::Value::String(state_name(&value.state).to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    object.insert(
+        "review_head_sha".to_string(),
+        review
+            .and_then(|value| value.commit_id.clone())
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
 }
 
 fn aggregate_review_state(reviews: &[ForgejoReview]) -> ForgejoReviewState {
@@ -4368,6 +4516,33 @@ mod tests {
             if payload["kind"] == "approved"
                 && payload["reviewer_agent_id"] == "review-pr-1-claude")));
         assert!(state.notified_parent_approved);
+    }
+
+    #[test]
+    fn approved_review_payload_carries_exact_head_and_identity_correlation() {
+        let mut payload = serde_json::json!({"kind": "approved"});
+        let reviews = vec![ForgejoReview {
+            review_id: Some(7),
+            body: "LGTM!".to_string(),
+            state: ForgejoReviewVerdict::Approved,
+            author_branch: None,
+            commit_id: Some("abc123".to_string()),
+            author_agent_id: Some("review-pr-1-claude".to_string()),
+        }];
+        let mut pending = test_pending_pr_actions();
+        pending.slice_id = Some("slice-a".to_string());
+
+        attach_review_authority(&mut payload, &reviews, ForgejoReviewVerdict::Approved);
+        attach_review_correlation(&mut payload, &pending);
+
+        assert_eq!(payload["slice_id"], "slice-a");
+        assert_eq!(payload["pr_number"], 42);
+        assert_eq!(payload["head_sha"], "abc123");
+        assert_eq!(payload["review_id"], 7);
+        assert_eq!(payload["verdict"], "approved");
+        assert_eq!(payload["review_head_sha"], "abc123");
+        assert_eq!(payload["reviewer_agent_id"], "review-pr-1-claude");
+        assert_eq!(payload["reviewer_identity_unresolved"], false);
     }
 
     #[test]

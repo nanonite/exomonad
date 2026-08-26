@@ -44,3 +44,31 @@ def test_projection_keeps_verified_publication_identity() -> None:
     assert observed.publication is not None
     assert observed.publication.invocation_id == "inv-1"
     assert observed.publication.slice_id == "slice-a"
+
+
+def test_projection_preserves_exact_head_review_evidence() -> None:
+    observed = WatcherObservation.from_response(
+        {
+            "review_id": 17,
+            "review_verdict": " APPROVED ",
+            "review_head_sha": "head-a",
+            "reviewer_agent_id": "review-pr-7-codex",
+            "reviewer_identity_error": "",
+        }
+    )
+
+    assert observed.review_id == 17
+    assert observed.review_verdict == "approved"
+    assert observed.review_head_sha == "head-a"
+    assert observed.reviewer_agent_id == "review-pr-7-codex"
+    assert observed.to_payload()["review_id"] == 17
+
+
+def test_projection_drops_unknown_or_non_positive_review_evidence() -> None:
+    observed = WatcherObservation.from_response(
+        {"review_id": 0, "review_verdict": "dismissed", "review_head_sha": ""}
+    )
+
+    assert observed.review_id is None
+    assert observed.review_verdict is None
+    assert observed.review_head_sha == ""

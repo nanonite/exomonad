@@ -439,6 +439,12 @@ message WatcherPrStateResponse {
   bool publication_ownership_verified = 20;
   string publication_ownership_error = 21;
   PublishedHeadEvidence publication = 22;
+  // The latest non-dismissed review bound to the complete current head.
+  uint64 review_id = 23;
+  string review_verdict = 24;
+  string review_head_sha = 25;
+  string reviewer_agent_id = 26;
+  string reviewer_identity_error = 27;
 }
 
 // ============================================================================

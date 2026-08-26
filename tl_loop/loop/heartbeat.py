@@ -6,7 +6,7 @@ import json
 import logging
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TypeAlias, cast
@@ -42,6 +42,7 @@ from tl_loop.state.store import RunStore
 
 JsonMapping: TypeAlias = Mapping[str, object]
 LiveEffects: TypeAlias = EffectClient | ReadOnlyEffectClient
+ReviewReplay: TypeAlias = Callable[[RunState, SliceState, WatcherObservation], RunState]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -115,6 +116,7 @@ def heartbeat_once(
     *,
     now: float | None = None,
     project_root: Path | str,
+    review_replay: ReviewReplay | None = None,
 ) -> HeartbeatResult:
     """Poll liveness and reconcile one idle wave through the durable store."""
     current_time = time.time() if now is None else now
@@ -400,6 +402,10 @@ def heartbeat_once(
             )
             continue
         updated, observed = _reconcile_pr(slice_state, watcher)
+        if review_replay is not None:
+            replayed = review_replay(store.load(), slice_state, watcher)
+            current = replayed
+            updated = replayed.slices[slice_state.id]
         updated = reconcile_merge_observation(updated, watcher)
         if updated == slice_state:
             continue

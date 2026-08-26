@@ -19,6 +19,17 @@ def _optional_bool(value: object) -> bool | None:
     return value if type(value) is bool else None
 
 
+def _optional_positive_int(value: object) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def _optional_review_verdict(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    verdict = value.strip().lower()
+    return verdict if verdict in {"approved", "changes_requested", "commented"} else None
+
+
 @dataclass(frozen=True)
 class PublicationRecord:
     """Host-verified publication identity carried by a watcher snapshot."""
@@ -68,6 +79,11 @@ class WatcherObservation:
     publication_ownership_verified: bool | None
     publication_ownership_error: str | None
     publication: PublicationRecord | None
+    review_id: int | None
+    review_verdict: str | None
+    review_head_sha: str | None
+    reviewer_agent_id: str | None
+    reviewer_identity_error: str | None
     ownership_verified_present: bool
     ownership_error_present: bool
 
@@ -102,6 +118,11 @@ class WatcherObservation:
             ),
             publication_ownership_error=_optional_text(raw.get("publication_ownership_error")),
             publication=PublicationRecord.from_value(raw.get("publication")),
+            review_id=_optional_positive_int(raw.get("review_id")),
+            review_verdict=_optional_review_verdict(raw.get("review_verdict")),
+            review_head_sha=_optional_text(raw.get("review_head_sha")),
+            reviewer_agent_id=_optional_text(raw.get("reviewer_agent_id")),
+            reviewer_identity_error=_optional_text(raw.get("reviewer_identity_error")),
             ownership_verified_present="publication_ownership_verified" in raw,
             ownership_error_present="publication_ownership_error" in raw,
         )
@@ -135,6 +156,11 @@ class WatcherObservation:
             "evidence_error",
             "publication_ownership_verified",
             "publication_ownership_error",
+            "review_id",
+            "review_verdict",
+            "review_head_sha",
+            "reviewer_agent_id",
+            "reviewer_identity_error",
         ):
             value = getattr(self, name)
             if value is not None or (
@@ -163,6 +189,11 @@ class WatcherObservation:
             publication_ownership_verified=self.publication_ownership_verified,
             publication_ownership_error=self.publication_ownership_error,
             publication=PublicationRecord.from_value(publication),
+            review_id=self.review_id,
+            review_verdict=self.review_verdict,
+            review_head_sha=self.review_head_sha,
+            reviewer_agent_id=self.reviewer_agent_id,
+            reviewer_identity_error=self.reviewer_identity_error,
             ownership_verified_present=self.ownership_verified_present,
             ownership_error_present=self.ownership_error_present,
         )

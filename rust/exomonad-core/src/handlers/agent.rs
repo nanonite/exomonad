@@ -784,6 +784,11 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
         publication_ownership_verified: false,
         publication_ownership_error: String::new(),
         publication: None,
+        review_id: 0,
+        review_verdict: String::new(),
+        review_head_sha: String::new(),
+        reviewer_agent_id: String::new(),
+        reviewer_identity_error: String::new(),
     }
 }
 
@@ -879,11 +884,7 @@ fn review_state_from_forgejo_reviews(
     let mut review_count = 0;
 
     for review in reviews {
-        if review
-            .commit_id
-            .as_deref()
-            .is_some_and(|commit| !head_sha.is_empty() && commit != head_sha)
-        {
+        if !review_matches_exact_head(review, head_sha) {
             continue;
         }
 
@@ -907,6 +908,71 @@ fn review_state_from_forgejo_reviews(
     } else {
         ("pending_review".to_string(), review_count)
     }
+}
+
+fn review_matches_exact_head(review: &ForgejoPullRequestReview, head_sha: &str) -> bool {
+    !head_sha.is_empty()
+        && review.commit_id.as_deref() == Some(head_sha)
+        && normalized_review_verdict(&review.state).is_some()
+}
+
+fn latest_exact_forgejo_review<'a>(
+    reviews: &'a [ForgejoPullRequestReview],
+    head_sha: &str,
+) -> Option<&'a ForgejoPullRequestReview> {
+    reviews
+        .iter()
+        .rev()
+        .find(|review| review_matches_exact_head(review, head_sha))
+}
+
+fn normalized_review_verdict(state: &str) -> Option<&'static str> {
+    match state.trim().to_ascii_lowercase().as_str() {
+        "approved" | "approve" => Some("approved"),
+        "changes_requested" | "request_changes" | "request_changes_requested" => {
+            Some("changes_requested")
+        }
+        "commented" | "comment" => Some("commented"),
+        _ => None,
+    }
+}
+
+async fn resolve_registered_review_author<C: HasAgentResolver>(
+    ctx: &C,
+    login: Option<&str>,
+    expected_reviewer: Option<&str>,
+    owner_agent: Option<&str>,
+) -> Option<String> {
+    let login = login?.trim();
+    if login.is_empty() {
+        return None;
+    }
+    let candidates = [login, login.strip_prefix("exomonad-").unwrap_or(login)];
+    for candidate in candidates {
+        if let Ok(agent_name) = AgentName::try_from_str(candidate) {
+            if ctx.agent_resolver().get(&agent_name).await.is_some() {
+                let resolved = agent_name.to_string();
+                if owner_agent == Some(resolved.as_str())
+                    || expected_reviewer.is_some_and(|expected| expected != resolved)
+                {
+                    return None;
+                }
+                return Some(resolved);
+            }
+        }
+        if let Ok(slug) = Slug::try_from_str(candidate) {
+            if let Some(record) = ctx.agent_resolver().lookup_by_slug(&slug).await {
+                let resolved = record.agent_name.to_string();
+                if owner_agent == Some(resolved.as_str())
+                    || expected_reviewer.is_some_and(|expected| expected != resolved)
+                {
+                    return None;
+                }
+                return Some(resolved);
+            }
+        }
+    }
+    None
 }
 
 #[async_trait]
@@ -1983,6 +2049,61 @@ impl<
         } else {
             None
         };
+        let pr_metadata = parse_pr_body_metadata(&pr.body);
+        let (
+            review_id,
+            review_verdict,
+            review_head_sha,
+            reviewer_agent_id,
+            reviewer_identity_error,
+        ) = match latest_exact_forgejo_review(&reviews, &head_sha) {
+            None => (
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+            Some(review) => {
+                let review_id = review.id.unwrap_or_default();
+                let review_verdict = normalized_review_verdict(&review.state)
+                    .unwrap_or_default()
+                    .to_string();
+                let resolved = resolve_registered_review_author(
+                    self.ctx.as_ref(),
+                    review.author_login.as_deref(),
+                    pr_metadata.reviewer_agent.as_deref(),
+                    pr_metadata.author_agent.as_deref(),
+                )
+                .await;
+                let owner = publication
+                    .as_ref()
+                    .and_then(|value| value.author_agent.as_deref());
+                match resolved {
+                    Some(agent_id) if owner != Some(agent_id.as_str()) => (
+                        review_id,
+                        review_verdict,
+                        head_sha.clone(),
+                        agent_id,
+                        String::new(),
+                    ),
+                    Some(_) => (
+                        review_id,
+                        review_verdict,
+                        head_sha.clone(),
+                        String::new(),
+                        "Forgejo review author is the PR owner".to_string(),
+                    ),
+                    None => (
+                        review_id,
+                        review_verdict,
+                        head_sha.clone(),
+                        String::new(),
+                        "Forgejo review author did not resolve to a registered agent".to_string(),
+                    ),
+                }
+            }
+        };
         Ok(WatcherPrStateResponse {
             success: true,
             error: String::new(),
@@ -2013,6 +2134,11 @@ impl<
             publication_ownership_verified,
             publication_ownership_error,
             publication: published_head_evidence(publication.as_ref()),
+            review_id,
+            review_verdict,
+            review_head_sha,
+            reviewer_agent_id,
+            reviewer_identity_error,
         })
     }
 
@@ -5829,6 +5955,26 @@ mod tests {
 
         assert_eq!(state, "changes_requested");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn watcher_review_evidence_requires_full_current_head() {
+        let reviews = vec![
+            test_review("APPROVED", None),
+            test_review("APPROVED", Some("oldsha")),
+            test_review("APPROVED", Some("abc123")),
+            test_review("DISMISSED", Some("abc123")),
+        ];
+
+        let latest = latest_exact_forgejo_review(&reviews, "abc123")
+            .expect("current-head review should be selected");
+        assert_eq!(latest.commit_id.as_deref(), Some("abc123"));
+        assert_eq!(latest.state, "APPROVED");
+        assert!(latest_exact_forgejo_review(&reviews, "missing").is_none());
+        assert_eq!(
+            review_state_from_forgejo_reviews(&reviews, "abc123").0,
+            "approved"
+        );
     }
 
     #[tokio::test]

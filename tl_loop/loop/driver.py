@@ -1018,6 +1018,16 @@ def _run_loop(
                     effects,
                     config.heartbeat,
                     project_root=config.project_root,
+                    review_replay=lambda replay_state, replay_slice, replay_watcher: _replay_watcher_review_if_needed(
+                        plan,
+                        replay_state,
+                        replay_slice,
+                        replay_watcher,
+                        config,
+                        effects,
+                        store,
+                        effects_log,
+                    ),
                 )
                 if heartbeat.fired:
                     before_phase = phase
@@ -2810,6 +2820,24 @@ def _reconcile_nonterminal_slices(
             owner_id,
         )
         if watcher is not None:
+            replay_state = replace(
+                state,
+                slices={**state.slices, **updated, current.id: reconciled},
+            )
+            replayed = _replay_watcher_review_if_needed(
+                plan,
+                replay_state,
+                reconciled,
+                watcher,
+                config,
+                effects,
+                store,
+                effects_log,
+            )
+            if replayed != state:
+                state = replayed
+                reconciled = state.slices[current.id]
+        if watcher is not None:
             reconciled = reconcile_merge_observation(reconciled, watcher)
         if current.handoff is None and watcher is not None:
             handoff_payload = _handoff_reconciliation_event_payload(
@@ -2933,6 +2961,121 @@ def _reconciliation_phase(
         }
     }
     return TLWaiting(handles)
+
+
+def _replay_watcher_review_if_needed(
+    plan: WorkPlan,
+    state: RunState,
+    current: SliceState,
+    watcher: WatcherObservation | Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Replay one authorized exact-head review snapshot through the reducer."""
+    observed_watcher = _as_watcher_observation(watcher)
+    if observed_watcher is None:
+        return state
+    watcher = observed_watcher
+    head_sha = watcher.head_sha
+    review_head_sha = watcher.review_head_sha
+    reviewer_agent_id = watcher.reviewer_agent_id
+    ownership_verified, _ = watcher.ownership_status()
+    if (
+        current.status not in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+        or current.verdict is not None
+        or watcher.found is not True
+        or not head_sha
+        or not review_head_sha
+        or review_head_sha != head_sha
+        or current.reviewed_head not in {None, head_sha}
+        or watcher.review_id is None
+        or not reviewer_agent_id
+        or watcher.reviewer_identity_error
+        or not ownership_verified
+        or current.handoff is None
+        or current.handoff.head_sha != head_sha
+        or current.dispatch_agent_id == reviewer_agent_id
+        or (
+            current.pr_number is not None
+            and watcher.pr_number != current.pr_number
+        )
+        or watcher.review_verdict not in {"approved", "changes_requested"}
+    ):
+        return state
+    publication = watcher.publication
+    if publication is not None:
+        if publication.slice_id not in {None, current.id}:
+            return state
+        if (
+            current.dispatch_agent_id is not None
+            and publication.author_agent not in {None, current.dispatch_agent_id}
+        ):
+            return state
+    kind = "approved" if watcher.review_verdict == "approved" else "review_received"
+    event = project(
+        {
+            "event_type": "pr.review",
+            "run_id": state.run_id,
+            "agent_id": reviewer_agent_id,
+            "slice_id": current.id,
+            "role": "reviewer",
+            "lifecycle_state": "running",
+            "observed_at": _now_timestamp(),
+            "data": {
+                "kind": kind,
+                "slice_id": current.id,
+                "pr_number": watcher.pr_number or current.pr_number,
+                "head_sha": head_sha,
+                "review_head_sha": review_head_sha,
+                "review_id": watcher.review_id,
+                "reviewer_agent_id": reviewer_agent_id,
+                "verdict": "GO" if kind == "approved" else "NO-GO",
+                "findings": [],
+                "review_state": watcher.review_verdict,
+                "ci_status": watcher.ci_status,
+                "source": "watcher_snapshot",
+            },
+        }
+    )
+    replayed = _route_review_event(
+        plan,
+        store,
+        state,
+        _phase_from_state(state),
+        event,
+        state.events.last_consumed_offset,
+        config,
+        effects,
+        effects_log,
+    )
+    updated = replayed.slices[current.id]
+    if updated.verdict is None:
+        LOGGER.warning(
+            "[TL loop] rejected exact-head watcher review replay target=%s review_id=%s reviewer=%s",
+            current.id,
+            watcher.review_id,
+            reviewer_agent_id,
+        )
+        return state
+    _record_controller_event(
+        current.id,
+        "tl.review_reconciled",
+        {
+            "slice_id": current.id,
+            "pr_number": watcher.pr_number or current.pr_number,
+            "head_sha": head_sha,
+            "review_id": watcher.review_id,
+            "verdict": watcher.review_verdict,
+            "reviewer_agent_id": reviewer_agent_id,
+            "source": "authoritative_watcher_snapshot",
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return replayed
 
 
 def _apply_reconciliation_observations(
@@ -5872,6 +6015,25 @@ def _reviewer_identity_authorized(
     return actor_id is not None
 
 
+def _review_evidence_matches_exact_head(event: EventEnvelope, head_sha: str) -> bool:
+    """Validate optional watcher correlation fields without weakening legacy events."""
+    if "review_head_sha" in event.data and event.data.get("review_head_sha") != head_sha:
+        return False
+    if "review_id" in event.data:
+        review_id = event.data.get("review_id")
+        if type(review_id) is not int or review_id <= 0:
+            return False
+    if "reviewer_agent_id" in event.data:
+        reviewer_agent_id = event.data.get("reviewer_agent_id")
+        if not isinstance(reviewer_agent_id, str) or not reviewer_agent_id:
+            return False
+        if reviewer_agent_id != event.agent_id:
+            return False
+    if "reviewer_identity_error" in event.data and event.data.get("reviewer_identity_error"):
+        return False
+    return event.data.get("reviewer_identity_unresolved") is not True
+
+
 def _review_slice_id(event: EventEnvelope, state: RunState) -> str | None:
     return resolve_event_slice(event, state).slice_id
 
@@ -6016,6 +6178,13 @@ def _route_review_event(
     direct_reviewer_event = event.event_type == "pr.review" and "verdict" in event.data
     reviewer_agent_id = current.reviewer_agent_id
     if direct_reviewer_event:
+        if not _review_evidence_matches_exact_head(event, head_sha):
+            LOGGER.warning(
+                "[TL loop] ignoring incomplete exact-head reviewer evidence target=%s head=%s",
+                slice_id,
+                head_sha,
+            )
+            return state
         if incoming_verdict is None or not _reviewer_identity_authorized(
             event, current, strict=True
         ):

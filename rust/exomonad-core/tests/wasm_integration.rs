@@ -581,6 +581,11 @@ impl EffectHandler for MockAgentHandler {
                     publication_ownership_verified: true,
                     publication_ownership_error: String::new(),
                     publication: None,
+                    review_id: 0,
+                    review_verdict: String::new(),
+                    review_head_sha: String::new(),
+                    reviewer_agent_id: String::new(),
+                    reviewer_identity_error: String::new(),
                 }
                 .encode_to_vec())
             }
