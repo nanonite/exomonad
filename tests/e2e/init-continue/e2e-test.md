@@ -18,9 +18,11 @@ observed JSON and ledger state:
   the published owner's identity; and
 - --start refuses the existing nonterminal run.
 
-The --mutant option exercises the preservation assertion in the negative
-direction by feeding it a freshly minted observed ID; the harness must reject
-that result. Run three consecutive clean executions:
+The --mutant option clones the repository into a disposable directory, changes
+the production classify_agent Preserve arm to mint a fresh invocation, and
+runs the existing Rust preservation regression against that mutant. The mutant
+must fail the regression; the unmodified source must pass. Run three
+consecutive clean executions:
 
     for attempt in 1 2 3; do just e2e-init-continue; done
 

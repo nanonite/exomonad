@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,49 @@ def run_init(exomonad: str, repo: Path, session: str, mode: str) -> subprocess.C
 def assert_preserved(before: dict[str, str], after: dict[str, str]) -> None:
     if before != after:
         raise AssertionError(f"invocation ownership changed: before={before}, after={after}")
+
+
+def run_production_mutant() -> None:
+    """Compile an isolated classify_agent mutant and require its regression to fail."""
+    with tempfile.TemporaryDirectory(prefix="exomonad-init-mutant-") as directory:
+        mutant_root = Path(directory) / "source"
+        subprocess.run(
+            ["git", "clone", "--local", "--no-hardlinks", str(PROJECT_ROOT), str(mutant_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        source_path = mutant_root / "rust/exomonad/src/init.rs"
+        source = source_path.read_text(encoding="utf-8")
+        preserve = """        AgentContinuation::Preserve {
+            invocation_id: record.invocation_id,
+        }
+"""
+        recreate = """        AgentContinuation::Recreate {
+            reason: "mutation: mint a fresh invocation",
+        }
+"""
+        if source.count(preserve) != 1:
+            raise AssertionError("classify_agent mutation target was not unique")
+        source_path.write_text(source.replace(preserve, recreate), encoding="utf-8")
+        result = subprocess.run(
+            [
+                "cargo",
+                "test",
+                "-p",
+                "exomonad",
+                "continue_preserves_matching_invocation_identity_even_when_pane_is_dead",
+            ],
+            cwd=mutant_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+        if result.returncode == 0:
+            raise AssertionError("production classify_agent mutant unexpectedly passed")
+        if "continue_preserves_matching_invocation_identity_even_when_pane_is_dead" not in output:
+            raise AssertionError(f"production mutant failed before the preservation regression: {output[-2000:]}")
 
 
 def check_corrupt_artifact(
@@ -209,18 +253,11 @@ def run(
         raise AssertionError("--continue modified plan.json")
     check_corrupt_artifact(repo, exomonad, session, before)
     start = run_init(exomonad, repo, session, "--start")
-    if start.returncode == 0 or "refusing --start" not in start.stdout + start.stderr:
+    start_refused = start.returncode != 0 and "refusing --start" in start.stdout + start.stderr
+    if not start_refused:
         raise AssertionError("--start did not refuse the nonterminal run")
     if mutant:
-        mutated = dict(before)
-        owner = next(iter(mutated))
-        mutated[owner] += "-fresh"
-        try:
-            assert_preserved(before, mutated)
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("mutant accepted a freshly minted invocation")
+        run_production_mutant()
     return {
         "invocation_ids_before": before,
         "invocation_ids_after": after,
@@ -228,7 +265,7 @@ def run(
         "run_dir_archived": bool(archived),
         "ownership_unresolved_events": len(unresolved),
         "next_action": next_action,
-        "start_refused": True,
+        "start_refused": start_refused,
         "restart_returncode": restarted.returncode,
     }
 
