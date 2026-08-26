@@ -26,9 +26,9 @@ use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
 #[cfg(test)]
 use crate::services::pr_registry::PrRegistry;
 use crate::services::pr_registry::{
-    publication_history_for_slice, read_published_heads,
-    resolve_live_pr_for_slice_with_abandonments, AbandonedAttempt, LivePrResolution, PrEntry,
-    PrState, PublicationProvenance, PublishedHead,
+    publication_history_for_slice, publication_owner_matches, read_published_heads,
+    resolve_live_pr_for_slice_with_abandonments, verify_publication_ownership, AbandonedAttempt,
+    LivePrResolution, PrEntry, PrState, PublicationProvenance, PublishedHead,
 };
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
@@ -829,11 +829,13 @@ where
             format!("no verified publication matches PR #{pr_number} and head {head_sha}"),
         );
     };
-    let Some(owner) = publication.author_agent.as_deref() else {
-        return (false, "publication is missing author_agent".to_string());
+    let owner = match publication_owner_matches(publication, None) {
+        Ok(owner) => owner,
+        Err(error) => return (false, error.to_string()),
     };
-    let Ok(owner_name) = AgentName::try_from_str(owner) else {
-        return (false, format!("publication owner '{owner}' is invalid"));
+    let owner_name = match AgentName::try_from_str(owner) {
+        Ok(owner_name) => owner_name,
+        Err(_) => return (false, format!("publication owner '{owner}' is invalid")),
     };
     let Some(identity) = ctx.agent_resolver().get(&owner_name).await else {
         return (
@@ -841,94 +843,31 @@ where
             format!("publication owner '{owner}' has no identity"),
         );
     };
-    if identity.birth_branch.to_string() != publication.head_branch
-        || identity.parent_branch.to_string() != publication.base_branch
-    {
-        return (
-            false,
-            "publication branch identity does not match owner identity".to_string(),
-        );
-    }
-    if publication.provenance == PublicationProvenance::LedgerOwned
-        && identity.slice_id != publication.slice_id
-    {
-        return (
-            false,
-            "publication slice identity does not match owner identity".to_string(),
-        );
-    }
-    if publication.provenance == PublicationProvenance::Legacy {
-        return (true, String::new());
-    }
-    let invocation_dir = ctx
-        .project_dir()
-        .join(".exo/agents")
-        .join(owner_name.as_str());
-    let Some(current) =
-        crate::services::agent_control::read_invocation_conservatively(&invocation_dir).await
-    else {
-        return (
-            false,
-            "publication owner has no durable invocation record".to_string(),
-        );
+    let current_invocation_id = if publication.invocation_id.is_some() {
+        let invocation_dir = ctx
+            .project_dir()
+            .join(".exo/agents")
+            .join(owner_name.as_str());
+        crate::services::agent_control::read_invocation_conservatively(&invocation_dir)
+            .await
+            .map(|record| record.invocation_id)
+    } else {
+        None
     };
-    let Some(original) = publication.invocation_id.as_deref() else {
-        return (
-            false,
-            "ledger-owned publication is missing invocation provenance".to_string(),
-        );
-    };
-    if current.invocation_id != original
-        && !crate::services::pr_registry::invocation_succession_reaches_current(
-            publication,
-            &current.invocation_id,
-        )
-    {
-        let adoptions = match crate::services::pr_registry::adopt_publication_for_invocation(
-            ctx.project_dir(),
-            owner_name.as_str(),
-            &publication.head_branch,
-            &publication.base_branch,
-            publication.slice_id.as_deref().unwrap_or_default(),
-            original,
-            &current.invocation_id,
-        )
-        .await
-        {
-            Ok(adoptions) => adoptions,
-            Err(error) => {
-                return (
-                    false,
-                    format!("publication succession adoption failed: {error}"),
-                )
-            }
-        };
-        for adoption in &adoptions {
-            crate::services::lifecycle::record_invocation_succession(
-                ctx.project_dir(),
-                owner_name.as_str(),
-                adoption,
-            );
-        }
-        if adoptions
-            .iter()
-            .any(|adoption| adoption.pr_number == publication.pr_number)
-            || crate::services::pr_registry::invocation_succession_reaches_current(
-                publication,
-                &current.invocation_id,
-            )
-        {
-            return (true, String::new());
-        }
-        return (
-            false,
-            format!(
-                "publication invocation '{original}' has no succession to current invocation '{}'",
-                current.invocation_id
-            ),
-        );
+    let owner_branch = identity.birth_branch.to_string();
+    let owner_parent_branch = identity.parent_branch.to_string();
+    let verification = verify_publication_ownership(
+        publication,
+        None,
+        Some(&owner_branch),
+        Some(&owner_parent_branch),
+        identity.slice_id.as_deref(),
+        current_invocation_id.as_deref(),
+    );
+    match verification {
+        Ok(()) => (true, String::new()),
+        Err(error) => (false, error.to_string()),
     }
-    (true, String::new())
 }
 
 fn review_state_from_forgejo_reviews(
@@ -4897,7 +4836,7 @@ mod tests {
 
     #[tokio::test]
     async fn publication_ownership_status_rejects_unrelated_successor_component() {
-        let mut publication = ownership_publication(None);
+        let mut publication = ownership_publication(Some("slice-a"));
         publication.invocation_succession.push(
             crate::services::pr_registry::InvocationSuccession {
                 from_invocation_id: "unrelated-root".to_string(),
@@ -4907,7 +4846,7 @@ mod tests {
             },
         );
         let (_temp_dir, services) =
-            ownership_services(&publication, "invocation-unrelated", None).await;
+            ownership_services(&publication, "invocation-unrelated", Some("slice-a")).await;
         let (verified, error) = publication_ownership_status(
             &services,
             publication.pr_number,
@@ -4917,7 +4856,7 @@ mod tests {
         )
         .await;
         assert!(!verified);
-        assert!(error.contains("no succession to current invocation"));
+        assert!(error.contains("no recorded succession"));
     }
 
     #[test]

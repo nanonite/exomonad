@@ -1,13 +1,14 @@
 use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
-use crate::services::agent_control::{AgentIdentityRecord, AgentType};
+use crate::services::agent_control::AgentType;
 use crate::services::event_log::{
     canonical_review_wakeup_data, canonical_sibling_merged_data, PR_REVIEW_EVENT_TYPE,
 };
 use crate::services::forgejo::ForgejoCommitStatus;
 use crate::services::pr_registry::{
-    read_published_heads, ForgejoReviewState, PrEntry, PrRegistry, PrState, PublicationProvenance,
-    PublishedHead, ReviewerAttempt, ReviewerAttemptPhase,
+    publication_owner_matches, read_published_heads, verify_publication_ownership,
+    ForgejoReviewState, PrEntry, PrRegistry, PrState, PublicationProvenance, PublishedHead,
+    ReviewerAttempt, ReviewerAttemptPhase,
 };
 use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
@@ -199,68 +200,6 @@ fn review_event_target(pr: &PrEntry) -> (BranchName, AgentType, String) {
         AgentType::from_dir_name(&pr.author_agent),
         pr.author_role.clone(),
     )
-}
-
-fn validate_publication_owner(
-    pr: &PrEntry,
-    publication: &PublishedHead,
-) -> std::result::Result<String, String> {
-    let owner = publication
-        .author_agent
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "verified publication is missing author_agent".to_string())?;
-    if owner != pr.author_agent {
-        return Err(format!(
-            "publication owner '{owner}' conflicts with PR owner '{}'",
-            pr.author_agent
-        ));
-    }
-    Ok(owner.to_string())
-}
-
-fn validate_publication_slice(
-    publication: &PublishedHead,
-    identity: Option<&AgentIdentityRecord>,
-) -> std::result::Result<(), String> {
-    let slice_id = match publication.provenance {
-        PublicationProvenance::LedgerOwned => publication
-            .slice_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                "ledger-owned publication is missing a non-empty resolver-backed slice".to_string()
-            })?,
-        PublicationProvenance::Legacy => {
-            let Some(slice_id) = publication.slice_id.as_deref() else {
-                return Ok(());
-            };
-            slice_id
-        }
-    };
-    let identity = identity.ok_or_else(|| {
-        format!("publication slice '{slice_id}' has no registered owner identity")
-    })?;
-    if identity.slice_id.as_deref() != Some(slice_id) {
-        return Err(format!(
-            "publication slice '{slice_id}' conflicts with registered slice '{}'",
-            identity.slice_id.as_deref().unwrap_or("missing")
-        ));
-    }
-    Ok(())
-}
-
-fn validate_publication_invocation(publication: &PublishedHead) -> std::result::Result<(), String> {
-    if publication.provenance == PublicationProvenance::LedgerOwned
-        && publication
-            .invocation_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .is_none()
-    {
-        return Err("ledger-owned publication is missing invocation provenance".to_string());
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -837,53 +776,35 @@ where
         pr: &PrEntry,
         publication: &PublishedHead,
     ) -> std::result::Result<String, String> {
-        let owner = validate_publication_owner(pr, publication)?;
-        let owner_name = AgentName::try_from_str(owner.as_str())
-            .map_err(|error| format!("publication owner is invalid: {error}"))?;
+        let owner = publication_owner_matches(publication, Some(pr.author_agent.as_str()))
+            .map_err(|error| error.to_string())?;
+        let owner_name = AgentName::try_from_str(owner)
+            .map_err(|_| format!("publication owner '{owner}' is invalid"))?;
         let identity = self.ctx.agent_resolver().get(&owner_name).await;
-        validate_publication_slice(publication, identity.as_ref())?;
-        validate_publication_invocation(publication)?;
-        if let Some(identity) = identity.as_ref() {
-            if identity.birth_branch.as_str() != publication.head_branch {
-                return Err(format!(
-                    "publication branch '{}' conflicts with owner branch '{}'",
-                    publication.head_branch, identity.birth_branch
-                ));
-            }
-            if identity.parent_branch.as_str() != publication.base_branch {
-                return Err(format!(
-                    "publication base branch '{}' conflicts with owner parent branch '{}'",
-                    publication.base_branch, identity.parent_branch
-                ));
-            }
-        }
-        if let Some(publication_invocation) = publication.invocation_id.as_deref() {
+        let current_invocation_id = if publication.invocation_id.is_some() {
             let invocation_dir = self
                 .ctx
                 .project_dir()
                 .join(".exo/agents")
                 .join(owner_name.as_str());
-            let current_invocation =
-                crate::services::agent_control::read_invocation_conservatively(&invocation_dir)
-                    .await
-                    .ok_or_else(|| {
-                        format!(
-                            "publication invocation '{publication_invocation}' has no durable owner record"
-                        )
-                    })?;
-            if current_invocation.invocation_id != publication_invocation
-                && !crate::services::pr_registry::invocation_succession_reaches_current(
-                    publication,
-                    &current_invocation.invocation_id,
-                )
-            {
-                return Err(format!(
-                    "publication invocation '{publication_invocation}' conflicts with current invocation '{}' and has no recorded succession",
-                    current_invocation.invocation_id
-                ));
-            }
-        }
-        Ok(owner)
+            crate::services::agent_control::read_invocation_conservatively(&invocation_dir)
+                .await
+                .map(|record| record.invocation_id)
+        } else {
+            None
+        };
+        verify_publication_ownership(
+            publication,
+            Some(pr.author_agent.as_str()),
+            identity.as_ref().map(|value| value.birth_branch.as_str()),
+            identity.as_ref().map(|value| value.parent_branch.as_str()),
+            identity
+                .as_ref()
+                .and_then(|value| value.slice_id.as_deref()),
+            current_invocation_id.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(owner.to_string())
     }
 
     pub fn new(ctx: Arc<C>) -> Self {
@@ -5342,25 +5263,25 @@ mod tests {
 
     #[test]
     fn missing_publication_owner_is_unresolved() {
-        let error = validate_publication_owner(&test_pr_entry(), &publication_for_owner(None))
+        let error = publication_owner_matches(&publication_for_owner(None), Some("feat-codex"))
             .expect_err("missing owner must not be routable");
-        assert!(error.contains("missing author_agent"));
+        assert!(error.to_string().contains("missing author_agent"));
     }
 
     #[test]
     fn conflicting_publication_owner_is_unresolved() {
         let error =
-            validate_publication_owner(&test_pr_entry(), &publication_for_owner(Some("stale")))
+            publication_owner_matches(&publication_for_owner(Some("stale")), Some("feat-codex"))
                 .expect_err("conflicting owner must not be routable");
-        assert!(error.contains("conflicts with PR owner"));
+        assert!(error.to_string().contains("conflicts with PR owner"));
     }
 
     #[test]
     fn matching_publication_owner_is_authoritative() {
         assert_eq!(
-            validate_publication_owner(
-                &test_pr_entry(),
-                &publication_for_owner(Some("feat-codex"))
+            publication_owner_matches(
+                &publication_for_owner(Some("feat-codex")),
+                Some("feat-codex")
             )
             .unwrap(),
             "feat-codex"
@@ -5369,21 +5290,46 @@ mod tests {
 
     #[test]
     fn sliced_publication_requires_invocation_provenance() {
-        let error = validate_publication_invocation(&publication_for_owner(Some("feat-codex")))
-            .expect_err("new sliced publications must carry invocation provenance");
-        assert!(error.contains("missing invocation provenance"));
+        let publication = publication_for_owner(Some("feat-codex"));
+        let error = verify_publication_ownership(
+            &publication,
+            Some("feat-codex"),
+            Some("main.feat-codex"),
+            Some("main"),
+            Some("slice-a"),
+            None,
+        )
+        .expect_err("new sliced publications must carry invocation provenance");
+        assert!(error.to_string().contains("missing invocation provenance"));
 
         let mut missing_slice = publication_for_owner(Some("feat-codex"));
         missing_slice.slice_id = None;
-        let error = validate_publication_slice(&missing_slice, None)
-            .expect_err("ledger-owned publications must carry a server-owned slice");
-        assert!(error.contains("missing a non-empty resolver-backed slice"));
+        let error = verify_publication_ownership(
+            &missing_slice,
+            Some("feat-codex"),
+            Some("main.feat-codex"),
+            Some("main"),
+            Some("slice-a"),
+            None,
+        )
+        .expect_err("ledger-owned publications must carry a server-owned slice");
+        assert!(error
+            .to_string()
+            .contains("missing a non-empty resolver-backed slice"));
 
         let mut legacy = publication_for_owner(Some("feat-codex"));
         legacy.provenance = PublicationProvenance::Legacy;
         legacy.slice_id = None;
         assert!(
-            validate_publication_invocation(&legacy).is_ok(),
+            verify_publication_ownership(
+                &legacy,
+                Some("feat-codex"),
+                Some("main.feat-codex"),
+                Some("main"),
+                None,
+                None,
+            )
+            .is_ok(),
             "legacy publications without a proven slice remain migratable"
         );
     }

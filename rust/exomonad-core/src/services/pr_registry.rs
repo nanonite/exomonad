@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use thiserror::Error;
 use tokio::sync::Mutex;
 
 pub const PUBLISHED_HEADS_FILENAME: &str = "published-heads.json";
@@ -97,6 +98,131 @@ pub struct PublishedHead {
     /// are reachable through this chain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invocation_succession: Vec<InvocationSuccession>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PublicationOwnershipError {
+    #[error("verified publication is missing author_agent")]
+    MissingAuthor,
+    #[error("publication owner '{owner}' conflicts with PR owner '{expected}'")]
+    OwnerMismatch { owner: String, expected: String },
+    #[error("publication owner '{owner}' has no identity")]
+    MissingIdentity { owner: String },
+    #[error("publication branch '{publication}' conflicts with owner branch '{owner}'")]
+    BranchMismatch { publication: String, owner: String },
+    #[error(
+        "publication base branch '{publication}' conflicts with owner parent branch '{owner}'"
+    )]
+    BaseBranchMismatch { publication: String, owner: String },
+    #[error("ledger-owned publication is missing a non-empty resolver-backed slice")]
+    MissingSlice,
+    #[error("publication slice '{slice}' conflicts with registered slice '{owner}'")]
+    SliceMismatch { slice: String, owner: String },
+    #[error("ledger-owned publication is missing invocation provenance")]
+    MissingInvocationProvenance,
+    #[error("publication invocation '{invocation}' has no durable owner record")]
+    MissingInvocationRecord { invocation: String },
+    #[error(
+        "publication invocation '{original}' conflicts with current invocation '{current}' and has no recorded succession"
+    )]
+    InvocationSuccessionMissing { original: String, current: String },
+}
+
+pub fn publication_owner_matches<'a>(
+    publication: &'a PublishedHead,
+    expected_owner: Option<&str>,
+) -> Result<&'a str, PublicationOwnershipError> {
+    let owner = publication
+        .author_agent
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(PublicationOwnershipError::MissingAuthor)?;
+    if let Some(expected) = expected_owner.filter(|value| !value.trim().is_empty()) {
+        if owner != expected {
+            return Err(PublicationOwnershipError::OwnerMismatch {
+                owner: owner.to_string(),
+                expected: expected.to_string(),
+            });
+        }
+    }
+    Ok(owner)
+}
+
+pub fn verify_publication_ownership(
+    publication: &PublishedHead,
+    expected_owner: Option<&str>,
+    owner_branch: Option<&str>,
+    owner_parent_branch: Option<&str>,
+    owner_slice_id: Option<&str>,
+    current_invocation_id: Option<&str>,
+) -> Result<(), PublicationOwnershipError> {
+    let owner = publication_owner_matches(publication, expected_owner)?;
+    let owner_branch = match owner_branch {
+        Some(branch) => branch,
+        None if publication.provenance == PublicationProvenance::Legacy
+            && publication.slice_id.is_none()
+            && publication.invocation_id.is_none() =>
+        {
+            return Ok(());
+        }
+        None => {
+            return Err(PublicationOwnershipError::MissingIdentity {
+                owner: owner.to_string(),
+            })
+        }
+    };
+    let owner_parent_branch =
+        owner_parent_branch.ok_or_else(|| PublicationOwnershipError::MissingIdentity {
+            owner: owner.to_string(),
+        })?;
+    if owner_branch != publication.head_branch {
+        return Err(PublicationOwnershipError::BranchMismatch {
+            publication: publication.head_branch.clone(),
+            owner: owner_branch.to_string(),
+        });
+    }
+    if owner_parent_branch != publication.base_branch {
+        return Err(PublicationOwnershipError::BaseBranchMismatch {
+            publication: publication.base_branch.clone(),
+            owner: owner_parent_branch.to_string(),
+        });
+    }
+
+    let publication_slice = match publication.provenance {
+        PublicationProvenance::LedgerOwned => publication
+            .slice_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(PublicationOwnershipError::MissingSlice)?,
+        PublicationProvenance::Legacy => publication.slice_id.as_deref().unwrap_or_default(),
+    };
+    if !publication_slice.is_empty() && owner_slice_id != Some(publication_slice) {
+        return Err(PublicationOwnershipError::SliceMismatch {
+            slice: publication_slice.to_string(),
+            owner: owner_slice_id.unwrap_or("missing").to_string(),
+        });
+    }
+
+    let Some(original_invocation_id) = publication.invocation_id.as_deref() else {
+        if publication.provenance == PublicationProvenance::LedgerOwned {
+            return Err(PublicationOwnershipError::MissingInvocationProvenance);
+        }
+        return Ok(());
+    };
+    let current_invocation_id = current_invocation_id.ok_or_else(|| {
+        PublicationOwnershipError::MissingInvocationRecord {
+            invocation: original_invocation_id.to_string(),
+        }
+    })?;
+    if current_invocation_id != original_invocation_id
+        && !invocation_succession_reaches_current(publication, current_invocation_id)
+    {
+        return Err(PublicationOwnershipError::InvocationSuccessionMissing {
+            original: original_invocation_id.to_string(),
+            current: current_invocation_id.to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl PublishedHead {
@@ -741,6 +867,89 @@ mod tests {
             "invocation-unrelated"
         ));
         assert!(!invocation_succession_reaches_current(&head, "not-present"));
+    }
+
+    #[test]
+    fn publication_ownership_verdict_covers_shared_refusal_cases() {
+        let mut publication = publication("sha-1");
+        publication.provenance = PublicationProvenance::LedgerOwned;
+        publication.slice_id = Some("slice-a".to_string());
+        let valid = verify_publication_ownership(
+            &publication,
+            Some("feature-codex"),
+            Some("main.feature-codex"),
+            Some("main"),
+            Some("slice-a"),
+            Some("invocation-1"),
+        );
+        assert!(valid.is_ok());
+
+        assert!(matches!(
+            verify_publication_ownership(
+                &publication,
+                Some("other-owner"),
+                Some("main.feature-codex"),
+                Some("main"),
+                Some("slice-a"),
+                Some("invocation-1"),
+            ),
+            Err(PublicationOwnershipError::OwnerMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_publication_ownership(
+                &publication,
+                Some("feature-codex"),
+                Some("other-branch"),
+                Some("main"),
+                Some("slice-a"),
+                Some("invocation-1"),
+            ),
+            Err(PublicationOwnershipError::BranchMismatch { .. })
+        ));
+        assert!(matches!(
+            verify_publication_ownership(
+                &publication,
+                Some("feature-codex"),
+                Some("main.feature-codex"),
+                Some("main"),
+                Some("other-slice"),
+                Some("invocation-1"),
+            ),
+            Err(PublicationOwnershipError::SliceMismatch { .. })
+        ));
+
+        let mut missing_author = publication.clone();
+        missing_author.author_agent = None;
+        assert!(matches!(
+            verify_publication_ownership(
+                &missing_author,
+                Some("feature-codex"),
+                Some("main.feature-codex"),
+                Some("main"),
+                Some("slice-a"),
+                Some("invocation-1"),
+            ),
+            Err(PublicationOwnershipError::MissingAuthor)
+        ));
+
+        let mut unrelated = publication;
+        unrelated.invocation_succession.push(InvocationSuccession {
+            from_invocation_id: "unrelated-root".to_string(),
+            to_invocation_id: "invocation-unrelated".to_string(),
+            reason: SuccessionReason::SessionRecreate,
+            recorded_at: 1,
+        });
+        assert!(matches!(
+            verify_publication_ownership(
+                &unrelated,
+                Some("feature-codex"),
+                Some("main.feature-codex"),
+                Some("main"),
+                Some("slice-a"),
+                Some("invocation-unrelated"),
+            ),
+            Err(PublicationOwnershipError::InvocationSuccessionMissing { .. })
+        ));
     }
 
     #[tokio::test]
