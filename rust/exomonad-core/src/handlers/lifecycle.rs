@@ -310,6 +310,7 @@ mod tests {
             has_tab,
             topology: Topology::WorktreePerAgent,
             agent_dir: None,
+            worktree_path: None,
             slug: None,
             agent_type: Some(AgentType::OpenCode),
             pr: None,

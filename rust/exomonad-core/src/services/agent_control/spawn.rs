@@ -655,8 +655,10 @@ impl<
             self.create_worktree_checked(&worktree_path, &branch_name, &base_branch)
                 .await?;
 
-            // Use worktree path as agent_dir
-            let agent_dir = worktree_path;
+            let agent_config_dir = self
+                .project_dir()
+                .join(".exo/agents")
+                .join(agent_name.as_str());
 
             // Write .mcp.json for the agent
             let role = match options.agent_type {
@@ -669,7 +671,7 @@ impl<
             let effort = self.effective_effort_for(role.as_str(), None);
             self.write_agent_mcp_config(
                 &effective_project_dir,
-                &agent_dir,
+                &worktree_path,
                 options.agent_type,
                 &role,
             )
@@ -720,7 +722,7 @@ impl<
             let window_id = self
                 .new_tmux_window(
                     &display_name,
-                    &agent_dir,
+                    &worktree_path,
                     options.agent_type,
                     Some(&initial_prompt),
                     env_vars,
@@ -738,7 +740,7 @@ impl<
                 birth_branch: BirthBranch::try_from_str(branch_name.as_str())
                     .expect("validated string input is non-empty"),
                 parent_branch: effective_birth,
-                working_dir: agent_dir.clone(),
+                working_dir: worktree_path.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
                 model: model.clone(),
@@ -757,7 +759,8 @@ impl<
             self.emit_agent_started(&agent_name)?;
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
-                agent_dir: agent_dir.clone(),
+                agent_dir: agent_config_dir,
+                worktree_path: worktree_path.clone(),
                 branch_name: branch_name.to_string(),
                 agent_name,
                 issue_title: issue.title,
@@ -1056,6 +1059,7 @@ impl<
                     info!(name = %options.name, "Worker pane still alive, returning existing");
                     return Ok(SpawnResult {
                         agent_dir: PathBuf::new(),
+                        worktree_path: PathBuf::new(),
                         branch_name: String::new(),
                         agent_name,
                         issue_title: options.name.to_string(),
@@ -1176,6 +1180,7 @@ impl<
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: PathBuf::new(),
+                worktree_path: PathBuf::new(),
                 branch_name: String::new(),
                 agent_name,
                 issue_title: options.name.to_string(),
@@ -1229,7 +1234,11 @@ impl<
             if tab_alive {
                 info!(slug = %identity.slug(), "Subtree already running, returning existing");
                 return Ok(SpawnResult {
-                    agent_dir: self.worktree_base.join(agent_name.as_str()),
+                    agent_dir: self
+                        .project_dir()
+                        .join(".exo/agents")
+                        .join(agent_name.as_str()),
+                    worktree_path: self.worktree_base.join(agent_name.as_str()),
                     branch_name: child_birth.to_string(),
                     agent_name,
                     issue_title: options.branch_name.clone(),
@@ -1528,7 +1537,11 @@ impl<
                 .await?;
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
-                agent_dir: worktree_path.clone(),
+                agent_dir: self
+                    .project_dir()
+                    .join(".exo/agents")
+                    .join(agent_name.as_str()),
+                worktree_path: worktree_path.clone(),
                 branch_name: branch_name.clone(),
                 agent_name,
                 issue_title: options.branch_name.clone(),
@@ -1692,7 +1705,8 @@ impl<
                 }
                 info!(slug = %identity.slug(), "Leaf subtree already running, returning existing");
                 return Ok(SpawnResult {
-                    agent_dir: worktree_path,
+                    agent_dir: config_dir,
+                    worktree_path,
                     branch_name: child_birth.to_string(),
                     agent_name,
                     issue_title: options.branch_name.clone(),
@@ -2065,7 +2079,8 @@ impl<
             }
 
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
-                agent_dir: worktree_path.clone(),
+                agent_dir: agent_config_dir,
+                worktree_path: worktree_path.clone(),
                 branch_name: actual_branch_name,
                 agent_name,
                 issue_title: options.branch_name.clone(),

@@ -104,11 +104,15 @@ Handles effects in the `agent.*` namespace.
 
 ### Type Safety
 
-- `SpawnResult.agent_dir` is `PathBuf` (not String)
+- `SpawnResult.agent_dir` is the exomonad-managed metadata directory
+  (`.exo/agents/{agent_id}/`) and `SpawnResult.worktree_path` is the agent's
+  git worktree location (empty for shared-dir workers)
 - `SpawnResult.agent_type` uses the `AgentType` enum rather than a harness string.
 - `SpawnSubtreeOptions.agent_type` and `SpawnLeafOptions.agent_type` are `AgentType` (required, no default — `AGENT_TYPE_UNSPECIFIED` is rejected)
 - `SpawnOptions.base_branch` is `Option<BirthBranch>`
-- `AgentInfo.agent_dir` is `Option<PathBuf>`, `AgentInfo.slug` is `Option<AgentName>`
+- `AgentInfo.agent_dir` is the exomonad-managed metadata directory
+  (`.exo/agents/{agent_id}/`), `AgentInfo.worktree_path` is the optional git
+  worktree location, and `AgentInfo.slug` is `Option<AgentName>`
 - Proto conversion uses `AgentType::suffix()` and `AgentType::emoji()` methods
 - Claude session registry lookups use `AgentName`
 

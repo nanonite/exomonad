@@ -614,8 +614,11 @@ pub struct SpawnLeafOptions {
 /// Result of spawning an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpawnResult {
-    /// Path to the agent directory (.exo/agents/{agent_id}/)
+    /// Path to the exomonad-managed agent metadata directory
+    /// (.exo/agents/{agent_id}/). Empty for shared-dir workers.
     pub agent_dir: PathBuf,
+    /// The agent's git worktree location. Empty for shared-dir workers.
+    pub worktree_path: PathBuf,
     /// Actual git branch created or resumed for the agent. Empty for shared-dir workers.
     pub branch_name: String,
     /// Agent's internal name (suffixed, e.g., "feature-a-claude").
@@ -680,9 +683,13 @@ pub struct AgentInfo {
     /// Workspace topology.
     #[serde(default)]
     pub topology: Topology,
-    /// Path to agent directory (.exo/agents/{agent_id}/)
+    /// Path to the exomonad-managed agent metadata directory
+    /// (.exo/agents/{agent_id}/).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_dir: Option<PathBuf>,
+    /// The agent's git worktree location. None for shared-dir workers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
     /// Slug from agent name (e.g., "fix-bug-in-parser")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slug: Option<AgentName>,

@@ -1752,7 +1752,7 @@ impl<
 
         record.spawn_status = "spawned".to_string();
         record.error.clear();
-        record.worktree_path = spawn_result.agent_dir.to_string_lossy().to_string();
+        record.worktree_path = spawn_result.worktree_path.to_string_lossy().to_string();
         info!(
             chainlink_issue_id = issue_id,
             old_pr_number,
@@ -4351,7 +4351,7 @@ fn spawn_result_to_proto(
     exomonad_proto::effects::agent::AgentInfo {
         id: format!("{}-{}", issue, result.agent_type.suffix()),
         issue: issue.to_string(),
-        worktree_path: result.agent_dir.display().to_string(),
+        worktree_path: result.worktree_path.display().to_string(),
         branch_name: String::new(),
         agent_type: service_agent_type_to_proto(result.agent_type),
         role: 0,
@@ -4400,7 +4400,7 @@ fn subtree_result_to_proto(
     Ok(exomonad_proto::effects::agent::AgentInfo {
         id: result.agent_name.to_string(),
         issue: String::new(),
-        worktree_path: result.agent_dir.display().to_string(),
+        worktree_path: result.worktree_path.display().to_string(),
         branch_name: actual_branch.to_string(),
         agent_type: service_agent_type_to_proto(result.agent_type),
         role: 0,
@@ -4425,7 +4425,7 @@ fn leaf_subtree_result_to_proto(
     Ok(exomonad_proto::effects::agent::AgentInfo {
         id: result.agent_name.to_string(),
         issue: String::new(),
-        worktree_path: result.agent_dir.display().to_string(),
+        worktree_path: result.worktree_path.display().to_string(),
         branch_name: actual_branch.to_string(),
         agent_type: service_agent_type_to_proto(result.agent_type),
         role: 0,
@@ -4626,7 +4626,7 @@ pub(crate) fn service_info_to_proto(
         id: info.internal_name.to_string(),
         issue: info.internal_name.to_string(),
         worktree_path: info
-            .agent_dir
+            .worktree_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default(),
@@ -5588,6 +5588,7 @@ mod tests {
             has_tab: true,
             topology: Topology::WorktreePerAgent,
             agent_dir: None,
+            worktree_path: None,
             slug: None,
             agent_type: Some(ServiceAgentType::Codex),
             pr: None,
@@ -5618,7 +5619,12 @@ mod tests {
         let routing =
             RoutingInfo::window(crate::services::tmux_ipc::WindowId::parse("@17").unwrap());
         let agent_dir = temp_dir.path().join("agent");
+        let worktree_path = temp_dir.path().join("worktree");
         tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        tokio::fs::create_dir_all(&worktree_path).await.unwrap();
+        tokio::fs::write(agent_dir.join("dispatch_intent"), "intent-715\n")
+            .await
+            .unwrap();
         routing.write_to_dir(&agent_dir).await.unwrap();
         crate::services::agent_control::start_invocation(
             &agent_dir,
@@ -5654,6 +5660,7 @@ mod tests {
             has_tab: true,
             topology: Topology::WorktreePerAgent,
             agent_dir: Some(agent_dir),
+            worktree_path: Some(worktree_path.clone()),
             slug: None,
             agent_type: Some(ServiceAgentType::OpenCode),
             pr: None,
@@ -5677,6 +5684,8 @@ mod tests {
 
         assert_eq!(proto.mux_window, "@17");
         assert_eq!(proto.error, "retired routing (exit_code=0)");
+        assert_eq!(proto.intent_id, "intent-715");
+        assert_eq!(proto.worktree_path, worktree_path.display().to_string());
         assert!(!proto.is_alive);
     }
 
@@ -5697,6 +5706,7 @@ mod tests {
             has_tab: true,
             topology: Topology::WorktreePerAgent,
             agent_dir: Some(agent_dir),
+            worktree_path: None,
             slug: None,
             agent_type: Some(ServiceAgentType::OpenCode),
             pr: None,
@@ -5722,6 +5732,7 @@ mod tests {
             has_tab: false,
             topology: Topology::WorktreePerAgent,
             agent_dir: Some(temp_dir.path().to_path_buf()),
+            worktree_path: None,
             slug: None,
             agent_type: Some(ServiceAgentType::OpenCode),
             pr: None,
@@ -5996,7 +6007,8 @@ mod tests {
     #[test]
     fn leaf_subtree_response_reports_actual_branch_for_new_and_resumed_leaves() {
         let result = crate::services::agent_control::SpawnResult {
-            agent_dir: PathBuf::from(".exo/worktrees/fix-pr97-ci-codex"),
+            agent_dir: PathBuf::from(".exo/agents/fix-pr97-ci-codex"),
+            worktree_path: PathBuf::from(".exo/worktrees/fix-pr97-ci-codex"),
             branch_name: "main.fix-pr97-ci".to_string(),
             agent_name: AgentName::try_from_str("fix-pr97-ci-codex").unwrap(),
             issue_title: "fix CI".to_string(),
@@ -6005,8 +6017,10 @@ mod tests {
         };
         let response = leaf_subtree_result_to_proto("fix-pr97-ci", &result).unwrap();
         assert_eq!(response.branch_name, "main.fix-pr97-ci");
+        assert_eq!(response.worktree_path, ".exo/worktrees/fix-pr97-ci-codex");
         let response = subtree_result_to_proto("fix-pr97-ci", &result).unwrap();
         assert_eq!(response.branch_name, "main.fix-pr97-ci");
+        assert_eq!(response.worktree_path, ".exo/worktrees/fix-pr97-ci-codex");
 
         let resumed = crate::services::agent_control::SpawnResult {
             branch_name: "main.rebase-pr95-main-conflicts-opencode".to_string(),
@@ -6024,6 +6038,7 @@ mod tests {
     fn branch_response_rejects_missing_actual_branch() {
         let result = crate::services::agent_control::SpawnResult {
             agent_dir: PathBuf::new(),
+            worktree_path: PathBuf::new(),
             branch_name: String::new(),
             agent_name: AgentName::try_from_str("missing-branch-codex").unwrap(),
             issue_title: String::new(),

@@ -419,7 +419,8 @@ impl<
                                 .expect("validated string input is non-empty"),
                             has_tab,
                             topology: Topology::WorktreePerAgent,
-                            agent_dir: Some(path.clone()),
+                            agent_dir: Some(config_dir.clone()),
+                            worktree_path: Some(path.clone()),
                             slug: Some(
                                 AgentName::try_from_str(slug_str)
                                     .expect("validated string input is non-empty"),
@@ -494,6 +495,7 @@ impl<
                     has_tab,
                     topology: Topology::SharedDir,
                     agent_dir: Some(path.clone()),
+                    worktree_path: None,
                     slug: Some(
                         AgentName::try_from_str(base_name)
                             .expect("validated string input is non-empty"),
