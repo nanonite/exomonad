@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix durable exact-head review verdict reconstruction (#1039)
 - Accept Forgejo bare-array runner responses (#1038)
 - Fix dashboard CI matching for Forgejo Actions runs (#1037)
 - Fix continuation replay of merge-ready PR state (#1036)
