@@ -515,7 +515,7 @@ fn report_legacy_session(project_dir: &Path, mode: SessionMode) {
         return;
     }
     info!(
-        "No session-mode record found; continuing legacy runtime state without archiving or reinterpreting it"
+        "Detected legacy runtime state; --continue will validate it without archiving or reinterpreting it"
     );
 }
 
@@ -536,13 +536,27 @@ fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()>
         if !plan_exists && !snapshot_exists {
             return Ok(());
         }
-        if !plan_exists || !snapshot_exists {
+        if !plan_exists {
             anyhow::bail!(
-                "cannot continue: plan.json and its byte-identical snapshot must both exist"
+                "cannot continue: plan.json is missing while its persisted session snapshot exists"
             );
         }
         let current = std::fs::read(&plan_path)
             .with_context(|| format!("failed to read {}", plan_path.display()))?;
+        if !snapshot_exists {
+            let parent = snapshot_path
+                .parent()
+                .context("plan snapshot has no parent directory")?;
+            std::fs::create_dir_all(parent)?;
+            let temporary = snapshot_path.with_extension("tmp");
+            std::fs::write(&temporary, &current)?;
+            std::fs::rename(&temporary, &snapshot_path)?;
+            info!(
+                path = %snapshot_path.display(),
+                "Adopted legacy plan bytes as the initial TL plan snapshot"
+            );
+            return Ok(());
+        }
         let original = std::fs::read(&snapshot_path)
             .with_context(|| format!("failed to read {}", snapshot_path.display()))?;
         if current != original {
@@ -4089,6 +4103,49 @@ mod tests {
 
         std::fs::write(&plan, snapshot).unwrap();
         validate_or_record_plan_snapshot(tmp.path(), SessionMode::Continue).unwrap();
+    }
+
+    #[test]
+    fn continue_adopts_legacy_plan_then_rejects_later_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = tmp.path().join(".exo/tl-loop/plan.json");
+        std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+        let original = b"{\"plan\":{\"leaves\":[]}}\n".to_vec();
+        std::fs::write(&plan, &original).unwrap();
+
+        validate_or_record_plan_snapshot(tmp.path(), SessionMode::Continue).unwrap();
+        assert_eq!(std::fs::read(&plan).unwrap(), original);
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(tmp.path())).unwrap(),
+            original
+        );
+
+        std::fs::write(&plan, b"{\"plan\":{\"leaves\":[{\"name\":\"changed\"}]}}\n").unwrap();
+        let error =
+            validate_or_record_plan_snapshot(tmp.path(), SessionMode::Continue).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("differs from its persisted session snapshot"));
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(tmp.path())).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn continue_refuses_missing_plan_when_snapshot_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plan = tmp.path().join(".exo/tl-loop/plan.json");
+        std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+        std::fs::write(&plan, b"{\"plan\":{\"leaves\":[]}}\n").unwrap();
+        validate_or_record_plan_snapshot(tmp.path(), SessionMode::Start).unwrap();
+        std::fs::remove_file(&plan).unwrap();
+
+        let error =
+            validate_or_record_plan_snapshot(tmp.path(), SessionMode::Continue).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("plan.json is missing while its persisted session snapshot exists"));
     }
 
     #[test]
