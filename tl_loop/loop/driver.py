@@ -2487,6 +2487,10 @@ def _reconcile_action_journal(
     silently matching the earlier APPROVED one. Without this, one approval
     would authorize the effect (spawn, merge, PR, or cleanup) to be retried
     indefinitely with no further human check, risking it running twice.
+
+    This provides at-most-once dispatch until an operator reconciles an
+    ambiguous outcome; it cannot autonomously prove exactly-once execution
+    after a process crash between the external effect and its response.
     """
     if not isinstance(effects_log, EffectJournal):
         return state

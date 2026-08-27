@@ -1,4 +1,5 @@
-use crate::domain::{BranchName, RoutingInfo};
+use crate::domain::{AgentName, BranchName, RoutingInfo};
+use crate::services::agent_resolver::AgentResolver;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -413,6 +414,61 @@ async fn read_published_heads_locked(project_dir: &Path) -> Result<Vec<Published
 pub async fn read_published_heads(project_dir: &Path) -> Result<Vec<PublishedHead>> {
     let _guard = published_heads_lock().lock().await;
     read_published_heads_locked(project_dir).await
+}
+
+/// Verify the current PR head against the same durable owner identity used by
+/// watcher reconciliation. This is intentionally fail-closed: a matching
+/// publication is not sufficient without a resolver identity, matching birth
+/// and parent branches, matching slice ownership, and valid invocation
+/// succession.
+pub async fn verify_current_publication_ownership(
+    project_dir: &Path,
+    resolver: &AgentResolver,
+    pr_number: u64,
+    head_branch: &str,
+    base_branch: &str,
+    head_sha: &str,
+) -> Result<()> {
+    let heads = read_published_heads(project_dir).await?;
+    let publication = heads
+        .iter()
+        .filter(|head| head.matches_current(pr_number, head_branch, base_branch, head_sha))
+        .max_by_key(|head| {
+            (
+                head.provenance == PublicationProvenance::LedgerOwned,
+                head.invocation_succession.len(),
+            )
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("no verified publication matches PR #{pr_number} and head {head_sha}")
+        })?;
+    let owner = publication_owner_matches(publication, None)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let owner_name = AgentName::try_from_str(owner)
+        .map_err(|_| anyhow::anyhow!("publication owner '{owner}' is invalid"))?;
+    let identity = resolver
+        .get(&owner_name)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("publication owner '{owner}' has no identity"))?;
+    let current_invocation_id = if publication.invocation_id.is_some() {
+        let invocation_dir = project_dir.join(".exo/agents").join(owner_name.as_str());
+        crate::services::agent_control::read_invocation_conservatively(&invocation_dir)
+            .await
+            .map(|record| record.invocation_id)
+    } else {
+        None
+    };
+    let owner_branch = identity.birth_branch.to_string();
+    let owner_parent_branch = identity.parent_branch.to_string();
+    verify_publication_ownership(
+        publication,
+        None,
+        Some(&owner_branch),
+        Some(&owner_parent_branch),
+        identity.slice_id.as_deref(),
+        current_invocation_id.as_deref(),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 /// Recover a slice's PR number from the durable publication registry when the

@@ -106,7 +106,7 @@ instance Aeson.ToJSON MergePROutput where
 
 -- | Shared tool description for merge_pr.
 mergePRDescription :: Text
-mergePRDescription = "Merge a GitHub pull request and fetch changes. Before merging, requires a Forgejo reviewer approval for the exact current PR head and passing CI (success or neutral) for that same head; stale approvals, review changes/comments, pending/failed/unknown CI, and missing evidence are rejected. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
+mergePRDescription = "Merge a GitHub pull request and fetch changes. Before merging, requires a Forgejo reviewer approval for the exact current PR head and passing CI (success or neutral) for that same head; stale approvals, review changes/comments, pending/failed/unknown CI, and missing evidence are rejected. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md after a successful merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
 
 -- | Shared tool schema for merge_pr.
 mergePRSchema :: Aeson.Object
@@ -115,7 +115,7 @@ mergePRSchema =
     [ ("pr_number", "PR number to merge"),
       ("strategy", "Merge strategy: squash (default), merge, or rebase"),
       ("working_dir", "Working directory for git operations"),
-      ("chainlink_issue_id", "Optional Chainlink issue ID to close and commit CHANGELOG.md before merging")
+      ("chainlink_issue_id", "Optional Chainlink issue ID to close and commit CHANGELOG.md after a successful merge")
     ]
 
 -- | Core merge_pr I/O: self-merge guard + readiness check + merge + cleanup + git pull.
@@ -436,7 +436,7 @@ closeIssueAndCommitChangelog args =
     Just issueId -> do
       let workingDir = mergePRWorkingDir args
       closeResult <-
-        runPreMergeCommand
+        runBookkeepingCommand
           workingDir
           "close Chainlink issue"
           "chainlink"
@@ -445,7 +445,7 @@ closeIssueAndCommitChangelog args =
         Left err -> pure $ Left err
         Right () -> do
           addResult <-
-            runPreMergeCommand
+            runBookkeepingCommand
               workingDir
               "stage CHANGELOG.md"
               "git"
@@ -453,14 +453,14 @@ closeIssueAndCommitChangelog args =
           case addResult of
             Left err -> pure $ Left err
             Right () ->
-              runPreMergeCommand
+              runBookkeepingCommand
                 workingDir
                 "commit CHANGELOG.md"
                 "git"
                 ["commit", "-m", chainlinkChangelogCommitMessage issueId]
 
-runPreMergeCommand :: Text -> Text -> Text -> [Text] -> Eff Effects (Either Text ())
-runPreMergeCommand workingDir label command args = do
+runBookkeepingCommand :: Text -> Text -> Text -> [Text] -> Eff Effects (Either Text ())
+runBookkeepingCommand workingDir label command args = do
   void $
     suspendEffect_ @LogInfo
       ( Log.InfoRequest
@@ -480,7 +480,7 @@ runPreMergeCommand workingDir label command args = do
   case result of
     Left err -> do
       let message = label <> " failed before exit code was captured: " <> T.pack (show err)
-      logPreMergeFailure message ""
+      logMergeCommandFailure message ""
       pure $ Left message
     Right resp
       | Proc.runResponseExitCode resp == 0 -> pure $ Right ()
@@ -497,11 +497,11 @@ runPreMergeCommand workingDir label command args = do
                     <> stdoutText
                     <> "\nstderr:\n"
                     <> stderrText
-          logPreMergeFailure message fields
+          logMergeCommandFailure message fields
           pure $ Left message
 
-logPreMergeFailure :: Text -> BS.ByteString -> Eff Effects ()
-logPreMergeFailure message fields =
+logMergeCommandFailure :: Text -> BS.ByteString -> Eff Effects ()
+logMergeCommandFailure message fields =
   void $
     suspendEffect_ @LogError
       ( Log.ErrorRequest
@@ -519,10 +519,23 @@ mergeExpectedHeadSha _ observedHead = observedHead
 -- | Execute the actual merge after readiness check passes.
 doMerge :: MergePRArgs -> Text -> Eff Effects (Either Text MergePROutput)
 doMerge args observedHead = do
-  preMergeResult <- closeIssueAndCommitChangelog args
-  case preMergeResult of
+  mergeResult <- runMerge args observedHead
+  case mergeResult of
     Left err -> pure $ Left err
-    Right () -> runMerge args observedHead
+    Right output
+      | not (mpoSuccess output) -> pure $ Right output
+      | otherwise -> do
+          bookkeepingResult <- closeIssueAndCommitChangelog args
+          case bookkeepingResult of
+            Left err ->
+              pure . Right $
+                output
+                  { mpoMessage =
+                      mpoMessage output
+                        <> "; post-merge Chainlink bookkeeping failed: "
+                        <> err
+                  }
+            Right () -> pure $ Right output
 
 runMerge :: MergePRArgs -> Text -> Eff Effects (Either Text MergePROutput)
 runMerge args observedHead = do

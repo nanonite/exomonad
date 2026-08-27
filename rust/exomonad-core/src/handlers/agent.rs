@@ -25,13 +25,13 @@ use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
 use crate::services::forgejo::{
     normalize_review_verdict, ForgejoPullRequest, ForgejoPullRequestReview,
 };
-#[cfg(test)]
-use crate::services::pr_registry::PrRegistry;
 use crate::services::pr_registry::{
-    publication_history_for_slice, publication_owner_matches, read_published_heads,
-    resolve_live_pr_for_slice_with_abandonments, verify_publication_ownership, AbandonedAttempt,
-    LivePrResolution, PrEntry, PrState, PublicationProvenance, PublishedHead,
+    publication_history_for_slice, read_published_heads,
+    resolve_live_pr_for_slice_with_abandonments, verify_current_publication_ownership,
+    AbandonedAttempt, LivePrResolution, PrEntry, PrState, PublishedHead,
 };
+#[cfg(test)]
+use crate::services::pr_registry::{PrRegistry, PublicationProvenance};
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
@@ -810,7 +810,7 @@ fn published_head_evidence(publication: Option<&PublishedHead>) -> Option<Publis
     })
 }
 
-async fn publication_ownership_status<C>(
+pub(crate) async fn publication_ownership_status<C>(
     ctx: &C,
     pr_number: u64,
     head_branch: &str,
@@ -820,61 +820,16 @@ async fn publication_ownership_status<C>(
 where
     C: HasAgentResolver + HasProjectDir,
 {
-    let heads = match read_published_heads(ctx.project_dir()).await {
-        Ok(heads) => heads,
-        Err(error) => return (false, format!("publication registry unavailable: {error}")),
-    };
-    let Some(publication) = heads
-        .iter()
-        .filter(|head| head.matches_current(pr_number, head_branch, base_branch, head_sha))
-        .max_by_key(|head| {
-            (
-                head.provenance == PublicationProvenance::LedgerOwned,
-                head.invocation_succession.len(),
-            )
-        })
-    else {
-        return (
-            false,
-            format!("no verified publication matches PR #{pr_number} and head {head_sha}"),
-        );
-    };
-    let owner = match publication_owner_matches(publication, None) {
-        Ok(owner) => owner,
-        Err(error) => return (false, error.to_string()),
-    };
-    let owner_name = match AgentName::try_from_str(owner) {
-        Ok(owner_name) => owner_name,
-        Err(_) => return (false, format!("publication owner '{owner}' is invalid")),
-    };
-    let Some(identity) = ctx.agent_resolver().get(&owner_name).await else {
-        return (
-            false,
-            format!("publication owner '{owner}' has no identity"),
-        );
-    };
-    let current_invocation_id = if publication.invocation_id.is_some() {
-        let invocation_dir = ctx
-            .project_dir()
-            .join(".exo/agents")
-            .join(owner_name.as_str());
-        crate::services::agent_control::read_invocation_conservatively(&invocation_dir)
-            .await
-            .map(|record| record.invocation_id)
-    } else {
-        None
-    };
-    let owner_branch = identity.birth_branch.to_string();
-    let owner_parent_branch = identity.parent_branch.to_string();
-    let verification = verify_publication_ownership(
-        publication,
-        None,
-        Some(&owner_branch),
-        Some(&owner_parent_branch),
-        identity.slice_id.as_deref(),
-        current_invocation_id.as_deref(),
-    );
-    match verification {
+    match verify_current_publication_ownership(
+        ctx.project_dir(),
+        ctx.agent_resolver(),
+        pr_number,
+        head_branch,
+        base_branch,
+        head_sha,
+    )
+    .await
+    {
         Ok(()) => (true, String::new()),
         Err(error) => (false, error.to_string()),
     }

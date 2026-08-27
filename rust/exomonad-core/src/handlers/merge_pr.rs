@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use crate::services::{
-    HasCiStatusMap, HasEventLog, HasForgejoClient, HasGitWorktreeService, HasProjectDir,
-    HasSessionMemory,
+    HasAgentResolver, HasCiStatusMap, HasEventLog, HasForgejoClient, HasGitWorktreeService,
+    HasProjectDir, HasSessionMemory,
 };
 
 pub struct MergePRHandler<C> {
@@ -38,6 +38,7 @@ impl<
             + HasProjectDir
             + HasCiStatusMap
             + HasSessionMemory
+            + HasAgentResolver
             + 'static,
     > crate::effects::EffectHandler for MergePRHandler<C>
 {
@@ -63,6 +64,7 @@ impl<
             + HasProjectDir
             + HasCiStatusMap
             + HasSessionMemory
+            + HasAgentResolver
             + 'static,
     > MergePrEffects for MergePRHandler<C>
 {
@@ -99,7 +101,10 @@ impl<
                 },
                 self.ctx.git_worktree_service().clone(),
                 self.ctx.forgejo_client().map(|arc| arc.as_ref()),
-                self.ctx.project_dir(),
+                merge_pr::MergeAuthority {
+                    resolver: self.ctx.agent_resolver(),
+                    project_dir: self.ctx.project_dir(),
+                },
             )
             .await
             .effect_err("merge_pr")?

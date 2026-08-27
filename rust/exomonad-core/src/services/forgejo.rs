@@ -144,6 +144,7 @@ struct ClosePullRequestBody {
 struct MergePullRequestBody<'a> {
     #[serde(rename = "Do")]
     method: &'a str,
+    head_commit_id: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -623,13 +624,18 @@ impl ForgejoClient {
         repo: &GithubRepo,
         number: PRNumber,
         method: &str,
+        head_commit_id: &str,
     ) -> Result<()> {
         match &self.backend {
             ForgejoBackend::Http(client) => {
-                client.merge_pull_request(owner, repo, number, method).await
+                client
+                    .merge_pull_request(owner, repo, number, method, head_commit_id)
+                    .await
             }
             ForgejoBackend::Fj(client) => {
-                client.merge_pull_request(owner, repo, number, method).await
+                client
+                    .merge_pull_request(owner, repo, number, method, head_commit_id)
+                    .await
             }
         }
     }
@@ -1230,6 +1236,7 @@ impl HttpForgejoClient {
         repo: &GithubRepo,
         number: PRNumber,
         method: &str,
+        head_commit_id: &str,
     ) -> Result<()> {
         let number_segment = number.as_u64().to_string();
         let url = self.api_url(&[
@@ -1244,7 +1251,10 @@ impl HttpForgejoClient {
             .http
             .post(url)
             .headers(self.auth_headers()?)
-            .json(&MergePullRequestBody { method })
+            .json(&MergePullRequestBody {
+                method,
+                head_commit_id,
+            })
             .send()
             .await
             .context("Forgejo PR merge request failed")?;
@@ -1653,6 +1663,7 @@ impl FjForgejoClient {
         repo: &GithubRepo,
         number: PRNumber,
         method: &str,
+        head_commit_id: &str,
     ) -> Result<()> {
         let path = format!(
             "/repos/{}/{}/pulls/{}/merge",
@@ -1660,8 +1671,16 @@ impl FjForgejoClient {
             repo.as_str(),
             number.as_u64()
         );
-        self.fj_status(["api", "POST", path.as_str(), "-f", &format!("Do={method}")])
-            .await
+        self.fj_status([
+            "api",
+            "POST",
+            path.as_str(),
+            "-f",
+            &format!("Do={method}"),
+            "-f",
+            &format!("head_commit_id={head_commit_id}"),
+        ])
+        .await
     }
 
     async fn update_pull_request(
@@ -2716,5 +2735,17 @@ mod tests {
 
         assert!(message.contains("path [0].name"), "{message}");
         assert!(!message.contains("sensitive-runner"), "{message}");
+    }
+
+    #[test]
+    fn merge_request_serializes_atomic_head_commit_id() {
+        let body = MergePullRequestBody {
+            method: "squash",
+            head_commit_id: "head-a",
+        };
+        let value = serde_json::to_value(body).expect("merge request body serializes");
+
+        assert_eq!(value["Do"], "squash");
+        assert_eq!(value["head_commit_id"], "head-a");
     }
 }

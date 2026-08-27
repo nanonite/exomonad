@@ -11,14 +11,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from tl_loop.client.effects import ToolResult
 from tl_loop.loop.driver import (
+    TLLoopConfig,
     _action_journal_gate_name,
     _record_controller_event,
     _reconcile_action_journal,
-    TLLoopConfig,
 )
 from tl_loop.loop.journal import EffectJournal
-from tl_loop.client.effects import ToolResult
 from tl_loop.state.schema import GateStatus, SliceStatus
 from tl_loop.state.store import RunStore, create
 from tl_loop.tests.test_reconcile import _slice
@@ -61,6 +61,31 @@ def test_first_reconciliation_opens_a_named_gate_and_leaves_entry_blocked(tmp_pa
     assert gate.status is GateStatus.PENDING
     # The entry itself is untouched until the operator answers the gate.
     assert journal.existing(intent)["status"] == "unknown"
+
+
+def test_intended_resume_entry_from_process_death_opens_gate_without_dispatch(tmp_path) -> None:
+    path = tmp_path / "action-journal.json"
+    journal = EffectJournal("reconcile-journal", path)
+    intent = _Intent(
+        operation="resume_pr",
+        arguments={"head_sha": "head-a", "pr_number": 42},
+    )
+    # Simulate process death after the durable intent write and before the
+    # external call returned. A new controller must treat intended exactly as
+    # ambiguous as unknown, never redispatching automatically.
+    journal.append(intent)
+
+    restarted_journal = EffectJournal("reconcile-journal", path)
+    store, state = _store_and_state(tmp_path)
+    reconciled = _reconcile_action_journal(state, store, restarted_journal)
+
+    gate_name = _action_journal_gate_name(restarted_journal.key_for(intent))
+    gate = next(gate for gate in reconciled.gates if gate.name == gate_name)
+    assert gate.status is GateStatus.PENDING
+    pending = restarted_journal.pending_entries()
+    assert len(pending) == 1
+    assert pending[0]["operation"] == "resume_pr"
+    assert pending[0]["status"] == "intended"
 
 
 def test_approved_gate_compensates_the_entry_and_clears_the_block(tmp_path) -> None:
