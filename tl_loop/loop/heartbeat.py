@@ -403,7 +403,12 @@ def heartbeat_once(
             continue
         updated, observed = _reconcile_pr(slice_state, watcher)
         if review_replay is not None:
-            replayed = review_replay(store.load(), slice_state, watcher)
+            replay_input = store.load()
+            replay_input = replace(
+                replay_input,
+                slices={**replay_input.slices, slice_state.id: updated},
+            )
+            replayed = review_replay(replay_input, updated, watcher)
             current = replayed
             updated = replayed.slices[slice_state.id]
         updated = reconcile_merge_observation(updated, watcher)

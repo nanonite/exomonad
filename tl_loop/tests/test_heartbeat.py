@@ -269,6 +269,29 @@ def test_repeated_heartbeat_reconciliation_is_idempotent(tmp_path: Path) -> None
     ]
 
 
+def test_review_replay_cannot_restore_stale_head_after_heartbeat_reconciliation(
+    tmp_path: Path,
+) -> None:
+    store, state = _state(
+        tmp_path,
+        status="in_review",
+        heartbeat_at=0.0,
+        pr_number=42,
+        reviewed_head="head-old",
+    )
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport()),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+        review_replay=lambda replay_state, _slice_state, _watcher: replay_state,
+    )
+
+    assert result.state.slices["slice-a"].reviewed_head == "head-new"
+
+
 def test_heartbeat_parks_closed_unmerged_pr(tmp_path: Path) -> None:
     store, state = _state(
         tmp_path,

@@ -290,6 +290,8 @@ mod tests {
             body: "looks good".to_string(),
             commit_id: Some("abc123".to_string()),
             author_login: None,
+            dismissed: false,
+            stale: false,
         });
 
         assert_eq!(proto.state, ReviewState::Approved as i32);
@@ -305,6 +307,8 @@ mod tests {
             body: String::new(),
             commit_id: None,
             author_login: None,
+            dismissed: false,
+            stale: false,
         });
 
         assert_eq!(proto.state, ReviewState::Unspecified as i32);

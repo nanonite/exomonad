@@ -341,10 +341,9 @@ async fn current_review_feedback(
     reviews: &[ForgejoPullRequestReview],
 ) -> ContinuationResult<Vec<String>> {
     let mut feedback = Vec::new();
-    for review in reviews
-        .iter()
-        .filter(|review| review.commit_id.as_deref() == Some(head_sha))
-    {
+    for review in reviews.iter().filter(|review| {
+        review.commit_id.as_deref() == Some(head_sha) && !review.dismissed && !review.stale
+    }) {
         if !review.body.trim().is_empty() {
             feedback.push(format!("- {}", one_line(&review.body)));
         }
@@ -364,25 +363,22 @@ async fn current_review_feedback(
 }
 
 fn review_state_for_head(reviews: &[ForgejoPullRequestReview], head_sha: &str) -> String {
-    let mut current = reviews
+    reviews
         .iter()
-        .filter(|review| review.commit_id.as_deref() == Some(head_sha));
-    if current
-        .clone()
-        .any(|review| review.state.eq_ignore_ascii_case("changes_requested"))
-    {
-        return "changes_requested".to_string();
-    }
-    if current
-        .clone()
-        .any(|review| review.state.eq_ignore_ascii_case("approved"))
-    {
-        return "approved".to_string();
-    }
-    if current.any(|review| review.state.eq_ignore_ascii_case("comment")) {
-        return "commented".to_string();
-    }
-    "pending_review".to_string()
+        .rev()
+        .find(|review| {
+            review.commit_id.as_deref() == Some(head_sha) && !review.dismissed && !review.stale
+        })
+        .map(|review| match review.state.to_ascii_lowercase().as_str() {
+            "approved" | "approve" => "approved",
+            "changes_requested" | "request_changes" | "request_changes_requested" => {
+                "changes_requested"
+            }
+            "comment" | "commented" => "commented",
+            _ => "pending_review",
+        })
+        .unwrap_or("pending_review")
+        .to_string()
 }
 
 fn scoped_records<'a>(
@@ -469,6 +465,8 @@ mod tests {
                 body: "stale".to_string(),
                 commit_id: Some("old".to_string()),
                 author_login: None,
+                dismissed: false,
+                stale: false,
             },
             ForgejoPullRequestReview {
                 id: Some(2),
@@ -476,6 +474,8 @@ mod tests {
                 body: "current".to_string(),
                 commit_id: Some("head".to_string()),
                 author_login: None,
+                dismissed: false,
+                stale: false,
             },
         ];
         assert_eq!(review_state_for_head(&reviews, "head"), "approved");

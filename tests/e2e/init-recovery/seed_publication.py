@@ -107,13 +107,43 @@ def main() -> None:
                 "invocation_id": f"seed-invocation-{args.slice_id}",
                 "runtime": "codex",
                 "trigger": "spawn",
-                "routing": {"kind": "none"},
+                "mode": "interactive",
+                "routing": {"window_id": "@42"},
                 "started_at": 1700000000,
                 "ended_at": 1700000060,
                 "status": "exited",
                 "exit_code": 0,
                 "pr_number": pr_number,
                 "generation": 1,
+            },
+            indent=2,
+        )
+    )
+
+    # Reviewer provenance is intentionally durable even though the reviewer
+    # identity is not registered as a live agent. This models the one-shot
+    # reviewer cleanup window: watcher_pr_state must resolve the reviewer from
+    # the exact PR/head-bound Review invocation, not from editable PR metadata
+    # or the current identity registry.
+    reviewer_agent = f"review-pr-{pr_number}-codex"
+    reviewer_dir = repo / ".exo" / "agents" / reviewer_agent
+    reviewer_dir.mkdir(parents=True, exist_ok=True)
+    (reviewer_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": f"seed-review-invocation-{pr_number}",
+                "runtime": "codex",
+                "trigger": "review",
+                "mode": "interactive",
+                "routing": {"window_id": "@42"},
+                "started_at": 1700000000,
+                "ended_at": 1700000060,
+                "status": "exited",
+                "exit_code": 0,
+                "pr_number": pr_number,
+                "head_sha": args.head_sha,
+                "generation": 1,
+                "runtime_agent_id": reviewer_agent,
             },
             indent=2,
         )

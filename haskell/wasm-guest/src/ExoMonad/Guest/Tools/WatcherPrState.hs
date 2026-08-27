@@ -82,7 +82,13 @@ watcherPrStateCore args
                       .= PA.watcherPrStateResponsePublicationOwnershipVerified resp,
                     "publication_ownership_error"
                       .= lazyText (PA.watcherPrStateResponsePublicationOwnershipError resp),
-                    "publication" .= PA.watcherPrStateResponsePublication resp
+                    "publication" .= PA.watcherPrStateResponsePublication resp,
+                    "review_id" .= PA.watcherPrStateResponseReviewId resp,
+                    "review_verdict" .= lazyText (PA.watcherPrStateResponseReviewVerdict resp),
+                    "review_head_sha" .= lazyText (PA.watcherPrStateResponseReviewHeadSha resp),
+                    "reviewer_agent_id" .= lazyText (PA.watcherPrStateResponseReviewerAgentId resp),
+                    "reviewer_identity_error"
+                      .= lazyText (PA.watcherPrStateResponseReviewerIdentityError resp)
                   ]
 
 instance MCPTool WatcherPrState where

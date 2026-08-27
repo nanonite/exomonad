@@ -1,4 +1,4 @@
-use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber, Slug};
+use crate::domain::{AgentName, BirthBranch, BranchName, CIStatus, PRNumber};
 use crate::plugin_manager::PluginManager;
 use crate::services::agent_control::AgentType;
 use crate::services::event_log::{
@@ -828,11 +828,10 @@ where
 {
     async fn validate_publication_provenance(
         &self,
-        pr: &PrEntry,
         publication: &PublishedHead,
     ) -> std::result::Result<String, String> {
-        let owner = publication_owner_matches(publication, Some(pr.author_agent.as_str()))
-            .map_err(|error| error.to_string())?;
+        let owner =
+            publication_owner_matches(publication, None).map_err(|error| error.to_string())?;
         let owner_name = AgentName::try_from_str(owner)
             .map_err(|_| format!("publication owner '{owner}' is invalid"))?;
         let identity = self.ctx.agent_resolver().get(&owner_name).await;
@@ -850,7 +849,7 @@ where
         };
         verify_publication_ownership(
             publication,
-            Some(pr.author_agent.as_str()),
+            None,
             identity.as_ref().map(|value| value.birth_branch.as_str()),
             identity.as_ref().map(|value| value.parent_branch.as_str()),
             identity
@@ -1471,29 +1470,27 @@ where
             else {
                 continue;
             };
-            if let Err(reason) = self.validate_publication_provenance(pr, publication).await {
-                self.log_watcher_event(
-                    "watcher.ownership_unresolved",
-                    &serde_json::json!({
-                        "pr_number": number,
-                        "branch": pr.head_branch,
-                        "publication_owner": publication.author_agent,
-                        "registry_owner": pr.author_agent,
-                        "reason": reason,
-                    }),
-                );
-                warn!(pr_number = number, %reason, "Ignoring PR with unverified publication ownership");
-                continue;
-            }
+            let owner_id = match self.validate_publication_provenance(publication).await {
+                Ok(owner) => owner,
+                Err(reason) => {
+                    self.log_watcher_event(
+                        "watcher.ownership_unresolved",
+                        &serde_json::json!({
+                            "pr_number": number,
+                            "branch": pr.head_branch,
+                            "publication_owner": publication.author_agent,
+                            "registry_owner": pr.author_agent,
+                            "reason": reason,
+                        }),
+                    );
+                    warn!(pr_number = number, %reason, "Ignoring PR with unverified publication ownership");
+                    continue;
+                }
+            };
 
             let (review_state, comments, reviews, changes_requested_rounds, forgejo_review_present) =
-                self.forgejo_review_parts(
-                    *number,
-                    &head_sha,
-                    pr.reviewer_agent.as_deref(),
-                    Some(pr.author_agent.as_str()),
-                )
-                .await;
+                self.forgejo_review_parts(*number, &head_sha, Some(owner_id.as_str()))
+                    .await;
 
             let branch = BranchName::try_from_str(pr.head_branch.as_str())
                 .expect("validated string input is non-empty");
@@ -1616,7 +1613,7 @@ where
                     );
                     continue;
                 };
-                let owner_id = match self.validate_publication_provenance(pr, publication).await {
+                let owner_id = match self.validate_publication_provenance(publication).await {
                     Ok(owner) => owner,
                     Err(reason) => {
                         self.log_watcher_event(
@@ -1708,7 +1705,10 @@ where
                         current_changes_requested_rounds,
                         obs.ci_status,
                         pr.merge_blocked_on_ci,
-                        pr.reviewer_agent.is_some(),
+                        self.ctx
+                            .agent_resolver()
+                            .has_reviewer_invocation(*pr_number, &obs.head_sha)
+                            .await,
                         obs.forgejo_review_present,
                         replay_notifications,
                         branch.as_str(),
@@ -1755,7 +1755,10 @@ where
                         current_changes_requested_rounds,
                         obs.ci_status,
                         pr.merge_blocked_on_ci,
-                        pr.reviewer_agent.is_some(),
+                        self.ctx
+                            .agent_resolver()
+                            .has_reviewer_invocation(*pr_number, &obs.head_sha)
+                            .await,
                         obs.forgejo_review_present,
                         replay_notifications,
                         branch.as_str(),
@@ -2376,7 +2379,6 @@ where
         &self,
         pr_number: u64,
         head_sha: &str,
-        expected_reviewer: Option<&str>,
         owner_agent: Option<&str>,
     ) -> (
         ForgejoReviewState,
@@ -2412,6 +2414,9 @@ where
 
         let mut local_reviews = Vec::new();
         for review in reviews {
+            if review.dismissed || review.stale {
+                continue;
+            }
             let state = review_state_from_str(&review.state);
             if state == ForgejoReviewVerdict::None {
                 continue;
@@ -2424,8 +2429,9 @@ where
                 commit_id: review.commit_id,
                 author_agent_id: self
                     .resolve_review_author(
+                        pr_number,
+                        head_sha,
                         review.author_login.as_deref(),
-                        expected_reviewer,
                         owner_agent,
                     )
                     .await,
@@ -2492,40 +2498,25 @@ where
 
     async fn resolve_review_author(
         &self,
+        pr_number: u64,
+        head_sha: &str,
         login: Option<&str>,
-        expected_reviewer: Option<&str>,
         owner_agent: Option<&str>,
     ) -> Option<String> {
         let login = login?.trim();
         if login.is_empty() {
             return None;
         }
-        let candidates = [login, login.strip_prefix("exomonad-").unwrap_or(login)];
-        for candidate in candidates {
-            if let Ok(agent_name) = AgentName::try_from_str(candidate) {
-                if self.ctx.agent_resolver().get(&agent_name).await.is_some() {
-                    let resolved = agent_name.to_string();
-                    if owner_agent == Some(resolved.as_str())
-                        || expected_reviewer.is_some_and(|expected| expected != resolved)
-                    {
-                        return None;
-                    }
-                    return Some(resolved);
-                }
-            }
-            if let Ok(slug) = Slug::try_from_str(candidate) {
-                if let Some(record) = self.ctx.agent_resolver().lookup_by_slug(&slug).await {
-                    let resolved = record.agent_name.to_string();
-                    if owner_agent == Some(resolved.as_str())
-                        || expected_reviewer.is_some_and(|expected| expected != resolved)
-                    {
-                        return None;
-                    }
-                    return Some(resolved);
-                }
-            }
+        let resolved = self
+            .ctx
+            .agent_resolver()
+            .resolve_reviewer_invocation(pr_number, head_sha)
+            .await?;
+        if owner_agent == Some(resolved.as_str()) {
+            None
+        } else {
+            Some(resolved)
         }
-        None
     }
 }
 
@@ -2810,9 +2801,8 @@ fn compute_pr_actions_with_context(
         old_state.pr_review_cycle_count = comment_count;
     }
 
-    let approved = reviews.iter().any(|r| {
-        r.state == ForgejoReviewVerdict::Approved || r.body.to_lowercase().contains("approved")
-    });
+    let latest_review_state = latest_review_verdict(reviews);
+    let approved = latest_review_state == ForgejoReviewVerdict::Approved;
     if approved
         && (old_state.last_review_state != ForgejoReviewVerdict::Approved || replay_notifications)
     {
@@ -2850,9 +2840,7 @@ fn compute_pr_actions_with_context(
         }
     }
 
-    let changes_requested = reviews
-        .iter()
-        .any(|r| r.state == ForgejoReviewVerdict::ChangesRequested);
+    let changes_requested = latest_review_state == ForgejoReviewVerdict::ChangesRequested;
     let changes_requested_fingerprint =
         review_fingerprint(comments, reviews, ForgejoReviewVerdict::ChangesRequested);
     if !approved
@@ -2894,9 +2882,7 @@ fn compute_pr_actions_with_context(
         });
     }
 
-    let commented = reviews
-        .iter()
-        .any(|review| review.state == ForgejoReviewVerdict::Commented);
+    let commented = latest_review_state == ForgejoReviewVerdict::Commented;
     let commented_fingerprint =
         review_fingerprint(comments, reviews, ForgejoReviewVerdict::Commented);
     if !approved
@@ -3093,23 +3079,30 @@ fn attach_review_correlation_fields(
 }
 
 fn aggregate_review_state(reviews: &[ForgejoReview]) -> ForgejoReviewState {
-    if reviews
+    match latest_review_verdict(reviews) {
+        ForgejoReviewVerdict::ChangesRequested => ForgejoReviewState::ChangesRequested,
+        ForgejoReviewVerdict::Approved => ForgejoReviewState::Approved,
+        ForgejoReviewVerdict::Commented => ForgejoReviewState::Commented,
+        ForgejoReviewVerdict::None => ForgejoReviewState::PendingReview,
+    }
+}
+
+fn latest_review_verdict(reviews: &[ForgejoReview]) -> ForgejoReviewVerdict {
+    reviews
         .iter()
-        .any(|review| review.state == ForgejoReviewVerdict::ChangesRequested)
+        .rev()
+        .map(effective_review_verdict)
+        .find(|state| *state != ForgejoReviewVerdict::None)
+        .unwrap_or_default()
+}
+
+fn effective_review_verdict(review: &ForgejoReview) -> ForgejoReviewVerdict {
+    if review.state == ForgejoReviewVerdict::None
+        && review.body.to_ascii_lowercase().contains("approved")
     {
-        ForgejoReviewState::ChangesRequested
-    } else if reviews
-        .iter()
-        .any(|review| review.state == ForgejoReviewVerdict::Approved)
-    {
-        ForgejoReviewState::Approved
-    } else if reviews
-        .iter()
-        .any(|review| review.state == ForgejoReviewVerdict::Commented)
-    {
-        ForgejoReviewState::Commented
+        ForgejoReviewVerdict::Approved
     } else {
-        ForgejoReviewState::PendingReview
+        review.state.clone()
     }
 }
 
@@ -5423,6 +5416,16 @@ mod tests {
             ]),
             ForgejoReviewState::ChangesRequested
         );
+    }
+
+    #[test]
+    fn latest_review_verdict_allows_approval_after_requested_changes() {
+        let state = aggregate_review_state(&[
+            test_review("needs work", ForgejoReviewVerdict::ChangesRequested),
+            test_review("fixed", ForgejoReviewVerdict::Approved),
+        ]);
+
+        assert_eq!(state, ForgejoReviewState::Approved);
     }
 
     #[test]

@@ -52,6 +52,8 @@ pub struct ForgejoPullRequestReview {
     pub body: String,
     pub commit_id: Option<String>,
     pub author_login: Option<String>,
+    pub dismissed: bool,
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +161,10 @@ struct PullRequestReviewResponse {
     commit_id: Option<String>,
     #[serde(default)]
     user: Option<PullRequestReviewAuthor>,
+    #[serde(default)]
+    dismissed: bool,
+    #[serde(default)]
+    stale: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -824,6 +830,8 @@ impl HttpForgejoClient {
                 body: review.body,
                 commit_id: review.commit_id,
                 author_login: review.user.and_then(|user| user.login.or(user.username)),
+                dismissed: review.dismissed,
+                stale: review.stale,
             })
             .collect())
     }
@@ -1369,6 +1377,8 @@ impl FjForgejoClient {
                 body: review.body,
                 commit_id: review.commit_id,
                 author_login: review.user.and_then(|user| user.login.or(user.username)),
+                dismissed: review.dismissed,
+                stale: review.stale,
             })
             .collect())
     }
@@ -2133,6 +2143,31 @@ mod tests {
             reviews[0].author_login.as_deref(),
             Some("exomonad-reviewer")
         );
+        assert!(!reviews[0].dismissed);
+        assert!(!reviews[0].stale);
+    }
+
+    #[tokio::test]
+    async fn list_reviews_preserves_real_dismissed_flag() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/pulls/43/reviews"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(include_str!("fixtures/forgejo-dismissed-review.json")),
+            )
+            .mount(&server)
+            .await;
+
+        let reviews = client
+            .list_pull_request_reviews(&owner(), &repo(), PRNumber::new(43))
+            .await
+            .unwrap();
+
+        assert_eq!(reviews[0].state, "APPROVED");
+        assert!(reviews[0].dismissed);
+        assert!(!reviews[0].stale);
     }
 
     #[test]

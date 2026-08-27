@@ -5,7 +5,8 @@
 //! Consumers read from the resolver — no re-derivation, no suffix stripping, no fallbacks.
 
 use crate::domain::{AgentName, BirthBranch, Slug};
-use crate::services::agent_control::{AgentType, Topology};
+use crate::services::agent_control::{AgentType, InvocationTrigger, Topology};
+use crate::services::event_log::EventLog;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,6 +61,31 @@ const IDENTITY_FILENAME: &str = "identity.json";
 pub struct AgentResolver {
     records: RwLock<HashMap<AgentName, AgentIdentityRecord>>,
     project_dir: PathBuf,
+}
+
+fn lifecycle_review_agent(
+    data: Option<&serde_json::Value>,
+    event_agent_id: Option<&str>,
+    pr_number: u64,
+    head_sha: &str,
+) -> Option<String> {
+    let data = data?;
+    let is_review = data.get("trigger").and_then(|value| value.as_str()) == Some("review")
+        || data.get("role").and_then(|value| value.as_str()) == Some("reviewer");
+    let matches_head = data.get("pr_number").and_then(|value| value.as_u64()) == Some(pr_number)
+        && data.get("head_sha").and_then(|value| value.as_str()) == Some(head_sha);
+    if !is_review || !matches_head {
+        return None;
+    }
+    data.get("runtime_agent_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            event_agent_id
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 impl AgentResolver {
@@ -237,6 +263,122 @@ impl AgentResolver {
         self.records.read().await.values().cloned().collect()
     }
 
+    /// Resolve the reviewer assigned to an exact PR head from durable
+    /// invocation provenance. Cleanup may remove both `identity.json` and the
+    /// per-agent directory, so the immutable lifecycle event is the final
+    /// fallback. A Forgejo login alone is not an agent authorization: the exact
+    /// PR/head-bound `Review` invocation is the assignment proof.
+    pub async fn resolve_reviewer_invocation(
+        &self,
+        pr_number: u64,
+        head_sha: &str,
+    ) -> Option<String> {
+        if pr_number == 0 || head_sha.trim().is_empty() {
+            return None;
+        }
+        let agents_dir = self.project_dir.join(".exo/agents");
+        if let Ok(mut entries) = tokio::fs::read_dir(agents_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let Some(invocation) =
+                    crate::services::agent_control::read_invocation_conservatively(&entry.path())
+                        .await
+                else {
+                    continue;
+                };
+                if invocation.trigger != InvocationTrigger::Review
+                    || invocation.pr_number != Some(pr_number)
+                    || invocation.head_sha.as_deref() != Some(head_sha)
+                {
+                    continue;
+                }
+                let agent_id = invocation
+                    .runtime_agent_id
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .filter(|value| !value.trim().is_empty())
+                            .map(ToOwned::to_owned)
+                    });
+                if agent_id.is_some() {
+                    return agent_id;
+                }
+            }
+        }
+
+        let events_dir = self.project_dir.join(".exo/events");
+        if let Ok(mut entries) = tokio::fs::read_dir(&events_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
+                if !file_type.is_file()
+                    || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
+                {
+                    continue;
+                }
+                let Ok(contents) = tokio::fs::read_to_string(entry.path()).await else {
+                    continue;
+                };
+                for line in contents.lines().rev() {
+                    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    if !matches!(
+                        event.get("type").and_then(|value| value.as_str()),
+                        Some("agent.invocation.started") | Some("agent.invocation.finished")
+                    ) {
+                        continue;
+                    }
+                    if let Some(agent_id) = lifecycle_review_agent(
+                        event.get("data"),
+                        event.get("agent_id").and_then(|value| value.as_str()),
+                        pr_number,
+                        head_sha,
+                    ) {
+                        return Some(agent_id);
+                    }
+                }
+            }
+        }
+
+        let event_log = EventLog::open(self.project_dir.join(".exo/events")).ok()?;
+        event_log
+            .ledger()
+            .read_events()
+            .ok()?
+            .iter()
+            .rev()
+            .filter(|record| {
+                matches!(
+                    record.event.event_type.as_str(),
+                    "agent.invocation.started" | "agent.invocation.finished"
+                )
+            })
+            .find_map(|record| {
+                lifecycle_review_agent(
+                    Some(&record.event.data),
+                    record.event.agent_id.as_deref(),
+                    pr_number,
+                    head_sha,
+                )
+            })
+    }
+
+    /// Return whether an exact PR head has a durable reviewer assignment.
+    pub async fn has_reviewer_invocation(&self, pr_number: u64, head_sha: &str) -> bool {
+        self.resolve_reviewer_invocation(pr_number, head_sha)
+            .await
+            .is_some()
+    }
+
     /// Resolve an agent's birth branch and working directory, trying in-memory
     /// records first, then probing disk (identity.json, git branch, .birth_branch file).
     ///
@@ -345,6 +487,7 @@ impl AgentResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::RoutingInfo;
     use tempfile::TempDir;
 
     fn test_record(name: &str, slug: &str, branch: &str) -> AgentIdentityRecord {
@@ -463,6 +606,60 @@ mod tests {
             )
             .await;
         assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn resolves_review_invocation_after_identity_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join(".exo/agents/review-pr-43-claude");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        crate::services::agent_control::start_invocation_with_provenance(
+            &agent_dir,
+            AgentType::Claude,
+            InvocationTrigger::Review,
+            RoutingInfo::window(crate::services::tmux_ipc::WindowId::parse("@42").unwrap()),
+            Some(43),
+            Some("head-43".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let resolver = AgentResolver::load(tmp.path().to_path_buf()).await;
+        assert!(resolver
+            .get(&AgentName::try_from_str("review-pr-43-claude").unwrap())
+            .await
+            .is_none());
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(43, "head-43").await,
+            Some("review-pr-43-claude".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_review_from_lifecycle_ledger_after_directory_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let agent_dir = tmp.path().join(".exo/agents/review-pr-43-claude");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        crate::services::agent_control::start_invocation_with_provenance(
+            &agent_dir,
+            AgentType::Claude,
+            InvocationTrigger::Review,
+            RoutingInfo::window(crate::services::tmux_ipc::WindowId::parse("@42").unwrap()),
+            Some(43),
+            Some("head-43".to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+
+        let resolver = AgentResolver::load(tmp.path().to_path_buf()).await;
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(43, "head-43").await,
+            Some("review-pr-43-claude".to_string())
+        );
     }
 
     #[tokio::test]

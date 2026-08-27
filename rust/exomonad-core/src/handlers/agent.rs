@@ -879,39 +879,20 @@ fn review_state_from_forgejo_reviews(
     reviews: &[ForgejoPullRequestReview],
     head_sha: &str,
 ) -> (String, u32) {
-    let mut has_approved = false;
-    let mut has_changes_requested = false;
-    let mut review_count = 0;
-
-    for review in reviews {
-        if !review_matches_exact_head(review, head_sha) {
-            continue;
-        }
-
-        match review.state.to_ascii_lowercase().as_str() {
-            "approved" | "approve" => {
-                has_approved = true;
-                review_count += 1;
-            }
-            "changes_requested" | "request_changes" | "request_changes_requested" => {
-                has_changes_requested = true;
-                review_count += 1;
-            }
-            _ => {}
-        }
-    }
-
-    if has_changes_requested {
-        ("changes_requested".to_string(), review_count)
-    } else if has_approved {
-        ("approved".to_string(), review_count)
-    } else {
-        ("pending_review".to_string(), review_count)
-    }
+    let review_count = reviews
+        .iter()
+        .filter(|review| review_matches_exact_head(review, head_sha))
+        .count() as u32;
+    let state = latest_exact_forgejo_review(reviews, head_sha)
+        .and_then(|review| normalized_review_verdict(&review.state))
+        .unwrap_or("pending_review");
+    (state.to_string(), review_count)
 }
 
 fn review_matches_exact_head(review: &ForgejoPullRequestReview, head_sha: &str) -> bool {
     !head_sha.is_empty()
+        && !review.dismissed
+        && !review.stale
         && review.commit_id.as_deref() == Some(head_sha)
         && normalized_review_verdict(&review.state).is_some()
 }
@@ -937,42 +918,26 @@ fn normalized_review_verdict(state: &str) -> Option<&'static str> {
     }
 }
 
-async fn resolve_registered_review_author<C: HasAgentResolver>(
+async fn resolve_durable_review_author<C: HasAgentResolver>(
     ctx: &C,
+    pr_number: u64,
+    head_sha: &str,
     login: Option<&str>,
-    expected_reviewer: Option<&str>,
     owner_agent: Option<&str>,
 ) -> Option<String> {
     let login = login?.trim();
     if login.is_empty() {
         return None;
     }
-    let candidates = [login, login.strip_prefix("exomonad-").unwrap_or(login)];
-    for candidate in candidates {
-        if let Ok(agent_name) = AgentName::try_from_str(candidate) {
-            if ctx.agent_resolver().get(&agent_name).await.is_some() {
-                let resolved = agent_name.to_string();
-                if owner_agent == Some(resolved.as_str())
-                    || expected_reviewer.is_some_and(|expected| expected != resolved)
-                {
-                    return None;
-                }
-                return Some(resolved);
-            }
-        }
-        if let Ok(slug) = Slug::try_from_str(candidate) {
-            if let Some(record) = ctx.agent_resolver().lookup_by_slug(&slug).await {
-                let resolved = record.agent_name.to_string();
-                if owner_agent == Some(resolved.as_str())
-                    || expected_reviewer.is_some_and(|expected| expected != resolved)
-                {
-                    return None;
-                }
-                return Some(resolved);
-            }
-        }
+    let resolved = ctx
+        .agent_resolver()
+        .resolve_reviewer_invocation(pr_number, head_sha)
+        .await?;
+    if owner_agent == Some(resolved.as_str()) {
+        None
+    } else {
+        Some(resolved)
     }
-    None
 }
 
 #[async_trait]
@@ -2049,7 +2014,6 @@ impl<
         } else {
             None
         };
-        let pr_metadata = parse_pr_body_metadata(&pr.body);
         let (
             review_id,
             review_verdict,
@@ -2069,11 +2033,14 @@ impl<
                 let review_verdict = normalized_review_verdict(&review.state)
                     .unwrap_or_default()
                     .to_string();
-                let resolved = resolve_registered_review_author(
+                let resolved = resolve_durable_review_author(
                     self.ctx.as_ref(),
+                    pr_number,
+                    &head_sha,
                     review.author_login.as_deref(),
-                    pr_metadata.reviewer_agent.as_deref(),
-                    pr_metadata.author_agent.as_deref(),
+                    publication
+                        .as_ref()
+                        .and_then(|value| value.author_agent.as_deref()),
                 )
                 .await;
                 let owner = publication
@@ -5940,6 +5907,8 @@ mod tests {
             body: String::new(),
             commit_id: commit_id.map(str::to_string),
             author_login: None,
+            dismissed: false,
+            stale: false,
         }
     }
 
@@ -5955,6 +5924,31 @@ mod tests {
 
         assert_eq!(state, "changes_requested");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn watcher_pr_review_state_uses_latest_active_current_head_verdict() {
+        let reviews = vec![
+            test_review("REQUEST_CHANGES", Some("abc123")),
+            test_review("APPROVED", Some("abc123")),
+        ];
+
+        let (state, count) = review_state_from_forgejo_reviews(&reviews, "abc123");
+
+        assert_eq!(state, "approved");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn dismissed_current_head_approval_is_not_review_evidence() {
+        let mut dismissed = test_review("APPROVED", Some("abc123"));
+        dismissed.dismissed = true;
+        let active = test_review("APPROVED", Some("abc123"));
+
+        let (state, count) = review_state_from_forgejo_reviews(&[dismissed, active], "abc123");
+
+        assert_eq!(state, "approved");
+        assert_eq!(count, 1);
     }
 
     #[test]

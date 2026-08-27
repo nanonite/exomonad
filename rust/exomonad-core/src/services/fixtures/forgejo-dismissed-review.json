@@ -1,10 +1,10 @@
 [
   {
-    "id": 403,
+    "id": 404,
     "state": "APPROVED",
-    "body": "<redacted review body>",
+    "body": "<redacted dismissed review body>",
     "commit_id": "090098863e9c9945506e6e25ade35e6f4a3eca4d",
-    "dismissed": false,
+    "dismissed": true,
     "stale": false,
     "user": {
       "id": 2,
