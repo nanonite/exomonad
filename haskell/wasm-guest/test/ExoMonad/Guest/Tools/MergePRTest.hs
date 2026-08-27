@@ -6,7 +6,12 @@ import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Effects.Agent qualified as Agent
 import Effects.Github qualified as GH
-import ExoMonad.Guest.Tools.MergePR (Readiness (..), watcherMergeGate)
+import ExoMonad.Guest.Tools.MergePR
+  ( MergePRArgs (..),
+    Readiness (..),
+    mergeExpectedHeadSha,
+    watcherMergeGate,
+  )
 import Proto3.Suite.Types qualified as Protobuf
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, testCase)
@@ -24,7 +29,68 @@ mergePrTests =
         let watcher = watcherResponse "review-pr-43-codex" ""
         case watcherMergeGate 43 hostedResponse watcher of
           Ready -> pure ()
-          NotReady reason -> assertBool ("unexpected merge rejection: " <> TL.unpack (TL.fromStrict reason)) False
+          NotReady reason ->
+            assertBool
+              ("unexpected merge rejection: " <> TL.unpack (TL.fromStrict reason))
+              False,
+      testCase "rejects unverified publication ownership" $ do
+        let watcher =
+              (watcherResponse "review-pr-43-codex" "")
+                { Agent.watcherPrStateResponsePublicationOwnershipVerified = False
+                }
+        case watcherMergeGate 43 hostedResponse watcher of
+          NotReady reason ->
+            assertBool
+              "reports publication ownership failure"
+              (TL.isInfixOf "publication ownership" (TL.fromStrict reason))
+          Ready -> assertBool "must reject unverified publication ownership" False,
+      testCase "rejects publication ownership errors" $ do
+        let watcher =
+              (watcherResponse "review-pr-43-codex" "")
+                { Agent.watcherPrStateResponsePublicationOwnershipError = "wrong invocation"
+                }
+        case watcherMergeGate 43 hostedResponse watcher of
+          NotReady reason ->
+            assertBool
+              "reports publication ownership error"
+              (TL.isInfixOf "wrong invocation" (TL.fromStrict reason))
+          Ready -> assertBool "must reject publication ownership errors" False,
+      testCase "rejects unreachable head evidence" $ do
+        let watcher =
+              (watcherResponse "review-pr-43-codex" "")
+                { Agent.watcherPrStateResponseHeadReachable = False
+                }
+        case watcherMergeGate 43 hostedResponse watcher of
+          NotReady reason ->
+            assertBool
+              "reports unreachable head"
+              (TL.isInfixOf "unreachable" (TL.fromStrict reason))
+          Ready -> assertBool "must reject unreachable head evidence" False,
+      testCase "rejects canonical evidence errors" $ do
+        let watcher =
+              (watcherResponse "review-pr-43-codex" "")
+                { Agent.watcherPrStateResponseEvidenceError = "merge tree mismatch"
+                }
+        case watcherMergeGate 43 hostedResponse watcher of
+          NotReady reason ->
+            assertBool
+              "reports evidence error"
+              (TL.isInfixOf "merge tree mismatch" (TL.fromStrict reason))
+          Ready -> assertBool "must reject canonical evidence errors" False,
+      testCase "always compare-binds the observed head" $ do
+        let args =
+              MergePRArgs
+                { mprPrNumber = 43,
+                  mprStrategy = Nothing,
+                  mprWorkingDir = Nothing,
+                  mprExpectedBaseSha = Nothing,
+                  mprExpectedHeadSha = Just "caller-head",
+                  mprExpectedPatchDigest = Nothing,
+                  mprExpectedMergeTreeSha = Nothing
+                }
+        assertBool
+          "observed head must override a caller-supplied head"
+          (mergeExpectedHeadSha args "head-a" == "head-a")
     ]
 
 hostedResponse :: GH.GetPullRequestResponse

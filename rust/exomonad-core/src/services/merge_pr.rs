@@ -1,9 +1,11 @@
 use crate::domain::{BranchName, MergeStrategy, PRNumber};
 use crate::services::forgejo::ForgejoClient;
 use crate::services::git_worktree::GitWorktreeService;
+use crate::services::pr_registry::{read_published_heads, PublicationProvenance, PublishedHead};
 use crate::services::repo;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::Duration;
@@ -41,6 +43,7 @@ pub async fn merge_pr_async(
     expected: MergeExpectedEvidence<'_>,
     git_wt: Arc<GitWorktreeService>,
     forgejo: Option<&ForgejoClient>,
+    project_dir: &Path,
 ) -> Result<MergePROutput> {
     let dir = if working_dir.is_empty() {
         "."
@@ -64,6 +67,37 @@ pub async fn merge_pr_async(
         .await?;
     let branch_name = pr.head_ref.clone();
     let head_sha = pr.head_sha.clone();
+    let Some(actual_head) = pr.head_sha.as_deref() else {
+        return Ok(cas_failure(
+            "compare_and_swap: PR has no authoritative head SHA".to_string(),
+            branch_name,
+            head_sha,
+        ));
+    };
+    let publications = match read_published_heads(project_dir).await {
+        Ok(publications) => publications,
+        Err(error) => {
+            return Ok(cas_failure(
+                format!("compare_and_swap: publication ownership verification failed: {error}"),
+                branch_name,
+                head_sha,
+            ));
+        }
+    };
+    if !has_verified_publication(
+        &publications,
+        pr_number.as_u64(),
+        pr.head_ref.as_str(),
+        pr.base_ref.as_str(),
+        actual_head,
+    ) {
+        return Ok(cas_failure(
+            "compare_and_swap: publication ownership is not verified for the current PR head"
+                .to_string(),
+            branch_name,
+            head_sha,
+        ));
+    }
     if let Some(expected) = expected.head_sha.filter(|value| !value.is_empty()) {
         if pr.head_sha.as_deref() != Some(expected) {
             return Ok(MergePROutput {
@@ -166,6 +200,31 @@ pub async fn merge_pr_async(
         git_fetched,
         branch_name,
         head_sha,
+    })
+}
+
+fn has_verified_publication(
+    publications: &[PublishedHead],
+    pr_number: u64,
+    head_branch: &str,
+    base_branch: &str,
+    head_sha: &str,
+) -> bool {
+    publications.iter().any(|publication| {
+        publication.provenance == PublicationProvenance::LedgerOwned
+            && publication
+                .author_agent
+                .as_deref()
+                .is_some_and(|owner| !owner.trim().is_empty())
+            && publication
+                .slice_id
+                .as_deref()
+                .is_some_and(|slice| !slice.trim().is_empty())
+            && publication
+                .invocation_id
+                .as_deref()
+                .is_some_and(|invocation| !invocation.trim().is_empty())
+            && publication.matches_current(pr_number, head_branch, base_branch, head_sha)
     })
 }
 
@@ -447,5 +506,51 @@ mod tests {
             .await
             .expect_err("missing identity must not trigger a broad fetch");
         assert!(error.to_string().contains("pr_head_unreachable:"));
+    }
+
+    fn ledger_publication(head_sha: &str) -> PublishedHead {
+        PublishedHead {
+            pr_number: 7,
+            head_branch: "main.slice-a".to_string(),
+            base_branch: "main".to_string(),
+            head_sha: head_sha.to_string(),
+            author_agent: Some("agent-a".to_string()),
+            author_role: Some("worker".to_string()),
+            provenance: PublicationProvenance::LedgerOwned,
+            slice_id: Some("slice-a".to_string()),
+            invocation_id: Some("invocation-a".to_string()),
+            invocation_trigger: Some("spawn".to_string()),
+            invocation_runtime: Some("codex".to_string()),
+            invocation_succession: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn publication_ownership_requires_ledger_provenance_and_exact_head() {
+        let publication = ledger_publication("head-a");
+        assert!(has_verified_publication(
+            std::slice::from_ref(&publication),
+            7,
+            "main.slice-a",
+            "main",
+            "head-a",
+        ));
+        assert!(!has_verified_publication(
+            std::slice::from_ref(&publication),
+            7,
+            "main.slice-a",
+            "main",
+            "head-b",
+        ));
+
+        let mut legacy = publication.clone();
+        legacy.provenance = PublicationProvenance::Legacy;
+        assert!(!has_verified_publication(
+            std::slice::from_ref(&legacy),
+            7,
+            "main.slice-a",
+            "main",
+            "head-a",
+        ));
     }
 }

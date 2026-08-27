@@ -19,6 +19,7 @@ module ExoMonad.Guest.Tools.MergePR
     Readiness (..),
     watcherMergeGate,
     authenticatedReviewEvidenceGate,
+    mergeExpectedHeadSha,
   )
 where
 
@@ -286,7 +287,7 @@ mergeFromHostedPr args prNum owner repo currentBranch localPrResult = do
                       <> T.pack (show err)
                 Right watcher ->
                   case watcherMergeGate prNum resp watcher of
-                    Ready -> doMerge args
+                    Ready -> doMerge args (TL.toStrict (Agent.watcherPrStateResponseHeadSha watcher))
                     NotReady reason -> mergeBlocked reason
 
 mergeBlocked :: Text -> Eff Effects (Either Text MergePROutput)
@@ -301,6 +302,10 @@ watcherMergeGate prNum resp watcher =
       reviewState = T.toLower (TL.toStrict (Agent.watcherPrStateResponseReviewState watcher))
       ciStatus = T.toLower (TL.toStrict (Agent.watcherPrStateResponseCiStatus watcher))
       prState = T.toLower (TL.toStrict (Agent.watcherPrStateResponsePrState watcher))
+      ownershipVerified = Agent.watcherPrStateResponsePublicationOwnershipVerified watcher
+      ownershipError = T.strip (TL.toStrict (Agent.watcherPrStateResponsePublicationOwnershipError watcher))
+      headReachable = Agent.watcherPrStateResponseHeadReachable watcher
+      evidenceError = T.strip (TL.toStrict (Agent.watcherPrStateResponseEvidenceError watcher))
       prefix = "Canonical merge evidence for PR #" <> T.pack (show prNum) <> ": "
    in case () of
         _
@@ -308,6 +313,14 @@ watcherMergeGate prNum resp watcher =
               NotReady $ prefix <> TL.toStrict (Agent.watcherPrStateResponseError watcher)
           | not (Agent.watcherPrStateResponseFound watcher) ->
               NotReady $ prefix <> "PR was not found"
+          | not ownershipVerified ->
+              NotReady $ prefix <> "publication ownership is not verified"
+          | not (T.null ownershipError) ->
+              NotReady $ prefix <> "publication ownership error: " <> ownershipError
+          | not headReachable ->
+              NotReady $ prefix <> "published PR head is unreachable"
+          | not (T.null evidenceError) ->
+              NotReady $ prefix <> "canonical head evidence is invalid: " <> evidenceError
           | T.null observedHead ->
               NotReady $ prefix <> "current PR head SHA is unavailable"
           | Agent.watcherPrStateResponseMerged watcher ->
@@ -497,23 +510,29 @@ logPreMergeFailure message fields =
           }
       )
 
+-- | The head observed by the canonical watcher is mandatory compare-and-swap
+-- evidence. The caller's optional head is retained for request compatibility,
+-- but can never weaken the final merge binding.
+mergeExpectedHeadSha :: MergePRArgs -> Text -> Text
+mergeExpectedHeadSha _ observedHead = observedHead
+
 -- | Execute the actual merge after readiness check passes.
-doMerge :: MergePRArgs -> Eff Effects (Either Text MergePROutput)
-doMerge args = do
+doMerge :: MergePRArgs -> Text -> Eff Effects (Either Text MergePROutput)
+doMerge args observedHead = do
   preMergeResult <- closeIssueAndCommitChangelog args
   case preMergeResult of
     Left err -> pure $ Left err
-    Right () -> runMerge args
+    Right () -> runMerge args observedHead
 
-runMerge :: MergePRArgs -> Eff Effects (Either Text MergePROutput)
-runMerge args = do
+runMerge :: MergePRArgs -> Text -> Eff Effects (Either Text MergePROutput)
+runMerge args observedHead = do
   let req =
         MP.MergePrRequest
           { MP.mergePrRequestPrNumber = fromIntegral (mprPrNumber args),
             MP.mergePrRequestStrategy = maybe "" TL.fromStrict (mprStrategy args),
             MP.mergePrRequestWorkingDir = maybe "" TL.fromStrict (mprWorkingDir args),
             MP.mergePrRequestExpectedBaseSha = maybe "" TL.fromStrict (mprExpectedBaseSha args),
-            MP.mergePrRequestExpectedHeadSha = maybe "" TL.fromStrict (mprExpectedHeadSha args),
+            MP.mergePrRequestExpectedHeadSha = TL.fromStrict (mergeExpectedHeadSha args observedHead),
             MP.mergePrRequestExpectedPatchDigest = maybe "" TL.fromStrict (mprExpectedPatchDigest args),
             MP.mergePrRequestExpectedMergeTreeSha = maybe "" TL.fromStrict (mprExpectedMergeTreeSha args)
           }

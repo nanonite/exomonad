@@ -5,16 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from tl_loop.client.effects import ToolResult
+from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
     LeafTask,
     TLLoopConfig,
     WorkPlan,
+    _action_journal_gate_name,
     _apply_convergence,
+    _reconcile_action_journal,
     _reconcile_nonterminal_slices,
 )
-from tl_loop.loop.convergence import ConvergenceTracker
+from tl_loop.loop.journal import EffectJournal
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
-from tl_loop.state.schema import SliceState, SliceStatus
+from tl_loop.state.schema import GateStatus, SliceState, SliceStatus
 from tl_loop.state.store import RunStore, _encode_slice, create
 
 _PLAN = WorkPlan(
@@ -550,6 +553,88 @@ def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_p
 
     assert repeated.slices["slice-a"].verdict is not None
     assert len(backend.requests) == 1
+    assert len(client.resume_pr_calls) == 1
+
+
+def test_repair_effect_journal_recovers_unknown_resume_without_duplicate_dispatch(tmp_path) -> None:
+    import pytest
+
+    class UnknownResumeClient(FakeClient):
+        def resume_pr(self, **arguments: object) -> ToolResult:
+            self.resume_pr_calls.append(arguments)
+            raise RuntimeError("resume transport connection lost")
+
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    client = UnknownResumeClient(
+        review_id=8,
+        review_verdict="CHANGES_REQUESTED",
+        review_head_sha="head-a",
+        review_body="Handle the missing error branch in src/a.py before retrying.",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    backend = RecordingRepairBackend(
+        RlmResponse(
+            {
+                "root_cause": "The error branch is not handled",
+                "proposed_solution": "Handle the error branch in src/a.py",
+                "read_first": ["src/a.py"],
+                "steps": ["Update src/a.py"],
+                "verify": ["just test"],
+                "boundary": ["Only edit src/a.py"],
+                "done_criteria": ["The error branch is covered"],
+            }
+        )
+    )
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        review_model_choice=RlmModelChoice(
+            model_id="test-model",
+            backend=backend,
+            store=RlmCallStore(),
+            context_length=10_000,
+        ),
+    )
+    journal_path = tmp_path / "action-journal.json"
+    journal = EffectJournal("run-1", journal_path)
+
+    with pytest.raises(RuntimeError, match="resume transport connection lost"):
+        _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    pending = journal.pending_entries()
+    assert len(pending) == 1
+    assert pending[0]["operation"] == "resume_pr"
+    assert pending[0]["status"] == "unknown"
+    assert len(client.resume_pr_calls) == 1
+
+    # A fresh journal object models a restarted controller recovering the
+    # durable unknown outcome. Recovery opens a gate and must not dispatch the
+    # repair again.
+    restarted_journal = EffectJournal("run-1", journal_path)
+    restarted_store = RunStore("reconcile", tmp_path)
+    restarted_state = _reconcile_action_journal(
+        restarted_store.load(),
+        restarted_store,
+        restarted_journal,
+    )
+    key = pending[0]["key"]
+    gate_name = _action_journal_gate_name(key)
+    gate = next(gate for gate in restarted_state.gates if gate.name == gate_name)
+    assert gate.status is GateStatus.PENDING
+    assert len(client.resume_pr_calls) == 1
+    assert restarted_journal.pending_entries()[0]["status"] == "unknown"
+
+    # Replaying startup reconciliation with the same unresolved journal is
+    # idempotent: it reuses the pending gate and still does not duplicate the
+    # external repair effect.
+    repeated = _reconcile_action_journal(
+        restarted_store.load(),
+        restarted_store,
+        restarted_journal,
+    )
+    assert next(gate for gate in repeated.gates if gate.name == gate_name).status is GateStatus.PENDING
     assert len(client.resume_pr_calls) == 1
 
 
