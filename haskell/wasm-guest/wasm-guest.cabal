@@ -161,6 +161,7 @@ test-suite wasm-guest-tests
         ExoMonad.Guest.Tools.PollWorkersTest
         ExoMonad.Guest.Tools.ResumePrTest
         ExoMonad.Guest.Tools.ResumeBlockedLeafTest
+        ExoMonad.Guest.Tools.MergePRTest
         ExoMonad.Guest.Tools.WatcherPrStateTest
     build-depends:
         wasm-guest:wasm-guest-internal,
@@ -168,4 +169,6 @@ test-suite wasm-guest-tests
         tasty-hunit,
         text,
         containers,
-        exomonad-proto
+        exomonad-proto,
+        proto3-runtime,
+        vector

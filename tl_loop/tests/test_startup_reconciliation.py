@@ -13,6 +13,7 @@ from tl_loop.loop.driver import (
     _reconcile_nonterminal_slices,
 )
 from tl_loop.loop.convergence import ConvergenceTracker
+from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.state.schema import SliceState, SliceStatus
 from tl_loop.state.store import RunStore, _encode_slice, create
 
@@ -67,6 +68,7 @@ class FakeClient:
     review_body: str | None = None
     reviewer_agent_id: str | None = None
     reviewer_identity_error: str | None = None
+    resume_pr_calls: list[dict[str, object]] = field(default_factory=list)
 
     def list_agents(self, *, filter_type: str | None = None) -> ToolResult:
         return ToolResult(
@@ -113,6 +115,7 @@ class FakeClient:
                 "merge_tree_sha": "tree-a",
                 "review_state": self.review_state,
                 "ci_status": "success",
+                "state": self.pr_state,
                 "pr_state": self.pr_state,
                 "merged": self.merged,
                 "head_reachable": self.head_reachable,
@@ -169,6 +172,15 @@ class FakeClient:
             raw={"success": True},
             success=True,
             result={"merged": True},
+            error=None,
+        )
+
+    def resume_pr(self, **arguments: object) -> ToolResult:
+        self.resume_pr_calls.append(arguments)
+        return ToolResult(
+            raw={"success": True},
+            success=True,
+            result={"resumed": True},
             error=None,
         )
 
@@ -464,7 +476,17 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     assert len(client.merge_calls) == 1
 
 
-def test_reconciliation_replays_actionable_findings_from_negative_review(tmp_path) -> None:
+@dataclass
+class RecordingRepairBackend:
+    response: RlmResponse
+    requests: list[RlmRequest] = field(default_factory=list)
+
+    def complete(self, request: RlmRequest) -> object:
+        self.requests.append(request)
+        return self.response
+
+
+def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
     client = FakeClient(
@@ -474,7 +496,30 @@ def test_reconciliation_replays_actionable_findings_from_negative_review(tmp_pat
         review_body="Handle the missing error branch in src/a.py before retrying.",
         reviewer_agent_id="review-pr-99-codex",
     )
-    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+    backend = RecordingRepairBackend(
+        RlmResponse(
+            {
+                "root_cause": "The error branch is not handled",
+                "proposed_solution": "Handle the error branch in src/a.py",
+                "read_first": ["src/a.py"],
+                "steps": ["Update src/a.py"],
+                "verify": ["just test"],
+                "boundary": ["Only edit src/a.py"],
+                "done_criteria": ["The error branch is covered"],
+            }
+        )
+    )
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        review_model_choice=RlmModelChoice(
+            model_id="test-model",
+            backend=backend,
+            store=RlmCallStore(),
+            context_length=10_000,
+        ),
+    )
 
     recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
 
@@ -482,6 +527,29 @@ def test_reconciliation_replays_actionable_findings_from_negative_review(tmp_pat
     assert slice_state.review_findings["head-a"][0]["rationale"] == (
         "Handle the missing error branch in src/a.py before retrying."
     )
+    assert len(backend.requests) == 1
+    no_go_sections = [
+        section
+        for section in backend.requests[0].inputs["sections"]
+        if section["name"] == "no_go_reasons"
+    ]
+    assert len(no_go_sections) == 1
+    assert "Handle the missing error branch" in str(no_go_sections[0]["content"])
+    assert len(client.resume_pr_calls) == 1
+    assert client.resume_pr_calls[0]["pr_number"] == 99
+
+    repeated = _reconcile_nonterminal_slices(
+        _PLAN,
+        store.load(),
+        config,
+        client,
+        store,
+        [],
+    )
+
+    assert repeated.slices["slice-a"].verdict is not None
+    assert len(backend.requests) == 1
+    assert len(client.resume_pr_calls) == 1
 
 
 def test_reconciliation_rejects_stale_or_unresolved_review_evidence(tmp_path) -> None:

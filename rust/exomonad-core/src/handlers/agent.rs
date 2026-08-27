@@ -22,7 +22,9 @@ use crate::services::agent_control::{
 use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::configured_tl_preflight_runtime_paths;
 use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
-use crate::services::forgejo::{ForgejoPullRequest, ForgejoPullRequestReview};
+use crate::services::forgejo::{
+    normalize_review_verdict, ForgejoPullRequest, ForgejoPullRequestReview,
+};
 #[cfg(test)]
 use crate::services::pr_registry::PrRegistry;
 use crate::services::pr_registry::{
@@ -911,14 +913,7 @@ fn latest_exact_forgejo_review<'a>(
 }
 
 fn normalized_review_verdict(state: &str) -> Option<&'static str> {
-    match state.trim().to_ascii_lowercase().as_str() {
-        "approved" | "approve" => Some("approved"),
-        "changes_requested" | "request_changes" | "request_changes_requested" => {
-            Some("changes_requested")
-        }
-        "commented" | "comment" => Some("commented"),
-        _ => None,
-    }
+    normalize_review_verdict(state).map(|verdict| verdict.as_str())
 }
 
 pub(crate) fn review_author_matches_reviewer_login(

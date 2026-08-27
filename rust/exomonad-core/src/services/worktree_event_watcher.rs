@@ -4,7 +4,9 @@ use crate::services::agent_control::AgentType;
 use crate::services::event_log::{
     canonical_review_wakeup_data, canonical_sibling_merged_data, PR_REVIEW_EVENT_TYPE,
 };
-use crate::services::forgejo::ForgejoCommitStatus;
+use crate::services::forgejo::{
+    normalize_review_verdict, ForgejoCommitStatus, ForgejoReviewVerdictKind,
+};
 use crate::services::pr_registry::{
     publication_owner_matches, read_published_heads, verify_publication_ownership,
     ForgejoReviewState, PrEntry, PrRegistry, PrState, PublicationProvenance, PublishedHead,
@@ -2972,15 +2974,12 @@ fn compute_pr_actions_with_context(
     pending_actions
 }
 
-#[allow(dead_code)]
 fn review_state_from_str(state: &str) -> ForgejoReviewVerdict {
-    match state.to_ascii_lowercase().as_str() {
-        "approved" | "approve" => ForgejoReviewVerdict::Approved,
-        "changes_requested" | "request_changes" | "request_changes_requested" => {
-            ForgejoReviewVerdict::ChangesRequested
-        }
-        "comment" | "commented" | "forgejo/comment" => ForgejoReviewVerdict::Commented,
-        _ => ForgejoReviewVerdict::None,
+    match normalize_review_verdict(state) {
+        Some(ForgejoReviewVerdictKind::Approved) => ForgejoReviewVerdict::Approved,
+        Some(ForgejoReviewVerdictKind::ChangesRequested) => ForgejoReviewVerdict::ChangesRequested,
+        Some(ForgejoReviewVerdictKind::Commented) => ForgejoReviewVerdict::Commented,
+        None => ForgejoReviewVerdict::None,
     }
 }
 

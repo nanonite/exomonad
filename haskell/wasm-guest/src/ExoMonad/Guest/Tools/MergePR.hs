@@ -16,6 +16,9 @@ module ExoMonad.Guest.Tools.MergePR
     mergePRSchema,
     mergePRRender,
     extractAgentName,
+    Readiness (..),
+    watcherMergeGate,
+    authenticatedReviewEvidenceGate,
   )
 where
 
@@ -315,9 +318,38 @@ watcherMergeGate prNum resp watcher =
               NotReady $ prefix <> "hosted PR head SHA changed during the merge check"
           | reviewState /= "approved" ->
               NotReady $ prefix <> "review approval is not recorded for the current PR head"
-          | ciStatus == "success" || ciStatus == "neutral" -> Ready
           | otherwise ->
-              NotReady $ prefix <> "CI status for the current PR head is " <> ciStatus
+              case authenticatedReviewEvidenceGate prNum observedHead watcher of
+                NotReady reason -> NotReady (prefix <> reason)
+                Ready
+                  | ciStatus == "success" || ciStatus == "neutral" -> Ready
+                  | otherwise ->
+                      NotReady $ prefix <> "CI status for the current PR head is " <> ciStatus
+
+-- | Require the canonical watcher response to carry authenticated, exact-head
+-- review evidence before allowing the final merge effect.
+authenticatedReviewEvidenceGate :: Int -> Text -> Agent.WatcherPrStateResponse -> Readiness
+authenticatedReviewEvidenceGate prNum observedHead watcher =
+  let reviewVerdict = T.toLower (T.strip (TL.toStrict (Agent.watcherPrStateResponseReviewVerdict watcher)))
+      reviewHeadSha = T.strip (TL.toStrict (Agent.watcherPrStateResponseReviewHeadSha watcher))
+      reviewerAgentId = T.strip (TL.toStrict (Agent.watcherPrStateResponseReviewerAgentId watcher))
+      identityError = T.strip (TL.toStrict (Agent.watcherPrStateResponseReviewerIdentityError watcher))
+      prefix = "review evidence for PR #" <> T.pack (show prNum) <> ": "
+   in case () of
+        _
+          | Agent.watcherPrStateResponseReviewId watcher <= 0 ->
+              NotReady $ prefix <> "Forgejo review ID is missing"
+          | reviewVerdict /= "approved" ->
+              NotReady $ prefix <> "authenticated review verdict is not approved"
+          | T.null reviewHeadSha ->
+              NotReady $ prefix <> "authenticated review head SHA is missing"
+          | reviewHeadSha /= observedHead ->
+              NotReady $ prefix <> "authenticated review is not for the current PR head"
+          | not (T.null identityError) ->
+              NotReady $ prefix <> "reviewer identity could not be authenticated: " <> identityError
+          | T.null reviewerAgentId ->
+              NotReady $ prefix <> "authenticated reviewer identity is missing"
+          | otherwise -> Ready
 
 -- | Check Forgejo reviewer readiness from an already-fetched PR response.
 checkReviewerReadinessFromPR :: Int -> GH.GetPullRequestResponse -> Readiness

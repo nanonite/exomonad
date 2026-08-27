@@ -56,6 +56,34 @@ pub struct ForgejoPullRequestReview {
     pub stale: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgejoReviewVerdictKind {
+    Approved,
+    ChangesRequested,
+    Commented,
+}
+
+impl ForgejoReviewVerdictKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::ChangesRequested => "changes_requested",
+            Self::Commented => "commented",
+        }
+    }
+}
+
+pub fn normalize_review_verdict(state: &str) -> Option<ForgejoReviewVerdictKind> {
+    match state.trim().to_ascii_lowercase().as_str() {
+        "approved" | "approve" => Some(ForgejoReviewVerdictKind::Approved),
+        "changes_requested" | "request_changes" | "request_changes_requested" => {
+            Some(ForgejoReviewVerdictKind::ChangesRequested)
+        }
+        "comment" | "commented" | "forgejo/comment" => Some(ForgejoReviewVerdictKind::Commented),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgejoPullRequestReviewComment {
     pub body: String,
@@ -301,6 +329,21 @@ struct RunnerResponse {
 
 const PULL_REQUEST_PAGE_SIZE: usize = 50;
 const FORGEJO_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_REVIEW_BODY_BYTES: usize = 16 * 1024;
+const REVIEW_BODY_TRUNCATION_SUFFIX: &str = "\n[review body truncated]";
+
+fn bounded_review_body(body: String) -> String {
+    if body.len() <= MAX_REVIEW_BODY_BYTES {
+        return body;
+    }
+
+    let content_limit = MAX_REVIEW_BODY_BYTES.saturating_sub(REVIEW_BODY_TRUNCATION_SUFFIX.len());
+    let mut end = body.len().min(content_limit);
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &body[..end], REVIEW_BODY_TRUNCATION_SUFFIX)
+}
 
 impl ForgejoClient {
     pub fn new(forgejo_url: &str, forgejo_token: &str) -> Result<Arc<Self>> {
@@ -857,7 +900,7 @@ impl HttpForgejoClient {
             .map(|review| ForgejoPullRequestReview {
                 id: review.id,
                 state: review.state,
-                body: review.body,
+                body: bounded_review_body(review.body),
                 commit_id: review.commit_id,
                 author_login: review.user.and_then(|user| user.login.or(user.username)),
                 dismissed: review.dismissed,
@@ -1404,7 +1447,7 @@ impl FjForgejoClient {
             .map(|review| ForgejoPullRequestReview {
                 id: review.id,
                 state: review.state,
-                body: review.body,
+                body: bounded_review_body(review.body),
                 commit_id: review.commit_id,
                 author_login: review.user.and_then(|user| user.login.or(user.username)),
                 dismissed: review.dismissed,
@@ -1899,6 +1942,42 @@ mod tests {
 
         assert_eq!(client.git_auth_token(), None);
     }
+
+    #[test]
+    fn review_verdict_normalization_is_shared_and_case_insensitive() {
+        assert_eq!(
+            normalize_review_verdict(" APPROVE "),
+            Some(ForgejoReviewVerdictKind::Approved)
+        );
+        assert_eq!(
+            normalize_review_verdict("request_changes_requested"),
+            Some(ForgejoReviewVerdictKind::ChangesRequested)
+        );
+        assert_eq!(
+            normalize_review_verdict("Forgejo/COMMENT"),
+            Some(ForgejoReviewVerdictKind::Commented)
+        );
+        assert_eq!(normalize_review_verdict("dismissed"), None);
+    }
+
+    #[test]
+    fn review_body_is_bounded_to_defined_budget_without_splitting_utf8() {
+        let body = "é".repeat(MAX_REVIEW_BODY_BYTES);
+
+        let bounded = bounded_review_body(body);
+
+        assert!(bounded.len() <= MAX_REVIEW_BODY_BYTES);
+        assert!(bounded.ends_with(REVIEW_BODY_TRUNCATION_SUFFIX));
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn review_body_under_budget_is_unchanged() {
+        assert_eq!(
+            bounded_review_body("short review".to_string()),
+            "short review"
+        );
+    }
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2198,6 +2277,35 @@ mod tests {
         assert_eq!(reviews[0].state, "APPROVED");
         assert!(reviews[0].dismissed);
         assert!(!reviews[0].stale);
+    }
+
+    #[tokio::test]
+    async fn list_reviews_enforces_the_review_body_budget() {
+        let (client, server) = client().await;
+        let oversized_body = "é".repeat(MAX_REVIEW_BODY_BYTES);
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/pulls/43/reviews"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": 403,
+                    "state": "CHANGES_REQUESTED",
+                    "body": oversized_body,
+                    "commit_id": "head-a",
+                    "user": {"login": "exomonad-reviewer"}
+                }
+            ])))
+            .mount(&server)
+            .await;
+
+        let reviews = client
+            .list_pull_request_reviews(&owner(), &repo(), PRNumber::new(43))
+            .await
+            .unwrap();
+
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews[0].body.len() <= MAX_REVIEW_BODY_BYTES);
+        assert!(reviews[0].body.ends_with(REVIEW_BODY_TRUNCATION_SUFFIX));
     }
 
     #[tokio::test]

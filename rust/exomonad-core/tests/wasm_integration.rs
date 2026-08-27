@@ -560,6 +560,7 @@ impl EffectHandler for MockAgentHandler {
                 } else {
                     "abc123"
                 };
+                let has_authenticated_review = req.pr_number == 42;
                 Ok(WatcherPrStateResponse {
                     success: true,
                     error: String::new(),
@@ -581,10 +582,22 @@ impl EffectHandler for MockAgentHandler {
                     publication_ownership_verified: true,
                     publication_ownership_error: String::new(),
                     publication: None,
-                    review_id: 0,
-                    review_verdict: String::new(),
-                    review_head_sha: String::new(),
-                    reviewer_agent_id: String::new(),
+                    review_id: if has_authenticated_review { 403 } else { 0 },
+                    review_verdict: if has_authenticated_review {
+                        "approved".into()
+                    } else {
+                        String::new()
+                    },
+                    review_head_sha: if has_authenticated_review {
+                        head_sha.into()
+                    } else {
+                        String::new()
+                    },
+                    reviewer_agent_id: if has_authenticated_review {
+                        "review-pr-42-codex".into()
+                    } else {
+                        String::new()
+                    },
                     reviewer_identity_error: String::new(),
                     review_body: String::new(),
                 }
