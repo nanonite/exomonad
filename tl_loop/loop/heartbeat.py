@@ -38,6 +38,7 @@ from tl_loop.state.schema import (
     SliceStatus,
 )
 from tl_loop.state.serialization import dumps as dumps_json
+from tl_loop.state.slice_transition import HeadChanged, slice_transition
 from tl_loop.state.store import RunStore
 
 JsonMapping: TypeAlias = Mapping[str, object]
@@ -826,9 +827,7 @@ def _reconcile_pr(
     payload = _as_watcher_observation(payload)
     head_sha = payload.head_sha
     if head_sha and head_sha != slice_state.reviewed_head:
-        return replace(
-            slice_state, reviewed_head=head_sha, verdict=None, verdict_at=None
-        ), "pr.updated"
+        return slice_transition(slice_state, HeadChanged(head_sha)), "pr.updated"
     return slice_state, "pr.review"
 
 

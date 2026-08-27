@@ -14,6 +14,7 @@ from tl_loop.state.schema import (
     WaitReason,
     _patterns_overlap,
 )
+from tl_loop.state.slice_transition import SliceStatusChanged, slice_transition
 
 SliceCollection: TypeAlias = Mapping[str, SliceState] | Iterable[SliceState]
 _LIVE_STATUSES = frozenset({SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING})
@@ -125,8 +126,7 @@ def suspend_dependents(
                 or candidate.status is not SliceStatus.PENDING
             ):
                 updated[candidate.id] = replace(
-                    candidate,
-                    status=SliceStatus.PENDING,
+                    slice_transition(candidate, SliceStatusChanged(SliceStatus.PENDING)),
                     suspended_dependency=suspension,
                 )
             next_frontier.add(candidate.id)
@@ -153,8 +153,7 @@ def restore_dependents(
         ):
             continue
         updated[candidate.id] = replace(
-            candidate,
-            status=suspension.prior_status,
+            slice_transition(candidate, SliceStatusChanged(suspension.prior_status)),
             suspended_dependency=None,
         )
     return updated
@@ -176,8 +175,7 @@ def propagate_abandonment(
         ):
             continue
         updated[candidate.id] = replace(
-            candidate,
-            status=SliceStatus.BLOCKED,
+            slice_transition(candidate, SliceStatusChanged(SliceStatus.BLOCKED)),
             blocked_by=blocker_id,
             suspended_dependency=None,
         )

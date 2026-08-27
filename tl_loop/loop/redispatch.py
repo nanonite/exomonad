@@ -17,6 +17,7 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.state.schema import ParkCause, RunState, SliceStatus
+from tl_loop.state.slice_transition import RedispatchRequested, slice_transition
 from tl_loop.state.store import RunStore
 
 DEFAULT_ABANDONMENT_RETRY_CEILING = 3
@@ -83,18 +84,10 @@ def redispatch_slice(
         raise RedispatchError(f"slice {slice_id!r} is absent from the supplied plan specification")
     runtime_name = _runtime_name(slice_id, current.attempts + 1)
     reset = replace(
-        current,
-        status=SliceStatus.PENDING,
+        slice_transition(current, RedispatchRequested()),
         park_cause=None,
         park_issue_id=None,
         pr_number=None,
-        reviewed_head=None,
-        verdict=None,
-        verdict_at=None,
-        review_findings={},
-        review_patch_digests={},
-        ci_state={},
-        reviewer_attempt={},
         branch=None,
         worktree=None,
         agent_type=getattr(task, "agent_type", None),

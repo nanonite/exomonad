@@ -20,6 +20,7 @@ from tl_loop.select.ledger import LedgerInput
 from tl_loop.state.schema import BudgetLedger, ParkCause, SliceState, SliceStatus
 from tl_loop.state.serialization import dumps as dumps_json
 from tl_loop.state.serialization import to_jsonable
+from tl_loop.state.slice_transition import SliceStatusChanged, slice_transition
 from tl_loop.state.store import RunStore
 from tl_loop.state.write import apply
 
@@ -127,8 +128,7 @@ def park(
     parked_audit = _build_audit(slice, ledger, audit)
     if store is None:
         return replace(
-            slice,
-            status=SliceStatus.PARKED,
+            slice_transition(slice, SliceStatusChanged(SliceStatus.PARKED)),
             park_cause=parsed_cause,
             park_issue_id=None,
             park_audit=parked_audit,

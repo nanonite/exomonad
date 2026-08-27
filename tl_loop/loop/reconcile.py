@@ -19,6 +19,11 @@ from tl_loop.state.schema import (
     SliceStatus,
     Verdict,
 )
+from tl_loop.state.slice_transition import (
+    HeadEvidenceObserved,
+    MergeCompleted,
+    slice_transition,
+)
 
 
 @dataclass(frozen=True)
@@ -67,12 +72,8 @@ def reconcile_merge_observation(
         }
         if state.status is SliceStatus.MERGED and state.reconciliation == reconciliation:
             return state
-        return replace(
-            state,
-            status=SliceStatus.MERGED,
-            action=None,
-            reconciliation=reconciliation,
-        )
+        transitioned = slice_transition(state, MergeCompleted(watcher.pr_number or 0))
+        return replace(transitioned, reconciliation=reconciliation)
     if state.status is not SliceStatus.IN_REVIEW:
         return state
     if state.reviewed_head != head_sha:
@@ -537,32 +538,24 @@ def _apply_head_evidence(slice_state: SliceState, observation: Mapping[str, obje
     if not isinstance(head_sha, str) or not head_sha:
         return slice_state
     ci_status = observation.get("ci_status")
-    ci_state = dict(slice_state.ci_state)
-    if isinstance(ci_status, str) and ci_status:
-        ci_state[head_sha] = ci_status
     findings = observation.get("review_findings")
-    review_findings = dict(slice_state.review_findings)
+    review_findings: tuple[dict[str, str], ...] = ()
     if isinstance(findings, list):
-        review_findings[head_sha] = tuple(
-            dict(item) for item in findings if isinstance(item, Mapping)
-        )
+        review_findings = tuple(dict(item) for item in findings if isinstance(item, Mapping))
     current_head = slice_state.reviewed_head
-    if current_head is not None and head_sha != current_head:
-        return replace(
-            slice_state,
-            review_findings=review_findings,
-            ci_state=ci_state,
-        )
-    return replace(
+    transitioned = slice_transition(
         slice_state,
-        pr_number=(
-            cast(int, observation["pr_number"])
-            if type(observation.get("pr_number")) is int
-            else slice_state.pr_number
+        HeadEvidenceObserved(
+            head_sha=head_sha,
+            ci_status=ci_status if isinstance(ci_status, str) and ci_status else None,
+            review_findings=review_findings,
+            bind_reviewed_head=current_head is None or current_head == head_sha,
         ),
-        reviewed_head=head_sha,
-        review_findings=review_findings,
-        ci_state=ci_state,
+    )
+    pr_number = observation.get("pr_number")
+    return replace(
+        transitioned,
+        pr_number=pr_number if type(pr_number) is int else transitioned.pr_number,
     )
 
 

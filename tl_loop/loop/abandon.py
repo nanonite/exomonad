@@ -11,6 +11,7 @@ from tl_loop.events.reader import LedgerReader
 from tl_loop.loop.driver import _invoke
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.state.schema import ParkCause, SliceState, SliceStatus
+from tl_loop.state.slice_transition import SliceStatusChanged, slice_transition
 from tl_loop.state.store import RunStore
 
 ABANDONABLE_STATUSES = frozenset(
@@ -95,8 +96,7 @@ def abandon_slice(
     ):
         return {"status": "already_abandoned", "slice_id": slice_id, "attempt": current.attempts}
     parked = replace(
-        latest_slice,
-        status=SliceStatus.PARKED,
+        slice_transition(latest_slice, SliceStatusChanged(SliceStatus.PARKED)),
         park_cause=ParkCause.ATTEMPT_ABANDONED,
         park_issue_id=None,
         park_audit={

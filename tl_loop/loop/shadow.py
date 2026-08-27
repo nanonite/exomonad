@@ -43,6 +43,12 @@ from tl_loop.fsm.transition import IllegalTransition, transition
 from tl_loop.loop.escalate import blocked_gate_name
 from tl_loop.loop.schedule import propagate_abandonment, restore_dependents, suspend_dependents
 from tl_loop.state.schema import GateStatus, RunState, SliceState, SliceStatus
+from tl_loop.state.slice_transition import (
+    HeadChanged,
+    MergeCompleted,
+    SliceStatusChanged,
+    slice_transition,
+)
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 DEFAULT_SHADOW_ROOT = DEFAULT_ROOT / "shadow"
@@ -337,8 +343,7 @@ class ShadowLoop:
                 current = slices.get(fsm_event.handle.slug)
                 if current is not None:
                     slices[fsm_event.handle.slug] = replace(
-                        current,
-                        status=SliceStatus.SPAWNED,
+                        slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED)),
                         park_cause=None,
                         dispatch_last_boundary="agent.spawned",
                         dispatch_agent_id=event.agent_id or fsm_event.handle.slug,
@@ -424,18 +429,14 @@ def _update_slices(
                 updated = restore_dependents(updated, target_id, recovery_generation)
             return updated
         updated[target_id] = replace(
-            current,
-            status=SliceStatus.IN_REVIEW,
+            slice_transition(
+                slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW)),
+                HeadChanged(event.head_sha),
+            ),
             pr_number=event.pr_number,
-            reviewed_head=event.head_sha,
             publication=None,
             handoff=None,
             review_findings={},
-            ci_state={},
-            reviewer_attempt={},
-            verdict=None,
-            verdict_at=None,
-            stall_classification=None,
             recovery=None,
         )
         if recovery_generation is not None:
@@ -464,15 +465,14 @@ def _update_slices(
             )
         else:
             updated[handle.slug] = replace(
-                current,
-                status=SliceStatus.SPAWNED,
+                slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED)),
                 agent_type=handle.agent_type,
                 branch=handle.branch,
             )
     elif isinstance(event, PRMerged):
         current = updated.get(event.slug)
         if current is not None:
-            updated[event.slug] = replace(current, status=SliceStatus.MERGED)
+            updated[event.slug] = slice_transition(current, MergeCompleted(current.pr_number or 0))
     elif isinstance(event, ChildFailed):
         current = updated.get(event.slug)
         if current is not None:
@@ -480,7 +480,9 @@ def _update_slices(
                 updated = propagate_abandonment(
                     updated, event.slug, current.recovery.recovery_round
                 )
-            updated[event.slug] = replace(current, status=SliceStatus.FAILED)
+            updated[event.slug] = slice_transition(
+                current, SliceStatusChanged(SliceStatus.FAILED)
+            )
     elif isinstance(event, ChildBlocked):
         current = updated.get(event.slug)
         if current is not None:

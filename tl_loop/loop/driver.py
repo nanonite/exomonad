@@ -116,6 +116,22 @@ from tl_loop.state.schema import (
     Verdict,
 )
 from tl_loop.state.serialization import DurableWriteError
+from tl_loop.state.slice_transition import (
+    ActionChanged,
+    CIStatusObserved,
+    HeadChanged,
+    HeadEvidenceObserved,
+    MergeCompleted,
+    RepairQueued,
+    ReviewDiscarded,
+    ReviewerDispatched,
+    ReviewerIdentityObserved,
+    ReviewRoundsExhausted,
+    ReviewVerdictObserved,
+    SliceStatusChanged,
+    StallClassificationObserved,
+    slice_transition,
+)
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
 from .journal import MUTATING_OPERATIONS, EffectJournal, stable_action_key
@@ -1474,12 +1490,11 @@ def _park_review_rounds_exhausted(
             audit=audit,
         )
     else:
+        parked = slice_transition(target, ReviewRoundsExhausted())
         parked = replace(
-            target,
-            status=SliceStatus.PARKED,
+            parked,
             park_cause=ParkCause.REVIEW_ROUNDS_EXHAUSTED,
             park_audit=audit,
-            action=None,
         )
         store.checkpoint(
             state.fsm,
@@ -1535,13 +1550,10 @@ def _apply_internal_transition(
         )
         if target is None:
             return state
+        updated = slice_transition(target, HeadChanged(None))
+        updated = slice_transition(updated, SliceStatusChanged(SliceStatus.IN_REVIEW))
         updated = replace(
-            target,
-            status=SliceStatus.IN_REVIEW,
-            reviewed_head=None,
-            verdict=None,
-            verdict_at=None,
-            action=None,
+            updated,
             dispatch_last_boundary="restart_head_reset",
             dispatch_error=None,
         )
@@ -1549,11 +1561,9 @@ def _apply_internal_transition(
         target = next((current for current in candidates if _slice_has_conflict(current)), None)
         if target is None:
             return state
+        updated = slice_transition(target, RepairQueued())
         updated = replace(
-            target,
-            status=SliceStatus.REPAIRING,
-            verdict=Verdict.NO_GO,
-            action=None,
+            updated,
             dispatch_last_boundary="restart_repair_queued",
             dispatch_error=None,
         )
@@ -1642,20 +1652,27 @@ def _execute_direct_reviewer_intent(
         reviewer_attempt={**current.reviewer_attempt, head_sha: 1},
         review_contract=contract.as_mapping(),
     )
-    action = ActionState(
-        ActionKind.REVIEWER_SPAWN,
-        ActionPhase.IN_FLIGHT,
-        intent_id=stable_action_key(state.run_id, "spawn_reviewer", current.id, review_arguments),
-        head_sha=head_sha,
-        attempt=max(1, current.attempts),
-        contract_digest=contract.digest,
+    action_intent_id = stable_action_key(
+        state.run_id, "spawn_reviewer", current.id, review_arguments
     )
+    claimed = slice_transition(
+        claimed,
+        ReviewerDispatched(
+            intent_id=action_intent_id,
+            head_sha=head_sha,
+            attempt=max(1, current.attempts),
+            contract_digest=contract.digest,
+        ),
+    )
+    action = claimed.action
+    if action is None:
+        raise TLLoopError(f"reviewer dispatch did not create an action for {current.id!r}")
     state = _checkpoint_slice_action(
         store,
         state,
         current.id,
         action,
-        slice_state=replace(claimed, action=action),
+        slice_state=claimed,
     )
     current = state.slices[current.id]
     _record_convergence_event(
@@ -1718,12 +1735,15 @@ def _execute_direct_reviewer_intent(
     )
     refreshed = store.load()
     latest = refreshed.slices[current.id]
-    updated = replace(
+    updated = slice_transition(
         latest,
-        reviewer_agent_id=reviewer_name
-        if isinstance(reviewer_name, str)
-        else latest.reviewer_agent_id,
-        action=replace(action, phase=ActionPhase.CONFIRMED),
+        ReviewerIdentityObserved(
+            reviewer_name if isinstance(reviewer_name, str) else latest.reviewer_agent_id
+        ),
+    )
+    updated = slice_transition(
+        updated,
+        ActionChanged(replace(action, phase=ActionPhase.CONFIRMED)),
     )
     return _checkpoint_slice_action(
         store, refreshed, current.id, updated.action, slice_state=updated
@@ -1861,8 +1881,7 @@ def _execute_direct_merge_intent(
             current.id,
             None,
             slice_state=replace(
-                refreshed.slices[current.id],
-                status=SliceStatus.MERGED,
+                slice_transition(refreshed.slices[current.id], MergeCompleted(current.pr_number or 0)),
                 dispatch_last_boundary="direct_merge_adopted",
                 dispatch_error=None,
             ),
@@ -2015,8 +2034,7 @@ def _reconcile_unknown_merge(
             current.id,
             None,
             slice_state=replace(
-                refreshed.slices[current.id],
-                status=SliceStatus.MERGED,
+                slice_transition(refreshed.slices[current.id], MergeCompleted(current.pr_number or 0)),
                 dispatch_last_boundary="direct_merge_reconciled",
             ),
         )
@@ -2138,8 +2156,10 @@ def _adopt_direct_merge_result(
                 slice_id,
                 None,
                 slice_state=replace(
-                    recovered.slices[slice_id],
-                    action=replace(action, phase=ActionPhase.CONFIRMED),
+                    slice_transition(
+                        recovered.slices[slice_id],
+                        ActionChanged(replace(action, phase=ActionPhase.CONFIRMED)),
+                    ),
                     dispatch_error=bookkeeping_error,
                 ),
             )
@@ -2150,8 +2170,7 @@ def _adopt_direct_merge_result(
             slice_id,
             None,
             slice_state=replace(
-                refreshed.slices[slice_id],
-                status=SliceStatus.MERGED,
+                slice_transition(refreshed.slices[slice_id], MergeCompleted(current.pr_number or 0)),
                 dispatch_last_boundary="direct_merge_confirmed",
             ),
         )
@@ -2174,7 +2193,7 @@ def _checkpoint_slice_action(
     """Persist one direct action phase without changing unrelated run state."""
     current = slice_state or state.slices[slice_id]
     if slice_state is None:
-        current = replace(current, action=action)
+        current = slice_transition(current, ActionChanged(action))
     return store.checkpoint(
         state.fsm,
         {**state.slices, slice_id: current},
@@ -2420,9 +2439,9 @@ def _record_dispatch_result(
         )
     boundary = "spawn_request_accepted" if result is not None else "spawn_not_executed"
     current = state.slices[slice_id]
+    updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED))
     updated = replace(
-        current,
-        status=SliceStatus.DISPATCH_UNCONFIRMED,
+        updated,
         park_cause=ParkCause.DISPATCH_UNCONFIRMED,
         dispatch_last_boundary=boundary,
         dispatch_agent_id=_spawn_agent_id(result),
@@ -2459,9 +2478,9 @@ def _record_dispatch_failure(
 ) -> RunState:
     bounded_reason = reason[:500]
     current = state.slices[slice_id]
+    updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCH_FAILED))
     updated = replace(
-        current,
-        status=SliceStatus.DISPATCH_FAILED,
+        updated,
         park_cause=ParkCause.DISPATCH_FAILED,
         dispatch_last_boundary="spawn_request_failed",
         dispatch_error=bounded_reason,
@@ -2670,11 +2689,13 @@ def _reconcile_pending_merge_entry(
             {
                 **state.slices,
                 target: replace(
-                    current,
-                    action=(
-                        replace(current.action, phase=ActionPhase.CONFIRMED)
-                        if current.action is not None
-                        else None
+                    slice_transition(
+                        current,
+                        ActionChanged(
+                            replace(current.action, phase=ActionPhase.CONFIRMED)
+                            if current.action is not None
+                            else None
+                        ),
                     ),
                     dispatch_error=bookkeeping_error,
                 ),
@@ -2691,9 +2712,7 @@ def _reconcile_pending_merge_entry(
         {
             **state.slices,
             target: replace(
-                current,
-                status=SliceStatus.MERGED,
-                action=None,
+                slice_transition(current, MergeCompleted(pr_number)),
                 dispatch_last_boundary="restart_merge_reconciled",
             ),
         },
@@ -2889,8 +2908,7 @@ def _reconcile_dispatches(
                 adopted_slices = {
                     **state.slices,
                     current.id: replace(
-                        current,
-                        status=SliceStatus.SPAWNED,
+                        slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED)),
                         park_cause=None,
                         dispatch_last_boundary="owner_adopted",
                         dispatch_error=None,
@@ -2911,8 +2929,9 @@ def _reconcile_dispatches(
                 {
                     **state.slices,
                     current.id: replace(
-                        current,
-                        status=SliceStatus.DISPATCH_UNCONFIRMED,
+                        slice_transition(
+                            current, SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED)
+                        ),
                         park_cause=ParkCause.DISPATCH_UNCONFIRMED,
                         dispatch_last_boundary="reconciliation_started",
                     ),
@@ -3289,6 +3308,7 @@ def _apply_reconciliation_observations(
 ) -> SliceState:
     watcher = _as_watcher_observation(watcher)
     updates: dict[str, object] = {"reconciliation": result.as_state()}
+    transitioned = current
     if result.conflicts:
         return replace(current, **updates)
 
@@ -3300,9 +3320,14 @@ def _apply_reconciliation_observations(
         head_sha = watcher.head_sha
         ci_status = watcher.ci_status
         if head_sha and ci_status in CI_STATUS_VALUES:
-            ci_state = dict(current.ci_state)
-            ci_state[head_sha] = ci_status
-            updates["ci_state"] = ci_state
+            transitioned = slice_transition(
+                transitioned,
+                HeadEvidenceObserved(
+                    head_sha=head_sha,
+                    ci_status=ci_status,
+                    bind_reviewed_head=transitioned.reviewed_head in {None, head_sha},
+                ),
+            )
         publication = _publication_from_watcher(current, watcher, head_sha, owner_id)
         if publication is not None:
             updates["publication"] = publication
@@ -3338,7 +3363,9 @@ def _apply_reconciliation_observations(
                 observed_at=_now_timestamp(),
             )
             if current.status is SliceStatus.SPAWNED:
-                updates["status"] = SliceStatus.IN_REVIEW
+                transitioned = slice_transition(
+                    transitioned, SliceStatusChanged(SliceStatus.IN_REVIEW)
+                )
         elif watcher.publication_ownership_verified is True:
             missing = [
                 name
@@ -3365,10 +3392,12 @@ def _apply_reconciliation_observations(
                 or "host publication identity unavailable",
             )
         if watcher.merged is True:
-            updates["status"] = SliceStatus.MERGED
+            transitioned = slice_transition(
+                transitioned, MergeCompleted(watcher.pr_number or 0)
+            )
     if owner_id is not None and current.dispatch_agent_id is None:
         updates["dispatch_agent_id"] = owner_id
-    return replace(current, **updates)
+    return replace(transitioned, **updates)
 
 
 def _publication_from_watcher(
@@ -3554,8 +3583,7 @@ def _confirm_dispatch_event(
     return {
         **updated_slices,
         slice_id: replace(
-            current,
-            status=SliceStatus.SPAWNED,
+            slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED)),
             park_cause=None,
             dispatch_last_boundary="agent.spawned",
             dispatch_error=None,
@@ -4148,7 +4176,8 @@ def _prepare_sub_tl_stage(
         if config.depth >= config.max_depth:
             before_phase = _phase_from_state(state)
             parked = replace(
-                current, status=SliceStatus.PARKED, park_cause=ParkCause.SCHEDULE_DEADLOCK
+                slice_transition(current, SliceStatusChanged(SliceStatus.PARKED)),
+                park_cause=ParkCause.SCHEDULE_DEADLOCK,
             )
             failed_slices = {**state.slices, task.name: parked}
             state = store.checkpoint(
@@ -4210,8 +4239,7 @@ def _prepare_sub_tl_stage(
             if authoritative_seq is None:
                 authoritative_seq = state.events.last_consumed_offset
             updated_slices[task.name] = replace(
-                current,
-                status=SliceStatus.SPAWNED,
+                slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED)),
                 base_ref=config.branch,
                 branch=branch,
                 worktree=worktree,
@@ -4423,7 +4451,9 @@ def _complete_sub_tl_batch(
     for task, phase, child_state in outcomes:
         if phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
             current = updated_slices[task.name]
-            updated_slices[task.name] = replace(current, status=SliceStatus.SPAWNED)
+            updated_slices[task.name] = slice_transition(
+                current, SliceStatusChanged(SliceStatus.SPAWNED)
+            )
             projection = _child_recovery_projection(child_state, state.run_id)
             if projection is not None:
                 lifecycle, summary = projection
@@ -4466,11 +4496,19 @@ def _complete_sub_tl_batch(
                         )
                     )
                 )
+                current = slice_transition(
+                    current, SliceStatusChanged(SliceStatus.IN_REVIEW)
+                )
+                current = slice_transition(
+                    current,
+                    HeadEvidenceObserved(
+                        head_sha=candidate.head_sha,
+                        bind_reviewed_head=True,
+                    ),
+                )
                 current = replace(
                     current,
-                    status=SliceStatus.IN_REVIEW,
                     pr_number=candidate.pr_number,
-                    reviewed_head=candidate.head_sha,
                     dispatch_agent_id=owner_id,
                     dispatch_last_boundary="aggregate_pr_open",
                 )
@@ -4492,7 +4530,9 @@ def _complete_sub_tl_batch(
                     head_sha=candidate.head_sha,
                     patch_digest=candidate.patch_digest,
                 )
-        updated_slices[task.name] = replace(current, status=status)
+        updated_slices[task.name] = slice_transition(
+            current, SliceStatusChanged(status)
+        )
         sub_tl_states[task.name] = lifecycle
         candidate_records[task.name] = IntegrationCandidateState(
             lifecycle=candidate_runtime.lifecycle,
@@ -4768,12 +4808,12 @@ def _open_integration_gate(
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[task.name] = lifecycle
     candidate_runtime = _candidate_runtime(state.integration, task.name)
+    updated = slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW))
+    updated = slice_transition(updated, ActionChanged(None))
     updated = replace(
-        current,
-        status=SliceStatus.IN_REVIEW,
+        updated,
         dispatch_last_boundary="integration_gate",
         dispatch_error=reason[:500],
-        action=None,
     )
     previous = next((gate for gate in state.gates if gate.name == gate_name), None)
     candidate_runtime = replace(
@@ -4873,10 +4913,9 @@ def _handle_external_base_change(
         config,
         store,
         slice_update=replace(
-            current,
+            slice_transition(current, ActionChanged(None)),
             dispatch_last_boundary="base_revalidation",
             dispatch_error=reason[:500],
-            action=None,
         ),
     )
 
@@ -4926,10 +4965,9 @@ def _handle_integration_revalidation(
         config,
         store,
         slice_update=replace(
-            current,
+            slice_transition(current, ActionChanged(None)),
             dispatch_last_boundary="integration_revalidation",
             dispatch_error=reason[:500],
-            action=None,
         ),
     )
 
@@ -4975,14 +5013,11 @@ def _handle_integration_conflict(
         stage_verification="failed",
         merge_attempts=candidate_runtime.merge_attempts + 1,
     )
+    conflicted = slice_transition(current, RepairQueued())
     conflicted = replace(
-        current,
-        status=SliceStatus.REPAIRING,
-        verdict=Verdict.NO_GO,
-        ci_state={},
+        conflicted,
         dispatch_last_boundary="integration_conflict",
         dispatch_error=reason[:500],
-        action=None,
     )
     state = store.checkpoint(
         _phase_from_state(state),
@@ -5262,16 +5297,14 @@ def _integrate_one_candidate(
         "base_sha": base_sha,
     }
     merge_intent_id = stable_action_key(state.run_id, "merge_pr", task.name, merge_arguments)
-    merge_slice = replace(
-        current,
-        action=ActionState(
-            ActionKind.MERGE,
-            ActionPhase.IN_FLIGHT,
-            intent_id=merge_intent_id,
-            head_sha=head_sha,
-            attempt=max(1, current.attempts),
-        ),
+    merge_action = ActionState(
+        ActionKind.MERGE,
+        ActionPhase.IN_FLIGHT,
+        intent_id=merge_intent_id,
+        head_sha=head_sha,
+        attempt=max(1, current.attempts),
     )
+    merge_slice = slice_transition(current, ActionChanged(merge_action))
     state = store.checkpoint(
         _phase_from_state(state),
         {**state.slices, task.name: merge_slice},
@@ -5355,10 +5388,8 @@ def _checkpoint_aggregate_merged(
     current = state.slices[task.name]
     updated_slices = dict(state.slices)
     updated_slices[task.name] = replace(
-        current,
-        status=SliceStatus.MERGED,
+        slice_transition(current, MergeCompleted(current.pr_number or 0)),
         dispatch_last_boundary="aggregate_merged",
-        action=None,
     )
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[task.name] = IntegrationLifecycle.MERGED
@@ -5828,9 +5859,9 @@ def _prepare_spawn(
         current = state.slices.get(name)
         if current is None:
             raise TLLoopError(f"dispatch slice {name!r} is missing from run state")
+        updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCHING))
         updated = replace(
-            current,
-            status=SliceStatus.DISPATCHING,
+            updated,
             attempts=current.attempts + 1,
             dispatch_intent_id=intent.intent_id,
             dispatch_started_at=intent.started_at,
@@ -5911,18 +5942,25 @@ def _prepare_spawn(
         raw_slice = slices.get(name)
         if not isinstance(raw_slice, dict):
             raise TLLoopError(f"selector slice {name!r} is not an object")
-        raw_slice["status"] = SliceStatus.DISPATCHING.value
-        raw_slice["agent_type"] = route.agent_type
-        raw_slice["model"] = model_id
-        raw_slice["attempts"] = slice_state.attempts + 1
-        raw_slice["dispatch_intent_id"] = intent.intent_id
-        raw_slice["dispatch_started_at"] = intent.started_at
-        raw_slice["dispatch_last_boundary"] = "dispatch_intended"
-        raw_slice["dispatch_error"] = None
-        raw_slice["dispatch_agent_id"] = None
-        raw_slice["dispatch_invocation_id"] = None
-        raw_slice["dispatch_authoritative_event_seq"] = None
-        raw_slice["park_cause"] = None
+        dispatched = slice_transition(
+            slice_state, SliceStatusChanged(SliceStatus.DISPATCHING)
+        )
+        raw_slice.update(
+            {
+                "status": dispatched.status.value,
+                "agent_type": route.agent_type,
+                "model": model_id,
+                "attempts": slice_state.attempts + 1,
+                "dispatch_intent_id": intent.intent_id,
+                "dispatch_started_at": intent.started_at,
+                "dispatch_last_boundary": "dispatch_intended",
+                "dispatch_error": None,
+                "dispatch_agent_id": None,
+                "dispatch_invocation_id": None,
+                "dispatch_authoritative_event_seq": None,
+                "park_cause": None,
+            }
+        )
         return document
 
     apply_spawn_and_charge(store.run_dir, choice, slice_state, record_spawn)
@@ -6051,16 +6089,10 @@ def _discard_review(slices: Mapping[str, SliceState], slice_id: str) -> dict[str
     current = slices.get(slice_id)
     if current is None:
         return dict(slices)
+    discarded = slice_transition(current, ReviewDiscarded())
     return {
         **slices,
-        slice_id: replace(
-            current,
-            status=SliceStatus.IN_REVIEW,
-            verdict=None,
-            reviewed_head=None,
-            verdict_at=None,
-            stall_classification=None,
-        ),
+        slice_id: discarded,
     }
 
 
@@ -6111,33 +6143,53 @@ def _record_review_event(
     if verdict is None:
         updated = dict(state.slices)
         updated[slice_id] = replace(
-            current,
+            slice_transition(
+                current,
+                StallClassificationObserved(
+                    stall_classification or current.stall_classification
+                ),
+            ),
             pr_number=event.pr_number or current.pr_number,
             review_findings=review_findings,
             review_patch_digests=patch_digests,
-            stall_classification=stall_classification or current.stall_classification,
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     updated = dict(state.slices)
-    updated[slice_id] = replace(
+    transitioned = slice_transition(
         current,
-        status=(
-            SliceStatus.IN_REVIEW
-            if current.status is SliceStatus.REPAIRING and _is_aggregate_slice(current)
-            else current.status
+        ReviewVerdictObserved(
+            head_sha=event.head_sha,
+            verdict=verdict,
+            reviewer_agent_id=current.reviewer_agent_id,
+            review_id=event.data.get("review_id")
+            if type(event.data.get("review_id")) is int
+            else None,
+            findings=tuple(findings or ()),
+            source="ledger",
+            pr_number=event.pr_number,
+            reviewer_account_authenticated=event.data.get(
+                "reviewer_account_authenticated"
+            ) is True,
+            reviewer_identity_unresolved=event.data.get("reviewer_identity_unresolved") is not False,
+            self_approval=(event.agent_id is not None and event.agent_id == current.dispatch_agent_id),
+            stall_classification=stall_classification or current.stall_classification,
+            requires_authenticated_evidence=False,
+            increment_round=not (
+                current.reviewed_head == event.head_sha and current.verdict is not None
+            ),
+            next_status=(
+                SliceStatus.IN_REVIEW
+                if current.status is SliceStatus.REPAIRING and _is_aggregate_slice(current)
+                else None
+            ),
         ),
+    )
+    updated[slice_id] = replace(
+        transitioned,
         pr_number=event.pr_number or current.pr_number,
-        reviewed_head=event.head_sha,
-        verdict=verdict,
         verdict_at=event.observed_at,
-        review_rounds=(
-            current.review_rounds
-            if current.reviewed_head == event.head_sha and current.verdict is not None
-            else current.review_rounds + 1
-        ),
         review_findings=review_findings,
         review_patch_digests=patch_digests,
-        stall_classification=stall_classification or current.stall_classification,
     )
     return store.checkpoint(phase, updated, state.budgets, event_seq)
 
@@ -6353,10 +6405,14 @@ def _route_review_event(
         )
         updated = dict(state.slices)
         updated[slice_id] = replace(
-            current,
+            slice_transition(
+                current,
+                StallClassificationObserved(
+                    stall_classification or current.stall_classification
+                ),
+            ),
             review_findings=review_findings,
             review_patch_digests=patch_digests,
-            stall_classification=stall_classification or current.stall_classification,
         )
         return store.checkpoint(phase, updated, state.budgets, event_seq)
     if (
@@ -6437,11 +6493,15 @@ def _route_review_event(
             )
             updated = dict(state.slices)
             updated[slice_id] = replace(
-                current,
+                slice_transition(
+                    current,
+                    StallClassificationObserved(
+                        stall_classification or current.stall_classification
+                    ),
+                ),
                 pr_number=event.pr_number or current.pr_number,
                 review_findings=review_findings,
                 review_patch_digests=patch_digests,
-                stall_classification=stall_classification or current.stall_classification,
             )
             return store.checkpoint(phase, updated, state.budgets, event_seq)
     review_findings = _persist_adjudication_nits(review_findings, head_sha, decision_reasons)
@@ -6460,18 +6520,40 @@ def _route_review_event(
         if authorized_exact_verdict and current.stall_classification == "reviewer_not_responding"
         else stall_classification or current.stall_classification
     )
-    updated[slice_id] = replace(
+    transitioned = slice_transition(
         current,
+        ReviewVerdictObserved(
+            head_sha=decision_head,
+            verdict=decision_verdict,
+            reviewer_agent_id=reviewer_agent_id,
+            review_id=event.data.get("review_id")
+            if type(event.data.get("review_id")) is int
+            else None,
+            findings=tuple(findings),
+            source=(
+                "watcher_snapshot"
+                if event.data.get("source") == "watcher_snapshot"
+                else "ledger"
+            ),
+            pr_number=event.pr_number,
+            reviewer_account_authenticated=event.data.get(
+                "reviewer_account_authenticated"
+            ) is True,
+            reviewer_identity_unresolved=event.data.get("reviewer_identity_unresolved") is not False,
+            self_approval=(
+                reviewer_agent_id is not None
+                and reviewer_agent_id == current.dispatch_agent_id
+            ),
+            stall_classification=next_stall_classification,
+            requires_authenticated_evidence=direct_reviewer_event,
+        ),
+    )
+    updated[slice_id] = replace(
+        transitioned,
         pr_number=event.pr_number or current.pr_number,
-        reviewed_head=decision_head,
-        verdict=decision_verdict,
         verdict_at=event.observed_at,
-        review_rounds=current.review_rounds + 1,
         review_findings=review_findings,
         review_patch_digests=patch_digests,
-        ci_state={} if current.reviewed_head != decision_head else current.ci_state,
-        reviewer_agent_id=reviewer_agent_id,
-        stall_classification=next_stall_classification,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     if _is_aggregate_slice(updated[slice_id]):
@@ -6607,16 +6689,18 @@ def _route_ci_event(
     if head_sha is None:
         raise TLLoopError(f"{event.event_type!r} has no head SHA")
     status = _ci_status(event)
-    ci_state = dict(current.ci_state)
-    ci_state[head_sha] = status
-    reviewed_head_matches = status == "failure" and current.reviewed_head == head_sha
     updated = dict(state.slices)
-    updated[slice_id] = replace(
+    transitioned = slice_transition(
         current,
+        CIStatusObserved(
+            head_sha=head_sha,
+            status=status,
+            observed_at=event.observed_at,
+        ),
+    )
+    updated[slice_id] = replace(
+        transitioned,
         pr_number=event.pr_number or current.pr_number,
-        ci_state=ci_state,
-        verdict=Verdict.NO_GO if reviewed_head_matches else current.verdict,
-        verdict_at=event.observed_at if reviewed_head_matches else current.verdict_at,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     should_repair = (
@@ -6693,9 +6777,11 @@ def _route_repair(
         head_sha=current.reviewed_head,
         attempt=max(1, current.attempts),
     )
+    repairing = slice_transition(current, RepairQueued())
+    repairing = slice_transition(repairing, ActionChanged(repair_action))
     state = store.checkpoint(
         phase,
-        {**state.slices, slice_id: replace(current, action=repair_action)},
+        {**state.slices, slice_id: repairing},
         state.budgets,
         event_seq,
         current_order=state.current_order,
@@ -6745,12 +6831,14 @@ def _route_repair(
             dispatch=dispatch_resume,
         )
     except (RepairError, ValueError) as error:
+        parked = slice_transition(
+            slice_transition(current, SliceStatusChanged(SliceStatus.PARKED)),
+            ActionChanged(None),
+        )
+        parked = slice_transition(parked, StallClassificationObserved("review_stuck"))
         parked = replace(
-            current,
-            status=SliceStatus.PARKED,
-            action=None,
+            parked,
             park_cause=ParkCause.REVIEW_STUCK,
-            stall_classification="review_stuck",
             dispatch_last_boundary="repair_exhausted",
             dispatch_error=str(error)[:500],
         )
@@ -6786,9 +6874,9 @@ def _route_repair(
         )
         return state
     refreshed = store.load()
-    resumed = replace(
+    resumed = slice_transition(
         refreshed.slices[slice_id],
-        action=replace(repair_action, phase=ActionPhase.CONFIRMED),
+        ActionChanged(replace(repair_action, phase=ActionPhase.CONFIRMED)),
     )
     return store.checkpoint(
         phase,
@@ -7363,7 +7451,8 @@ def _bind_publication_evidence(
             observed_at=envelope.observed_at,
         )
         if updated.handoff != handoff:
-            updated = replace(updated, handoff=handoff, status=SliceStatus.IN_REVIEW)
+            updated = slice_transition(updated, SliceStatusChanged(SliceStatus.IN_REVIEW))
+            updated = replace(updated, handoff=handoff)
     if updated == current:
         return dict(slices)
     return {**slices, target_id: updated}

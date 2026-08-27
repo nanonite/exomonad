@@ -12,6 +12,7 @@ from typing import Protocol, cast
 from tl_loop.client.effects import ToolResult
 from tl_loop.client.transport import JsonObject
 from tl_loop.state.schema import SliceStatus, Verdict
+from tl_loop.state.slice_transition import SliceStatusChanged, slice_transition
 from tl_loop.state.store import RunStore
 
 from .call import MAX_ATTEMPTS
@@ -204,8 +205,7 @@ def _increment_store(
         raise RepairInputError(f"repair attempts reference unknown slice {target_id!r}")
     updated = dict(state.slices)
     updated[target_id] = replace(
-        current,
-        status=SliceStatus.REPAIRING,
+        slice_transition(current, SliceStatusChanged(SliceStatus.REPAIRING)),
         repair_attempts=current.repair_attempts + 1,
         attempts=current.attempts + 1,
     )
