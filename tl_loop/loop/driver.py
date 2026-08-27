@@ -1827,6 +1827,34 @@ def _execute_direct_merge_intent(
         and _watcher_result_observation(watcher).merged is True
     ):
         refreshed = store.load()
+        bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
+            current.id,
+            current.pr_number,
+            config.chainlink_issue_id,
+            config,
+            store,
+            effects,
+            effects_log,
+        )
+        if not bookkeeping_ok:
+            recovered = _ensure_merge_bookkeeping_gate(
+                refreshed,
+                store,
+                effects_log,
+                current.id,
+                current.pr_number,
+                config.chainlink_issue_id,
+            )
+            return _checkpoint_slice_action(
+                store,
+                recovered,
+                current.id,
+                recovered.slices[current.id].action,
+                slice_state=replace(
+                    recovered.slices[current.id],
+                    dispatch_error=bookkeeping_error,
+                ),
+            )
         return _checkpoint_slice_action(
             store,
             refreshed,
@@ -1836,6 +1864,7 @@ def _execute_direct_merge_intent(
                 refreshed.slices[current.id],
                 status=SliceStatus.MERGED,
                 dispatch_last_boundary="direct_merge_adopted",
+                dispatch_error=None,
             ),
         )
     if (
@@ -1878,6 +1907,8 @@ def _execute_direct_merge_intent(
         "expected_patch_digest": evidence["patch_digest"],
         "expected_merge_tree_sha": evidence["merge_tree_sha"],
     }
+    if config.chainlink_issue_id is not None:
+        arguments["chainlink_issue_id"] = config.chainlink_issue_id
     action = ActionState(
         ActionKind.MERGE,
         ActionPhase.IN_FLIGHT,
@@ -2082,6 +2113,36 @@ def _adopt_direct_merge_result(
         and (_watcher_result_observation(watcher) is not None)
         and _watcher_result_observation(watcher).merged is True
     ):
+        bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
+            slice_id,
+            current.pr_number,
+            config.chainlink_issue_id,
+            config,
+            store,
+            effects,
+            effects_log,
+        )
+        if not bookkeeping_ok:
+            recovered = store.load()
+            recovered = _ensure_merge_bookkeeping_gate(
+                recovered,
+                store,
+                effects_log,
+                slice_id,
+                current.pr_number,
+                config.chainlink_issue_id,
+            )
+            return _checkpoint_slice_action(
+                store,
+                recovered,
+                slice_id,
+                None,
+                slice_state=replace(
+                    recovered.slices[slice_id],
+                    action=replace(action, phase=ActionPhase.CONFIRMED),
+                    dispatch_error=bookkeeping_error,
+                ),
+            )
         refreshed = store.load()
         return _checkpoint_slice_action(
             store,
@@ -2577,12 +2638,54 @@ def _reconcile_pending_merge_entry(
     key = entry.get("key")
     if not isinstance(key, str) or not key:
         return False
+    chainlink_issue_id = arguments.get("chainlink_issue_id")
+    if chainlink_issue_id is not None and type(chainlink_issue_id) is not int:
+        return False
+    bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
+        target,
+        pr_number,
+        chainlink_issue_id,
+        TLLoopConfig(active=True),
+        store,
+        effects,
+        effects_log,
+    )
     effects_log.resolve_by_key(
         key,
         status="confirmed",
         result={"success": True, "result": {"merged": True, "reconciled": True}},
     )
     current = state.slices[target]
+    if not bookkeeping_ok:
+        state = _ensure_merge_bookkeeping_gate(
+            state,
+            store,
+            effects_log,
+            target,
+            pr_number,
+            chainlink_issue_id,
+        )
+        store.checkpoint(
+            state.fsm,
+            {
+                **state.slices,
+                target: replace(
+                    current,
+                    action=(
+                        replace(current.action, phase=ActionPhase.CONFIRMED)
+                        if current.action is not None
+                        else None
+                    ),
+                    dispatch_error=bookkeeping_error,
+                ),
+            },
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+        )
+        return True
     store.checkpoint(
         state.fsm,
         {
@@ -2601,6 +2704,88 @@ def _reconcile_pending_merge_entry(
         integration=state.integration,
     )
     return True
+
+
+def _merge_bookkeeping_arguments(
+    issue_id: int,
+    pr_number: int,
+) -> dict[str, object]:
+    return {
+        "issue_id": issue_id,
+        "force": True,
+        "summary": f"Closed after successful merge of PR #{pr_number}",
+        "commit_changelog": True,
+    }
+
+
+def _reconcile_merge_bookkeeping(
+    target: str,
+    pr_number: int | None,
+    issue_id: int | None,
+    config: TLLoopConfig,
+    store: RunStore,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> tuple[bool, str | None]:
+    if issue_id is None:
+        return True, None
+    if pr_number is None:
+        return False, "merge bookkeeping requires a PR number"
+    if not config.active or not callable(getattr(effects, "chainlink_issue_close", None)):
+        return False, "merge bookkeeping requires an active effect client"
+    arguments = _merge_bookkeeping_arguments(issue_id, pr_number)
+    try:
+        result = _invoke(
+            "merge_bookkeeping",
+            target,
+            arguments,
+            config.active,
+            cast(EffectClient, effects),
+            lambda client: client.chainlink_issue_close(
+                issue_id=issue_id,
+                force=True,
+                summary=cast(str, arguments["summary"]),
+                commit_changelog=True,
+            ),
+            effects_log,
+            raise_on_failure=False,
+            retryable_failure=True,
+        )
+    except TLLoopError as error:
+        return False, str(error)
+    if result is not None and result.success is True:
+        return True, None
+    if result is None:
+        return False, "merge bookkeeping was not dispatched"
+    return False, result.error or "merge bookkeeping returned failure"
+
+
+def _ensure_merge_bookkeeping_gate(
+    state: RunState,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    target: str,
+    pr_number: int | None,
+    issue_id: int | None,
+) -> RunState:
+    if issue_id is None or pr_number is None or not isinstance(effects_log, EffectJournal):
+        return state
+    intent = EffectIntent(
+        "merge_bookkeeping",
+        target,
+        _merge_bookkeeping_arguments(issue_id, pr_number),
+        True,
+    )
+    entry = effects_log.existing(intent)
+    if entry is None or entry.get("status") not in {"intended", "unknown"}:
+        return state
+    gate_name = _action_journal_gate_name(
+        entry.get("key", effects_log.key_for(intent)),
+        _action_journal_compensation_attempt(entry),
+    )
+    if any(gate.name == gate_name for gate in state.gates):
+        return state
+    return store.set_gate(gate_name, GateStatus.PENDING)
 
 
 def _controller_event_was_committed(
@@ -6802,6 +6987,7 @@ def _invoke(
     effects_log: list[EffectIntent],
     *,
     raise_on_failure: bool = True,
+    retryable_failure: bool = False,
 ) -> ToolResult | None:
     intent = EffectIntent(operation, target, arguments, active)
     journal = effects_log if isinstance(effects_log, EffectJournal) else None
@@ -6861,7 +7047,13 @@ def _invoke(
         raise
     if journal is not None:
         try:
-            journal.mark_result(intent, result)
+            if retryable_failure and result.success is not True:
+                journal.mark_unknown(
+                    intent,
+                    RuntimeError(result.error or f"{operation} returned a retryable failure"),
+                )
+            else:
+                journal.mark_result(intent, result)
         except DurableWriteError as error:
             raise error.with_context(operation=operation, target=target) from error
     if result.error_kind == "tool_unavailable":

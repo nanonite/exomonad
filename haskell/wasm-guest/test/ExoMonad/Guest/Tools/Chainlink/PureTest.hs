@@ -118,7 +118,7 @@ pureTests =
         chainlinkSessionEndMemoryRequest (ChainlinkSessionEndArgs (Just "   ")) @=? Nothing,
       -- buildCloseArgs
       testCase "buildCloseArgs: basic" $
-        buildCloseArgs (ChainlinkIssueCloseArgs 42 Nothing False)
+        buildCloseArgs (ChainlinkIssueCloseArgs 42 Nothing False False)
           @=? ["close", "42", "-q"],
       -- buildTimerArgs
       testCase "buildTimerStartArgs: basic" $

@@ -738,12 +738,15 @@ instance FromJSON ChainlinkIssueCloseArgs where
       <$> v .: "issue_id"
       <*> v .:? "summary"
       <*> v .:? "force" .!= False
+      <*> v .:? "commit_changelog" .!= False
 
 instance ToJSON ChainlinkIssueCloseArgs where
   toJSON args =
     object
       [ "issue_id" .= cisIssueId args,
-        "summary" .= cisSummary args
+        "summary" .= cisSummary args,
+        "force" .= cisForce args,
+        "commit_changelog" .= cisCommitChangelog args
       ]
 
 chainlinkIssueCloseDescription :: Text
@@ -755,27 +758,102 @@ chainlinkIssueCloseSchema :: Aeson.Object
 chainlinkIssueCloseSchema =
   genericToolSchemaWith @ChainlinkIssueCloseArgs
     [ ("issue_id", "The numeric ID of the issue to close"),
-      ("summary", "Optional summary of what was completed. Defaults to \"Closed #<id>\" if omitted.")
+      ("summary", "Optional summary of what was completed. Defaults to \"Closed #<id>\" if omitted."),
+      ("commit_changelog", "After closing, stage and commit the generated CHANGELOG.md. Use only for merge bookkeeping.")
     ]
 
 chainlinkIssueCloseCore :: ChainlinkIssueCloseArgs -> Eff Effects (Either Text ())
-chainlinkIssueCloseCore args = do
+chainlinkIssueCloseCore args
+  | cisCommitChangelog args = closeIssueAndCommitChangelog args
+  | otherwise = closeIssueNormally args
+
+closeIssueNormally :: ChainlinkIssueCloseArgs -> Eff Effects (Either Text ())
+closeIssueNormally args = do
   clean <- if cisForce args then pure (Right ()) else ensureCleanWorktreeForClose (cisIssueId args)
   case clean of
     Left err -> pure (Left err)
     Right () -> do
-      result <- runChainlink (buildCloseArgs args)
-      case result of
-        Left err -> pure $ Left ("chainlink close failed: " <> err)
-        Right resp
-          | Proc.runResponseExitCode resp == 0 -> pure $ Right ()
-          | otherwise ->
-              pure $
-                Left $
-                  "chainlink close failed (exit "
-                    <> exitCodeToText (Proc.runResponseExitCode resp)
-                    <> "): "
-                    <> TL.toStrict (Proc.runResponseStderr resp)
+      runCloseCommand args
+
+closeIssueAndCommitChangelog :: ChainlinkIssueCloseArgs -> Eff Effects (Either Text ())
+closeIssueAndCommitChangelog args = do
+  statusResult <- chainlinkIssueShowCore (ChainlinkIssueShowArgs (cisIssueId args))
+  case statusResult of
+    Left err -> pure $ Left ("cannot inspect Chainlink issue before bookkeeping: " <> err)
+    Right issue
+      | T.toLower (cisoStatus issue) == "closed" -> commitChangelog
+      | otherwise -> do
+          closeResult <- runCloseCommand args
+          case closeResult of
+            Left err -> pure $ Left err
+            Right () -> commitChangelog
+  where
+    commitChangelog = do
+      statusResult <-
+        suspendEffect @GitGetStatus
+          (Git.GetStatusRequest {Git.getStatusRequestWorkingDir = ""})
+      case statusResult of
+        Left err -> pure $ Left ("cannot inspect CHANGELOG.md status: " <> T.pack (show err))
+        Right status
+          | not (changelogNeedsCommit status) -> pure $ Right ()
+          | otherwise -> do
+              addResult <- runGitCommand ["add", "CHANGELOG.md"]
+              case addResult of
+                Left err -> pure $ Left err
+                Right () ->
+                  runGitCommand
+                    [ "commit",
+                      "-m",
+                      "Update changelog for Chainlink issue #" <> T.pack (show (cisIssueId args))
+                    ]
+
+runCloseCommand :: ChainlinkIssueCloseArgs -> Eff Effects (Either Text ())
+runCloseCommand args = do
+  result <- runChainlink (buildCloseArgs args)
+  case result of
+    Left err -> pure $ Left ("chainlink close failed: " <> err)
+    Right resp
+      | Proc.runResponseExitCode resp == 0 -> pure $ Right ()
+      | otherwise ->
+          pure $
+            Left $
+              "chainlink close failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+runGitCommand :: [Text] -> Eff Effects (Either Text ())
+runGitCommand args = do
+  result <-
+    suspendEffect @ProcessRun
+      Proc.RunRequest
+        { Proc.runRequestCommand = "git",
+          Proc.runRequestArgs = V.fromList (TL.fromStrict <$> args),
+          Proc.runRequestWorkingDir = "",
+          Proc.runRequestEnv = Map.empty,
+          Proc.runRequestTimeoutMs = chainlinkTimeoutMs
+        }
+  case result of
+    Left err -> pure $ Left ("git bookkeeping command failed before exit code was captured: " <> T.pack (show err))
+    Right resp
+      | Proc.runResponseExitCode resp == 0 -> pure $ Right ()
+      | otherwise ->
+          pure $
+            Left $
+              "git bookkeeping command failed (exit "
+                <> exitCodeToText (Proc.runResponseExitCode resp)
+                <> "): "
+                <> TL.toStrict (Proc.runResponseStderr resp)
+
+changelogNeedsCommit :: Git.GetStatusResponse -> Bool
+changelogNeedsCommit status =
+  any isChangelog $
+    map TL.toStrict $
+      V.toList (Git.getStatusResponseDirtyFiles status)
+        <> V.toList (Git.getStatusResponseStagedFiles status)
+        <> V.toList (Git.getStatusResponseUntrackedFiles status)
+  where
+    isChangelog path = path == "CHANGELOG.md" || T.isSuffixOf "/CHANGELOG.md" path
 
 ensureCleanWorktreeForClose :: Int -> Eff Effects (Either Text ())
 ensureCleanWorktreeForClose issueId = do

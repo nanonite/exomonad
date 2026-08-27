@@ -1671,15 +1671,11 @@ impl FjForgejoClient {
             repo.as_str(),
             number.as_u64()
         );
-        self.fj_status([
-            "api",
-            "POST",
+        self.fj_status(fj_merge_pull_request_args(
             path.as_str(),
-            "-f",
-            &format!("Do={method}"),
-            "-f",
-            &format!("head_commit_id={head_commit_id}"),
-        ])
+            method,
+            head_commit_id,
+        ))
         .await
     }
 
@@ -1943,6 +1939,18 @@ impl From<RunnerResponse> for ForgejoRunner {
     }
 }
 
+fn fj_merge_pull_request_args(path: &str, method: &str, head_commit_id: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "POST".to_string(),
+        path.to_string(),
+        "-f".to_string(),
+        format!("Do={method}"),
+        "-f".to_string(),
+        format!("head_commit_id={head_commit_id}"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1960,6 +1968,22 @@ mod tests {
         let client = ForgejoClient::new_fj("/tmp/project");
 
         assert_eq!(client.git_auth_token(), None);
+    }
+
+    #[test]
+    fn fj_merge_args_include_atomic_head_commit_id() {
+        assert_eq!(
+            fj_merge_pull_request_args("/repos/owner/repo/pulls/43/merge", "squash", "head-a",),
+            vec![
+                "api",
+                "POST",
+                "/repos/owner/repo/pulls/43/merge",
+                "-f",
+                "Do=squash",
+                "-f",
+                "head_commit_id=head-a",
+            ]
+        );
     }
 
     #[test]
@@ -1997,7 +2021,7 @@ mod tests {
             "short review"
         );
     }
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn owner() -> GithubOwner {
@@ -2245,6 +2269,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pr.head_sha.as_deref(), Some("sha-update"));
+    }
+
+    #[tokio::test]
+    async fn merge_request_propagates_changed_head_rejection() {
+        let (client, server) = client().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/repos/owner/repo/pulls/43/merge"))
+            .and(header("authorization", "token token-123"))
+            .and(body_json(serde_json::json!({
+                "Do": "squash",
+                "head_commit_id": "head-a"
+            })))
+            .respond_with(ResponseTemplate::new(409).set_body_string("head changed"))
+            .mount(&server)
+            .await;
+
+        let error = client
+            .merge_pull_request(&owner(), &repo(), PRNumber::new(43), "squash", "head-a")
+            .await
+            .expect_err("Forgejo must reject a raced head");
+
+        assert!(error.to_string().contains("HTTP 409"));
     }
 
     #[tokio::test]

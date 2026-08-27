@@ -504,8 +504,13 @@ class EffectClient:
         issue_id: int,
         force: bool,
         summary: str | None = None,
+        commit_changelog: bool = False,
     ) -> ToolResult:
-        arguments: JsonObject = {"issue_id": issue_id, "force": force}
+        arguments: JsonObject = {
+            "issue_id": issue_id,
+            "force": force,
+            "commit_changelog": commit_changelog,
+        }
         _put(arguments, "summary", summary)
         return self._call("chainlink_issue_close", arguments)
 

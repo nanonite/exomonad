@@ -1022,6 +1022,10 @@
           "force": {
             "type": "boolean"
           },
+          "commit_changelog": {
+            "description": "After closing, stage and commit CHANGELOG.md for a completed merge. Use only for merge bookkeeping.",
+            "type": "boolean"
+          },
           "issue_id": {
             "description": "The numeric ID of the issue to close",
             "type": "integer"

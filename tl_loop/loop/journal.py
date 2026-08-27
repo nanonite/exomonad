@@ -25,6 +25,7 @@ MUTATING_OPERATIONS = frozenset(
         "file_pr",
         "update_pr",
         "merge_pr",
+        "merge_bookkeeping",
         "resume_pr",
         "cleanup_reviewer_leaf",
         "close_reviewer_window",

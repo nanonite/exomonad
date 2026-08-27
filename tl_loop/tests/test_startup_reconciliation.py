@@ -72,6 +72,8 @@ class FakeClient:
     reviewer_agent_id: str | None = None
     reviewer_identity_error: str | None = None
     resume_pr_calls: list[dict[str, object]] = field(default_factory=list)
+    chainlink_issue_close_calls: list[dict[str, object]] = field(default_factory=list)
+    chainlink_issue_close_result: ToolResult | None = None
 
     def list_agents(self, *, filter_type: str | None = None) -> ToolResult:
         return ToolResult(
@@ -202,6 +204,26 @@ class FakeClient:
             result={"issue_id": 932},
             error=None,
         )
+
+    def chainlink_issue_close(
+        self,
+        *,
+        issue_id: int,
+        force: bool,
+        summary: str | None = None,
+        commit_changelog: bool = False,
+    ) -> ToolResult:
+        self.chainlink_issue_close_calls.append(
+            {
+                "issue_id": issue_id,
+                "force": force,
+                "summary": summary,
+                "commit_changelog": commit_changelog,
+            }
+        )
+        if self.chainlink_issue_close_result is not None:
+            return self.chainlink_issue_close_result
+        return ToolResult(raw={"success": True}, success=True, result={}, error=None)
 
     def emit_controller_event(self, *, event_type: str, payload: dict[str, object]) -> ToolResult:
         del event_type, payload
@@ -444,9 +466,15 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
         review_head_sha="head-a",
         reviewer_agent_id="review-pr-99-codex",
     )
-    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
 
-    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
 
     slice_state = recovered.slices["slice-a"]
     assert slice_state.reviewed_head == "head-a"
@@ -462,10 +490,12 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
         store,
         config,
         client,
-        [],
+        journal,
     )
     assert len(client.merge_calls) == 1
     assert client.merge_calls[0]["expected_head_sha"] == "head-a"
+    assert len(client.chainlink_issue_close_calls) == 1
+    assert client.chainlink_issue_close_calls[0]["commit_changelog"] is True
     assert merged.slices["slice-a"].status is SliceStatus.MERGED
 
     repeated = _reconcile_nonterminal_slices(
@@ -474,10 +504,59 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
         config,
         client,
         store,
-        [],
+        journal,
     )
-    _apply_convergence(repeated, ConvergenceTracker(), store, config, client, [])
+    _apply_convergence(repeated, ConvergenceTracker(), store, config, client, journal)
     assert len(client.merge_calls) == 1
+    assert len(client.chainlink_issue_close_calls) == 1
+
+
+def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    client = FakeClient(
+        review_id=7,
+        review_verdict="APPROVED",
+        review_head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+        chainlink_issue_close_result=ToolResult(
+            raw={"success": False, "error": "changelog commit failed"},
+            success=False,
+            result=None,
+            error="changelog commit failed",
+        ),
+    )
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+    after_merge = _apply_convergence(
+        recovered,
+        ConvergenceTracker(),
+        store,
+        config,
+        client,
+        journal,
+    )
+
+    assert len(client.merge_calls) == 1
+    assert len(client.chainlink_issue_close_calls) == 1
+    assert after_merge.slices["slice-a"].status is not SliceStatus.MERGED
+    assert "changelog commit failed" in (after_merge.slices["slice-a"].dispatch_error or "")
+    pending = journal.pending_entries()
+    assert len(pending) == 1
+    assert pending[0]["operation"] == "merge_bookkeeping"
+    gate = next(
+        gate
+        for gate in after_merge.gates
+        if gate.name.startswith("tl-action-journal-")
+    )
+    assert gate.status is GateStatus.PENDING
 
 
 @dataclass

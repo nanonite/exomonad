@@ -8,6 +8,8 @@ now converts that into the project's normal named-gate pattern instead.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,20 +67,33 @@ def test_first_reconciliation_opens_a_named_gate_and_leaves_entry_blocked(tmp_pa
 
 def test_intended_resume_entry_from_process_death_opens_gate_without_dispatch(tmp_path) -> None:
     path = tmp_path / "action-journal.json"
-    journal = EffectJournal("reconcile-journal", path)
-    intent = _Intent(
-        operation="resume_pr",
-        arguments={"head_sha": "head-a", "pr_number": 42},
-    )
-    # Simulate process death after the durable intent write and before the
-    # external call returned. A new controller must treat intended exactly as
-    # ambiguous as unknown, never redispatching automatically.
-    journal.append(intent)
+    child = """
+from pathlib import Path
+from types import SimpleNamespace
+import os
+import sys
+
+from tl_loop.loop.journal import EffectJournal
+
+journal = EffectJournal("reconcile-journal", Path(sys.argv[1]))
+journal.append(SimpleNamespace(
+    operation="resume_pr",
+    target="slice-a",
+    arguments={"head_sha": "head-a", "pr_number": 42},
+    active=True,
+))
+os._exit(0)
+"""
+    subprocess.run([sys.executable, "-c", child, str(path)], check=True)
 
     restarted_journal = EffectJournal("reconcile-journal", path)
     store, state = _store_and_state(tmp_path)
     reconciled = _reconcile_action_journal(state, store, restarted_journal)
 
+    intent = _Intent(
+        operation="resume_pr",
+        arguments={"head_sha": "head-a", "pr_number": 42},
+    )
     gate_name = _action_journal_gate_name(restarted_journal.key_for(intent))
     gate = next(gate for gate in reconciled.gates if gate.name == gate_name)
     assert gate.status is GateStatus.PENDING

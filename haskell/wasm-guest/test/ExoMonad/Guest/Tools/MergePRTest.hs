@@ -86,7 +86,8 @@ mergePrTests =
                   mprExpectedBaseSha = Nothing,
                   mprExpectedHeadSha = Just "caller-head",
                   mprExpectedPatchDigest = Nothing,
-                  mprExpectedMergeTreeSha = Nothing
+                  mprExpectedMergeTreeSha = Nothing,
+                  mprChainlinkIssueId = Nothing
                 }
         assertBool
           "observed head must override a caller-supplied head"

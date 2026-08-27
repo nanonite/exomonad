@@ -1009,6 +1009,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_verifier_selects_registry_head_resolves_identity_and_follows_succession() {
+        use crate::services::agent_control::{AgentType, InvocationTrigger, Topology};
+        use crate::services::agent_resolver::AgentIdentityRecord;
+
+        let directory = tempfile::tempdir().unwrap();
+        let resolver = AgentResolver::load(directory.path().to_path_buf()).await;
+        resolver
+            .register(AgentIdentityRecord {
+                agent_name: AgentName::try_from_str("leaf-codex").unwrap(),
+                slug: crate::domain::Slug::try_from_str("feature-codex").unwrap(),
+                agent_type: AgentType::Codex,
+                birth_branch: crate::domain::BirthBranch::try_from_str("main.feature-codex")
+                    .unwrap(),
+                parent_branch: crate::domain::BirthBranch::try_from_str("main").unwrap(),
+                working_dir: PathBuf::from(".exo/worktrees/leaf-codex"),
+                display_name: "leaf-codex".to_string(),
+                topology: Topology::WorktreePerAgent,
+                model: None,
+                effort: None,
+                ledger_owned: true,
+                slice_id: Some("slice-a".to_string()),
+            })
+            .await
+            .unwrap();
+        let agent_dir = directory.path().join(".exo/agents/leaf-codex");
+        let record = crate::services::agent_control::start_invocation(
+            &agent_dir,
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            RoutingInfo::window(crate::services::tmux_ipc::WindowId::parse("@42").unwrap()),
+            Some(43),
+            Some("head-current".to_string()),
+        )
+        .await
+        .unwrap();
+        let mut invocation = serde_json::to_value(record).unwrap();
+        invocation["invocation_id"] = serde_json::json!("invocation-current");
+        tokio::fs::write(
+            agent_dir.join("invocation.json"),
+            serde_json::to_vec_pretty(&invocation).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let mut old = publication("head-old");
+        old.pr_number = 43;
+        old.author_agent = Some("leaf-codex".to_string());
+        old.provenance = PublicationProvenance::LedgerOwned;
+        old.slice_id = Some("slice-a".to_string());
+        publish_verified_head(directory.path(), old).await.unwrap();
+
+        let mut current = publication("head-current");
+        current.pr_number = 43;
+        current.author_agent = Some("leaf-codex".to_string());
+        current.provenance = PublicationProvenance::LedgerOwned;
+        current.slice_id = Some("slice-a".to_string());
+        current.invocation_succession.push(InvocationSuccession {
+            from_invocation_id: "invocation-original".to_string(),
+            to_invocation_id: "invocation-current".to_string(),
+            reason: SuccessionReason::SessionRecreate,
+            recorded_at: 1,
+        });
+        current.invocation_id = Some("invocation-original".to_string());
+        publish_verified_head(directory.path(), current)
+            .await
+            .unwrap();
+
+        verify_current_publication_ownership(
+            directory.path(),
+            &resolver,
+            43,
+            "main.feature-codex",
+            "main",
+            "head-current",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn duplicate_publication_is_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let first = publication("sha-1");
