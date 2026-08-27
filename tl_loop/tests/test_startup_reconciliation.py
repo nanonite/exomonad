@@ -428,7 +428,7 @@ def _review_recovery_state(store: RunStore):
             )
         },
         state.budgets,
-        state.events.last_consumed_offset,
+        25446,
     )
 
 
@@ -451,6 +451,7 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     assert slice_state.verdict.value == "GO"
     assert slice_state.reconciliation["next_action"] == "queue_merge"
     assert client.spawn_reviewer_calls == []
+    assert recovered.events.last_consumed_offset == 25446
 
     merged = _apply_convergence(
         recovered,

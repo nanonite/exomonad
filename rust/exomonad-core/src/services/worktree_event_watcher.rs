@@ -257,6 +257,10 @@ fn canonical_watcher_event_data(
                     .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null),
             );
+            object.insert(
+                "reviewer_account_authenticated".to_string(),
+                serde_json::Value::Bool(review.author_agent_id.is_some()),
+            );
             if let Some(agent_id) = review.author_agent_id.as_deref() {
                 object.insert(
                     "reviewer_agent_id".to_string(),
@@ -2513,6 +2517,10 @@ where
         reviewer_login: Option<&str>,
         owner_agent: Option<&str>,
     ) -> Option<String> {
+        // Forgejo reviews use one shared service account.  The login proves
+        // reviewer-vs-author separation; the durable invocation lookup below
+        // supplies the per-slice assignment binding.  Never derive an agent
+        // identity by parsing the shared account login.
         if !crate::handlers::agent::review_author_matches_reviewer_login(login, reviewer_login) {
             return None;
         }
@@ -3081,6 +3089,14 @@ fn attach_review_correlation_fields(
             .and_then(|value| value.commit_id.clone())
             .map(serde_json::Value::String)
             .unwrap_or(serde_json::Value::Null),
+    );
+    object.insert(
+        "reviewer_account_authenticated".to_string(),
+        serde_json::Value::Bool(
+            review
+                .and_then(|value| value.author_agent_id.as_ref())
+                .is_some(),
+        ),
     );
 }
 
@@ -4541,6 +4557,7 @@ mod tests {
         assert_eq!(payload["verdict"], "approved");
         assert_eq!(payload["review_head_sha"], "abc123");
         assert_eq!(payload["reviewer_agent_id"], "review-pr-1-claude");
+        assert_eq!(payload["reviewer_account_authenticated"], true);
         assert_eq!(payload["reviewer_identity_unresolved"], false);
     }
 
@@ -4552,6 +4569,7 @@ mod tests {
         attach_review_authority(&mut payload, &reviews, ForgejoReviewVerdict::Approved);
 
         assert_eq!(payload["reviewer_identity_unresolved"], true);
+        assert_eq!(payload["reviewer_account_authenticated"], false);
         assert!(payload["reviewer_identity_reason"].as_str().is_some());
         assert!(payload.get("reviewer_agent_id").is_none());
     }

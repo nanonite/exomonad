@@ -3043,6 +3043,8 @@ def _replay_watcher_review_if_needed(
                 "review_head_sha": review_head_sha,
                 "review_id": watcher.review_id,
                 "reviewer_agent_id": reviewer_agent_id,
+                "reviewer_account_authenticated": True,
+                "reviewer_identity_unresolved": False,
                 "verdict": "GO" if kind == "approved" else "NO-GO",
                 "findings": findings,
                 "review_state": watcher.review_verdict,
@@ -3108,22 +3110,10 @@ def _apply_reconciliation_observations(
                 updates["pr_number"] = recovered_pr_number
         head_sha = watcher.head_sha
         ci_status = watcher.ci_status
-        review_state = watcher.review_state
         if head_sha and ci_status in CI_STATUS_VALUES:
             ci_state = dict(current.ci_state)
             ci_state[head_sha] = ci_status
             updates["ci_state"] = ci_state
-        if (
-            head_sha
-            and current.reviewed_head is None
-            and review_state in {"approved", "go", "go-with-nits", "go_with_nits"}
-        ):
-            updates["reviewed_head"] = head_sha
-            updates["verdict"] = (
-                Verdict.GO_WITH_NITS
-                if review_state in {"go-with-nits", "go_with_nits"}
-                else Verdict.GO
-            )
         publication = _publication_from_watcher(current, watcher, head_sha, owner_id)
         if publication is not None:
             updates["publication"] = publication
@@ -6004,15 +5994,22 @@ def _reviewer_identity_authorized(
             return False
         if current.reviewed_head is not None and current.reviewed_head != event.head_sha:
             return False
-        actor_id = event.agent_id
-        expected = current.reviewer_agent_id
-        if expected is not None:
-            return actor_id == expected
-        if current.reviewer_attempt.get(event.head_sha, 0) <= 0 or actor_id is None:
+        if current.handoff is not None and current.handoff.head_sha != event.head_sha:
             return False
-        return actor_id.startswith(f"review-pr-{event.pr_number}-") or actor_id == (
-            f"review-pr-{event.pr_number}"
-        )
+        if (
+            current.handoff is not None
+            and current.pr_number is not None
+            and current.handoff.pr_number != current.pr_number
+        ):
+            return False
+        if not _review_evidence_matches_exact_head(event, event.head_sha):
+            return False
+        reviewer_agent_id = event.data.get("reviewer_agent_id")
+        if current.reviewer_agent_id is not None:
+            return reviewer_agent_id == current.reviewer_agent_id
+        if current.reviewer_attempt.get(event.head_sha, 0) <= 0:
+            return False
+        return reviewer_agent_id != current.dispatch_agent_id
     actor_role = event.role or event.data.get("actor_role") or event.data.get("actor_type")
     if isinstance(actor_role, str):
         normalized = actor_role.strip().lower()
@@ -6028,22 +6025,30 @@ def _reviewer_identity_authorized(
 
 
 def _review_evidence_matches_exact_head(event: EventEnvelope, head_sha: str) -> bool:
-    """Validate optional watcher correlation fields without weakening legacy events."""
-    if "review_head_sha" in event.data and event.data.get("review_head_sha") != head_sha:
+    """Validate watcher proof for one exact-head reviewer decision.
+
+    ``reviewer_agent_id`` is the durable invocation assigned to the slice; it
+    is not a Forgejo login.  The Rust watcher only emits
+    ``reviewer_account_authenticated`` after the review author matched the
+    configured shared reviewer token and the exact-head invocation lookup
+    succeeded.  Keep that proof separate from the assignment binding.
+    """
+    if event.data.get("review_head_sha") != head_sha:
         return False
-    if "review_id" in event.data:
-        review_id = event.data.get("review_id")
-        if type(review_id) is not int or review_id <= 0:
-            return False
+    review_id = event.data.get("review_id")
+    if type(review_id) is not int or review_id <= 0:
+        return False
     if "reviewer_agent_id" in event.data:
         reviewer_agent_id = event.data.get("reviewer_agent_id")
         if not isinstance(reviewer_agent_id, str) or not reviewer_agent_id:
             return False
-        if reviewer_agent_id != event.agent_id:
-            return False
+    else:
+        return False
+    if event.data.get("reviewer_account_authenticated") is not True:
+        return False
     if "reviewer_identity_error" in event.data and event.data.get("reviewer_identity_error"):
         return False
-    return event.data.get("reviewer_identity_unresolved") is not True
+    return event.data.get("reviewer_identity_unresolved") is False
 
 
 def _review_slice_id(event: EventEnvelope, state: RunState) -> str | None:
@@ -6219,7 +6224,7 @@ def _route_review_event(
             for finding in findings
         )
         if reviewer_agent_id is None:
-            reviewer_agent_id = event.agent_id
+            reviewer_agent_id = event.data.get("reviewer_agent_id")
     else:
         result = adjudicate_review(
             _review_diff(event),

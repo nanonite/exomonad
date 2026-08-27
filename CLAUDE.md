@@ -409,7 +409,7 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`. To ov
 | `require_second_reviewer_complexity` | false | Require second reviewer for complex PRs |
 | `complexity_line_threshold` | 500 | Line threshold for complexity-based second review |
 
-**Reviewer identity discipline:** Each reviewer agent operates under a distinct git identity (`user.name=exomonad-reviewer-{name}`). The reviewer never commits to a branch it didn't author — the Authoring-Agent line in the PR body establishes traceability. An agent never reviews under the identity that authored the PR.
+**Reviewer identity discipline:** Every reviewer invocation uses the one configured `exomonad-reviewer` Forgejo service account and `forgejo_reviewer_token`; per-invocation Forgejo accounts and logins are not part of this deployment. Authorization proves that the review author is the reviewer-token account rather than the PR-authoring account, then binds the review to the exact PR head and the durable reviewer invocation assigned to that slice. Git identity, branch provenance, and invocation IDs remain distinct internal traceability, and an agent never reviews its own authored PR.
 
 **Stuck state:** `tl_loop` counts completed reviewer verdicts in durable `SliceState.review_rounds`, across head resets. When the count reaches `reviewer_max_rounds` without convergence, the controller parks the slice with `review_rounds_exhausted`, opens a named human gate, and emits bounded round/ceiling telemetry. The watcher remains an observation source and never owns this control decision.
 

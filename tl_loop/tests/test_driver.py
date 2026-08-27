@@ -1908,6 +1908,8 @@ def _direct_reviewer_event(
     verdict: str,
     agent_id: str = "review-pr-42-codex",
     reviewer_agent_id: str | None = None,
+    reviewer_account_authenticated: bool = True,
+    reviewer_identity_unresolved: bool = False,
 ) -> EventEnvelope:
     data: dict[str, object] = {
         "slice_id": "leaf-a",
@@ -1915,6 +1917,10 @@ def _direct_reviewer_event(
         "head_sha": "head-a",
         "kind": "approved" if verdict == "GO" else "changes_requested",
         "verdict": verdict,
+        "review_id": 403,
+        "review_head_sha": "head-a",
+        "reviewer_account_authenticated": reviewer_account_authenticated,
+        "reviewer_identity_unresolved": reviewer_identity_unresolved,
         "findings": []
         if verdict == "GO"
         else [
@@ -2035,7 +2041,10 @@ def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path
         review_model_choice=_review_choice(backend),
         review_policy_path=Path(".exo/review-policy.toml"),
     )
-    event = _direct_reviewer_event(verdict="NO-GO")
+    event = _direct_reviewer_event(
+        verdict="NO-GO",
+        reviewer_agent_id="review-pr-42-codex",
+    )
     _route_review_event(
         plan, store, store.load(), TLPlanning(), event, 1, config, EffectClient(transport), []
     )
@@ -2155,6 +2164,82 @@ def test_direct_reviewer_verdict_rejects_unregistered_actor(tmp_path: Path) -> N
         store.load(),
         TLPlanning(),
         _direct_reviewer_event(verdict="GO", agent_id="leaf-a"),
+        1,
+        TLLoopConfig(active=True),
+        EffectClient(RecordingTransport()),
+        [],
+    )
+
+    assert store.load().slices["leaf-a"].verdict is None
+
+
+def test_direct_reviewer_verdict_uses_shared_account_not_event_agent_slug(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                reviewer_attempt={"head-a": 1},
+                reviewer_agent_id="review-pr-42-codex",
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+
+    event = replace(
+        _direct_reviewer_event(
+            verdict="GO",
+            agent_id="exomonad-reviewer",
+            reviewer_agent_id="review-pr-42-codex",
+        ),
+        agent_id="exomonad-reviewer",
+    )
+    _route_review_event(
+        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+        store,
+        store.load(),
+        TLPlanning(),
+        event,
+        1,
+        TLLoopConfig(active=True),
+        EffectClient(RecordingTransport()),
+        [],
+    )
+
+    assert store.load().slices["leaf-a"].verdict is Verdict.GO
+
+
+def test_direct_reviewer_verdict_rejects_unverified_shared_account(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                reviewer_attempt={"head-a": 1},
+                reviewer_agent_id="review-pr-42-codex",
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+
+    _route_review_event(
+        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+        store,
+        store.load(),
+        TLPlanning(),
+        _direct_reviewer_event(
+            verdict="GO",
+            agent_id="exomonad-reviewer",
+            reviewer_agent_id="review-pr-42-codex",
+            reviewer_account_authenticated=False,
+            reviewer_identity_unresolved=True,
+        ),
         1,
         TLLoopConfig(active=True),
         EffectClient(RecordingTransport()),
