@@ -326,6 +326,17 @@ impl ForgejoClient {
         }
     }
 
+    /// Return the Forgejo login represented by this client's token.
+    ///
+    /// The fj backend does not expose an authenticated-user endpoint, so it
+    /// fails closed by returning no identity.
+    pub async fn authenticated_user_login(&self) -> Result<Option<String>> {
+        match &self.backend {
+            ForgejoBackend::Http(client) => client.authenticated_user_login().await,
+            ForgejoBackend::Fj(_) => Ok(None),
+        }
+    }
+
     pub async fn find_open_pull_request(
         &self,
         owner: &GithubOwner,
@@ -693,6 +704,25 @@ impl HttpForgejoClient {
             token: forgejo_token.to_string(),
             http,
         })
+    }
+
+    async fn authenticated_user_login(&self) -> Result<Option<String>> {
+        let url = self.api_url(&["user"])?;
+        let response = self
+            .http
+            .get(url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .context("Forgejo authenticated-user request failed")?;
+        let user: PullRequestReviewAuthor = self
+            .decode_response(response, "get Forgejo authenticated user")
+            .await?;
+        Ok(user
+            .login
+            .or(user.username)
+            .map(|login| login.trim().to_string())
+            .filter(|login| !login.is_empty()))
     }
 
     pub async fn find_open_pull_request(
@@ -2168,6 +2198,24 @@ mod tests {
         assert_eq!(reviews[0].state, "APPROVED");
         assert!(reviews[0].dismissed);
         assert!(!reviews[0].stale);
+    }
+
+    #[tokio::test]
+    async fn authenticated_user_login_reads_the_reviewer_service_account() {
+        let (client, server) = client().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/user"))
+            .and(header("authorization", "token token-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "login": "exomonad-reviewer"
+            })))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            client.authenticated_user_login().await.unwrap().as_deref(),
+            Some("exomonad-reviewer")
+        );
     }
 
     #[test]

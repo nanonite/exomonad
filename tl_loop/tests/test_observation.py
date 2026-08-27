@@ -52,6 +52,7 @@ def test_projection_preserves_exact_head_review_evidence() -> None:
             "review_id": 17,
             "review_verdict": " APPROVED ",
             "review_head_sha": "head-a",
+            "review_body": "Looks good",
             "reviewer_agent_id": "review-pr-7-codex",
             "reviewer_identity_error": "",
         }
@@ -60,6 +61,7 @@ def test_projection_preserves_exact_head_review_evidence() -> None:
     assert observed.review_id == 17
     assert observed.review_verdict == "approved"
     assert observed.review_head_sha == "head-a"
+    assert observed.review_body == "Looks good"
     assert observed.reviewer_agent_id == "review-pr-7-codex"
     assert observed.to_payload()["review_id"] == 17
 

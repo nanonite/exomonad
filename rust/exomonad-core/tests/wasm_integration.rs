@@ -586,6 +586,7 @@ impl EffectHandler for MockAgentHandler {
                     review_head_sha: String::new(),
                     reviewer_agent_id: String::new(),
                     reviewer_identity_error: String::new(),
+                    review_body: String::new(),
                 }
                 .encode_to_vec())
             }

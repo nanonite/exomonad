@@ -9,6 +9,7 @@ module ExoMonad.Guest.Tools.WatcherPrState
     watcherPrStateDescription,
     watcherPrStateSchema,
     watcherPrStateCore,
+    watcherPrStateResponseValue,
   )
 where
 
@@ -45,6 +46,39 @@ watcherPrStateSchema =
   genericToolSchemaWith @WatcherPrStateArgs
     [("pr_number", "Existing PR number whose live Forgejo review and CI state should be inspected.")]
 
+watcherPrStateResponseValue :: PA.WatcherPrStateResponse -> Aeson.Value
+watcherPrStateResponseValue resp =
+  object
+    [ "success" .= True,
+      "pr_number" .= PA.watcherPrStateResponsePrNumber resp,
+      "found" .= PA.watcherPrStateResponseFound resp,
+      "review_state" .= lazyText (PA.watcherPrStateResponseReviewState resp),
+      "ci_status" .= lazyText (PA.watcherPrStateResponseCiStatus resp),
+      "head_sha" .= lazyText (PA.watcherPrStateResponseHeadSha resp),
+      "head_branch" .= lazyText (PA.watcherPrStateResponseHeadBranch resp),
+      "base_branch" .= lazyText (PA.watcherPrStateResponseBaseBranch resp),
+      "base_sha" .= lazyText (PA.watcherPrStateResponseBaseSha resp),
+      "patch_digest" .= lazyText (PA.watcherPrStateResponsePatchDigest resp),
+      "merge_tree_sha" .= lazyText (PA.watcherPrStateResponseMergeTreeSha resp),
+      "pr_state" .= lazyText (PA.watcherPrStateResponsePrState resp),
+      "merged" .= PA.watcherPrStateResponseMerged resp,
+      "review_count" .= PA.watcherPrStateResponseReviewCount resp,
+      "head_reachable" .= PA.watcherPrStateResponseHeadReachable resp,
+      "evidence_error" .= lazyText (PA.watcherPrStateResponseEvidenceError resp),
+      "publication_ownership_verified"
+        .= PA.watcherPrStateResponsePublicationOwnershipVerified resp,
+      "publication_ownership_error"
+        .= lazyText (PA.watcherPrStateResponsePublicationOwnershipError resp),
+      "publication" .= PA.watcherPrStateResponsePublication resp,
+      "review_id" .= PA.watcherPrStateResponseReviewId resp,
+      "review_verdict" .= lazyText (PA.watcherPrStateResponseReviewVerdict resp),
+      "review_head_sha" .= lazyText (PA.watcherPrStateResponseReviewHeadSha resp),
+      "reviewer_agent_id" .= lazyText (PA.watcherPrStateResponseReviewerAgentId resp),
+      "reviewer_identity_error"
+        .= lazyText (PA.watcherPrStateResponseReviewerIdentityError resp),
+      "review_body" .= lazyText (PA.watcherPrStateResponseReviewBody resp)
+    ]
+
 watcherPrStateCore :: WatcherPrStateArgs -> Eff Effects (Either Text Aeson.Value)
 watcherPrStateCore args
   | wpsPrNumber args <= 0 = pure $ Left "pr_number must be positive"
@@ -59,37 +93,7 @@ watcherPrStateCore args
         Right resp
           | not (PA.watcherPrStateResponseSuccess resp) ->
               Left (lazyText (PA.watcherPrStateResponseError resp))
-          | otherwise ->
-              Right $
-                object
-                  [ "success" .= True,
-                    "pr_number" .= PA.watcherPrStateResponsePrNumber resp,
-                    "found" .= PA.watcherPrStateResponseFound resp,
-                    "review_state" .= lazyText (PA.watcherPrStateResponseReviewState resp),
-                    "ci_status" .= lazyText (PA.watcherPrStateResponseCiStatus resp),
-                    "head_sha" .= lazyText (PA.watcherPrStateResponseHeadSha resp),
-                    "head_branch" .= lazyText (PA.watcherPrStateResponseHeadBranch resp),
-                    "base_branch" .= lazyText (PA.watcherPrStateResponseBaseBranch resp),
-                    "base_sha" .= lazyText (PA.watcherPrStateResponseBaseSha resp),
-                    "patch_digest" .= lazyText (PA.watcherPrStateResponsePatchDigest resp),
-                    "merge_tree_sha" .= lazyText (PA.watcherPrStateResponseMergeTreeSha resp),
-                    "pr_state" .= lazyText (PA.watcherPrStateResponsePrState resp),
-                    "merged" .= PA.watcherPrStateResponseMerged resp,
-                    "review_count" .= PA.watcherPrStateResponseReviewCount resp,
-                    "head_reachable" .= PA.watcherPrStateResponseHeadReachable resp,
-                    "evidence_error" .= lazyText (PA.watcherPrStateResponseEvidenceError resp),
-                    "publication_ownership_verified"
-                      .= PA.watcherPrStateResponsePublicationOwnershipVerified resp,
-                    "publication_ownership_error"
-                      .= lazyText (PA.watcherPrStateResponsePublicationOwnershipError resp),
-                    "publication" .= PA.watcherPrStateResponsePublication resp,
-                    "review_id" .= PA.watcherPrStateResponseReviewId resp,
-                    "review_verdict" .= lazyText (PA.watcherPrStateResponseReviewVerdict resp),
-                    "review_head_sha" .= lazyText (PA.watcherPrStateResponseReviewHeadSha resp),
-                    "reviewer_agent_id" .= lazyText (PA.watcherPrStateResponseReviewerAgentId resp),
-                    "reviewer_identity_error"
-                      .= lazyText (PA.watcherPrStateResponseReviewerIdentityError resp)
-                  ]
+          | otherwise -> Right (watcherPrStateResponseValue resp)
 
 instance MCPTool WatcherPrState where
   type ToolArgs WatcherPrState = WatcherPrStateArgs

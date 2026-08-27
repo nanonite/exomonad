@@ -64,6 +64,7 @@ class FakeClient:
     review_id: int | None = None
     review_verdict: str | None = None
     review_head_sha: str | None = None
+    review_body: str | None = None
     reviewer_agent_id: str | None = None
     reviewer_identity_error: str | None = None
 
@@ -124,6 +125,8 @@ class FakeClient:
                 result["review_verdict"] = self.review_verdict
             if self.review_head_sha is not None:
                 result["review_head_sha"] = self.review_head_sha
+            if self.review_body is not None:
+                result["review_body"] = self.review_body
             if self.reviewer_agent_id is not None:
                 result["reviewer_agent_id"] = self.reviewer_agent_id
             if self.reviewer_identity_error is not None:
@@ -459,6 +462,26 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     )
     _apply_convergence(repeated, ConvergenceTracker(), store, config, client, [])
     assert len(client.merge_calls) == 1
+
+
+def test_reconciliation_replays_actionable_findings_from_negative_review(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    client = FakeClient(
+        review_id=8,
+        review_verdict="CHANGES_REQUESTED",
+        review_head_sha="head-a",
+        review_body="Handle the missing error branch in src/a.py before retrying.",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+
+    slice_state = recovered.slices["slice-a"]
+    assert slice_state.review_findings["head-a"][0]["rationale"] == (
+        "Handle the missing error branch in src/a.py before retrying."
+    )
 
 
 def test_reconciliation_rejects_stale_or_unresolved_review_evidence(tmp_path) -> None:

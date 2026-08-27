@@ -3014,13 +3014,16 @@ def _replay_watcher_review_if_needed(
         ):
             return state
     kind = "approved" if watcher.review_verdict == "approved" else "review_received"
+    review_rationale = (watcher.review_body or "").strip()
+    if not review_rationale:
+        review_rationale = (
+            f"Forgejo review {watcher.review_id} requested changes on exact head {head_sha}"
+        )
     findings = [] if kind == "approved" else [
         {
             "severity": "blocking",
             "path": "review",
-            "rationale": (
-                f"Forgejo review {watcher.review_id} requested changes on exact head {head_sha}"
-            ),
+            "rationale": review_rationale,
         }
     ]
     event = project(

@@ -44,13 +44,12 @@ where
             .await
             .map_err(|e| EffectError::network_error(e.to_string()))?;
         let reviews = if req.include_reviews {
-            forgejo
-                .list_pull_request_reviews(&owner, &repo, number)
-                .await
-                .map_err(|e| EffectError::network_error(e.to_string()))?
-                .into_iter()
-                .map(forgejo_review_to_proto)
-                .collect()
+            forgejo_reviews_to_proto(
+                forgejo
+                    .list_pull_request_reviews(&owner, &repo, number)
+                    .await
+                    .map_err(|e| EffectError::network_error(e.to_string()))?,
+            )
         } else {
             Vec::new()
         };
@@ -220,6 +219,14 @@ fn forgejo_review_to_proto(review: ForgejoPullRequestReview) -> Review {
     }
 }
 
+fn forgejo_reviews_to_proto(reviews: Vec<ForgejoPullRequestReview>) -> Vec<Review> {
+    reviews
+        .into_iter()
+        .filter(|review| !review.dismissed && !review.stale)
+        .map(forgejo_review_to_proto)
+        .collect()
+}
+
 pub fn forgejo_pr_to_proto(pr: ForgejoPullRequest) -> PullRequest {
     let state = if pr.state == "closed" || pr.merged {
         IssueState::Closed
@@ -313,5 +320,27 @@ mod tests {
 
         assert_eq!(proto.state, ReviewState::Unspecified as i32);
         assert_eq!(proto.commit_id, "");
+    }
+
+    #[test]
+    fn forgejo_review_projection_excludes_dismissed_and_stale_approvals() {
+        let review = |dismissed, stale| ForgejoPullRequestReview {
+            id: Some(1),
+            state: "APPROVED".to_string(),
+            body: "looks good".to_string(),
+            commit_id: Some("abc123".to_string()),
+            author_login: Some("reviewer".to_string()),
+            dismissed,
+            stale,
+        };
+
+        let projected = forgejo_reviews_to_proto(vec![
+            review(false, false),
+            review(true, false),
+            review(false, true),
+        ]);
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].state, ReviewState::Approved as i32);
     }
 }

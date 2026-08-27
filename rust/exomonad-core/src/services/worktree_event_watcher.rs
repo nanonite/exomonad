@@ -14,8 +14,8 @@ use crate::services::repo;
 use crate::services::review_policy::ReviewPolicy;
 use crate::services::{
     capture_memory, CiStatusMap, HasAgentResolver, HasEventLog, HasEventQueue, HasForgejoClient,
-    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory, HasTeamRegistry,
-    MemoryCapture, MemoryKind,
+    HasForgejoReviewerClient, HasGitWorktreeService, HasInboxStore, HasProjectDir,
+    HasSessionMemory, HasTeamRegistry, MemoryCapture, MemoryKind,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -820,6 +820,7 @@ where
         + HasEventLog
         + HasEventQueue
         + HasForgejoClient
+        + HasForgejoReviewerClient
         + HasGitWorktreeService
         + HasInboxStore
         + HasProjectDir
@@ -2412,6 +2413,11 @@ where
             }
         };
 
+        let reviewer_login = match self.ctx.forgejo_reviewer_client() {
+            Some(client) => client.authenticated_user_login().await.ok().flatten(),
+            None => None,
+        };
+
         let mut local_reviews = Vec::new();
         for review in reviews {
             if review.dismissed || review.stale {
@@ -2432,6 +2438,7 @@ where
                         pr_number,
                         head_sha,
                         review.author_login.as_deref(),
+                        reviewer_login.as_deref(),
                         owner_agent,
                     )
                     .await,
@@ -2501,10 +2508,10 @@ where
         pr_number: u64,
         head_sha: &str,
         login: Option<&str>,
+        reviewer_login: Option<&str>,
         owner_agent: Option<&str>,
     ) -> Option<String> {
-        let login = login?.trim();
-        if login.is_empty() {
+        if !crate::handlers::agent::review_author_matches_reviewer_login(login, reviewer_login) {
             return None;
         }
         let resolved = self

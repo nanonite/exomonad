@@ -46,8 +46,9 @@ use tracing::{info, warn};
 
 use crate::services::{
     capture_memory, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient,
-    HasGitHubClient, HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory,
-    HasSupervisorRegistry, HasTeamRegistry, HasWatcherRuntimeState, MemoryCapture, MemoryKind,
+    HasForgejoReviewerClient, HasGitHubClient, HasGitWorktreeService, HasInboxStore, HasProjectDir,
+    HasSessionMemory, HasSupervisorRegistry, HasTeamRegistry, HasWatcherRuntimeState,
+    MemoryCapture, MemoryKind,
 };
 
 /// Agent effect handler.
@@ -386,6 +387,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasForgejoReviewerClient
             + HasWatcherRuntimeState
             + 'static,
     > EffectHandler for AgentHandler<C>
@@ -789,6 +791,7 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
         review_head_sha: String::new(),
         reviewer_agent_id: String::new(),
         reviewer_identity_error: String::new(),
+        review_body: String::new(),
     }
 }
 
@@ -918,15 +921,34 @@ fn normalized_review_verdict(state: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn review_author_matches_reviewer_login(
+    review_login: Option<&str>,
+    reviewer_login: Option<&str>,
+) -> bool {
+    let Some(review_login) = review_login
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(reviewer_login) = reviewer_login
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    review_login.eq_ignore_ascii_case(reviewer_login)
+}
+
 async fn resolve_durable_review_author<C: HasAgentResolver>(
     ctx: &C,
     pr_number: u64,
     head_sha: &str,
     login: Option<&str>,
+    reviewer_login: Option<&str>,
     owner_agent: Option<&str>,
 ) -> Option<String> {
-    let login = login?.trim();
-    if login.is_empty() {
+    if !review_author_matches_reviewer_login(login, reviewer_login) {
         return None;
     }
     let resolved = ctx
@@ -953,6 +975,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasForgejoReviewerClient
             + HasWatcherRuntimeState
             + 'static,
     > AgentEffects for AgentHandler<C>
@@ -2018,11 +2041,13 @@ impl<
             review_id,
             review_verdict,
             review_head_sha,
+            review_body,
             reviewer_agent_id,
             reviewer_identity_error,
         ) = match latest_exact_forgejo_review(&reviews, &head_sha) {
             None => (
                 0,
+                String::new(),
                 String::new(),
                 String::new(),
                 String::new(),
@@ -2033,11 +2058,17 @@ impl<
                 let review_verdict = normalized_review_verdict(&review.state)
                     .unwrap_or_default()
                     .to_string();
+                let review_body = review.body.clone();
+                let reviewer_login = match self.ctx.forgejo_reviewer_client() {
+                    Some(client) => client.authenticated_user_login().await.ok().flatten(),
+                    None => None,
+                };
                 let resolved = resolve_durable_review_author(
                     self.ctx.as_ref(),
                     pr_number,
                     &head_sha,
                     review.author_login.as_deref(),
+                    reviewer_login.as_deref(),
                     publication
                         .as_ref()
                         .and_then(|value| value.author_agent.as_deref()),
@@ -2051,6 +2082,7 @@ impl<
                         review_id,
                         review_verdict,
                         head_sha.clone(),
+                        review_body.clone(),
                         agent_id,
                         String::new(),
                     ),
@@ -2058,6 +2090,7 @@ impl<
                         review_id,
                         review_verdict,
                         head_sha.clone(),
+                        review_body.clone(),
                         String::new(),
                         "Forgejo review author is the PR owner".to_string(),
                     ),
@@ -2065,6 +2098,7 @@ impl<
                         review_id,
                         review_verdict,
                         head_sha.clone(),
+                        review_body,
                         String::new(),
                         "Forgejo review author did not resolve to a registered agent".to_string(),
                     ),
@@ -2106,6 +2140,7 @@ impl<
             review_head_sha,
             reviewer_agent_id,
             reviewer_identity_error,
+            review_body,
         })
     }
 
@@ -5910,6 +5945,38 @@ mod tests {
             dismissed: false,
             stale: false,
         }
+    }
+
+    #[test]
+    fn review_authorization_rejects_owner_login() {
+        assert!(!review_author_matches_reviewer_login(
+            Some("pr-owner"),
+            Some("exomonad-reviewer"),
+        ));
+    }
+
+    #[test]
+    fn review_authorization_rejects_unrelated_registered_login() {
+        assert!(!review_author_matches_reviewer_login(
+            Some("other-registered-agent"),
+            Some("exomonad-reviewer"),
+        ));
+    }
+
+    #[test]
+    fn review_authorization_rejects_unregistered_login() {
+        assert!(!review_author_matches_reviewer_login(
+            Some("unknown-forgejo-login"),
+            Some("exomonad-reviewer"),
+        ));
+    }
+
+    #[test]
+    fn review_authorization_accepts_the_reviewer_service_account_login() {
+        assert!(review_author_matches_reviewer_login(
+            Some("Exomonad-Reviewer"),
+            Some("exomonad-reviewer"),
+        ));
     }
 
     #[test]

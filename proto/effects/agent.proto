@@ -445,6 +445,7 @@ message WatcherPrStateResponse {
   string review_head_sha = 25;
   string reviewer_agent_id = 26;
   string reviewer_identity_error = 27;
+  string review_body = 28;
 }
 
 // ============================================================================
