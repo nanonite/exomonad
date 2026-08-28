@@ -369,6 +369,29 @@ def _freshness_age(
     return age_seconds
 
 
+def verdict_is_stale(
+    slice: SliceState,
+    *,
+    now: datetime | None = None,
+    freshness_window_secs: int | None = None,
+) -> bool:
+    """Return True when a recorded verdict has aged past the freshness window.
+
+    Uses the identical clock/threshold semantics ``verify_review`` applies when
+    gating a merge, so a slice this reports as stale is exactly the slice that
+    would otherwise fail the merge freshness check forever with no way to
+    recover: a verdict already set, watched facts unchanged, but too old for
+    ``verify_review`` to accept as evidence for a fresh merge attempt.
+    """
+    if slice.verdict is None or slice.verdict_at is None or freshness_window_secs is None:
+        return False
+    try:
+        _freshness_age(slice, now=now, freshness_window_secs=freshness_window_secs)
+    except StaleVerdict:
+        return True
+    return False
+
+
 def watcher_head(result: ToolResult) -> str:
     """Extract the live PR head from the typed watcher effect result."""
     if result.success is not True:

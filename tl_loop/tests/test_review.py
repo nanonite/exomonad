@@ -33,6 +33,7 @@ from tl_loop.loop.review import (
     integration_needs_revalidation,
     invalidate_integration_evidence,
     load_reviewer_max_rounds,
+    verdict_is_stale,
     verify_integration,
     verify_review,
 )
@@ -302,6 +303,22 @@ def test_expired_matching_verdict_requires_review() -> None:
             now=NOW,
             freshness_window_secs=600,
         )
+
+
+def test_verdict_is_stale_reports_true_only_past_the_freshness_window() -> None:
+    fresh = _slice(verdict_at="2026-08-11T16:55:00Z")
+    expired = _slice(verdict_at="2026-08-11T15:00:00Z")
+
+    assert verdict_is_stale(fresh, now=NOW, freshness_window_secs=600) is False
+    assert verdict_is_stale(expired, now=NOW, freshness_window_secs=600) is True
+
+
+def test_verdict_is_stale_is_false_without_a_verdict_or_disabled_window() -> None:
+    no_verdict = replace(_slice(verdict_at=None), verdict=None)
+    unbounded = _slice(verdict_at="2026-08-11T15:00:00Z")
+
+    assert verdict_is_stale(no_verdict, now=NOW, freshness_window_secs=600) is False
+    assert verdict_is_stale(unbounded, now=NOW, freshness_window_secs=None) is False
 
 
 def test_pre_merge_watcher_recheck_blocks_a_fix_pushed_after_verdict(

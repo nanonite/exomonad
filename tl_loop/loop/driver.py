@@ -70,6 +70,7 @@ from tl_loop.loop.review import (
     load_freshness_window,
     load_reviewer_max_rounds,
     load_reviewer_policy_snapshot,
+    verdict_is_stale,
     verify_integration,
     verify_review,
 )
@@ -3181,7 +3182,16 @@ def _replay_watcher_review_if_needed(
     store: RunStore,
     effects_log: list[EffectIntent],
 ) -> RunState:
-    """Replay one authorized exact-head review snapshot through the reducer."""
+    """Replay one authorized exact-head review snapshot through the reducer.
+
+    A verdict already set and still fresh has nothing to replay. A verdict
+    already set but aged past the configured freshness window is treated as
+    eligible for replay too: the underlying facts (exact head, reviewer,
+    review outcome) still have to pass every check below unchanged, but a
+    successful replay refreshes ``verdict_at`` through the same reducer path
+    a live event would use, since nothing else ever re-confirms an
+    already-decided slice once its verdict has gone stale on the clock alone.
+    """
     observed_watcher = _as_watcher_observation(watcher)
     if observed_watcher is None:
         return state
@@ -3190,9 +3200,18 @@ def _replay_watcher_review_if_needed(
     review_head_sha = watcher.review_head_sha
     reviewer_agent_id = watcher.reviewer_agent_id
     ownership_verified, _ = watcher.ownership_status()
+    stale_verdict = current.verdict is not None and verdict_is_stale(
+        current,
+        now=config.review_clock() if config.review_clock is not None else None,
+        freshness_window_secs=(
+            load_freshness_window(config.review_policy_path)
+            if config.review_policy_path is not None
+            else None
+        ),
+    )
     if (
         current.status not in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
-        or current.verdict is not None
+        or (current.verdict is not None and not stale_verdict)
         or watcher.found is not True
         or not head_sha
         or not review_head_sha
