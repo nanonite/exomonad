@@ -357,9 +357,18 @@ def _freshness_age(
 ) -> float:
     if freshness_window_secs is None:
         return 0.0
-    if slice.verdict_at is None:
+    validation_at = (
+        slice.review_evidence.validated_at if slice.review_evidence is not None else None
+    )
+    if (
+        validation_at is None
+        and not slice.review_validation_required
+        and slice.review_evidence is None
+    ):
+        validation_at = slice.verdict_at
+    if validation_at is None:
         raise StaleVerdict(f"slice {slice.id!r} verdict has no observed timestamp")
-    observed = _parse_timestamp(slice.verdict_at)
+    observed = _parse_timestamp(validation_at)
     current = now or datetime.now(UTC)
     age_seconds = max(0.0, (current - observed).total_seconds())
     if age_seconds > freshness_window_secs:
@@ -383,7 +392,7 @@ def verdict_is_stale(
     recover: a verdict already set, watched facts unchanged, but too old for
     ``verify_review`` to accept as evidence for a fresh merge attempt.
     """
-    if slice.verdict is None or slice.verdict_at is None or freshness_window_secs is None:
+    if slice.verdict is None or freshness_window_secs is None:
         return False
     try:
         _freshness_age(slice, now=now, freshness_window_secs=freshness_window_secs)

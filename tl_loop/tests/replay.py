@@ -195,7 +195,12 @@ def normalize_state(document: Mapping[str, object]) -> dict[str, object]:
 
 def _normalize_value(key: str, value: object) -> object:
     if isinstance(value, Mapping):
-        return {name: _normalize_value(name, item) for name, item in sorted(value.items())}
+        return {
+            name: _normalize_value(name, item)
+            for name, item in sorted(value.items())
+            if name not in {"plan_manifest", "manifest_node_id", "manifest_revision"}
+            and not (key == "fsm" and name in {"kind", "payload"})
+        }
     if isinstance(value, list):
         return [_normalize_value(key, item) for item in value]
     if key in {"dispatch_intent_id", "intent_id"}:

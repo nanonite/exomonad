@@ -5,19 +5,36 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from tl_loop.client.effects import ToolResult
+from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
+    EffectIntent,
     LeafTask,
     TLLoopConfig,
     WorkPlan,
     _action_journal_gate_name,
     _apply_convergence,
+    _persist_review_validation,
     _reconcile_action_journal,
     _reconcile_nonterminal_slices,
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
-from tl_loop.state.schema import GateStatus, SliceState, SliceStatus
+from tl_loop.state.schema import (
+    DurableReviewEvidence,
+    FSMState,
+    GateStatus,
+    ReviewValidationDisposition,
+    ReviewValidationObservation,
+    SliceState,
+    SliceStatus,
+    Verdict,
+)
+from tl_loop.state.slice_transition import (
+    RevalidateReview,
+    ReviewValidationFailed,
+    slice_transition,
+)
 from tl_loop.state.store import RunStore, _encode_slice, create
 
 _PLAN = WorkPlan(
@@ -68,6 +85,7 @@ class FakeClient:
     review_id: int | None = None
     review_verdict: str | None = None
     review_head_sha: str | None = None
+    review_submitted_at: str | None = None
     review_body: str | None = None
     reviewer_agent_id: str | None = None
     reviewer_identity_error: str | None = None
@@ -133,6 +151,8 @@ class FakeClient:
                 result["review_verdict"] = self.review_verdict
             if self.review_head_sha is not None:
                 result["review_head_sha"] = self.review_head_sha
+            if self.review_submitted_at is not None:
+                result["review_submitted_at"] = self.review_submitted_at
             if self.review_body is not None:
                 result["review_body"] = self.review_body
             if self.reviewer_agent_id is not None:
@@ -511,6 +531,288 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     assert len(client.chainlink_issue_close_calls) == 1
 
 
+def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    state = store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {
+            "slice-a": replace(
+                state.slices["slice-a"],
+                status=SliceStatus.IN_REVIEW,
+                pr_number=99,
+                dispatch_invocation_id="invocation-a",
+                reviewed_head="head-a",
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+    intent = EffectIntent("merge_pr", "slice-a", {"pr_number": 99}, True)
+    journal.append(intent)
+    journal.mark_result(
+        intent,
+        ToolResult(
+            raw={"success": True, "result": {"merged": True}},
+            success=True,
+            result={"merged": True},
+            error=None,
+        ),
+    )
+    client = FakeClient(merged=True, pr_state="closed")
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    assert recovered.slices["slice-a"].status is SliceStatus.MERGED
+    assert recovered.slices["slice-a"].action is None
+    assert recovered.fsm.phase is TLPhase.TLAllMerged
+    assert recovered.fsm.waiting == ()
+    assert client.spawn_reviewer_calls == []
+    assert client.merge_calls == []
+    assert journal.pending_entries() == []
+
+
+def test_review_validation_failure_reason_round_trips_through_checkpoint(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    failed = slice_transition(
+        state.slices["slice-a"],
+        ReviewValidationFailed(
+            disposition=ReviewValidationDisposition.INVALIDATED,
+            reason="authoritative_review_observation_incomplete",
+        ),
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": failed},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    restored = store.load().slices["slice-a"]
+
+    assert restored.review_validation_failure_reason == (
+        "authoritative_review_observation_incomplete"
+    )
+    assert restored.review_validation_disposition is ReviewValidationDisposition.INVALIDATED
+    assert restored.stall_classification is None
+
+
+def test_stale_exact_head_review_refreshes_validation_once_before_merge(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    current = state.slices["slice-a"]
+    evidence = DurableReviewEvidence(
+        review_id=7,
+        pr_number=99,
+        head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+        verdict=Verdict.GO,
+        submitted_at="2026-08-27T00:00:00Z",
+        validated_at="2026-08-27T00:00:00Z",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "slice-a": replace(
+                current,
+                verdict=Verdict.GO,
+                verdict_at=evidence.submitted_at,
+                review_evidence=evidence,
+                review_validation_required=False,
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    policy_path = tmp_path / "review-policy.toml"
+    policy_path.write_text("review_freshness_window_secs = 1200\n", encoding="utf-8")
+    client = FakeClient(
+        review_id=7,
+        review_verdict="APPROVED",
+        review_head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        review_policy_path=policy_path,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+
+    refreshed = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+    refreshed_slice = refreshed.slices["slice-a"]
+
+    assert refreshed.state_version == 1
+    assert refreshed_slice.review_evidence is not None
+    assert refreshed_slice.review_evidence.submitted_at == evidence.submitted_at
+    assert refreshed_slice.review_evidence.validated_at != evidence.validated_at
+    assert refreshed_slice.review_rounds == 0
+    assert refreshed_slice.review_validation_required is False
+
+    _apply_convergence(refreshed, ConvergenceTracker(), store, config, client, journal)
+    assert len(client.merge_calls) == 1
+
+    repeated = _reconcile_nonterminal_slices(
+        _PLAN,
+        store.load(),
+        config,
+        client,
+        store,
+        journal,
+    )
+    _apply_convergence(repeated, ConvergenceTracker(), store, config, client, journal)
+    _apply_convergence(repeated, ConvergenceTracker(), store, config, client, journal)
+    assert len(client.merge_calls) == 1
+
+
+def test_derived_revalidation_and_success_share_one_version_advance(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    evidence = DurableReviewEvidence(
+        review_id=7,
+        pr_number=99,
+        head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+        verdict=Verdict.GO,
+        submitted_at="2026-08-27T00:00:00Z",
+        validated_at="2026-08-27T00:00:00Z",
+    )
+    current = replace(
+        state.slices["slice-a"],
+        verdict=Verdict.GO,
+        verdict_at=evidence.submitted_at,
+        review_evidence=evidence,
+        review_validation_required=False,
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    requested = slice_transition(current, RevalidateReview())
+    requested_state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": requested},
+        state.budgets,
+        state.events.last_consumed_offset,
+        state_version=1,
+    )
+    observation = ReviewValidationObservation(
+        review_id=7,
+        pr_number=99,
+        head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+        verdict=Verdict.GO,
+        observed_at="2026-08-29T00:00:00Z",
+        submitted_at=evidence.submitted_at,
+    )
+
+    refreshed = _persist_review_validation(
+        requested_state,
+        requested,
+        observation,
+        store,
+        submitted_at=observation.submitted_at,
+    )
+
+    assert refreshed.state_version == 1
+    assert refreshed.slices["slice-a"].review_validation_required is False
+
+
+def test_out_of_order_snapshot_is_quiescent_while_revalidation_is_pending(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    evidence = DurableReviewEvidence(
+        review_id=7,
+        pr_number=99,
+        head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+        verdict=Verdict.GO,
+        submitted_at="2026-08-27T00:00:00Z",
+        validated_at="2026-08-29T00:00:00Z",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "slice-a": replace(
+                state.slices["slice-a"],
+                verdict=Verdict.GO,
+                verdict_at=evidence.submitted_at,
+                review_evidence=evidence,
+                review_validation_required=True,
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    client = FakeClient(
+        review_id=6,
+        review_verdict="APPROVED",
+        review_head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+    current = recovered.slices["slice-a"]
+
+    assert current.review_evidence is not None
+    assert current.review_evidence.review_id == 7
+    assert current.review_validation_required is True
+    assert current.review_rounds == 0
+
+
+def test_newer_same_head_snapshot_supersedes_fresh_verdict(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    evidence = DurableReviewEvidence(
+        review_id=7,
+        pr_number=99,
+        head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+        verdict=Verdict.GO,
+        submitted_at="2026-08-29T00:00:00Z",
+        validated_at="2026-08-29T00:00:00Z",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "slice-a": replace(
+                state.slices["slice-a"],
+                verdict=Verdict.GO,
+                verdict_at=evidence.submitted_at,
+                review_evidence=evidence,
+                review_validation_required=False,
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    client = FakeClient(
+        review_id=8,
+        review_verdict="CHANGES_REQUESTED",
+        review_head_sha="head-a",
+        review_body="Please fix the regression",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+    current = recovered.slices["slice-a"]
+
+    assert current.verdict is Verdict.NO_GO
+    assert current.review_evidence is not None
+    assert current.review_evidence.review_id == 8
+    assert current.review_rounds == 1
+
+
 def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
@@ -546,16 +848,13 @@ def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None
 
     assert len(client.merge_calls) == 1
     assert len(client.chainlink_issue_close_calls) == 1
-    assert after_merge.slices["slice-a"].status is not SliceStatus.MERGED
+    assert after_merge.slices["slice-a"].status is SliceStatus.MERGED
+    assert after_merge.slices["slice-a"].action is None
     assert "changelog commit failed" in (after_merge.slices["slice-a"].dispatch_error or "")
     pending = journal.pending_entries()
     assert len(pending) == 1
     assert pending[0]["operation"] == "merge_bookkeeping"
-    gate = next(
-        gate
-        for gate in after_merge.gates
-        if gate.name.startswith("tl-action-journal-")
-    )
+    gate = next(gate for gate in after_merge.gates if gate.name.startswith("tl-action-journal-"))
     assert gate.status is GateStatus.PENDING
 
 
@@ -713,16 +1012,39 @@ def test_repair_effect_journal_recovers_unknown_resume_without_duplicate_dispatc
         restarted_store,
         restarted_journal,
     )
-    assert next(gate for gate in repeated.gates if gate.name == gate_name).status is GateStatus.PENDING
+    assert (
+        next(gate for gate in repeated.gates if gate.name == gate_name).status is GateStatus.PENDING
+    )
     assert len(client.resume_pr_calls) == 1
 
 
 def test_reconciliation_rejects_stale_or_unresolved_review_evidence(tmp_path) -> None:
     cases = (
-        {"review_id": 7, "review_verdict": "approved", "review_head_sha": "old-head", "reviewer_agent_id": "review-pr-99-codex"},
-        {"review_id": 7, "review_verdict": "approved", "review_head_sha": "head-a", "reviewer_agent_id": "review-pr-99-codex", "reviewer_identity_error": "unresolved"},
-        {"review_id": 7, "review_verdict": "approved", "review_head_sha": "head-a", "reviewer_agent_id": "agent-a"},
-        {"review_id": 0, "review_verdict": "approved", "review_head_sha": "head-a", "reviewer_agent_id": "review-pr-99-codex"},
+        {
+            "review_id": 7,
+            "review_verdict": "approved",
+            "review_head_sha": "old-head",
+            "reviewer_agent_id": "review-pr-99-codex",
+        },
+        {
+            "review_id": 7,
+            "review_verdict": "approved",
+            "review_head_sha": "head-a",
+            "reviewer_agent_id": "review-pr-99-codex",
+            "reviewer_identity_error": "unresolved",
+        },
+        {
+            "review_id": 7,
+            "review_verdict": "approved",
+            "review_head_sha": "head-a",
+            "reviewer_agent_id": "agent-a",
+        },
+        {
+            "review_id": 0,
+            "review_verdict": "approved",
+            "review_head_sha": "head-a",
+            "reviewer_agent_id": "review-pr-99-codex",
+        },
     )
     for evidence in cases:
         case_dir = tmp_path / str(len(list(tmp_path.iterdir())))

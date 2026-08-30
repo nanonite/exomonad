@@ -9,6 +9,9 @@ from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
     ActionState,
+    DurableReviewEvidence,
+    ReviewValidationDisposition,
+    ReviewValidationObservation,
     SliceState,
     SliceStatus,
     Verdict,
@@ -62,6 +65,32 @@ class ReviewVerdictObserved(SliceEvent):
     requires_authenticated_evidence: bool = True
     increment_round: bool = True
     next_status: SliceStatus | None = None
+    submitted_at: str | None = None
+    validated_at: str | None = None
+    observed_at: str | None = None
+    dismissed: bool = False
+    forgejo_stale: bool = False
+
+
+@dataclass(frozen=True)
+class RevalidateReview(SliceEvent):
+    """Mark an existing verdict as awaiting authoritative revalidation."""
+
+
+@dataclass(frozen=True)
+class ReviewValidated(SliceEvent):
+    """Persist a successful validation without creating a new review round."""
+
+    observation: ReviewValidationObservation
+    submitted_at: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewValidationFailed(SliceEvent):
+    """Persist invalidation before the reducer is allowed to derive again."""
+
+    disposition: ReviewValidationDisposition
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -138,8 +167,7 @@ class IllegalSliceTransition(Exception):
         self.state = state
         self.event = event
         super().__init__(
-            f"No slice transition for {type(state.status).__name__} "
-            f"and {type(event).__name__}"
+            f"No slice transition for {type(state.status).__name__} and {type(event).__name__}"
         )
 
 
@@ -167,11 +195,7 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
         _validate_review_event(state, event)
         findings = dict(state.review_findings)
         findings[event.head_sha] = event.findings
-        ci_state = (
-            {}
-            if state.reviewed_head != event.head_sha
-            else dict(state.ci_state)
-        )
+        ci_state = {} if state.reviewed_head != event.head_sha else dict(state.ci_state)
         return replace(
             state,
             reviewed_head=event.head_sha,
@@ -182,10 +206,15 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
             reviewer_agent_id=event.reviewer_agent_id,
             stall_classification=event.stall_classification,
             status=event.next_status or state.status,
+            verdict_at=event.submitted_at or event.observed_at or state.verdict_at,
+            review_evidence=_review_evidence_from_event(event),
+            review_validation_required=(
+                event.requires_authenticated_evidence and _review_evidence_from_event(event) is None
+            ),
+            review_validation_disposition=None,
+            review_validation_failure_reason=None,
             action=(
-                None
-                if _reviewer_action_matches(state.action, event.head_sha)
-                else state.action
+                None if _reviewer_action_matches(state.action, event.head_sha) else state.action
             ),
         )
     if isinstance(event, CIStatusObserved):
@@ -196,7 +225,22 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
         if event.status == "failure" and state.reviewed_head == event.head_sha:
             verdict = Verdict.NO_GO
             verdict_at = event.observed_at
-        return replace(state, ci_state=ci_state, verdict=verdict, verdict_at=verdict_at)
+        return replace(
+            state,
+            ci_state=ci_state,
+            verdict=verdict,
+            verdict_at=verdict_at,
+            review_evidence=None if event.status == "failure" else state.review_evidence,
+            review_validation_required=False
+            if event.status == "failure"
+            else state.review_validation_required,
+            review_validation_disposition=None
+            if event.status == "failure"
+            else state.review_validation_disposition,
+            review_validation_failure_reason=None
+            if event.status == "failure"
+            else state.review_validation_failure_reason,
+        )
     if isinstance(event, HeadEvidenceObserved):
         ci_state = dict(state.ci_state)
         if event.ci_status:
@@ -217,6 +261,10 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
             reviewed_head=event.head_sha,
             verdict=None,
             verdict_at=None,
+            review_evidence=None,
+            review_validation_required=False,
+            review_validation_disposition=None,
+            review_validation_failure_reason=None,
             action=None,
             review_findings={},
             review_patch_digests={},
@@ -231,6 +279,10 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
             reviewed_head=None,
             verdict=None,
             verdict_at=None,
+            review_evidence=None,
+            review_validation_required=False,
+            review_validation_disposition=None,
+            review_validation_failure_reason=None,
             action=None,
             stall_classification=None,
         )
@@ -251,6 +303,10 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
             reviewed_head=None,
             verdict=None,
             verdict_at=None,
+            review_evidence=None,
+            review_validation_required=False,
+            review_validation_disposition=None,
+            review_validation_failure_reason=None,
             review_findings={},
             review_patch_digests={},
             ci_state={},
@@ -260,6 +316,63 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
         )
     if isinstance(event, MergeCompleted):
         return replace(state, status=SliceStatus.MERGED, action=None)
+    if isinstance(event, RevalidateReview):
+        if state.verdict is None or state.reviewed_head is None:
+            return state
+        return replace(
+            state,
+            review_validation_required=True,
+            action=(
+                None
+                if _reviewer_action_matches(state.action, state.reviewed_head)
+                or (
+                    state.action is not None
+                    and state.action.kind is ActionKind.MERGE
+                    and state.action.head_sha == state.reviewed_head
+                )
+                else state.action
+            ),
+        )
+    if isinstance(event, ReviewValidated):
+        _validate_review_validation_event(state, event)
+        current = state.review_evidence
+        submitted_at = (
+            current.submitted_at
+            if current is not None
+            else event.submitted_at
+            or event.observation.submitted_at
+            or event.observation.observed_at
+        )
+        evidence = DurableReviewEvidence(
+            review_id=event.observation.review_id,
+            pr_number=event.observation.pr_number,
+            head_sha=event.observation.head_sha,
+            reviewer_agent_id=event.observation.reviewer_agent_id,
+            verdict=event.observation.verdict,
+            submitted_at=submitted_at,
+            validated_at=event.observation.observed_at,
+            reviewer_account_authenticated=event.observation.reviewer_account_authenticated,
+            dismissed=event.observation.dismissed,
+            forgejo_stale=event.observation.forgejo_stale,
+            reviewer_identity_unresolved=event.observation.reviewer_identity_unresolved,
+        )
+        return replace(
+            state,
+            review_evidence=evidence,
+            review_validation_required=False,
+            review_validation_disposition=None,
+            review_validation_failure_reason=None,
+            reviewer_agent_id=event.observation.reviewer_agent_id,
+        )
+    if isinstance(event, ReviewValidationFailed):
+        return replace(
+            state,
+            status=SliceStatus.IN_REVIEW,
+            review_validation_required=True,
+            review_validation_disposition=event.disposition,
+            review_validation_failure_reason=event.reason,
+            action=None,
+        )
     raise IllegalSliceTransition(state, event)
 
 
@@ -298,6 +411,69 @@ def _validate_review_event(state: SliceState, event: ReviewVerdictObserved) -> N
         or not event.reviewer_account_authenticated
         or event.reviewer_identity_unresolved
         or event.self_approval
+        or event.dismissed
+        or event.forgejo_stale
+    ):
+        raise IllegalSliceTransition(state, event)
+
+
+def _review_evidence_from_event(
+    event: ReviewVerdictObserved,
+) -> DurableReviewEvidence | None:
+    if (
+        type(event.review_id) is not int
+        or event.review_id <= 0
+        or event.pr_number is None
+        or event.pr_number <= 0
+        or not event.reviewer_agent_id
+        or not event.reviewer_account_authenticated
+        or event.reviewer_identity_unresolved
+        or event.dismissed
+        or event.forgejo_stale
+    ):
+        return None
+    observed_at = event.observed_at or event.validated_at or event.submitted_at
+    submitted_at = event.submitted_at or observed_at
+    if not observed_at or not submitted_at:
+        return None
+    return DurableReviewEvidence(
+        review_id=event.review_id,
+        pr_number=event.pr_number,
+        head_sha=event.head_sha,
+        reviewer_agent_id=event.reviewer_agent_id,
+        verdict=event.verdict,
+        submitted_at=submitted_at,
+        validated_at=event.validated_at or observed_at,
+        reviewer_account_authenticated=event.reviewer_account_authenticated,
+        dismissed=event.dismissed,
+        forgejo_stale=event.forgejo_stale,
+        reviewer_identity_unresolved=event.reviewer_identity_unresolved,
+    )
+
+
+def _validate_review_validation_event(
+    state: SliceState,
+    event: ReviewValidated,
+) -> None:
+    observation = event.observation
+    if (
+        state.verdict != observation.verdict
+        or state.reviewed_head != observation.head_sha
+        or state.pr_number != observation.pr_number
+        or not observation.reviewer_account_authenticated
+        or observation.reviewer_identity_unresolved
+        or observation.dismissed
+        or observation.forgejo_stale
+    ):
+        raise IllegalSliceTransition(state, event)
+    if state.handoff is not None and (
+        state.handoff.pr_number != observation.pr_number
+        or state.handoff.head_sha != observation.head_sha
+    ):
+        raise IllegalSliceTransition(state, event)
+    if (
+        state.review_evidence is not None
+        and state.review_evidence.identity() != observation.identity()
     ):
         raise IllegalSliceTransition(state, event)
 

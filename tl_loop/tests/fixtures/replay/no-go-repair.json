@@ -452,12 +452,28 @@
     {
       "operation": "emit_controller_event",
       "arguments": {
+        "event_type": "tl.transition_applied",
+        "payload": {
+          "reason": "review_validation_expired",
+          "run_id": "replay-repair",
+          "state_version": 1,
+          "target_id": "leaf-a",
+          "transition": "revalidate_review"
+        },
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
+      "operation": "emit_controller_event",
+      "arguments": {
         "event_type": "tl.wait_reason_changed",
         "payload": {
           "previous_reason": "await_publication",
-          "reason": "await_handoff",
+          "reason": "await_review_revalidation",
           "run_id": "replay-repair",
-          "state_version": 0,
+          "state_version": 1,
           "target_id": "replay-repair"
         },
         "force": false,

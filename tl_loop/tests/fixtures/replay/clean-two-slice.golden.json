@@ -54,7 +54,7 @@
   },
   "reviewer_max_rounds": 5,
   "reviewer_max_rounds_source": "policy_file",
-  "revision": 16,
+  "revision": 18,
   "run_id": "<run-id>",
   "slices": {
     "leaf-a": {
@@ -129,5 +129,5 @@
       "worktree": null
     }
   },
-  "version": 2
+  "version": 4
 }

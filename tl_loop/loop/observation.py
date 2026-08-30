@@ -82,6 +82,7 @@ class WatcherObservation:
     review_id: int | None
     review_verdict: str | None
     review_head_sha: str | None
+    review_submitted_at: str | None
     review_body: str | None
     reviewer_agent_id: str | None
     reviewer_identity_error: str | None
@@ -122,6 +123,7 @@ class WatcherObservation:
             review_id=_optional_positive_int(raw.get("review_id")),
             review_verdict=_optional_review_verdict(raw.get("review_verdict")),
             review_head_sha=_optional_text(raw.get("review_head_sha")),
+            review_submitted_at=_optional_text(raw.get("review_submitted_at")),
             review_body=_optional_text(raw.get("review_body")),
             reviewer_agent_id=_optional_text(raw.get("reviewer_agent_id")),
             reviewer_identity_error=_optional_text(raw.get("reviewer_identity_error")),
@@ -161,6 +163,7 @@ class WatcherObservation:
             "review_id",
             "review_verdict",
             "review_head_sha",
+            "review_submitted_at",
             "review_body",
             "reviewer_agent_id",
             "reviewer_identity_error",
@@ -195,6 +198,7 @@ class WatcherObservation:
             review_id=self.review_id,
             review_verdict=self.review_verdict,
             review_head_sha=self.review_head_sha,
+            review_submitted_at=self.review_submitted_at,
             review_body=self.review_body,
             reviewer_agent_id=self.reviewer_agent_id,
             reviewer_identity_error=self.reviewer_identity_error,

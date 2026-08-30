@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime
 from types import MappingProxyType
 from typing import cast
 
 from tl_loop.loop.observation import WatcherObservation
 from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.state.review_validation import review_validation_is_fresh
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
     ActionKind,
@@ -121,6 +123,7 @@ class InternalTransition:
 
     transition: str
     reason: str
+    target_id: str | None = None
 
     @property
     def name(self) -> str:
@@ -161,6 +164,8 @@ def derive_next_action(
     persisted_state: SliceState | RunState,
     *,
     reviewer_max_rounds: int | None = None,
+    review_freshness_window_secs: int | None = None,
+    now: datetime | None = None,
 ) -> MergeDecision:
     """Derive one merge/review action from durable evidence only.
 
@@ -169,14 +174,26 @@ def derive_next_action(
     independent of event arrival order.
     """
     if isinstance(persisted_state, RunState):
-        return _derive_run_action(persisted_state, reviewer_max_rounds=reviewer_max_rounds)
-    return _derive_slice_action(persisted_state, reviewer_max_rounds=reviewer_max_rounds)
+        return _derive_run_action(
+            persisted_state,
+            reviewer_max_rounds=reviewer_max_rounds,
+            review_freshness_window_secs=review_freshness_window_secs,
+            now=now,
+        )
+    return _derive_slice_action(
+        persisted_state,
+        reviewer_max_rounds=reviewer_max_rounds,
+        review_freshness_window_secs=review_freshness_window_secs,
+        now=now,
+    )
 
 
 def _derive_run_action(
     state: RunState,
     *,
     reviewer_max_rounds: int | None = None,
+    review_freshness_window_secs: int | None = None,
+    now: datetime | None = None,
 ) -> MergeDecision:
     active = tuple(
         current
@@ -259,7 +276,15 @@ def _derive_run_action(
                 current,
                 repository_identity=repository_identity,
                 reviewer_max_rounds=effective_reviewer_max_rounds,
+                review_freshness_window_secs=review_freshness_window_secs,
+                now=now,
             )
+            if (
+                isinstance(decision, InternalTransition)
+                and decision.transition == "revalidate_review"
+                and decision.target_id is None
+            ):
+                decision = replace(decision, target_id=current.id)
             if not isinstance(decision, Quiescent):
                 return decision
             if first_wait is None:
@@ -273,6 +298,8 @@ def _derive_slice_action(
     *,
     repository_identity: Mapping[str, object] | None = None,
     reviewer_max_rounds: int | None = None,
+    review_freshness_window_secs: int | None = None,
+    now: datetime | None = None,
 ) -> MergeDecision:
     current_head = _persisted_head(state)
     if (
@@ -302,6 +329,29 @@ def _derive_slice_action(
     )
     if state.status is SliceStatus.MERGED:
         return InternalTransition("terminal", "merged")
+    if (
+        state.verdict is not None
+        and state.reviewed_head == current_head
+        and not state.review_validation_required
+        and review_freshness_window_secs is not None
+        and (
+            state.reviewer_agent_id is None
+            or not review_validation_is_fresh(
+                state.review_evidence,
+                now=now,
+                freshness_window_secs=review_freshness_window_secs,
+                expected_pr_number=state.pr_number,
+                expected_head_sha=current_head,
+                expected_verdict=state.verdict,
+                expected_reviewer_agent_id=state.reviewer_agent_id,
+            )
+        )
+    ):
+        return InternalTransition(
+            "revalidate_review",
+            "review_validation_expired",
+            target_id=state.id,
+        )
     if state.action is not None:
         if (
             state.action.kind
@@ -336,6 +386,8 @@ def _derive_slice_action(
         SliceStatus.BLOCKED,
     }:
         return Quiescent(f"closed_{state.status.value}")
+    if state.review_validation_required:
+        return Quiescent("await_review_revalidation")
     if state.status is SliceStatus.REPAIRING:
         return ExternalIntent("repair", state.id, {"head_sha": current_head})
     if _has_conflict(state):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -108,6 +109,7 @@ def test_legacy_reviewed_head_never_becomes_handoff_evidence() -> None:
     migrated = result.document["slices"]["slice-a"]
     assert "handoff" not in migrated
     assert migrated["reviewed_head"] == "head-from-review"
+    assert migrated["review_validation_required"] is True
 
 
 def test_install_migration_interrupted_before_report_leaves_checkpoint_untouched_and_retries_cleanly(
@@ -201,3 +203,20 @@ def test_unsupported_checkpoint_version_is_blocked(tmp_path) -> None:
 
     assert json.loads(path.read_text()) == original
     assert (path.parent / "migration-error.json").exists()
+
+
+def test_concurrent_loads_serialize_migration_and_leave_one_checkpoint(tmp_path) -> None:
+    path = tmp_path / "concurrent" / "run.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(_legacy_spawned()), encoding="utf-8")
+
+    def load_checkpoint():
+        return RunStore("concurrent", tmp_path).load()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        states = list(executor.map(lambda _index: load_checkpoint(), range(2)))
+
+    assert [state.version for state in states] == [SCHEMA_VERSION, SCHEMA_VERSION]
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == SCHEMA_VERSION
+    assert len(tuple(path.parent.glob("run.json.legacy-*"))) == 1
+    assert not tuple(path.parent.glob("*.tmp"))

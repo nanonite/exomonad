@@ -67,13 +67,34 @@ line-count, and complexity gates; a GO behind a gate is marked
 second_review_required and is not mergeable. GO-WITH-NITS remains mergeable
 and its nit reasons are stored in durable per-head `review_findings` state.
 
+Review submission and validation are separate durable facts. A slice's
+`review_evidence` records the Forgejo review identity, exact PR head, verdict,
+immutable `submitted_at`, and renewable `validated_at`. Controller startup may
+revalidate an expired exact-head verdict from the authoritative watcher
+snapshot; it must not create a new review round, charge budget, or spawn a
+reviewer. The pure `RevalidateReview` and `ReviewValidated` transitions update
+only validation state and advance the run `state_version` once. Legacy
+verdicts without validation evidence are marked `review_validation_required`
+by migration and remain quiescent until authenticated, exact-head evidence is
+observed. Newer same-head review IDs supersede older evidence, while older or
+already-fresh observations are no-ops.
+
 ## Checkpoint and resume layout
 
 Each run is persisted at `.exo/tl-loop/<run_id>/run.json`; the shared writer
 lock is `.exo/tl-loop/run.lock`. `tl_loop.state.store.resume()` reconstructs
-the FSM, slice map, budget ledger, and event-log replay offset from that file.
+the immutable recursive `plan_manifest`, FSM, slice map, budget ledger, and
+event-log replay offset from that file. The manifest records the complete
+scope/node declaration, stable source ordering, branch ownership, integration
+targets, ordered stages, and nested child-manifest digests. Every persisted
+slice carries its exact manifest node ID and revision. Once a run exists,
+external `plan.json` is only a candidate: an equal canonical digest is
+accepted, a changed plan requires an explicit monotonic revision, and a
+revision that mutates dispatched ownership or completed history fails closed.
 Resume treats the checkpoint and event log as authoritative and performs no
-server or network query.
+server or network query. Legacy checkpoints receive deterministic manifest
+bindings; ambiguous child kind or ownership is recorded as an actionable
+recovery gate rather than guessed.
 
 ## Long-running wave goals and heartbeats
 

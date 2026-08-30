@@ -22,8 +22,8 @@ from tl_loop.state.schema import (
     HandoffEvidence,
     IntegrationCandidateState,
     IntegrationRuntimeState,
-    OrderedStageState,
     ObservationProvenance,
+    OrderedStageState,
     PublicationBinding,
     RepositoryIdentity,
     SliceState,
@@ -58,9 +58,17 @@ def test_mid_wave_resume_reconstructs_exact_local_state(tmp_path: Path) -> None:
 
     assert checkpointed.fsm == fsm
     assert loaded.fsm == fsm
-    assert dict(loaded.slices) == slices
+    expected_slices = {
+        slice_id: replace(
+            slice_state,
+            manifest_node_id=f"run-1/worker/{slice_id}",
+            manifest_revision=2,
+        )
+        for slice_id, slice_state in slices.items()
+    }
+    assert dict(loaded.slices) == expected_slices
     assert resumed.fsm == fsm
-    assert dict(resumed.slices) == slices
+    assert dict(resumed.slices) == expected_slices
     assert resumed.budgets == budgets
     assert resumed.offset == 17
     assert loaded.revision == 1

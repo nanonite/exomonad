@@ -16,6 +16,8 @@ from tl_loop.ordered import (
     SubTLLifecycle,
 )
 
+from .plan_manifest import ManifestError, PlanManifest
+
 BLOCK_CAUSE_VALUES = frozenset(
     {
         "base_ci_unstable",
@@ -26,7 +28,7 @@ BLOCK_CAUSE_VALUES = frozenset(
     }
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 class ReviewPolicySource(str, Enum):
@@ -147,6 +149,121 @@ class Verdict(str, Enum):
     GO = "GO"
     GO_WITH_NITS = "GO-WITH-NITS"
     NO_GO = "NO-GO"
+
+
+class ReviewValidationDisposition(str, Enum):
+    """Result of comparing an authoritative review observation with evidence."""
+
+    ALREADY_FRESH = "already_fresh"
+    OUT_OF_ORDER = "out_of_order"
+    REFRESHED = "refreshed"
+    SUPERSEDED = "superseded"
+    INVALIDATED = "invalidated"
+    UNAUTHORIZED = "unauthorized"
+
+
+@dataclass(frozen=True)
+class DurableReviewEvidence:
+    """Immutable review identity plus the last authoritative validation."""
+
+    review_id: int
+    pr_number: int
+    head_sha: str
+    reviewer_agent_id: str
+    verdict: Verdict
+    submitted_at: str
+    validated_at: str | None
+    reviewer_account_authenticated: bool = True
+    dismissed: bool = False
+    forgejo_stale: bool = False
+    reviewer_identity_unresolved: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.review_id) is not int or self.review_id <= 0:
+            raise ValueError("review evidence review_id must be positive")
+        if type(self.pr_number) is not int or self.pr_number <= 0:
+            raise ValueError("review evidence pr_number must be positive")
+        for name in ("head_sha", "reviewer_agent_id", "submitted_at"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"review evidence {name} must be non-empty")
+        if self.validated_at is not None and not self.validated_at:
+            raise ValueError("review evidence validated_at must be non-empty or null")
+        if not isinstance(self.verdict, Verdict):
+            raise TypeError("review evidence verdict must be a Verdict")
+        for name in (
+            "reviewer_account_authenticated",
+            "dismissed",
+            "forgejo_stale",
+            "reviewer_identity_unresolved",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"review evidence {name} must be a boolean")
+
+    def identity(self) -> tuple[object, ...]:
+        """Return the durable identity used to compare repeated observations."""
+        return (
+            self.review_id,
+            self.pr_number,
+            self.head_sha,
+            self.reviewer_agent_id,
+            self.verdict,
+            self.reviewer_account_authenticated,
+            self.dismissed,
+            self.forgejo_stale,
+            self.reviewer_identity_unresolved,
+        )
+
+
+@dataclass(frozen=True)
+class ReviewValidationObservation:
+    """One authoritative observation used to refresh or invalidate evidence."""
+
+    review_id: int
+    pr_number: int
+    head_sha: str
+    reviewer_agent_id: str
+    verdict: Verdict
+    observed_at: str
+    submitted_at: str | None = None
+    reviewer_account_authenticated: bool = True
+    dismissed: bool = False
+    forgejo_stale: bool = False
+    reviewer_identity_unresolved: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.review_id) is not int or self.review_id <= 0:
+            raise ValueError("review observation review_id must be positive")
+        if type(self.pr_number) is not int or self.pr_number <= 0:
+            raise ValueError("review observation pr_number must be positive")
+        for name in ("head_sha", "reviewer_agent_id", "observed_at"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"review observation {name} must be non-empty")
+        if self.submitted_at is not None and not self.submitted_at:
+            raise ValueError("review observation submitted_at must be non-empty or null")
+        if not isinstance(self.verdict, Verdict):
+            raise TypeError("review observation verdict must be a Verdict")
+        for name in (
+            "reviewer_account_authenticated",
+            "dismissed",
+            "forgejo_stale",
+            "reviewer_identity_unresolved",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"review observation {name} must be a boolean")
+
+    def identity(self) -> tuple[object, ...]:
+        """Return the observed review identity without its observation time."""
+        return (
+            self.review_id,
+            self.pr_number,
+            self.head_sha,
+            self.reviewer_agent_id,
+            self.verdict,
+            self.reviewer_account_authenticated,
+            self.dismissed,
+            self.forgejo_stale,
+            self.reviewer_identity_unresolved,
+        )
 
 
 class GateStatus(str, Enum):
@@ -355,6 +472,7 @@ RUN_KEYS = frozenset(
         "session_mode",
         "reviewer_max_rounds",
         "reviewer_max_rounds_source",
+        "plan_manifest",
     }
 )
 ORDERED_STAGE_KEYS = frozenset({"order", "sub_tls"})
@@ -416,7 +534,19 @@ INTEGRATION_CANDIDATE_KEYS = frozenset(
     }
 )
 INTEGRATION_VERIFICATION_VALUES = frozenset({"pending", "passed", "failed"})
-FSM_KEYS = frozenset({"phase", "waiting"})
+FSM_KEYS = frozenset({"phase", "waiting", "kind", "payload"})
+RECURSIVE_FSM_KINDS = frozenset(
+    {
+        "tl_planning",
+        "tl_running",
+        "tl_all_merged",
+        "tl_finalizing",
+        "tl_done",
+        "tl_pr_filed",
+        "tl_failed",
+        "tl_parked",
+    }
+)
 SLICE_KEYS = frozenset(
     {
         "id",
@@ -440,6 +570,10 @@ SLICE_KEYS = frozenset(
         "review_rounds",
         "reviewed_head",
         "verdict_at",
+        "review_evidence",
+        "review_validation_required",
+        "review_validation_disposition",
+        "review_validation_failure_reason",
         "attempts",
         "verdict",
         "park_cause",
@@ -465,6 +599,8 @@ SLICE_KEYS = frozenset(
         "handoff",
         "observation_provenance",
         "action",
+        "manifest_node_id",
+        "manifest_revision",
     }
 )
 RECONCILIATION_KEYS = frozenset(
@@ -555,6 +691,21 @@ OBSERVATION_PROVENANCE_KEYS = frozenset(
 ACTION_KEYS = frozenset(
     {"kind", "phase", "state_version", "intent_id", "head_sha", "attempt", "contract_digest"}
 )
+REVIEW_EVIDENCE_KEYS = frozenset(
+    {
+        "review_id",
+        "pr_number",
+        "head_sha",
+        "reviewer_agent_id",
+        "verdict",
+        "submitted_at",
+        "validated_at",
+        "reviewer_account_authenticated",
+        "dismissed",
+        "forgejo_stale",
+        "reviewer_identity_unresolved",
+    }
+)
 BUDGET_KEYS = frozenset({"ledger"})
 LEDGER_KEYS = frozenset(
     {
@@ -622,6 +773,10 @@ class SliceState:
     repair_attempts: int = 0
     review_rounds: int = 0
     verdict_at: str | None = None
+    review_evidence: DurableReviewEvidence | None = None
+    review_validation_required: bool = False
+    review_validation_disposition: ReviewValidationDisposition | None = None
+    review_validation_failure_reason: str | None = None
     park_cause: ParkCause | None = None
     park_issue_id: int | None = None
     park_audit: Mapping[str, object] | None = None
@@ -645,6 +800,8 @@ class SliceState:
     handoff: HandoffEvidence | None = None
     observation_provenance: ObservationProvenance | None = None
     action: ActionState | None = None
+    manifest_node_id: str | None = None
+    manifest_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -807,6 +964,8 @@ class RunState:
     # pre-policy legacy form; otherwise validation admits only producer pairs.
     reviewer_max_rounds: int | None = None
     reviewer_max_rounds_source: ReviewPolicySource | None = None
+    plan_manifest: PlanManifest | None = None
+    recursive_fsm: object | None = None
 
 
 class SchemaError(ValueError):
@@ -851,8 +1010,19 @@ def validate(doc: object) -> None:
         _enum_value(fsm, "phase", "run.fsm", TLPhase, errors)
         _string_list(fsm, "waiting", "run.fsm", errors, allow_empty=True)
         _unique_strings(fsm.get("waiting"), "run.fsm.waiting", errors)
+        if "kind" in fsm:
+            if fsm.get("kind") != "recursive":
+                errors.append(("run.fsm.kind", "must be 'recursive' when present"))
+            payload = fsm.get("payload")
+            if not isinstance(payload, Mapping):
+                errors.append(("run.fsm.payload", "must be an object"))
+            elif payload.get("kind") not in RECURSIVE_FSM_KINDS:
+                errors.append(("run.fsm.payload.kind", "is not a recognised recursive FSM kind"))
+        elif "payload" in fsm:
+            errors.append(("run.fsm.kind", "is required when a payload is present"))
 
     slices = _slice_map(root.get("slices"), errors)
+    _validate_plan_manifest(root.get("plan_manifest"), slices, errors)
     _goals(root.get("goals"), errors)
     _ordered_state(root, errors)
     _budgets(root.get("budgets"), errors)
@@ -875,6 +1045,55 @@ def _version(root: dict[str, object], errors: list[tuple[str, str]]) -> None:
         errors.append(("run.version", "must be an integer"))
     elif value not in {SCHEMA_VERSION}:
         errors.append(("run.version", f"unrecognised version {value}"))
+
+
+def _validate_plan_manifest(
+    value: object,
+    slices: dict[str, dict[str, object]] | None,
+    errors: list[tuple[str, str]],
+) -> None:
+    if value is None:
+        errors.append(("run.plan_manifest", "is required for schema v4 checkpoints"))
+        return
+    if not isinstance(value, Mapping):
+        errors.append(("run.plan_manifest", "must be an object"))
+        return
+    try:
+        manifest = PlanManifest.from_document(value)
+    except (ManifestError, TypeError, ValueError) as error:
+        errors.append(("run.plan_manifest", str(error)))
+        return
+    if slices is None:
+        return
+    nodes = {node.node_id: node for node in manifest.nodes}
+    persisted_names = set(slices)
+    for node in manifest.nodes:
+        if node.name not in persisted_names:
+            errors.append(
+                (
+                    "run.plan_manifest.nodes",
+                    f"node {node.node_id!r} has no persisted slice state",
+                )
+            )
+    for slice_id, record in slices.items():
+        node_id = record.get("manifest_node_id")
+        revision = record.get("manifest_revision")
+        path = f"run.slices[{slice_id!r}]"
+        if not isinstance(node_id, str) or not node_id:
+            errors.append(
+                (f"{path}.manifest_node_id", "is required when a plan manifest is present")
+            )
+            continue
+        node = nodes.get(node_id)
+        if node is None:
+            errors.append((f"{path}.manifest_node_id", "does not resolve to the plan manifest"))
+            continue
+        if node.name != slice_id:
+            errors.append((f"{path}.manifest_node_id", "resolves to a different slice name"))
+        if type(revision) is not int or revision != manifest.manifest_revision:
+            errors.append(
+                (f"{path}.manifest_revision", "does not match the plan manifest revision")
+            )
 
 
 def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> None:
@@ -1077,10 +1296,19 @@ def _validate_slice(
     _string_list(value, "test_plan", path, errors, allow_empty=True)
     for key in ("base_ref", "agent_type", "model", "branch", "worktree", "reviewed_head"):
         _nullable_string(value, key, path, errors)
+    _nullable_string(value, "manifest_node_id", path, errors)
+    _nullable_positive_int(value, "manifest_revision", path, errors)
     _nullable_positive_int(value, "pr_number", path, errors)
     _non_negative_int(value, "attempts", path, errors)
     _nullable_enum_value(value, "verdict", path, Verdict, errors)
     _nullable_string(value, "verdict_at", path, errors)
+    if "review_validation_required" in value:
+        _boolean(value, "review_validation_required", path, errors)
+    _nullable_enum_value(
+        value, "review_validation_disposition", path, ReviewValidationDisposition, errors
+    )
+    _nullable_string(value, "review_validation_failure_reason", path, errors)
+    _validate_review_evidence(value.get("review_evidence"), path, errors)
     if value.get("verdict") is not None and (
         not isinstance(value.get("reviewed_head"), str) or not value.get("reviewed_head")
     ):
@@ -1421,6 +1649,27 @@ def _validate_action(value: object, path: str, errors: list[tuple[str, str]]) ->
     _nullable_string(action, "head_sha", f"{path}.action", errors)
     _nullable_positive_int(action, "attempt", f"{path}.action", errors)
     _nullable_string(action, "contract_digest", f"{path}.action", errors)
+
+
+def _validate_review_evidence(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    evidence = _object(value, f"{path}.review_evidence", REVIEW_EVIDENCE_KEYS, errors)
+    if evidence is None:
+        return
+    _positive_int(evidence, "review_id", f"{path}.review_evidence", errors)
+    _positive_int(evidence, "pr_number", f"{path}.review_evidence", errors)
+    for key in ("head_sha", "reviewer_agent_id", "submitted_at"):
+        _non_empty_string(evidence, key, f"{path}.review_evidence", errors)
+    _enum_value(evidence, "verdict", f"{path}.review_evidence", Verdict, errors)
+    _nullable_string(evidence, "validated_at", f"{path}.review_evidence", errors)
+    for key in (
+        "reviewer_account_authenticated",
+        "dismissed",
+        "forgejo_stale",
+        "reviewer_identity_unresolved",
+    ):
+        _boolean(evidence, key, f"{path}.review_evidence", errors)
 
 
 def _validate_deadline_ledger(value: object, path: str, errors: list[tuple[str, str]]) -> None:

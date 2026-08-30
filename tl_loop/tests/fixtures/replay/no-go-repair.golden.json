@@ -38,6 +38,7 @@
   "events": {
     "last_consumed_offset": 8
   },
+  "current_order": 1,
   "fsm": {
     "phase": "tl_done",
     "waiting": []
@@ -52,10 +53,34 @@
     "last_progress_at": "<timestamp>",
     "objective": ""
   },
+  "integration": {
+    "aggregate_head_sha": null,
+    "aggregate_original_base_sha": null,
+    "aggregate_patch_digest": null,
+    "aggregate_pr_number": null,
+    "base_revalidation_count": 0,
+    "candidates": {},
+    "ci_status": "unknown",
+    "head_sha": null,
+    "integration_owner_branch": null,
+    "integration_owner_id": null,
+    "integration_owner_run_id": null,
+    "integration_owner_worktree": null,
+    "lifecycle": "RUNNING",
+    "merge_attempts": 0,
+    "merge_tree_sha": null,
+    "patch_digest": null,
+    "stage_verification": "pending",
+    "sub_tl_recovery": {},
+    "sub_tl_states": {},
+    "validated_base_sha": null
+  },
+  "ordered_stages": [],
   "reviewer_max_rounds": 5,
   "reviewer_max_rounds_source": "policy_file",
-  "revision": 22,
+  "revision": 26,
   "run_id": "<run-id>",
+  "state_version": 1,
   "slices": {
     "leaf-a": {
       "agent_type": "codex/gpt-luna",
@@ -89,6 +114,7 @@
         ],
         "digest": "8b8f11362e3aa144fc0dc4777705bc3d431b7dc47d65e1334ea365432051ff3b"
       },
+      "review_validation_required": true,
       "reviewed_head": "head-a",
       "reviewer_attempt": {},
       "status": "spawned",
@@ -133,5 +159,5 @@
       "worktree": null
     }
   },
-  "version": 2
+  "version": 4
 }

@@ -9,11 +9,13 @@
     "last_consumed_offset": 0
   },
   "fsm": {
-    "phase": "tl_planning",
-    "waiting": []
+    "phase": "tl_running",
+    "waiting": [
+      "leaf-a"
+    ]
   },
   "gates": [],
-  "revision": 1,
+  "revision": 2,
   "run_id": "<run-id>",
   "slices": {
     "leaf-a": {
@@ -95,5 +97,5 @@
       "worktree": null
     }
   },
-  "version": 2
+  "version": 4
 }

@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
+from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import SCHEMA_VERSION, SchemaError, validate
 from tl_loop.state.write import ConcurrentWrite, WriteHooks, apply
 
@@ -22,7 +23,9 @@ def test_concurrent_processes_serialize_without_lost_updates(tmp_path: Path) -> 
     context = multiprocessing.get_context(context_name)
     results: Any = context.Queue()
     process_type = cast(Any, context).Process
-    processes = [process_type(target=_increment_worker, args=(str(run_dir), results)) for _ in range(4)]
+    processes = [
+        process_type(target=_increment_worker, args=(str(run_dir), results)) for _ in range(4)
+    ]
     for process in processes:
         process.start()
     for process in processes:
@@ -32,7 +35,9 @@ def test_concurrent_processes_serialize_without_lost_updates(tmp_path: Path) -> 
     for _ in processes:
         assert results.get(timeout=2) is None
 
-    document = cast(dict[str, object], json.loads((run_dir / "run.json").read_text(encoding="utf-8")))
+    document = cast(
+        dict[str, object], json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    )
     validate(document)
     ledger = cast(dict[str, object], cast(dict[str, object], document["budgets"])["ledger"])
     assert ledger["tokens"] == 4
@@ -79,9 +84,13 @@ def test_final_compare_and_swap_rejects_external_change(tmp_path: Path) -> None:
     run_dir = _make_run(tmp_path)
 
     def external_change() -> None:
-        document = cast(dict[str, object], json.loads((run_dir / "run.json").read_text(encoding="utf-8")))
+        document = cast(
+            dict[str, object], json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        )
         document["revision"] = 99
-        (run_dir / "run.json").write_bytes((json.dumps(document, sort_keys=True) + "\n").encode("utf-8"))
+        (run_dir / "run.json").write_bytes(
+            (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+        )
 
     try:
         apply(run_dir, _increment, hooks=WriteHooks(before_rename=external_change))
@@ -89,7 +98,9 @@ def test_final_compare_and_swap_rejects_external_change(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("expected concurrent write detection")
-    current = cast(dict[str, object], json.loads((run_dir / "run.json").read_text(encoding="utf-8")))
+    current = cast(
+        dict[str, object], json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    )
     assert current["revision"] == 99
 
 
@@ -144,6 +155,15 @@ def _make_run(tmp_path: Path) -> Path:
         "gates": [{"name": "plan", "status": "pending"}],
         "events": {"last_consumed_offset": 0},
     }
+    manifest = build_plan_manifest(
+        {"workers": [{"name": "slice-a", "task": "legacy"}]},
+        scope_id="run-1",
+        owned_branch="legacy",
+    )
+    document["plan_manifest"] = manifest.to_document()
+    cast(dict[str, object], document["slices"])["slice-a"].update(
+        {"manifest_node_id": manifest.nodes[0].node_id, "manifest_revision": 1}
+    )
     target = run_dir / "run.json"
     target.write_bytes((json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     validate(document)

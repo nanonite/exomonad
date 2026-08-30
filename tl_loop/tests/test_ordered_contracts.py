@@ -92,14 +92,15 @@ def test_ordered_plan_rejects_mixed_invalid_or_non_contiguous_orders(
     assert message in str(error.value)
 
 
-def test_ordered_plan_rejects_top_level_leaves_and_recursive_overlap() -> None:
-    with pytest.raises(ValueError, match="leaves must be empty"):
-        WorkPlan.from_mapping(
-            {
-                "leaves": [{"name": "top", "task": "not staged"}],
-                "sub_tls": [{"name": "stage", "order": 1, "plan": {}}],
-            }
-        )
+def test_ordered_plan_keeps_top_level_leaves_and_rejects_recursive_overlap() -> None:
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [{"name": "top", "task": "parallel"}],
+            "sub_tls": [{"name": "stage", "order": 1, "plan": {}}],
+        }
+    )
+    assert [leaf.name for leaf in plan.leaves] == ["top"]
+    assert plan.ordered_stages[0].sub_tls == ("stage",)
     with pytest.raises(ValueError, match="ownership overlaps"):
         WorkPlan.from_mapping(
             {

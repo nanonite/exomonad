@@ -7,11 +7,12 @@ import json
 import os
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeAlias, cast
 
+from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.phase import (
     PhaseValue,
     TLAllMerged,
@@ -24,14 +25,49 @@ from tl_loop.fsm.phase import (
     TLPRFiled,
     TLWaiting,
 )
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import decode_recovery, encode_recovery
+from tl_loop.fsm.scope import (
+    TLAllMerged as RecursiveTLAllMerged,
+)
+from tl_loop.fsm.scope import (
+    TLDone as RecursiveTLDone,
+)
+from tl_loop.fsm.scope import (
+    TLFailed as RecursiveTLFailed,
+)
+from tl_loop.fsm.scope import (
+    TLFinalizing as RecursiveTLFinalizing,
+)
+from tl_loop.fsm.scope import (
+    TLParked as RecursiveTLParked,
+)
+from tl_loop.fsm.scope import (
+    TLPlanning as RecursiveTLPlanning,
+)
+from tl_loop.fsm.scope import (
+    TLPRFiled as RecursiveTLPRFiled,
+)
+from tl_loop.fsm.scope import (
+    TLRunning as RecursiveTLRunning,
+)
+from tl_loop.fsm.scope_events import ScopeRole
+from tl_loop.fsm.scope_projection import phase_tag as canonical_phase_tag
 from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 
+from .lock import RunLock
 from .migration import (
     MigrationError,
     install_migration,
     migrate_checkpoint_document,
     record_migration_failure,
+)
+from .plan_manifest import (
+    ManifestError,
+    ManifestNode,
+    PlanManifest,
+    build_legacy_manifest,
+    validate_manifest_revision,
 )
 from .schema import (
     SCHEMA_VERSION,
@@ -42,6 +78,7 @@ from .schema import (
     BudgetCharge,
     BudgetLedger,
     DeadlineLedger,
+    DurableReviewEvidence,
     EventCursor,
     FSMState,
     GateState,
@@ -56,6 +93,7 @@ from .schema import (
     PublicationBinding,
     RepositoryIdentity,
     ReviewPolicySource,
+    ReviewValidationDisposition,
     RunState,
     SchemaError,
     SessionMode,
@@ -73,7 +111,19 @@ from .write import apply
 DEFAULT_ROOT = Path(".exo/tl-loop")
 RootSpec: TypeAlias = Mapping[str, object]
 SliceInput: TypeAlias = SliceState | Mapping[str, object]
-FSMInput: TypeAlias = FSMState | PhaseValue | TLPhase
+FSMInput: TypeAlias = (
+    FSMState
+    | PhaseValue
+    | TLPhase
+    | RecursiveTLPlanning
+    | RecursiveTLRunning
+    | RecursiveTLAllMerged
+    | RecursiveTLFinalizing
+    | RecursiveTLDone
+    | RecursiveTLPRFiled
+    | RecursiveTLFailed
+    | RecursiveTLParked
+)
 BudgetInput: TypeAlias = BudgetLedger | Mapping[str, object]
 OrderedStagesInput: TypeAlias = (
     tuple[OrderedStageState, ...] | list[Mapping[str, object]] | Mapping[str, object]
@@ -152,6 +202,8 @@ class ResumeState:
     reviewer_max_rounds: int | None = None
     reviewer_max_rounds_source: ReviewPolicySource | None = None
     session_mode: SessionMode | None = None
+    plan_manifest: PlanManifest | None = None
+    recursive_fsm: object | None = None
 
     @property
     def phase(self) -> TLPhase:
@@ -188,6 +240,8 @@ class RunStore:
         current_order: int | None = None,
         ordered_stages: OrderedStagesInput | None = None,
         integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
     ) -> RunState:
         """Persist one checkpoint through the shared atomic mutation path."""
         return checkpoint(
@@ -199,7 +253,53 @@ class RunStore:
             current_order=current_order,
             ordered_stages=ordered_stages,
             integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
         )
+
+    def set_plan_manifest(
+        self,
+        manifest: PlanManifest,
+        *,
+        slices: Mapping[str, SliceInput] | None = None,
+        protected_node_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> RunState:
+        """Install the immutable continuation manifest and bind direct slices."""
+        if not isinstance(manifest, PlanManifest):
+            raise TypeError("manifest must be a PlanManifest")
+        encoded = manifest.to_document()
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            existing = document.get("plan_manifest")
+            replace_node_binding = False
+            if isinstance(existing, dict):
+                previous = PlanManifest.from_document(existing)
+                if previous.digest != manifest.digest:
+                    if _is_legacy_manifest(previous):
+                        replace_node_binding = True
+                    else:
+                        validate_manifest_revision(
+                            previous,
+                            manifest,
+                            protected_node_ids=protected_node_ids,
+                        )
+            document["plan_manifest"] = copy.deepcopy(encoded)
+            encoded_slices = (
+                _encode_slices(slices)
+                if slices is not None
+                else _activate_manifest_nodes(document.get("slices"), manifest)
+            )
+            document["slices"] = encoded_slices
+            _bind_slice_records(
+                encoded_slices,
+                manifest,
+                replace_revision=True,
+                replace_node_binding=replace_node_binding,
+            )
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
 
     def set_ordered_state(
         self,
@@ -532,12 +632,28 @@ def load(path: str | Path) -> RunState:
         raise CorruptCheckpoint(f"{target}: migration blocked: {error}; see {report}") from error
     if migration.migrated:
         try:
-            validate(migration.document)
-            migrated_state = _decode(migration.document)
-            _assert_consistent(target, migrated_state)
-            install_migration(target, migration)
-            value = migration.document
-        except (OSError, SchemaError, CorruptCheckpoint, MigrationError) as error:
+            # Migration is a read/transform/write transaction.  A controller
+            # and ledger tailer can discover the same legacy checkpoint at
+            # nearly the same time, so the first transform must be discarded
+            # after taking the lock and the live file must be read again.
+            with RunLock(target.with_name("migration.lock")):
+                locked_data = _read_bytes(target)
+                locked_value = json.loads(locked_data.decode("utf-8"))
+                if not isinstance(locked_value, dict):
+                    raise MigrationError("checkpoint must contain a JSON object")
+                migration = migrate_checkpoint_document(
+                    locked_value,
+                    run_id=target.parent.name,
+                )
+                if migration.migrated:
+                    validate(migration.document)
+                    migrated_state = _decode(migration.document)
+                    _assert_consistent(target, migrated_state)
+                    install_migration(target, migration)
+                    value = migration.document
+                else:
+                    value = locked_value
+        except (OSError, TimeoutError, SchemaError, CorruptCheckpoint, MigrationError) as error:
             report = record_migration_failure(target, error)
             raise CorruptCheckpoint(
                 f"{target}: migration validation failed: {error}; see {report}"
@@ -563,6 +679,8 @@ def checkpoint(
     current_order: int | None = None,
     ordered_stages: OrderedStagesInput | None = None,
     integration: IntegrationInput | None = None,
+    state_version: int | None = None,
+    plan_manifest: PlanManifest | None = None,
 ) -> RunState:
     """Atomically update a run's FSM, slices, budget ledger, and event offset."""
     run_directory = _resolve_run_directory(run_id, path, root_dir)
@@ -573,13 +691,51 @@ def checkpoint(
     encoded_budgets = _encode_budgets(budgets)
     encoded_stages = _encode_ordered_stages(ordered_stages) if ordered_stages is not None else None
     encoded_integration = _encode_integration(integration) if integration is not None else None
+    encoded_manifest = plan_manifest.to_document() if plan_manifest is not None else None
     if current_order is not None and (type(current_order) is not int or current_order <= 0):
         raise ValueError("current_order must be a positive integer")
+    if state_version is not None and (type(state_version) is not int or state_version < 0):
+        raise ValueError("state_version must be a non-negative integer")
     _assert_encoded_consistent(run_directory / "run.json", encoded_fsm, encoded_slices)
 
     def mutate(document: dict[str, object]) -> dict[str, object]:
-        document["fsm"] = copy.deepcopy(encoded_fsm)
+        existing_fsm = document.get("fsm")
+        legacy_terminal = isinstance(fsm, (TLDone, TLPRFiled, TLFailed))
+        if (
+            isinstance(existing_fsm, Mapping)
+            and existing_fsm.get("kind") == "recursive"
+            and not isinstance(
+                fsm,
+                (
+                    RecursiveTLPlanning,
+                    RecursiveTLRunning,
+                    RecursiveTLAllMerged,
+                    RecursiveTLFinalizing,
+                    RecursiveTLDone,
+                    RecursiveTLPRFiled,
+                    RecursiveTLFailed,
+                    RecursiveTLParked,
+                ),
+            )
+            and not legacy_terminal
+        ):
+            # The compact phase/waiting fields are a compatibility projection.
+            # Once a canonical scope FSM exists, slice-only checkpoints retain it.
+            document["fsm"] = copy.deepcopy(existing_fsm)
+        else:
+            document["fsm"] = copy.deepcopy(encoded_fsm)
         document["slices"] = copy.deepcopy(encoded_slices)
+        if encoded_manifest is not None:
+            document["plan_manifest"] = copy.deepcopy(encoded_manifest)
+        if isinstance(document.get("plan_manifest"), dict):
+            manifest = PlanManifest.from_document(document["plan_manifest"])
+            if any(
+                slice_id not in {node.name for node in manifest.nodes}
+                for slice_id in encoded_slices
+            ):
+                manifest = _extend_legacy_manifest(manifest, document)
+                document["plan_manifest"] = manifest.to_document()
+            _bind_slice_records(document["slices"], manifest)
         document["budgets"] = copy.deepcopy(encoded_budgets)
         document["events"] = {"last_consumed_offset": offset}
         if current_order is not None:
@@ -588,6 +744,11 @@ def checkpoint(
             document["ordered_stages"] = copy.deepcopy(encoded_stages)
         if encoded_integration is not None:
             document["integration"] = copy.deepcopy(encoded_integration)
+        if state_version is not None:
+            current_version = document.get("state_version", 0)
+            if type(current_version) is not int or state_version < current_version:
+                raise ValueError("state_version must not regress")
+            document["state_version"] = state_version
         return document
 
     apply(run_directory, mutate)
@@ -611,6 +772,8 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
         reviewer_max_rounds=state.reviewer_max_rounds,
         reviewer_max_rounds_source=state.reviewer_max_rounds_source,
         session_mode=state.session_mode,
+        plan_manifest=state.plan_manifest,
+        recursive_fsm=state.recursive_fsm,
     )
 
 
@@ -638,6 +801,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "session_mode",
         "reviewer_max_rounds",
         "reviewer_max_rounds_source",
+        "plan_manifest",
     }
     unknown = sorted(set(root_spec) - allowed)
     if unknown:
@@ -655,7 +819,18 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
     if "session_mode" in root_spec:
         document["session_mode"] = root_spec["session_mode"]
     for key, value in root_spec.items():
-        document[key] = copy.deepcopy(value)
+        if key == "fsm" and not isinstance(value, Mapping):
+            document[key] = _encode_fsm(value)
+        else:
+            document[key] = copy.deepcopy(value)
+    if isinstance(document.get("plan_manifest"), dict):
+        manifest = PlanManifest.from_document(document["plan_manifest"])
+        document["slices"] = _activate_manifest_nodes(document.get("slices"), manifest)
+        _bind_slice_records(document.get("slices"), manifest)
+    else:
+        manifest = build_legacy_manifest(document, run_id=run_id)
+        document["plan_manifest"] = manifest.to_document()
+        _bind_slice_records(document["slices"], manifest)
     return document
 
 
@@ -715,6 +890,20 @@ def _identity(document: dict[str, object]) -> dict[str, object]:
 
 
 def _encode_fsm(fsm: FSMInput) -> dict[str, object]:
+    if isinstance(
+        fsm,
+        (
+            RecursiveTLPlanning,
+            RecursiveTLRunning,
+            RecursiveTLAllMerged,
+            RecursiveTLFinalizing,
+            RecursiveTLDone,
+            RecursiveTLPRFiled,
+            RecursiveTLFailed,
+            RecursiveTLParked,
+        ),
+    ):
+        return _encode_recursive_fsm(fsm)
     if isinstance(fsm, FSMState):
         return {"phase": fsm.phase.value, "waiting": list(fsm.waiting)}
     if isinstance(fsm, TLPhase):
@@ -735,6 +924,173 @@ def _encode_fsm(fsm: FSMInput) -> dict[str, object]:
         if isinstance(fsm, phase_type):
             return {"phase": phase.value, "waiting": []}
     raise TypeError(f"unsupported FSM value: {type(fsm).__name__}")
+
+
+def _encode_recursive_fsm(fsm: object) -> dict[str, object]:
+    """Encode the complete #1048 scope value behind a stable discriminator."""
+    if isinstance(fsm, RecursiveTLPlanning):
+        payload = {
+            "kind": "tl_planning",
+            "scope_path": list(fsm.scope_path),
+            "plan_digest": fsm.plan_digest,
+            "parallel_children": _encode_child_records(fsm.parallel_children),
+            "ordered_children": [
+                {"order": order, "children": _encode_child_records(children)}
+                for order, children in fsm.ordered_children
+            ],
+        }
+        return {
+            "kind": "recursive",
+            "phase": TLPhase.TLPlanning.value,
+            "waiting": [],
+            "payload": payload,
+        }
+    if isinstance(fsm, RecursiveTLRunning):
+        waiting = [record.child_id for record in fsm.parallel_pending] + [
+            record.child_id
+            for _, records in sorted(fsm.pending_by_order.items())
+            for record in records
+        ]
+        payload = {
+            "kind": "tl_running",
+            "current_order": fsm.current_order,
+            "pending_by_order": {
+                str(order): _encode_child_records(records)
+                for order, records in sorted(fsm.pending_by_order.items())
+            },
+            "scope_path": list(fsm.scope_path),
+            "plan_digest": fsm.plan_digest,
+            "parallel_pending": _encode_child_records(fsm.parallel_pending),
+            "completed_children": {
+                child_id: _encode_child_record(record)
+                for child_id, record in fsm.completed_children.items()
+            },
+            "post_merge": {
+                child_id: _encode_post_merge_state(state)
+                for child_id, state in fsm.post_merge.items()
+            },
+            "dispatch_intents": dict(fsm.dispatch_intents),
+            "evidence": dict(fsm.evidence),
+            "lane_bindings": dict(fsm.lane_bindings),
+        }
+        return {
+            "kind": "recursive",
+            "phase": TLPhase.TLRunning.value,
+            "waiting": waiting,
+            "payload": payload,
+        }
+    if isinstance(fsm, RecursiveTLAllMerged):
+        payload = {
+            "kind": "tl_all_merged",
+            "scope_path": list(fsm.scope_path),
+            "plan_digest": fsm.plan_digest,
+            "completed_children": {
+                child_id: _encode_post_merge_state(state)
+                for child_id, state in fsm.completed_children.items()
+            },
+        }
+        return {
+            "kind": "recursive",
+            "phase": TLPhase.TLAllMerged.value,
+            "waiting": [],
+            "payload": payload,
+        }
+    if isinstance(fsm, RecursiveTLFinalizing):
+        payload = {
+            "kind": "tl_finalizing",
+            "role": fsm.role.value,
+            "scope_path": list(fsm.scope_path),
+            "plan_digest": fsm.plan_digest,
+            "evidence": dict(fsm.evidence),
+        }
+        return {
+            "kind": "recursive",
+            "phase": TLPhase.TLFinalizing.value,
+            "waiting": [],
+            "payload": payload,
+        }
+    if isinstance(fsm, RecursiveTLDone):
+        payload = {
+            "kind": "tl_done",
+            "scope_path": list(fsm.scope_path),
+            "plan_digest": fsm.plan_digest,
+            "finalization_evidence": dict(fsm.finalization_evidence),
+        }
+        return {
+            "kind": "recursive",
+            "phase": TLPhase.TLDone.value,
+            "waiting": [],
+            "payload": payload,
+        }
+    if isinstance(fsm, RecursiveTLPRFiled):
+        payload = {
+            "kind": "tl_pr_filed",
+            "aggregate_pr": fsm.aggregate_pr,
+            "head_sha": fsm.head_sha,
+            "base_sha": fsm.base_sha,
+            "parent_branch": fsm.parent_branch,
+            "handoff": fsm.handoff,
+            "scope_path": list(fsm.scope_path),
+            "plan_digest": fsm.plan_digest,
+        }
+        return {
+            "kind": "recursive",
+            "phase": TLPhase.TLPRFiled.value,
+            "waiting": [],
+            "payload": payload,
+        }
+    if isinstance(fsm, RecursiveTLFailed):
+        payload = {
+            "kind": "tl_failed",
+            "reason": fsm.reason,
+            "scope_path": list(fsm.scope_path),
+            "last_evidence": dict(fsm.last_evidence),
+            "next_transition": fsm.next_transition,
+        }
+        return {
+            "kind": "recursive",
+            "phase": TLPhase.TLFailed.value,
+            "waiting": [],
+            "payload": payload,
+        }
+    if isinstance(fsm, RecursiveTLParked):
+        payload = {
+            "kind": "tl_parked",
+            "cause": fsm.cause,
+            "diagnostic": fsm.diagnostic,
+            "scope_path": list(fsm.scope_path),
+            "next_transition": fsm.next_transition,
+        }
+        return {
+            "kind": "recursive",
+            "phase": TLPhase.TLParked.value,
+            "waiting": [],
+            "payload": payload,
+        }
+    raise TypeError(f"unsupported recursive FSM value: {type(fsm).__name__}")
+
+
+def _encode_child_records(records: object) -> list[dict[str, object]]:
+    if not isinstance(records, (tuple, list)):
+        raise TypeError("recursive child records must be a sequence")
+    return [_encode_child_record(record) for record in records]
+
+
+def _encode_child_record(record: ChildRecord) -> dict[str, object]:
+    return {
+        "child_id": record.child_id,
+        "kind": record.kind.value,
+        "dispatch_intent_id": record.dispatch_intent_id,
+        "invocation_id": record.invocation_id,
+        "evidence": dict(record.evidence),
+        "lane_id": record.lane_id,
+        "manifest_node_id": record.manifest_node_id,
+        "manifest_revision": record.manifest_revision,
+    }
+
+
+def _encode_post_merge_state(state: PostMergeState) -> dict[str, object]:
+    return {"phase": state.phase.value, "evidence": dict(state.evidence)}
 
 
 def _encode_slices(slices: Mapping[str, SliceInput]) -> dict[str, object]:
@@ -773,6 +1129,14 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["review_contract"] = copy.deepcopy(dict(value.review_contract))
         if value.verdict_at is not None:
             record["verdict_at"] = value.verdict_at
+        if value.review_evidence is not None:
+            record["review_evidence"] = _encode_review_evidence(value.review_evidence)
+        if value.review_validation_required:
+            record["review_validation_required"] = True
+        if value.review_validation_disposition is not None:
+            record["review_validation_disposition"] = value.review_validation_disposition.value
+        if value.review_validation_failure_reason is not None:
+            record["review_validation_failure_reason"] = value.review_validation_failure_reason
         if value.park_cause is not None:
             record["park_cause"] = value.park_cause.value
         if value.park_issue_id is not None:
@@ -832,10 +1196,106 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             )
         if value.action is not None:
             record["action"] = _encode_action(value.action)
+        if value.manifest_node_id is not None:
+            record["manifest_node_id"] = value.manifest_node_id
+        if value.manifest_revision is not None:
+            record["manifest_revision"] = value.manifest_revision
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
     raise TypeError(f"slice {slice_id!r} is not a SliceState or object")
+
+
+def _bind_slice_records(
+    value: object,
+    manifest: PlanManifest,
+    *,
+    replace_revision: bool = False,
+    replace_node_binding: bool = False,
+) -> None:
+    """Bind each persisted direct slice to one immutable manifest node."""
+    if not isinstance(value, dict):
+        raise ManifestError("manifest-backed slices must be an object")
+    by_name: dict[str, str] = {node.name: node.node_id for node in manifest.nodes}
+    if len(by_name) != len(manifest.nodes):
+        raise ManifestError("manifest node names must be unique within a scope")
+    for slice_id, raw in value.items():
+        if not isinstance(raw, dict):
+            raise ManifestError(f"slice {slice_id!r} must be an object")
+        node_id = by_name.get(slice_id)
+        if node_id is None:
+            raise ManifestError(f"slice {slice_id!r} is not declared by the plan manifest")
+        prior_id = raw.get("manifest_node_id")
+        prior_revision = raw.get("manifest_revision")
+        if not replace_node_binding and prior_id is not None and prior_id != node_id:
+            raise ManifestError(f"slice {slice_id!r} is bound to a different manifest node")
+        if (
+            not replace_revision
+            and prior_revision is not None
+            and prior_revision != manifest.manifest_revision
+        ):
+            raise ManifestError(f"slice {slice_id!r} has a stale manifest revision")
+        raw["manifest_node_id"] = node_id
+        raw["manifest_revision"] = manifest.manifest_revision
+
+
+def _activate_manifest_nodes(value: object, manifest: PlanManifest) -> dict[str, object]:
+    """Retain runtime records and create safe pending records for new nodes."""
+    if not isinstance(value, dict):
+        raise ManifestError("manifest-backed slices must be an object")
+    activated = copy.deepcopy(value)
+    existing = set(activated)
+    for node in manifest.nodes:
+        if node.name not in existing:
+            activated[node.name] = _pending_manifest_slice(node)
+    return activated
+
+
+def _is_legacy_manifest(manifest: PlanManifest) -> bool:
+    return manifest.role == "root" and manifest.owned_branch == "legacy"
+
+
+def _extend_legacy_manifest(manifest: PlanManifest, document: Mapping[str, object]) -> PlanManifest:
+    """Keep legacy callers usable while making newly persisted slices explicit."""
+    if manifest.owned_branch != "legacy" or manifest.role != "root":
+        raise ManifestError("checkpoint contains a slice absent from its immutable plan manifest")
+    expanded = build_legacy_manifest(document, run_id=manifest.scope_id)
+    expanded = replace(expanded, manifest_revision=manifest.manifest_revision + 1, digest=None)
+    slices = document.get("slices")
+    protected = {
+        node.node_id
+        for node in manifest.nodes
+        if isinstance(slices, Mapping)
+        and isinstance(slices.get(node.name), Mapping)
+        and slices[node.name].get("status")
+        not in {SliceStatus.PENDING.value, SliceStatus.READY.value}
+    }
+    validate_manifest_revision(manifest, expanded, protected_node_ids=protected)
+    return expanded
+
+
+def _pending_manifest_slice(node: ManifestNode) -> dict[str, object]:
+    """Build the inert runtime record for a newly declared manifest node."""
+    return {
+        "id": node.name,
+        "status": SliceStatus.PENDING.value,
+        "paths": list(node.boundary or (f"tl-loop/{node.name}",)),
+        "depends_on": [],
+        "base_ref": None,
+        "test_plan": ["controller"],
+        "agent_type": node.agent_type,
+        "model": None,
+        "branch": node.owned_branch,
+        "worktree": node.worktree,
+        "pr_number": None,
+        "review_findings": {},
+        "ci_state": {},
+        "reviewer_attempt": {},
+        "repair_attempts": 0,
+        "reviewed_head": None,
+        "attempts": 0,
+        "verdict": None,
+    }
 
 
 def _encode_review_findings(
@@ -879,6 +1339,22 @@ def _encode_observation_provenance(value: ObservationProvenance) -> dict[str, ob
         "source_epoch": value.source_epoch,
         "source_revision": value.source_revision,
         "coverage": list(value.coverage),
+    }
+
+
+def _encode_review_evidence(value: DurableReviewEvidence) -> dict[str, object]:
+    return {
+        "review_id": value.review_id,
+        "pr_number": value.pr_number,
+        "head_sha": value.head_sha,
+        "reviewer_agent_id": value.reviewer_agent_id,
+        "verdict": value.verdict.value,
+        "submitted_at": value.submitted_at,
+        "validated_at": value.validated_at,
+        "reviewer_account_authenticated": value.reviewer_account_authenticated,
+        "dismissed": value.dismissed,
+        "forgejo_stale": value.forgejo_stale,
+        "reviewer_identity_unresolved": value.reviewer_identity_unresolved,
     }
 
 
@@ -1021,13 +1497,52 @@ def _decode(document: dict[str, object]) -> RunState:
         slice_id: _decode_slice(cast(dict[str, object], value))
         for slice_id, value in raw_slices.items()
     }
+    recursive_fsm = _decode_recursive_fsm(fsm) if fsm.get("kind") == "recursive" else None
+    integration = _decode_integration(document.get("integration"))
+    phase = TLPhase(cast(str, fsm["phase"]))
+    if recursive_fsm is not None:
+        phase = canonical_phase_tag(recursive_fsm)
+        if isinstance(recursive_fsm, RecursiveTLRunning):
+            raw_integration = document.get("integration")
+            has_candidates = (
+                isinstance(raw_integration, Mapping)
+                and isinstance(raw_integration.get("candidates"), Mapping)
+                and any(
+                    isinstance(candidate, Mapping)
+                    and any(
+                        candidate.get(key)
+                        for key in ("aggregate_pr_number", "aggregate_head_sha", "head_sha")
+                    )
+                    for candidate in raw_integration["candidates"].values()
+                )
+            )
+            lifecycle = (
+                raw_integration.get("lifecycle") if isinstance(raw_integration, Mapping) else None
+            )
+            has_recovery = (
+                isinstance(raw_integration, Mapping)
+                and isinstance(raw_integration.get("sub_tl_recovery"), Mapping)
+                and bool(raw_integration["sub_tl_recovery"])
+            )
+            has_reviewing_slice = any(
+                isinstance(value, Mapping)
+                and value.get("status")
+                in {SliceStatus.IN_REVIEW.value, SliceStatus.REPAIRING.value}
+                for value in raw_slices.values()
+            )
+            if (
+                not has_candidates
+                and not has_reviewing_slice
+                and (lifecycle == IntegrationLifecycle.RUNNING.value or has_recovery)
+            ):
+                phase = TLPhase.TLRunning
     return RunState(
         version=cast(int, document["version"]),
         revision=cast(int, document["revision"]),
         run_id=cast(str, document["run_id"]),
         ledger_run_id=cast(str | None, document.get("ledger_run_id")),
         fsm=FSMState(
-            phase=TLPhase(cast(str, fsm["phase"])),
+            phase=phase,
             waiting=tuple(cast(list[str], fsm["waiting"])),
         ),
         slices=MappingProxyType(slices),
@@ -1054,7 +1569,7 @@ def _decode(document: dict[str, object]) -> RunState:
         depth=cast(int, document.get("depth", 0)),
         current_order=cast(int, document.get("current_order", 1)),
         ordered_stages=_decode_ordered_stages(document.get("ordered_stages")),
-        integration=_decode_integration(document.get("integration")),
+        integration=integration,
         repository_identity=_decode_repository_identity(document.get("repository_identity")),
         state_version=cast(int, document.get("state_version", 0)),
         controller_epoch=cast(str | None, document.get("controller_epoch")),
@@ -1069,7 +1584,262 @@ def _decode(document: dict[str, object]) -> RunState:
             if document.get("session_mode") is not None
             else None
         ),
+        plan_manifest=(
+            PlanManifest.from_document(cast(dict[str, object], document["plan_manifest"]))
+            if document.get("plan_manifest") is not None
+            else None
+        ),
+        recursive_fsm=recursive_fsm,
     )
+
+
+def _decode_recursive_fsm(value: Mapping[str, object]) -> object:
+    """Decode the complete target scope value retained beside legacy fields."""
+    payload = value.get("payload")
+    if not isinstance(payload, Mapping):
+        raise TypeError("recursive FSM payload must be an object")
+    kind = _recursive_text(payload, "kind")
+    scope_path = _optional_recursive_text_list(payload, "scope_path", ("root",))
+    if kind == "tl_failed":
+        return RecursiveTLFailed(
+            reason=_recursive_text(payload, "reason"),
+            scope_path=scope_path,
+            last_evidence=_optional_recursive_string_map(payload, "last_evidence"),
+            next_transition=_optional_recursive_text(
+                payload,
+                "next_transition",
+                "operator_recovery",
+            ),
+        )
+    if kind == "tl_parked":
+        return RecursiveTLParked(
+            cause=_recursive_text(payload, "cause"),
+            diagnostic=_recursive_text(payload, "diagnostic"),
+            scope_path=scope_path,
+            next_transition=_optional_recursive_text(
+                payload,
+                "next_transition",
+                "operator_recovery",
+            ),
+        )
+    plan_digest = _recursive_text(payload, "plan_digest")
+    if kind == "tl_planning":
+        ordered = tuple(
+            (
+                _recursive_int(stage, "order"),
+                tuple(_decode_child_record(child) for child in _recursive_list(stage, "children")),
+            )
+            for stage in _recursive_list(payload, "ordered_children")
+        )
+        return RecursiveTLPlanning(
+            ordered_children=ordered,
+            scope_path=scope_path,
+            plan_digest=plan_digest,
+            parallel_children=tuple(
+                _decode_child_record(child)
+                for child in _recursive_list(payload, "parallel_children")
+            ),
+        )
+    if kind == "tl_running":
+        pending_raw = payload.get("pending_by_order")
+        if not isinstance(pending_raw, Mapping):
+            raise ValueError("recursive pending_by_order must be an object")
+        pending = {
+            _recursive_order(order): tuple(
+                _decode_child_record(child) for child in _recursive_array(children, "pending order")
+            )
+            for order, children in pending_raw.items()
+        }
+        completed_raw = _recursive_mapping(payload, "completed_children")
+        post_raw = _recursive_mapping(payload, "post_merge")
+        return RecursiveTLRunning(
+            current_order=_recursive_int(payload, "current_order"),
+            pending_by_order=pending,
+            scope_path=scope_path,
+            plan_digest=plan_digest,
+            parallel_pending=tuple(
+                _decode_child_record(child)
+                for child in _recursive_list(payload, "parallel_pending")
+            ),
+            completed_children={
+                child_id: _decode_child_record(child) for child_id, child in completed_raw.items()
+            },
+            post_merge={
+                child_id: _decode_post_merge_state(state) for child_id, state in post_raw.items()
+            },
+            dispatch_intents=_recursive_string_map(payload, "dispatch_intents"),
+            evidence=_recursive_string_map(payload, "evidence"),
+            lane_bindings=_recursive_string_map(payload, "lane_bindings"),
+        )
+    if kind == "tl_all_merged":
+        return RecursiveTLAllMerged(
+            scope_path=scope_path,
+            plan_digest=plan_digest,
+            completed_children={
+                child_id: _decode_post_merge_state(state)
+                for child_id, state in _recursive_mapping(payload, "completed_children").items()
+            },
+        )
+    if kind == "tl_finalizing":
+        return RecursiveTLFinalizing(
+            role=ScopeRole(_recursive_text(payload, "role")),
+            scope_path=scope_path,
+            plan_digest=plan_digest,
+            evidence=_recursive_string_map(payload, "evidence"),
+        )
+    if kind == "tl_done":
+        return RecursiveTLDone(
+            scope_path=scope_path,
+            plan_digest=plan_digest,
+            finalization_evidence=_recursive_string_map(payload, "finalization_evidence"),
+        )
+    if kind == "tl_pr_filed":
+        return RecursiveTLPRFiled(
+            aggregate_pr=_recursive_text(payload, "aggregate_pr"),
+            head_sha=_recursive_text(payload, "head_sha"),
+            base_sha=_recursive_text(payload, "base_sha"),
+            parent_branch=_recursive_text(payload, "parent_branch"),
+            handoff=_recursive_text(payload, "handoff"),
+            scope_path=scope_path,
+            plan_digest=plan_digest,
+        )
+    raise ValueError(f"recursive FSM kind {kind!r} is not recognized")
+
+
+def _decode_child_record(value: object) -> ChildRecord:
+    if not isinstance(value, Mapping):
+        raise TypeError("recursive child record must be an object")
+    return ChildRecord(
+        child_id=_recursive_text(value, "child_id"),
+        kind=ChildKind(_recursive_text(value, "kind")),
+        dispatch_intent_id=_recursive_optional_text(value, "dispatch_intent_id"),
+        invocation_id=_recursive_optional_text(value, "invocation_id"),
+        evidence=_recursive_string_map(value, "evidence"),
+        lane_id=_recursive_optional_text(value, "lane_id"),
+        manifest_node_id=_recursive_optional_text(value, "manifest_node_id"),
+        manifest_revision=_recursive_optional_int(value, "manifest_revision"),
+    )
+
+
+def _decode_post_merge_state(value: object) -> PostMergeState:
+    if not isinstance(value, Mapping):
+        raise TypeError("recursive post-merge state must be an object")
+    return PostMergeState(
+        phase=PostMergePhase(_recursive_text(value, "phase")),
+        evidence=_recursive_string_map(value, "evidence"),
+    )
+
+
+def _recursive_text(value: Mapping[str, object], field_name: str) -> str:
+    raw = value.get(field_name)
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"recursive FSM {field_name} must be a non-empty string")
+    return raw
+
+
+def _recursive_optional_text(value: Mapping[str, object], field_name: str) -> str | None:
+    raw = value.get(field_name)
+    if raw is None:
+        return None
+    return _recursive_text(value, field_name)
+
+
+def _optional_recursive_text(
+    value: Mapping[str, object],
+    field_name: str,
+    default: str,
+) -> str:
+    """Read a compatibility string while keeping new payloads strict."""
+    raw = value.get(field_name)
+    if raw is None:
+        return default
+    return _recursive_text(value, field_name)
+
+
+def _optional_recursive_text_list(
+    value: Mapping[str, object],
+    field_name: str,
+    default: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Read a legacy-optional scope path without guessing non-default data."""
+    if field_name not in value:
+        return default
+    return _recursive_text_list(value, field_name)
+
+
+def _optional_recursive_string_map(
+    value: Mapping[str, object],
+    field_name: str,
+) -> dict[str, str]:
+    """Read optional terminal evidence from pre-target checkpoints."""
+    if field_name not in value:
+        return {}
+    return _recursive_string_map(value, field_name)
+
+
+def _recursive_optional_int(value: Mapping[str, object], field_name: str) -> int | None:
+    """Decode an optional integer from a recursive child record."""
+    raw = value.get(field_name)
+    if raw is None:
+        return None
+    if type(raw) is not int:
+        raise ValueError(f"recursive FSM {field_name} must be an integer")
+    return raw
+
+
+def _recursive_text_list(value: Mapping[str, object], field_name: str) -> tuple[str, ...]:
+    return tuple(
+        _recursive_text({"value": item}, "value") for item in _recursive_list(value, field_name)
+    )
+
+
+def _recursive_int(value: Mapping[str, object], field_name: str) -> int:
+    raw = value.get(field_name)
+    if type(raw) is not int:
+        raise ValueError(f"recursive FSM {field_name} must be an integer")
+    return raw
+
+
+def _recursive_order(value: object) -> int:
+    if type(value) is int:
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    raise ValueError("recursive FSM pending order must be an integer key")
+
+
+def _recursive_list(value: object, field_name: str) -> list[object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"recursive FSM {field_name} must be an object containing an array")
+    raw = value.get(field_name)
+    if not isinstance(raw, list):
+        raise TypeError(f"recursive FSM {field_name} must be an array")
+    return raw
+
+
+def _recursive_array(value: object, field_name: str) -> list[object]:
+    if not isinstance(value, list):
+        raise TypeError(f"recursive FSM {field_name} must be an array")
+    return value
+
+
+def _recursive_mapping(value: object, field_name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"recursive FSM {field_name} must be an object containing a mapping")
+    raw = value.get(field_name)
+    if not isinstance(raw, Mapping):
+        raise TypeError(f"recursive FSM {field_name} must be an object")
+    return raw
+
+
+def _recursive_string_map(value: Mapping[str, object], field_name: str) -> dict[str, str]:
+    raw = _recursive_mapping(value, field_name)
+    result: dict[str, str] = {}
+    for key, item in raw.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            raise TypeError(f"recursive FSM {field_name} must map strings to strings")
+        result[key] = item
+    return result
 
 
 def _decode_ordered_stages(value: object) -> tuple[OrderedStageState, ...]:
@@ -1317,6 +2087,16 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         attempts=cast(int, value["attempts"]),
         verdict=Verdict(cast(str, value["verdict"])) if value["verdict"] is not None else None,
         verdict_at=cast(str | None, value.get("verdict_at")),
+        review_evidence=_decode_review_evidence(value.get("review_evidence")),
+        review_validation_required=value.get("review_validation_required") is True,
+        review_validation_disposition=(
+            ReviewValidationDisposition(cast(str, value["review_validation_disposition"]))
+            if value.get("review_validation_disposition") is not None
+            else None
+        ),
+        review_validation_failure_reason=cast(
+            str | None, value.get("review_validation_failure_reason")
+        ),
         park_cause=(
             ParkCause(cast(str, value["park_cause"]))
             if value.get("park_cause") is not None
@@ -1354,6 +2134,8 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         handoff=_decode_handoff(value.get("handoff")),
         observation_provenance=_decode_observation_provenance(value.get("observation_provenance")),
         action=_decode_action(value.get("action")),
+        manifest_node_id=cast(str | None, value.get("manifest_node_id")),
+        manifest_revision=cast(int | None, value.get("manifest_revision")),
     )
 
 
@@ -1411,6 +2193,26 @@ def _decode_observation_provenance(value: object) -> ObservationProvenance | Non
     )
 
 
+def _decode_review_evidence(value: object) -> DurableReviewEvidence | None:
+    if not isinstance(value, Mapping):
+        return None
+    return DurableReviewEvidence(
+        review_id=cast(int, value["review_id"]),
+        pr_number=cast(int, value["pr_number"]),
+        head_sha=cast(str, value["head_sha"]),
+        reviewer_agent_id=cast(str, value["reviewer_agent_id"]),
+        verdict=Verdict(cast(str, value["verdict"])),
+        submitted_at=cast(str, value["submitted_at"]),
+        validated_at=cast(str | None, value.get("validated_at")),
+        reviewer_account_authenticated=cast(
+            bool, value.get("reviewer_account_authenticated", True)
+        ),
+        dismissed=cast(bool, value.get("dismissed", False)),
+        forgejo_stale=cast(bool, value.get("forgejo_stale", False)),
+        reviewer_identity_unresolved=cast(bool, value.get("reviewer_identity_unresolved", False)),
+    )
+
+
 def _decode_action(value: object) -> ActionState | None:
     if not isinstance(value, Mapping):
         return None
@@ -1453,6 +2255,8 @@ def _decode_gate(value: dict[str, object]) -> GateState:
 
 
 def _assert_consistent(path: Path, state: RunState) -> None:
+    if state.recursive_fsm is not None:
+        return
     _assert_fsm_slices_consistent(path, state.fsm.phase, state.fsm.waiting, state.slices)
 
 
@@ -1461,6 +2265,19 @@ def _assert_encoded_consistent(
     fsm: Mapping[str, object],
     slices: Mapping[str, object],
 ) -> None:
+    if fsm.get("kind") == "recursive":
+        return
+    if path.exists():
+        try:
+            existing = json.loads(_read_bytes(path).decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            existing = None
+        if (
+            isinstance(existing, Mapping)
+            and isinstance(existing.get("fsm"), Mapping)
+            and existing["fsm"].get("kind") == "recursive"
+        ):
+            return
     phase = TLPhase(cast(str, fsm["phase"]))
     waiting = tuple(cast(list[str], fsm["waiting"]))
     statuses = {

@@ -1,6 +1,15 @@
 """Durable TL run-state schema and persistence boundaries."""
 
 from .lock import LockOwner, LockTimeout, RunLock, owner_is_stale
+from .plan_manifest import (
+    ManifestError,
+    ManifestNode,
+    PlanManifest,
+    build_legacy_manifest,
+    build_plan_manifest,
+    validate_manifest_revision,
+)
+from .review_validation import review_validation_disposition, review_validation_is_fresh
 from .schema import (
     BUDGET_KEYS,
     CI_STATUS_VALUES,
@@ -15,6 +24,7 @@ from .schema import (
     ActualTokens,
     BudgetCharge,
     BudgetLedger,
+    DurableReviewEvidence,
     EventCursor,
     FSMState,
     GateState,
@@ -23,6 +33,8 @@ from .schema import (
     IntegrationRuntimeState,
     OrderedStageState,
     ReviewPolicySource,
+    ReviewValidationDisposition,
+    ReviewValidationObservation,
     RunState,
     SchemaError,
     SliceState,
@@ -68,6 +80,7 @@ __all__ = [
     "BudgetLedger",
     "ConcurrentWrite",
     "CorruptCheckpoint",
+    "DurableReviewEvidence",
     "EventCursor",
     "FSMState",
     "GateState",
@@ -76,10 +89,15 @@ __all__ = [
     "IntegrationRuntimeState",
     "LockOwner",
     "LockTimeout",
+    "ManifestError",
+    "ManifestNode",
     "MutationError",
     "OrderedStageState",
+    "PlanManifest",
     "ResumeState",
     "ReviewPolicySource",
+    "ReviewValidationDisposition",
+    "ReviewValidationObservation",
     "RunLock",
     "RunState",
     "RunStore",
@@ -92,11 +110,16 @@ __all__ = [
     "WorktreeClaimError",
     "WriteHooks",
     "apply",
+    "build_legacy_manifest",
+    "build_plan_manifest",
     "checkpoint",
     "create",
     "load",
     "owner_is_stale",
     "publish",
     "resume",
+    "review_validation_disposition",
+    "review_validation_is_fresh",
     "validate",
+    "validate_manifest_revision",
 ]

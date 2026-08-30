@@ -32,15 +32,22 @@ class ChildRecord:
     invocation_id: str | None = None
     evidence: Mapping[str, str] = field(default_factory=dict)
     lane_id: str | None = None
+    manifest_node_id: str | None = None
+    manifest_revision: int | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.child_id, "child ID")
         if not isinstance(self.kind, ChildKind):
             raise TypeError("child kind must be a ChildKind")
-        for name in ("dispatch_intent_id", "invocation_id", "lane_id"):
+        for name in ("dispatch_intent_id", "invocation_id", "lane_id", "manifest_node_id"):
             value = getattr(self, name)
             if value is not None:
                 _require_text(value, name)
+        if self.manifest_revision is not None:
+            if type(self.manifest_revision) is not int or self.manifest_revision < 1:
+                raise ValueError("manifest revision must be a positive integer")
+            if self.manifest_node_id is None:
+                raise ValueError("manifest revision requires a manifest node ID")
         object.__setattr__(self, "evidence", MappingProxyType(dict(self.evidence)))
 
 

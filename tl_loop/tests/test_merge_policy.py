@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
 
 from tl_loop.loop.reconcile import (
     ExternalIntent,
@@ -17,6 +18,7 @@ from tl_loop.state.schema import (
     ActionPhase,
     ActionState,
     BudgetLedger,
+    DurableReviewEvidence,
     EventCursor,
     FSMState,
     HandoffEvidence,
@@ -39,6 +41,7 @@ def _mergeable() -> SliceState:
         publication=PublicationBinding(42, "head-a", "task/a", "main", 1),
         handoff=HandoffEvidence(42, "head-a", 1, "inv-1", "agent-a", "2026-08-24T00:00:00Z"),
         reviewer_attempt={"head-a": 1},
+        reviewer_agent_id="reviewer-a",
         verdict=Verdict.GO,
         ci_state={"head-a": "success"},
     )
@@ -55,6 +58,33 @@ def test_direct_merge_policy_is_order_independent_and_head_bound() -> None:
     assert first.arguments == {"pr_number": 42, "head_sha": "head-a"}
     assert isinstance(second, ExternalIntent)
     assert second.arguments == first.arguments
+
+
+def test_direct_policy_derives_revalidation_before_stale_merge() -> None:
+    state = replace(
+        _mergeable(),
+        review_evidence=DurableReviewEvidence(
+            review_id=17,
+            pr_number=42,
+            head_sha="head-a",
+            reviewer_agent_id="reviewer-a",
+            verdict=Verdict.GO,
+            submitted_at="2026-08-28T00:00:00Z",
+            validated_at="2026-08-28T00:00:00Z",
+        ),
+    )
+
+    decision = derive_next_action(
+        state,
+        review_freshness_window_secs=60,
+        now=datetime(2026, 8, 29, tzinfo=UTC),
+    )
+
+    assert decision == InternalTransition(
+        "revalidate_review",
+        "review_validation_expired",
+        target_id="slice-a",
+    )
 
 
 def test_direct_policy_priority_rejects_mismatched_head_before_merge() -> None:

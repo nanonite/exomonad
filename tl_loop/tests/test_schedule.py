@@ -17,6 +17,7 @@ from tl_loop.loop.schedule import (
     restore_dependents,
     suspend_dependents,
 )
+from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import SCHEMA_VERSION, SchemaError, SliceState, SliceStatus, validate
 
 
@@ -164,7 +165,7 @@ def _slice(
 
 
 def _valid_document() -> dict[str, object]:
-    return {
+    document = {
         "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "schedule-test",
@@ -174,6 +175,18 @@ def _valid_document() -> dict[str, object]:
         "gates": [],
         "events": {"last_consumed_offset": 0},
     }
+    manifest = build_plan_manifest(
+        {"workers": [{"name": "a", "task": "legacy"}, {"name": "b", "task": "legacy"}]},
+        scope_id="schedule-test",
+        owned_branch="legacy",
+    )
+    document["plan_manifest"] = manifest.to_document()
+    slices = cast(dict[str, object], document["slices"])
+    for node in manifest.nodes:
+        cast(dict[str, object], slices[node.name]).update(
+            {"manifest_node_id": node.node_id, "manifest_revision": 1}
+        )
+    return document
 
 
 def _record(slice_id: str, *, depends_on: list[str] | None = None) -> dict[str, object]:

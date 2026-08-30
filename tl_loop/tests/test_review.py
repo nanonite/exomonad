@@ -38,6 +38,7 @@ from tl_loop.loop.review import (
     verify_review,
 )
 from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import (
     SCHEMA_VERSION,
     IntegrationRuntimeState,
@@ -451,7 +452,7 @@ def _slice(
 
 
 def _document() -> dict[str, object]:
-    return {
+    document = {
         "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "review-test",
@@ -478,6 +479,16 @@ def _document() -> dict[str, object]:
         "gates": [],
         "events": {"last_consumed_offset": 0},
     }
+    manifest = build_plan_manifest(
+        {"workers": [{"name": "leaf", "task": "legacy"}]},
+        scope_id="review-test",
+        owned_branch="legacy",
+    )
+    document["plan_manifest"] = manifest.to_document()
+    cast(dict[str, object], document["slices"])["leaf"].update(
+        {"manifest_node_id": manifest.nodes[0].node_id, "manifest_revision": 1}
+    )
+    return document
 
 
 def _state(tmp_path: Path, head: str, verdict_at: str) -> tuple[RunState, RunStore]:

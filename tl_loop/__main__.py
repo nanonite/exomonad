@@ -137,6 +137,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_project_options(run)
     run.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
     run.add_argument("--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID))
+    run.add_argument("--plan-revision", type=_positive_int, default=1)
     run.add_argument("--max-events", type=_positive_int, default=DEFAULT_MAX_EVENTS)
     run.add_argument("--transport-timeout", type=_positive_float, default=DEFAULT_TIMEOUT_SECONDS)
     run.add_argument(
@@ -264,11 +265,17 @@ def _run(args: argparse.Namespace) -> TLRunResult:
             controller_fingerprint,
         )
     plan_path = _resolve_under_project(project_root, args.plan)
-    plan_document = _load_plan(plan_path, args.wait_for_plan)
-    plan = _plan_from_document(plan_document)
+    state_root = project_root / ".exo" / "tl-loop"
+    checkpoint = RunStore(args.run_id, state_root)
+    existing = checkpoint.load() if checkpoint.path.exists() else None
+    if existing is not None and existing.plan_manifest is not None and not plan_path.exists():
+        plan_document: dict[str, object] = {"run_id": args.run_id}
+        plan = None
+    else:
+        plan_document = _load_plan(plan_path, args.wait_for_plan)
+        plan = _plan_from_document(plan_document)
     run_id = _run_id(plan_document, args.run_id)
     ledger_run_id = _authoritative_ledger_run_id(project_root)
-    state_root = project_root / ".exo" / "tl-loop"
     session_mode = _read_session_mode(project_root)
     reader = LedgerReader(
         project_root / ".exo" / "ledger" / "segments",
@@ -309,6 +316,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         root_dir=state_root,
         project_root=project_root,
         run_id=run_id,
+        plan_revision=getattr(args, "plan_revision", 1),
         session_mode=session_mode,
         ledger_run_id=ledger_run_id,
         role="worker",
@@ -328,7 +336,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     )
     try:
         return tl_run(
-            {"run_id": run_id, "plan": plan},
+            {"run_id": run_id, **({"plan": plan} if plan is not None else {})},
             config,
             cast(Mapping[str, object], budgets),
         )

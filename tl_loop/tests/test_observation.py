@@ -52,6 +52,7 @@ def test_projection_preserves_exact_head_review_evidence() -> None:
             "review_id": 17,
             "review_verdict": " APPROVED ",
             "review_head_sha": "head-a",
+            "review_submitted_at": "2026-08-28T12:00:00Z",
             "review_body": "Looks good",
             "reviewer_agent_id": "review-pr-7-codex",
             "reviewer_identity_error": "",
@@ -61,9 +62,13 @@ def test_projection_preserves_exact_head_review_evidence() -> None:
     assert observed.review_id == 17
     assert observed.review_verdict == "approved"
     assert observed.review_head_sha == "head-a"
+    assert observed.review_submitted_at == "2026-08-28T12:00:00Z"
     assert observed.review_body == "Looks good"
     assert observed.reviewer_agent_id == "review-pr-7-codex"
     assert observed.to_payload()["review_id"] == 17
+
+    rebound = observed.with_publication({"invocation_id": "inv-1"})
+    assert rebound.review_submitted_at == observed.review_submitted_at
 
 
 def test_projection_drops_unknown_or_non_positive_review_evidence() -> None:

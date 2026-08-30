@@ -50,7 +50,7 @@ from tl_loop.fsm.phase import (
     TLWaiting,
 )
 from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
-from tl_loop.fsm.transition import IllegalTransition, transition
+from tl_loop.fsm.transition import IllegalTransition, transition as phase_transition
 from tl_loop.loop.convergence import (
     ConvergenceInvariantError,
     ConvergenceTracker,
@@ -97,6 +97,12 @@ from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
 from tl_loop.select.policy import HarnessPolicy, load_policy
+from tl_loop.state.plan_manifest import (
+    ManifestError,
+    PlanManifest,
+    build_plan_manifest,
+)
+from tl_loop.state.review_validation import review_validation_disposition
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
     ActionKind,
@@ -111,6 +117,8 @@ from tl_loop.state.schema import (
     OrderedStageState,
     ParkCause,
     PublicationBinding,
+    ReviewValidationDisposition,
+    ReviewValidationObservation,
     RunState,
     SliceState,
     SliceStatus,
@@ -124,10 +132,13 @@ from tl_loop.state.slice_transition import (
     HeadEvidenceObserved,
     MergeCompleted,
     RepairQueued,
+    RevalidateReview,
     ReviewDiscarded,
     ReviewerDispatched,
     ReviewerIdentityObserved,
     ReviewRoundsExhausted,
+    ReviewValidated,
+    ReviewValidationFailed,
     ReviewVerdictObserved,
     SliceStatusChanged,
     StallClassificationObserved,
@@ -566,6 +577,7 @@ class TLLoopConfig:
     parent_agent_id: str | None = None
     depth: int = 0
     max_depth: int = 3
+    plan_revision: int = 1
 
     def __post_init__(self) -> None:
         if self.project_root is not None:
@@ -620,6 +632,8 @@ class TLLoopConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        if type(self.plan_revision) is not int or self.plan_revision < 1:
+            raise ValueError("plan_revision must be a positive integer")
         _require_text(self.branch, "branch")
         _optional_text(self.agent_id, "agent_id")
         _optional_text(self.parent_branch, "parent_branch")
@@ -687,13 +701,13 @@ def tl_run(
         config=selected,
         root_dir=selected.root_dir,
         budgets=budgets,
-        initial_slices=_initial_slices(plan, selected),
+        initial_slices=_initial_slices(plan, selected) if plan is not None else None,
     )
 
 
 def run_tl_loop(
     run_id: str,
-    plan: WorkPlan | Mapping[str, object],
+    plan: WorkPlan | Mapping[str, object] | None,
     source: EventQueue,
     effects: EffectClient | ReadOnlyEffectClient,
     *,
@@ -705,17 +719,116 @@ def run_tl_loop(
 ) -> TLRunResult:
     """Dispatch direct children and run one bounded active/shadow event loop."""
     selected = config or TLLoopConfig()
-    work_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
     _validate_mode(selected, effects)
+    store = RunStore(run_id, Path(root_dir))
+    existing_state = store.load() if store.path.exists() else None
+    manifest: PlanManifest
+    if existing_state is not None and existing_state.plan_manifest is not None:
+        persisted_manifest = existing_state.plan_manifest
+        if _manifest_is_legacy(persisted_manifest):
+            if plan is None:
+                raise TLLoopError(
+                    "continuation cannot reconstruct a legacy checkpoint; "
+                    "supply an explicit external WorkPlan"
+                )
+            supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
+            candidate = _manifest_for_plan(supplied_plan, run_id, selected)
+            protected = {
+                slice_state.manifest_node_id
+                for slice_state in existing_state.slices.values()
+                if slice_state.status not in {SliceStatus.PENDING, SliceStatus.READY}
+                and slice_state.manifest_node_id is not None
+            }
+            if protected and selected.active:
+                store.set_gate(
+                    "plan-manifest-migration: existing active run has no unambiguous immutable manifest"
+                )
+                raise TLLoopError(
+                    "continuation cannot replace an ambiguous legacy manifest for an active run"
+                )
+            generated = _initial_slices(supplied_plan, selected, root_dir, run_id)
+            initial_slices = {
+                **dict(existing_state.slices),
+                **{
+                    name: value
+                    for name, value in generated.items()
+                    if name not in existing_state.slices
+                },
+            }
+            try:
+                store.set_plan_manifest(
+                    candidate,
+                    slices=initial_slices,
+                    protected_node_ids=protected,
+                )
+            except ManifestError as error:
+                raise TLLoopError(f"legacy plan manifest replacement rejected: {error}") from error
+            work_plan = _work_plan_from_manifest(candidate)
+            manifest = candidate
+            initial_slices = None
+        elif plan is None:
+            work_plan = _work_plan_from_manifest(persisted_manifest)
+            manifest = persisted_manifest
+            initial_slices = None
+        else:
+            supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
+            candidate = _manifest_for_plan(supplied_plan, run_id, selected)
+            if candidate.digest == persisted_manifest.digest:
+                work_plan = _work_plan_from_manifest(persisted_manifest)
+                manifest = persisted_manifest
+                initial_slices = None
+            else:
+                if candidate.manifest_revision <= persisted_manifest.manifest_revision:
+                    raise TLLoopError(
+                        "external plan differs from the persisted manifest; "
+                        "increase plan_revision with an explicit compatible revision"
+                    )
+                protected = {
+                    slice_state.manifest_node_id
+                    for slice_state in existing_state.slices.values()
+                    if slice_state.status not in {SliceStatus.PENDING, SliceStatus.READY}
+                    and slice_state.manifest_node_id is not None
+                }
+                generated = _initial_slices(supplied_plan, selected, root_dir, run_id)
+                initial_slices = {
+                    **dict(existing_state.slices),
+                    **{
+                        name: value
+                        for name, value in generated.items()
+                        if name not in existing_state.slices
+                    },
+                }
+                try:
+                    existing_state = store.set_plan_manifest(
+                        candidate,
+                        slices=initial_slices,
+                        protected_node_ids=protected,
+                    )
+                except ManifestError as error:
+                    raise TLLoopError(f"plan manifest revision rejected: {error}") from error
+                work_plan = _work_plan_from_manifest(candidate)
+                manifest = candidate
+                initial_slices = None
+    else:
+        if plan is None:
+            if existing_state is None:
+                raise TLLoopError("a new run requires an external WorkPlan")
+            raise TLLoopError(
+                "continuation cannot reconstruct a legacy checkpoint without an immutable plan manifest"
+            )
+        work_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
+        manifest = _manifest_for_plan(work_plan, run_id, selected)
+        if initial_slices is None:
+            initial_slices = _initial_slices(work_plan, selected, root_dir, run_id)
+        initial_slices = _bind_initial_slices(initial_slices, manifest)
+
     if len(work_plan.workers) > selected.max_workers:
         raise LoopLimitExceeded("work plan exceeds max_workers")
     if len(work_plan.leaves) > selected.max_leaves:
         raise LoopLimitExceeded("work plan exceeds max_leaves")
-    initial_slices = initial_slices or _initial_slices(work_plan, selected, root_dir, run_id)
     epoch_enabled = selected.active and selected.review_clock is None
 
-    store = RunStore(run_id, Path(root_dir))
-    if not store.path.exists():
+    if existing_state is None:
         root_state: dict[str, object] = {}
         if (
             work_plan.sub_tls
@@ -745,6 +858,23 @@ def run_tl_loop(
             root_state["controller_epoch"] = _controller_epoch(store.root_dir, run_id)
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
+    if state.plan_manifest is None:
+        node_ids_by_name = {node.name: node.node_id for node in manifest.nodes}
+        protected = {
+            node_ids_by_name[next_node]
+            for next_node, slice_state in state.slices.items()
+            if slice_state.status not in {SliceStatus.PENDING, SliceStatus.READY}
+            and next_node in node_ids_by_name
+        }
+        if protected and selected.active:
+            state = store.set_gate(
+                "plan-manifest-migration: existing active run has no immutable manifest"
+            )
+            raise TLLoopError("continuation cannot infer a plan manifest for an active legacy run")
+        state = store.set_plan_manifest(
+            manifest,
+            slices=initial_slices if existing_state is None else None,
+        )
     if state.session_mode is None and selected.session_mode is not None:
         state = store.set_session_mode(selected.session_mode)
     if epoch_enabled:
@@ -948,7 +1078,16 @@ def _run_loop(
     consumed: list[int] = []
     policy = _review_policy_for_state(state, config.review_policy_path, store)
     state = store.load()
-    convergence = ConvergenceTracker(reviewer_max_rounds=policy.reviewer_max_rounds)
+    freshness_window_secs = (
+        load_freshness_window(config.review_policy_path)
+        if config.review_policy_path is not None
+        else None
+    )
+    convergence = ConvergenceTracker(
+        reviewer_max_rounds=policy.reviewer_max_rounds,
+        review_freshness_window_secs=freshness_window_secs,
+        review_now=config.review_clock() if config.review_clock is not None else None,
+    )
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
     diagnostics = EventDiagnostics(
         task_started_at={
@@ -994,6 +1133,8 @@ def _run_loop(
         derive_next_action(
             state,
             reviewer_max_rounds=convergence.reviewer_max_rounds,
+            review_freshness_window_secs=convergence.review_freshness_window_secs,
+            now=convergence.review_now,
         ),
         Quiescent,
     ):
@@ -1035,15 +1176,17 @@ def _run_loop(
                     effects,
                     config.heartbeat,
                     project_root=config.project_root,
-                    review_replay=lambda replay_state, replay_slice, replay_watcher: _replay_watcher_review_if_needed(
-                        plan,
-                        replay_state,
-                        replay_slice,
-                        replay_watcher,
-                        config,
-                        effects,
-                        store,
-                        effects_log,
+                    review_replay=lambda replay_state, replay_slice, replay_watcher: (
+                        _replay_watcher_review_if_needed(
+                            plan,
+                            replay_state,
+                            replay_slice,
+                            replay_watcher,
+                            config,
+                            effects,
+                            store,
+                            effects_log,
+                        )
                     ),
                 )
                 if heartbeat.fired:
@@ -1396,6 +1539,8 @@ def _apply_convergence(
         decision = derive_next_action(
             state,
             reviewer_max_rounds=tracker.reviewer_max_rounds,
+            review_freshness_window_secs=tracker.review_freshness_window_secs,
+            now=tracker.review_now,
         )
         if isinstance(decision, ExternalIntent) and decision.operation == "spawn_reviewer":
             tracker.last_decision = Quiescent("reviewer_spawn_disabled")
@@ -1538,6 +1683,24 @@ def _apply_internal_transition(
         if current.status not in {SliceStatus.MERGED, SliceStatus.FAILED}
     )
     target: SliceState | None = None
+    if decision.transition == "revalidate_review":
+        if decision.target_id is None:
+            return state
+        target = state.slices.get(decision.target_id)
+        if target is None:
+            return state
+        updated = slice_transition(target, RevalidateReview())
+        if updated == target:
+            return state
+        return store.checkpoint(
+            state.fsm,
+            {**state.slices, target.id: updated},
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+        )
     if decision.reason == "head_reset":
         target = next(
             (
@@ -1873,7 +2036,10 @@ def _execute_direct_merge_intent(
                 recovered.slices[current.id].action,
                 slice_state=replace(
                     recovered.slices[current.id],
+                    status=SliceStatus.MERGED,
+                    action=None,
                     dispatch_error=bookkeeping_error,
+                    dispatch_last_boundary="direct_merge_adopted",
                 ),
             )
         return _checkpoint_slice_action(
@@ -1882,7 +2048,9 @@ def _execute_direct_merge_intent(
             current.id,
             None,
             slice_state=replace(
-                slice_transition(refreshed.slices[current.id], MergeCompleted(current.pr_number or 0)),
+                slice_transition(
+                    refreshed.slices[current.id], MergeCompleted(current.pr_number or 0)
+                ),
                 dispatch_last_boundary="direct_merge_adopted",
                 dispatch_error=None,
             ),
@@ -1917,6 +2085,22 @@ def _execute_direct_merge_intent(
                 effects_log,
             )
         return state
+    freshness_window_secs = (
+        load_freshness_window(config.review_policy_path)
+        if config.review_policy_path is not None
+        else None
+    )
+    if current.verdict is not None and verdict_is_stale(
+        current,
+        now=config.review_clock() if config.review_clock is not None else None,
+        freshness_window_secs=freshness_window_secs,
+    ):
+        return _request_review_revalidation(
+            state,
+            current,
+            store,
+            reason="pre_merge_review_validation_expired",
+        )
     evidence = _direct_merge_evidence(current, watcher, config)
     if evidence is None:
         return _clear_action_for_reduction(store, state, current.id)
@@ -2035,7 +2219,9 @@ def _reconcile_unknown_merge(
             current.id,
             None,
             slice_state=replace(
-                slice_transition(refreshed.slices[current.id], MergeCompleted(current.pr_number or 0)),
+                slice_transition(
+                    refreshed.slices[current.id], MergeCompleted(current.pr_number or 0)
+                ),
                 dispatch_last_boundary="direct_merge_reconciled",
             ),
         )
@@ -2159,9 +2345,10 @@ def _adopt_direct_merge_result(
                 slice_state=replace(
                     slice_transition(
                         recovered.slices[slice_id],
-                        ActionChanged(replace(action, phase=ActionPhase.CONFIRMED)),
+                        MergeCompleted(current.pr_number or 0),
                     ),
                     dispatch_error=bookkeeping_error,
+                    dispatch_last_boundary="direct_merge_confirmed",
                 ),
             )
         refreshed = store.load()
@@ -2171,7 +2358,9 @@ def _adopt_direct_merge_result(
             slice_id,
             None,
             slice_state=replace(
-                slice_transition(refreshed.slices[slice_id], MergeCompleted(current.pr_number or 0)),
+                slice_transition(
+                    refreshed.slices[slice_id], MergeCompleted(current.pr_number or 0)
+                ),
                 dispatch_last_boundary="direct_merge_confirmed",
             ),
         )
@@ -2195,8 +2384,11 @@ def _checkpoint_slice_action(
     current = slice_state or state.slices[slice_id]
     if slice_state is None:
         current = slice_transition(current, ActionChanged(action))
+    checkpoint_phase = state.fsm
+    if current.status is SliceStatus.MERGED:
+        checkpoint_phase = _phase_after_slice_merge(state, slice_id, current)
     return store.checkpoint(
-        state.fsm,
+        checkpoint_phase,
         {**state.slices, slice_id: current},
         state.budgets,
         state.events.last_consumed_offset,
@@ -2204,6 +2396,35 @@ def _checkpoint_slice_action(
         ordered_stages=state.ordered_stages,
         integration=state.integration,
     )
+
+
+def _phase_after_slice_merge(
+    state: RunState,
+    slice_id: str,
+    merged_slice: SliceState,
+) -> PhaseValue:
+    """Remove a merged slice from the waiting FSM in the same checkpoint."""
+    phase = _phase_from_state(state)
+    if isinstance(phase, (TLWaiting, TLMerging)):
+        return phase_transition(
+            phase,
+            PRMerged(merged_slice.pr_number or 0, slice_id),
+        )
+    active = {
+        current_id: ChildHandle(
+            current_id,
+            current.branch or "",
+            current.agent_type or "unknown",
+        )
+        for current_id, current in state.slices.items()
+        if current_id != slice_id
+        and current.status in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+    }
+    if active:
+        return TLWaiting(active)
+    if all(current.status is SliceStatus.MERGED for current in state.slices.values()):
+        return TLAllMerged()
+    return phase
 
 
 def _clear_action_for_reduction(store: RunStore, state: RunState, slice_id: str) -> RunState:
@@ -2367,12 +2588,15 @@ def _source_has_pending(source: EventQueue) -> bool:
     events = getattr(source, "events", None)
     if isinstance(events, (list, tuple, set, frozenset)):
         return bool(events)
-    pending = getattr(source, "queue", None)
-    if pending is not None:
+    queued = getattr(source, "_events", None)
+    if queued is not None:
         try:
-            return not pending.empty()
+            return not queued.empty()
         except (AttributeError, TypeError):
             return True
+    nested = getattr(source, "queue", None)
+    if nested is not None and nested is not source:
+        return _source_has_pending(nested)
     return True
 
 
@@ -2488,7 +2712,7 @@ def _record_dispatch_failure(
     )
     before_phase = _phase_from_state(state)
     state = store.checkpoint(
-        TLFailed(f"dispatch failed for {slice_id!r}: {bounded_reason}"),
+        _failure_phase(state, f"dispatch failed for {slice_id!r}: {bounded_reason}"),
         {**state.slices, slice_id: updated},
         state.budgets,
         state.events.last_consumed_offset,
@@ -2685,43 +2909,27 @@ def _reconcile_pending_merge_entry(
             pr_number,
             chainlink_issue_id,
         )
-        store.checkpoint(
-            state.fsm,
-            {
-                **state.slices,
-                target: replace(
-                    slice_transition(
-                        current,
-                        ActionChanged(
-                            replace(current.action, phase=ActionPhase.CONFIRMED)
-                            if current.action is not None
-                            else None
-                        ),
-                    ),
-                    dispatch_error=bookkeeping_error,
-                ),
-            },
-            state.budgets,
-            state.events.last_consumed_offset,
-            current_order=state.current_order,
-            ordered_stages=state.ordered_stages,
-            integration=state.integration,
-        )
-        return True
-    store.checkpoint(
-        state.fsm,
-        {
-            **state.slices,
-            target: replace(
+        _checkpoint_slice_action(
+            store,
+            state,
+            target,
+            None,
+            slice_state=replace(
                 slice_transition(current, MergeCompleted(pr_number)),
+                dispatch_error=bookkeeping_error,
                 dispatch_last_boundary="restart_merge_reconciled",
             ),
-        },
-        state.budgets,
-        state.events.last_consumed_offset,
-        current_order=state.current_order,
-        ordered_stages=state.ordered_stages,
-        integration=state.integration,
+        )
+        return True
+    _checkpoint_slice_action(
+        store,
+        state,
+        target,
+        None,
+        slice_state=replace(
+            slice_transition(current, MergeCompleted(pr_number)),
+            dispatch_last_boundary="restart_merge_reconciled",
+        ),
     )
     return True
 
@@ -3013,6 +3221,26 @@ def _reconcile_nonterminal_slices(
             recovered_pr_number = watcher.get("pr_number") if watcher else None
             if isinstance(recovered_pr_number, int) and recovered_pr_number > 0:
                 snapshots[recovered_pr_number] = watcher
+        if watcher is not None and watcher.merged is True:
+            merge_entry = _confirmed_merge_entry(
+                effects_log,
+                current,
+                watcher.pr_number,
+            )
+            if merge_entry is not None:
+                state = _adopt_authoritative_merged_snapshot(
+                    state,
+                    current.id,
+                    watcher.pr_number or current.pr_number or 0,
+                    merge_entry,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                )
+                updated = dict(state.slices)
+                changed = False
+                continue
         owner_id = _agent_for_dispatch_intent(
             agent_listing,
             current.dispatch_intent_id or "",
@@ -3149,12 +3377,167 @@ def _reconcile_nonterminal_slices(
     return state
 
 
+def _confirmed_merge_entry(
+    effects_log: list[EffectIntent],
+    current: SliceState,
+    observed_pr_number: int | None,
+) -> Mapping[str, object] | None:
+    """Find durable merge evidence without reconstructing its arguments."""
+    if not isinstance(effects_log, EffectJournal):
+        return None
+    for entry in effects_log.confirmed_entries("merge_pr", current.id):
+        arguments = entry.get("arguments")
+        if not isinstance(arguments, Mapping):
+            continue
+        journal_pr_number = arguments.get("pr_number")
+        if type(journal_pr_number) is not int:
+            continue
+        if observed_pr_number is not None and journal_pr_number != observed_pr_number:
+            continue
+        if current.pr_number is not None and journal_pr_number != current.pr_number:
+            continue
+        result = entry.get("result")
+        if isinstance(result, Mapping):
+            nested = result.get("result")
+            if isinstance(nested, Mapping) and nested.get("merged") is False:
+                continue
+        return entry
+    return None
+
+
+def _adopt_authoritative_merged_snapshot(
+    state: RunState,
+    slice_id: str,
+    pr_number: int,
+    merge_entry: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Adopt a journal-confirmed merge before review/ownership recovery."""
+    arguments = merge_entry.get("arguments")
+    issue_id = config.chainlink_issue_id
+    if isinstance(arguments, Mapping) and type(arguments.get("chainlink_issue_id")) is int:
+        issue_id = cast(int, arguments["chainlink_issue_id"])
+    bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
+        slice_id,
+        pr_number,
+        issue_id,
+        config,
+        store,
+        effects,
+        effects_log,
+    )
+    current = state.slices[slice_id]
+    merged = replace(
+        slice_transition(current, MergeCompleted(pr_number)),
+        dispatch_last_boundary="authoritative_merge_adopted",
+        dispatch_error=bookkeeping_error,
+    )
+    adopted = _checkpoint_slice_action(
+        store,
+        state,
+        slice_id,
+        None,
+        slice_state=merged,
+    )
+    if not bookkeeping_ok:
+        adopted = _ensure_merge_bookkeeping_gate(
+            adopted,
+            store,
+            effects_log,
+            slice_id,
+            pr_number,
+            issue_id,
+        )
+    return adopted
+
+
+def _confirmed_merge_entry(
+    effects_log: list[EffectIntent],
+    current: SliceState,
+    observed_pr_number: int | None,
+) -> Mapping[str, object] | None:
+    """Find durable merge evidence without reconstructing its arguments."""
+    if not isinstance(effects_log, EffectJournal):
+        return None
+    for entry in effects_log.confirmed_entries("merge_pr", current.id):
+        arguments = entry.get("arguments")
+        if not isinstance(arguments, Mapping):
+            continue
+        journal_pr_number = arguments.get("pr_number")
+        if type(journal_pr_number) is not int:
+            continue
+        if observed_pr_number is not None and journal_pr_number != observed_pr_number:
+            continue
+        if current.pr_number is not None and journal_pr_number != current.pr_number:
+            continue
+        result = entry.get("result")
+        if isinstance(result, Mapping):
+            nested = result.get("result")
+            if isinstance(nested, Mapping) and nested.get("merged") is False:
+                continue
+        return entry
+    return None
+
+
+def _adopt_authoritative_merged_snapshot(
+    state: RunState,
+    slice_id: str,
+    pr_number: int,
+    merge_entry: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Adopt a journal-confirmed merge before review/ownership recovery."""
+    arguments = merge_entry.get("arguments")
+    issue_id = config.chainlink_issue_id
+    if isinstance(arguments, Mapping) and type(arguments.get("chainlink_issue_id")) is int:
+        issue_id = cast(int, arguments["chainlink_issue_id"])
+    bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
+        slice_id,
+        pr_number,
+        issue_id,
+        config,
+        store,
+        effects,
+        effects_log,
+    )
+    current = state.slices[slice_id]
+    merged = replace(
+        slice_transition(current, MergeCompleted(pr_number)),
+        dispatch_last_boundary="authoritative_merge_adopted",
+        dispatch_error=bookkeeping_error,
+    )
+    adopted = _checkpoint_slice_action(
+        store,
+        state,
+        slice_id,
+        None,
+        slice_state=merged,
+    )
+    if not bookkeeping_ok:
+        adopted = _ensure_merge_bookkeeping_gate(
+            adopted,
+            store,
+            effects_log,
+            slice_id,
+            pr_number,
+            issue_id,
+        )
+    return adopted
+
+
 def _reconciliation_phase(
     state: RunState,
     slices: Mapping[str, SliceState],
 ) -> PhaseValue:
-    if not isinstance(state.fsm, TLWaiting):
-        return state.fsm
+    phase = _phase_from_state(state)
+    if not isinstance(phase, TLWaiting):
+        return phase
     handles = {
         slice_id: ChildHandle(
             slice_id,
@@ -3169,7 +3552,13 @@ def _reconciliation_phase(
             SliceStatus.REPAIRING,
         }
     }
-    return TLWaiting(handles)
+    if handles:
+        return TLWaiting(handles)
+    return (
+        TLAllMerged()
+        if all(item.status is SliceStatus.MERGED for item in slices.values())
+        else TLPlanning()
+    )
 
 
 def _replay_watcher_review_if_needed(
@@ -3182,16 +3571,7 @@ def _replay_watcher_review_if_needed(
     store: RunStore,
     effects_log: list[EffectIntent],
 ) -> RunState:
-    """Replay one authorized exact-head review snapshot through the reducer.
-
-    A verdict already set and still fresh has nothing to replay. A verdict
-    already set but aged past the configured freshness window is treated as
-    eligible for replay too: the underlying facts (exact head, reviewer,
-    review outcome) still have to pass every check below unchanged, but a
-    successful replay refreshes ``verdict_at`` through the same reducer path
-    a live event would use, since nothing else ever re-confirms an
-    already-decided slice once its verdict has gone stale on the clock alone.
-    """
+    """Revalidate one exact-head review snapshot without creating a new round."""
     observed_watcher = _as_watcher_observation(watcher)
     if observed_watcher is None:
         return state
@@ -3200,18 +3580,18 @@ def _replay_watcher_review_if_needed(
     review_head_sha = watcher.review_head_sha
     reviewer_agent_id = watcher.reviewer_agent_id
     ownership_verified, _ = watcher.ownership_status()
+    freshness_window_secs = (
+        load_freshness_window(config.review_policy_path)
+        if config.review_policy_path is not None
+        else None
+    )
     stale_verdict = current.verdict is not None and verdict_is_stale(
         current,
         now=config.review_clock() if config.review_clock is not None else None,
-        freshness_window_secs=(
-            load_freshness_window(config.review_policy_path)
-            if config.review_policy_path is not None
-            else None
-        ),
+        freshness_window_secs=freshness_window_secs,
     )
     if (
         current.status not in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
-        or (current.verdict is not None and not stale_verdict)
         or watcher.found is not True
         or not head_sha
         or not review_head_sha
@@ -3224,21 +3604,26 @@ def _replay_watcher_review_if_needed(
         or current.handoff is None
         or current.handoff.head_sha != head_sha
         or current.dispatch_agent_id == reviewer_agent_id
-        or (
-            current.pr_number is not None
-            and watcher.pr_number != current.pr_number
-        )
+        or (current.pr_number is not None and watcher.pr_number != current.pr_number)
         or watcher.review_verdict not in {"approved", "changes_requested"}
     ):
+        if stale_verdict and not current.review_validation_required:
+            return _persist_review_validation_failure(
+                state,
+                current,
+                store,
+                disposition=ReviewValidationDisposition.INVALIDATED,
+                reason="authoritative_review_observation_incomplete",
+            )
         return state
     publication = watcher.publication
     if publication is not None:
         if publication.slice_id not in {None, current.id}:
             return state
-        if (
-            current.dispatch_agent_id is not None
-            and publication.author_agent not in {None, current.dispatch_agent_id}
-        ):
+        if current.dispatch_agent_id is not None and publication.author_agent not in {
+            None,
+            current.dispatch_agent_id,
+        }:
             return state
     kind = "approved" if watcher.review_verdict == "approved" else "review_received"
     review_rationale = (watcher.review_body or "").strip()
@@ -3246,29 +3631,115 @@ def _replay_watcher_review_if_needed(
         review_rationale = (
             f"Forgejo review {watcher.review_id} requested changes on exact head {head_sha}"
         )
-    findings = [] if kind == "approved" else [
-        {
-            "severity": "blocking",
-            "path": "review",
-            "rationale": review_rationale,
-        }
-    ]
+    findings = (
+        []
+        if kind == "approved"
+        else [
+            {
+                "severity": "blocking",
+                "path": "review",
+                "rationale": review_rationale,
+            }
+        ]
+    )
+    observed_at = _now_timestamp()
+    pr_number = watcher.pr_number or current.pr_number
+    if pr_number is None:
+        return _request_review_revalidation(
+            state,
+            current,
+            store,
+            reason="authoritative_review_pr_missing",
+        )
+    observation = ReviewValidationObservation(
+        review_id=watcher.review_id,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        reviewer_agent_id=reviewer_agent_id,
+        verdict=Verdict.GO if kind == "approved" else Verdict.NO_GO,
+        observed_at=observed_at,
+        submitted_at=(
+            current.review_evidence.submitted_at
+            if current.review_evidence is not None
+            and current.review_evidence.review_id == watcher.review_id
+            else watcher.review_submitted_at
+        ),
+    )
+    disposition = review_validation_disposition(
+        current.review_evidence,
+        observation,
+        now=config.review_clock() if config.review_clock is not None else None,
+        freshness_window_secs=freshness_window_secs,
+    )
+    if disposition is ReviewValidationDisposition.OUT_OF_ORDER:
+        LOGGER.info(
+            "[TL loop] stale watcher review ignored target=%s review_id=%s current_review_id=%s",
+            current.id,
+            observation.review_id,
+            current.review_evidence.review_id if current.review_evidence is not None else None,
+        )
+        return state
+    if current.verdict is not None and disposition is ReviewValidationDisposition.ALREADY_FRESH:
+        if current.review_validation_required:
+            return _persist_review_validation(
+                state,
+                current,
+                observation,
+                store,
+                submitted_at=observation.submitted_at,
+            )
+        LOGGER.info(
+            "[TL loop] review validation ignored target=%s disposition=%s state_version=%s",
+            current.id,
+            disposition.value,
+            state.state_version,
+        )
+        return state
+    if (
+        current.verdict is not None
+        and disposition is ReviewValidationDisposition.REFRESHED
+        and current.reviewed_head == head_sha
+        and current.verdict == observation.verdict
+    ):
+        return _persist_review_validation(
+            state,
+            current,
+            observation,
+            store,
+            submitted_at=observation.submitted_at,
+        )
+    if current.verdict is not None and disposition in {
+        ReviewValidationDisposition.INVALIDATED,
+        ReviewValidationDisposition.UNAUTHORIZED,
+    }:
+        return _persist_review_validation_failure(
+            state,
+            current,
+            store,
+            disposition=disposition,
+            reason=f"review_validation_{disposition.value}",
+        )
     event = project(
         {
             "event_type": "pr.review",
             "run_id": state.run_id,
             "agent_id": reviewer_agent_id,
             "slice_id": current.id,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
             "role": "reviewer",
             "lifecycle_state": "running",
-            "observed_at": _now_timestamp(),
+            "observed_at": observed_at,
             "data": {
                 "kind": kind,
                 "slice_id": current.id,
-                "pr_number": watcher.pr_number or current.pr_number,
+                "pr_number": pr_number,
                 "head_sha": head_sha,
                 "review_head_sha": review_head_sha,
                 "review_id": watcher.review_id,
+                "review_submitted_at": observation.submitted_at or observed_at,
+                "submitted_at": observation.submitted_at or observed_at,
+                "validated_at": observed_at,
                 "reviewer_agent_id": reviewer_agent_id,
                 "reviewer_account_authenticated": True,
                 "reviewer_identity_unresolved": False,
@@ -3317,6 +3788,120 @@ def _replay_watcher_review_if_needed(
         effects_log,
     )
     return replayed
+
+
+def _persist_review_validation(
+    state: RunState,
+    current: SliceState,
+    observation: ReviewValidationObservation,
+    store: RunStore,
+    *,
+    submitted_at: str | None,
+) -> RunState:
+    """Persist one successful revalidation and its single version advance."""
+    requested = slice_transition(current, RevalidateReview())
+    validated = slice_transition(
+        requested,
+        ReviewValidated(observation, submitted_at=submitted_at),
+    )
+    if validated == current:
+        return state
+    refreshed = store.checkpoint(
+        state.fsm,
+        {**state.slices, current.id: validated},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        state_version=(
+            state.state_version
+            if (
+                current.review_validation_required
+                and current.review_evidence is not None
+                and current.review_validation_disposition is None
+            )
+            else state.state_version + 1
+        ),
+    )
+    LOGGER.info(
+        "[TL loop] review validation refreshed target=%s disposition=refreshed state_version=%s->%s",
+        current.id,
+        state.state_version,
+        refreshed.state_version,
+    )
+    return refreshed
+
+
+def _persist_review_validation_failure(
+    state: RunState,
+    current: SliceState,
+    store: RunStore,
+    *,
+    disposition: ReviewValidationDisposition,
+    reason: str,
+) -> RunState:
+    """Persist a named validation failure and keep the verdict quiescent."""
+    if not reason:
+        raise ValueError("review validation failure reason must be non-empty")
+    failed = slice_transition(
+        current,
+        ReviewValidationFailed(disposition=disposition, reason=reason),
+    )
+    if failed == current:
+        return state
+    failed_state = store.checkpoint(
+        state.fsm,
+        {**state.slices, current.id: failed},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        state_version=state.state_version + 1,
+    )
+    LOGGER.warning(
+        "[TL loop] review validation failed target=%s disposition=%s reason=%s state_version=%s->%s",
+        current.id,
+        disposition.value,
+        reason,
+        state.state_version,
+        failed_state.state_version,
+    )
+    return failed_state
+
+
+def _request_review_revalidation(
+    state: RunState,
+    current: SliceState,
+    store: RunStore,
+    *,
+    reason: str,
+) -> RunState:
+    """Durably quiesce a stale verdict until a fresh authoritative observation arrives."""
+    if not reason:
+        raise ValueError("review revalidation reason must be non-empty")
+    requested = slice_transition(current, RevalidateReview())
+    if requested == current:
+        return state
+    requested_state = store.checkpoint(
+        state.fsm,
+        {**state.slices, current.id: requested},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        state_version=state.state_version + 1,
+    )
+    LOGGER.info(
+        "[TL loop] review validation requested target=%s reason=%s state_version=%s->%s",
+        current.id,
+        reason,
+        state.state_version,
+        requested_state.state_version,
+    )
+    return requested_state
 
 
 def _apply_reconciliation_observations(
@@ -3411,9 +3996,7 @@ def _apply_reconciliation_observations(
                 or "host publication identity unavailable",
             )
         if watcher.merged is True:
-            transitioned = slice_transition(
-                transitioned, MergeCompleted(watcher.pr_number or 0)
-            )
+            transitioned = slice_transition(transitioned, MergeCompleted(watcher.pr_number or 0))
     if owner_id is not None and current.dispatch_agent_id is None:
         updates["dispatch_agent_id"] = owner_id
     return replace(transitioned, **updates)
@@ -5709,6 +6292,15 @@ def _now_timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _review_event_submitted_at(event: EventEnvelope) -> str:
+    """Prefer the immutable Forgejo submission timestamp over observation time."""
+    for key in ("review_submitted_at", "submitted_at"):
+        value = event.data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return event.observed_at
+
+
 def _child_has_aggregate_output(state: RunState) -> bool:
     """Require a child result with a reviewable head before opening an aggregate PR."""
     if state.integration.aggregate_pr_number is not None:
@@ -6186,11 +6778,12 @@ def _record_review_event(
             findings=tuple(findings or ()),
             source="ledger",
             pr_number=event.pr_number,
-            reviewer_account_authenticated=event.data.get(
-                "reviewer_account_authenticated"
-            ) is True,
-            reviewer_identity_unresolved=event.data.get("reviewer_identity_unresolved") is not False,
-            self_approval=(event.agent_id is not None and event.agent_id == current.dispatch_agent_id),
+            reviewer_account_authenticated=event.data.get("reviewer_account_authenticated") is True,
+            reviewer_identity_unresolved=event.data.get("reviewer_identity_unresolved")
+            is not False,
+            self_approval=(
+                event.agent_id is not None and event.agent_id == current.dispatch_agent_id
+            ),
             stall_classification=stall_classification or current.stall_classification,
             requires_authenticated_evidence=False,
             increment_round=not (
@@ -6201,6 +6794,15 @@ def _record_review_event(
                 if current.status is SliceStatus.REPAIRING and _is_aggregate_slice(current)
                 else None
             ),
+            submitted_at=_review_event_submitted_at(event),
+            validated_at=(
+                event.data.get("validated_at")
+                if isinstance(event.data.get("validated_at"), str)
+                else event.observed_at
+            ),
+            observed_at=event.observed_at,
+            dismissed=event.data.get("dismissed") is True,
+            forgejo_stale=event.data.get("forgejo_stale") is True,
         ),
     )
     updated[slice_id] = replace(
@@ -6402,14 +7004,21 @@ def _route_review_event(
         and current.reviewed_head == head_sha
         and current.verdict is not None
     ):
-        LOGGER.info(
-            "[TL loop] ignoring repeated reviewer verdict target=%s head=%s existing=%s incoming=%s",
-            slice_id,
-            head_sha,
-            current.verdict.value,
-            incoming_verdict.value,
+        incoming_review_id = event.data.get("review_id")
+        existing_review_id = (
+            current.review_evidence.review_id if current.review_evidence is not None else None
         )
-        return state
+        if existing_review_id is not None and not (
+            type(incoming_review_id) is int and incoming_review_id > existing_review_id
+        ):
+            LOGGER.info(
+                "[TL loop] ignoring repeated reviewer verdict target=%s head=%s existing=%s incoming=%s",
+                slice_id,
+                head_sha,
+                current.verdict.value,
+                incoming_verdict.value,
+            )
+            return state
     review_findings = _review_findings(current, head_sha, findings)
     patch_digest = _event_patch_digest(event)
     patch_digests = dict(current.review_patch_digests)
@@ -6550,21 +7159,26 @@ def _route_review_event(
             else None,
             findings=tuple(findings),
             source=(
-                "watcher_snapshot"
-                if event.data.get("source") == "watcher_snapshot"
-                else "ledger"
+                "watcher_snapshot" if event.data.get("source") == "watcher_snapshot" else "ledger"
             ),
             pr_number=event.pr_number,
-            reviewer_account_authenticated=event.data.get(
-                "reviewer_account_authenticated"
-            ) is True,
-            reviewer_identity_unresolved=event.data.get("reviewer_identity_unresolved") is not False,
+            reviewer_account_authenticated=event.data.get("reviewer_account_authenticated") is True,
+            reviewer_identity_unresolved=event.data.get("reviewer_identity_unresolved")
+            is not False,
             self_approval=(
-                reviewer_agent_id is not None
-                and reviewer_agent_id == current.dispatch_agent_id
+                reviewer_agent_id is not None and reviewer_agent_id == current.dispatch_agent_id
             ),
             stall_classification=next_stall_classification,
             requires_authenticated_evidence=direct_reviewer_event,
+            submitted_at=_review_event_submitted_at(event),
+            validated_at=(
+                event.data.get("validated_at")
+                if isinstance(event.data.get("validated_at"), str)
+                else event.observed_at
+            ),
+            observed_at=event.observed_at,
+            dismissed=event.data.get("dismissed") is True,
+            forgejo_stale=event.data.get("forgejo_stale") is True,
         ),
     )
     updated[slice_id] = replace(
@@ -7491,7 +8105,7 @@ def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool
 
 def _root_inputs(
     root_spec: WorkPlan | Mapping[str, object], config: TLLoopConfig
-) -> tuple[WorkPlan, str, EventQueue, EffectClient | ReadOnlyEffectClient]:
+) -> tuple[WorkPlan | None, str, EventQueue, EffectClient | ReadOnlyEffectClient]:
     if isinstance(root_spec, WorkPlan):
         raw: Mapping[str, object] = {}
         plan = root_spec
@@ -7505,7 +8119,7 @@ def _root_inputs(
         elif isinstance(plan_value, Mapping):
             plan = WorkPlan.from_mapping(plan_value)
         else:
-            raise TypeError("root_spec must contain a work plan")
+            plan = None
     else:
         raise TypeError("root_spec must be a WorkPlan or object")
     run_id = raw.get("run_id", config.run_id)
@@ -7535,6 +8149,201 @@ def derive_child_worktree(parent_worktree: str | Path, name: str) -> Path:
 def _effective_worktree(config: TLLoopConfig, root_dir: Path, run_id: str) -> str:
     value = config.worktree or (root_dir / run_id)
     return str(Path(value).expanduser().resolve())
+
+
+def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
+    """Convert the typed recursive plan into its canonical declaration shape."""
+    workers = [
+        {
+            "name": task.name,
+            "task": task.task,
+            "agent_type": task.agent_type,
+            **(
+                {"task_timeout_seconds": task.task_timeout_seconds}
+                if task.task_timeout_declared
+                else {}
+            ),
+        }
+        for task in plan.workers
+    ]
+    leaves = [
+        {
+            "name": task.name,
+            "task": task.task,
+            "agent_type": task.agent_type,
+            "boundary": list(task.boundary),
+            "context": task.context,
+            "read_first": list(task.read_first),
+            "steps": list(task.steps),
+            "verify": list(task.verify),
+            "done_criteria": list(task.done_criteria),
+            **(
+                {"task_timeout_seconds": task.task_timeout_seconds}
+                if task.task_timeout_declared
+                else {}
+            ),
+        }
+        for task in plan.leaves
+    ]
+    sub_tls = []
+    for task in plan.sub_tls:
+        child_plan = (
+            task.plan if isinstance(task.plan, WorkPlan) else WorkPlan.from_mapping(task.plan)
+        )
+        sub_tls.append(
+            {
+                "name": task.name,
+                "order": task.order,
+                "task": f"sub-TL {task.name}",
+                "agent_type": task.agent_type,
+                "worktree": str(task.worktree) if task.worktree is not None else None,
+                "integration": _manifest_integration(task.integration),
+                "plan": _manifest_plan(child_plan),
+                "order_explicit": task.order_explicit,
+                **(
+                    {"task_timeout_seconds": task.task_timeout_seconds}
+                    if task.task_timeout_declared
+                    else {}
+                ),
+            }
+        )
+    return {"workers": workers, "leaves": leaves, "sub_tls": sub_tls}
+
+
+def _manifest_for_plan(
+    plan: WorkPlan,
+    run_id: str,
+    config: TLLoopConfig,
+) -> PlanManifest:
+    """Build a candidate declaration only when a run explicitly supplies one."""
+    return build_plan_manifest(
+        _manifest_plan(plan),
+        scope_id=run_id,
+        parent_scope_id=config.parent_run_id,
+        role="non_root" if config.parent_run_id is not None or config.depth > 0 else "root",
+        owned_branch=config.branch,
+        parent_integration_target=config.parent_branch,
+        manifest_revision=config.plan_revision,
+    )
+
+
+def _manifest_is_legacy(manifest: PlanManifest) -> bool:
+    return manifest.role == "root" and manifest.owned_branch == "legacy"
+
+
+def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
+    """Reconstruct executable declarations from the persisted recursive authority."""
+    workers: list[WorkerTask] = []
+    leaves: list[LeafTask] = []
+    sub_tls: list[SubTLTask] = []
+    for node in manifest.nodes:
+        declaration = node.declaration
+        if node.kind == "worker":
+            workers.append(
+                WorkerTask(
+                    node.name,
+                    node.task,
+                    node.agent_type,
+                    _manifest_timeout(declaration),
+                    "task_timeout_seconds" in declaration,
+                )
+            )
+        elif node.kind == "leaf":
+            leaves.append(
+                LeafTask(
+                    name=node.name,
+                    task=node.task,
+                    agent_type=node.agent_type,
+                    boundary=node.boundary,
+                    context=_manifest_optional_text(declaration, "context"),
+                    read_first=_manifest_texts(declaration, "read_first"),
+                    steps=_manifest_texts(declaration, "steps"),
+                    verify=_manifest_texts(declaration, "verify"),
+                    done_criteria=_manifest_texts(declaration, "done_criteria"),
+                    task_timeout_seconds=_manifest_timeout(declaration),
+                    task_timeout_declared="task_timeout_seconds" in declaration,
+                )
+            )
+        elif node.kind == "sub_tl":
+            child = manifest.child_manifests.get(node.node_id)
+            if child is None or node.order is None:
+                raise TLLoopError(
+                    f"manifest node {node.node_id!r} has no reconstructable child scope"
+                )
+            sub_tls.append(
+                SubTLTask(
+                    name=node.name,
+                    plan=_work_plan_from_manifest(child),
+                    agent_type=node.agent_type,
+                    worktree=node.worktree,
+                    order=node.order,
+                    integration=_integration_contract(node.integration_contract),
+                    order_explicit=bool(declaration.get("order_explicit", True)),
+                    task_timeout_seconds=_manifest_timeout(declaration),
+                    task_timeout_declared="task_timeout_seconds" in declaration,
+                )
+            )
+        else:
+            raise TLLoopError(
+                f"manifest node {node.node_id!r} has legacy kind {node.kind!r} and cannot be resumed"
+            )
+    return normalize_work_plan(WorkPlan(tuple(workers), tuple(leaves), tuple(sub_tls)))
+
+
+def _manifest_timeout(declaration: Mapping[str, object]) -> float | None:
+    value = declaration.get("task_timeout_seconds")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TLLoopError("manifest task_timeout_seconds must be numeric or null")
+    return float(value)
+
+
+def _manifest_optional_text(declaration: Mapping[str, object], name: str) -> str | None:
+    value = declaration.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TLLoopError(f"manifest declaration {name} must be a string or null")
+    return value
+
+
+def _manifest_texts(declaration: Mapping[str, object], name: str) -> tuple[str, ...]:
+    value = declaration.get(name, ())
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TLLoopError(f"manifest declaration {name} must be an array")
+    if any(not isinstance(item, str) for item in value):
+        raise TLLoopError(f"manifest declaration {name} must contain strings")
+    return tuple(value)
+
+
+def _manifest_integration(contract: IntegrationContract) -> Mapping[str, object]:
+    return {
+        "aggregate_pr_required": contract.aggregate_pr_required,
+        "base_revalidation_required": contract.base_revalidation_required,
+        "leaf_review_owner": contract.leaf_review_owner.value,
+        "aggregate_review_owner": contract.aggregate_review_owner.value,
+        "aggregate_repair_owner": contract.aggregate_repair_owner.value,
+        "merge_strategy": contract.merge_strategy,
+    }
+
+
+def _bind_initial_slices(
+    slices: Mapping[str, Mapping[str, object]],
+    manifest: PlanManifest,
+) -> Mapping[str, Mapping[str, object]]:
+    """Attach exact manifest identity to every direct initial slice."""
+    by_name = {node.name: node for node in manifest.nodes}
+    bound: dict[str, Mapping[str, object]] = {}
+    for slice_id, value in slices.items():
+        node = by_name.get(slice_id)
+        if node is None:
+            raise TLLoopError(f"slice {slice_id!r} is not declared by the plan manifest")
+        record = copy.deepcopy(dict(value))
+        record["manifest_node_id"] = node.node_id
+        record["manifest_revision"] = manifest.manifest_revision
+        bound[slice_id] = record
+    return bound
 
 
 def _initial_slices(
@@ -7867,8 +8676,9 @@ def normalize_work_plan(plan: WorkPlan, *, path: str = "plan") -> WorkPlan:
     """Normalize explicit sibling orders and validate stage ownership.
 
     A plan with no explicit orders is intentionally returned in source order.
-    Once ordered mode is selected, all direct sub-TLs must declare an order,
-    values must be contiguous from one, and top-level leaves are forbidden.
+    Once ordered mode is selected, all direct sub-TLs must declare an order
+    and values must be contiguous from one. Direct workers and leaves remain
+    an unordered parallel block that runs before the ordered sub-TL stages.
     The nested plans have already gone through this function with their own
     path, so recursive order scopes remain independent.
     """
@@ -7878,8 +8688,6 @@ def normalize_work_plan(plan: WorkPlan, *, path: str = "plan") -> WorkPlan:
     if not all(task.order_explicit for task in tasks):
         missing = next(index for index, task in enumerate(tasks) if not task.order_explicit)
         raise ValueError(f"{path}.sub_tls[{missing}].order is required when ordered mode is used")
-    if plan.leaves:
-        raise ValueError(f"{path}.leaves must be empty when ordered sub-TL stages are used")
     orders = sorted({task.order for task in tasks})
     expected = list(range(1, len(orders) + 1))
     if orders != expected:

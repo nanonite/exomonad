@@ -92,7 +92,8 @@ def test_status_renders_live_state_without_watch_controls(tmp_path: Path, capsys
     assert "\x1b[" not in output
     assert document["phase"] == "tl_dispatching"
     assert document["slices"]["task-a"]["pr_number"] == 101
-    assert document["gates"] == [{"name": "review", "status": "pending"}]
+    assert {"name": "review", "status": "pending"} in document["gates"]
+    assert any(gate["name"].startswith("plan-manifest-migration:") for gate in document["gates"])
     assert document["park_causes"] == {"task-a": "review_stuck"}
     assert document["last_consumed_offset"] == 112
     assert document["controller_fingerprint"]["status"] == "source"

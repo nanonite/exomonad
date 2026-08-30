@@ -10,9 +10,11 @@ from typing import TypeAlias
 
 
 class TLPhase(Enum):
-    """Stable tags for the Haskell ``TLPhase`` constructors."""
+    """Stable tags for durable scope projections and legacy checkpoints."""
 
     TLPlanning = "tl_planning"
+    TLRunning = "tl_running"
+    TLFinalizing = "tl_finalizing"
     TLDispatching = "tl_dispatching"
     TLWaiting = "tl_waiting"
     TLMerging = "tl_merging"
@@ -20,6 +22,7 @@ class TLPhase(Enum):
     TLPRFiled = "tl_pr_filed"
     TLDone = "tl_done"
     TLFailed = "tl_failed"
+    TLParked = "tl_parked"
 
 
 @dataclass(frozen=True)
@@ -92,12 +95,5 @@ class TLFailed(Phase):
 
 
 PhaseValue: TypeAlias = (
-    TLPlanning
-    | TLDispatching
-    | TLWaiting
-    | TLMerging
-    | TLAllMerged
-    | TLPRFiled
-    | TLDone
-    | TLFailed
+    TLPlanning | TLDispatching | TLWaiting | TLMerging | TLAllMerged | TLPRFiled | TLDone | TLFailed
 )

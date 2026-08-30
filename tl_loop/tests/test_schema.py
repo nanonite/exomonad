@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import cast
 
 from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import SCHEMA_VERSION, SchemaError, validate
 
 
@@ -294,6 +295,16 @@ def test_terminal_slice_paths_do_not_conflict_with_active_ownership() -> None:
         status="merged",
         paths=["src/a.py"],
     )
+    manifest = build_plan_manifest(
+        {"workers": [{"name": "slice-a", "task": "legacy"}, {"name": "slice-b", "task": "legacy"}]},
+        scope_id="run-1",
+        owned_branch="legacy",
+    )
+    document["plan_manifest"] = manifest.to_document()
+    for slice_id, node in (("slice-a", manifest.nodes[0]), ("slice-b", manifest.nodes[1])):
+        cast(dict[str, object], slices[slice_id]).update(
+            {"manifest_node_id": node.node_id, "manifest_revision": manifest.manifest_revision}
+        )
     validate(document)
 
 
@@ -358,7 +369,7 @@ def test_review_policy_snapshot_accepts_only_producer_values() -> None:
 
 
 def _valid_document() -> dict[str, object]:
-    return {
+    document = {
         "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "run-1",
@@ -368,6 +379,16 @@ def _valid_document() -> dict[str, object]:
         "gates": [{"name": "plan", "status": "pending"}],
         "events": {"last_consumed_offset": 0},
     }
+    manifest = build_plan_manifest(
+        {"workers": [{"name": "slice-a", "task": "legacy"}]},
+        scope_id="run-1",
+        owned_branch="legacy",
+    )
+    document["plan_manifest"] = manifest.to_document()
+    cast(dict[str, object], document["slices"])["slice-a"].update(
+        {"manifest_node_id": manifest.nodes[0].node_id, "manifest_revision": 1}
+    )
+    return document
 
 
 def _slice_record(

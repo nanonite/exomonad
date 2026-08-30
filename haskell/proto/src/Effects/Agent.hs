@@ -5558,7 +5558,8 @@ data WatcherPrStateResponse
     watcherPrStateResponseReviewHeadSha :: Hs.Text,
     watcherPrStateResponseReviewerAgentId :: Hs.Text,
     watcherPrStateResponseReviewerIdentityError :: Hs.Text,
-    watcherPrStateResponseReviewBody :: Hs.Text
+    watcherPrStateResponseReviewBody :: Hs.Text,
+    watcherPrStateResponseReviewSubmittedAt :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -5598,7 +5599,8 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
         watcherPrStateResponseReviewHeadSha,
         watcherPrStateResponseReviewerAgentId,
         watcherPrStateResponseReviewerIdentityError,
-        watcherPrStateResponseReviewBody
+        watcherPrStateResponseReviewBody,
+        watcherPrStateResponseReviewSubmittedAt
       } =
       Hs.mappend
         ( Hs.mappend
@@ -5625,200 +5627,213 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
                                                                                             ( Hs.mappend
                                                                                                 ( Hs.mappend
                                                                                                     ( Hs.mappend
-                                                                                                        ( HsProtobuf.encodeMessageField
-                                                                                                            ( HsProtobuf.FieldNumber
-                                                                                                                1
+                                                                                                        ( Hs.mappend
+                                                                                                            ( HsProtobuf.encodeMessageField
+                                                                                                                ( HsProtobuf.FieldNumber
+                                                                                                                    1
+                                                                                                                )
+                                                                                                                watcherPrStateResponseSuccess
                                                                                                             )
-                                                                                                            watcherPrStateResponseSuccess
+                                                                                                            ( HsProtobuf.encodeMessageField
+                                                                                                                ( HsProtobuf.FieldNumber
+                                                                                                                    2
+                                                                                                                )
+                                                                                                                ( ( Hs.coerce
+                                                                                                                      @Hs.Text
+                                                                                                                      @(HsProtobuf.String Hs.Text)
+                                                                                                                  )
+                                                                                                                    watcherPrStateResponseError
+                                                                                                                )
+                                                                                                            )
                                                                                                         )
                                                                                                         ( HsProtobuf.encodeMessageField
                                                                                                             ( HsProtobuf.FieldNumber
-                                                                                                                2
+                                                                                                                3
                                                                                                             )
-                                                                                                            ( ( Hs.coerce
-                                                                                                                  @Hs.Text
-                                                                                                                  @(HsProtobuf.String Hs.Text)
-                                                                                                              )
-                                                                                                                watcherPrStateResponseError
-                                                                                                            )
+                                                                                                            watcherPrStateResponsePrNumber
                                                                                                         )
                                                                                                     )
                                                                                                     ( HsProtobuf.encodeMessageField
                                                                                                         ( HsProtobuf.FieldNumber
-                                                                                                            3
+                                                                                                            4
                                                                                                         )
-                                                                                                        watcherPrStateResponsePrNumber
+                                                                                                        watcherPrStateResponseFound
                                                                                                     )
                                                                                                 )
                                                                                                 ( HsProtobuf.encodeMessageField
                                                                                                     ( HsProtobuf.FieldNumber
-                                                                                                        4
+                                                                                                        7
                                                                                                     )
-                                                                                                    watcherPrStateResponseFound
+                                                                                                    ( ( Hs.coerce
+                                                                                                          @Hs.Text
+                                                                                                          @(HsProtobuf.String Hs.Text)
+                                                                                                      )
+                                                                                                        watcherPrStateResponseReviewState
+                                                                                                    )
                                                                                                 )
                                                                                             )
                                                                                             ( HsProtobuf.encodeMessageField
-                                                                                                (HsProtobuf.FieldNumber 7)
+                                                                                                (HsProtobuf.FieldNumber 8)
                                                                                                 ( ( Hs.coerce
                                                                                                       @Hs.Text
                                                                                                       @(HsProtobuf.String Hs.Text)
                                                                                                   )
-                                                                                                    watcherPrStateResponseReviewState
+                                                                                                    watcherPrStateResponseCiStatus
                                                                                                 )
                                                                                             )
                                                                                         )
                                                                                         ( HsProtobuf.encodeMessageField
-                                                                                            (HsProtobuf.FieldNumber 8)
+                                                                                            (HsProtobuf.FieldNumber 9)
                                                                                             ( ( Hs.coerce
                                                                                                   @Hs.Text
                                                                                                   @(HsProtobuf.String Hs.Text)
                                                                                               )
-                                                                                                watcherPrStateResponseCiStatus
+                                                                                                watcherPrStateResponseHeadSha
                                                                                             )
                                                                                         )
                                                                                     )
                                                                                     ( HsProtobuf.encodeMessageField
-                                                                                        (HsProtobuf.FieldNumber 9)
+                                                                                        (HsProtobuf.FieldNumber 10)
                                                                                         ( ( Hs.coerce
                                                                                               @Hs.Text
                                                                                               @(HsProtobuf.String Hs.Text)
                                                                                           )
-                                                                                            watcherPrStateResponseHeadSha
+                                                                                            watcherPrStateResponseHeadBranch
                                                                                         )
                                                                                     )
                                                                                 )
                                                                                 ( HsProtobuf.encodeMessageField
-                                                                                    (HsProtobuf.FieldNumber 10)
+                                                                                    (HsProtobuf.FieldNumber 11)
                                                                                     ( ( Hs.coerce
                                                                                           @Hs.Text
                                                                                           @(HsProtobuf.String Hs.Text)
                                                                                       )
-                                                                                        watcherPrStateResponseHeadBranch
+                                                                                        watcherPrStateResponseBaseBranch
                                                                                     )
                                                                                 )
                                                                             )
                                                                             ( HsProtobuf.encodeMessageField
-                                                                                (HsProtobuf.FieldNumber 11)
+                                                                                (HsProtobuf.FieldNumber 12)
                                                                                 ( ( Hs.coerce
                                                                                       @Hs.Text
                                                                                       @(HsProtobuf.String Hs.Text)
                                                                                   )
-                                                                                    watcherPrStateResponseBaseBranch
+                                                                                    watcherPrStateResponsePrState
                                                                                 )
                                                                             )
                                                                         )
                                                                         ( HsProtobuf.encodeMessageField
-                                                                            (HsProtobuf.FieldNumber 12)
-                                                                            ( ( Hs.coerce
-                                                                                  @Hs.Text
-                                                                                  @(HsProtobuf.String Hs.Text)
-                                                                              )
-                                                                                watcherPrStateResponsePrState
-                                                                            )
+                                                                            (HsProtobuf.FieldNumber 13)
+                                                                            watcherPrStateResponseMerged
                                                                         )
                                                                     )
                                                                     ( HsProtobuf.encodeMessageField
-                                                                        (HsProtobuf.FieldNumber 13)
-                                                                        watcherPrStateResponseMerged
+                                                                        (HsProtobuf.FieldNumber 14)
+                                                                        watcherPrStateResponseReviewCount
                                                                     )
                                                                 )
                                                                 ( HsProtobuf.encodeMessageField
-                                                                    (HsProtobuf.FieldNumber 14)
-                                                                    watcherPrStateResponseReviewCount
+                                                                    (HsProtobuf.FieldNumber 15)
+                                                                    ( ( Hs.coerce
+                                                                          @Hs.Text
+                                                                          @(HsProtobuf.String Hs.Text)
+                                                                      )
+                                                                        watcherPrStateResponseBaseSha
+                                                                    )
                                                                 )
                                                             )
                                                             ( HsProtobuf.encodeMessageField
-                                                                (HsProtobuf.FieldNumber 15)
+                                                                (HsProtobuf.FieldNumber 16)
                                                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                                    watcherPrStateResponseBaseSha
+                                                                    watcherPrStateResponsePatchDigest
                                                                 )
                                                             )
                                                         )
                                                         ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 16)
+                                                            (HsProtobuf.FieldNumber 17)
                                                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                                watcherPrStateResponsePatchDigest
+                                                                watcherPrStateResponseMergeTreeSha
                                                             )
                                                         )
                                                     )
                                                     ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 17)
-                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                            watcherPrStateResponseMergeTreeSha
-                                                        )
+                                                        (HsProtobuf.FieldNumber 18)
+                                                        watcherPrStateResponseHeadReachable
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 18)
-                                                    watcherPrStateResponseHeadReachable
+                                                    (HsProtobuf.FieldNumber 19)
+                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                        watcherPrStateResponseEvidenceError
+                                                    )
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 19)
-                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                    watcherPrStateResponseEvidenceError
-                                                )
+                                                (HsProtobuf.FieldNumber 20)
+                                                watcherPrStateResponsePublicationOwnershipVerified
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 20)
-                                            watcherPrStateResponsePublicationOwnershipVerified
+                                            (HsProtobuf.FieldNumber 21)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                watcherPrStateResponsePublicationOwnershipError
+                                            )
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 21)
-                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                            watcherPrStateResponsePublicationOwnershipError
+                                        (HsProtobuf.FieldNumber 22)
+                                        ( ( Hs.coerce
+                                              @(Hs.Maybe Effects.Agent.PublishedHeadEvidence)
+                                              @(HsProtobuf.Nested Effects.Agent.PublishedHeadEvidence)
+                                          )
+                                            watcherPrStateResponsePublication
                                         )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 22)
-                                    ( ( Hs.coerce
-                                          @(Hs.Maybe Effects.Agent.PublishedHeadEvidence)
-                                          @(HsProtobuf.Nested Effects.Agent.PublishedHeadEvidence)
-                                      )
-                                        watcherPrStateResponsePublication
-                                    )
+                                    (HsProtobuf.FieldNumber 23)
+                                    watcherPrStateResponseReviewId
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 23)
-                                watcherPrStateResponseReviewId
+                                (HsProtobuf.FieldNumber 24)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    watcherPrStateResponseReviewVerdict
+                                )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 24)
+                            (HsProtobuf.FieldNumber 25)
                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                watcherPrStateResponseReviewVerdict
+                                watcherPrStateResponseReviewHeadSha
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 25)
+                        (HsProtobuf.FieldNumber 26)
                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            watcherPrStateResponseReviewHeadSha
+                            watcherPrStateResponseReviewerAgentId
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 26)
+                    (HsProtobuf.FieldNumber 27)
                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        watcherPrStateResponseReviewerAgentId
+                        watcherPrStateResponseReviewerIdentityError
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 27)
+                (HsProtobuf.FieldNumber 28)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    watcherPrStateResponseReviewerIdentityError
+                    watcherPrStateResponseReviewBody
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 28)
+            (HsProtobuf.FieldNumber 29)
             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                watcherPrStateResponseReviewBody
+                watcherPrStateResponseReviewSubmittedAt
             )
         )
   decodeMessage _ =
@@ -5956,6 +5971,12 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
                   (HsProtobuf.FieldNumber 28)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 29)
               )
           )
   dotProto _ =
@@ -6118,6 +6139,12 @@ instance (HsProtobuf.Message WatcherPrStateResponse) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "review_body")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 29)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "review_submitted_at")
+        []
         ""
     ]
 
@@ -6150,6 +6177,7 @@ instance (HsJSONPB.ToJSONPB WatcherPrStateResponse) where
         f26
         f27
         f28
+        f29
       ) =
       HsJSONPB.object
         [ "success" .= f1,
@@ -6199,7 +6227,9 @@ instance (HsJSONPB.ToJSONPB WatcherPrStateResponse) where
           "reviewer_identity_error"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f27),
           "review_body"
-            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f28)
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f28),
+          "review_submitted_at"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f29)
         ]
   toEncodingPB
     ( WatcherPrStateResponse
@@ -6229,6 +6259,7 @@ instance (HsJSONPB.ToJSONPB WatcherPrStateResponse) where
         f26
         f27
         f28
+        f29
       ) =
       HsJSONPB.pairs
         [ "success" .= f1,
@@ -6278,7 +6309,9 @@ instance (HsJSONPB.ToJSONPB WatcherPrStateResponse) where
           "reviewer_identity_error"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f27),
           "review_body"
-            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f28)
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f28),
+          "review_submitted_at"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f29)
         ]
 
 instance (HsJSONPB.FromJSONPB WatcherPrStateResponse) where
@@ -6351,6 +6384,9 @@ instance (HsJSONPB.FromJSONPB WatcherPrStateResponse) where
                 )
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "review_body")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "review_submitted_at")
                 )
       )
 

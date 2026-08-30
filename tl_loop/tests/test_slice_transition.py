@@ -7,6 +7,8 @@ from tl_loop.state.schema import (
     ActionPhase,
     ActionState,
     HandoffEvidence,
+    ReviewValidationDisposition,
+    ReviewValidationObservation,
     SliceState,
     SliceStatus,
     Verdict,
@@ -15,6 +17,9 @@ from tl_loop.state.slice_transition import (
     CIStatusObserved,
     HeadChanged,
     IllegalSliceTransition,
+    RevalidateReview,
+    ReviewValidated,
+    ReviewValidationFailed,
     ReviewVerdictObserved,
     slice_transition,
 )
@@ -70,6 +75,9 @@ def _verdict_event(source: str = "ledger") -> ReviewVerdictObserved:
         reviewer_account_authenticated=True,
         reviewer_identity_unresolved=False,
         self_approval=False,
+        submitted_at="2026-08-27T00:00:00Z",
+        validated_at="2026-08-27T00:00:00Z",
+        observed_at="2026-08-27T00:00:00Z",
     )
 
 
@@ -129,3 +137,82 @@ def test_ci_failure_and_new_head_invalidation_are_reducer_events() -> None:
     assert changed.verdict is None
     assert changed.ci_state == {}
     assert changed.action is None
+
+
+def test_revalidation_refresh_preserves_submission_and_review_round() -> None:
+    reviewed = slice_transition(_state(), _verdict_event())
+    assert reviewed.review_evidence is not None
+    stale = replace(
+        reviewed,
+        review_evidence=replace(
+            reviewed.review_evidence,
+            validated_at="2026-08-27T00:00:00Z",
+        ),
+        review_validation_required=True,
+    )
+
+    requested = slice_transition(stale, RevalidateReview())
+    refreshed = slice_transition(
+        requested,
+        ReviewValidated(
+            ReviewValidationObservation(
+                review_id=17,
+                pr_number=43,
+                head_sha="head-a",
+                reviewer_agent_id="review-invocation",
+                verdict=Verdict.GO,
+                observed_at="2026-08-29T00:00:00Z",
+                submitted_at="2026-08-27T00:00:00Z",
+            )
+        ),
+    )
+
+    assert refreshed.review_evidence is not None
+    assert refreshed.review_evidence.submitted_at == "2026-08-27T00:00:00Z"
+    assert refreshed.review_evidence.validated_at == "2026-08-29T00:00:00Z"
+    assert refreshed.review_validation_required is False
+    assert refreshed.verdict is Verdict.GO
+    assert refreshed.review_rounds == reviewed.review_rounds
+    assert refreshed.handoff == reviewed.handoff
+
+
+def test_revalidation_does_not_change_state_for_missing_verdict() -> None:
+    state = _state()
+    assert slice_transition(state, RevalidateReview()) == state
+
+
+def test_newer_same_head_review_uses_a_new_review_round() -> None:
+    reviewed = slice_transition(_state(), _verdict_event())
+    superseding = slice_transition(
+        reviewed,
+        replace(
+            _verdict_event(),
+            review_id=18,
+            verdict=Verdict.NO_GO,
+            findings=({"severity": "blocking", "path": "src/a.py", "rationale": "fix it"},),
+        ),
+    )
+
+    assert superseding.verdict is Verdict.NO_GO
+    assert superseding.review_rounds == reviewed.review_rounds + 1
+    assert superseding.review_evidence is not None
+    assert superseding.review_evidence.review_id == 18
+
+
+def test_failed_revalidation_is_durable_without_erasing_review_identity() -> None:
+    reviewed = slice_transition(_state(), _verdict_event())
+    failed = slice_transition(
+        reviewed,
+        ReviewValidationFailed(
+            disposition=ReviewValidationDisposition.UNAUTHORIZED,
+            reason="review_validation_unauthorized",
+        ),
+    )
+
+    assert failed.review_validation_required is True
+    assert failed.review_validation_disposition is ReviewValidationDisposition.UNAUTHORIZED
+    assert failed.stall_classification == reviewed.stall_classification
+    assert failed.review_validation_failure_reason == "review_validation_unauthorized"
+    assert failed.verdict is Verdict.GO
+    assert failed.review_evidence == reviewed.review_evidence
+    assert failed.action is None

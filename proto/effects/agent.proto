@@ -446,6 +446,8 @@ message WatcherPrStateResponse {
   string reviewer_agent_id = 26;
   string reviewer_identity_error = 27;
   string review_body = 28;
+  // Immutable Forgejo submission time for the selected exact-head review.
+  string review_submitted_at = 29;
 }
 
 // ============================================================================

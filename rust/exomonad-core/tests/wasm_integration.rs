@@ -560,7 +560,7 @@ impl EffectHandler for MockAgentHandler {
                 } else {
                     "abc123"
                 };
-                let has_authenticated_review = req.pr_number == 42;
+                let has_authenticated_review = matches!(req.pr_number, 42 | 44 | 46 | 47);
                 Ok(WatcherPrStateResponse {
                     success: true,
                     error: String::new(),
@@ -590,6 +590,11 @@ impl EffectHandler for MockAgentHandler {
                     },
                     review_head_sha: if has_authenticated_review {
                         head_sha.into()
+                    } else {
+                        String::new()
+                    },
+                    review_submitted_at: if has_authenticated_review {
+                        "2026-01-01T00:00:00Z".into()
                     } else {
                         String::new()
                     },

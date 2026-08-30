@@ -138,6 +138,7 @@ struct ForgejoReview {
     state: ForgejoReviewVerdict,
     author_branch: Option<String>,
     commit_id: Option<String>,
+    submitted_at: Option<String>,
     author_agent_id: Option<String>,
 }
 
@@ -2439,6 +2440,7 @@ where
                 state,
                 author_branch: None,
                 commit_id: review.commit_id,
+                submitted_at: review.submitted_at,
                 author_agent_id: self
                     .resolve_review_author(
                         pr_number,
@@ -3091,6 +3093,13 @@ fn attach_review_correlation_fields(
             .unwrap_or(serde_json::Value::Null),
     );
     object.insert(
+        "review_submitted_at".to_string(),
+        review
+            .and_then(|value| value.submitted_at.clone())
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    object.insert(
         "reviewer_account_authenticated".to_string(),
         serde_json::Value::Bool(
             review
@@ -3152,6 +3161,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             state: state.clone(),
             author_branch: c.author_branch.clone(),
             commit_id: None,
+            submitted_at: None,
             author_agent_id: None,
         })
         .collect();
@@ -3163,6 +3173,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             state: ForgejoReviewVerdict::Approved,
             author_branch: None,
             commit_id: None,
+            submitted_at: None,
             author_agent_id: None,
         });
     } else if obs.review_state == ForgejoReviewState::ChangesRequested && reviews.is_empty() {
@@ -3172,6 +3183,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: None,
             commit_id: None,
+            submitted_at: None,
             author_agent_id: None,
         });
     } else if obs.review_state == ForgejoReviewState::Commented && reviews.is_empty() {
@@ -3181,6 +3193,7 @@ fn obs_to_review_parts(obs: &Observation) -> (Vec<ForgejoReview>, ForgejoReviewV
             state: ForgejoReviewVerdict::Commented,
             author_branch: None,
             commit_id: None,
+            submitted_at: None,
             author_agent_id: None,
         });
     }
@@ -3899,6 +3912,7 @@ mod tests {
             state,
             author_branch: None,
             commit_id: None,
+            submitted_at: None,
             author_agent_id: None,
         }
     }
@@ -4395,6 +4409,7 @@ mod tests {
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: Some("review-pr-1".to_string()),
             commit_id: None,
+            submitted_at: None,
             author_agent_id: None,
         }];
 
@@ -4431,6 +4446,7 @@ mod tests {
             state: ForgejoReviewVerdict::ChangesRequested,
             author_branch: Some("main.review-pr-10-codex".to_string()),
             commit_id: Some("abc123".to_string()),
+            submitted_at: None,
             author_agent_id: None,
         };
         let first_actions = compute_pr_actions(
@@ -4511,6 +4527,7 @@ mod tests {
             state: ForgejoReviewVerdict::Approved,
             author_branch: None,
             commit_id: Some("abc123".to_string()),
+            submitted_at: None,
             author_agent_id: Some("review-pr-1-claude".to_string()),
         }];
         let actions = compute_pr_actions(
@@ -4542,6 +4559,7 @@ mod tests {
             state: ForgejoReviewVerdict::Approved,
             author_branch: None,
             commit_id: Some("abc123".to_string()),
+            submitted_at: None,
             author_agent_id: Some("review-pr-1-claude".to_string()),
         }];
         let mut pending = test_pending_pr_actions();
@@ -5084,6 +5102,7 @@ mod tests {
             state: ForgejoReviewVerdict::None,
             author_branch: None,
             commit_id: None,
+            submitted_at: None,
             author_agent_id: None,
         }];
         let actions = compute_pr_actions(
@@ -5260,6 +5279,7 @@ mod tests {
             state: ForgejoReviewVerdict::Commented,
             author_branch: Some("main.review-pr-1-codex".to_string()),
             commit_id: None,
+            submitted_at: None,
             author_agent_id: None,
         };
         let obs = Observation {
@@ -5338,6 +5358,7 @@ mod tests {
                 state: ForgejoReviewVerdict::Approved,
                 author_branch: None,
                 commit_id: None,
+                submitted_at: None,
                 author_agent_id: None,
             },
             ForgejoReview {
@@ -5346,6 +5367,7 @@ mod tests {
                 state: ForgejoReviewVerdict::None,
                 author_branch: None,
                 commit_id: None,
+                submitted_at: None,
                 author_agent_id: None,
             },
         ];
@@ -5525,6 +5547,7 @@ mod tests {
             state: ForgejoReviewVerdict::Approved,
             author_branch: None,
             commit_id: Some("sha-old".to_string()),
+            submitted_at: None,
             author_agent_id: None,
         }];
         let mut observations = HashMap::new();

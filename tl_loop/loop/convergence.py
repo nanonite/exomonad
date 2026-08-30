@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, replace
+from datetime import datetime
 from typing import TypeAlias
 
 from tl_loop.loop.reconcile import (
@@ -49,8 +50,16 @@ class ConvergenceResult:
 class ConvergenceTracker:
     """In-memory per-invocation guard for deterministic action reduction."""
 
-    def __init__(self, *, reviewer_max_rounds: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        reviewer_max_rounds: int | None = None,
+        review_freshness_window_secs: int | None = None,
+        review_now: datetime | None = None,
+    ) -> None:
         self.reviewer_max_rounds = reviewer_max_rounds
+        self.review_freshness_window_secs = review_freshness_window_secs
+        self.review_now = review_now
         self._seen: set[tuple[str, int, str]] = set()
         self._wait_reasons: dict[str, str] = {}
         self.last_decision: MergeDecision | None = None
@@ -61,6 +70,8 @@ class ConvergenceTracker:
         decision = derive_next_action(
             state,
             reviewer_max_rounds=self.reviewer_max_rounds,
+            review_freshness_window_secs=self.review_freshness_window_secs,
+            now=self.review_now,
         )
         self.last_decision = decision
         run_id = state.run_id if isinstance(state, RunState) else state.id
@@ -99,7 +110,11 @@ class ConvergenceTracker:
                     version,
                     action=decision.operation,
                     action_key=action_key,
-                    arguments=dict(decision.arguments),
+                    arguments=dumps_json(
+                        dict(decision.arguments),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                 )
             )
             return ConvergenceResult(state, decision, tuple(events))
@@ -187,6 +202,8 @@ class ConvergenceTracker:
 def _target(decision: MergeDecision, fallback: str) -> str:
     if isinstance(decision, ExternalIntent):
         return decision.target_id
+    if isinstance(decision, InternalTransition) and decision.target_id is not None:
+        return decision.target_id
     return fallback
 
 
@@ -198,7 +215,11 @@ def _action_key(decision: MergeDecision) -> str:
             "arguments": dict(decision.arguments),
         }
     elif isinstance(decision, InternalTransition):
-        payload = {"transition": decision.transition, "reason": decision.reason}
+        payload = {
+            "transition": decision.transition,
+            "reason": decision.reason,
+            "target": decision.target_id,
+        }
     else:
         payload = {"wait": decision.reason}
     return hashlib.sha256(

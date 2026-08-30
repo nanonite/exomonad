@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import copy
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .plan_manifest import ManifestError, PlanManifest, build_legacy_manifest
 from .schema import SCHEMA_VERSION
 from .serialization import dumps as dumps_json
 
@@ -47,7 +50,9 @@ def migrate_checkpoint_document(
             f"checkpoint version {source_version} is newer than supported "
             f"version {CURRENT_CHECKPOINT_VERSION}"
         )
-    if source_version == CURRENT_CHECKPOINT_VERSION:
+    if source_version == CURRENT_CHECKPOINT_VERSION and isinstance(
+        value.get("plan_manifest"), dict
+    ):
         return MigrationResult(copy.deepcopy(value), source_version, False, ())
 
     document = copy.deepcopy(value)
@@ -66,7 +71,43 @@ def migrate_checkpoint_document(
     document.setdefault("gates", [])
     document.setdefault("events", {"last_consumed_offset": 0})
     changes.extend(_migrate_slices(document["slices"]))
+    if document.get("plan_manifest") is None:
+        try:
+            manifest = build_legacy_manifest(document, run_id=run_id)
+        except ManifestError as error:
+            raise MigrationError(f"legacy plan manifest is ambiguous: {error}") from error
+        document["plan_manifest"] = manifest.to_document()
+        _bind_migrated_slices(document["slices"], manifest)
+        changes.append("plan_manifest")
+        if manifest.nodes:
+            gates = document.get("gates")
+            if not isinstance(gates, list):
+                raise MigrationError("legacy gates must be an array")
+            gates.append(
+                {
+                    "name": (
+                        "plan-manifest-migration: direct child kind and recursive ownership "
+                        "cannot be proven from this checkpoint"
+                    ),
+                    "status": "pending",
+                }
+            )
+            changes.append("plan_manifest_recovery_gate")
     return MigrationResult(document, source_version, True, tuple(changes))
+
+
+def _bind_migrated_slices(value: object, manifest: PlanManifest) -> None:
+    if not isinstance(value, dict):
+        raise MigrationError("legacy slices must be an object")
+    nodes = {node.name: node for node in manifest.nodes}
+    for slice_id, raw in value.items():
+        if not isinstance(raw, dict) or not isinstance(slice_id, str):
+            raise MigrationError(f"legacy slice {slice_id!r} cannot be bound")
+        node = nodes.get(slice_id)
+        if node is None:
+            raise MigrationError(f"legacy slice {slice_id!r} is not declared by its manifest")
+        raw["manifest_node_id"] = node.node_id
+        raw["manifest_revision"] = manifest.manifest_revision
 
 
 def install_migration(path: Path, result: MigrationResult) -> Path:
@@ -174,6 +215,9 @@ def _migrate_slices(value: object) -> list[str]:
             if key not in raw:
                 raw[key] = copy.deepcopy(default)
                 changes.append(f"{slice_id}.{key}")
+        if raw.get("verdict") is not None and "review_validation_required" not in raw:
+            raw["review_validation_required"] = True
+            changes.append(f"{slice_id}.review_validation_required")
         if raw.get("status") == "spawned" and not _has_spawn_evidence(raw):
             raw["status"] = "dispatch_unconfirmed"
             raw["dispatch_last_boundary"] = "legacy_migration"
@@ -196,9 +240,24 @@ def _has_spawn_evidence(value: dict[str, object]) -> bool:
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_bytes(payload)
-    temporary.replace(path)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _atomic_write_json(path: Path, payload: Any) -> None:

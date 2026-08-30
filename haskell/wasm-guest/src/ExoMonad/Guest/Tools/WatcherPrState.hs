@@ -73,6 +73,7 @@ watcherPrStateResponseValue resp =
       "review_id" .= PA.watcherPrStateResponseReviewId resp,
       "review_verdict" .= lazyText (PA.watcherPrStateResponseReviewVerdict resp),
       "review_head_sha" .= lazyText (PA.watcherPrStateResponseReviewHeadSha resp),
+      "review_submitted_at" .= lazyText (PA.watcherPrStateResponseReviewSubmittedAt resp),
       "reviewer_agent_id" .= lazyText (PA.watcherPrStateResponseReviewerAgentId resp),
       "reviewer_identity_error"
         .= lazyText (PA.watcherPrStateResponseReviewerIdentityError resp),
