@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, cast
 
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.envelope import EventEnvelope, EventKind
@@ -39,7 +39,33 @@ from tl_loop.fsm.phase import (
     TLWaiting,
 )
 from tl_loop.fsm.recovery import begin_recovery
-from tl_loop.fsm.transition import IllegalTransition, transition
+from tl_loop.fsm.scope import (
+    TLAllMerged as RecursiveTLAllMerged,
+)
+from tl_loop.fsm.scope import (
+    TLDone as RecursiveTLDone,
+)
+from tl_loop.fsm.scope import (
+    TLFailed as RecursiveTLFailed,
+)
+from tl_loop.fsm.scope import (
+    TLFinalizing as RecursiveTLFinalizing,
+)
+from tl_loop.fsm.scope import (
+    TLParked as RecursiveTLParked,
+)
+from tl_loop.fsm.scope import (
+    TLPlanning as RecursiveTLPlanning,
+)
+from tl_loop.fsm.scope import (
+    TLPRFiled as RecursiveTLPRFiled,
+)
+from tl_loop.fsm.scope import (
+    TLRunning as RecursiveTLRunning,
+)
+from tl_loop.fsm.scope_projection import phase_tag as canonical_phase_tag
+from tl_loop.fsm.transition import IllegalTransition
+from tl_loop.fsm.transition import transition as phase_transition
 from tl_loop.loop.escalate import blocked_gate_name
 from tl_loop.loop.schedule import propagate_abandonment, restore_dependents, suspend_dependents
 from tl_loop.state.schema import GateStatus, RunState, SliceState, SliceStatus
@@ -326,7 +352,7 @@ class ShadowLoop:
                 self.source.acknowledge(event)
                 continue
             try:
-                next_phase = transition(phase, fsm_event)
+                next_phase = phase_transition(phase, fsm_event)
             except IllegalTransition as error:
                 raise ShadowLoopError(str(error)) from error
             event_seq = event.run_seq
@@ -480,9 +506,7 @@ def _update_slices(
                 updated = propagate_abandonment(
                     updated, event.slug, current.recovery.recovery_round
                 )
-            updated[event.slug] = slice_transition(
-                current, SliceStatusChanged(SliceStatus.FAILED)
-            )
+            updated[event.slug] = slice_transition(current, SliceStatusChanged(SliceStatus.FAILED))
     elif isinstance(event, ChildBlocked):
         current = updated.get(event.slug)
         if current is not None:
@@ -519,6 +543,8 @@ def _shadow_slice_paths(slug: str) -> tuple[str, ...]:
 
 
 def _phase_from_state(state: RunState) -> PhaseValue:
+    if state.recursive_fsm is not None:
+        return cast(PhaseValue, state.recursive_fsm)
     phase = state.fsm.phase
     handles = {
         slice_id: ChildHandle(
@@ -545,6 +571,20 @@ def _phase_from_state(state: RunState) -> PhaseValue:
 
 
 def _phase_tag(phase: PhaseValue) -> TLPhase:
+    if isinstance(
+        phase,
+        (
+            RecursiveTLPlanning,
+            RecursiveTLRunning,
+            RecursiveTLAllMerged,
+            RecursiveTLFinalizing,
+            RecursiveTLPRFiled,
+            RecursiveTLDone,
+            RecursiveTLParked,
+            RecursiveTLFailed,
+        ),
+    ):
+        return canonical_phase_tag(phase)
     if isinstance(phase, TLPlanning):
         return TLPhase.TLPlanning
     if isinstance(phase, TLDispatching):

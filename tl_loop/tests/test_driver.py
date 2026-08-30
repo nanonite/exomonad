@@ -362,7 +362,7 @@ def test_recursive_tl_waiting_child_is_not_marked_failed(
         root_dir=tmp_path,
     )
 
-    assert result.final_state.fsm.phase is TLPhase.TLWaiting
+    assert result.final_state.fsm.phase is TLPhase.TLRunning
     assert result.final_state.slices["waiting-child"].status is SliceStatus.SPAWNED
 
 
@@ -416,7 +416,7 @@ def test_recursive_recovery_is_projected_without_advancing_higher_order(
         root_dir=tmp_path,
     )
 
-    assert result.final_state.fsm.phase is TLPhase.TLWaiting
+    assert result.final_state.fsm.phase is TLPhase.TLRunning
     assert (
         result.final_state.integration.sub_tl_states["recovering-child"]
         is SubTLLifecycle.RECOVERING
@@ -2132,14 +2132,17 @@ def test_review_round_exhaustion_parks_gate_and_emits_once(tmp_path: Path) -> No
         EffectClient(transport),
         journal,
     )
-    assert len(
-        [
-            arguments
-            for name, arguments in transport.calls
-            if name == "emit_controller_event"
-            and arguments.get("event_type") == "tl.review_rounds_exhausted"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                arguments
+                for name, arguments in transport.calls
+                if name == "emit_controller_event"
+                and arguments.get("event_type") == "tl.review_rounds_exhausted"
+            ]
+        )
+        == 1
+    )
 
 
 def test_direct_reviewer_verdict_rejects_unregistered_actor(tmp_path: Path) -> None:

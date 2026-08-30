@@ -11,10 +11,25 @@ from .child import ChildKind, ChildRecord
 from .evidence import require_text as _require_text
 from .post_merge import PostMergePhase, PostMergeState
 from .scope_events import (
+    BaseInvalidated,
+    ChildDispatchRequested,
+    ChildSpawned,
+    ChildTerminal,
+    CIObserved,
     FailureRecorded,
     FinalizationComplete,
     FinalizationRequested,
+    Heartbeat,
+    IntegrationValidated,
+    LeafCompleted,
+    MergeRequested,
     ParkRequested,
+    PlanLoaded,
+    PostMergeObserved,
+    PublicationFiled,
+    RecoveryObserved,
+    RepairRequested,
+    ReviewObserved,
     ScopeRole,
     StageReleased,
     WorkerCompleted,
@@ -115,6 +130,13 @@ class TLRunning:
                     raise ValueError("completed workers require NOT_REQUIRED post-merge state")
                 if not state.evidence.get("worker_result"):
                     raise ValueError("completed workers require result evidence")
+            elif record.kind is ChildKind.LEAF:
+                if state.phase is PostMergePhase.COMPLETE:
+                    continue
+                if state.phase is not PostMergePhase.NOT_REQUIRED or not state.evidence.get(
+                    "leaf_result"
+                ):
+                    raise ValueError("completed leaves require result evidence")
             elif state.phase is not PostMergePhase.COMPLETE:
                 raise ValueError("completed PR children require COMPLETE post-merge state")
         object.__setattr__(self, "pending_by_order", MappingProxyType(dict(groups)))
@@ -142,10 +164,11 @@ class TLAllMerged:
         for state in completed.values():
             if state.phase is PostMergePhase.COMPLETE:
                 continue
-            if state.phase is not PostMergePhase.NOT_REQUIRED or not state.evidence.get(
-                "worker_result"
+            if state.phase is PostMergePhase.NOT_REQUIRED and (
+                state.evidence.get("worker_result") or state.evidence.get("leaf_result")
             ):
-                raise ValueError("all-merged confirmations must carry completion evidence")
+                continue
+            raise ValueError("all-merged confirmations must carry completion evidence")
         object.__setattr__(self, "completed_children", MappingProxyType(completed))
 
 
@@ -203,6 +226,14 @@ class TLFailed:
     """A failure awaiting explicit operator recovery."""
 
     reason: str
+    scope_path: tuple[str, ...] = ("root",)
+    last_evidence: Mapping[str, str] = field(default_factory=dict)
+    next_transition: str = "operator_recovery"
+
+    def __post_init__(self) -> None:
+        _require_text(self.reason, "failure reason")
+        _validate_scope(self.scope_path, "failure")
+        object.__setattr__(self, "last_evidence", MappingProxyType(dict(self.last_evidence)))
 
 
 @dataclass(frozen=True)
@@ -211,6 +242,13 @@ class TLParked:
 
     cause: str
     diagnostic: str
+    scope_path: tuple[str, ...] = ("root",)
+    next_transition: str = "operator_recovery"
+
+    def __post_init__(self) -> None:
+        _require_text(self.cause, "park cause")
+        _require_text(self.diagnostic, "park diagnostic")
+        _validate_scope(self.scope_path, "park")
 
 
 PhaseValue: TypeAlias = (
@@ -219,11 +257,26 @@ PhaseValue: TypeAlias = (
 
 
 __all__ = [
+    "BaseInvalidated",
+    "CIObserved",
+    "ChildDispatchRequested",
+    "ChildSpawned",
+    "ChildTerminal",
     "FailureRecorded",
     "FinalizationComplete",
     "FinalizationRequested",
+    "Heartbeat",
+    "IntegrationValidated",
+    "LeafCompleted",
+    "MergeRequested",
     "ParkRequested",
     "PhaseValue",
+    "PlanLoaded",
+    "PostMergeObserved",
+    "PublicationFiled",
+    "RecoveryObserved",
+    "RepairRequested",
+    "ReviewObserved",
     "ScopeRole",
     "StageReleased",
     "TLAllMerged",

@@ -23,6 +23,7 @@ class ChildCompleted(TLEvent):
     """A child completed its work."""
 
     slug: str
+    result_digest: str = "legacy-completion"
 
 
 @dataclass(frozen=True)

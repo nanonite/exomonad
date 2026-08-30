@@ -29,6 +29,7 @@ from tl_loop.events.identity import (
     resolve_event_slice,
 )
 from tl_loop.events.reader import FindingKind, LedgerFinding, LedgerReader, LedgerReadError
+from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import (
     AllChildrenDone,
     ChildCompleted,
@@ -39,9 +40,11 @@ from tl_loop.fsm.event import (
     PRUpdated,
     TLEvent,
 )
+from tl_loop.fsm.orchestration import transition as scope_transition
 from tl_loop.fsm.phase import (
     ChildHandle,
     PhaseValue,
+    TLAllMerged,
     TLDone,
     TLFailed,
     TLMerging,
@@ -50,7 +53,51 @@ from tl_loop.fsm.phase import (
     TLWaiting,
 )
 from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
-from tl_loop.fsm.transition import IllegalTransition, transition as phase_transition
+from tl_loop.fsm.scope import (
+    TLAllMerged as RecursiveTLAllMerged,
+)
+from tl_loop.fsm.scope import (
+    TLDone as RecursiveTLDone,
+)
+from tl_loop.fsm.scope import (
+    TLFailed as RecursiveTLFailed,
+)
+from tl_loop.fsm.scope import (
+    TLParked as RecursiveTLParked,
+)
+from tl_loop.fsm.scope import (
+    TLPlanning as RecursiveTLPlanning,
+)
+from tl_loop.fsm.scope import (
+    TLPRFiled as RecursiveTLPRFiled,
+)
+from tl_loop.fsm.scope import (
+    TLRunning as RecursiveTLRunning,
+)
+from tl_loop.fsm.scope_events import (
+    FailureRecorded as ScopeFailureRecorded,
+)
+from tl_loop.fsm.scope_events import (
+    FinalizationComplete as ScopeFinalizationComplete,
+)
+from tl_loop.fsm.scope_events import (
+    FinalizationRequested as ScopeFinalizationRequested,
+)
+from tl_loop.fsm.scope_events import (
+    LeafCompleted as ScopeLeafCompleted,
+)
+from tl_loop.fsm.scope_events import (
+    ScopeRole,
+)
+from tl_loop.fsm.scope_events import (
+    StageReleased as ScopeStageReleased,
+)
+from tl_loop.fsm.scope_events import (
+    WorkerCompleted as ScopeWorkerCompleted,
+)
+from tl_loop.fsm.scope_projection import active_child_ids
+from tl_loop.fsm.transition import IllegalTransition
+from tl_loop.fsm.transition import transition as phase_transition
 from tl_loop.loop.convergence import (
     ConvergenceInvariantError,
     ConvergenceTracker,
@@ -364,7 +411,6 @@ class EventDiagnostics:
             self.reader_findings.append(finding.message)
             if finding.kind is FindingKind.RUN_ID_MISMATCH:
                 self.received += 1
-                self.filtered += 1
 
     def record_unresolved_event(self, event: EventEnvelope, resolution: IdentityResolution) -> None:
         """Record a valid observation retained until ownership is proven."""
@@ -848,6 +894,8 @@ def run_tl_loop(
             root_state["goals"] = _encode_goals(selected.goals)
         if initial_slices is not None:
             root_state["slices"] = copy.deepcopy(dict(initial_slices))
+        root_state["plan_manifest"] = manifest.to_document()
+        root_state["fsm"] = _canonical_planning_from_manifest(manifest, initial_slices or {})
         if budgets is not None:
             root_state["budgets"] = _budget_root(budgets)
         if selected.ledger_run_id is not None:
@@ -896,6 +944,8 @@ def run_tl_loop(
     effective_ledger_run_id = selected.ledger_run_id or state.ledger_run_id
     if effective_ledger_run_id is not None:
         selected = replace(selected, ledger_run_id=effective_ledger_run_id)
+    state = _ensure_canonical_scope(state, manifest, store)
+    state = _release_canonical_scope(state, store)
     state = _initialize_ordered_runtime(work_plan, state, store)
     effects_log: list[EffectIntent] = (
         EffectJournal(run_id, store.run_dir / "action-journal.json")
@@ -932,6 +982,14 @@ def run_tl_loop(
         return _recover_tool_unavailable(store, effects, effects_log, error)
     except DurableWriteError as error:
         return _recover_durable_write_failure(store, effects, effects_log, error)
+
+
+def _failure_phase(state: RunState, reason: str) -> PhaseValue:
+    """Build a failure value in the active FSM domain."""
+    phase = state.recursive_fsm
+    if phase is not None:
+        return scope_transition(phase, ScopeFailureRecorded(reason))
+    return TLFailed(reason)
 
 
 def _recover_durable_write_failure(
@@ -974,7 +1032,7 @@ def _recover_durable_write_failure(
     state = store.load()
     if state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
         state = store.checkpoint(
-            TLFailed(f"durable write failed for {slice_state.id!r}"),
+            _failure_phase(state, f"durable write failed for {slice_state.id!r}"),
             state.slices,
             state.budgets,
             state.events.last_consumed_offset,
@@ -1033,7 +1091,7 @@ def _recover_tool_unavailable(
     state = store.load()
     if state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
         state = store.checkpoint(
-            TLFailed(f"tool unavailable for {slice_state.id!r}"),
+            _failure_phase(state, f"tool unavailable for {slice_state.id!r}"),
             state.slices,
             state.budgets,
             state.events.last_consumed_offset,
@@ -1054,6 +1112,192 @@ def _initialize_ordered_runtime(plan: WorkPlan, state: RunState, store: RunStore
         sub_tl_states={task.name: IntegrationLifecycle.RUNNING for task in plan.sub_tls}
     )
     return store.set_ordered_state(1, stages, integration)
+
+
+def _canonical_planning_from_manifest(
+    manifest: PlanManifest,
+    slices: Mapping[str, object],
+) -> RecursiveTLPlanning:
+    """Build the one canonical planning value from immutable declarations."""
+    records = {
+        node.node_id: _canonical_child_record(
+            node, slices.get(node.name), manifest.manifest_revision
+        )
+        for node in manifest.nodes
+    }
+    parallel = tuple(
+        records[node.node_id] for node in manifest.nodes if node.kind in {"worker", "leaf"}
+    )
+    ordered = tuple(
+        (order, tuple(records[node_id] for node_id in node_ids))
+        for order, node_ids in manifest.ordered_stages
+    )
+    return RecursiveTLPlanning(
+        ordered_children=ordered,
+        scope_path=(manifest.scope_id,),
+        plan_digest=manifest.digest or "",
+        parallel_children=parallel,
+    )
+
+
+def _canonical_child_record(
+    node: object,
+    slice_value: object,
+    manifest_revision: int,
+) -> ChildRecord:
+    """Bind one runtime child record to its immutable manifest identity."""
+    kind = ChildKind(node.kind)
+    action = _runtime_field(slice_value, "action")
+    intent_id = _runtime_field(action, "intent_id")
+    invocation_id = _runtime_field(slice_value, "dispatch_invocation_id")
+    return ChildRecord(
+        child_id=node.name,
+        kind=kind,
+        dispatch_intent_id=intent_id if isinstance(intent_id, str) else None,
+        invocation_id=invocation_id if isinstance(invocation_id, str) else None,
+        evidence={
+            "manifest_node_id": node.node_id,
+            "manifest_revision": str(manifest_revision),
+        },
+        manifest_node_id=node.node_id,
+        manifest_revision=manifest_revision,
+    )
+
+
+def _runtime_field(value: object, field_name: str) -> object:
+    """Read a field from either a decoded state value or an input mapping."""
+    if isinstance(value, Mapping):
+        return value.get(field_name)
+    return getattr(value, field_name, None)
+
+
+def _ensure_canonical_scope(
+    state: RunState,
+    manifest: PlanManifest,
+    store: RunStore,
+) -> RunState:
+    """Upgrade only unambiguous legacy planning checkpoints."""
+    if state.recursive_fsm is not None:
+        return state
+    if state.fsm.phase is TLPhase.TLPlanning:
+        planning = _canonical_planning_from_manifest(manifest, state.slices)
+        return store.checkpoint(
+            planning,
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+            plan_manifest=manifest,
+        )
+    if state.fsm.phase is TLPhase.TLDone:
+        return store.checkpoint(
+            RecursiveTLDone(
+                scope_path=(manifest.scope_id,),
+                plan_digest=manifest.digest or "",
+                finalization_evidence={"legacy_terminal": "true"},
+            ),
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+        )
+    if state.fsm.phase is TLPhase.TLFailed:
+        return store.checkpoint(
+            RecursiveTLFailed("legacy failure checkpoint"),
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+        )
+    if state.fsm.phase in {TLPhase.TLWaiting, TLPhase.TLMerging} and not manifest.ordered_stages:
+        planning = _canonical_planning_from_manifest(manifest, state.slices)
+        active_ids = tuple(state.fsm.waiting)
+        declared_ids = tuple(record.child_id for record in planning.parallel_children)
+        if set(active_ids) == set(declared_ids) and len(active_ids) == len(declared_ids):
+            running = scope_transition(
+                planning,
+                ScopeStageReleased(
+                    order=0,
+                    child_ids=declared_ids,
+                    scope_path=planning.scope_path,
+                ),
+            )
+            return store.checkpoint(
+                running,
+                state.slices,
+                state.budgets,
+                state.events.last_consumed_offset,
+            )
+    store.set_gate(
+        "recursive-fsm-migration: legacy active phase cannot be upgraded without dispatch evidence"
+    )
+    raise TLLoopError(
+        f"legacy active phase {state.fsm.phase.value!r} cannot be resumed safely; "
+        "dispatch evidence is ambiguous"
+    )
+
+
+def _release_canonical_scope(state: RunState, store: RunStore) -> RunState:
+    """Release the first canonical block exactly once at startup."""
+    phase = state.recursive_fsm
+    if not isinstance(phase, RecursiveTLPlanning):
+        return state
+    if phase.ordered_children:
+        order, records = phase.ordered_children[0]
+    else:
+        order, records = 0, phase.parallel_children
+    event = ScopeStageReleased(
+        order=order,
+        child_ids=tuple(record.child_id for record in records),
+        scope_path=phase.scope_path,
+    )
+    try:
+        next_phase = scope_transition(phase, event)
+    except Exception as error:
+        raise TLLoopError(f"canonical scope release failed: {error}") from error
+    return store.checkpoint(
+        next_phase,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+
+def _is_terminal_phase(phase: object) -> bool:
+    """Recognize terminal values from both the canonical and legacy views."""
+    return isinstance(
+        phase,
+        (
+            TLDone,
+            TLFailed,
+            RecursiveTLDone,
+            RecursiveTLPRFiled,
+            RecursiveTLFailed,
+            RecursiveTLParked,
+        ),
+    )
+
+
+def _maybe_finalize_root_scope(state: RunState, store: RunStore) -> RunState:
+    """Enter and complete root finalization after all direct work is merged."""
+    phase = state.recursive_fsm
+    manifest = state.plan_manifest
+    if not isinstance(phase, RecursiveTLAllMerged) or manifest is None:
+        return state
+    if manifest.role != "root":
+        return state
+    finalizing = scope_transition(phase, ScopeFinalizationRequested(ScopeRole.ROOT))
+    evidence = {
+        "root_branch": state.owner_branch or manifest.owned_branch,
+        "local_checkout": state.owner_worktree or manifest.owned_branch,
+    }
+    completed = scope_transition(
+        finalizing,
+        ScopeFinalizationComplete(ScopeRole.ROOT, evidence),
+    )
+    return store.checkpoint(
+        completed,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
 
 
 def _run_loop(
@@ -1108,19 +1352,22 @@ def _run_loop(
         state = store.set_goals(
             replace(state.goals, controller_started_at=diagnostics.controller_started_at)
         )
-    if not expected and not plan.sub_tls:
-        before_phase = phase
-        state = store.checkpoint(
-            TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
-        )
+    before_finalization_phase = _phase_from_state(state)
+    state = _maybe_finalize_root_scope(state, store)
+    after_finalization_phase = _phase_from_state(state)
+    if after_finalization_phase != before_finalization_phase:
         _emit_phase_change(
             run_id,
-            before_phase,
-            _phase_from_state(state),
+            before_finalization_phase,
+            after_finalization_phase,
             config,
             effects,
             effects_log,
         )
+    phase = _phase_from_state(state)
+    if not expected and not plan.sub_tls and not _is_terminal_phase(phase):
+        if not isinstance(phase, RecursiveTLAllMerged):
+            raise TLLoopError("empty scope did not reach a canonical completion boundary")
         return TLRunResult(
             state,
             tuple(effects_log),
@@ -1142,7 +1389,24 @@ def _run_loop(
         phase = _phase_from_state(state)
 
     while not config.test_harness or len(consumed) < config.max_events:
-        if isinstance(phase, (TLDone, TLFailed)):
+        if not (
+            isinstance(_phase_from_state(state), RecursiveTLAllMerged)
+            and _source_has_pending(source)
+        ):
+            before_finalization_phase = _phase_from_state(state)
+            state = _maybe_finalize_root_scope(state, store)
+            after_finalization_phase = _phase_from_state(state)
+            if after_finalization_phase != before_finalization_phase:
+                _emit_phase_change(
+                    run_id,
+                    before_finalization_phase,
+                    after_finalization_phase,
+                    config,
+                    effects,
+                    effects_log,
+                )
+        phase = _phase_from_state(state)
+        if _is_terminal_phase(phase):
             break
         if (
             isinstance(convergence.last_decision, Quiescent)
@@ -1211,7 +1475,10 @@ def _run_loop(
                     if heartbeat.parked_slice_ids and _all_expected_terminal(state, expected):
                         before_phase = phase
                         state = store.checkpoint(
-                            TLFailed("heartbeat parked the remaining active slices"),
+                            _failure_phase(
+                                state,
+                                "heartbeat parked the remaining active slices",
+                            ),
                             state.slices,
                             state.budgets,
                             state.events.last_consumed_offset,
@@ -1294,7 +1561,7 @@ def _run_loop(
             state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
-            if isinstance(phase, (TLDone, TLFailed)):
+            if _is_terminal_phase(phase):
                 break
             continue
         if event.kind is EventKind.CI_STATUS_CHANGED:
@@ -1308,7 +1575,7 @@ def _run_loop(
             state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
-            if isinstance(phase, (TLDone, TLFailed)):
+            if _is_terminal_phase(phase):
                 break
             continue
         # Rust's direct agent.spawned records carry the canonical branch and
@@ -1353,7 +1620,7 @@ def _run_loop(
             )
             fsm_event = ChildSpawned(ChildHandle(event_slice_id, branch, agent_type))
             try:
-                next_phase = transition(phase, fsm_event)
+                next_phase = phase_transition(phase, fsm_event)
             except IllegalTransition as error:
                 raise TLLoopError(str(error)) from error
             next_slices = _confirm_dispatch_event(
@@ -1400,13 +1667,20 @@ def _run_loop(
             )
             _emit_phase_change(run_id, phase, next_phase, config, effects, effects_log)
             phase = next_phase
-            if isinstance(phase, (TLDone, TLFailed)):
+            if _is_terminal_phase(phase):
                 break
             continue
         try:
             fsm_event = decoder.decode(event)
         except Exception as error:
             raise TLLoopError(str(error)) from error
+        event_slice_id = _event_slice_id(event, state)
+        if (
+            isinstance(fsm_event, (PRFiled, PRUpdated))
+            and fsm_event.slice_id is None
+            and event_slice_id is not None
+        ):
+            fsm_event = replace(fsm_event, slice_id=event_slice_id)
         if event.kind is EventKind.AGENT_TASK_BLOCKED:
             state = _record_task_blocked_recovery(
                 event,
@@ -1429,11 +1703,35 @@ def _run_loop(
                 diagnostics.acknowledged += 1
             state = store.load()
             continue
+        if isinstance(phase, RecursiveTLRunning) and isinstance(fsm_event, AllChildrenDone):
+            next_phase = _complete_legacy_direct_children(phase)
+            if next_phase == phase and not phase.parallel_pending:
+                next_phase = TLDone()
+            if next_phase != phase:
+                state = store.checkpoint(
+                    next_phase,
+                    state.slices,
+                    state.budgets,
+                    checkpoint_seq,
+                )
+                _ack_event(source, event, replaying, diagnostics)
+                _release_replayed_event(store, event, replaying)
+                diagnostics.correlated += 1
+                transitions.append(
+                    LoopTransition(
+                        event_seq,
+                        event.event_type,
+                        _phase_tag(phase),
+                        _phase_tag(next_phase),
+                    )
+                )
+                _emit_phase_change(run_id, phase, next_phase, config, effects, effects_log)
+                phase = next_phase
+                continue
         try:
-            next_phase = transition(phase, fsm_event)
+            next_phase = phase_transition(phase, fsm_event)
         except IllegalTransition as error:
             raise TLLoopError(str(error)) from error
-        event_slice_id = _event_slice_id(event, state)
         next_slices = _update_slices(
             state.slices,
             fsm_event,
@@ -1476,6 +1774,21 @@ def _run_loop(
             effects,
             effects_log,
         )
+        if (
+            isinstance(phase, RecursiveTLRunning)
+            and isinstance(fsm_event, ChildSpawned)
+            and not transitions
+            and isinstance(event.data.get("shadow_event"), Mapping)
+            and event.data["shadow_event"].get("kind") == "child_spawned"
+        ):
+            _emit_phase_change(
+                run_id,
+                TLPlanning(),
+                TLWaiting({}),
+                config,
+                effects,
+                effects_log,
+            )
         _ack_event(source, event, replaying, diagnostics)
         _release_replayed_event(store, event, replaying)
         diagnostics.correlated += 1
@@ -1494,14 +1807,14 @@ def _run_loop(
         if config.policy is not None and config.max_parallel_slices is not None:
             state = _dispatch_children(plan, state, config, effects, effects_log, store)
         state = _apply_convergence(state, convergence, store, config, effects, effects_log)
-        if isinstance(phase, (TLDone, TLFailed)):
+        if _is_terminal_phase(phase):
             break
     else:
         if config.test_harness:
             raise LoopLimitExceeded(
                 f"event limit {config.max_events} reached before TL reached a terminal phase"
             )
-    if not isinstance(phase, (TLDone, TLFailed)):
+    if not _is_terminal_phase(phase):
         raise TLLoopError("TL controller exited without an authoritative terminal phase")
     if phase is TLFailed:
         reason = next(
@@ -3454,83 +3767,6 @@ def _adopt_authoritative_merged_snapshot(
     return adopted
 
 
-def _confirmed_merge_entry(
-    effects_log: list[EffectIntent],
-    current: SliceState,
-    observed_pr_number: int | None,
-) -> Mapping[str, object] | None:
-    """Find durable merge evidence without reconstructing its arguments."""
-    if not isinstance(effects_log, EffectJournal):
-        return None
-    for entry in effects_log.confirmed_entries("merge_pr", current.id):
-        arguments = entry.get("arguments")
-        if not isinstance(arguments, Mapping):
-            continue
-        journal_pr_number = arguments.get("pr_number")
-        if type(journal_pr_number) is not int:
-            continue
-        if observed_pr_number is not None and journal_pr_number != observed_pr_number:
-            continue
-        if current.pr_number is not None and journal_pr_number != current.pr_number:
-            continue
-        result = entry.get("result")
-        if isinstance(result, Mapping):
-            nested = result.get("result")
-            if isinstance(nested, Mapping) and nested.get("merged") is False:
-                continue
-        return entry
-    return None
-
-
-def _adopt_authoritative_merged_snapshot(
-    state: RunState,
-    slice_id: str,
-    pr_number: int,
-    merge_entry: Mapping[str, object],
-    config: TLLoopConfig,
-    effects: EffectClient | ReadOnlyEffectClient,
-    store: RunStore,
-    effects_log: list[EffectIntent],
-) -> RunState:
-    """Adopt a journal-confirmed merge before review/ownership recovery."""
-    arguments = merge_entry.get("arguments")
-    issue_id = config.chainlink_issue_id
-    if isinstance(arguments, Mapping) and type(arguments.get("chainlink_issue_id")) is int:
-        issue_id = cast(int, arguments["chainlink_issue_id"])
-    bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
-        slice_id,
-        pr_number,
-        issue_id,
-        config,
-        store,
-        effects,
-        effects_log,
-    )
-    current = state.slices[slice_id]
-    merged = replace(
-        slice_transition(current, MergeCompleted(pr_number)),
-        dispatch_last_boundary="authoritative_merge_adopted",
-        dispatch_error=bookkeeping_error,
-    )
-    adopted = _checkpoint_slice_action(
-        store,
-        state,
-        slice_id,
-        None,
-        slice_state=merged,
-    )
-    if not bookkeeping_ok:
-        adopted = _ensure_merge_bookkeeping_gate(
-            adopted,
-            store,
-            effects_log,
-            slice_id,
-            pr_number,
-            issue_id,
-        )
-    return adopted
-
-
 def _reconciliation_phase(
     state: RunState,
     slices: Mapping[str, SliceState],
@@ -4899,8 +5135,8 @@ def _run_sub_tl_batch(
         child_store = RunStore(task.name, store.run_dir)
         if child_store.path.exists():
             child_state = child_store.load()
-            child_phase = child_state.fsm.phase
-            if child_phase in {TLPhase.TLDone, TLPhase.TLFailed}:
+            child_phase = _child_completion_phase(child_state)
+            if child_phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}:
                 return task, child_phase, child_state
             if _child_recovery_projection(child_state, store.run_id) is not None:
                 return task, child_phase, child_state
@@ -4910,11 +5146,24 @@ def _run_sub_tl_batch(
         except Exception as error:  # noqa: BLE001 - batch completion persists a durable failure
             child_store.record_exit_reason(str(error))
             return task, TLPhase.TLFailed, None
-        return task, child_result.final_state.fsm.phase, child_result.final_state
+        return task, _child_completion_phase(child_result.final_state), child_result.final_state
 
     with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
         futures = [executor.submit(run_one, task) for task in tasks]
         return tuple(future.result() for future in futures)
+
+
+def _child_completion_phase(state: RunState) -> TLPhase:
+    """Project an empty canonical child for the legacy parent adapter."""
+    recursive_fsm = getattr(state, "recursive_fsm", None)
+    manifest = getattr(state, "plan_manifest", None)
+    if (
+        isinstance(recursive_fsm, RecursiveTLAllMerged)
+        and manifest is not None
+        and not manifest.nodes
+    ):
+        return TLPhase.TLDone
+    return state.fsm.phase
 
 
 def _run_live_sub_tl_batch(
@@ -4935,9 +5184,9 @@ def _run_live_sub_tl_batch(
         child_store = RunStore(task.name, store.run_dir)
         if child_store.path.exists():
             child_state = child_store.load()
-            child_phase = child_state.fsm.phase
+            child_phase = _child_completion_phase(child_state)
             if (
-                child_phase in {TLPhase.TLDone, TLPhase.TLFailed}
+                child_phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
                 or _child_recovery_projection(child_state, store.run_id) is not None
             ):
                 existing[task.name] = (task, child_phase, child_state)
@@ -4962,7 +5211,9 @@ def _run_live_sub_tl_batch(
     for task, process in processes:
         child_store = RunStore(task.name, store.run_dir)
         child_state = _supervise_live_sub_tl(process, child_store, config)
-        phase = child_state.fsm.phase if child_state is not None else TLPhase.TLFailed
+        phase = (
+            _child_completion_phase(child_state) if child_state is not None else TLPhase.TLFailed
+        )
         outcomes_by_name[task.name] = (task, phase, child_state)
     return tuple(outcomes_by_name[task.name] for task in tasks)
 
@@ -5001,7 +5252,16 @@ def _supervise_live_sub_tl(
             is not None
         ):
             return child_state
-        if child_state is None or child_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
+        empty_scope = (
+            child_state is not None
+            and isinstance(getattr(child_state, "recursive_fsm", None), RecursiveTLAllMerged)
+            and getattr(child_state, "plan_manifest", None) is not None
+            and not child_state.plan_manifest.nodes
+        )
+        if child_state is None or (
+            child_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
+            and not empty_scope
+        ):
             child_store.record_exit_reason(
                 f"sub-TL controller exited before authoritative resolution with code {exitcode}"
             )
@@ -5051,7 +5311,7 @@ def _complete_sub_tl_batch(
     sub_tl_recovery = dict(state.integration.sub_tl_recovery)
     candidate_records = dict(state.integration.candidates)
     for task, phase, child_state in outcomes:
-        if phase not in {TLPhase.TLDone, TLPhase.TLFailed}:
+        if phase not in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}:
             current = updated_slices[task.name]
             updated_slices[task.name] = slice_transition(
                 current, SliceStatusChanged(SliceStatus.SPAWNED)
@@ -5062,7 +5322,11 @@ def _complete_sub_tl_batch(
                 sub_tl_states[task.name] = lifecycle
                 sub_tl_recovery[task.name] = summary
             continue
-        status = SliceStatus.MERGED if phase is TLPhase.TLDone else SliceStatus.FAILED
+        status = (
+            SliceStatus.MERGED
+            if phase in {TLPhase.TLDone, TLPhase.TLPRFiled}
+            else SliceStatus.FAILED
+        )
         previous_lifecycle = sub_tl_states.get(task.name, IntegrationLifecycle.RUNNING)
         if isinstance(previous_lifecycle, SubTLLifecycle):
             previous_lifecycle = IntegrationLifecycle.RUNNING
@@ -5098,9 +5362,7 @@ def _complete_sub_tl_batch(
                         )
                     )
                 )
-                current = slice_transition(
-                    current, SliceStatusChanged(SliceStatus.IN_REVIEW)
-                )
+                current = slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW))
                 current = slice_transition(
                     current,
                     HeadEvidenceObserved(
@@ -5132,9 +5394,7 @@ def _complete_sub_tl_batch(
                     head_sha=candidate.head_sha,
                     patch_digest=candidate.patch_digest,
                 )
-        updated_slices[task.name] = slice_transition(
-            current, SliceStatusChanged(status)
-        )
+        updated_slices[task.name] = slice_transition(current, SliceStatusChanged(status))
         sub_tl_states[task.name] = lifecycle
         candidate_records[task.name] = IntegrationCandidateState(
             lifecycle=candidate_runtime.lifecycle,
@@ -6347,7 +6607,7 @@ def _fail_recursive_parent(
     """Stop stage advancement while retaining completed sibling results."""
     before_phase = _phase_from_state(state)
     state = store.checkpoint(
-        TLFailed(reason),
+        _failure_phase(state, reason),
         state.slices,
         state.budgets,
         state.events.last_consumed_offset,
@@ -6553,9 +6813,7 @@ def _prepare_spawn(
         raw_slice = slices.get(name)
         if not isinstance(raw_slice, dict):
             raise TLLoopError(f"selector slice {name!r} is not an object")
-        dispatched = slice_transition(
-            slice_state, SliceStatusChanged(SliceStatus.DISPATCHING)
-        )
+        dispatched = slice_transition(slice_state, SliceStatusChanged(SliceStatus.DISPATCHING))
         raw_slice.update(
             {
                 "status": dispatched.status.value,
@@ -6756,9 +7014,7 @@ def _record_review_event(
         updated[slice_id] = replace(
             slice_transition(
                 current,
-                StallClassificationObserved(
-                    stall_classification or current.stall_classification
-                ),
+                StallClassificationObserved(stall_classification or current.stall_classification),
             ),
             pr_number=event.pr_number or current.pr_number,
             review_findings=review_findings,
@@ -7035,9 +7291,7 @@ def _route_review_event(
         updated[slice_id] = replace(
             slice_transition(
                 current,
-                StallClassificationObserved(
-                    stall_classification or current.stall_classification
-                ),
+                StallClassificationObserved(stall_classification or current.stall_classification),
             ),
             review_findings=review_findings,
             review_patch_digests=patch_digests,
@@ -8091,7 +8345,56 @@ def _bind_publication_evidence(
     return {**slices, target_id: updated}
 
 
+def _complete_legacy_direct_children(phase: RecursiveTLRunning) -> PhaseValue:
+    """Translate the legacy aggregate signal into typed direct completions."""
+    next_phase: PhaseValue = phase
+    for record in phase.parallel_pending:
+        if record.kind is ChildKind.WORKER:
+            next_phase = scope_transition(
+                next_phase,
+                ScopeWorkerCompleted(record.child_id, "legacy-all-children-done"),
+            )
+        elif record.kind is ChildKind.LEAF:
+            next_phase = scope_transition(
+                next_phase,
+                ScopeLeafCompleted(record.child_id, "legacy-all-children-done"),
+            )
+    return next_phase
+
+
 def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool:
+    if isinstance(
+        phase,
+        (
+            RecursiveTLAllMerged,
+            RecursiveTLDone,
+            RecursiveTLPRFiled,
+            RecursiveTLFailed,
+            RecursiveTLParked,
+        ),
+    ):
+        return isinstance(event, AllChildrenDone)
+    if isinstance(phase, RecursiveTLRunning):
+        active = set(active_child_ids(phase))
+        if isinstance(event, ChildSpawned):
+            current = state.slices.get(event.handle.slug)
+            if current is not None and current.status in DISPATCHING_STATUSES:
+                return False
+            return event.handle.slug in active
+        if isinstance(event, (ChildCompleted, ChildFailed, PRMerged)):
+            return event.slug not in active
+        if isinstance(event, AllChildrenDone):
+            return isinstance(
+                phase,
+                (
+                    RecursiveTLAllMerged,
+                    RecursiveTLDone,
+                    RecursiveTLPRFiled,
+                    RecursiveTLFailed,
+                    RecursiveTLParked,
+                ),
+            )
+        return False
     if isinstance(event, ChildSpawned):
         active = phase.children if isinstance(phase, (TLWaiting, TLMerging)) else {}
         return event.handle.slug in active

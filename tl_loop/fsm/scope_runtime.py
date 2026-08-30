@@ -80,6 +80,23 @@ def complete_worker(phase: TLRunning, event: object) -> PhaseValue:
     return remove_active(phase, event.child_id, post, evidence)
 
 
+def complete_leaf(phase: TLRunning, event: object) -> PhaseValue:
+    """Record a direct leaf result without granting worker completion rights."""
+    record = active_record(phase, event.child_id)
+    if record.kind is not ChildKind.LEAF:
+        raise IllegalTransition("LeafCompleted cannot complete a worker or sub-TL")
+    if not event.result_digest:
+        raise ValueError("leaf result digest must be non-empty")
+    post = dict(phase.post_merge)
+    post[event.child_id] = PostMergeState(
+        PostMergePhase.NOT_REQUIRED,
+        {**post[event.child_id].evidence, "leaf_result": event.result_digest},
+    )
+    evidence = dict(phase.evidence)
+    evidence[f"{event.child_id}:leaf_result"] = event.result_digest
+    return remove_active(phase, event.child_id, post, evidence)
+
+
 def post_merge_transition(phase: TLRunning, event: object) -> PhaseValue:
     """Advance one active PR child through the post-merge reducer."""
     current = phase.post_merge.get(event.child_id)
@@ -210,6 +227,7 @@ __all__ = [
     "IllegalTransition",
     "active_record",
     "all_merged",
+    "complete_leaf",
     "complete_worker",
     "post_merge_transition",
     "release_first_stage",

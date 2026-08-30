@@ -34,11 +34,26 @@ from .post_merge_events import (
 )
 from .post_merge_evidence import PushReceipt
 from .scope import (
+    BaseInvalidated,
+    ChildDispatchRequested,
+    ChildSpawned,
+    ChildTerminal,
+    CIObserved,
     FailureRecorded,
     FinalizationComplete,
     FinalizationRequested,
+    Heartbeat,
+    IntegrationValidated,
+    LeafCompleted,
+    MergeRequested,
     ParkRequested,
     PhaseValue,
+    PlanLoaded,
+    PostMergeObserved,
+    PublicationFiled,
+    RecoveryObserved,
+    RepairRequested,
+    ReviewObserved,
     ScopeRole,
     StageReleased,
     TLAllMerged,
@@ -53,6 +68,7 @@ from .scope import (
 )
 from .scope_runtime import (
     IllegalTransition,
+    complete_leaf,
     complete_worker,
     post_merge_transition,
     release_first_stage,
@@ -80,20 +96,52 @@ def stable_integration_order(child_ids: tuple[str, ...] | list[str]) -> tuple[st
 
 def transition(phase: PhaseValue, event: TLOrchestrationEvent) -> PhaseValue:
     """Apply one scope event; terminal phases have no automatic arms."""
+    if isinstance(event, PlanLoaded):
+        if not isinstance(phase, TLPlanning):
+            raise IllegalTransition("a plan can only be loaded while planning")
+        if event.scope_path != phase.scope_path or event.plan_digest != phase.plan_digest:
+            raise IllegalTransition("loaded plan identity does not match scope")
+        return phase
     if isinstance(event, FailureRecorded) and isinstance(
         phase, (TLPlanning, TLRunning, TLAllMerged, TLFinalizing)
     ):
         _require_text(event.reason, "failure reason")
-        return TLFailed(event.reason)
+        return TLFailed(event.reason, getattr(phase, "scope_path", ("root",)))
     if isinstance(event, ParkRequested) and isinstance(
         phase, (TLPlanning, TLRunning, TLAllMerged, TLFinalizing)
     ):
         _require_text(event.cause, "park cause")
         _require_text(event.diagnostic, "park diagnostic")
-        return TLParked(event.cause, event.diagnostic)
+        return TLParked(event.cause, event.diagnostic, getattr(phase, "scope_path", ("root",)))
     if isinstance(phase, TLPlanning) and isinstance(event, StageReleased):
         return release_first_stage(phase, event)
     if isinstance(phase, TLRunning):
+        if isinstance(event, ChildDispatchRequested):
+            _active_child(phase, event.child_id)
+            return phase
+        if isinstance(event, ChildSpawned):
+            _active_child(phase, event.child_id)
+            return phase
+        if isinstance(event, ChildTerminal):
+            return _child_terminal(phase, event)
+        if isinstance(
+            event,
+            (
+                PublicationFiled,
+                ReviewObserved,
+                CIObserved,
+                BaseInvalidated,
+                IntegrationValidated,
+                MergeRequested,
+                PostMergeObserved,
+                RepairRequested,
+                RecoveryObserved,
+                Heartbeat,
+            ),
+        ):
+            if hasattr(event, "child_id"):
+                _active_child(phase, event.child_id)
+            return phase
         if isinstance(
             event,
             (
@@ -111,6 +159,8 @@ def transition(phase: PhaseValue, event: TLOrchestrationEvent) -> PhaseValue:
             return post_merge_transition(phase, event)
         if isinstance(event, WorkerCompleted):
             return complete_worker(phase, event)
+        if isinstance(event, LeafCompleted):
+            return complete_leaf(phase, event)
     if isinstance(phase, TLAllMerged) and isinstance(event, FinalizationRequested):
         if not isinstance(event.role, ScopeRole):
             raise TypeError("finalization role is invalid")
@@ -141,6 +191,26 @@ def _validate_finalization_evidence(event: FinalizationComplete) -> None:
     )
     if any(not event.evidence.get(key) for key in required):
         raise ValueError("finalization evidence is incomplete for scope role")
+
+
+def _active_child(phase: TLRunning, child_id: str) -> ChildRecord:
+    records = (*phase.parallel_pending, *phase.pending_by_order.get(phase.current_order, ()))
+    for record in records:
+        if record.child_id == child_id:
+            return record
+    raise IllegalTransition("scope event names a child outside the active barrier")
+
+
+def _child_terminal(phase: TLRunning, event: ChildTerminal) -> PhaseValue:
+    record = _active_child(phase, event.child_id)
+    if record.kind is ChildKind.WORKER:
+        result_digest = event.evidence.get("result_digest")
+        if event.outcome not in {"success", "completed"} or not result_digest:
+            raise IllegalTransition("worker terminal evidence requires a result digest")
+        return complete_worker(phase, WorkerCompleted(event.child_id, result_digest))
+    if event.outcome not in {"success", "completed"}:
+        raise IllegalTransition("PR-producing child failure requires a failure event")
+    return phase
 
 
 __all__ = [

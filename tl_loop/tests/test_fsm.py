@@ -38,6 +38,8 @@ HANDLE_B = ChildHandle("b", "main.b", "claude")
 def test_phase_enum_matches_haskell_constructors() -> None:
     assert {phase.name for phase in TLPhase} == {
         "TLPlanning",
+        "TLRunning",
+        "TLFinalizing",
         "TLDispatching",
         "TLWaiting",
         "TLMerging",
@@ -45,6 +47,7 @@ def test_phase_enum_matches_haskell_constructors() -> None:
         "TLPRFiled",
         "TLDone",
         "TLFailed",
+        "TLParked",
     }
 
 
