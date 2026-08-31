@@ -62,6 +62,7 @@ from tl_loop.fsm.post_merge_events import (
     ParentBranchSynced,
     ParentPushPending,
     PostMergeComplete,
+    PostMergeRebuildRequested,
 )
 from tl_loop.fsm.post_merge_evidence import PushReceipt
 from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
@@ -231,6 +232,13 @@ INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 MAX_CONVERGENCE_STEPS = 8
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
+REMOTE_ADVANCE_FAILURE_MARKERS = (
+    "force-with-lease",
+    "stale info",
+    "non-fast-forward",
+    "non fast-forward",
+    "fetch first",
+)
 
 
 def _transition_sub_tl_lifecycle(
@@ -2645,6 +2653,7 @@ def _post_merge_effect(
     *,
     active: bool = True,
     call_arguments: Mapping[str, object] | None = None,
+    retryable_failure: bool = True,
 ) -> ToolResult | None:
     callback = getattr(effects, method, None)
     if not callable(callback):
@@ -2659,7 +2668,7 @@ def _post_merge_effect(
         lambda client: cast(ToolResult, getattr(client, method)(**dispatch_arguments)),
         effects_log,
         raise_on_failure=False,
-        retryable_failure=True,
+        retryable_failure=retryable_failure,
     )
 
 
@@ -2719,10 +2728,53 @@ def _advance_post_merge_boundary(
                 ChangelogPending(current.id, intent_id, 0),
             )
         if post_merge.phase is PostMergePhase.CHANGELOG_PENDING:
+            if post_merge.evidence.get("rebuild_reason") and not post_merge.evidence.get(
+                "rebuild_applied"
+            ):
+                generation = _required_int(
+                    post_merge.evidence,
+                    "changelog_generation",
+                    "changelog generation",
+                    allow_zero=True,
+                )
+                return _checkpoint_post_merge_event(
+                    store,
+                    state,
+                    slice_id,
+                    ChangelogPending(
+                        current.id,
+                        _post_merge_key(
+                            state,
+                            "changelog_rebuild",
+                            current.id,
+                            pr_number,
+                            generation=generation,
+                        ),
+                        generation,
+                    ),
+                )
             return _run_changelog(state, current, evidence, config, effects, effects_log, store)
         if post_merge.phase is PostMergePhase.CHANGELOG_COMMITTED:
-            intent_id = _post_merge_key(state, "parent_push", current.id, pr_number)
-            journal_id = _post_merge_key(state, "parent_push_journal", current.id, pr_number)
+            generation = (
+                _required_int(
+                    post_merge.evidence,
+                    "changelog_generation",
+                    "changelog generation",
+                    allow_zero=True,
+                )
+                if post_merge.evidence.get("rebuild_reason")
+                else None
+            )
+            operation = "parent_push_rebuild" if generation is not None else "parent_push"
+            journal_operation = (
+                "parent_push_rebuild_journal" if generation is not None else "parent_push_journal"
+            )
+            intent_id = _post_merge_key(
+                state, operation, current.id, pr_number, generation=generation
+            )
+            journal_id = _post_merge_key(
+                state, journal_operation, current.id, pr_number, generation=generation
+            )
             return _checkpoint_post_merge_event(
                 store,
                 state,
@@ -2747,10 +2799,18 @@ def _required_issue_id(issue_id: int | None) -> str:
     return str(issue_id)
 
 
-def _post_merge_key(state: RunState, operation: str, child_id: str, pr_number: int) -> str:
-    return stable_action_key(
-        state.run_id, f"post_merge_{operation}", child_id, {"pr_number": pr_number}
-    )
+def _post_merge_key(
+    state: RunState,
+    operation: str,
+    child_id: str,
+    pr_number: int,
+    *,
+    generation: int | None = None,
+) -> str:
+    arguments: dict[str, object] = {"pr_number": pr_number}
+    if generation is not None:
+        arguments["generation"] = generation
+    return stable_action_key(state.run_id, f"post_merge_{operation}", child_id, arguments)
 
 
 def _run_parent_sync(
@@ -2763,18 +2823,54 @@ def _run_parent_sync(
     effects_log: list[EffectIntent],
     store: RunStore,
 ) -> RunState:
-    arguments = {
+    arguments, payload = _parent_sync_effect(
+        state,
+        current,
+        pr_number,
+        evidence,
+        config,
+        effects,
+        effects_log,
+        operation="post_merge_parent_sync",
+        expected_base_sha=_required_current_base(current),
+    )
+    return _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        ParentBranchSynced(current.id, arguments["parent_branch"], payload["parent_commit_sha"]),
+        {
+            "remote_head_sha": payload["remote_head_sha"],
+            "ancestry_proof": payload["ancestry_proof"],
+        },
+    )
+
+
+def _parent_sync_effect(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    *,
+    operation: str,
+    expected_base_sha: str,
+) -> tuple[dict[str, object], Mapping[str, str]]:
+    """Run and validate one authoritative parent-branch observation."""
+    arguments: dict[str, object] = {
         "child_id": current.id,
         "pr_number": pr_number,
         "repository": _required_merge_identity(evidence, ("repository",), "repository"),
         "parent_branch": _required_merge_identity(evidence, ("parent_branch",), "parent branch"),
         "merged_head_sha": _required_merge_identity(evidence, ("head_sha",), "merged head SHA"),
-        "expected_base_sha": _required_current_base(current),
+        "expected_base_sha": expected_base_sha,
         "lane_epoch": _required_int(evidence, "lane_epoch", "lane epoch"),
         "working_dir": config.working_dir,
     }
     result = _post_merge_effect(
-        "post_merge_parent_sync",
+        operation,
         current.id,
         arguments,
         effects,
@@ -2816,16 +2912,7 @@ def _run_parent_sync(
         f"ancestor:{arguments['merged_head_sha']}->{payload['parent_commit_sha']}"
     ):
         raise ValueError("parent synchronization returned unverifiable ancestry evidence")
-    return _checkpoint_post_merge_event(
-        store,
-        state,
-        current.id,
-        ParentBranchSynced(current.id, arguments["parent_branch"], payload["parent_commit_sha"]),
-        {
-            "remote_head_sha": payload["remote_head_sha"],
-            "ancestry_proof": payload["ancestry_proof"],
-        },
-    )
+    return arguments, payload
 
 
 def _run_issue_close(
@@ -2969,7 +3056,21 @@ def _run_parent_push(
         effects_log,
         "post_merge_push",
         active=config.active,
+        retryable_failure=False,
     )
+    if result is None or result.success is not True:
+        return _recover_remote_advance(
+            state,
+            current,
+            pr_number=int(evidence["pr_number"]),
+            evidence=evidence,
+            push_arguments=arguments,
+            failed_result=result,
+            config=config,
+            effects=effects,
+            effects_log=effects_log,
+            store=store,
+        )
     payload = _required_effect_result(
         result,
         (
@@ -3030,6 +3131,75 @@ def _run_parent_push(
             receipt,
         ),
     )
+
+
+def _recover_remote_advance(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    push_arguments: Mapping[str, object],
+    failed_result: ToolResult | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    """Reconcile a stale parent push into a fresh bookkeeping generation."""
+    failure = failed_result.error if failed_result is not None else None
+    if not _is_remote_advance_failure(failure):
+        raise ValueError(failure or "parent push returned no authoritative result")
+    expected_base_sha = push_arguments.get("expected_base_sha")
+    if not isinstance(expected_base_sha, str) or not expected_base_sha:
+        raise ValueError("failed parent push has no expected base SHA")
+    _, payload = _parent_sync_effect(
+        state,
+        current,
+        pr_number,
+        evidence,
+        config,
+        effects,
+        effects_log,
+        operation="post_merge_remote_reconcile",
+        expected_base_sha=expected_base_sha,
+    )
+    observed_remote_head = payload["remote_head_sha"]
+    if observed_remote_head == expected_base_sha:
+        raise ValueError("parent push failed without authoritative remote advancement")
+    generation = (
+        _required_int(evidence, "changelog_generation", "changelog generation", allow_zero=True) + 1
+    )
+    failed_push_result = failure or "parent push failed"
+    reason = f"parent push compare-and-swap rejected after remote advancement: {failed_push_result}"
+    rebuilt = PostMergeRebuildRequested(
+        current.id,
+        generation,
+        str(push_arguments["push_intent_id"]),
+        str(push_arguments["push_journal_id"]),
+        failed_push_result,
+        observed_remote_head,
+        observed_remote_head,
+        payload["ancestry_proof"],
+        reason,
+    )
+    return _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        rebuilt,
+        {
+            "remote_head_sha": observed_remote_head,
+            "merge_base_sha": observed_remote_head,
+        },
+    )
+
+
+def _is_remote_advance_failure(error: str | None) -> bool:
+    """Recognize only server errors that identify a stale compare-and-swap base."""
+    if not error:
+        return False
+    normalized = error.lower()
+    return any(marker in normalized for marker in REMOTE_ADVANCE_FAILURE_MARKERS)
 
 
 def _required_effect_result(

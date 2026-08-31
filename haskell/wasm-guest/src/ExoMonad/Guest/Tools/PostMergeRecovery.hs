@@ -35,7 +35,7 @@ module ExoMonad.Guest.Tools.PostMergeRecovery
 where
 
 import Control.Monad (void)
-import Control.Monad.Freer (Eff)
+import Control.Monad.Freer (Eff, Member)
 import Data.Aeson (FromJSON (..), Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Map qualified as Map
@@ -50,6 +50,7 @@ import ExoMonad.Effects.Log (LogInfo)
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
+import ExoMonad.Guest.Tool.Suspend.Types (SuspendYield)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
@@ -261,7 +262,7 @@ postMergeParentSyncCore args = do
                                       )
                         _ -> pure $ Left "parent synchronization could not read authoritative heads"
 
-postMergeChangelogCore :: PostMergeChangelogArgs -> Eff Effects (Either Text Value)
+postMergeChangelogCore :: (Member SuspendYield effs) => PostMergeChangelogArgs -> Eff effs (Either Text Value)
 postMergeChangelogCore args = do
   case validateChangelog args of
     Left err -> pure $ Left err
@@ -291,11 +292,12 @@ postMergeChangelogCore args = do
                                 staged <- runGitAt (pmcWorkingDir args) postMergeChangelogStageArgs
                                 case staged of
                                   Left err -> pure $ Left err
-                                  Right _ ->
-                                    runGitAt
-                                      (pmcWorkingDir args)
-                                      (postMergeChangelogCommitArgs (pmcIssueId args))
-                                      >> pure (Right ())
+                                  Right _ -> do
+                                    committedResult <-
+                                      runGitAt
+                                        (pmcWorkingDir args)
+                                        (postMergeChangelogCommitArgs (pmcIssueId args))
+                                    pure (fmap (const ()) committedResult)
                           case committed of
                             Left err -> pure $ Left err
                             Right () -> do
@@ -362,7 +364,7 @@ postMergePushCore args = do
                                       ]
                                   )
 
-runGitAt :: Maybe Text -> [Text] -> Eff Effects (Either Text Text)
+runGitAt :: (Member SuspendYield effs) => Maybe Text -> [Text] -> Eff effs (Either Text Text)
 runGitAt workingDir args = do
   logInfo ("post-merge git before: " <> T.unwords args)
   result <-
@@ -494,7 +496,7 @@ validatePush args
   | not (validToken (pmpuPushedCommit args)) = Left "pushed_commit is required"
   | otherwise = Right ()
 
-logInfo :: Text -> Eff Effects ()
+logInfo :: (Member SuspendYield effs) => Text -> Eff effs ()
 logInfo message =
   void $
     suspendEffect_ @LogInfo

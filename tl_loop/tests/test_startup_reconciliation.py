@@ -1002,6 +1002,132 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
     ]
 
 
+def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+
+    class RemoteAdvanceClient(FakeClient):
+        parent_sync_count: int = 0
+        changelog_count: int = 0
+        push_count: int = 0
+
+        def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
+            self.parent_sync_count += 1
+            parent_commit = (
+                "parent-after-merge"
+                if self.parent_sync_count == 1
+                else "parent-after-remote-advance"
+            )
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        "child_id": arguments["child_id"],
+                        "pr_number": arguments["pr_number"],
+                        "repository": arguments["repository"],
+                        "parent_branch": arguments["parent_branch"],
+                        "merged_head_sha": arguments["merged_head_sha"],
+                        "expected_base_sha": arguments["expected_base_sha"],
+                        "lane_epoch": arguments["lane_epoch"],
+                        "parent_commit_sha": parent_commit,
+                        "remote_head_sha": parent_commit,
+                        "ancestry_proof": (
+                            f"ancestor:{arguments['merged_head_sha']}->{parent_commit}"
+                        ),
+                    },
+                }
+            )
+
+        def chainlink_issue_close(self, **arguments: object) -> ToolResult:
+            self.chainlink_issue_close_calls.append(arguments)
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        "issue_id": arguments["issue_id"],
+                        "receipt_id": f"issue-close:{arguments['issue_id']}",
+                    },
+                }
+            )
+
+        def post_merge_changelog(self, **arguments: object) -> ToolResult:
+            self.changelog_count += 1
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        **arguments,
+                        "commit_sha": f"changelog-commit-{self.changelog_count}",
+                    },
+                }
+            )
+
+        def post_merge_push(self, **arguments: object) -> ToolResult:
+            self.push_count += 1
+            if self.push_count == 1:
+                return ToolResult.from_raw(
+                    {
+                        "success": False,
+                        "error": "git command failed (1): stale info",
+                    }
+                )
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        **arguments,
+                        "push_receipt_id": "push-receipt-rebuilt",
+                        "observed_remote_head": arguments["pushed_commit"],
+                        "ancestry_proof": (
+                            f"ancestor:{arguments['pushed_commit']}->{arguments['pushed_commit']}"
+                        ),
+                    },
+                }
+            )
+
+    client = RemoteAdvanceClient(
+        review_id=7,
+        review_verdict="APPROVED",
+        review_head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    for _ in range(20):
+        recovered = _apply_convergence(
+            store.load(), ConvergenceTracker(), store, config, client, journal
+        )
+        if recovered.slices["slice-a"].post_merge.phase.value == "complete":
+            break
+
+    post_merge = recovered.slices["slice-a"].post_merge
+    assert post_merge.phase.value == "complete", (
+        post_merge.phase.value,
+        dict(post_merge.evidence),
+        client.parent_sync_count,
+        client.changelog_count,
+        client.push_count,
+        recovered.slices["slice-a"].dispatch_error,
+    )
+    assert post_merge.evidence["changelog_generation"] == "1"
+    assert post_merge.evidence["changelog_commit_sha"] == "changelog-commit-2"
+    assert post_merge.evidence["rebuild_applied"] == "true"
+    assert post_merge.evidence["rebuild_new_base_sha"] == "parent-after-remote-advance"
+    assert client.parent_sync_count == 2
+    assert client.changelog_count == 2
+    assert client.push_count == 2
+    assert len(client.chainlink_issue_close_calls) == 1
+    assert len(journal.confirmed_entries("post_merge_remote_reconcile", "slice-a")) == 1
+    assert len(journal.confirmed_entries("post_merge_push", "slice-a")) == 1
+
+
 @pytest.mark.parametrize("crash_boundary", ["parent_sync", "issue_close", "changelog", "push"])
 def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
     tmp_path, monkeypatch, crash_boundary

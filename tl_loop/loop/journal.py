@@ -27,6 +27,7 @@ MUTATING_OPERATIONS = frozenset(
         "merge_pr",
         "merge_bookkeeping",
         "post_merge_parent_sync",
+        "post_merge_remote_reconcile",
         "post_merge_issue_close",
         "post_merge_changelog",
         "post_merge_push",
