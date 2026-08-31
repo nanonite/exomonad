@@ -78,9 +78,9 @@
   "ordered_stages": [],
   "reviewer_max_rounds": 5,
   "reviewer_max_rounds_source": "policy_file",
-  "revision": 26,
+  "revision": 27,
   "run_id": "<run-id>",
-  "state_version": 1,
+  "state_version": 3,
   "slices": {
     "leaf-a": {
       "agent_type": "codex/gpt-luna",

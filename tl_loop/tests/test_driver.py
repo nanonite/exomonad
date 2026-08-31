@@ -23,7 +23,12 @@ from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning
 from tl_loop.fsm.recovery import begin_recovery
+from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
+from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
+    DISPATCH_CORRELATED,
+    DISPATCH_HISTORICAL_AUDIT,
+    DISPATCH_INTEGRITY_CONFLICT,
     DepthLimitExceeded,
     DispatchAttempt,
     EventDiagnostics,
@@ -35,17 +40,13 @@ from tl_loop.loop.driver import (
     TLRunResult,
     WorkerTask,
     WorkPlan,
-    _child_recovery_projection,
     _apply_convergence,
     _apply_reconciliation_observations,
     _bind_publication_evidence,
-    _execute_direct_reviewer_intent,
-    DISPATCH_CORRELATED,
-    DISPATCH_HISTORICAL_AUDIT,
-    DISPATCH_INTEGRITY_CONFLICT,
-    correlate_dispatch_event,
+    _child_recovery_projection,
     _dispatch_payload,
     _event_belongs_to_plan,
+    _execute_direct_reviewer_intent,
     _initial_slices,
     _merge_result_is_authoritative,
     _record_review_event,
@@ -56,12 +57,12 @@ from tl_loop.loop.driver import (
     _run_sub_tl_batch,
     _spawn_invocation_id,
     _supervise_live_sub_tl,
+    correlate_dispatch_event,
     run_tl_loop,
     tl_run,
 )
 from tl_loop.loop.escalate import blocked_gate_name
 from tl_loop.loop.journal import EffectJournal
-from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.reconcile import (
     ExternalIntent,
     ReconciliationResult,
@@ -75,6 +76,7 @@ from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import (
+    ActionPhase,
     BudgetLedger,
     GateState,
     GateStatus,
@@ -84,7 +86,6 @@ from tl_loop.state.schema import (
     OrderedStageState,
     ParkCause,
     PublicationBinding,
-    ActionPhase,
     SliceState,
     SliceStatus,
     Verdict,
@@ -3103,6 +3104,32 @@ def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) 
     assert all(name == "emit_controller_event" for name, _ in transport.calls)
 
 
+def test_root_finalization_checkpoint_precedes_terminal_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_types: list[str] = []
+    original_checkpoint = RunStore.checkpoint
+
+    def record_checkpoint(self: RunStore, *args: object, **kwargs: object) -> object:
+        if args:
+            checkpoint_types.append(type(args[0]).__name__)
+        return original_checkpoint(self, *args, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", record_checkpoint)
+    run_tl_loop(
+        "root-finalization-run",
+        WorkPlan(),
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=_config(),
+        root_dir=tmp_path,
+    )
+
+    finalizing = checkpoint_types.index("TLFinalizing")
+    done = checkpoint_types.index("TLDone")
+    assert finalizing < done
+
+
 def test_recursive_depth_ceiling_parks_schedule_deadlock(tmp_path: Path) -> None:
     with pytest.raises(DepthLimitExceeded):
         run_tl_loop(
@@ -3513,7 +3540,14 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
         child_plan,
         SyntheticQueue(_lifecycle_events("aggregate-child")),
         EffectClient(transport),
-        config=_config(),
+        config=replace(
+            _config(),
+            branch="main.aggregate-child",
+            parent_branch="main",
+            parent_run_id="aggregate-run",
+            depth=1,
+            keep_alive_on_waiting=False,
+        ),
         root_dir=parent_dir,
     )
     child_store = RunStore("aggregate-child", parent_dir)
@@ -3566,6 +3600,7 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     assert parent_slice.dispatch_agent_id == "aggregate-run:aggregate-child:integration"
     assert second.final_state.slices["later-stage"].status is SliceStatus.PENDING
     child = load_state(parent_dir / "aggregate-child" / "run.json")
+    assert isinstance(child.recursive_fsm, RecursiveTLPRFiled)
     assert child.integration.aggregate_pr_number == parent_slice.pr_number
     assert child.integration.integration_owner_id == parent_slice.dispatch_agent_id
     assert child.integration.integration_owner_run_id == "aggregate-child"

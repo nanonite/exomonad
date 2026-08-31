@@ -63,6 +63,9 @@ from tl_loop.fsm.scope import (
     TLFailed as RecursiveTLFailed,
 )
 from tl_loop.fsm.scope import (
+    TLFinalizing as RecursiveTLFinalizing,
+)
+from tl_loop.fsm.scope import (
     TLParked as RecursiveTLParked,
 )
 from tl_loop.fsm.scope import (
@@ -1275,29 +1278,112 @@ def _is_terminal_phase(phase: object) -> bool:
     )
 
 
+def _checkpoint_scope_phase(
+    phase: PhaseValue,
+    state: RunState,
+    store: RunStore,
+) -> RunState:
+    """Persist one canonical scope transition with exactly one version step."""
+    return store.checkpoint(
+        phase,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        state_version=state.state_version + 1,
+    )
+
+
 def _maybe_finalize_root_scope(state: RunState, store: RunStore) -> RunState:
-    """Enter and complete root finalization after all direct work is merged."""
+    """Persist and complete root finalization as two recoverable transitions."""
     phase = state.recursive_fsm
     manifest = state.plan_manifest
-    if not isinstance(phase, RecursiveTLAllMerged) or manifest is None:
+    if manifest is None or manifest.role != "root":
         return state
-    if manifest.role != "root":
+    if not isinstance(phase, (RecursiveTLAllMerged, RecursiveTLFinalizing)):
         return state
-    finalizing = scope_transition(phase, ScopeFinalizationRequested(ScopeRole.ROOT))
     evidence = {
         "root_branch": state.owner_branch or manifest.owned_branch,
         "local_checkout": state.owner_worktree or manifest.owned_branch,
     }
+    if isinstance(phase, RecursiveTLAllMerged):
+        finalizing = scope_transition(phase, ScopeFinalizationRequested(ScopeRole.ROOT))
+        finalizing = replace(finalizing, evidence=evidence)
+        state = _checkpoint_scope_phase(finalizing, state, store)
+    else:
+        finalizing = phase
+        if not finalizing.evidence:
+            finalizing = replace(finalizing, evidence=evidence)
+            state = _checkpoint_scope_phase(finalizing, state, store)
     completed = scope_transition(
         finalizing,
         ScopeFinalizationComplete(ScopeRole.ROOT, evidence),
     )
-    return store.checkpoint(
-        completed,
-        state.slices,
-        state.budgets,
-        state.events.last_consumed_offset,
+    return _checkpoint_scope_phase(completed, state, store)
+
+
+def _non_root_finalization_evidence(
+    state: RunState,
+    manifest: PlanManifest,
+) -> Mapping[str, str] | None:
+    """Recover a parent-targeted aggregate candidate from durable runtime data."""
+    integration = state.integration
+    aggregate_pr = integration.aggregate_pr_number
+    head_sha = integration.aggregate_head_sha or integration.head_sha
+    base_sha = integration.aggregate_original_base_sha or state.parent_branch
+    parent_branch = state.parent_branch or manifest.parent_integration_target
+    handoff = integration.integration_owner_id
+    if not all((aggregate_pr, head_sha, base_sha, parent_branch, handoff)):
+        return None
+    return {
+        "aggregate_pr": str(aggregate_pr),
+        "head_sha": str(head_sha),
+        "base_sha": str(base_sha),
+        "parent_branch": str(parent_branch),
+        "handoff": str(handoff),
+    }
+
+
+def _maybe_finalize_non_root_scope(state: RunState, store: RunStore) -> RunState:
+    """Persist and complete a non-root aggregate publication handoff."""
+    phase = state.recursive_fsm
+    manifest = state.plan_manifest
+    if manifest is None or manifest.role != "non_root":
+        return state
+    if isinstance(phase, RecursiveTLAllMerged):
+        evidence = _non_root_finalization_evidence(state, manifest)
+        if evidence is None:
+            return state
+        finalizing = scope_transition(phase, ScopeFinalizationRequested(ScopeRole.NON_ROOT))
+        finalizing = replace(finalizing, evidence=evidence)
+        state = _checkpoint_scope_phase(finalizing, state, store)
+    elif isinstance(phase, RecursiveTLFinalizing):
+        finalizing = phase
+        if not finalizing.evidence:
+            evidence = _non_root_finalization_evidence(state, manifest)
+            if evidence is None:
+                return state
+            finalizing = replace(finalizing, evidence=evidence)
+            state = _checkpoint_scope_phase(finalizing, state, store)
+    else:
+        return state
+    completed = scope_transition(
+        finalizing,
+        ScopeFinalizationComplete(ScopeRole.NON_ROOT, finalizing.evidence),
     )
+    return _checkpoint_scope_phase(completed, state, store)
+
+
+def _maybe_finalize_scope(state: RunState, store: RunStore) -> RunState:
+    """Select the role-specific finalization reducer for one scope."""
+    manifest = state.plan_manifest
+    if manifest is None:
+        return state
+    if manifest.role == "root":
+        return _maybe_finalize_root_scope(state, store)
+    return _maybe_finalize_non_root_scope(state, store)
 
 
 def _run_loop(
@@ -1353,7 +1439,7 @@ def _run_loop(
             replace(state.goals, controller_started_at=diagnostics.controller_started_at)
         )
     before_finalization_phase = _phase_from_state(state)
-    state = _maybe_finalize_root_scope(state, store)
+    state = _maybe_finalize_scope(state, store)
     after_finalization_phase = _phase_from_state(state)
     if after_finalization_phase != before_finalization_phase:
         _emit_phase_change(
@@ -1365,6 +1451,14 @@ def _run_loop(
             effects_log,
         )
     phase = _phase_from_state(state)
+    if isinstance(state.recursive_fsm, RecursiveTLAllMerged) and not _source_has_pending(source):
+        return TLRunResult(
+            state,
+            tuple(effects_log),
+            tuple(transitions),
+            tuple(consumed),
+            diagnostics=diagnostics.snapshot(),
+        )
     if not expected and not plan.sub_tls and not _is_terminal_phase(phase):
         if not isinstance(phase, RecursiveTLAllMerged):
             raise TLLoopError("empty scope did not reach a canonical completion boundary")
@@ -1394,7 +1488,7 @@ def _run_loop(
             and _source_has_pending(source)
         ):
             before_finalization_phase = _phase_from_state(state)
-            state = _maybe_finalize_root_scope(state, store)
+            state = _maybe_finalize_scope(state, store)
             after_finalization_phase = _phase_from_state(state)
             if after_finalization_phase != before_finalization_phase:
                 _emit_phase_change(
@@ -4946,6 +5040,8 @@ def _run_sub_tls(
             )
             return state
         before_phase = _phase_from_state(state)
+        if isinstance(state.recursive_fsm, RecursiveTLAllMerged):
+            return state
         state = store.checkpoint(
             TLDone(), state.slices, state.budgets, state.events.last_consumed_offset
         )
@@ -5310,8 +5406,15 @@ def _complete_sub_tl_batch(
     sub_tl_states = dict(state.integration.sub_tl_states)
     sub_tl_recovery = dict(state.integration.sub_tl_recovery)
     candidate_records = dict(state.integration.candidates)
+    canonical_phase = state.recursive_fsm
     for task, phase, child_state in outcomes:
-        if phase not in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}:
+        child_handoff_ready = isinstance(
+            getattr(child_state, "recursive_fsm", None), RecursiveTLAllMerged
+        )
+        if (
+            phase not in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
+            and not child_handoff_ready
+        ):
             current = updated_slices[task.name]
             updated_slices[task.name] = slice_transition(
                 current, SliceStatusChanged(SliceStatus.SPAWNED)
@@ -5322,11 +5425,7 @@ def _complete_sub_tl_batch(
                 sub_tl_states[task.name] = lifecycle
                 sub_tl_recovery[task.name] = summary
             continue
-        status = (
-            SliceStatus.MERGED
-            if phase in {TLPhase.TLDone, TLPhase.TLPRFiled}
-            else SliceStatus.FAILED
-        )
+        status = SliceStatus.FAILED if phase is TLPhase.TLFailed else SliceStatus.MERGED
         previous_lifecycle = sub_tl_states.get(task.name, IntegrationLifecycle.RUNNING)
         if isinstance(previous_lifecycle, SubTLLifecycle):
             previous_lifecycle = IntegrationLifecycle.RUNNING
@@ -5423,8 +5522,16 @@ def _complete_sub_tl_batch(
         candidates=candidate_records,
     )
     previous_slices = state.slices
+    checkpoint_phase = (
+        canonical_phase
+        if isinstance(
+            canonical_phase,
+            (RecursiveTLRunning, RecursiveTLAllMerged, RecursiveTLFinalizing),
+        )
+        else _phase_from_state(state)
+    )
     state = store.checkpoint(
-        _phase_from_state(state),
+        checkpoint_phase,
         updated_slices,
         state.budgets,
         state.events.last_consumed_offset,
@@ -5474,6 +5581,18 @@ def _ensure_aggregate_candidate(
             own_candidate.aggregate_head_sha or fallback_head,
             own_candidate.aggregate_patch_digest or fallback_patch,
             fallback_base,
+        )
+    elif (
+        own_candidate is None
+        and child_integration.aggregate_pr_number is not None
+        and child_integration.aggregate_head_sha
+    ):
+        candidate = AggregateCandidate(
+            task.name,
+            child_integration.aggregate_pr_number,
+            child_integration.aggregate_head_sha,
+            child_integration.aggregate_patch_digest or fallback_patch,
+            child_integration.aggregate_original_base_sha or fallback_base,
         )
     else:
         body = (
@@ -5530,10 +5649,17 @@ def _ensure_aggregate_candidate(
         patch_digest=candidate.patch_digest,
     )
     child_store = RunStore(task.name, store.run_dir)
-    child_store.set_ordered_state(
+    updated_child_state = child_store.set_ordered_state(
         child_state.current_order,
         child_state.ordered_stages,
         updated_integration,
+    )
+    _persist_non_root_handoff(
+        updated_child_state,
+        child_store,
+        updated_integration,
+        candidate,
+        parent_branch=config.branch,
     )
     if child_integration.aggregate_pr_number is None:
         _record_controller_event(
@@ -6586,6 +6712,49 @@ def _child_patch_digest(state: RunState) -> str:
     return hashlib.sha256("|".join(values).encode()).hexdigest()
 
 
+def _persist_non_root_handoff(
+    state: RunState,
+    store: RunStore,
+    integration: IntegrationRuntimeState,
+    candidate: AggregateCandidate,
+    *,
+    parent_branch: str,
+) -> None:
+    """Durably finish a non-root scope after its parent publishes its candidate."""
+    phase = state.recursive_fsm
+    manifest = state.plan_manifest
+    if manifest is None or manifest.role != "non_root":
+        return
+    if isinstance(phase, RecursiveTLPRFiled):
+        return
+    if not isinstance(phase, (RecursiveTLAllMerged, RecursiveTLFinalizing)):
+        return
+    owner_id = integration.integration_owner_id
+    if not owner_id:
+        raise TLLoopError("non-root aggregate handoff is missing its durable owner identity")
+    evidence = {
+        "aggregate_pr": str(candidate.pr_number),
+        "head_sha": candidate.head_sha,
+        "base_sha": candidate.original_base_sha or parent_branch,
+        "parent_branch": parent_branch,
+        "handoff": owner_id,
+    }
+    if isinstance(phase, RecursiveTLAllMerged):
+        finalizing = scope_transition(phase, ScopeFinalizationRequested(ScopeRole.NON_ROOT))
+        finalizing = replace(finalizing, evidence=evidence)
+        state = _checkpoint_scope_phase(finalizing, state, store)
+    else:
+        finalizing = phase
+        if not finalizing.evidence:
+            finalizing = replace(finalizing, evidence=evidence)
+            state = _checkpoint_scope_phase(finalizing, state, store)
+    filed = scope_transition(
+        finalizing,
+        ScopeFinalizationComplete(ScopeRole.NON_ROOT, finalizing.evidence),
+    )
+    _checkpoint_scope_phase(filed, state, store)
+
+
 def _positive_result_int(value: Mapping[str, object], key: str) -> int | None:
     candidate = value.get(key)
     return candidate if type(candidate) is int and candidate > 0 else None
@@ -6668,6 +6837,7 @@ def _child_config(
         agent_id=task.agent_id or task.name,
         depth=config.depth + 1,
         dispatch_names={},
+        keep_alive_on_waiting=False,
     )
 
 

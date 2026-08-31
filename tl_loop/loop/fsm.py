@@ -119,11 +119,15 @@ def _step_lifecycle(state: RunState, event: TLEvent) -> Transition:
 
 def _with_scope_phase(state: RunState, phase: PhaseValue) -> RunState:
     """Keep the old phase fields as a derived compatibility projection."""
+    projected = FSMState(phase_tag(phase), active_child_ids(phase))
+    if phase == state.recursive_fsm and projected == state.fsm:
+        return state
+    version = state.state_version + (0 if phase == state.recursive_fsm else 1)
     return replace(
         state,
-        fsm=FSMState(phase_tag(phase), active_child_ids(phase)),
+        fsm=projected,
         recursive_fsm=phase,
-        state_version=state.state_version + 1,
+        state_version=version,
     )
 
 

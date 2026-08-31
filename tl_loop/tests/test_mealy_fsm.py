@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from tl_loop.events.envelope import EventKind
 from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
+from tl_loop.fsm.post_merge_events import PostMergeComplete
+from tl_loop.fsm.post_merge_evidence import PushReceipt
 from tl_loop.fsm.scope import TLAllMerged, TLDone, TLFinalizing, TLPlanning, TLPRFiled, TLRunning
 from tl_loop.fsm.scope_events import (
     FinalizationComplete,
@@ -163,3 +168,62 @@ def test_mealy_scope_step_reduces_typed_worker_completion() -> None:
 
     assert isinstance(completed.recursive_fsm, TLAllMerged)
     assert completed.state_version == 1
+
+
+def test_replaying_completed_post_merge_is_state_version_idempotent() -> None:
+    evidence = {
+        "child_id": "child",
+        "repository": "repo",
+        "parent_branch": "main",
+        "pr_number": "43",
+        "head_sha": "head-43",
+        "merge_journal_id": "merge-journal",
+        "lane_epoch": "1",
+        "parent_commit_sha": "parent-43",
+        "issue_id": "issue-43",
+        "issue_close_intent_id": "close-intent",
+        "issue_close_journal_id": "close-journal",
+        "changelog_intent_id": "changelog-intent",
+        "changelog_generation": "0",
+        "changelog_commit_sha": "bookkeeping",
+        "parent_push_intent_id": "push-intent",
+        "push_journal_id": "push-journal",
+        "expected_base_sha": "base-43",
+        "push_receipt_id": "receipt-43",
+        "pushed_commit": "bookkeeping",
+        "bookkeeping_commit": "bookkeeping",
+        "observed_remote_head": "remote-bookkeeping",
+        "ancestry_proof": "ancestor:bookkeeping",
+    }
+    receipt = PushReceipt(
+        repository="repo",
+        parent_branch="main",
+        child_id="child",
+        lane_epoch=1,
+        push_intent_id="push-intent",
+        push_journal_id="push-journal",
+        push_receipt_id="receipt-43",
+        expected_base_sha="base-43",
+        pushed_commit="bookkeeping",
+        observed_remote_head="remote-bookkeeping",
+        ancestry_proof="ancestor:bookkeeping",
+    )
+    child = ChildRecord("child", ChildKind.LEAF)
+    phase = TLRunning(
+        current_order=1,
+        pending_by_order={1: (child,)},
+        post_merge={"child": PostMergeState(PostMergePhase.COMPLETE, evidence)},
+    )
+    state = replace(
+        _canonical_state(phase),
+        fsm=FSMState(TLPhase.TLWaiting, ("child",)),
+        state_version=7,
+    )
+
+    replayed = step(
+        state,
+        PostMergeComplete("child", "merge-journal", "push-intent", "bookkeeping", receipt),
+    )
+
+    assert replayed.state is state
+    assert replayed.state.state_version == 7
