@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
+import pytest
+
 from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.convergence import ConvergenceTracker
@@ -1000,19 +1002,22 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
     ]
 
 
+@pytest.mark.parametrize("crash_boundary", ["parent_sync", "issue_close", "changelog", "push"])
 def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, crash_boundary
 ) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
-    crash = [False]
+    crash = {"observed": False, "raised": False}
 
     class CrashRecoveryClient(FakeClient):
-        parent_sync_calls: int = 0
+        def _mark_boundary(self, boundary: str) -> None:
+            self.post_merge_calls.append(boundary)
+            if boundary == crash_boundary and not crash["observed"]:
+                crash["observed"] = True
 
         def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
-            self.parent_sync_calls += 1
-            crash[0] = True
+            self._mark_boundary("parent_sync")
             return ToolResult.from_raw(
                 {
                     "success": True,
@@ -1033,6 +1038,44 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
                 }
             )
 
+        def chainlink_issue_close(self, **arguments: object) -> ToolResult:
+            self._mark_boundary("issue_close")
+            result = super().chainlink_issue_close(**arguments)
+            if result.success is not True:
+                return result
+            issue_id = arguments["issue_id"]
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {"issue_id": issue_id, "receipt_id": f"issue-close:{issue_id}"},
+                }
+            )
+
+        def post_merge_changelog(self, **arguments: object) -> ToolResult:
+            self._mark_boundary("changelog")
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {**arguments, "commit_sha": "changelog-commit"},
+                }
+            )
+
+        def post_merge_push(self, **arguments: object) -> ToolResult:
+            self._mark_boundary("push")
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        **arguments,
+                        "push_receipt_id": "push-receipt",
+                        "observed_remote_head": arguments["pushed_commit"],
+                        "ancestry_proof": (
+                            f"ancestor:{arguments['pushed_commit']}->{arguments['pushed_commit']}"
+                        ),
+                    },
+                }
+            )
+
     client = CrashRecoveryClient(
         review_id=7,
         review_verdict="APPROVED",
@@ -1045,35 +1088,49 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
         enable_reviewer_spawn=True,
         chainlink_issue_id=1039,
     )
+    client.post_merge_calls = []
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
     recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
 
     checkpoint = RunStore.checkpoint
 
     def crash_checkpoint(run_store, *args, **kwargs):
-        if run_store is store and crash[0]:
-            crash[0] = False
-            raise RuntimeError("simulated process death after parent sync")
+        if run_store is store and crash["observed"] and not crash["raised"]:
+            crash["raised"] = True
+            raise RuntimeError("simulated process death after post-merge boundary")
         return checkpoint(run_store, *args, **kwargs)
 
     monkeypatch.setattr(RunStore, "checkpoint", crash_checkpoint)
-    try:
-        _apply_convergence(recovered, ConvergenceTracker(), store, config, client, journal)
-    except RuntimeError as error:
-        assert str(error) == "simulated process death after parent sync"
+    for _ in range(8):
+        if crash["raised"]:
+            break
+        try:
+            recovered = _apply_convergence(
+                store.load(), ConvergenceTracker(), store, config, client, journal
+            )
+        except RuntimeError as error:
+            assert str(error) == "simulated process death after post-merge boundary"
     else:
-        raise AssertionError("checkpoint crash should interrupt the recovery boundary")
+        raise AssertionError(f"checkpoint crash should interrupt {crash_boundary} boundary")
 
-    assert client.parent_sync_calls == 1
-    assert len(journal.confirmed_entries("post_merge_parent_sync", "slice-a")) == 1
+    assert crash["observed"] is True
+    assert crash["raised"] is True
     monkeypatch.setattr(RunStore, "checkpoint", checkpoint)
 
-    restarted = _apply_convergence(
-        store.load(), ConvergenceTracker(), store, config, client, journal
-    )
+    for _ in range(10):
+        restarted = _apply_convergence(
+            store.load(), ConvergenceTracker(), store, config, client, journal
+        )
+        if restarted.slices["slice-a"].post_merge.phase.value == "complete":
+            break
 
-    assert client.parent_sync_calls == 1
-    assert restarted.slices["slice-a"].post_merge.phase.value == "parent_branch_synced"
+    assert restarted.slices["slice-a"].post_merge.phase.value == "complete"
+    assert client.post_merge_calls == ["parent_sync", "issue_close", "changelog", "push"]
+    assert len(client.chainlink_issue_close_calls) == 1
+    assert len(journal.confirmed_entries("post_merge_parent_sync", "slice-a")) == 1
+    assert len(journal.confirmed_entries("post_merge_issue_close", "slice-a")) == 1
+    assert len(journal.confirmed_entries("post_merge_changelog", "slice-a")) == 1
+    assert len(journal.confirmed_entries("post_merge_push", "slice-a")) == 1
 
 
 @dataclass

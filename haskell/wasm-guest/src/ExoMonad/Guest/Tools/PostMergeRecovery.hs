@@ -13,18 +13,24 @@ module ExoMonad.Guest.Tools.PostMergeRecovery
   ( PostMergeParentSync,
     PostMergeParentSyncArgs (..),
     postMergeParentSyncCore,
+    postMergeParentSyncFetchArgs,
+    postMergeParentSyncMergeArgs,
     postMergeParentSyncDescription,
     postMergeParentSyncSchema,
     PostMergeChangelog,
     PostMergeChangelogArgs (..),
     postMergeChangelogCore,
+    postMergeChangelogStageArgs,
+    postMergeChangelogCommitArgs,
     postMergeChangelogDescription,
     postMergeChangelogSchema,
     PostMergePush,
     PostMergePushArgs (..),
     postMergePushCore,
+    postMergePushGitArgs,
     postMergePushDescription,
-    postMergePushSchema
+    postMergePushSchema,
+    interpretGitResult
   )
 where
 
@@ -216,11 +222,15 @@ postMergeParentSyncCore args = do
           | T.strip current /= pmpParentBranch args ->
               pure $ Left "parent synchronization requires the requested branch to be checked out"
           | otherwise -> do
-              fetched <- runGitAt (pmpWorkingDir args) ["fetch", "--prune", "origin", pmpParentBranch args]
+              fetched <- runGitAt
+                (pmpWorkingDir args)
+                (postMergeParentSyncFetchArgs (pmpParentBranch args))
               case fetched of
                 Left err -> pure $ Left err
                 Right _ -> do
-                  merged <- runGitAt (pmpWorkingDir args) ["merge", "--ff-only", remoteRef (pmpParentBranch args)]
+                  merged <- runGitAt
+                    (pmpWorkingDir args)
+                    (postMergeParentSyncMergeArgs (pmpParentBranch args))
                   case merged of
                     Left err -> pure $ Left err
                     Right _ -> do
@@ -278,18 +288,13 @@ postMergeChangelogCore args = do
                             if T.null (T.strip changes)
                               then pure (Right ())
                               else do
-                                staged <- runGitAt (pmcWorkingDir args) ["add", "--", "CHANGELOG.md"]
+                                staged <- runGitAt (pmcWorkingDir args) postMergeChangelogStageArgs
                                 case staged of
                                   Left err -> pure $ Left err
                                   Right _ ->
                                     runGitAt
                                       (pmcWorkingDir args)
-                                      [ "commit",
-                                        "--only",
-                                        "CHANGELOG.md",
-                                        "-m",
-                                        changelogMessage (pmcIssueId args)
-                                      ]
+                                      (postMergeChangelogCommitArgs (pmcIssueId args))
                                       >> pure (Right ())
                           case committed of
                             Left err -> pure $ Left err
@@ -326,12 +331,7 @@ postMergePushCore args = do
               pushed <-
                 runGitAt
                   (pmpuWorkingDir args)
-                  [ "push",
-                    "--porcelain",
-                    forceLease (pmpuParentBranch args) (pmpuExpectedBaseSha args),
-                    "origin",
-                    "HEAD:" <> refName (pmpuParentBranch args)
-                  ]
+                  (postMergePushGitArgs (pmpuParentBranch args) (pmpuExpectedBaseSha args))
               case pushed of
                 Left err -> pure $ Left err
                 Right _ -> do
@@ -382,9 +382,46 @@ runGitAt workingDir args = do
           stderr = T.strip (TL.toStrict (Proc.runResponseStderr response))
           exitCode = Proc.runResponseExitCode response
       logInfo ("post-merge git after: exit=" <> T.pack (show exitCode))
-      if exitCode == 0
-        then pure $ Right stdout
-        else pure $ Left ("git command failed (" <> T.pack (show exitCode) <> "): " <> stderr)
+      pure (interpretGitResult exitCode stdout stderr)
+
+-- | Git argv for fetching the direct parent branch before synchronization.
+postMergeParentSyncFetchArgs :: Text -> [Text]
+postMergeParentSyncFetchArgs branch = ["fetch", "--prune", "origin", branch]
+
+-- | Git argv for fast-forwarding the checked-out parent branch.
+postMergeParentSyncMergeArgs :: Text -> [Text]
+postMergeParentSyncMergeArgs branch = ["merge", "--ff-only", remoteRef branch]
+
+-- | Git argv for staging the generated changelog entry.
+postMergeChangelogStageArgs :: [Text]
+postMergeChangelogStageArgs = ["add", "--", "CHANGELOG.md"]
+
+-- | Git argv for committing the staged changelog entry.
+postMergeChangelogCommitArgs :: Int -> [Text]
+postMergeChangelogCommitArgs issueId =
+  [ "commit",
+    "--only",
+    "CHANGELOG.md",
+    "-m",
+    changelogMessage issueId
+  ]
+
+-- | Git argv for the compare-and-swap parent push boundary.
+postMergePushGitArgs :: Text -> Text -> [Text]
+postMergePushGitArgs branch base =
+  [ "push",
+    "--porcelain",
+    forceLease branch base,
+    "origin",
+    "HEAD:" <> refName branch
+  ]
+
+-- | Convert one process response into the boundary's authoritative result.
+interpretGitResult :: Int -> Text -> Text -> Either Text Text
+interpretGitResult exitCode stdout stderr =
+  if exitCode == 0
+    then Right (T.strip stdout)
+    else Left ("git command failed (" <> T.pack (show exitCode) <> "): " <> T.strip stderr)
 
 verifyAncestryAt :: Maybe Text -> Text -> Text -> Eff Effects (Either Text Text)
 verifyAncestryAt workingDir mergedHead parent = do

@@ -163,6 +163,7 @@ test-suite wasm-guest-tests
         ExoMonad.Guest.Tools.ResumePrTest
         ExoMonad.Guest.Tools.ResumeBlockedLeafTest
         ExoMonad.Guest.Tools.MergePRTest
+        ExoMonad.Guest.Tools.PostMergeRecoveryTest
         ExoMonad.Guest.Tools.WatcherPrStateTest
     build-depends:
         wasm-guest:wasm-guest-internal,
