@@ -57,6 +57,7 @@ import ExoMonad.Guest.Tools.FilePR (FilePRArgs, filePRCore, filePRDescription, f
 import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
+import ExoMonad.Guest.Tools.PostMergeRecovery (PostMergeChangelog, PostMergeParentSync, PostMergePush)
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.ResolveLivePrForSlice (ResolveLivePrForSlice (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
@@ -277,6 +278,9 @@ data Tools mode = Tools
     resumeBlockedLeaf :: mode :- ResumeBlockedLeaf,
     resolveLivePrForSlice :: mode :- ResolveLivePrForSlice,
     watcherPrState :: mode :- WatcherPrState,
+    postMergeParentSync :: mode :- PostMergeParentSync,
+    postMergeChangelog :: mode :- PostMergeChangelog,
+    postMergePush :: mode :- PostMergePush,
     discardWorkerOutput :: mode :- DiscardWorkerOutput,
     disposeLeaf :: mode :- DisposeLeaf,
     closeWorkerPane :: mode :- TLCloseWorkerPane,
@@ -336,6 +340,9 @@ config =
             resumeBlockedLeaf = mkHandler @ResumeBlockedLeaf,
             resolveLivePrForSlice = mkHandler @ResolveLivePrForSlice,
             watcherPrState = mkHandler @WatcherPrState,
+            postMergeParentSync = mkHandler @PostMergeParentSync,
+            postMergeChangelog = mkHandler @PostMergeChangelog,
+            postMergePush = mkHandler @PostMergePush,
             discardWorkerOutput = mkHandler @DiscardWorkerOutput,
             disposeLeaf = mkHandler @DisposeLeaf,
             closeWorkerPane = mkHandler @TLCloseWorkerPane,

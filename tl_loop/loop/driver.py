@@ -179,6 +179,7 @@ from tl_loop.state.schema import (
     OrderedStageState,
     ParkCause,
     PublicationBinding,
+    RepositoryIdentity,
     ReviewValidationDisposition,
     ReviewValidationObservation,
     RunState,
@@ -613,6 +614,7 @@ class TLLoopConfig:
     chainlink_issue_id: int | None = None
     merge_strategy: str | None = None
     working_dir: str | None = None
+    repository_identity: RepositoryIdentity | None = None
     source: EventQueue | None = None
     effects: EffectClient | ReadOnlyEffectClient | None = None
     root_dir: str | Path = DEFAULT_ROOT
@@ -681,6 +683,10 @@ class TLLoopConfig:
             raise ValueError("chainlink_issue_id must be positive")
         _optional_text(self.merge_strategy, "merge_strategy")
         _optional_text(self.working_dir, "working_dir")
+        if self.repository_identity is not None and not isinstance(
+            self.repository_identity, RepositoryIdentity
+        ):
+            raise TypeError("repository_identity must be a RepositoryIdentity or null")
         _require_text(self.run_id, "run_id")
         if self.session_mode is not None and self.session_mode not in {
             "start",
@@ -916,6 +922,14 @@ def run_tl_loop(
             root_state["budgets"] = _budget_root(budgets)
         if selected.ledger_run_id is not None:
             root_state["ledger_run_id"] = selected.ledger_run_id
+        if selected.repository_identity is not None:
+            root_state["repository_identity"] = {
+                "owner": selected.repository_identity.owner,
+                "repo": selected.repository_identity.repo,
+                "base_branch": selected.repository_identity.base_branch,
+                "forge_host": selected.repository_identity.forge_host,
+                "remote_url": selected.repository_identity.remote_url,
+            }
         if selected.session_mode is not None:
             root_state["session_mode"] = selected.session_mode
         if epoch_enabled:
@@ -2426,16 +2440,18 @@ def _execute_post_merge_recovery_intent(
     current = state.slices[intent.target_id]
     if current.status is not SliceStatus.MERGED or current.pr_number is None:
         return state
-    journal_id = (
-        current.action.intent_id
-        if current.action is not None and current.action.intent_id
-        else stable_action_key(
-            state.run_id,
-            "merge_pr",
+    journal_id = current.action.intent_id if current.action is not None else None
+    if not journal_id and isinstance(current.reconciliation, Mapping):
+        persisted_journal_id = current.reconciliation.get("merge_journal_id")
+        if isinstance(persisted_journal_id, str) and persisted_journal_id:
+            journal_id = persisted_journal_id
+    if not journal_id:
+        return _block_post_merge_recovery(
+            store,
+            state,
             current.id,
-            {"pr_number": current.pr_number},
+            "post-merge recovery has no durable merge journal identity",
         )
-    )
     return _reconcile_merged_slice(
         state,
         current.id,
@@ -2460,58 +2476,36 @@ def _reconcile_merged_slice(
     effects_log: list[EffectIntent],
     *,
     boundary: str,
+    merge_evidence: Mapping[str, object] | None = None,
 ) -> RunState:
-    """Adopt a confirmed merge, then advance its durable bookkeeping lane."""
+    """Adopt a confirmed merge and execute at most one recovery boundary."""
     current = state.slices[slice_id]
-    adopted = _adopt_post_merge_slice(current, state, pr_number, merge_journal_id, boundary)
-    if adopted != current:
-        state = _checkpoint_slice_action(
-            store,
-            state,
-            slice_id,
-            None,
-            slice_state=adopted,
-        )
-    bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
-        slice_id,
-        pr_number,
-        config.chainlink_issue_id,
-        config,
-        store,
-        effects,
-        effects_log,
-    )
-    if not bookkeeping_ok:
-        state = _ensure_merge_bookkeeping_gate(
-            store.load(),
-            store,
-            effects_log,
-            slice_id,
-            pr_number,
-            config.chainlink_issue_id,
-        )
-        return _checkpoint_slice_action(
-            store,
-            state,
-            slice_id,
-            None,
-            slice_state=replace(
-                state.slices[slice_id],
-                dispatch_error=bookkeeping_error,
-            ),
-        )
-    completed = _complete_post_merge(
-        store.load().slices[slice_id],
-        state,
-        pr_number,
-        config,
-    )
-    return _checkpoint_slice_action(
-        store,
+    if current.post_merge is None or current.post_merge.phase is PostMergePhase.NOT_STARTED:
+        try:
+            current = _adopt_post_merge_slice(
+                current,
+                state,
+                pr_number,
+                merge_journal_id,
+                boundary,
+                merge_evidence,
+            )
+        except ValueError as error:
+            return _block_post_merge_recovery(
+                store,
+                state,
+                slice_id,
+                f"cannot adopt merged PR #{pr_number}: {error}",
+            )
+        state = _checkpoint_slice_action(store, state, slice_id, None, slice_state=current)
+    return _advance_post_merge_boundary(
         store.load(),
         slice_id,
-        None,
-        slice_state=replace(completed, dispatch_error=None),
+        pr_number,
+        config,
+        effects,
+        effects_log,
+        store,
     )
 
 
@@ -2521,8 +2515,13 @@ def _adopt_post_merge_slice(
     pr_number: int,
     merge_journal_id: str,
     boundary: str,
+    merge_evidence: Mapping[str, object] | None,
 ) -> SliceState:
     """Turn authoritative merge evidence into the first post-merge state."""
+    if type(pr_number) is not int or pr_number <= 0:
+        raise ValueError("merged PR number is unavailable in authoritative evidence")
+    if not merge_journal_id:
+        raise ValueError("merged PR journal identity is unavailable")
     if (
         current.post_merge is not None
         and current.post_merge.phase is not PostMergePhase.NOT_STARTED
@@ -2533,18 +2532,33 @@ def _adopt_post_merge_slice(
             action=None,
             dispatch_last_boundary=boundary,
         )
-    head_sha = (
-        current.reviewed_head
-        or (current.publication.head_sha if current.publication is not None else None)
-        or (current.handoff.head_sha if current.handoff is not None else None)
-        or f"pr-{pr_number}"
+    evidence = merge_evidence or {}
+    head_sha = _required_merge_identity(
+        evidence,
+        ("head_sha", "expected_head_sha"),
+        "merged PR head SHA",
     )
-    repository = state.repository_identity.repo if state.repository_identity else "local"
+    expected_base_sha = _required_merge_identity(
+        evidence,
+        ("base_sha", "expected_base_sha"),
+        "merged PR base SHA",
+    )
+    persisted_repository = _repository_identity(state)
+    repository = (
+        _required_merge_identity(evidence, ("repository",), "merged PR repository")
+        if "repository" in evidence
+        else persisted_repository
+    )
+    if repository != persisted_repository:
+        raise ValueError("merged PR repository does not match persisted repository identity")
+    persisted_parent_branch = _publication_parent_branch_from_slice(current)
     parent_branch = (
-        current.publication.base_branch
-        if current.publication is not None
-        else current.base_ref or state.parent_branch or "main"
+        _required_merge_identity(evidence, ("base_branch", "parent_branch"), "parent branch")
+        if "base_branch" in evidence or "parent_branch" in evidence
+        else persisted_parent_branch
     )
+    if parent_branch != persisted_parent_branch:
+        raise ValueError("merged PR parent branch does not match persisted publication identity")
     adopted = replace(current, status=SliceStatus.MERGED, action=None, post_merge=None)
     adopted = slice_transition(
         adopted,
@@ -2556,86 +2570,545 @@ def _adopt_post_merge_slice(
                 journal_id=merge_journal_id,
                 repository=repository,
                 parent_branch=parent_branch,
+                lane_epoch=1,
             )
         ),
     )
-    return replace(adopted, dispatch_last_boundary=boundary)
+    assert adopted.post_merge is not None
+    reconciliation = dict(current.reconciliation or {})
+    defaults: dict[str, object] = {
+        "confirmed_stage": boundary,
+        "authoritative_evidence": [],
+        "missing_evidence": [],
+        "conflicts": [],
+        "next_action": "post_merge_recovery",
+    }
+    for key, default in defaults.items():
+        value = reconciliation.get(key)
+        if (key in {"confirmed_stage", "next_action"} and not isinstance(value, str)) or (
+            key not in {"confirmed_stage", "next_action"} and not isinstance(value, list)
+        ):
+            reconciliation[key] = default
+    reconciliation.update(
+        {
+            "merge_base_sha": expected_base_sha,
+            "merge_head_sha": head_sha,
+            "merge_journal_id": merge_journal_id,
+        }
+    )
+    return replace(
+        adopted,
+        dispatch_last_boundary=boundary,
+        reconciliation=reconciliation,
+    )
 
 
-def _complete_post_merge(
-    current: SliceState,
+def _required_merge_identity(
+    evidence: Mapping[str, object], keys: tuple[str, ...], name: str
+) -> str:
+    for key in keys:
+        value = evidence.get(key)
+        if isinstance(value, str) and value:
+            return value
+    raise ValueError(f"{name} is unavailable in authoritative merge evidence")
+
+
+def _repository_identity(state: RunState) -> str:
+    identity = state.repository_identity
+    if identity is None or not identity.repo:
+        raise ValueError("repository identity is unavailable")
+    return identity.repo
+
+
+def _publication_parent_branch_from_slice(current: SliceState) -> str:
+    """Use persisted publication identity, then the immutable target branch."""
+    if current.publication is not None and current.publication.base_branch:
+        return current.publication.base_branch
+    if current.base_ref:
+        return current.base_ref
+    raise ValueError("parent branch is unavailable in persisted slice identity")
+
+
+def _merge_result_payload(result: ToolResult | None) -> Mapping[str, object] | None:
+    if result is None or result.success is not True or not isinstance(result.result, Mapping):
+        return None
+    return result.result
+
+
+def _post_merge_effect(
+    operation: str,
+    target: str,
+    arguments: Mapping[str, object],
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    method: str,
+    *,
+    active: bool = True,
+    call_arguments: Mapping[str, object] | None = None,
+) -> ToolResult | None:
+    callback = getattr(effects, method, None)
+    if not callable(callback):
+        raise TLLoopError(f"{operation} requires effect {method!r}; no safe fallback exists")
+    dispatch_arguments = call_arguments or arguments
+    return _invoke(
+        operation,
+        target,
+        arguments,
+        active,
+        cast(EffectClient, effects),
+        lambda client: cast(ToolResult, getattr(client, method)(**dispatch_arguments)),
+        effects_log,
+        raise_on_failure=False,
+        retryable_failure=True,
+    )
+
+
+def _checkpoint_post_merge_event(
+    store: RunStore,
     state: RunState,
+    slice_id: str,
+    event: object,
+    reconciliation_additions: Mapping[str, object] | None = None,
+) -> RunState:
+    current = state.slices[slice_id]
+    updated = slice_transition(current, PostMergeEventObserved(event))
+    if reconciliation_additions:
+        reconciliation = dict(updated.reconciliation or {})
+        reconciliation.update(reconciliation_additions)
+        updated = replace(updated, reconciliation=reconciliation)
+    return _checkpoint_slice_action(store, state, slice_id, None, slice_state=updated)
+
+
+def _advance_post_merge_boundary(
+    state: RunState,
+    slice_id: str,
     pr_number: int,
     config: TLLoopConfig,
-) -> SliceState:
-    """Fold confirmed issue, changelog, and parent-push evidence to COMPLETE."""
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    """Run one authoritative effect or persist the next pending boundary."""
+    current = state.slices[slice_id]
     post_merge = current.post_merge
     if post_merge is None or post_merge.phase is PostMergePhase.COMPLETE:
-        return current
+        return state
     evidence = dict(post_merge.evidence)
-    child_id = current.id
-    repository = evidence["repository"]
-    parent_branch = evidence["parent_branch"]
-    parent_commit = evidence.get("parent_commit_sha", current.base_ref or parent_branch)
-    bookkeeping_id = stable_action_key(
-        state.run_id,
-        "merge_bookkeeping",
-        child_id,
+    try:
+        if post_merge.phase is PostMergePhase.REMOTE_MERGE_ADOPTED:
+            return _run_parent_sync(
+                state, current, pr_number, evidence, config, effects, effects_log, store
+            )
+        if post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED:
+            issue_id = _required_issue_id(config.chainlink_issue_id)
+            intent_id = _post_merge_key(state, "issue_close", current.id, pr_number)
+            return _checkpoint_post_merge_event(
+                store,
+                state,
+                slice_id,
+                IssueClosePending(current.id, issue_id, intent_id),
+            )
+        if post_merge.phase is PostMergePhase.ISSUE_CLOSE_PENDING:
+            return _run_issue_close(state, current, evidence, config, effects, effects_log, store)
+        if post_merge.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED:
+            intent_id = _post_merge_key(state, "changelog", current.id, pr_number)
+            return _checkpoint_post_merge_event(
+                store,
+                state,
+                slice_id,
+                ChangelogPending(current.id, intent_id, 0),
+            )
+        if post_merge.phase is PostMergePhase.CHANGELOG_PENDING:
+            return _run_changelog(state, current, evidence, config, effects, effects_log, store)
+        if post_merge.phase is PostMergePhase.CHANGELOG_COMMITTED:
+            intent_id = _post_merge_key(state, "parent_push", current.id, pr_number)
+            journal_id = _post_merge_key(state, "parent_push_journal", current.id, pr_number)
+            return _checkpoint_post_merge_event(
+                store,
+                state,
+                slice_id,
+                ParentPushPending(
+                    current.id,
+                    intent_id,
+                    _required_current_base(current),
+                    journal_id,
+                ),
+            )
+        if post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING:
+            return _run_parent_push(state, current, evidence, config, effects, effects_log, store)
+    except (EffectFailed, TLLoopError, ToolUnavailableError, TypeError, ValueError) as error:
+        return _block_post_merge_recovery(store, state, slice_id, str(error))
+    return state
+
+
+def _required_issue_id(issue_id: int | None) -> str:
+    if type(issue_id) is not int or issue_id <= 0:
+        raise ValueError("Chainlink issue ID is unavailable")
+    return str(issue_id)
+
+
+def _post_merge_key(state: RunState, operation: str, child_id: str, pr_number: int) -> str:
+    return stable_action_key(
+        state.run_id, f"post_merge_{operation}", child_id, {"pr_number": pr_number}
+    )
+
+
+def _run_parent_sync(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    arguments = {
+        "child_id": current.id,
+        "pr_number": pr_number,
+        "repository": _required_merge_identity(evidence, ("repository",), "repository"),
+        "parent_branch": _required_merge_identity(evidence, ("parent_branch",), "parent branch"),
+        "merged_head_sha": _required_merge_identity(evidence, ("head_sha",), "merged head SHA"),
+        "expected_base_sha": _required_current_base(current),
+        "lane_epoch": _required_int(evidence, "lane_epoch", "lane epoch"),
+        "working_dir": config.working_dir,
+    }
+    result = _post_merge_effect(
+        "post_merge_parent_sync",
+        current.id,
+        arguments,
+        effects,
+        effects_log,
+        "post_merge_parent_sync",
+        active=config.active,
+    )
+    payload = _required_effect_result(
+        result,
+        (
+            "child_id",
+            "pr_number",
+            "repository",
+            "parent_branch",
+            "merged_head_sha",
+            "expected_base_sha",
+            "lane_epoch",
+            "parent_commit_sha",
+            "remote_head_sha",
+            "ancestry_proof",
+        ),
+    )
+    _require_matching_text(
+        payload,
+        arguments,
+        "child_id",
+        "repository",
+        "parent_branch",
+        "merged_head_sha",
+        "expected_base_sha",
+    )
+    if str(payload["pr_number"]) != str(arguments["pr_number"]):
+        raise ValueError("parent synchronization receipt mismatch for pr_number")
+    if str(payload["lane_epoch"]) != str(arguments["lane_epoch"]):
+        raise ValueError("parent synchronization receipt mismatch for lane_epoch")
+    if payload["parent_commit_sha"] != payload["remote_head_sha"]:
+        raise ValueError("parent synchronization returned divergent local and remote heads")
+    if payload["ancestry_proof"] != (
+        f"ancestor:{arguments['merged_head_sha']}->{payload['parent_commit_sha']}"
+    ):
+        raise ValueError("parent synchronization returned unverifiable ancestry evidence")
+    return _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        ParentBranchSynced(current.id, arguments["parent_branch"], payload["parent_commit_sha"]),
         {
-            "issue_id": config.chainlink_issue_id or 0,
-            "pr_number": pr_number,
+            "remote_head_sha": payload["remote_head_sha"],
+            "ancestry_proof": payload["ancestry_proof"],
         },
     )
-    issue_id = str(config.chainlink_issue_id or "not-configured")
-    while post_merge.phase is not PostMergePhase.COMPLETE:
-        evidence = dict(post_merge.evidence)
-        if post_merge.phase is PostMergePhase.REMOTE_MERGE_ADOPTED:
-            event: object = ParentBranchSynced(child_id, parent_branch, parent_commit)
-        elif post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED:
-            event = IssueClosePending(child_id, issue_id, bookkeeping_id)
-        elif post_merge.phase is PostMergePhase.ISSUE_CLOSE_PENDING:
-            event = IssueCloseConfirmed(child_id, issue_id, bookkeeping_id, bookkeeping_id)
-        elif post_merge.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED:
-            event = ChangelogPending(child_id, bookkeeping_id)
-        elif post_merge.phase is PostMergePhase.CHANGELOG_PENDING:
-            event = ChangelogCommitted(child_id, bookkeeping_id, bookkeeping_id)
-        elif post_merge.phase is PostMergePhase.CHANGELOG_COMMITTED:
-            event = ParentPushPending(
-                child_id,
-                bookkeeping_id,
-                current.base_ref or parent_commit,
-                bookkeeping_id,
-            )
-        elif post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING:
-            receipt = PushReceipt(
-                repository=repository,
-                parent_branch=parent_branch,
-                child_id=child_id,
-                lane_epoch=int(evidence.get("lane_epoch", "1")),
-                push_intent_id=evidence["parent_push_intent_id"],
-                push_journal_id=evidence["push_journal_id"],
-                push_receipt_id=f"{evidence['push_journal_id']}:receipt",
-                expected_base_sha=evidence["expected_base_sha"],
-                pushed_commit=evidence["changelog_commit_sha"],
-                observed_remote_head=evidence["changelog_commit_sha"],
-                ancestry_proof=f"ancestor:{evidence['changelog_commit_sha']}",
-            )
-            event = PostMergeComplete(
-                child_id,
-                evidence["merge_journal_id"],
-                evidence["parent_push_intent_id"],
-                evidence["changelog_commit_sha"],
-                receipt,
-            )
+
+
+def _run_issue_close(
+    state: RunState,
+    current: SliceState,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    issue_id = _required_issue_id(config.chainlink_issue_id)
+    intent_id = _required_merge_identity(evidence, ("issue_close_intent_id",), "issue-close intent")
+    arguments = {"issue_id": int(issue_id), "force": True, "commit_changelog": False}
+    result = _post_merge_effect(
+        "post_merge_issue_close",
+        current.id,
+        {**arguments, "intent_id": intent_id},
+        effects,
+        effects_log,
+        "chainlink_issue_close",
+        active=config.active,
+        call_arguments={
+            "issue_id": int(issue_id),
+            "force": True,
+            "commit_changelog": False,
+            "summary": f"Closed after successful merge of PR #{evidence['pr_number']}",
+        },
+    )
+    payload = _required_effect_result(result, ("issue_id", "receipt_id"))
+    if str(payload["issue_id"]) != issue_id:
+        raise ValueError("issue-close receipt has a different issue ID")
+    updated = _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        IssueCloseConfirmed(current.id, issue_id, intent_id, payload["receipt_id"]),
+    )
+    return updated
+
+
+def _run_changelog(
+    state: RunState,
+    current: SliceState,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    issue_id = _required_issue_id(config.chainlink_issue_id)
+    intent_id = _required_merge_identity(evidence, ("changelog_intent_id",), "changelog intent")
+    generation = _required_int(
+        evidence, "changelog_generation", "changelog generation", allow_zero=True
+    )
+    arguments = {
+        "child_id": current.id,
+        "issue_id": int(issue_id),
+        "repository": _required_merge_identity(evidence, ("repository",), "repository"),
+        "parent_branch": _required_merge_identity(evidence, ("parent_branch",), "parent branch"),
+        "expected_base_sha": _required_current_base(current),
+        "generation": generation,
+        "intent_id": intent_id,
+        "working_dir": config.working_dir,
+    }
+    result = _post_merge_effect(
+        "post_merge_changelog",
+        current.id,
+        arguments,
+        effects,
+        effects_log,
+        "post_merge_changelog",
+        active=config.active,
+    )
+    payload = _required_effect_result(
+        result,
+        (
+            "child_id",
+            "issue_id",
+            "repository",
+            "parent_branch",
+            "expected_base_sha",
+            "generation",
+            "intent_id",
+            "commit_sha",
+        ),
+    )
+    _require_matching_text(
+        payload,
+        arguments,
+        "child_id",
+        "repository",
+        "parent_branch",
+        "expected_base_sha",
+        "intent_id",
+    )
+    if str(payload["issue_id"]) != str(arguments["issue_id"]):
+        raise ValueError("changelog receipt mismatch for issue_id")
+    if str(payload["generation"]) != str(arguments["generation"]):
+        raise ValueError("changelog receipt mismatch for generation")
+    updated = _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        ChangelogCommitted(current.id, intent_id, payload["commit_sha"]),
+    )
+    return updated
+
+
+def _run_parent_push(
+    state: RunState,
+    current: SliceState,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    arguments = {
+        "child_id": current.id,
+        "repository": _required_merge_identity(evidence, ("repository",), "repository"),
+        "parent_branch": _required_merge_identity(evidence, ("parent_branch",), "parent branch"),
+        "lane_epoch": _required_int(evidence, "lane_epoch", "lane epoch"),
+        "push_intent_id": _required_merge_identity(
+            evidence, ("parent_push_intent_id",), "push intent"
+        ),
+        "push_journal_id": _required_merge_identity(evidence, ("push_journal_id",), "push journal"),
+        "expected_base_sha": _required_merge_identity(
+            evidence, ("expected_base_sha",), "push base SHA"
+        ),
+        "pushed_commit": _required_merge_identity(
+            evidence, ("changelog_commit_sha",), "changelog commit"
+        ),
+        "working_dir": config.working_dir,
+    }
+    result = _post_merge_effect(
+        "post_merge_push",
+        current.id,
+        arguments,
+        effects,
+        effects_log,
+        "post_merge_push",
+        active=config.active,
+    )
+    payload = _required_effect_result(
+        result,
+        (
+            "repository",
+            "parent_branch",
+            "child_id",
+            "lane_epoch",
+            "push_intent_id",
+            "push_journal_id",
+            "push_receipt_id",
+            "expected_base_sha",
+            "pushed_commit",
+            "observed_remote_head",
+            "ancestry_proof",
+        ),
+    )
+    _require_matching_text(payload, arguments, "repository", "parent_branch", "child_id")
+    for key in (
+        "lane_epoch",
+        "push_intent_id",
+        "push_journal_id",
+        "expected_base_sha",
+        "pushed_commit",
+    ):
+        if str(payload[key]) != str(arguments[key]):
+            raise ValueError(f"parent-push receipt mismatch for {key}")
+    if payload["observed_remote_head"] != payload["pushed_commit"]:
+        raise ValueError("parent-push receipt observed a different remote head")
+    if payload["ancestry_proof"] != (
+        f"ancestor:{payload['pushed_commit']}->{payload['observed_remote_head']}"
+    ):
+        raise ValueError("parent-push receipt has unverifiable ancestry evidence")
+    lane_epoch = payload["lane_epoch"]
+    if isinstance(lane_epoch, str) and lane_epoch.isdigit():
+        lane_epoch = int(lane_epoch)
+    receipt = PushReceipt(
+        repository=payload["repository"],
+        parent_branch=payload["parent_branch"],
+        child_id=payload["child_id"],
+        lane_epoch=_positive_int(lane_epoch, "lane epoch"),
+        push_intent_id=payload["push_intent_id"],
+        push_journal_id=payload["push_journal_id"],
+        push_receipt_id=payload["push_receipt_id"],
+        expected_base_sha=payload["expected_base_sha"],
+        pushed_commit=payload["pushed_commit"],
+        observed_remote_head=payload["observed_remote_head"],
+        ancestry_proof=payload["ancestry_proof"],
+    )
+    return _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        PostMergeComplete(
+            current.id,
+            evidence["merge_journal_id"],
+            arguments["push_intent_id"],
+            arguments["pushed_commit"],
+            receipt,
+        ),
+    )
+
+
+def _required_effect_result(
+    result: ToolResult | None, fields: tuple[str, ...]
+) -> Mapping[str, str]:
+    payload = _merge_result_payload(result)
+    if payload is None:
+        raise ValueError("post-merge effect returned no authoritative success receipt")
+    values: dict[str, str] = {}
+    for field_name in fields:
+        value = payload.get(field_name)
+        if isinstance(value, str) and value:
+            values[field_name] = value
+        elif (
+            field_name in {"lane_epoch", "pr_number", "issue_id", "generation"}
+            and type(value) is int
+        ):
+            values[field_name] = str(value)
         else:
-            return current
-        post_merge = slice_transition(
-            replace(current, post_merge=post_merge),
-            PostMergeEventObserved(event),
-        ).post_merge
-        if post_merge is None:
-            return current
-    return replace(current, post_merge=post_merge)
+            raise ValueError(f"post-merge effect receipt is missing {field_name}")
+    return values
+
+
+def _require_matching_text(
+    payload: Mapping[str, object], arguments: Mapping[str, object], *fields: str
+) -> None:
+    for field_name in fields:
+        if payload.get(field_name) != arguments.get(field_name):
+            raise ValueError(f"post-merge receipt mismatch for {field_name}")
+
+
+def _required_current_base(current: SliceState) -> str:
+    reconciliation = current.reconciliation
+    value = None
+    if isinstance(reconciliation, Mapping):
+        for key in ("remote_head_sha", "merge_base_sha"):
+            candidate = reconciliation.get(key)
+            if isinstance(candidate, str) and candidate:
+                value = candidate
+                break
+    if value is None:
+        raise ValueError("merged PR base SHA is unavailable")
+    return value
+
+
+def _required_int(
+    evidence: Mapping[str, object], key: str, name: str, *, allow_zero: bool = False
+) -> int:
+    value = evidence.get(key)
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    minimum = 0 if allow_zero else 1
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} is unavailable")
+    return value
+
+
+def _positive_int(value: object, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _block_post_merge_recovery(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    reason: str,
+) -> RunState:
+    bounded = reason[:500]
+    blocked = replace(state.slices[slice_id], dispatch_error=bounded, action=None)
+    blocked_state = _checkpoint_slice_action(store, state, slice_id, None, slice_state=blocked)
+    gate_name = f"tl-post-merge-{slice_id}"
+    gate = next(
+        (candidate for candidate in blocked_state.gates if candidate.name == gate_name), None
+    )
+    if gate is None:
+        return store.set_gate(gate_name, GateStatus.PENDING)
+    return blocked_state
 
 
 def _execute_direct_merge_intent(
@@ -2668,16 +3141,18 @@ def _execute_direct_merge_intent(
         and (_watcher_result_observation(watcher) is not None)
         and _watcher_result_observation(watcher).merged is True
     ):
+        observation = _watcher_result_observation(watcher)
         return _reconcile_merged_slice(
             store.load(),
             current.id,
             current.pr_number,
-            current.action.intent_id if current.action is not None else intent.operation,
+            current.action.intent_id if current.action is not None else "",
             config,
             effects,
             store,
             effects_log,
             boundary="direct_merge_adopted",
+            merge_evidence=_watcher_merge_evidence(observation),
         )
     if (
         watcher is not None
@@ -2847,6 +3322,10 @@ def _reconcile_unknown_merge(
             store,
             effects_log,
             boundary="direct_merge_reconciled",
+            merge_evidence={
+                **arguments,
+                **_watcher_merge_evidence(_watcher_result_observation(watcher)),
+            },
         )
     refreshed = store.load()
     unknown = replace(action, phase=ActionPhase.UNKNOWN)
@@ -2869,6 +3348,18 @@ def _direct_compare_evidence_complete(watcher: ToolResult) -> bool:
         isinstance(getattr(observation, key), str) and bool(getattr(observation, key))
         for key in ("base_sha", "head_sha", "patch_digest", "merge_tree_sha", "ci_status")
     )
+
+
+def _watcher_merge_evidence(observation: object) -> dict[str, object]:
+    """Copy only authoritative merge identity from a watcher observation."""
+    if observation is None:
+        return {}
+    values: dict[str, object] = {}
+    for name in ("head_sha", "base_sha", "base_branch"):
+        value = getattr(observation, name, None)
+        if value is not None:
+            values[name] = value
+    return values
 
 
 def _direct_merge_evidence(
@@ -2941,6 +3432,7 @@ def _adopt_direct_merge_result(
         and (_watcher_result_observation(watcher) is not None)
         and _watcher_result_observation(watcher).merged is True
     ):
+        observation = _watcher_result_observation(watcher)
         return _reconcile_merged_slice(
             store.load(),
             slice_id,
@@ -2951,6 +3443,7 @@ def _adopt_direct_merge_result(
             store,
             effects_log,
             boundary="direct_merge_confirmed",
+            merge_evidence=_watcher_merge_evidence(observation),
         )
     return _checkpoint_slice_action(
         store,
@@ -3544,90 +4037,12 @@ def _reconcile_pending_merge_entry(
         store,
         effects_log,
         boundary="restart_merge_reconciled",
+        merge_evidence={
+            **arguments,
+            **_watcher_merge_evidence(_watcher_result_observation(watcher)),
+        },
     )
     return True
-
-
-def _merge_bookkeeping_arguments(
-    issue_id: int,
-    pr_number: int,
-) -> dict[str, object]:
-    return {
-        "issue_id": issue_id,
-        "force": True,
-        "summary": f"Closed after successful merge of PR #{pr_number}",
-        "commit_changelog": True,
-    }
-
-
-def _reconcile_merge_bookkeeping(
-    target: str,
-    pr_number: int | None,
-    issue_id: int | None,
-    config: TLLoopConfig,
-    store: RunStore,
-    effects: EffectClient | ReadOnlyEffectClient,
-    effects_log: list[EffectIntent],
-) -> tuple[bool, str | None]:
-    if issue_id is None:
-        return True, None
-    if pr_number is None:
-        return False, "merge bookkeeping requires a PR number"
-    if not config.active or not callable(getattr(effects, "chainlink_issue_close", None)):
-        return False, "merge bookkeeping requires an active effect client"
-    arguments = _merge_bookkeeping_arguments(issue_id, pr_number)
-    try:
-        result = _invoke(
-            "merge_bookkeeping",
-            target,
-            arguments,
-            config.active,
-            cast(EffectClient, effects),
-            lambda client: client.chainlink_issue_close(
-                issue_id=issue_id,
-                force=True,
-                summary=cast(str, arguments["summary"]),
-                commit_changelog=True,
-            ),
-            effects_log,
-            raise_on_failure=False,
-            retryable_failure=True,
-        )
-    except TLLoopError as error:
-        return False, str(error)
-    if result is not None and result.success is True:
-        return True, None
-    if result is None:
-        return False, "merge bookkeeping was not dispatched"
-    return False, result.error or "merge bookkeeping returned failure"
-
-
-def _ensure_merge_bookkeeping_gate(
-    state: RunState,
-    store: RunStore,
-    effects_log: list[EffectIntent],
-    target: str,
-    pr_number: int | None,
-    issue_id: int | None,
-) -> RunState:
-    if issue_id is None or pr_number is None or not isinstance(effects_log, EffectJournal):
-        return state
-    intent = EffectIntent(
-        "merge_bookkeeping",
-        target,
-        _merge_bookkeeping_arguments(issue_id, pr_number),
-        True,
-    )
-    entry = effects_log.existing(intent)
-    if entry is None or entry.get("status") not in {"intended", "unknown"}:
-        return state
-    gate_name = _action_journal_gate_name(
-        entry.get("key", effects_log.key_for(intent)),
-        _action_journal_compensation_attempt(entry),
-    )
-    if any(gate.name == gate_name for gate in state.gates):
-        return state
-    return store.set_gate(gate_name, GateStatus.PENDING)
 
 
 def _controller_event_was_committed(
@@ -3851,6 +4266,7 @@ def _reconcile_nonterminal_slices(
                     effects,
                     store,
                     effects_log,
+                    merge_evidence=_watcher_merge_evidence(watcher),
                 )
                 updated = dict(state.slices)
                 changed = False
@@ -4028,6 +4444,7 @@ def _adopt_authoritative_merged_snapshot(
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
     effects_log: list[EffectIntent],
+    merge_evidence: Mapping[str, object] | None = None,
 ) -> RunState:
     """Adopt a journal-confirmed merge before review/ownership recovery."""
     arguments = merge_entry.get("arguments")
@@ -4035,9 +4452,10 @@ def _adopt_authoritative_merged_snapshot(
     if isinstance(arguments, Mapping) and type(arguments.get("chainlink_issue_id")) is int:
         issue_id = cast(int, arguments["chainlink_issue_id"])
     merge_key = merge_entry.get("key")
-    merge_journal_id = (
-        merge_key if isinstance(merge_key, str) and merge_key else (f"merge:{slice_id}:{pr_number}")
-    )
+    merge_journal_id = merge_key if isinstance(merge_key, str) else ""
+    authoritative_evidence = dict(arguments) if isinstance(arguments, Mapping) else {}
+    if merge_evidence is not None:
+        authoritative_evidence.update(merge_evidence)
     return _reconcile_merged_slice(
         state,
         slice_id,
@@ -4048,6 +4466,7 @@ def _adopt_authoritative_merged_snapshot(
         store,
         effects_log,
         boundary="authoritative_merge_adopted",
+        merge_evidence=authoritative_evidence,
     )
 
 
@@ -6310,7 +6729,9 @@ def _integrate_one_candidate(
                 effects,
                 effects_log,
             )
-            return _checkpoint_aggregate_merged(task, state, store, candidate_runtime)
+            return _checkpoint_aggregate_merged(
+                task, state, store, candidate_runtime, config, effects, effects_log
+            )
         # A successful merge response is not terminal. Keep the action in
         # flight and wait for an authoritative merged observation instead of
         # issuing a second request while the remote operation settles.
@@ -6351,7 +6772,9 @@ def _integrate_one_candidate(
             effects,
             effects_log,
         )
-        return _checkpoint_aggregate_merged(task, state, store, reconciled)
+        return _checkpoint_aggregate_merged(
+            task, state, store, reconciled, config, effects, effects_log
+        )
     head_sha = _snapshot_text(first, "head_sha")
     base_sha = _snapshot_text(first, "base_sha")
     patch_digest = _snapshot_text(first, "patch_digest") or current.review_patch_digests.get(
@@ -6531,7 +6954,9 @@ def _integrate_one_candidate(
     )
     failure = _merge_failure_classification(merge_result)
     if _merge_result_is_authoritative(merge_result):
-        return _checkpoint_aggregate_merged(task, state, store, integration)
+        return _checkpoint_aggregate_merged(
+            task, state, store, integration, config, effects, effects_log
+        )
     if failure == "conflict":
         return _handle_integration_conflict(
             task,
@@ -6567,22 +6992,60 @@ def _checkpoint_aggregate_merged(
     state: RunState,
     store: RunStore,
     integration: IntegrationRuntimeState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
 ) -> RunState:
     """Persist one merge result, including a restart reconciliation result."""
     current = state.slices[task.name]
+    previous_slices = state.slices
     updated_slices = dict(state.slices)
-    aggregate_pr_number = current.pr_number or 0
-    aggregate_merge_key = (
-        current.action.intent_id
-        if current.action is not None and current.action.intent_id
-        else f"aggregate_merge:{task.name}:{aggregate_pr_number}"
-    )
+    aggregate_pr_number = current.pr_number
+    if type(aggregate_pr_number) is not int or aggregate_pr_number <= 0:
+        return _block_post_merge_recovery(
+            store,
+            state,
+            task.name,
+            f"aggregate merge for {task.name!r} has no authoritative PR number",
+        )
+    if current.action is None or not current.action.intent_id:
+        return _block_post_merge_recovery(
+            store,
+            state,
+            task.name,
+            f"aggregate merge for {task.name!r} has no durable merge intent",
+        )
+    aggregate_merge_key = current.action.intent_id
+    aggregate_head = integration.aggregate_head_sha or integration.head_sha
+    aggregate_base = integration.aggregate_original_base_sha or integration.validated_base_sha
+    if not aggregate_head or not aggregate_base:
+        return _block_post_merge_recovery(
+            store,
+            state,
+            task.name,
+            f"aggregate merge for {task.name!r} has incomplete merge evidence",
+        )
+    try:
+        merge_evidence = {
+            "head_sha": aggregate_head,
+            "base_sha": aggregate_base,
+            "repository": _repository_identity(state),
+            "parent_branch": _publication_parent_branch_from_slice(current),
+        }
+    except ValueError as error:
+        return _block_post_merge_recovery(
+            store,
+            state,
+            task.name,
+            f"cannot adopt aggregate merge for {task.name!r}: {error}",
+        )
     updated_slices[task.name] = _adopt_post_merge_slice(
         current,
         state,
         aggregate_pr_number,
         aggregate_merge_key,
         "aggregate_merged",
+        merge_evidence,
     )
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[task.name] = IntegrationLifecycle.MERGED
@@ -6657,10 +7120,22 @@ def _checkpoint_aggregate_merged(
             "sub-tl",
         )
         for sibling_id, sibling_slice in updated_slices.items()
-        if sibling_slice.status is SliceStatus.IN_REVIEW
+        if sibling_slice.status
+        in {
+            SliceStatus.SPAWNED,
+            SliceStatus.IN_REVIEW,
+            SliceStatus.REPAIRING,
+        }
+        or (
+            sibling_slice.status is SliceStatus.MERGED
+            and (
+                sibling_slice.post_merge is None
+                or sibling_slice.post_merge.phase is not PostMergePhase.COMPLETE
+            )
+        )
     }
     checkpoint_phase: PhaseValue = TLWaiting(remaining) if remaining else TLPlanning()
-    return store.checkpoint(
+    checkpointed = store.checkpoint(
         checkpoint_phase,
         updated_slices,
         state.budgets,
@@ -6672,6 +7147,16 @@ def _checkpoint_aggregate_merged(
             sub_tl_states=sub_states,
             candidates=candidate_records,
         ),
+    )
+    _emit_slice_status_changes(previous_slices, checkpointed.slices, config, effects, effects_log)
+    return _advance_post_merge_boundary(
+        checkpointed,
+        task.name,
+        aggregate_pr_number,
+        config,
+        effects,
+        effects_log,
+        store,
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from typing import ClassVar
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.phase import TLPhase
@@ -253,7 +254,14 @@ class FakeClient:
 def _load_state(tmp_path):
     create(
         "reconcile",
-        {"slices": {"slice-a": _encode_slice("slice-a", _spawned_slice_without_pr())}},
+        {
+            "slices": {"slice-a": _encode_slice("slice-a", _spawned_slice_without_pr())},
+            "repository_identity": {
+                "owner": "org",
+                "repo": "repo",
+                "base_branch": "main",
+            },
+        },
         root_dir=tmp_path,
     )
     store = RunStore("reconcile", tmp_path)
@@ -514,9 +522,9 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     )
     assert len(client.merge_calls) == 1
     assert client.merge_calls[0]["expected_head_sha"] == "head-a"
-    assert len(client.chainlink_issue_close_calls) == 1
-    assert client.chainlink_issue_close_calls[0]["commit_changelog"] is True
+    assert client.chainlink_issue_close_calls == []
     assert merged.slices["slice-a"].status is SliceStatus.MERGED
+    assert merged.slices["slice-a"].post_merge.phase.value == "remote_merge_adopted"
 
     repeated = _reconcile_nonterminal_slices(
         _PLAN,
@@ -528,7 +536,7 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     )
     _apply_convergence(repeated, ConvergenceTracker(), store, config, client, journal)
     assert len(client.merge_calls) == 1
-    assert len(client.chainlink_issue_close_calls) == 1
+    assert len(client.chainlink_issue_close_calls) == 0
 
 
 def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_path) -> None:
@@ -566,8 +574,9 @@ def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_pa
 
     assert recovered.slices["slice-a"].status is SliceStatus.MERGED
     assert recovered.slices["slice-a"].action is None
-    assert recovered.fsm.phase is TLPhase.TLAllMerged
-    assert recovered.fsm.waiting == ()
+    assert recovered.slices["slice-a"].post_merge.phase.value == "remote_merge_adopted"
+    assert recovered.fsm.phase is TLPhase.TLWaiting
+    assert recovered.fsm.waiting == ("slice-a",)
     assert client.spawn_reviewer_calls == []
     assert client.merge_calls == []
     assert journal.pending_entries() == []
@@ -847,15 +856,224 @@ def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None
     )
 
     assert len(client.merge_calls) == 1
-    assert len(client.chainlink_issue_close_calls) == 1
+    assert client.chainlink_issue_close_calls == []
     assert after_merge.slices["slice-a"].status is SliceStatus.MERGED
+    assert after_merge.slices["slice-a"].post_merge.phase.value == "remote_merge_adopted"
     assert after_merge.slices["slice-a"].action is None
-    assert "changelog commit failed" in (after_merge.slices["slice-a"].dispatch_error or "")
-    pending = journal.pending_entries()
-    assert len(pending) == 1
-    assert pending[0]["operation"] == "merge_bookkeeping"
-    gate = next(gate for gate in after_merge.gates if gate.name.startswith("tl-action-journal-"))
+    assert "post_merge_parent_sync" in (after_merge.slices["slice-a"].dispatch_error or "")
+    assert journal.pending_entries() == []
+    gate = next(gate for gate in after_merge.gates if gate.name == "tl-post-merge-slice-a")
     assert gate.status is GateStatus.PENDING
+
+
+def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+
+    class DurableRecoveryClient(FakeClient):
+        post_merge_calls: ClassVar[list[tuple[str, dict[str, object]]]] = []
+
+        def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
+            self.post_merge_calls.append(("parent_sync", arguments))
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        "child_id": arguments["child_id"],
+                        "pr_number": arguments["pr_number"],
+                        "repository": "repo",
+                        "parent_branch": "main",
+                        "merged_head_sha": arguments["merged_head_sha"],
+                        "expected_base_sha": arguments["expected_base_sha"],
+                        "lane_epoch": arguments["lane_epoch"],
+                        "parent_commit_sha": "parent-after-merge",
+                        "remote_head_sha": "parent-after-merge",
+                        "ancestry_proof": (
+                            f"ancestor:{arguments['merged_head_sha']}->parent-after-merge"
+                        ),
+                    },
+                }
+            )
+
+        def chainlink_issue_close(self, **arguments: object) -> ToolResult:
+            result = super().chainlink_issue_close(**arguments)
+            if result.success is not True:
+                return result
+            issue_id = arguments["issue_id"]
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {"issue_id": issue_id, "receipt_id": f"issue-close:{issue_id}"},
+                }
+            )
+
+        def post_merge_changelog(self, **arguments: object) -> ToolResult:
+            self.post_merge_calls.append(("changelog", arguments))
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {**arguments, "commit_sha": "changelog-commit"},
+                }
+            )
+
+        def post_merge_push(self, **arguments: object) -> ToolResult:
+            self.post_merge_calls.append(("push", arguments))
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        **arguments,
+                        "push_receipt_id": "push-receipt",
+                        "observed_remote_head": arguments["pushed_commit"],
+                        "ancestry_proof": (
+                            f"ancestor:{arguments['pushed_commit']}->{arguments['pushed_commit']}"
+                        ),
+                    },
+                }
+            )
+
+    client = DurableRecoveryClient(
+        review_id=7,
+        review_verdict="APPROVED",
+        review_head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+    phases: list[str] = []
+    for _ in range(8):
+        recovered = _apply_convergence(
+            store.load(), ConvergenceTracker(), store, config, client, journal
+        )
+        persisted = store.load()
+        assert persisted.slices["slice-a"].post_merge == recovered.slices["slice-a"].post_merge
+        phases.append(recovered.slices["slice-a"].post_merge.phase.value)
+        if recovered.slices["slice-a"].post_merge.phase.value == "complete":
+            break
+
+    assert phases == [
+        "parent_branch_synced",
+        "issue_close_pending",
+        "issue_close_confirmed",
+        "changelog_pending",
+        "changelog_committed",
+        "parent_push_pending",
+        "complete",
+    ]
+    assert recovered.slices["slice-a"].post_merge.phase.value == "complete"
+    assert [name for name, _ in client.post_merge_calls] == [
+        "parent_sync",
+        "changelog",
+        "push",
+    ]
+    assert len(client.chainlink_issue_close_calls) == 1
+    assert all(
+        entry["status"] == "confirmed"
+        for entry in journal.confirmed_entries("post_merge_parent_sync", "slice-a")
+    )
+    assert all(
+        entry["status"] == "confirmed"
+        for entry in journal.confirmed_entries("post_merge_changelog", "slice-a")
+    )
+    assert all(
+        entry["status"] == "confirmed"
+        for entry in journal.confirmed_entries("post_merge_push", "slice-a")
+    )
+
+    restarted = _apply_convergence(
+        store.load(), ConvergenceTracker(), store, config, client, journal
+    )
+    assert restarted.slices["slice-a"].post_merge.phase.value == "complete"
+    assert len(client.merge_calls) == 1
+    assert len(client.chainlink_issue_close_calls) == 1
+    assert [name for name, _ in client.post_merge_calls] == [
+        "parent_sync",
+        "changelog",
+        "push",
+    ]
+
+
+def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
+    tmp_path, monkeypatch
+) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    crash = [False]
+
+    class CrashRecoveryClient(FakeClient):
+        parent_sync_calls: int = 0
+
+        def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
+            self.parent_sync_calls += 1
+            crash[0] = True
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        "child_id": arguments["child_id"],
+                        "pr_number": arguments["pr_number"],
+                        "repository": "repo",
+                        "parent_branch": "main",
+                        "merged_head_sha": arguments["merged_head_sha"],
+                        "expected_base_sha": arguments["expected_base_sha"],
+                        "lane_epoch": arguments["lane_epoch"],
+                        "parent_commit_sha": "parent-after-merge",
+                        "remote_head_sha": "parent-after-merge",
+                        "ancestry_proof": (
+                            f"ancestor:{arguments['merged_head_sha']}->parent-after-merge"
+                        ),
+                    },
+                }
+            )
+
+    client = CrashRecoveryClient(
+        review_id=7,
+        review_verdict="APPROVED",
+        review_head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+    )
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    checkpoint = RunStore.checkpoint
+
+    def crash_checkpoint(run_store, *args, **kwargs):
+        if run_store is store and crash[0]:
+            crash[0] = False
+            raise RuntimeError("simulated process death after parent sync")
+        return checkpoint(run_store, *args, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", crash_checkpoint)
+    try:
+        _apply_convergence(recovered, ConvergenceTracker(), store, config, client, journal)
+    except RuntimeError as error:
+        assert str(error) == "simulated process death after parent sync"
+    else:
+        raise AssertionError("checkpoint crash should interrupt the recovery boundary")
+
+    assert client.parent_sync_calls == 1
+    assert len(journal.confirmed_entries("post_merge_parent_sync", "slice-a")) == 1
+    monkeypatch.setattr(RunStore, "checkpoint", checkpoint)
+
+    restarted = _apply_convergence(
+        store.load(), ConvergenceTracker(), store, config, client, journal
+    )
+
+    assert client.parent_sync_calls == 1
+    assert restarted.slices["slice-a"].post_merge.phase.value == "parent_branch_synced"
 
 
 @dataclass

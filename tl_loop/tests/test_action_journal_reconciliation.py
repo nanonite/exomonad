@@ -17,8 +17,8 @@ from tl_loop.client.effects import ToolResult
 from tl_loop.loop.driver import (
     TLLoopConfig,
     _action_journal_gate_name,
-    _record_controller_event,
     _reconcile_action_journal,
+    _record_controller_event,
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.state.schema import GateStatus, SliceStatus
@@ -267,5 +267,5 @@ def test_restart_adopts_an_authoritative_merge_for_a_pending_intent(tmp_path) ->
 
     assert journal.pending_entries() == []
     assert journal.existing(intent)["status"] == "confirmed"
-    assert reconciled.slices["slice-a"].status is SliceStatus.MERGED
+    assert reconciled.slices["slice-a"].status is SliceStatus.IN_REVIEW
     assert reconciled.slices["slice-a"].action is None

@@ -889,7 +889,15 @@ instance MCPTool ChainlinkIssueClose where
     result <- chainlinkIssueCloseCore args
     case result of
       Left err -> pure $ errorResult err
-      Right _ -> pure $ successResult (object ["success" .= True])
+      Right _ ->
+        pure $
+          successResult
+            ( object
+                [ "success" .= True,
+                  "issue_id" .= cisIssueId args,
+                  "receipt_id" .= ("chainlink-close:" <> T.pack (show (cisIssueId args)))
+                ]
+            )
 
 --------------------------------------------------------------------------------
 -- Subissue Close
@@ -913,7 +921,15 @@ instance MCPTool ChainlinkSubissueClose where
     result <- chainlinkIssueCloseCore args
     case result of
       Left err -> pure $ errorResult err
-      Right _ -> pure $ successResult (object ["success" .= True])
+      Right _ ->
+        pure $
+          successResult
+            ( object
+                [ "success" .= True,
+                  "issue_id" .= cisIssueId args,
+                  "receipt_id" .= ("chainlink-close:" <> T.pack (show (cisIssueId args)))
+                ]
+            )
 
 --------------------------------------------------------------------------------
 -- Timer

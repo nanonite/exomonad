@@ -116,6 +116,9 @@ TOOL_METHODS: tuple[str, ...] = (
     "resume_pr",
     "resolve_live_pr_for_slice",
     "watcher_pr_state",
+    "post_merge_parent_sync",
+    "post_merge_changelog",
+    "post_merge_push",
     "close_worker_pane",
     "spawn_codex",
     "session_status",
@@ -513,6 +516,83 @@ class EffectClient:
         }
         _put(arguments, "summary", summary)
         return self._call("chainlink_issue_close", arguments)
+
+    def post_merge_parent_sync(
+        self,
+        *,
+        child_id: str,
+        pr_number: int,
+        repository: str,
+        parent_branch: str,
+        merged_head_sha: str,
+        expected_base_sha: str,
+        lane_epoch: int,
+        working_dir: str | None = None,
+    ) -> ToolResult:
+        """Synchronize the parent lane and return verified ancestry evidence."""
+        arguments: JsonObject = {
+            "child_id": child_id,
+            "pr_number": pr_number,
+            "repository": repository,
+            "parent_branch": parent_branch,
+            "merged_head_sha": merged_head_sha,
+            "expected_base_sha": expected_base_sha,
+            "lane_epoch": lane_epoch,
+        }
+        _put(arguments, "working_dir", working_dir)
+        return self._call("post_merge_parent_sync", arguments)
+
+    def post_merge_changelog(
+        self,
+        *,
+        child_id: str,
+        issue_id: int,
+        repository: str,
+        parent_branch: str,
+        expected_base_sha: str,
+        generation: int,
+        intent_id: str,
+        working_dir: str | None = None,
+    ) -> ToolResult:
+        """Commit the changelog and return its authoritative commit receipt."""
+        arguments: JsonObject = {
+            "child_id": child_id,
+            "issue_id": issue_id,
+            "repository": repository,
+            "parent_branch": parent_branch,
+            "expected_base_sha": expected_base_sha,
+            "generation": generation,
+            "intent_id": intent_id,
+        }
+        _put(arguments, "working_dir", working_dir)
+        return self._call("post_merge_changelog", arguments)
+
+    def post_merge_push(
+        self,
+        *,
+        child_id: str,
+        repository: str,
+        parent_branch: str,
+        lane_epoch: int,
+        push_intent_id: str,
+        push_journal_id: str,
+        expected_base_sha: str,
+        pushed_commit: str,
+        working_dir: str | None = None,
+    ) -> ToolResult:
+        """Push bookkeeping with compare-and-swap and return a receipt."""
+        arguments: JsonObject = {
+            "child_id": child_id,
+            "repository": repository,
+            "parent_branch": parent_branch,
+            "lane_epoch": lane_epoch,
+            "push_intent_id": push_intent_id,
+            "push_journal_id": push_journal_id,
+            "expected_base_sha": expected_base_sha,
+            "pushed_commit": pushed_commit,
+        }
+        _put(arguments, "working_dir", working_dir)
+        return self._call("post_merge_push", arguments)
 
     def close_issue_and_cleanup(self, *, issue_id: int, leaf_name: str) -> ToolResult:
         return self._call("close_issue_and_cleanup", {"issue_id": issue_id, "leaf_name": leaf_name})

@@ -340,6 +340,86 @@
       "name": "watcher_pr_state"
     },
     {
+      "description": "Synchronize a merged child into its parent branch and return Git-verified remote-head and ancestry evidence.",
+      "inputSchema": {
+        "properties": {
+          "child_id": { "description": "Stable child slice identifier.", "type": "string" },
+          "pr_number": { "description": "Merged Forgejo pull request number.", "type": "integer" },
+          "repository": { "description": "Authoritative repository identity.", "type": "string" },
+          "parent_branch": { "description": "Direct parent integration branch.", "type": "string" },
+          "merged_head_sha": { "description": "Exact merged child head SHA.", "type": "string" },
+          "expected_base_sha": { "description": "Base SHA captured by the merge boundary.", "type": "string" },
+          "lane_epoch": { "description": "Durable integration-lane epoch.", "type": "integer" },
+          "working_dir": { "description": "Optional relative repository working directory.", "type": "string" }
+        },
+        "required": [
+          "child_id",
+          "pr_number",
+          "repository",
+          "parent_branch",
+          "merged_head_sha",
+          "expected_base_sha",
+          "lane_epoch"
+        ],
+        "type": "object"
+      },
+      "name": "post_merge_parent_sync"
+    },
+    {
+      "description": "Commit the already prepared Chainlink changelog on the parent branch and return the resulting Git commit SHA.",
+      "inputSchema": {
+        "properties": {
+          "child_id": { "description": "Stable child slice identifier.", "type": "string" },
+          "issue_id": { "description": "Chainlink issue whose changelog entry was prepared.", "type": "integer" },
+          "repository": { "description": "Authoritative repository identity.", "type": "string" },
+          "parent_branch": { "description": "Direct parent integration branch.", "type": "string" },
+          "expected_base_sha": { "description": "Synchronized parent base SHA.", "type": "string" },
+          "generation": { "description": "Changelog recovery generation.", "type": "integer" },
+          "intent_id": { "description": "Durable changelog effect intent.", "type": "string" },
+          "working_dir": { "description": "Optional relative repository working directory.", "type": "string" }
+        },
+        "required": [
+          "child_id",
+          "issue_id",
+          "repository",
+          "parent_branch",
+          "expected_base_sha",
+          "generation",
+          "intent_id"
+        ],
+        "type": "object"
+      },
+      "name": "post_merge_changelog"
+    },
+    {
+      "description": "Push parent-branch bookkeeping with force-with-lease compare-and-swap and return a verified push receipt.",
+      "inputSchema": {
+        "properties": {
+          "child_id": { "description": "Stable child slice identifier.", "type": "string" },
+          "repository": { "description": "Authoritative repository identity.", "type": "string" },
+          "parent_branch": { "description": "Direct parent integration branch.", "type": "string" },
+          "lane_epoch": { "description": "Durable integration-lane epoch.", "type": "integer" },
+          "push_intent_id": { "description": "Durable parent-push effect intent.", "type": "string" },
+          "push_journal_id": { "description": "Durable parent-push journal identity.", "type": "string" },
+          "expected_base_sha": { "description": "Compare-and-swap expected remote base SHA.", "type": "string" },
+          "pushed_commit": { "description": "Changelog commit to publish.", "type": "string" },
+          "working_dir": { "description": "Optional relative repository working directory.", "type": "string" }
+        },
+        "required": [
+          "child_id",
+          "repository",
+          "parent_branch",
+          "lane_epoch",
+          "push_intent_id",
+          "push_journal_id",
+          "expected_base_sha",
+          "pushed_commit"
+        ],
+        "type": "object"
+      },
+      "name": "post_merge_push"
+    },
+    {
       "description": "Close an ephemeral worker tmux pane by pane_id. Use the pane_id returned by spawn_worker after you have received the worker's final result or no longer need the worker pane.",
       "inputSchema": {
         "properties": {

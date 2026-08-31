@@ -183,6 +183,34 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     )
     client.resolve_live_pr_for_slice(slice_id="slice-a")
     client.watcher_pr_state(pr_number=1)
+    client.post_merge_parent_sync(
+        child_id="child",
+        pr_number=1,
+        repository="org/repo",
+        parent_branch="main",
+        merged_head_sha="merged-head",
+        expected_base_sha="base",
+        lane_epoch=1,
+    )
+    client.post_merge_changelog(
+        child_id="child",
+        issue_id=1,
+        repository="org/repo",
+        parent_branch="main",
+        expected_base_sha="base",
+        generation=0,
+        intent_id="changelog-intent",
+    )
+    client.post_merge_push(
+        child_id="child",
+        repository="org/repo",
+        parent_branch="main",
+        lane_epoch=1,
+        push_intent_id="push-intent",
+        push_journal_id="push-journal",
+        expected_base_sha="base",
+        pushed_commit="commit",
+    )
     client.close_worker_pane(pane_id="%1")
     client.spawn_codex(
         task="sample",

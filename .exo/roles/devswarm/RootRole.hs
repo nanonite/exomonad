@@ -48,6 +48,7 @@ import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
+import ExoMonad.Guest.Tools.PostMergeRecovery (PostMergeChangelog, PostMergeParentSync, PostMergePush)
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
 import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
@@ -174,6 +175,9 @@ data Tools mode = Tools
     resumeBlockedLeaf :: mode :- ResumeBlockedLeaf,
     disposeLeaf :: mode :- DisposeLeaf,
     watcherPrState :: mode :- WatcherPrState,
+    postMergeParentSync :: mode :- PostMergeParentSync,
+    postMergeChangelog :: mode :- PostMergeChangelog,
+    postMergePush :: mode :- PostMergePush,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
@@ -228,6 +232,9 @@ config =
             resumeBlockedLeaf = mkHandler @ResumeBlockedLeaf,
             disposeLeaf = mkHandler @DisposeLeaf,
             watcherPrState = mkHandler @WatcherPrState,
+            postMergeParentSync = mkHandler @PostMergeParentSync,
+            postMergeChangelog = mkHandler @PostMergeChangelog,
+            postMergePush = mkHandler @PostMergePush,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,

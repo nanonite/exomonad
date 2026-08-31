@@ -96,6 +96,19 @@ server or network query. Legacy checkpoints receive deterministic manifest
 bindings; ambiguous child kind or ownership is recorded as an actionable
 recovery gate rather than guessed.
 
+## Durable post-merge recovery boundaries
+
+Remote merge adoption opens a per-slice recovery FSM; it does not complete the
+slice. The controller checkpoints after each boundary: parent-branch sync,
+Chainlink issue closure, changelog commit, and compare-guarded parent push.
+Each boundary is a distinct EffectJournal operation and must return an
+authoritative receipt before the next transition. The WASM tools perform the
+Git operation and verification; Python must never manufacture parent commits,
+remote heads, ancestry proofs, or push receipts. Parent pushes use
+`force-with-lease` against the persisted synchronized remote head and remain
+pending when that compare fails, so restart can reconcile the exact durable
+intent without redispatching an already confirmed effect.
+
 ## Long-running wave goals and heartbeats
 
 RunState.goals is optional durable metadata for a long-running wave:

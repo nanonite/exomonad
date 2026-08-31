@@ -81,6 +81,7 @@ from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import (
+    ActionKind,
     ActionPhase,
     BudgetLedger,
     FSMState,
@@ -92,6 +93,7 @@ from tl_loop.state.schema import (
     OrderedStageState,
     ParkCause,
     PublicationBinding,
+    RepositoryIdentity,
     SliceState,
     SliceStatus,
     Verdict,
@@ -1883,7 +1885,17 @@ def _review_store(
     tmp_path: Path, *, verdict: Verdict | None = None, reviewed_head: str | None = "head-a"
 ) -> RunStore:
     store = RunStore("review-run", tmp_path)
-    create("review-run", {}, root_dir=tmp_path)
+    create(
+        "review-run",
+        {
+            "repository_identity": {
+                "owner": "org",
+                "repo": "repo",
+                "base_branch": "main",
+            }
+        },
+        root_dir=tmp_path,
+    )
     store.checkpoint(
         TLPlanning(),
         {
@@ -2293,7 +2305,15 @@ def test_convergence_executes_journaled_direct_merge_with_compare_evidence(tmp_p
                 "merge_tree_sha": "tree-a",
                 "ci_status": "success",
             },
-            {"merged": True, "head_sha": "head-a", "pr_state": "closed"},
+            {
+                "merged": True,
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+                "pr_state": "closed",
+            },
         ],
         merge_response={"success": True, "result": {"merged": True}},
     )
@@ -2958,6 +2978,7 @@ def _config(*, active: bool = True) -> TLLoopConfig:
         max_leaves=1,
         max_events=5,
         poll_interval=0.001,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
 
 
@@ -3356,6 +3377,7 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
         max_events=5,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     parent_root = tmp_path / "ordered-e2e-run"
     for sub_tl_id, pr_number in (("alpha", 101), ("beta", 102)):
@@ -3626,6 +3648,7 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
 
     first = run_tl_loop(
@@ -3716,6 +3739,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     verified: list[tuple[str, str, str, str]] = []
     from tl_loop.loop import driver
@@ -3809,6 +3833,7 @@ def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Pat
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["aggregate-child"].update(
@@ -3819,6 +3844,15 @@ def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Pat
             "verdict": "GO",
             "review_patch_digests": {"head-a": "patch-a"},
             "ci_state": {"head-a": "success"},
+            "action": {
+                "kind": ActionKind.MERGE.value,
+                "phase": ActionPhase.IN_FLIGHT.value,
+                "state_version": 1,
+                "intent_id": "merge-intent",
+                "head_sha": "head-a",
+                "attempt": 1,
+                "contract_digest": None,
+            },
         }
     )
     transport = IntegrationTransport(snapshots=[{}])
@@ -3888,6 +3922,7 @@ def test_external_merge_is_adopted_before_dispatch_with_integrity_telemetry(
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     initial = _initial_slices(plan, config, tmp_path, "external-merge-run")
     initial["aggregate-child"].update(
@@ -3898,6 +3933,15 @@ def test_external_merge_is_adopted_before_dispatch_with_integrity_telemetry(
             "verdict": "GO",
             "review_patch_digests": {"head-external": "patch-external"},
             "ci_state": {"head-external": "success"},
+            "action": {
+                "kind": ActionKind.MERGE.value,
+                "phase": ActionPhase.IN_FLIGHT.value,
+                "state_version": 1,
+                "intent_id": "external-merge-intent",
+                "head_sha": "head-external",
+                "attempt": 1,
+                "contract_digest": None,
+            },
         }
     )
     transport = IntegrationTransport(

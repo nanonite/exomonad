@@ -612,6 +612,11 @@ RECONCILIATION_KEYS = frozenset(
         "missing_evidence",
         "conflicts",
         "next_action",
+        "merge_base_sha",
+        "merge_head_sha",
+        "merge_journal_id",
+        "remote_head_sha",
+        "ancestry_proof",
     }
 )
 PARK_AUDIT_KEYS = frozenset(
@@ -1520,6 +1525,14 @@ def _reconciliation(value: object, path: str, errors: list[tuple[str, str]]) -> 
         _non_empty_string(reconciliation, key, f"{path}.reconciliation", errors)
     for key in ("authoritative_evidence", "missing_evidence", "conflicts"):
         _string_list(reconciliation, key, f"{path}.reconciliation", errors, allow_empty=True)
+    for key in (
+        "merge_base_sha",
+        "merge_head_sha",
+        "merge_journal_id",
+        "remote_head_sha",
+        "ancestry_proof",
+    ):
+        _nullable_string(reconciliation, key, f"{path}.reconciliation", errors)
 
 
 def _validate_post_merge(value: object, path: str, errors: list[tuple[str, str]]) -> None:

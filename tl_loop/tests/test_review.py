@@ -350,7 +350,15 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
     transport = DirectMergeTransport(
         snapshots=[
             _snapshot(head_sha="abc123"),
-            {"merged": True, "head_sha": "abc123", "pr_state": "closed"},
+            {
+                "merged": True,
+                "head_sha": "abc123",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+                "pr_state": "closed",
+            },
         ]
     )
     effects_log: list[EffectIntent] = []
@@ -371,6 +379,7 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
         "watcher_pr_state",
         "merge_pr",
         "watcher_pr_state",
+        "post_merge_parent_sync",
     ]
     merge_arguments = next(arguments for name, arguments in transport.calls if name == "merge_pr")
     assert merge_arguments == {
@@ -499,6 +508,11 @@ def _state(tmp_path: Path, head: str, verdict_at: str) -> tuple[RunState, RunSto
     record["ci_state"] = {head: "success"}
     record["verdict_at"] = verdict_at
     root_spec = {key: document[key] for key in ("fsm", "slices", "budgets", "gates", "events")}
+    root_spec["repository_identity"] = {
+        "owner": "org",
+        "repo": "repo",
+        "base_branch": "main",
+    }
     create("review-test", root_spec, root_dir=tmp_path)
     store = RunStore("review-test", root_dir=tmp_path)
     return store.load(), store
