@@ -8,6 +8,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import cast
 
+from tl_loop.fsm.post_merge import PostMergePhase
 from tl_loop.loop.observation import WatcherObservation
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.review_validation import review_validation_is_fresh
@@ -198,13 +199,11 @@ def _derive_run_action(
     active = tuple(
         current
         for _, current in sorted(state.slices.items())
-        if current.status
-        not in {
-            SliceStatus.MERGED,
-            SliceStatus.FAILED,
-            SliceStatus.PARKED,
-            SliceStatus.BLOCKED,
-        }
+        if current.status not in {SliceStatus.FAILED, SliceStatus.PARKED, SliceStatus.BLOCKED}
+        and not (
+            current.status is SliceStatus.MERGED
+            and (current.post_merge is None or current.post_merge.phase is PostMergePhase.COMPLETE)
+        )
     )
     effective_reviewer_max_rounds = (
         state.reviewer_max_rounds
@@ -213,6 +212,20 @@ def _derive_run_action(
     )
     integration = state.integration
     if integration.lifecycle is IntegrationLifecycle.MERGED:
+        pending_post_merge = next(
+            (
+                current
+                for current in state.slices.values()
+                if current.status is SliceStatus.MERGED
+                and (
+                    current.post_merge is None
+                    or current.post_merge.phase is not PostMergePhase.COMPLETE
+                )
+            ),
+            None,
+        )
+        if pending_post_merge is not None:
+            return ExternalIntent("post_merge_recovery", pending_post_merge.id, {})
         return InternalTransition("terminal", "aggregate_merged")
     if integration.lifecycle in {IntegrationLifecycle.FAILED, IntegrationLifecycle.PARKED}:
         return Quiescent(f"aggregate_{integration.lifecycle.value.lower()}")
@@ -253,6 +266,20 @@ def _derive_run_action(
     if integration.lifecycle is IntegrationLifecycle.CODE_REVIEWED:
         return Quiescent("await_integration_validation")
     if integration.lifecycle is IntegrationLifecycle.MERGING:
+        pending_post_merge = next(
+            (
+                current
+                for current in state.slices.values()
+                if current.status is SliceStatus.MERGED
+                and (
+                    current.post_merge is None
+                    or current.post_merge.phase is not PostMergePhase.COMPLETE
+                )
+            ),
+            None,
+        )
+        if pending_post_merge is not None:
+            return ExternalIntent("post_merge_recovery", pending_post_merge.id, {})
         return Quiescent("await_merge_recovery")
     if integration.lifecycle is IntegrationLifecycle.CHILDREN_MERGED:
         return ExternalIntent(
@@ -328,6 +355,8 @@ def _derive_slice_action(
         and state.action.contract_digest != current_contract_digest
     )
     if state.status is SliceStatus.MERGED:
+        if state.post_merge is None or state.post_merge.phase is not PostMergePhase.COMPLETE:
+            return ExternalIntent("post_merge_recovery", state.id, {})
         return InternalTransition("terminal", "merged")
     if (
         state.verdict is not None
@@ -660,6 +689,13 @@ def reconcile_slice(
             "await_authoritative_spawn_event",
         )
 
+    if slice_state.status is SliceStatus.MERGED:
+        if (
+            slice_state.post_merge is not None
+            and slice_state.post_merge.phase is not PostMergePhase.COMPLETE
+        ):
+            return _result(slice_state, "post_merge", (), (), (), "post_merge_recovery")
+        return _result(slice_state, "merged", (), (), (), "no_action")
     if slice_state.status not in {
         SliceStatus.SPAWNED,
         SliceStatus.IN_REVIEW,

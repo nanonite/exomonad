@@ -5,6 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Literal
 
+from tl_loop.fsm.post_merge import PostMergeState
+from tl_loop.fsm.post_merge_events import (
+    ChangelogCommitted,
+    ChangelogPending,
+    IssueCloseConfirmed,
+    IssueClosePending,
+    MergeAdopted,
+    ParentBranchSynced,
+    ParentPushPending,
+    PostMergeComplete,
+    PostMergeRebuildRequested,
+)
+from tl_loop.fsm.post_merge_transition import advance_post_merge
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -144,6 +157,23 @@ class MergeCompleted(SliceEvent):
     """The authoritative PR snapshot confirmed a merge."""
 
     pr_number: int
+
+
+@dataclass(frozen=True)
+class PostMergeEventObserved(SliceEvent):
+    """Apply one typed durable post-merge event to this slice."""
+
+    event: (
+        MergeAdopted
+        | ParentBranchSynced
+        | IssueClosePending
+        | IssueCloseConfirmed
+        | ChangelogPending
+        | ChangelogCommitted
+        | ParentPushPending
+        | PostMergeComplete
+        | PostMergeRebuildRequested
+    )
 
 
 @dataclass(frozen=True)
@@ -316,6 +346,17 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
         )
     if isinstance(event, MergeCompleted):
         return replace(state, status=SliceStatus.MERGED, action=None)
+    if isinstance(event, PostMergeEventObserved):
+        current = state.post_merge
+        if current is None:
+            if not isinstance(event.event, MergeAdopted):
+                raise IllegalSliceTransition(state, event)
+            current = PostMergeState()
+        try:
+            post_merge = advance_post_merge(current, event.event)
+        except (TypeError, ValueError) as error:
+            raise IllegalSliceTransition(state, event) from error
+        return replace(state, post_merge=post_merge)
     if isinstance(event, RevalidateReview):
         if state.verdict is None or state.reviewed_head is None:
             return state

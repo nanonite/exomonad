@@ -1196,6 +1196,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             )
         if value.action is not None:
             record["action"] = _encode_action(value.action)
+        if value.post_merge is not None:
+            record["post_merge"] = _encode_post_merge_state(value.post_merge)
         if value.manifest_node_id is not None:
             record["manifest_node_id"] = value.manifest_node_id
         if value.manifest_revision is not None:
@@ -2134,9 +2136,20 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         handoff=_decode_handoff(value.get("handoff")),
         observation_provenance=_decode_observation_provenance(value.get("observation_provenance")),
         action=_decode_action(value.get("action")),
+        post_merge=_decode_post_merge_state(value.get("post_merge")),
         manifest_node_id=cast(str | None, value.get("manifest_node_id")),
         manifest_revision=cast(int | None, value.get("manifest_revision")),
     )
+
+
+def _decode_post_merge_state(value: object) -> PostMergeState | None:
+    if not isinstance(value, Mapping):
+        return None
+    phase = value.get("phase")
+    evidence = value.get("evidence")
+    if not isinstance(phase, str) or not isinstance(evidence, Mapping):
+        return None
+    return PostMergeState(PostMergePhase(phase), dict(evidence))
 
 
 def _decode_repository_identity(value: object) -> RepositoryIdentity | None:
@@ -2280,12 +2293,7 @@ def _assert_encoded_consistent(
             return
     phase = TLPhase(cast(str, fsm["phase"]))
     waiting = tuple(cast(list[str], fsm["waiting"]))
-    statuses = {
-        slice_id: value.get("status")
-        for slice_id, value in slices.items()
-        if isinstance(value, dict)
-    }
-    _assert_fsm_slices_consistent(path, phase, waiting, statuses)
+    _assert_fsm_slices_consistent(path, phase, waiting, slices)
 
 
 def _assert_fsm_slices_consistent(
@@ -2301,10 +2309,30 @@ def _assert_fsm_slices_consistent(
     }
     for slice_id in waiting_ids:
         value = slices.get(slice_id)
-        status = value.status if isinstance(value, SliceState) else value
+        status = (
+            value.status
+            if isinstance(value, SliceState)
+            else value.get("status")
+            if isinstance(value, Mapping)
+            else value
+        )
         if status not in active_statuses and status not in {item.value for item in SliceStatus}:
             continue
         if status not in active_statuses:
+            if (
+                isinstance(value, SliceState)
+                and value.status is SliceStatus.MERGED
+                and value.post_merge is not None
+                and value.post_merge.phase is not PostMergePhase.COMPLETE
+            ):
+                continue
+            if (
+                isinstance(value, Mapping)
+                and value.get("status") == SliceStatus.MERGED.value
+                and isinstance(value.get("post_merge"), Mapping)
+                and value["post_merge"].get("phase") != PostMergePhase.COMPLETE.value
+            ):
+                continue
             status_value = status.value if isinstance(status, SliceStatus) else status
             raise CorruptCheckpoint(
                 f"{path}: waiting set is inconsistent: slice {slice_id!r} has {status_value!r} status"

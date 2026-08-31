@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Literal, TypeAlias, cast
 
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState
 from tl_loop.ordered import (
     CI_STATUSES,
@@ -599,6 +600,7 @@ SLICE_KEYS = frozenset(
         "handoff",
         "observation_provenance",
         "action",
+        "post_merge",
         "manifest_node_id",
         "manifest_revision",
     }
@@ -691,6 +693,7 @@ OBSERVATION_PROVENANCE_KEYS = frozenset(
 ACTION_KEYS = frozenset(
     {"kind", "phase", "state_version", "intent_id", "head_sha", "attempt", "contract_digest"}
 )
+POST_MERGE_KEYS = frozenset({"phase", "evidence"})
 REVIEW_EVIDENCE_KEYS = frozenset(
     {
         "review_id",
@@ -800,6 +803,7 @@ class SliceState:
     handoff: HandoffEvidence | None = None
     observation_provenance: ObservationProvenance | None = None
     action: ActionState | None = None
+    post_merge: PostMergeState | None = None
     manifest_node_id: str | None = None
     manifest_revision: int | None = None
 
@@ -1345,6 +1349,7 @@ def _validate_slice(
     _validate_handoff(value.get("handoff"), path, errors)
     _validate_observation_provenance(value.get("observation_provenance"), path, errors)
     _validate_action(value.get("action"), path, errors)
+    _validate_post_merge(value.get("post_merge"), path, errors)
     if value.get("status") == SliceStatus.SPAWNED.value:
         _non_empty_string(value, "dispatch_intent_id", path, errors)
         _non_empty_string(value, "dispatch_agent_id", path, errors)
@@ -1515,6 +1520,34 @@ def _reconciliation(value: object, path: str, errors: list[tuple[str, str]]) -> 
         _non_empty_string(reconciliation, key, f"{path}.reconciliation", errors)
     for key in ("authoritative_evidence", "missing_evidence", "conflicts"):
         _string_list(reconciliation, key, f"{path}.reconciliation", errors, allow_empty=True)
+
+
+def _validate_post_merge(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    post_merge = _object(value, f"{path}.post_merge", POST_MERGE_KEYS, errors)
+    if post_merge is None:
+        return
+    phase = post_merge.get("phase")
+    if not isinstance(phase, str) or phase not in {item.value for item in PostMergePhase}:
+        errors.append((f"{path}.post_merge.phase", "is not a recognised post-merge phase"))
+        return
+    evidence = post_merge.get("evidence", {})
+    if not isinstance(evidence, dict) or any(
+        not isinstance(key, str) or not key or not isinstance(item, str) or not item
+        for key, item in evidence.items()
+    ):
+        errors.append(
+            (
+                f"{path}.post_merge.evidence",
+                "must map non-empty strings to non-empty strings",
+            )
+        )
+        return
+    try:
+        PostMergeState(PostMergePhase(phase), evidence)
+    except (TypeError, ValueError) as error:
+        errors.append((f"{path}.post_merge", str(error)))
 
 
 def _validate_recovery(value: object, path: str, errors: list[tuple[str, str]]) -> None:

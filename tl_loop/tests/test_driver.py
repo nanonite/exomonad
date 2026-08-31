@@ -20,10 +20,13 @@ from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader
+from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
-from tl_loop.fsm.phase import TLPhase, TLPlanning
+from tl_loop.fsm.phase import TLPhase, TLPlanning, TLWaiting
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
+from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
     DISPATCH_CORRELATED,
@@ -49,8 +52,10 @@ from tl_loop.loop.driver import (
     _execute_direct_reviewer_intent,
     _initial_slices,
     _merge_result_is_authoritative,
+    _phase_after_slice_merge,
     _record_review_event,
     _recover_tool_unavailable,
+    _recursive_phase_after_slice_update,
     _repair_model,
     _route_ci_event,
     _route_review_event,
@@ -78,6 +83,7 @@ from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import (
     ActionPhase,
     BudgetLedger,
+    FSMState,
     GateState,
     GateStatus,
     HandoffEvidence,
@@ -2310,6 +2316,56 @@ def test_convergence_executes_journaled_direct_merge_with_compare_evidence(tmp_p
     assert merge_arguments["expected_merge_tree_sha"] == "tree-a"
     merge_entries = journal.confirmed_entries("merge_pr", "leaf-a")
     assert len(merge_entries) == 1
+
+
+def test_slice_recovery_is_projected_into_the_canonical_scope_before_release(
+    tmp_path: Path,
+) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        status=SliceStatus.MERGED,
+        post_merge=PostMergeState(
+            PostMergePhase.REMOTE_MERGE_ADOPTED,
+            {
+                "child_id": "leaf-a",
+                "repository": "repo",
+                "parent_branch": "main",
+                "pr_number": "42",
+                "head_sha": "head-a",
+                "merge_journal_id": "merge-journal",
+                "lane_epoch": "1",
+            },
+        ),
+    )
+    canonical = RecursiveTLRunning(
+        current_order=0,
+        pending_by_order={},
+        parallel_pending=(ChildRecord("leaf-a", ChildKind.LEAF),),
+        post_merge={"leaf-a": PostMergeState()},
+    )
+    state = replace(store.load(), recursive_fsm=canonical)
+
+    projected = _recursive_phase_after_slice_update(state, "leaf-a", current)
+
+    assert isinstance(projected, RecursiveTLRunning)
+    assert projected.post_merge["leaf-a"].phase is PostMergePhase.REMOTE_MERGE_ADOPTED
+    assert tuple(record.child_id for record in projected.parallel_pending) == ("leaf-a",)
+
+
+def test_legacy_release_waits_for_each_slice_post_merge_completion(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(store.load().slices["leaf-a"], status=SliceStatus.MERGED)
+    sibling = replace(current, id="leaf-b", status=SliceStatus.MERGED)
+    state = replace(
+        store.load(),
+        fsm=FSMState(TLPhase.TLWaiting, ("leaf-a", "leaf-b")),
+        slices={"leaf-a": current, "leaf-b": sibling},
+    )
+
+    next_phase = _phase_after_slice_merge(state, "leaf-a", current)
+
+    assert isinstance(next_phase, TLWaiting)
 
 
 def test_unknown_direct_merge_reconciles_authoritative_merged_snapshot(tmp_path: Path) -> None:

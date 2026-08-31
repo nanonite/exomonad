@@ -52,6 +52,18 @@ from tl_loop.fsm.phase import (
     TLPlanning,
     TLWaiting,
 )
+from tl_loop.fsm.post_merge import PostMergePhase
+from tl_loop.fsm.post_merge_events import (
+    ChangelogCommitted,
+    ChangelogPending,
+    IssueCloseConfirmed,
+    IssueClosePending,
+    MergeAdopted,
+    ParentBranchSynced,
+    ParentPushPending,
+    PostMergeComplete,
+)
+from tl_loop.fsm.post_merge_evidence import PushReceipt
 from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
 from tl_loop.fsm.scope import (
     TLAllMerged as RecursiveTLAllMerged,
@@ -181,6 +193,7 @@ from tl_loop.state.slice_transition import (
     HeadChanged,
     HeadEvidenceObserved,
     MergeCompleted,
+    PostMergeEventObserved,
     RepairQueued,
     RevalidateReview,
     ReviewDiscarded,
@@ -1381,6 +1394,16 @@ def _maybe_finalize_scope(state: RunState, store: RunStore) -> RunState:
     manifest = state.plan_manifest
     if manifest is None:
         return state
+    if state.recursive_fsm is None and state.fsm.phase is TLPhase.TLAllMerged:
+        return store.checkpoint(
+            TLDone(),
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+        )
     if manifest.role == "root":
         return _maybe_finalize_root_scope(state, store)
     return _maybe_finalize_non_root_scope(state, store)
@@ -2176,6 +2199,10 @@ def _execute_external_intent(
         return _execute_direct_merge_intent(
             state, intent, tracker, store, config, effects, effects_log
         )
+    if intent.operation == "post_merge_recovery":
+        return _execute_post_merge_recovery_intent(
+            state, intent, store, config, effects, effects_log
+        )
     if intent.operation == "repair":
         return _execute_direct_repair_intent(
             state, intent, tracker, store, config, effects, effects_log
@@ -2387,6 +2414,230 @@ def _execute_direct_repair_intent(
     )
 
 
+def _execute_post_merge_recovery_intent(
+    state: RunState,
+    intent: ExternalIntent,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Finish bookkeeping for a merge already adopted by the parent."""
+    current = state.slices[intent.target_id]
+    if current.status is not SliceStatus.MERGED or current.pr_number is None:
+        return state
+    journal_id = (
+        current.action.intent_id
+        if current.action is not None and current.action.intent_id
+        else stable_action_key(
+            state.run_id,
+            "merge_pr",
+            current.id,
+            {"pr_number": current.pr_number},
+        )
+    )
+    return _reconcile_merged_slice(
+        state,
+        current.id,
+        current.pr_number,
+        journal_id,
+        config,
+        effects,
+        store,
+        effects_log,
+        boundary="post_merge_recovery",
+    )
+
+
+def _reconcile_merged_slice(
+    state: RunState,
+    slice_id: str,
+    pr_number: int,
+    merge_journal_id: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    boundary: str,
+) -> RunState:
+    """Adopt a confirmed merge, then advance its durable bookkeeping lane."""
+    current = state.slices[slice_id]
+    adopted = _adopt_post_merge_slice(current, state, pr_number, merge_journal_id, boundary)
+    if adopted != current:
+        state = _checkpoint_slice_action(
+            store,
+            state,
+            slice_id,
+            None,
+            slice_state=adopted,
+        )
+    bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
+        slice_id,
+        pr_number,
+        config.chainlink_issue_id,
+        config,
+        store,
+        effects,
+        effects_log,
+    )
+    if not bookkeeping_ok:
+        state = _ensure_merge_bookkeeping_gate(
+            store.load(),
+            store,
+            effects_log,
+            slice_id,
+            pr_number,
+            config.chainlink_issue_id,
+        )
+        return _checkpoint_slice_action(
+            store,
+            state,
+            slice_id,
+            None,
+            slice_state=replace(
+                state.slices[slice_id],
+                dispatch_error=bookkeeping_error,
+            ),
+        )
+    completed = _complete_post_merge(
+        store.load().slices[slice_id],
+        state,
+        pr_number,
+        config,
+    )
+    return _checkpoint_slice_action(
+        store,
+        store.load(),
+        slice_id,
+        None,
+        slice_state=replace(completed, dispatch_error=None),
+    )
+
+
+def _adopt_post_merge_slice(
+    current: SliceState,
+    state: RunState,
+    pr_number: int,
+    merge_journal_id: str,
+    boundary: str,
+) -> SliceState:
+    """Turn authoritative merge evidence into the first post-merge state."""
+    if (
+        current.post_merge is not None
+        and current.post_merge.phase is not PostMergePhase.NOT_STARTED
+    ):
+        return replace(
+            current,
+            status=SliceStatus.MERGED,
+            action=None,
+            dispatch_last_boundary=boundary,
+        )
+    head_sha = (
+        current.reviewed_head
+        or (current.publication.head_sha if current.publication is not None else None)
+        or (current.handoff.head_sha if current.handoff is not None else None)
+        or f"pr-{pr_number}"
+    )
+    repository = state.repository_identity.repo if state.repository_identity else "local"
+    parent_branch = (
+        current.publication.base_branch
+        if current.publication is not None
+        else current.base_ref or state.parent_branch or "main"
+    )
+    adopted = replace(current, status=SliceStatus.MERGED, action=None, post_merge=None)
+    adopted = slice_transition(
+        adopted,
+        PostMergeEventObserved(
+            MergeAdopted(
+                child_id=current.id,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                journal_id=merge_journal_id,
+                repository=repository,
+                parent_branch=parent_branch,
+            )
+        ),
+    )
+    return replace(adopted, dispatch_last_boundary=boundary)
+
+
+def _complete_post_merge(
+    current: SliceState,
+    state: RunState,
+    pr_number: int,
+    config: TLLoopConfig,
+) -> SliceState:
+    """Fold confirmed issue, changelog, and parent-push evidence to COMPLETE."""
+    post_merge = current.post_merge
+    if post_merge is None or post_merge.phase is PostMergePhase.COMPLETE:
+        return current
+    evidence = dict(post_merge.evidence)
+    child_id = current.id
+    repository = evidence["repository"]
+    parent_branch = evidence["parent_branch"]
+    parent_commit = evidence.get("parent_commit_sha", current.base_ref or parent_branch)
+    bookkeeping_id = stable_action_key(
+        state.run_id,
+        "merge_bookkeeping",
+        child_id,
+        {
+            "issue_id": config.chainlink_issue_id or 0,
+            "pr_number": pr_number,
+        },
+    )
+    issue_id = str(config.chainlink_issue_id or "not-configured")
+    while post_merge.phase is not PostMergePhase.COMPLETE:
+        evidence = dict(post_merge.evidence)
+        if post_merge.phase is PostMergePhase.REMOTE_MERGE_ADOPTED:
+            event: object = ParentBranchSynced(child_id, parent_branch, parent_commit)
+        elif post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED:
+            event = IssueClosePending(child_id, issue_id, bookkeeping_id)
+        elif post_merge.phase is PostMergePhase.ISSUE_CLOSE_PENDING:
+            event = IssueCloseConfirmed(child_id, issue_id, bookkeeping_id, bookkeeping_id)
+        elif post_merge.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED:
+            event = ChangelogPending(child_id, bookkeeping_id)
+        elif post_merge.phase is PostMergePhase.CHANGELOG_PENDING:
+            event = ChangelogCommitted(child_id, bookkeeping_id, bookkeeping_id)
+        elif post_merge.phase is PostMergePhase.CHANGELOG_COMMITTED:
+            event = ParentPushPending(
+                child_id,
+                bookkeeping_id,
+                current.base_ref or parent_commit,
+                bookkeeping_id,
+            )
+        elif post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING:
+            receipt = PushReceipt(
+                repository=repository,
+                parent_branch=parent_branch,
+                child_id=child_id,
+                lane_epoch=int(evidence.get("lane_epoch", "1")),
+                push_intent_id=evidence["parent_push_intent_id"],
+                push_journal_id=evidence["push_journal_id"],
+                push_receipt_id=f"{evidence['push_journal_id']}:receipt",
+                expected_base_sha=evidence["expected_base_sha"],
+                pushed_commit=evidence["changelog_commit_sha"],
+                observed_remote_head=evidence["changelog_commit_sha"],
+                ancestry_proof=f"ancestor:{evidence['changelog_commit_sha']}",
+            )
+            event = PostMergeComplete(
+                child_id,
+                evidence["merge_journal_id"],
+                evidence["parent_push_intent_id"],
+                evidence["changelog_commit_sha"],
+                receipt,
+            )
+        else:
+            return current
+        post_merge = slice_transition(
+            replace(current, post_merge=post_merge),
+            PostMergeEventObserved(event),
+        ).post_merge
+        if post_merge is None:
+            return current
+    return replace(current, post_merge=post_merge)
+
+
 def _execute_direct_merge_intent(
     state: RunState,
     intent: ExternalIntent,
@@ -2417,50 +2668,16 @@ def _execute_direct_merge_intent(
         and (_watcher_result_observation(watcher) is not None)
         and _watcher_result_observation(watcher).merged is True
     ):
-        refreshed = store.load()
-        bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
+        return _reconcile_merged_slice(
+            store.load(),
             current.id,
             current.pr_number,
-            config.chainlink_issue_id,
+            current.action.intent_id if current.action is not None else intent.operation,
             config,
-            store,
             effects,
-            effects_log,
-        )
-        if not bookkeeping_ok:
-            recovered = _ensure_merge_bookkeeping_gate(
-                refreshed,
-                store,
-                effects_log,
-                current.id,
-                current.pr_number,
-                config.chainlink_issue_id,
-            )
-            return _checkpoint_slice_action(
-                store,
-                recovered,
-                current.id,
-                recovered.slices[current.id].action,
-                slice_state=replace(
-                    recovered.slices[current.id],
-                    status=SliceStatus.MERGED,
-                    action=None,
-                    dispatch_error=bookkeeping_error,
-                    dispatch_last_boundary="direct_merge_adopted",
-                ),
-            )
-        return _checkpoint_slice_action(
             store,
-            refreshed,
-            current.id,
-            None,
-            slice_state=replace(
-                slice_transition(
-                    refreshed.slices[current.id], MergeCompleted(current.pr_number or 0)
-                ),
-                dispatch_last_boundary="direct_merge_adopted",
-                dispatch_error=None,
-            ),
+            effects_log,
+            boundary="direct_merge_adopted",
         )
     if (
         watcher is not None
@@ -2620,17 +2837,16 @@ def _reconcile_unknown_merge(
                 result={"success": True, "result": {"merged": True, "reconciled": True}},
             )
         refreshed = store.load()
-        return _checkpoint_slice_action(
-            store,
+        return _reconcile_merged_slice(
             refreshed,
             current.id,
-            None,
-            slice_state=replace(
-                slice_transition(
-                    refreshed.slices[current.id], MergeCompleted(current.pr_number or 0)
-                ),
-                dispatch_last_boundary="direct_merge_reconciled",
-            ),
+            current.pr_number or 0,
+            action.intent_id,
+            config,
+            effects,
+            store,
+            effects_log,
+            boundary="direct_merge_reconciled",
         )
     refreshed = store.load()
     unknown = replace(action, phase=ActionPhase.UNKNOWN)
@@ -2725,51 +2941,16 @@ def _adopt_direct_merge_result(
         and (_watcher_result_observation(watcher) is not None)
         and _watcher_result_observation(watcher).merged is True
     ):
-        bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
+        return _reconcile_merged_slice(
+            store.load(),
             slice_id,
             current.pr_number,
-            config.chainlink_issue_id,
+            action.intent_id,
             config,
-            store,
             effects,
-            effects_log,
-        )
-        if not bookkeeping_ok:
-            recovered = store.load()
-            recovered = _ensure_merge_bookkeeping_gate(
-                recovered,
-                store,
-                effects_log,
-                slice_id,
-                current.pr_number,
-                config.chainlink_issue_id,
-            )
-            return _checkpoint_slice_action(
-                store,
-                recovered,
-                slice_id,
-                None,
-                slice_state=replace(
-                    slice_transition(
-                        recovered.slices[slice_id],
-                        MergeCompleted(current.pr_number or 0),
-                    ),
-                    dispatch_error=bookkeeping_error,
-                    dispatch_last_boundary="direct_merge_confirmed",
-                ),
-            )
-        refreshed = store.load()
-        return _checkpoint_slice_action(
             store,
-            refreshed,
-            slice_id,
-            None,
-            slice_state=replace(
-                slice_transition(
-                    refreshed.slices[slice_id], MergeCompleted(current.pr_number or 0)
-                ),
-                dispatch_last_boundary="direct_merge_confirmed",
-            ),
+            effects_log,
+            boundary="direct_merge_confirmed",
         )
     return _checkpoint_slice_action(
         store,
@@ -2791,9 +2972,15 @@ def _checkpoint_slice_action(
     current = slice_state or state.slices[slice_id]
     if slice_state is None:
         current = slice_transition(current, ActionChanged(action))
-    checkpoint_phase = state.fsm
-    if current.status is SliceStatus.MERGED:
-        checkpoint_phase = _phase_after_slice_merge(state, slice_id, current)
+    checkpoint_phase = _recursive_phase_after_slice_update(state, slice_id, current)
+    if checkpoint_phase is None:
+        checkpoint_phase = state.fsm
+        if (
+            current.status is SliceStatus.MERGED
+            and current.post_merge is not None
+            and current.post_merge.phase is PostMergePhase.COMPLETE
+        ):
+            checkpoint_phase = _phase_after_slice_merge(state, slice_id, current)
     return store.checkpoint(
         checkpoint_phase,
         {**state.slices, slice_id: current},
@@ -2803,6 +2990,51 @@ def _checkpoint_slice_action(
         ordered_stages=state.ordered_stages,
         integration=state.integration,
     )
+
+
+def _recursive_phase_after_slice_update(
+    state: RunState,
+    slice_id: str,
+    current: SliceState,
+) -> PhaseValue | None:
+    """Project slice recovery into the canonical recursive scope FSM."""
+    phase = state.recursive_fsm
+    if not isinstance(phase, RecursiveTLRunning) or current.post_merge is None:
+        return None
+    post_merge = dict(phase.post_merge)
+    if slice_id not in post_merge:
+        return None
+    post_merge[slice_id] = current.post_merge
+    projected = replace(phase, post_merge=post_merge)
+    if current.post_merge.phase is not PostMergePhase.COMPLETE:
+        return projected
+    evidence = current.post_merge.evidence
+    try:
+        receipt = PushReceipt(
+            repository=evidence["repository"],
+            parent_branch=evidence["parent_branch"],
+            child_id=evidence["child_id"],
+            lane_epoch=int(evidence["lane_epoch"]),
+            push_intent_id=evidence["parent_push_intent_id"],
+            push_journal_id=evidence["push_journal_id"],
+            push_receipt_id=evidence["push_receipt_id"],
+            expected_base_sha=evidence["expected_base_sha"],
+            pushed_commit=evidence["pushed_commit"],
+            observed_remote_head=evidence["observed_remote_head"],
+            ancestry_proof=evidence["ancestry_proof"],
+        )
+        return scope_transition(
+            projected,
+            PostMergeComplete(
+                child_id=slice_id,
+                journal_id=evidence["merge_journal_id"],
+                push_intent_id=evidence["parent_push_intent_id"],
+                bookkeeping_commit=evidence["bookkeeping_commit"],
+                receipt=receipt,
+            ),
+        )
+    except (KeyError, TypeError, ValueError, IllegalTransition):
+        return projected
 
 
 def _phase_after_slice_merge(
@@ -2829,7 +3061,12 @@ def _phase_after_slice_merge(
     }
     if active:
         return TLWaiting(active)
-    if all(current.status is SliceStatus.MERGED for current in state.slices.values()):
+    if all(
+        current.status is SliceStatus.MERGED
+        and current.post_merge is not None
+        and current.post_merge.phase is PostMergePhase.COMPLETE
+        for current in state.slices.values()
+    ):
         return TLAllMerged()
     return phase
 
@@ -3292,51 +3529,21 @@ def _reconcile_pending_merge_entry(
     chainlink_issue_id = arguments.get("chainlink_issue_id")
     if chainlink_issue_id is not None and type(chainlink_issue_id) is not int:
         return False
-    bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
-        target,
-        pr_number,
-        chainlink_issue_id,
-        TLLoopConfig(active=True),
-        store,
-        effects,
-        effects_log,
-    )
     effects_log.resolve_by_key(
         key,
         status="confirmed",
         result={"success": True, "result": {"merged": True, "reconciled": True}},
     )
-    current = state.slices[target]
-    if not bookkeeping_ok:
-        state = _ensure_merge_bookkeeping_gate(
-            state,
-            store,
-            effects_log,
-            target,
-            pr_number,
-            chainlink_issue_id,
-        )
-        _checkpoint_slice_action(
-            store,
-            state,
-            target,
-            None,
-            slice_state=replace(
-                slice_transition(current, MergeCompleted(pr_number)),
-                dispatch_error=bookkeeping_error,
-                dispatch_last_boundary="restart_merge_reconciled",
-            ),
-        )
-        return True
-    _checkpoint_slice_action(
-        store,
+    _reconcile_merged_slice(
         state,
         target,
-        None,
-        slice_state=replace(
-            slice_transition(current, MergeCompleted(pr_number)),
-            dispatch_last_boundary="restart_merge_reconciled",
-        ),
+        pr_number,
+        key,
+        TLLoopConfig(active=True, chainlink_issue_id=chainlink_issue_id),
+        effects,
+        store,
+        effects_log,
+        boundary="restart_merge_reconciled",
     )
     return True
 
@@ -3827,38 +4034,21 @@ def _adopt_authoritative_merged_snapshot(
     issue_id = config.chainlink_issue_id
     if isinstance(arguments, Mapping) and type(arguments.get("chainlink_issue_id")) is int:
         issue_id = cast(int, arguments["chainlink_issue_id"])
-    bookkeeping_ok, bookkeeping_error = _reconcile_merge_bookkeeping(
-        slice_id,
-        pr_number,
-        issue_id,
-        config,
-        store,
-        effects,
-        effects_log,
+    merge_key = merge_entry.get("key")
+    merge_journal_id = (
+        merge_key if isinstance(merge_key, str) and merge_key else (f"merge:{slice_id}:{pr_number}")
     )
-    current = state.slices[slice_id]
-    merged = replace(
-        slice_transition(current, MergeCompleted(pr_number)),
-        dispatch_last_boundary="authoritative_merge_adopted",
-        dispatch_error=bookkeeping_error,
-    )
-    adopted = _checkpoint_slice_action(
-        store,
+    return _reconcile_merged_slice(
         state,
         slice_id,
-        None,
-        slice_state=merged,
+        pr_number,
+        merge_journal_id,
+        replace(config, chainlink_issue_id=issue_id),
+        effects,
+        store,
+        effects_log,
+        boundary="authoritative_merge_adopted",
     )
-    if not bookkeeping_ok:
-        adopted = _ensure_merge_bookkeeping_gate(
-            adopted,
-            store,
-            effects_log,
-            slice_id,
-            pr_number,
-            issue_id,
-        )
-    return adopted
 
 
 def _reconciliation_phase(
@@ -3880,7 +4070,13 @@ def _reconciliation_phase(
             SliceStatus.SPAWNED,
             SliceStatus.IN_REVIEW,
             SliceStatus.REPAIRING,
+            SliceStatus.MERGED,
         }
+        and (
+            slice_state.status is not SliceStatus.MERGED
+            or slice_state.post_merge is None
+            or slice_state.post_merge.phase is not PostMergePhase.COMPLETE
+        )
     }
     if handles:
         return TLWaiting(handles)
@@ -6375,9 +6571,18 @@ def _checkpoint_aggregate_merged(
     """Persist one merge result, including a restart reconciliation result."""
     current = state.slices[task.name]
     updated_slices = dict(state.slices)
-    updated_slices[task.name] = replace(
-        slice_transition(current, MergeCompleted(current.pr_number or 0)),
-        dispatch_last_boundary="aggregate_merged",
+    aggregate_pr_number = current.pr_number or 0
+    aggregate_merge_key = (
+        current.action.intent_id
+        if current.action is not None and current.action.intent_id
+        else f"aggregate_merge:{task.name}:{aggregate_pr_number}"
+    )
+    updated_slices[task.name] = _adopt_post_merge_slice(
+        current,
+        state,
+        aggregate_pr_number,
+        aggregate_merge_key,
+        "aggregate_merged",
     )
     sub_states = dict(state.integration.sub_tl_states)
     sub_states[task.name] = IntegrationLifecycle.MERGED
