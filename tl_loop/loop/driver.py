@@ -2859,16 +2859,9 @@ def _parent_sync_effect(
     expected_base_sha: str,
 ) -> tuple[dict[str, object], Mapping[str, str]]:
     """Run and validate one authoritative parent-branch observation."""
-    arguments: dict[str, object] = {
-        "child_id": current.id,
-        "pr_number": pr_number,
-        "repository": _required_merge_identity(evidence, ("repository",), "repository"),
-        "parent_branch": _required_merge_identity(evidence, ("parent_branch",), "parent branch"),
-        "merged_head_sha": _required_merge_identity(evidence, ("head_sha",), "merged head SHA"),
-        "expected_base_sha": expected_base_sha,
-        "lane_epoch": _required_int(evidence, "lane_epoch", "lane epoch"),
-        "working_dir": config.working_dir,
-    }
+    arguments = _parent_sync_arguments(
+        current, pr_number, evidence, expected_base_sha, config.working_dir
+    )
     result = _post_merge_effect(
         operation,
         current.id,
@@ -2912,6 +2905,94 @@ def _parent_sync_effect(
         f"ancestor:{arguments['merged_head_sha']}->{payload['parent_commit_sha']}"
     ):
         raise ValueError("parent synchronization returned unverifiable ancestry evidence")
+    return arguments, payload
+
+
+def _parent_sync_arguments(
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    expected_base_sha: str,
+    working_dir: str | None,
+) -> dict[str, object]:
+    return {
+        "child_id": current.id,
+        "pr_number": pr_number,
+        "repository": _required_merge_identity(evidence, ("repository",), "repository"),
+        "parent_branch": _required_merge_identity(evidence, ("parent_branch",), "parent branch"),
+        "merged_head_sha": _required_merge_identity(evidence, ("head_sha",), "merged head SHA"),
+        "expected_base_sha": expected_base_sha,
+        "lane_epoch": _required_int(evidence, "lane_epoch", "lane epoch"),
+        "working_dir": working_dir,
+    }
+
+
+def _remote_reconcile_effect(
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    *,
+    expected_base_sha: str,
+) -> tuple[dict[str, object], Mapping[str, str]]:
+    """Rebase local bookkeeping onto a new parent base and validate its receipt."""
+    arguments = _parent_sync_arguments(
+        current, pr_number, evidence, expected_base_sha, config.working_dir
+    )
+    result = _post_merge_effect(
+        "post_merge_remote_reconcile",
+        current.id,
+        arguments,
+        effects,
+        effects_log,
+        "post_merge_remote_reconcile",
+        active=config.active,
+    )
+    payload = _required_effect_result(
+        result,
+        (
+            "child_id",
+            "pr_number",
+            "repository",
+            "parent_branch",
+            "merged_head_sha",
+            "expected_base_sha",
+            "lane_epoch",
+            "parent_commit_sha",
+            "rebuilt_commit_sha",
+            "remote_head_sha",
+            "new_base_sha",
+            "remote_ancestry_proof",
+            "ancestry_proof",
+        ),
+    )
+    _require_matching_text(
+        payload,
+        arguments,
+        "child_id",
+        "repository",
+        "parent_branch",
+        "merged_head_sha",
+        "expected_base_sha",
+    )
+    if str(payload["pr_number"]) != str(arguments["pr_number"]):
+        raise ValueError("remote rebuild receipt mismatch for pr_number")
+    if str(payload["lane_epoch"]) != str(arguments["lane_epoch"]):
+        raise ValueError("remote rebuild receipt mismatch for lane_epoch")
+    if payload["new_base_sha"] != payload["remote_head_sha"]:
+        raise ValueError("remote rebuild receipt has divergent new base and remote head")
+    if payload["parent_commit_sha"] != payload["rebuilt_commit_sha"]:
+        raise ValueError("remote rebuild receipt has divergent rebuilt commit identities")
+    if payload["remote_ancestry_proof"] != (
+        f"ancestor:{payload['remote_head_sha']}->{payload['rebuilt_commit_sha']}"
+    ):
+        raise ValueError("remote rebuild receipt has unverifiable parent ancestry")
+    if payload["ancestry_proof"] != (
+        f"ancestor:{arguments['merged_head_sha']}->{payload['rebuilt_commit_sha']}"
+    ):
+        raise ValueError("remote rebuild receipt has unverifiable merge ancestry")
     return arguments, payload
 
 
@@ -3152,15 +3233,13 @@ def _recover_remote_advance(
     expected_base_sha = push_arguments.get("expected_base_sha")
     if not isinstance(expected_base_sha, str) or not expected_base_sha:
         raise ValueError("failed parent push has no expected base SHA")
-    _, payload = _parent_sync_effect(
-        state,
+    _, payload = _remote_reconcile_effect(
         current,
         pr_number,
         evidence,
         config,
         effects,
         effects_log,
-        operation="post_merge_remote_reconcile",
         expected_base_sha=expected_base_sha,
     )
     observed_remote_head = payload["remote_head_sha"]

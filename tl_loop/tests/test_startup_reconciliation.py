@@ -1008,16 +1008,12 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
 
     class RemoteAdvanceClient(FakeClient):
         parent_sync_count: int = 0
+        remote_reconcile_count: int = 0
         changelog_count: int = 0
         push_count: int = 0
 
         def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
             self.parent_sync_count += 1
-            parent_commit = (
-                "parent-after-merge"
-                if self.parent_sync_count == 1
-                else "parent-after-remote-advance"
-            )
             return ToolResult.from_raw(
                 {
                     "success": True,
@@ -1029,10 +1025,31 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
                         "merged_head_sha": arguments["merged_head_sha"],
                         "expected_base_sha": arguments["expected_base_sha"],
                         "lane_epoch": arguments["lane_epoch"],
-                        "parent_commit_sha": parent_commit,
-                        "remote_head_sha": parent_commit,
+                        "parent_commit_sha": "parent-after-merge",
+                        "remote_head_sha": "parent-after-merge",
                         "ancestry_proof": (
-                            f"ancestor:{arguments['merged_head_sha']}->{parent_commit}"
+                            f"ancestor:{arguments['merged_head_sha']}->parent-after-merge"
+                        ),
+                    },
+                }
+            )
+
+        def post_merge_remote_reconcile(self, **arguments: object) -> ToolResult:
+            self.remote_reconcile_count += 1
+            rebuilt_commit = "rebuilt-changelog-head"
+            remote_head = "parent-after-remote-advance"
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        **arguments,
+                        "parent_commit_sha": rebuilt_commit,
+                        "rebuilt_commit_sha": rebuilt_commit,
+                        "remote_head_sha": remote_head,
+                        "new_base_sha": remote_head,
+                        "remote_ancestry_proof": f"ancestor:{remote_head}->{rebuilt_commit}",
+                        "ancestry_proof": (
+                            f"ancestor:{arguments['merged_head_sha']}->{rebuilt_commit}"
                         ),
                     },
                 }
@@ -1120,7 +1137,8 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
     assert post_merge.evidence["changelog_commit_sha"] == "changelog-commit-2"
     assert post_merge.evidence["rebuild_applied"] == "true"
     assert post_merge.evidence["rebuild_new_base_sha"] == "parent-after-remote-advance"
-    assert client.parent_sync_count == 2
+    assert client.parent_sync_count == 1
+    assert client.remote_reconcile_count == 1
     assert client.changelog_count == 2
     assert client.push_count == 2
     assert len(client.chainlink_issue_close_calls) == 1

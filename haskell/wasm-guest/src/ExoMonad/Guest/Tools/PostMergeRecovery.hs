@@ -17,6 +17,11 @@ module ExoMonad.Guest.Tools.PostMergeRecovery
     postMergeParentSyncMergeArgs,
     postMergeParentSyncDescription,
     postMergeParentSyncSchema,
+    PostMergeRemoteReconcile,
+    postMergeRemoteReconcileCore,
+    postMergeRemoteReconcileDescription,
+    postMergeRemoteReconcileSchema,
+    postMergeRemoteReconcileRebaseArgs,
     PostMergeChangelog,
     PostMergeChangelogArgs (..),
     postMergeChangelogCore,
@@ -38,6 +43,7 @@ import Control.Monad (void)
 import Control.Monad.Freer (Eff, Member)
 import Data.Aeson (FromJSON (..), Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
+import Data.Int (Int32)
 import Data.Map qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -59,6 +65,8 @@ gitTimeoutMs :: Word64
 gitTimeoutMs = 120000
 
 data PostMergeParentSync
+
+data PostMergeRemoteReconcile
 
 data PostMergeParentSyncArgs = PostMergeParentSyncArgs
   { pmpChildId :: Text,
@@ -155,6 +163,23 @@ postMergeParentSyncSchema =
       ("working_dir", "Optional relative repository working directory.")
     ]
 
+postMergeRemoteReconcileDescription :: Text
+postMergeRemoteReconcileDescription =
+  "Fetch an advanced parent branch and rebase local post-merge bookkeeping onto it, returning Git-verified rebuild evidence."
+
+postMergeRemoteReconcileSchema :: Aeson.Object
+postMergeRemoteReconcileSchema =
+  genericToolSchemaWith @PostMergeParentSyncArgs
+    [ ("child_id", "Stable child slice identifier."),
+      ("pr_number", "Merged Forgejo pull request number."),
+      ("repository", "Authoritative repository identity."),
+      ("parent_branch", "Direct parent integration branch."),
+      ("merged_head_sha", "Exact merged child head SHA."),
+      ("expected_base_sha", "The stale parent base captured by the failed push."),
+      ("lane_epoch", "Durable integration-lane epoch."),
+      ("working_dir", "Optional relative repository working directory.")
+    ]
+
 postMergeChangelogDescription :: Text
 postMergeChangelogDescription =
   "Commit the already prepared Chainlink changelog on the parent branch and return the resulting Git commit SHA."
@@ -196,6 +221,13 @@ instance MCPTool PostMergeParentSync where
   toolDescription = postMergeParentSyncDescription
   toolSchema = postMergeParentSyncSchema
   toolHandlerEff args = either errorResult successResult <$> postMergeParentSyncCore args
+
+instance MCPTool PostMergeRemoteReconcile where
+  type ToolArgs PostMergeRemoteReconcile = PostMergeParentSyncArgs
+  toolName = "post_merge_remote_reconcile"
+  toolDescription = postMergeRemoteReconcileDescription
+  toolSchema = postMergeRemoteReconcileSchema
+  toolHandlerEff args = either errorResult successResult <$> postMergeRemoteReconcileCore args
 
 instance MCPTool PostMergeChangelog where
   type ToolArgs PostMergeChangelog = PostMergeChangelogArgs
@@ -261,6 +293,86 @@ postMergeParentSyncCore args = do
                                           ]
                                       )
                         _ -> pure $ Left "parent synchronization could not read authoritative heads"
+
+postMergeRemoteReconcileCore :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Eff effs (Either Text Value)
+postMergeRemoteReconcileCore args = do
+  case validateParentSync args of
+    Left err -> pure $ Left err
+    Right () -> do
+      branch <- runGitAt (pmpWorkingDir args) ["branch", "--show-current"]
+      case branch of
+        Left err -> pure $ Left err
+        Right current
+          | T.strip current /= pmpParentBranch args ->
+              pure $ Left "remote reconciliation requires the requested branch to be checked out"
+          | otherwise -> do
+              fetched <- runGitAt
+                (pmpWorkingDir args)
+                (postMergeParentSyncFetchArgs (pmpParentBranch args))
+              case fetched of
+                Left err -> pure $ Left err
+                Right _ -> do
+                  remoteBefore <- runGitAt
+                    (pmpWorkingDir args)
+                    ["rev-parse", remoteRef (pmpParentBranch args)]
+                  localHead <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+                  case (remoteBefore, localHead) of
+                    (Right remote, Right local)
+                      | remote == pmpExpectedBaseSha args ->
+                          pure $ Left "remote reconciliation found no parent-branch advancement"
+                      | local == pmpExpectedBaseSha args ->
+                          pure $ Left "remote reconciliation found no local bookkeeping to rebuild"
+                      | otherwise -> do
+                          baseReachable <- runGitAt
+                            (pmpWorkingDir args)
+                            ["merge-base", "--is-ancestor", pmpExpectedBaseSha args, local]
+                          case baseReachable of
+                            Left err -> pure $ Left ("failed parent-base ancestry check: " <> err)
+                            Right _ -> do
+                              rebased <- runGitAt
+                                (pmpWorkingDir args)
+                                (postMergeRemoteReconcileRebaseArgs (pmpParentBranch args) (pmpExpectedBaseSha args))
+                              case rebased of
+                                Left err -> do
+                                  _ <- runGitAt (pmpWorkingDir args) ["rebase", "--abort"]
+                                  pure $ Left ("failed to rebuild bookkeeping on the advanced parent: " <> err)
+                                Right _ -> do
+                                  rebuilt <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+                                  remoteAfter <- runGitAt
+                                    (pmpWorkingDir args)
+                                    ["rev-parse", remoteRef (pmpParentBranch args)]
+                                  case (rebuilt, remoteAfter) of
+                                    (Right rebuiltHead, Right remoteHead)
+                                      | remoteHead /= remote ->
+                                          pure $ Left "parent branch advanced during bookkeeping rebuild; recovery must restart"
+                                      | otherwise -> do
+                                          remoteProof <- verifyAncestryAt
+                                            (pmpWorkingDir args) remoteHead rebuiltHead
+                                          mergedProof <- verifyAncestryAt
+                                            (pmpWorkingDir args) (pmpMergedHeadSha args) rebuiltHead
+                                          case (remoteProof, mergedProof) of
+                                            (Right remoteAncestry, Right mergedAncestry) ->
+                                              pure $
+                                                Right
+                                                  ( object
+                                                      [ "child_id" .= pmpChildId args,
+                                                        "pr_number" .= pmpPrNumber args,
+                                                        "repository" .= pmpRepository args,
+                                                        "parent_branch" .= pmpParentBranch args,
+                                                        "merged_head_sha" .= pmpMergedHeadSha args,
+                                                        "expected_base_sha" .= pmpExpectedBaseSha args,
+                                                        "lane_epoch" .= pmpLaneEpoch args,
+                                                        "parent_commit_sha" .= rebuiltHead,
+                                                        "rebuilt_commit_sha" .= rebuiltHead,
+                                                        "remote_head_sha" .= remoteHead,
+                                                        "new_base_sha" .= remoteHead,
+                                                        "remote_ancestry_proof" .= remoteAncestry,
+                                                        "ancestry_proof" .= mergedAncestry
+                                                      ]
+                                                  )
+                                            _ -> pure $ Left "bookkeeping rebuild could not prove the rebuilt ancestry"
+                                    _ -> pure $ Left "bookkeeping rebuild could not read authoritative heads"
+                    _ -> pure $ Left "remote reconciliation could not read authoritative heads"
 
 postMergeChangelogCore :: (Member SuspendYield effs) => PostMergeChangelogArgs -> Eff effs (Either Text Value)
 postMergeChangelogCore args = do
@@ -390,6 +502,10 @@ runGitAt workingDir args = do
 postMergeParentSyncFetchArgs :: Text -> [Text]
 postMergeParentSyncFetchArgs branch = ["fetch", "--prune", "origin", branch]
 
+postMergeRemoteReconcileRebaseArgs :: Text -> Text -> [Text]
+postMergeRemoteReconcileRebaseArgs branch base =
+  ["rebase", "--onto", remoteRef branch, base, "HEAD"]
+
 -- | Git argv for fast-forwarding the checked-out parent branch.
 postMergeParentSyncMergeArgs :: Text -> [Text]
 postMergeParentSyncMergeArgs branch = ["merge", "--ff-only", remoteRef branch]
@@ -419,13 +535,13 @@ postMergePushGitArgs branch base =
   ]
 
 -- | Convert one process response into the boundary's authoritative result.
-interpretGitResult :: Int -> Text -> Text -> Either Text Text
+interpretGitResult :: Int32 -> Text -> Text -> Either Text Text
 interpretGitResult exitCode stdout stderr =
   if exitCode == 0
     then Right (T.strip stdout)
     else Left ("git command failed (" <> T.pack (show exitCode) <> "): " <> T.strip stderr)
 
-verifyAncestryAt :: Maybe Text -> Text -> Text -> Eff Effects (Either Text Text)
+verifyAncestryAt :: (Member SuspendYield effs) => Maybe Text -> Text -> Text -> Eff effs (Either Text Text)
 verifyAncestryAt workingDir mergedHead parent = do
   result <- runGitAt workingDir ["merge-base", "--is-ancestor", mergedHead, parent]
   pure $ fmap (const ("ancestor:" <> mergedHead <> "->" <> parent)) result

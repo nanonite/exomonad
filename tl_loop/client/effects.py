@@ -117,6 +117,7 @@ TOOL_METHODS: tuple[str, ...] = (
     "resolve_live_pr_for_slice",
     "watcher_pr_state",
     "post_merge_parent_sync",
+    "post_merge_remote_reconcile",
     "post_merge_changelog",
     "post_merge_push",
     "close_worker_pane",
@@ -541,6 +542,31 @@ class EffectClient:
         }
         _put(arguments, "working_dir", working_dir)
         return self._call("post_merge_parent_sync", arguments)
+
+    def post_merge_remote_reconcile(
+        self,
+        *,
+        child_id: str,
+        pr_number: int,
+        repository: str,
+        parent_branch: str,
+        merged_head_sha: str,
+        expected_base_sha: str,
+        lane_epoch: int,
+        working_dir: str | None = None,
+    ) -> ToolResult:
+        """Rebase local bookkeeping onto an advanced parent and return evidence."""
+        arguments: JsonObject = {
+            "child_id": child_id,
+            "pr_number": pr_number,
+            "repository": repository,
+            "parent_branch": parent_branch,
+            "merged_head_sha": merged_head_sha,
+            "expected_base_sha": expected_base_sha,
+            "lane_epoch": lane_epoch,
+        }
+        _put(arguments, "working_dir", working_dir)
+        return self._call("post_merge_remote_reconcile", arguments)
 
     def post_merge_changelog(
         self,

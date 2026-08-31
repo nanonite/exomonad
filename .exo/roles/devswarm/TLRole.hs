@@ -57,7 +57,12 @@ import ExoMonad.Guest.Tools.FilePR (FilePRArgs, filePRCore, filePRDescription, f
 import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
-import ExoMonad.Guest.Tools.PostMergeRecovery (PostMergeChangelog, PostMergeParentSync, PostMergePush)
+import ExoMonad.Guest.Tools.PostMergeRecovery
+  ( PostMergeChangelog,
+    PostMergeParentSync,
+    PostMergePush,
+    PostMergeRemoteReconcile,
+  )
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.ResolveLivePrForSlice (ResolveLivePrForSlice (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
@@ -279,6 +284,7 @@ data Tools mode = Tools
     resolveLivePrForSlice :: mode :- ResolveLivePrForSlice,
     watcherPrState :: mode :- WatcherPrState,
     postMergeParentSync :: mode :- PostMergeParentSync,
+    postMergeRemoteReconcile :: mode :- PostMergeRemoteReconcile,
     postMergeChangelog :: mode :- PostMergeChangelog,
     postMergePush :: mode :- PostMergePush,
     discardWorkerOutput :: mode :- DiscardWorkerOutput,
@@ -341,6 +347,7 @@ config =
             resolveLivePrForSlice = mkHandler @ResolveLivePrForSlice,
             watcherPrState = mkHandler @WatcherPrState,
             postMergeParentSync = mkHandler @PostMergeParentSync,
+            postMergeRemoteReconcile = mkHandler @PostMergeRemoteReconcile,
             postMergeChangelog = mkHandler @PostMergeChangelog,
             postMergePush = mkHandler @PostMergePush,
             discardWorkerOutput = mkHandler @DiscardWorkerOutput,

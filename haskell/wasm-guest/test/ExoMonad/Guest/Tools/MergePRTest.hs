@@ -145,5 +145,6 @@ watcherResponse reviewerAgentId identityError =
       Agent.watcherPrStateResponseReviewHeadSha = "head-a",
       Agent.watcherPrStateResponseReviewerAgentId = reviewerAgentId,
       Agent.watcherPrStateResponseReviewerIdentityError = identityError,
-      Agent.watcherPrStateResponseReviewBody = ""
+      Agent.watcherPrStateResponseReviewBody = "",
+      Agent.watcherPrStateResponseReviewSubmittedAt = ""
     }

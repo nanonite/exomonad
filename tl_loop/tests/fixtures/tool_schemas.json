@@ -366,6 +366,32 @@
       "name": "post_merge_parent_sync"
     },
     {
+      "description": "Fetch an advanced parent branch and rebase local post-merge bookkeeping onto it, returning Git-verified rebuild evidence.",
+      "inputSchema": {
+        "properties": {
+          "child_id": { "description": "Stable child slice identifier.", "type": "string" },
+          "pr_number": { "description": "Merged Forgejo pull request number.", "type": "integer" },
+          "repository": { "description": "Authoritative repository identity.", "type": "string" },
+          "parent_branch": { "description": "Direct parent integration branch.", "type": "string" },
+          "merged_head_sha": { "description": "Exact merged child head SHA.", "type": "string" },
+          "expected_base_sha": { "description": "The stale parent base captured by the failed push.", "type": "string" },
+          "lane_epoch": { "description": "Durable integration-lane epoch.", "type": "integer" },
+          "working_dir": { "description": "Optional relative repository working directory.", "type": "string" }
+        },
+        "required": [
+          "child_id",
+          "pr_number",
+          "repository",
+          "parent_branch",
+          "merged_head_sha",
+          "expected_base_sha",
+          "lane_epoch"
+        ],
+        "type": "object"
+      },
+      "name": "post_merge_remote_reconcile"
+    },
+    {
       "description": "Commit the already prepared Chainlink changelog on the parent branch and return the resulting Git commit SHA.",
       "inputSchema": {
         "properties": {

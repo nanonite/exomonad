@@ -44,7 +44,8 @@ watcherPrStateTests =
                   PA.watcherPrStateResponseReviewHeadSha = TL.pack "head-a",
                   PA.watcherPrStateResponseReviewerAgentId = TL.pack "review-pr-43-codex",
                   PA.watcherPrStateResponseReviewerIdentityError = "",
-                  PA.watcherPrStateResponseReviewBody = TL.pack "Looks good"
+                  PA.watcherPrStateResponseReviewBody = TL.pack "Looks good",
+                  PA.watcherPrStateResponseReviewSubmittedAt = TL.pack "2026-08-31T00:00:00Z"
                 }
         case watcherPrStateResponseValue response of
           Object fields -> do

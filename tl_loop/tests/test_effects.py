@@ -192,6 +192,15 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         expected_base_sha="base",
         lane_epoch=1,
     )
+    client.post_merge_remote_reconcile(
+        child_id="child",
+        pr_number=1,
+        repository="org/repo",
+        parent_branch="main",
+        merged_head_sha="merged-head",
+        expected_base_sha="base",
+        lane_epoch=1,
+    )
     client.post_merge_changelog(
         child_id="child",
         issue_id=1,

@@ -9,7 +9,9 @@ import Data.ByteString qualified as BS
 import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.ByteString.Lazy qualified as BL
 import Data.Int (Int32)
+import Data.List qualified as List
 import Data.Text (Text)
+import Data.Text.Lazy qualified as TL
 import Data.Word (Word8)
 import Effects.Envelope qualified as Envelope
 import Effects.Process qualified as Proc
@@ -25,6 +27,9 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
     postMergeChangelogSchema,
     postMergeParentSyncFetchArgs,
     postMergeParentSyncMergeArgs,
+    postMergeRemoteReconcileCore,
+    postMergeRemoteReconcileRebaseArgs,
+    postMergeRemoteReconcileSchema,
     postMergeParentSyncSchema,
     postMergePushGitArgs,
     postMergePushSchema
@@ -66,7 +71,11 @@ postMergeRecoveryTests =
         assertEqual
           "merge argv"
           ["merge", "--ff-only", "origin/main"]
-          (postMergeParentSyncMergeArgs "main"),
+          (postMergeParentSyncMergeArgs "main")
+        assertEqual
+          "remote rebuild argv"
+          ["rebase", "--onto", "origin/main", "base-head", "HEAD"]
+          (postMergeRemoteReconcileRebaseArgs "main" "base-head"),
       testCase "changelog arguments and argv are stable" $ do
         let value =
               object
@@ -168,19 +177,55 @@ postMergeRecoveryTests =
           "a failed commit must not become a successful boundary"
           (Left "git command failed (1): changelog commit failed")
           (runChangelogWithFailedCommit args),
+      testCase "remote reconciliation rebases local bookkeeping onto the new base" $ do
+        let args =
+              PostMergeParentSyncArgs
+                "slice-a"
+                43
+                "org/repo"
+                "main"
+                "merged-head"
+                "old-base"
+                7
+                Nothing
+        assertEqual
+          "remote reconciliation returns rebuilt evidence"
+          ( Right
+              ( object
+                  [ "child_id" .= ("slice-a" :: Text),
+                    "pr_number" .= (43 :: Int),
+                    "repository" .= ("org/repo" :: Text),
+                    "parent_branch" .= ("main" :: Text),
+                    "merged_head_sha" .= ("merged-head" :: Text),
+                    "expected_base_sha" .= ("old-base" :: Text),
+                    "lane_epoch" .= (7 :: Int),
+                    "parent_commit_sha" .= ("rebuilt-head" :: Text),
+                    "rebuilt_commit_sha" .= ("rebuilt-head" :: Text),
+                    "remote_head_sha" .= ("remote-head" :: Text),
+                    "new_base_sha" .= ("remote-head" :: Text),
+                    "remote_ancestry_proof" .= ("ancestor:remote-head->rebuilt-head" :: Text),
+                    "ancestry_proof" .= ("ancestor:merged-head->rebuilt-head" :: Text)
+                  ]
+              )
+          )
+          (runRemoteReconcile args),
       testCase "schemas expose every boundary identity and CAS field" $ do
         let schemaText schema = L8.unpack (encode schema)
             parentSchema = schemaText postMergeParentSyncSchema
+            remoteSchema = schemaText postMergeRemoteReconcileSchema
             changelogSchema = schemaText postMergeChangelogSchema
             pushSchema = schemaText postMergePushSchema
         mapM_
-          (\field -> assertBool ("parent schema field: " <> field) (field `L8.isInfixOf` L8.pack parentSchema))
+          (\field -> assertBool ("parent schema field: " <> field) (List.isInfixOf field parentSchema))
           ["child_id", "repository", "parent_branch", "merged_head_sha", "expected_base_sha", "lane_epoch"]
         mapM_
-          (\field -> assertBool ("changelog schema field: " <> field) (field `L8.isInfixOf` L8.pack changelogSchema))
+          (\field -> assertBool ("remote schema field: " <> field) (List.isInfixOf field remoteSchema))
+          ["child_id", "repository", "parent_branch", "merged_head_sha", "expected_base_sha", "lane_epoch"]
+        mapM_
+          (\field -> assertBool ("changelog schema field: " <> field) (List.isInfixOf field changelogSchema))
           ["child_id", "issue_id", "repository", "parent_branch", "expected_base_sha", "generation", "intent_id"]
         mapM_
-          (\field -> assertBool ("push schema field: " <> field) (field `L8.isInfixOf` L8.pack pushSchema))
+          (\field -> assertBool ("push schema field: " <> field) (List.isInfixOf field pushSchema))
           ["child_id", "repository", "parent_branch", "lane_epoch", "push_intent_id", "push_journal_id", "expected_base_sha", "pushed_commit"]
     ]
 
@@ -192,6 +237,32 @@ runChangelogWithFailedCommit args =
     handleResponses processCount (Continue request resume) =
       resume (responseFor processCount request)
         >>= handleResponses (if erType request == "process.run" then processCount + 1 else processCount)
+
+runRemoteReconcile :: PostMergeParentSyncArgs -> Either Text Value
+runRemoteReconcile args =
+  run $ runC (postMergeRemoteReconcileCore args) >>= handleResponses 0
+  where
+    handleResponses _ (Done result) = pure result
+    handleResponses processCount (Continue request resume) =
+      resume (remoteResponseFor processCount request)
+        >>= handleResponses (if erType request == "process.run" then processCount + 1 else processCount)
+
+remoteResponseFor :: Int -> EffectRequest -> Value
+remoteResponseFor processCount request
+  | erType request /= "process.run" = encodedEffectResponse BS.empty
+  | otherwise =
+      case processCount of
+        0 -> processResponse 0 "main" ""
+        1 -> processResponse 0 "" ""
+        2 -> processResponse 0 "remote-head" ""
+        3 -> processResponse 0 "local-bookkeeping" ""
+        4 -> processResponse 0 "" ""
+        5 -> processResponse 0 "" ""
+        6 -> processResponse 0 "rebuilt-head" ""
+        7 -> processResponse 0 "remote-head" ""
+        8 -> processResponse 0 "" ""
+        9 -> processResponse 0 "" ""
+        _ -> processResponse 1 "" "unexpected process request"
 
 responseFor :: Int -> EffectRequest -> Value
 responseFor processCount request
@@ -209,7 +280,7 @@ processResponse :: Int32 -> Text -> Text -> Value
 processResponse exitCode stdout stderr =
   encodedEffectResponse
     ( BL.toStrict
-        (toLazyByteString (Proc.RunResponse exitCode stdout stderr))
+        (toLazyByteString (Proc.RunResponse exitCode (TL.fromStrict stdout) (TL.fromStrict stderr)))
     )
 
 encodedEffectResponse :: BS.ByteString -> Value
