@@ -364,8 +364,14 @@ def _ordered_slice_complete(current: SliceState) -> bool:
 
 def _ordered_child_complete(task: SubTLTask, current: SliceState) -> bool:
     """Require aggregate post-merge recovery before releasing a child barrier."""
-    del task
-    return _ordered_slice_complete(current)
+    if not task.integration.aggregate_pr_required:
+        return _ordered_slice_complete(current)
+    return (
+        current.status is SliceStatus.MERGED
+        and current.pr_number is not None
+        and current.post_merge is not None
+        and current.post_merge.phase is PostMergePhase.COMPLETE
+    )
 
 
 def _ordered_stage_complete(
@@ -6648,7 +6654,7 @@ def _ensure_aggregate_candidate(
             f"Head: `{fallback_head}`\n"
             f"Patch: `{fallback_patch}`"
         )
-        owner_effects = _owner_effect_client(effects, config.agent_id or store.run_id)
+        owner_effects = _owner_effect_client(effects, task.agent_id or task.name)
         result = _invoke(
             "file_pr",
             task.name,

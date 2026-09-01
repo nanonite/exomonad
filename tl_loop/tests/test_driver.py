@@ -52,6 +52,7 @@ from tl_loop.loop.driver import (
     _execute_direct_reviewer_intent,
     _initial_slices,
     _merge_result_is_authoritative,
+    _ordered_child_complete,
     _phase_after_slice_merge,
     _record_review_event,
     _recover_tool_unavailable,
@@ -74,7 +75,12 @@ from tl_loop.loop.reconcile import (
     reconcile_merge_observation,
 )
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
-from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
+from tl_loop.ordered import (
+    ChildRecoverySummary,
+    IntegrationContract,
+    IntegrationLifecycle,
+    SubTLLifecycle,
+)
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
@@ -336,6 +342,56 @@ class RecordingTransport:
         if tool_name == "merge_pr":
             return {"success": True, "result": {"merged": True}}
         return {"success": True, "result": None}
+
+
+@dataclass
+class NamedRecordingTransport(RecordingTransport):
+    identities: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        self.identities.append((role, name, tool_name))
+        return super().call_tool(role, name, tool_name, arguments)
+
+
+def test_required_aggregate_completion_needs_publication_and_post_merge(
+    tmp_path: Path,
+) -> None:
+    required = SubTLTask("required", WorkPlan(), order=1)
+    optional = SubTLTask(
+        "optional",
+        WorkPlan(),
+        order=1,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    plan = WorkPlan(sub_tls=(required, optional))
+    run_id = "aggregate-contract"
+    create(
+        run_id,
+        {"slices": _initial_slices(plan, TLLoopConfig(), tmp_path, run_id)},
+        root_dir=tmp_path,
+    )
+    slices = RunStore(run_id, tmp_path).load().slices
+    incomplete_required = replace(
+        slices["required"],
+        status=SliceStatus.MERGED,
+        pr_number=None,
+        post_merge=None,
+    )
+    complete_optional = replace(
+        slices["optional"],
+        status=SliceStatus.MERGED,
+        pr_number=None,
+        post_merge=None,
+    )
+
+    assert not _ordered_child_complete(required, incomplete_required)
+    assert _ordered_child_complete(optional, complete_optional)
 
 
 def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path) -> None:
@@ -3214,8 +3270,18 @@ def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) 
         sub_tls=(
             SubTLTask(
                 "child",
-                WorkPlan(sub_tls=(SubTLTask("grandchild", WorkPlan(), source=grand_source),)),
+                WorkPlan(
+                    sub_tls=(
+                        SubTLTask(
+                            "grandchild",
+                            WorkPlan(),
+                            source=grand_source,
+                            integration=IntegrationContract(aggregate_pr_required=False),
+                        ),
+                    )
+                ),
                 source=child_source,
+                integration=IntegrationContract(aggregate_pr_required=False),
             ),
         )
     )
@@ -3314,9 +3380,24 @@ def test_same_order_sub_tls_overlap_and_wait_for_prior_stage(
     monkeypatch.setattr("tl_loop.loop.driver.tl_run", fake_tl_run)
     plan = WorkPlan(
         sub_tls=(
-            SubTLTask("stage-one-a", WorkPlan(), order=1),
-            SubTLTask("stage-one-b", WorkPlan(), order=1),
-            SubTLTask("stage-two", WorkPlan(), order=2),
+            SubTLTask(
+                "stage-one-a",
+                WorkPlan(),
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+            SubTLTask(
+                "stage-one-b",
+                WorkPlan(),
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+            SubTLTask(
+                "stage-two",
+                WorkPlan(),
+                order=2,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
         )
     )
     result = run_tl_loop(
@@ -3355,7 +3436,16 @@ def test_active_parent_stays_alive_for_later_recursive_event(
     run_id = "waiting-parent"
     result = run_tl_loop(
         run_id,
-        WorkPlan(sub_tls=(SubTLTask("waiting-child", WorkPlan(), order=1),)),
+        WorkPlan(
+            sub_tls=(
+                SubTLTask(
+                    "waiting-child",
+                    WorkPlan(),
+                    order=1,
+                    integration=IntegrationContract(aggregate_pr_required=False),
+                ),
+            )
+        ),
         DelayedQueue([_event(1, "all_children_done", run_id=run_id)]),
         EffectClient(RecordingTransport()),
         config=TLLoopConfig(
@@ -3576,15 +3666,37 @@ def test_failed_ordered_sub_tl_blocks_higher_order_work(tmp_path: Path) -> None:
 def test_nested_ordered_stages_round_trip_the_recursive_checkpoint(tmp_path: Path) -> None:
     nested = WorkPlan(
         sub_tls=(
-            SubTLTask("inner-one", WorkPlan(), source=SyntheticQueue([]), order=1),
-            SubTLTask("inner-two", WorkPlan(), source=SyntheticQueue([]), order=2),
+            SubTLTask(
+                "inner-one",
+                WorkPlan(),
+                source=SyntheticQueue([]),
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+            SubTLTask(
+                "inner-two",
+                WorkPlan(),
+                source=SyntheticQueue([]),
+                order=2,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
         )
     )
     transport = RecordingTransport()
 
     result = run_tl_loop(
         "nested-ordered-run",
-        WorkPlan(sub_tls=(SubTLTask("outer", nested, source=SyntheticQueue([]), order=1),)),
+        WorkPlan(
+            sub_tls=(
+                SubTLTask(
+                    "outer",
+                    nested,
+                    source=SyntheticQueue([]),
+                    order=1,
+                    integration=IntegrationContract(aggregate_pr_required=False),
+                ),
+            )
+        ),
         SyntheticQueue([]),
         EffectClient(transport),
         config=TLLoopConfig(max_parallel_slices=2, poll_interval=0.001),
@@ -3616,8 +3728,18 @@ def test_ordered_sub_tl_restart_does_not_rerun_merged_children(
     monkeypatch.setattr("tl_loop.loop.driver.tl_run", fake_tl_run)
     plan = WorkPlan(
         sub_tls=(
-            SubTLTask("restart-a", WorkPlan(), order=1),
-            SubTLTask("restart-b", WorkPlan(), order=1),
+            SubTLTask(
+                "restart-a",
+                WorkPlan(),
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+            SubTLTask(
+                "restart-b",
+                WorkPlan(),
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
         )
     )
     config = TLLoopConfig(max_parallel_slices=2, poll_interval=0.001)
@@ -3661,7 +3783,16 @@ def test_ordered_sub_tl_restart_adopts_terminal_child_checkpoint(
     monkeypatch.setattr("tl_loop.loop.driver.tl_run", unexpected_child_run)
     result = run_tl_loop(
         "adopt-run",
-        WorkPlan(sub_tls=(SubTLTask("adopt-child", WorkPlan(), order=1),)),
+        WorkPlan(
+            sub_tls=(
+                SubTLTask(
+                    "adopt-child",
+                    WorkPlan(),
+                    order=1,
+                    integration=IntegrationContract(aggregate_pr_required=False),
+                ),
+            )
+        ),
         SyntheticQueue([]),
         EffectClient(RecordingTransport()),
         config=_config(),
@@ -3672,7 +3803,7 @@ def test_ordered_sub_tl_restart_adopts_terminal_child_checkpoint(
 
 
 def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) -> None:
-    transport = RecordingTransport()
+    transport = NamedRecordingTransport()
     child_plan = _plan()
     parent_dir = tmp_path / "aggregate-run"
     run_tl_loop(
@@ -3702,7 +3833,13 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     )
     parent_plan = WorkPlan(
         sub_tls=(
-            SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),
+            SubTLTask(
+                "aggregate-child",
+                child_plan,
+                source=SyntheticQueue([]),
+                agent_id="child-service",
+                order=1,
+            ),
             SubTLTask("later-stage", WorkPlan(), source=SyntheticQueue([]), order=2),
         )
     )
@@ -3733,6 +3870,9 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
 
     file_pr_calls = [arguments for name, arguments in transport.calls if name == "file_pr"]
     assert len(file_pr_calls) == 1
+    assert [
+        (role, name) for role, name, tool_name in transport.identities if tool_name == "file_pr"
+    ] == [("tl", "child-service")]
     assert file_pr_calls[0]["base_branch"] == "main"
     assert first.final_state.fsm.phase is TLPhase.TLWaiting
     assert second.final_state.fsm.phase is TLPhase.TLWaiting
