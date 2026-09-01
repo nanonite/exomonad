@@ -340,19 +340,40 @@ def _persist_candidate_runtime(
 
 def _sub_tls_waiting_for_integration(plan: WorkPlan, state: RunState) -> bool:
     """Report recursive work that must remain alive until a later event."""
+    tasks = {task.name: task for task in plan.sub_tls}
     stage_ids = {
         task_id
         for stage in plan.ordered_stages
-        if state.current_order is None or stage.order == state.current_order
+        if stage.order == state.current_order
         for task_id in stage.sub_tls
     }
-    statuses = [state.slices[task_id].status for task_id in stage_ids if task_id in state.slices]
-    pending = {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
-    return (
-        bool(statuses)
-        and any(status in pending for status in statuses)
-        and all(status in pending | {SliceStatus.MERGED} for status in statuses)
+    return any(
+        task_id in state.slices
+        and not _ordered_child_complete(tasks[task_id], state.slices[task_id])
+        for task_id in stage_ids
     )
+
+
+def _ordered_slice_complete(current: SliceState) -> bool:
+    """Check a persisted slice's post-merge release condition."""
+    return current.status is SliceStatus.MERGED and (
+        current.pr_number is None
+        or (current.post_merge is not None and current.post_merge.phase is PostMergePhase.COMPLETE)
+    )
+
+
+def _ordered_child_complete(task: SubTLTask, current: SliceState) -> bool:
+    """Require aggregate post-merge recovery before releasing a child barrier."""
+    del task
+    return _ordered_slice_complete(current)
+
+
+def _ordered_stage_complete(
+    tasks: Sequence[SubTLTask],
+    slices: Mapping[str, SliceState],
+) -> bool:
+    """Check one stage using its child-specific completion contract."""
+    return all(_ordered_child_complete(task, slices[task.name]) for task in tasks)
 
 
 class TLLoopError(RuntimeError):
@@ -563,7 +584,9 @@ class WorkPlan:
         grouped: dict[int, list[str]] = {}
         for task in self.sub_tls:
             grouped.setdefault(task.order, []).append(task.name)
-        return tuple(OrderedStage(order, tuple(grouped[order])) for order in sorted(grouped))
+        return tuple(
+            OrderedStage(order, tuple(sorted(grouped[order]))) for order in sorted(grouped)
+        )
 
 
 @dataclass(frozen=True)
@@ -1879,6 +1902,20 @@ def _run_loop(
                 state.slices, event, controller_epoch=state.controller_epoch
             ),
         )
+        if isinstance(fsm_event, ChildCompleted):
+            completed_slice = next_slices.get(event_slice_id or "")
+            next_slices = _apply_child_completion(
+                next_slices,
+                event_slice_id,
+                event,
+                persist_publication=(
+                    config.parent_run_id is not None
+                    or (
+                        completed_slice is not None
+                        and "/sub_tl/" in (completed_slice.manifest_node_id or "")
+                    )
+                ),
+            )
         if _is_spawn_confirmation_event(event):
             next_slices = _confirm_dispatch_event(
                 state.slices,
@@ -2215,6 +2252,26 @@ def _execute_external_intent(
     effects_log: list[EffectIntent],
 ) -> RunState:
     """Execute one direct-leaf intent after its durable convergence event."""
+    if intent.operation in {"validate_integration", "merge_aggregate", "revalidate_base"}:
+        candidate_id = next(
+            (
+                candidate_id
+                for candidate_id, candidate in state.integration.candidates.items()
+                if candidate_id == intent.target_id
+                or candidate.integration_owner_id == intent.target_id
+            ),
+            None,
+        )
+        if candidate_id is None:
+            return state
+        return _integrate_one_candidate(
+            SubTLTask(candidate_id, WorkPlan()),
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+        )
     if intent.target_id not in state.slices:
         return state
     if intent.operation == "merge":
@@ -2790,6 +2847,33 @@ def _advance_post_merge_boundary(
             return _run_parent_push(state, current, evidence, config, effects, effects_log, store)
     except (EffectFailed, TLLoopError, ToolUnavailableError, TypeError, ValueError) as error:
         return _block_post_merge_recovery(store, state, slice_id, str(error))
+    return state
+
+
+def _drain_post_merge_recovery(
+    state: RunState,
+    slice_id: str,
+    pr_number: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    """Advance checkpointed post-merge edges until an effect blocks or completes."""
+    for _ in range(12):
+        current = state.slices[slice_id]
+        if current.post_merge is None or current.post_merge.phase is PostMergePhase.COMPLETE:
+            return state
+        before = (current.post_merge.phase, tuple(current.post_merge.evidence.items()))
+        state = _advance_post_merge_boundary(
+            state, slice_id, pr_number, config, effects, effects_log, store
+        )
+        current = state.slices[slice_id]
+        if current.post_merge is None:
+            return state
+        after = (current.post_merge.phase, tuple(current.post_merge.evidence.items()))
+        if before == after:
+            return state
     return state
 
 
@@ -3996,6 +4080,11 @@ def _source_has_pending(source: EventQueue) -> bool:
     events = getattr(source, "events", None)
     if isinstance(events, (list, tuple, set, frozenset)):
         return bool(events)
+    if events is not None and hasattr(events, "empty"):
+        try:
+            return not events.empty()
+        except (AttributeError, TypeError):
+            return True
     queued = getattr(source, "_events", None)
     if queued is not None:
         try:
@@ -5796,7 +5885,12 @@ def _run_sub_tls(
     if not plan.sub_tls:
         return state
     tasks_by_name = {task.name: task for task in plan.sub_tls}
+    current_order = state.current_order or 1
     for stage in plan.ordered_stages:
+        if stage.order < current_order:
+            continue
+        if stage.order > current_order:
+            break
         stage_tasks = tuple(tasks_by_name[name] for name in stage.sub_tls)
         state = store.load()
         stage_states = [state.slices.get(task.name) for task in stage_tasks]
@@ -5805,6 +5899,25 @@ def _run_sub_tls(
                 task.name for task, current in zip(stage_tasks, stage_states) if current is None
             )
             raise TLLoopError(f"recursive slice {missing!r} is missing")
+        for task, current in zip(stage_tasks, stage_states):
+            if (
+                current is not None
+                and current.status is SliceStatus.MERGED
+                and current.pr_number is not None
+                and current.post_merge is not None
+                and current.post_merge.phase is not PostMergePhase.COMPLETE
+            ):
+                state = _drain_post_merge_recovery(
+                    state,
+                    task.name,
+                    current.pr_number,
+                    config,
+                    effects,
+                    effects_log,
+                    store,
+                )
+        state = store.load()
+        stage_states = [state.slices.get(task.name) for task in stage_tasks]
         if any(
             current.status in {SliceStatus.FAILED, SliceStatus.PARKED}
             for current in stage_states
@@ -5813,15 +5926,13 @@ def _run_sub_tls(
             return _fail_recursive_parent(
                 state, config, effects, store, effects_log, "recursive child is not recoverable"
             )
-        was_stage_complete = all(
-            current is not None and current.status is SliceStatus.MERGED for current in stage_states
-        )
+        was_stage_complete = _ordered_stage_complete(stage_tasks, state.slices)
         pending = tuple(
             task
             for task, current in zip(stage_tasks, stage_states)
             if current is not None
-            and current.status
-            not in {SliceStatus.MERGED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+            and current.status not in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+            and not _ordered_child_complete(task, current)
         )
         if not pending:
             state = _integrate_stage_candidates(
@@ -5840,6 +5951,11 @@ def _run_sub_tls(
                 for task in stage_tasks
             ):
                 break
+            if not _ordered_stage_complete(stage_tasks, state.slices):
+                break
+            state, current_order = _advance_ordered_stage(
+                stage.order, state, current_order, plan, store
+            )
             continue
         if not any(
             current is not None and current.status is not SliceStatus.PENDING
@@ -5877,7 +5993,6 @@ def _run_sub_tls(
                 )
             if any(task.name in state.integration.sub_tl_recovery for task in stage_tasks):
                 stage_recovery = True
-                break
         state = _integrate_stage_candidates(stage_tasks, state, config, effects, store, effects_log)
         _emit_stage_completion(
             stage,
@@ -5892,14 +6007,18 @@ def _run_sub_tls(
             for task in stage_tasks
         ):
             break
+        if not _ordered_stage_complete(stage_tasks, state.slices):
+            break
         if stage_recovery:
             break
+        state, current_order = _advance_ordered_stage(
+            stage.order, state, current_order, plan, store
+        )
     if plan.sub_tls and not plan.workers and not plan.leaves:
         awaiting_integration = tuple(
             task.name
             for task in plan.sub_tls
-            if state.slices[task.name].status
-            in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+            if not _ordered_child_complete(task, state.slices[task.name])
         )
         if awaiting_integration:
             before_phase = _phase_from_state(state)
@@ -5952,7 +6071,7 @@ def _emit_stage_completion(
 ) -> None:
     """Publish one durable completion observation for an ordered stage."""
     if was_complete or any(
-        state.slices[slice_id].status is not SliceStatus.MERGED
+        not _ordered_slice_complete(state.slices[slice_id])
         for slice_id in stage.sub_tls
         if slice_id in state.slices
     ):
@@ -5967,6 +6086,30 @@ def _emit_stage_completion(
         config,
         effects,
         effects_log,
+    )
+
+
+def _advance_ordered_stage(
+    order: int,
+    state: RunState,
+    current_order: int,
+    plan: WorkPlan,
+    store: RunStore,
+) -> tuple[RunState, int]:
+    """Persist the next manifest stage only after this stage is complete."""
+    next_orders = [stage.order for stage in plan.ordered_stages if stage.order > order]
+    if not next_orders:
+        return state, current_order
+    next_order = min(next_orders)
+    if current_order == next_order:
+        return state, current_order
+    return (
+        store.set_ordered_state(
+            next_order,
+            state.ordered_stages,
+            state.integration,
+        ),
+        next_order,
     )
 
 
@@ -6118,7 +6261,12 @@ def _run_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
-            if child_phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}:
+            if child_phase in {
+                TLPhase.TLAllMerged,
+                TLPhase.TLDone,
+                TLPhase.TLPRFiled,
+                TLPhase.TLFailed,
+            }:
                 return task, child_phase, child_state
             if _child_recovery_projection(child_state, store.run_id) is not None:
                 return task, child_phase, child_state
@@ -6168,7 +6316,13 @@ def _run_live_sub_tl_batch(
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
             if (
-                child_phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
+                child_phase
+                in {
+                    TLPhase.TLAllMerged,
+                    TLPhase.TLDone,
+                    TLPhase.TLPRFiled,
+                    TLPhase.TLFailed,
+                }
                 or _child_recovery_projection(child_state, store.run_id) is not None
             ):
                 existing[task.name] = (task, child_phase, child_state)
@@ -6241,7 +6395,13 @@ def _supervise_live_sub_tl(
             and not child_state.plan_manifest.nodes
         )
         if child_state is None or (
-            child_state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
+            child_state.fsm.phase
+            not in {
+                TLPhase.TLAllMerged,
+                TLPhase.TLDone,
+                TLPhase.TLPRFiled,
+                TLPhase.TLFailed,
+            }
             and not empty_scope
         ):
             child_store.record_exit_reason(
@@ -6472,6 +6632,7 @@ def _ensure_aggregate_candidate(
         own_candidate is None
         and child_integration.aggregate_pr_number is not None
         and child_integration.aggregate_head_sha
+        and child_integration.integration_owner_run_id == task.name
     ):
         candidate = AggregateCandidate(
             task.name,
@@ -6487,7 +6648,7 @@ def _ensure_aggregate_candidate(
             f"Head: `{fallback_head}`\n"
             f"Patch: `{fallback_patch}`"
         )
-        owner_effects = _owner_effect_client(effects, task.name)
+        owner_effects = _owner_effect_client(effects, config.agent_id or store.run_id)
         result = _invoke(
             "file_pr",
             task.name,
@@ -6506,19 +6667,22 @@ def _ensure_aggregate_candidate(
         )
         pr_number = _positive_result_int(result_data, "pr_number")
         if pr_number is None:
-            pr_number = (
-                max(
-                    (slice_state.pr_number or 0 for slice_state in child_state.slices.values()),
-                    default=0,
-                )
-                + 1
+            raise TLLoopError(
+                f"aggregate publication for {task.name!r} returned no authoritative PR number"
+            )
+        head_sha = _result_text(result_data, "head_sha")
+        patch_digest = _result_text(result_data, "patch_digest")
+        base_sha = _result_text(result_data, "base_sha")
+        if not head_sha or not patch_digest or not base_sha:
+            raise TLLoopError(
+                f"aggregate publication for {task.name!r} returned incomplete evidence"
             )
         candidate = AggregateCandidate(
             task.name,
             pr_number,
-            _result_text(result_data, "head_sha") or fallback_head,
-            _result_text(result_data, "patch_digest") or fallback_patch,
-            _result_text(result_data, "base_sha") or fallback_base,
+            head_sha,
+            patch_digest,
+            base_sha,
         )
     updated_integration = replace(
         child_integration,
@@ -6579,6 +6743,8 @@ def _integrate_stage_candidates(
         return state
     for task in sorted(tasks, key=lambda item: item.name):
         current = state.slices[task.name]
+        if _ordered_child_complete(task, current):
+            continue
         if (
             current.status is not SliceStatus.IN_REVIEW
             or current.pr_number is None
@@ -6586,7 +6752,7 @@ def _integrate_stage_candidates(
             or current.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}
             or current.ci_state.get(current.reviewed_head) not in {"success", "neutral"}
         ):
-            continue
+            return state
         state = _integrate_one_candidate(task, state, config, effects, store, effects_log)
         if state.slices[task.name].status is not SliceStatus.MERGED:
             break
@@ -7420,7 +7586,7 @@ def _checkpoint_aggregate_merged(
         ),
     )
     _emit_slice_status_changes(previous_slices, checkpointed.slices, config, effects, effects_log)
-    return _advance_post_merge_boundary(
+    return _drain_post_merge_recovery(
         checkpointed,
         task.name,
         aggregate_pr_number,
@@ -9493,6 +9659,31 @@ def _complete_legacy_direct_children(phase: RecursiveTLRunning) -> PhaseValue:
     return next_phase
 
 
+def _apply_child_completion(
+    slices: Mapping[str, SliceState],
+    slice_id: str | None,
+    event: EventEnvelope,
+    *,
+    persist_publication: bool,
+) -> dict[str, SliceState]:
+    """Persist the child result carried by a completion notification."""
+    if slice_id is None or slice_id not in slices:
+        return dict(slices)
+    current = slices[slice_id]
+    if not persist_publication:
+        return dict(slices)
+    pr_number = event.data.get("pr_number")
+    head_sha = event.data.get("head_sha")
+    if type(pr_number) is int and pr_number > 0 and isinstance(head_sha, str) and head_sha:
+        updated = replace(
+            slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW)),
+            pr_number=pr_number,
+            reviewed_head=head_sha,
+        )
+        return {**slices, slice_id: updated}
+    return dict(slices)
+
+
 def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool:
     if isinstance(
         phase,
@@ -10132,7 +10323,7 @@ def normalize_work_plan(plan: WorkPlan, *, path: str = "plan") -> WorkPlan:
     return WorkPlan(
         workers=plan.workers,
         leaves=plan.leaves,
-        sub_tls=tuple(sorted(tasks, key=lambda task: task.order)),
+        sub_tls=tuple(sorted(tasks, key=lambda task: (task.order, task.name))),
     )
 
 

@@ -24,8 +24,8 @@ def test_ordered_stages_group_siblings_and_reset_at_recursive_boundaries() -> No
         {
             "sub_tls": [
                 {"name": "later", "order": 2, "plan": {}},
-                {"name": "first", "order": 1, "plan": {}},
                 {"name": "same", "order": 1, "plan": {}},
+                {"name": "first", "order": 1, "plan": {}},
             ]
         }
     )

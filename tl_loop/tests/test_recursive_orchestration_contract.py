@@ -197,7 +197,7 @@ def test_recursive_order_scopes_reset_at_each_nested_plan() -> None:
     )
 
     assert [stage.order for stage in plan.ordered_stages] == [1, 2]
-    assert plan.ordered_stages[0].sub_tls == ("first", "also-first")
+    assert plan.ordered_stages[0].sub_tls == ("also-first", "first")
     assert plan.ordered_stages[1].sub_tls == ("later",)
     nested = next(task.plan for task in plan.sub_tls if task.name == "first")
     assert [stage.order for stage in nested.ordered_stages] == [1]

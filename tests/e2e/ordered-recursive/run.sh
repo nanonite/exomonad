@@ -13,6 +13,13 @@ cleanup() {
     local status=$?
     if [[ -n "$MOCK_PID" ]]; then
         kill "$MOCK_PID" >/dev/null 2>&1 || true
+        for _ in $(seq 1 20); do
+            if ! kill -0 "$MOCK_PID" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.1
+        done
+        kill -KILL "$MOCK_PID" >/dev/null 2>&1 || true
         wait "$MOCK_PID" >/dev/null 2>&1 || true
     fi
     rm -rf -- "$WORK_DIR"

@@ -272,6 +272,67 @@ class RecordingTransport:
                 "success": True,
                 "result": {"event_id": "controller-event", "run_seq": self.next_controller_run_seq},
             }
+        if tool_name == "file_pr":
+            title = str(arguments.get("title", ""))
+            if "aggregate-child" in title:
+                return {
+                    "success": True,
+                    "result": {
+                        "pr_number": 43,
+                        "head_sha": "head-a",
+                        "patch_digest": "patch-a",
+                        "base_sha": "base-a",
+                    },
+                }
+            return {
+                "success": True,
+                "result": {
+                    "pr_number": 42,
+                    "head_sha": "aggregate-head",
+                    "patch_digest": "aggregate-patch",
+                    "base_sha": "base-main",
+                },
+            }
+        if tool_name == "post_merge_parent_sync":
+            return {
+                "success": True,
+                "result": {
+                    **arguments,
+                    "parent_commit_sha": arguments["expected_base_sha"],
+                    "remote_head_sha": arguments["expected_base_sha"],
+                    "ancestry_proof": (
+                        f"ancestor:{arguments['merged_head_sha']}->{arguments['expected_base_sha']}"
+                    ),
+                },
+            }
+        if tool_name == "chainlink_issue_close":
+            return {
+                "success": True,
+                "result": {
+                    "issue_id": arguments["issue_id"],
+                    "receipt_id": "issue-close-receipt",
+                },
+            }
+        if tool_name == "post_merge_changelog":
+            return {
+                "success": True,
+                "result": {
+                    **arguments,
+                    "commit_sha": "changelog-commit",
+                },
+            }
+        if tool_name == "post_merge_push":
+            return {
+                "success": True,
+                "result": {
+                    **arguments,
+                    "push_receipt_id": "push-receipt",
+                    "observed_remote_head": arguments["pushed_commit"],
+                    "ancestry_proof": (
+                        f"ancestor:{arguments['pushed_commit']}->{arguments['pushed_commit']}"
+                    ),
+                },
+            }
         if tool_name == "merge_pr":
             return {"success": True, "result": {"merged": True}}
         return {"success": True, "result": None}
@@ -3377,6 +3438,7 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
         max_events=5,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     parent_root = tmp_path / "ordered-e2e-run"
@@ -3648,6 +3710,7 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
 
@@ -3739,6 +3802,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     verified: list[tuple[str, str, str, str]] = []
@@ -3834,6 +3898,7 @@ def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Pat
         poll_interval=0.001,
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
+        chainlink_issue_id=1052,
     )
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["aggregate-child"].update(
@@ -4039,6 +4104,7 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
         poll_interval=0.001,
         max_base_revalidations=1,
         keep_alive_on_waiting=False,
+        chainlink_issue_id=1052,
     )
     run_tl_loop(
         "serialized-run",
@@ -4280,6 +4346,7 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
         poll_interval=0.001,
         review_model_choice=_review_choice(backend),
         keep_alive_on_waiting=False,
+        chainlink_issue_id=1052,
     )
     run_tl_loop(
         "conflict-run",

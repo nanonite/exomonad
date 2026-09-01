@@ -34,7 +34,7 @@ from tl_loop.loop.driver import (
     run_tl_loop,
 )
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse
-from tl_loop.state.schema import Verdict
+from tl_loop.state.schema import RepositoryIdentity, Verdict
 
 
 class HarnessError(RuntimeError):
@@ -366,6 +366,7 @@ class ControllerScenario:
             record.pr_number = int(pr["number"])
             record.head_sha = head_sha
             self.leaves[record.pr_number] = record
+            self._merge_local(record)
             self._put(
                 record.owner,
                 "agent.notify_parent",
@@ -513,6 +514,88 @@ class ControllerScenario:
             self.api.merge(record.pr_number)
         record.merged = True
 
+    def _parent_worktree(self, parent_branch: str) -> Path:
+        if parent_branch == "main":
+            return self.repo
+        owner = parent_branch.removeprefix("main.")
+        try:
+            return self.owner_worktrees[owner]
+        except KeyError as error:
+            raise HarnessError(
+                f"no aggregate worktree for parent branch {parent_branch!r}"
+            ) from error
+
+    def _post_merge_parent_sync(self, arguments: JsonObject) -> JsonObject:
+        branch = str(arguments["parent_branch"])
+        worktree = self._parent_worktree(branch)
+        git(worktree, "fetch", "origin", branch)
+        local_head = git(worktree, "rev-parse", "HEAD")
+        remote_head = git(worktree, "rev-parse", f"origin/{branch}")
+        if local_head != remote_head:
+            raise HarnessError(
+                f"parent branch {branch} is not synchronized: {local_head} != {remote_head}"
+            )
+        try:
+            git(
+                worktree,
+                "merge-base",
+                "--is-ancestor",
+                str(arguments["merged_head_sha"]),
+                local_head,
+            )
+        except HarnessError as error:
+            raise HarnessError("parent sync lost aggregate ancestry") from error
+        return {
+            **arguments,
+            "parent_commit_sha": local_head,
+            "remote_head_sha": remote_head,
+            "ancestry_proof": f"ancestor:{arguments['merged_head_sha']}->{local_head}",
+        }
+
+    def _post_merge_changelog(self, arguments: JsonObject) -> JsonObject:
+        branch = str(arguments["parent_branch"])
+        worktree = self._parent_worktree(branch)
+        expected = str(arguments["expected_base_sha"])
+        if git(worktree, "rev-parse", "HEAD") != expected:
+            raise HarnessError("changelog recovery observed a moved parent branch")
+        changelog = worktree / "CHANGELOG.md"
+        existing = changelog.read_text(encoding="utf-8") if changelog.exists() else ""
+        marker = f"- ordered aggregate {arguments['child_id']}\n"
+        if marker not in existing:
+            changelog.write_text(existing + marker, encoding="utf-8")
+            git(worktree, "add", "CHANGELOG.md")
+            git(
+                worktree,
+                "-c",
+                "user.name=ordered-e2e",
+                "-c",
+                "user.email=ordered-e2e@example.com",
+                "commit",
+                "-m",
+                f"Record {arguments['child_id']} aggregate",
+            )
+        return {**arguments, "commit_sha": git(worktree, "rev-parse", "HEAD")}
+
+    def _post_merge_push(self, arguments: JsonObject) -> JsonObject:
+        branch = str(arguments["parent_branch"])
+        worktree = self._parent_worktree(branch)
+        pushed = str(arguments["pushed_commit"])
+        if git(worktree, "rev-parse", "HEAD") != pushed:
+            raise HarnessError("bookkeeping push received a different local commit")
+        git(worktree, "push", "origin", f"HEAD:{branch}")
+        git(worktree, "fetch", "origin", branch)
+        remote_head = git(worktree, "rev-parse", f"origin/{branch}")
+        if remote_head != pushed:
+            raise HarnessError(
+                "bookkeeping push did not update the authoritative remote head"
+            )
+        return {
+            **arguments,
+            "push_receipt_id": f"push-{arguments['child_id']}-{arguments['lane_epoch']}",
+            "observed_remote_head": remote_head,
+            "ancestry_proof": f"ancestor:{pushed}->{remote_head}",
+        }
+
     def _call_tool(
         self,
         role: str,
@@ -570,11 +653,14 @@ class ControllerScenario:
             thread.start()
             return {"success": True, "result": {"agent_id": leaf_name}}
         if tool_name == "file_pr":
-            owner = name
+            title = str(arguments.get("title", ""))
+            owner = title.removeprefix("Aggregate ").split(" into ", 1)[0]
+            if owner not in self.owner_worktrees:
+                raise HarnessError(f"aggregate publication has unknown owner {owner!r}")
             branch = self.owner_branches[owner]
             base = str(arguments.get("base_branch") or "main")
-            base_sha = git(self.repo, "rev-parse", base)
-            head_sha = git(self.repo, "rev-parse", branch)
+            base_sha = git(self._parent_worktree(base), "rev-parse", "HEAD")
+            head_sha = git(self.owner_worktrees[owner], "rev-parse", "HEAD")
             record = AggregateRecord(
                 owner,
                 branch,
@@ -588,7 +674,12 @@ class ControllerScenario:
                 pr = self.api.create_pr(owner, branch, base)
             record.pr_number = int(pr["number"])
             if pr.get("head", {}).get("sha") != head_sha:
-                raise HarnessError(f"Forgejo head differs from local aggregate {owner}")
+                raise HarnessError(
+                    f"Forgejo head differs from local aggregate {owner}: "
+                    f"forgejo={pr.get('head', {}).get('sha')} local={head_sha} "
+                    f"branch={branch} base={base} "
+                    f"remote={git(self.owner_worktrees[owner], 'ls-remote', 'origin', branch)!r}"
+                )
             self.aggregates[record.pr_number] = record
             self._publish_or_hold(record, self.parent_streams[owner])
             return {
@@ -600,6 +691,20 @@ class ControllerScenario:
                     "base_sha": base_sha,
                 },
             }
+        if tool_name == "post_merge_parent_sync":
+            return {"success": True, "result": self._post_merge_parent_sync(arguments)}
+        if tool_name == "chainlink_issue_close":
+            return {
+                "success": True,
+                "result": {
+                    "issue_id": arguments["issue_id"],
+                    "receipt_id": f"issue-close-{arguments['issue_id']}",
+                },
+            }
+        if tool_name == "post_merge_changelog":
+            return {"success": True, "result": self._post_merge_changelog(arguments)}
+        if tool_name == "post_merge_push":
+            return {"success": True, "result": self._post_merge_push(arguments)}
         if tool_name == "watcher_pr_state":
             number = int(arguments["pr_number"])
             record = self.leaves.get(number) or self.aggregates.get(number)
@@ -827,6 +932,8 @@ def main() -> None:
             run_id="ordered-root",
             branch="main",
             worktree=repo,
+            chainlink_issue_id=1052,
+            repository_identity=RepositoryIdentity(api.owner, api.repo, "main"),
             source=root_source,
             effects=effects,
         )

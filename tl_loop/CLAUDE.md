@@ -284,7 +284,12 @@ and original base. `CodeReviewEvidence` is head/patch-bound, while
 `IntegrationEvidence` is base/head/tree/CI-bound. The centralized integration
 transition table rejects illegal lifecycle edges; base invalidation enters
 `NEEDS_BASE_REVALIDATION`, while head invalidation enters aggregate repair.
-Legacy sub-TL plans without `order` remain one order-1 stage.
+The controller activates only the persisted current numeric stage: its
+same-order children run concurrently, and the next stage cannot activate until
+every child in the current stage has completed its own integration and
+post-merge recovery. Stable child ID order controls aggregate integration,
+independent of dispatch or review completion order. Legacy sub-TL plans without
+`order` remain one order-1 stage.
 
 Branches use the coordinate form `{parent}.{name}`. A child PR targets its
 parent branch, recorded as the child slice `base_ref`. Run state records the

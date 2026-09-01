@@ -16,6 +16,7 @@ from tl_loop.state.schema import (
     CI_STATUS_VALUES,
     ActionKind,
     ActionPhase,
+    GateStatus,
     ObservationProvenance,
     RunState,
     SliceState,
@@ -211,6 +212,13 @@ def _derive_run_action(
         else reviewer_max_rounds
     )
     integration = state.integration
+    if integration.candidates:
+        return _derive_candidate_run_action(
+            state,
+            reviewer_max_rounds=effective_reviewer_max_rounds,
+            review_freshness_window_secs=review_freshness_window_secs,
+            now=now,
+        )
     if integration.lifecycle is IntegrationLifecycle.MERGED:
         pending_post_merge = next(
             (
@@ -318,6 +326,109 @@ def _derive_run_action(
                 first_wait = decision
         return first_wait or Quiescent("no_active_slices")
     return Quiescent("no_active_slices")
+
+
+def _derive_candidate_run_action(
+    state: RunState,
+    *,
+    reviewer_max_rounds: int | None,
+    review_freshness_window_secs: int | None,
+    now: datetime | None,
+) -> MergeDecision:
+    """Derive one aggregate action in stable persisted stage order."""
+    del reviewer_max_rounds, review_freshness_window_secs, now
+    if any(
+        gate.name in {"tl-integration-revalidation", "tl-integration-conflict"}
+        and gate.status is GateStatus.PENDING
+        for gate in state.gates
+    ):
+        return Quiescent("await_integration_gate")
+    candidate_ids = _candidate_ids_in_order(state)
+    if not candidate_ids:
+        return Quiescent("no_active_candidates")
+    for candidate_id in candidate_ids:
+        candidate = state.integration.candidates[candidate_id]
+        lifecycle = candidate.lifecycle
+        current = state.slices.get(candidate_id)
+        if lifecycle is IntegrationLifecycle.AGGREGATE_PR_OPEN:
+            return Quiescent("await_aggregate_review")
+        if lifecycle is IntegrationLifecycle.CODE_REVIEWED:
+            return Quiescent("await_integration_validation")
+        if lifecycle is IntegrationLifecycle.READY_FOR_INTEGRATION:
+            return ExternalIntent(
+                "validate_integration",
+                candidate.integration_owner_id or candidate_id,
+                {"head_sha": candidate.head_sha},
+            )
+        if lifecycle is IntegrationLifecycle.INTEGRATION_VALIDATED:
+            if not _aggregate_merge_gates_ready(candidate):
+                return Quiescent("await_integration_evidence")
+            return ExternalIntent(
+                "merge_aggregate",
+                candidate.integration_owner_id or candidate_id,
+                {"pr_number": candidate.aggregate_pr_number, "head_sha": candidate.head_sha},
+            )
+        if lifecycle in {
+            IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationLifecycle.INTEGRATION_CONFLICT,
+        }:
+            operation = (
+                "revalidate_base"
+                if lifecycle is IntegrationLifecycle.NEEDS_BASE_REVALIDATION
+                else "repair_aggregate"
+            )
+            return ExternalIntent(
+                operation,
+                candidate.integration_owner_id or candidate_id,
+                {"base_sha": candidate.validated_base_sha}
+                if operation == "revalidate_base"
+                else {"reason": "aggregate_repair"},
+            )
+        if lifecycle is IntegrationLifecycle.MERGING:
+            if (
+                current is not None
+                and current.status is SliceStatus.MERGED
+                and (
+                    current.post_merge is None
+                    or current.post_merge.phase is not PostMergePhase.COMPLETE
+                )
+            ):
+                return ExternalIntent("post_merge_recovery", candidate_id, {})
+            return Quiescent("await_merge_recovery")
+        if lifecycle is IntegrationLifecycle.MERGED:
+            if (
+                current is not None
+                and current.status is SliceStatus.MERGED
+                and (
+                    current.post_merge is None
+                    or current.post_merge.phase is not PostMergePhase.COMPLETE
+                )
+            ):
+                return ExternalIntent("post_merge_recovery", candidate_id, {})
+            continue
+        if lifecycle in {IntegrationLifecycle.FAILED, IntegrationLifecycle.PARKED}:
+            return Quiescent(f"aggregate_{lifecycle.value.lower()}")
+        if lifecycle is IntegrationLifecycle.CHILDREN_MERGED:
+            return ExternalIntent(
+                "publish_aggregate",
+                candidate.integration_owner_id or candidate_id,
+                {"patch_digest": candidate.aggregate_patch_digest},
+            )
+        return Quiescent("await_aggregate_progress")
+    return InternalTransition("terminal", "aggregate_merged")
+
+
+def _candidate_ids_in_order(state: RunState) -> tuple[str, ...]:
+    """Order candidate IDs by persisted stage order, then stable ID."""
+    ordered = [
+        candidate_id
+        for stage in state.ordered_stages
+        for candidate_id in sorted(stage.sub_tls)
+        if candidate_id in state.integration.candidates
+    ]
+    remaining = sorted(set(state.integration.candidates) - set(ordered))
+    return (*ordered, *remaining)
 
 
 def _derive_slice_action(
