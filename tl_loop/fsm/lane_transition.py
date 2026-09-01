@@ -7,6 +7,7 @@ from dataclasses import replace
 from .evidence import require_positive as _require_positive
 from .evidence import require_text as _require_text
 from .lane import (
+    LaneAbandoned,
     LaneBookkeepingStarted,
     LaneIntegrationStarted,
     LaneParkRequested,
@@ -21,7 +22,12 @@ from .lane import (
 def transition_lane(lane: LaneState, event: object) -> LaneState:
     """Apply one serialized lane event."""
     active = (LanePhase.IDLE, LanePhase.RESERVED, LanePhase.INTEGRATING, LanePhase.BOOKKEEPING)
-    if isinstance(event, LaneRecoveryRequested) and lane.phase in active:
+    if isinstance(event, LaneAbandoned) and lane.phase in active + (
+        LanePhase.RECOVERY,
+        LanePhase.PARKED,
+    ):
+        return _abandon_lane(lane, event)
+    if isinstance(event, LaneRecoveryRequested) and lane.phase in active + (LanePhase.PARKED,):
         _require_text(event.diagnostic, "lane recovery diagnostic")
         return replace(lane, phase=LanePhase.RECOVERY)
     if isinstance(event, LaneParkRequested) and lane.phase in active + (LanePhase.RECOVERY,):
@@ -45,6 +51,23 @@ def _park_lane(lane: LaneState, event: LaneParkRequested) -> LaneState:
     _require_text(event.cause, "lane park cause")
     _require_text(event.diagnostic, "lane park diagnostic")
     return replace(lane, phase=LanePhase.PARKED)
+
+
+def _abandon_lane(lane: LaneState, event: LaneAbandoned) -> LaneState:
+    _require_text(event.cause, "lane abandonment cause")
+    _require_text(event.diagnostic, "lane abandonment diagnostic")
+    return replace(
+        lane,
+        phase=LanePhase.IDLE,
+        child_id=None,
+        lane_epoch=None,
+        expected_base_sha=None,
+        head_sha=None,
+        merge_journal_id=None,
+        push_intent_id=None,
+        push_journal_id=None,
+        changelog_commit=None,
+    )
 
 
 def _reserve_lane(lane: LaneState, event: LaneReserved) -> LaneState:

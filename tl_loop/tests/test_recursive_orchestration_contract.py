@@ -10,6 +10,7 @@ import pytest
 
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.lane import (
+    LaneAbandoned,
     LaneBookkeepingStarted,
     LaneIntegrationStarted,
     LaneParkRequested,
@@ -407,6 +408,17 @@ def test_repository_lane_releases_only_after_bookkeeping_push() -> None:
     assert parked.phase is LanePhase.PARKED
     with pytest.raises(IllegalTransition):
         transition_lane(parked, LaneReserved("aggregate", 2, "base-2"))
+    recovered_parked = transition_lane(
+        parked, LaneRecoveryRequested("operator will resolve the parked lane")
+    )
+    assert recovered_parked.phase is LanePhase.RECOVERY
+    released = transition_lane(
+        recovered_parked, LaneAbandoned("operator_gate", "release resource lane")
+    )
+    assert released.phase is LanePhase.IDLE
+    reusable = transition_lane(released, LaneReserved("next-child", 2, "base-2"))
+    assert reusable.phase is LanePhase.RESERVED
+    assert reusable.child_id == "next-child"
 
 
 def test_repository_lanes_are_durable_and_reserve_atomically(tmp_path: Path) -> None:

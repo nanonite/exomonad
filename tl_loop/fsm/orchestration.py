@@ -10,6 +10,7 @@ from __future__ import annotations
 from .child import ChildKind, ChildRecord, TLOrchestrationEvent
 from .evidence import require_text as _require_text
 from .lane import (
+    LaneAbandoned,
     LaneBookkeepingStarted,
     LaneIntegrationStarted,
     LaneParkRequested,
@@ -224,6 +225,7 @@ __all__ = [
     "IllegalTransition",
     "IssueCloseConfirmed",
     "IssueClosePending",
+    "LaneAbandoned",
     "LaneBookkeepingStarted",
     "LaneIntegrationStarted",
     "LaneParkRequested",

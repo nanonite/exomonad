@@ -19,8 +19,8 @@ from tl_loop.loop.driver import (
     SubTLTask,
     TLLoopConfig,
     WorkPlan,
-    _open_integration_gate,
     _execute_direct_merge_intent,
+    _open_integration_gate,
 )
 from tl_loop.loop.reconcile import ExternalIntent
 from tl_loop.loop.review import (
@@ -380,8 +380,8 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
 
     assert result.slices["leaf"].status is SliceStatus.MERGED
     lane = store.load().integration.lanes["org/repo:main"]
-    assert lane.child_id == "leaf"
-    assert lane.phase is LanePhase.PARKED
+    assert lane.child_id is None
+    assert lane.phase is LanePhase.IDLE
     assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
         "watcher_pr_state",
         "merge_pr",
@@ -418,7 +418,7 @@ def test_direct_merge_waits_for_an_existing_parent_lane(tmp_path: Path) -> None:
     assert lane.phase is LanePhase.RESERVED
 
 
-def test_integration_gate_parks_the_owned_parent_lane(tmp_path: Path) -> None:
+def test_integration_gate_releases_the_owned_parent_lane(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
     state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
     transport = DirectMergeTransport()
@@ -436,9 +436,9 @@ def test_integration_gate_parks_the_owned_parent_lane(tmp_path: Path) -> None:
     )
 
     lane = result.integration.lanes["org/repo:main"]
-    assert lane.child_id == "leaf"
-    assert lane.phase is LanePhase.PARKED
-    assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.PARKED
+    assert lane.child_id is None
+    assert lane.phase is LanePhase.IDLE
+    assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.IDLE
 
 
 def test_missing_direct_compare_evidence_opens_integrity_gate(tmp_path: Path) -> None:

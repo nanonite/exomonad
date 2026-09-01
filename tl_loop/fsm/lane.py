@@ -102,6 +102,14 @@ class LaneParkRequested(TLOrchestrationEvent):
     diagnostic: str
 
 
+@dataclass(frozen=True)
+class LaneAbandoned(TLOrchestrationEvent):
+    """Release a lane after its child-owned work has entered a durable gate."""
+
+    cause: str
+    diagnostic: str
+
+
 def transition_lane(lane: LaneState, event: TLOrchestrationEvent) -> LaneState:
     """Compatibility entry point for the dedicated lane reducer."""
     from .lane_transition import transition_lane as apply_lane_transition
@@ -110,6 +118,7 @@ def transition_lane(lane: LaneState, event: TLOrchestrationEvent) -> LaneState:
 
 
 __all__ = [
+    "LaneAbandoned",
     "LaneBookkeepingStarted",
     "LaneIntegrationStarted",
     "LaneParkRequested",

@@ -41,9 +41,9 @@ from tl_loop.fsm.event import (
     TLEvent,
 )
 from tl_loop.fsm.lane import (
+    LaneAbandoned,
     LaneBookkeepingStarted,
     LaneIntegrationStarted,
-    LaneParkRequested,
     LanePhase,
     LaneRecoveryRequested,
     LaneReleased,
@@ -3721,7 +3721,7 @@ def _block_post_merge_recovery(
         slice_id,
         None,
         slice_state=blocked,
-        integration=_park_owned_lane_integration(
+        integration=_abandon_owned_lane_integration(
             state, blocked, state.integration, "post_merge_gate", bounded
         ),
     )
@@ -3826,9 +3826,7 @@ def _execute_direct_merge_intent(
     evidence = _direct_merge_evidence(current, watcher, config)
     if evidence is None:
         return _clear_action_for_reduction(store, state, current.id)
-    state, lane_ready = _ensure_candidate_lane(
-        state, current, evidence["base_sha"], store
-    )
+    state, lane_ready = _ensure_candidate_lane(state, current, evidence["base_sha"], store)
     if not lane_ready:
         return state
     state, lane_ready = _start_candidate_lane(
@@ -3968,11 +3966,10 @@ def _reconcile_unknown_merge(
         refreshed,
         current.id,
         unknown,
-        integration=_park_owned_lane_integration(
+        integration=_recover_owned_lane_integration(
             refreshed,
             refreshed.slices[current.id],
             refreshed.integration,
-            "merge_unknown",
             "direct merge outcome is unknown",
         ),
     )
@@ -4068,7 +4065,7 @@ def _adopt_direct_merge_result(
             slice_id,
             None,
             slice_state=cleared,
-            integration=_park_owned_lane_integration(
+            integration=_abandon_owned_lane_integration(
                 state, cleared, state.integration, "merge_failed", "direct merge failed"
             ),
         )
@@ -7144,14 +7141,14 @@ def _candidate_lane_blocked_by_other(state: RunState, current: SliceState) -> bo
     return lane is not None and lane.phase is not LanePhase.IDLE and lane.child_id != current.id
 
 
-def _park_owned_lane_integration(
+def _abandon_owned_lane_integration(
     state: RunState,
     current: SliceState,
     integration: IntegrationRuntimeState,
     cause: str,
     diagnostic: str,
 ) -> IntegrationRuntimeState:
-    """Park an owned lane when automatic progression reaches a durable gate."""
+    """Abandon an owned lane when a deterministic failure opens a durable gate."""
     try:
         repository, parent_branch = _candidate_lane_key(state, current)
     except ValueError:
@@ -7160,10 +7157,31 @@ def _park_owned_lane_integration(
     lane = integration.lanes.get(key)
     if lane is None or lane.child_id != current.id:
         return integration
-    if lane.phase in {LanePhase.IDLE, LanePhase.PARKED}:
+    if lane.phase is LanePhase.IDLE:
         return integration
-    parked = transition_lane(lane, LaneParkRequested(cause, diagnostic[:500]))
-    return replace(integration, lanes={**integration.lanes, key: parked})
+    abandoned = transition_lane(lane, LaneAbandoned(cause, diagnostic[:500]))
+    return replace(integration, lanes={**integration.lanes, key: abandoned})
+
+
+def _recover_owned_lane_integration(
+    state: RunState,
+    current: SliceState,
+    integration: IntegrationRuntimeState,
+    diagnostic: str,
+) -> IntegrationRuntimeState:
+    """Keep an uncertain effect lane owned until an operator resolves it."""
+    try:
+        repository, parent_branch = _candidate_lane_key(state, current)
+    except ValueError:
+        return integration
+    key = f"{repository}:{parent_branch}"
+    lane = integration.lanes.get(key)
+    if lane is None or lane.child_id != current.id:
+        return integration
+    if lane.phase in {LanePhase.IDLE, LanePhase.RECOVERY, LanePhase.PARKED}:
+        return integration
+    recovered = transition_lane(lane, LaneRecoveryRequested(diagnostic[:500]))
+    return replace(integration, lanes={**integration.lanes, key: recovered})
 
 
 def _ensure_candidate_lane(
@@ -7406,7 +7424,7 @@ def _open_integration_gate(
     integration = _persist_candidate_runtime(
         replace(state.integration, sub_tl_states=sub_states), task.name, candidate_runtime
     )
-    integration = _park_owned_lane_integration(
+    integration = _abandon_owned_lane_integration(
         state, updated, integration, "integration_gate", reason
     )
     state = store.checkpoint(
