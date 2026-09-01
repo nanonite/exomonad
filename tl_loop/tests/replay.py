@@ -17,6 +17,7 @@ from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.events.replay import ReplayEventSource
 from tl_loop.loop.driver import SubTLTask, TLLoopConfig, TLLoopError, WorkPlan, tl_run
 from tl_loop.loop.escalate import park
+from tl_loop.loop.journal import EffectJournal
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.policy import load_policy
@@ -149,6 +150,7 @@ def replay_fixture(
     journal: bool = False,
     production_clock: bool = False,
     session_mode: str | None = None,
+    crash_after: str | None = None,
 ) -> ReplayResult:
     """Run one committed event stream and return normalized observable output."""
     spec = _load_fixture(fixture)
@@ -189,29 +191,60 @@ def replay_fixture(
         session_mode=session_mode,
     )
     run_result = None
+    original_checkpoint = RunStore.checkpoint
+    crash_journal = (
+        EffectJournal(run_id, Path(root_dir) / run_id / "action-journal.json")
+        if crash_after is not None
+        else None
+    )
+    crashed = False
+
+    def crash_checkpoint(store: RunStore, *args: object, **kwargs: object) -> object:
+        nonlocal crashed
+        if (
+            crash_journal is not None
+            and not crashed
+            and store.run_id == run_id
+            and any(
+                entry.get("operation") == crash_after and entry.get("status") == "confirmed"
+                for entry in crash_journal.snapshot()
+            )
+        ):
+            crashed = True
+            raise RuntimeError(f"simulated process death after {crash_after}")
+        return original_checkpoint(store, *args, **kwargs)
+
+    if crash_after is not None:
+        RunStore.checkpoint = crash_checkpoint
     try:
-        run_result = tl_run(
-            {"run_id": run_id, "plan": plan},
-            config,
-            {"tokens": 0, "wall_seconds": 0},
-        )
-    except TLLoopError as error:
-        if not _bool(spec.get("expect_terminal_park"), "expect_terminal_park"):
-            raise
-        store = RunStore(run_id, root_dir=Path(root_dir))
-        state = store.load()
-        target_id = _string(spec["park_slice"], "park_slice")
-        target = state.slices.get(target_id)
-        if target is None:
-            raise TypeError(f"terminal replay slice {target_id!r} is missing")
-        judgment = ReplayJudgments()
-        park(
-            target,
-            judgment.cause_for_terminal_error(error),
-            store=store,
-            issue_creator=effects,
-            ledger=state.budgets,
-        )
+        try:
+            run_result = tl_run(
+                {"run_id": run_id, "plan": plan},
+                config,
+                {"tokens": 0, "wall_seconds": 0},
+            )
+        except TLLoopError as error:
+            if not _bool(spec.get("expect_terminal_park"), "expect_terminal_park"):
+                raise
+            store = RunStore(run_id, root_dir=Path(root_dir))
+            state = store.load()
+            target_id = _string(spec["park_slice"], "park_slice")
+            target = state.slices.get(target_id)
+            if target is None:
+                raise TypeError(f"terminal replay slice {target_id!r} is missing")
+            judgment = ReplayJudgments()
+            park(
+                target,
+                judgment.cause_for_terminal_error(error),
+                store=store,
+                issue_creator=effects,
+                ledger=state.budgets,
+            )
+    finally:
+        if crash_after is not None:
+            RunStore.checkpoint = original_checkpoint
+    if crash_after is not None and not crashed:
+        raise AssertionError(f"replay never reached crash boundary {crash_after!r}")
     store = RunStore(run_id, root_dir=Path(root_dir))
     state_path = store.path
     document = json.loads(state_path.read_text(encoding="utf-8"))
