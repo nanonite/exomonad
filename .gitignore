@@ -159,3 +159,4 @@ opencode-*.md
 docs/markdown
 docs/pdfs
 tl_loop.pyz
+pytest-of-*/
