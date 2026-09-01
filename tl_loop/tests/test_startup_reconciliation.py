@@ -1069,6 +1069,8 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
 
         def post_merge_changelog(self, **arguments: object) -> ToolResult:
             self.changelog_count += 1
+            if self.changelog_count > 1:
+                raise AssertionError("rebuilt recovery must not recommit the changelog")
             return ToolResult.from_raw(
                 {
                     "success": True,
@@ -1134,12 +1136,13 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
         recovered.slices["slice-a"].dispatch_error,
     )
     assert post_merge.evidence["changelog_generation"] == "1"
-    assert post_merge.evidence["changelog_commit_sha"] == "changelog-commit-2"
+    assert post_merge.evidence["changelog_commit_sha"] == "rebuilt-changelog-head"
+    assert post_merge.evidence["rebuild_commit_sha"] == "rebuilt-changelog-head"
     assert post_merge.evidence["rebuild_applied"] == "true"
     assert post_merge.evidence["rebuild_new_base_sha"] == "parent-after-remote-advance"
     assert client.parent_sync_count == 1
     assert client.remote_reconcile_count == 1
-    assert client.changelog_count == 2
+    assert client.changelog_count == 1
     assert client.push_count == 2
     assert len(client.chainlink_issue_close_calls) == 1
     assert len(journal.confirmed_entries("post_merge_remote_reconcile", "slice-a")) == 1

@@ -3261,15 +3261,37 @@ def _recover_remote_advance(
         payload["ancestry_proof"],
         reason,
     )
-    return _checkpoint_post_merge_event(
-        store,
+    rebuilt_slice = slice_transition(current, PostMergeEventObserved(rebuilt))
+    rebuilt_intent = _post_merge_key(
         state,
+        "changelog_rebuild",
         current.id,
-        rebuilt,
+        pr_number,
+        generation=generation,
+    )
+    committed_slice = slice_transition(
+        rebuilt_slice,
+        PostMergeEventObserved(
+            ChangelogCommitted(
+                current.id,
+                rebuilt_intent,
+                payload["rebuilt_commit_sha"],
+            )
+        ),
+    )
+    reconciliation = dict(committed_slice.reconciliation or {})
+    reconciliation.update(
         {
             "remote_head_sha": observed_remote_head,
             "merge_base_sha": observed_remote_head,
-        },
+        }
+    )
+    return _checkpoint_slice_action(
+        store,
+        state,
+        current.id,
+        None,
+        slice_state=replace(committed_slice, reconciliation=reconciliation),
     )
 
 

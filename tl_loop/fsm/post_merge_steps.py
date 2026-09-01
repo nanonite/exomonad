@@ -161,15 +161,25 @@ def _changelog_committed(state: PostMergeState, event: ChangelogCommitted) -> Po
     if state.phase is PostMergePhase.CHANGELOG_COMMITTED:
         _require_same(state, event, ("changelog_intent_id", "changelog_commit_sha"))
         return state
-    if state.evidence.get("rebuild_reason") and not state.evidence.get("rebuild_applied"):
-        raise ValueError("post-merge rebuild requires a new changelog intent")
     _require_phase(state, PostMergePhase.CHANGELOG_PENDING, "changelog commit")
+    if state.evidence.get("rebuild_reason") and not state.evidence.get("rebuild_applied"):
+        if state.evidence.get("changelog_intent_id") == event.intent_id:
+            raise ValueError("post-merge rebuild requires a fresh changelog intent")
+        return _with_evidence(
+            state,
+            PostMergePhase.CHANGELOG_COMMITTED,
+            {
+                "changelog_intent_id": event.intent_id,
+                "changelog_commit_sha": event.commit_sha,
+                "rebuild_applied": "true",
+                "rebuild_commit_sha": event.commit_sha,
+            },
+        )
     _require_evidence(state, "changelog_intent_id", event.intent_id)
-    return _with_evidence(
-        state,
-        PostMergePhase.CHANGELOG_COMMITTED,
-        {"changelog_commit_sha": event.commit_sha},
-    )
+    additions = {"changelog_commit_sha": event.commit_sha}
+    if state.evidence.get("rebuild_reason"):
+        additions["rebuild_commit_sha"] = event.commit_sha
+    return _with_evidence(state, PostMergePhase.CHANGELOG_COMMITTED, additions)
 
 
 def _parent_push_pending(state: PostMergeState, event: ParentPushPending) -> PostMergeState:

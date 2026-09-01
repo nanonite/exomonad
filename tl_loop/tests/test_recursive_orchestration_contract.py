@@ -575,14 +575,14 @@ def test_rebased_bookkeeping_requires_an_explicit_rebuild_generation() -> None:
     )
     assert isinstance(rebuilt, TLRunning)
     assert rebuilt.post_merge["aggregate"].phase is PostMergePhase.CHANGELOG_PENDING
-    with pytest.raises(IllegalTransition, match="new changelog intent"):
+    with pytest.raises(IllegalTransition, match="fresh changelog intent"):
         transition(rebuilt, ChangelogCommitted("aggregate", "log-intent", "rebuilt-commit"))
-    rebuilt = transition(rebuilt, ChangelogPending("aggregate", "rebuilt-log-intent", generation=1))
-    assert rebuilt.post_merge["aggregate"].evidence["rebuild_applied"] == "true"
     rebuilt = transition(
         rebuilt,
         ChangelogCommitted("aggregate", "rebuilt-log-intent", "rebuilt-log-commit"),
     )
+    assert rebuilt.post_merge["aggregate"].evidence["rebuild_applied"] == "true"
+    assert rebuilt.post_merge["aggregate"].evidence["rebuild_commit_sha"] == "rebuilt-log-commit"
     with pytest.raises(IllegalTransition, match="push intent must be fresh"):
         transition(
             rebuilt,
