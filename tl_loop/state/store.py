@@ -70,6 +70,7 @@ from .plan_manifest import (
     validate_manifest_revision,
 )
 from .schema import (
+    REDUCER_VERSION,
     SCHEMA_VERSION,
     ActionKind,
     ActionPhase,
@@ -198,6 +199,7 @@ class ResumeState:
     integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
     repository_identity: RepositoryIdentity | None = None
     state_version: int = 0
+    reducer_version: int = REDUCER_VERSION
     # Kept as one snapshot so restart cannot silently change policy precedence.
     reviewer_max_rounds: int | None = None
     reviewer_max_rounds_source: ReviewPolicySource | None = None
@@ -738,6 +740,7 @@ def checkpoint(
             _bind_slice_records(document["slices"], manifest)
         document["budgets"] = copy.deepcopy(encoded_budgets)
         document["events"] = {"last_consumed_offset": offset}
+        document.setdefault("reducer_version", REDUCER_VERSION)
         if current_order is not None:
             document["current_order"] = current_order
         if encoded_stages is not None:
@@ -769,6 +772,7 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
         integration=state.integration,
         repository_identity=state.repository_identity,
         state_version=state.state_version,
+        reducer_version=state.reducer_version,
         reviewer_max_rounds=state.reviewer_max_rounds,
         reviewer_max_rounds_source=state.reviewer_max_rounds_source,
         session_mode=state.session_mode,
@@ -797,6 +801,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "integration",
         "repository_identity",
         "state_version",
+        "reducer_version",
         "controller_epoch",
         "session_mode",
         "reviewer_max_rounds",
@@ -815,6 +820,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
         "gates": [],
         "events": {"last_consumed_offset": 0},
+        "reducer_version": REDUCER_VERSION,
     }
     if "session_mode" in root_spec:
         document["session_mode"] = root_spec["session_mode"]
@@ -1574,6 +1580,7 @@ def _decode(document: dict[str, object]) -> RunState:
         integration=integration,
         repository_identity=_decode_repository_identity(document.get("repository_identity")),
         state_version=cast(int, document.get("state_version", 0)),
+        reducer_version=cast(int, document.get("reducer_version", REDUCER_VERSION)),
         controller_epoch=cast(str | None, document.get("controller_epoch")),
         reviewer_max_rounds=cast(int | None, document.get("reviewer_max_rounds")),
         reviewer_max_rounds_source=(

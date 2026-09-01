@@ -30,6 +30,7 @@ BLOCK_CAUSE_VALUES = frozenset(
 )
 
 SCHEMA_VERSION = 4
+REDUCER_VERSION = 1
 
 
 class ReviewPolicySource(str, Enum):
@@ -469,6 +470,7 @@ RUN_KEYS = frozenset(
         "integration",
         "repository_identity",
         "state_version",
+        "reducer_version",
         "controller_epoch",
         "session_mode",
         "reviewer_max_rounds",
@@ -967,6 +969,7 @@ class RunState:
     integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
     repository_identity: RepositoryIdentity | None = None
     state_version: int = 0
+    reducer_version: int = 1
     controller_epoch: str | None = None
     session_mode: SessionMode | None = None
     # These two fields are one coupled snapshot. Both absent is the supported
@@ -1008,6 +1011,7 @@ def validate(doc: object) -> None:
     if "depth" in root:
         _non_negative_int(root, "depth", "run", errors)
     _nullable_non_negative_int(root, "state_version", "run", errors)
+    _nullable_positive_int(root, "reducer_version", "run", errors)
     _nullable_string(root, "controller_epoch", "run", errors)
     if root.get("session_mode") is not None:
         _enum_value(root, "session_mode", "run", SessionMode, errors)

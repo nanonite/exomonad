@@ -191,6 +191,7 @@ def envelope_document(event: EventEnvelope) -> dict[str, object]:
     return {
         "type": event.event_type,
         "run_seq": event.run_seq,
+        "event_id": event.event_id,
         "run_id": event.run_id,
         "agent_id": event.agent_id,
         "session_id": event.session_id,

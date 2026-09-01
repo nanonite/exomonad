@@ -35,6 +35,7 @@ from .recovery import (
     RecoveryOutcome,
     RecoveryTelemetryError,
 )
+from .replay import ReplayError, ReplayEventSource, ReplayTruncated, order_events
 from .stall import CiFailureAttribution, ReviewStallClassification, classify_review_stall
 
 __all__ = [
@@ -67,11 +68,15 @@ __all__ = [
     "RecoveryDimensions",
     "RecoveryOutcome",
     "RecoveryTelemetryError",
+    "ReplayError",
+    "ReplayEventSource",
+    "ReplayTruncated",
     "ReviewStallClassification",
     "SequenceStatus",
     "UnmappedEventType",
     "bridge_event",
     "classify_review_stall",
+    "order_events",
     "project",
     "project_ledger_event",
     "sequence_status",

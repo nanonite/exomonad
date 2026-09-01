@@ -215,11 +215,25 @@ class EventEnvelope:
     parent_agent_id: str | None = None
     task_blocked: TaskBlocked | None = None
     recovery_dimensions: RecoveryDimensions | None = None
+    event_id: str | None = None
 
     @property
     def reviewed_head(self) -> str | None:
         """Compatibility name used by the run-state slice schema."""
         return self.head_sha
+
+    @property
+    def identity(self) -> tuple[object, ...]:
+        """Return immutable identity used to audit duplicate delivery."""
+        return (
+            self.run_id,
+            self.run_seq,
+            self.event_id,
+            self.event_type,
+            self.slice_id,
+            self.invocation_id,
+            self.generation,
+        )
 
     @property
     def stall_classification(self) -> ReviewStallClassification | None:
@@ -283,6 +297,7 @@ def project(event: LedgerEventInput) -> EventEnvelope:
             if kind is EventKind.AGENT_RECOVERY_OUTCOME
             else None
         ),
+        event_id=_optional_string(event, "event_id", event_type),
     )
 
 

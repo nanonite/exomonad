@@ -168,6 +168,7 @@ from tl_loop.state.plan_manifest import (
 from tl_loop.state.review_validation import review_validation_disposition
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
+    REDUCER_VERSION,
     ActionKind,
     ActionPhase,
     ActionState,
@@ -784,6 +785,22 @@ class TLRunResult:
     consumed_events: tuple[int, ...]
     heartbeat_events: tuple[SyntheticHeartbeatEvent, ...] = ()
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    journal_entries: tuple[Mapping[str, object], ...] = ()
+
+    @property
+    def cursor(self) -> int:
+        """Return the exact durable ledger cursor reached by this invocation."""
+        return self.final_state.events.last_consumed_offset
+
+    @property
+    def reducer_version(self) -> int:
+        """Return the reducer contract used to produce this checkpoint."""
+        return self.final_state.reducer_version
+
+    @property
+    def recursive_position(self) -> object | None:
+        """Return the complete recursive FSM position, if this is recursive."""
+        return self.final_state.recursive_fsm
 
 
 def tl_run(
@@ -973,6 +990,11 @@ def run_tl_loop(
             root_state["controller_epoch"] = _controller_epoch(store.root_dir, run_id)
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
+    if state.reducer_version != REDUCER_VERSION:
+        raise TLLoopError(
+            f"checkpoint reducer_version {state.reducer_version} is incompatible "
+            f"with reducer {REDUCER_VERSION}"
+        )
     if state.plan_manifest is None:
         node_ids_by_name = {node.name: node.node_id for node in manifest.nodes}
         protected = {
@@ -1013,12 +1035,23 @@ def run_tl_loop(
         selected = replace(selected, ledger_run_id=effective_ledger_run_id)
     state = _ensure_canonical_scope(state, manifest, store)
     state = _release_canonical_scope(state, store)
-    state = _initialize_ordered_runtime(work_plan, state, store)
     effects_log: list[EffectIntent] = (
         EffectJournal(run_id, store.run_dir / "action-journal.json")
         if selected.ledger_run_id is not None
         else []
     )
+    if _is_terminal_phase(_phase_from_state(state)):
+        journal_entries = _journal_entries(effects_log)
+        return TLRunResult(
+            state,
+            (),
+            (),
+            (),
+            (),
+            {"reducer_version": state.reducer_version, "cursor": state.events.last_consumed_offset},
+            journal_entries,
+        )
+    state = _initialize_ordered_runtime(work_plan, state, store)
     try:
         state = _reconcile_action_journal(
             state,
@@ -1104,7 +1137,13 @@ def _recover_durable_write_failure(
             state.budgets,
             state.events.last_consumed_offset,
         )
-    return TLRunResult(state, tuple(effects_log), (), ())
+    return TLRunResult(
+        state,
+        tuple(effects_log),
+        (),
+        (),
+        journal_entries=_journal_entries(effects_log),
+    )
 
 
 def _recover_tool_unavailable(
@@ -1163,7 +1202,13 @@ def _recover_tool_unavailable(
             state.budgets,
             state.events.last_consumed_offset,
         )
-    return TLRunResult(state, tuple(effects_log), (), ())
+    return TLRunResult(
+        state,
+        tuple(effects_log),
+        (),
+        (),
+        journal_entries=_journal_entries(effects_log),
+    )
 
 
 def _initialize_ordered_runtime(plan: WorkPlan, state: RunState, store: RunStore) -> RunState:
@@ -1532,6 +1577,7 @@ def _run_loop(
             tuple(transitions),
             tuple(consumed),
             diagnostics=diagnostics.snapshot(),
+            journal_entries=_journal_entries(effects_log),
         )
     if not expected and not plan.sub_tls and not _is_terminal_phase(phase):
         if not isinstance(phase, RecursiveTLAllMerged):
@@ -1542,6 +1588,7 @@ def _run_loop(
             tuple(transitions),
             tuple(consumed),
             diagnostics=diagnostics.snapshot(),
+            journal_entries=_journal_entries(effects_log),
         )
 
     if not isinstance(
@@ -1588,6 +1635,7 @@ def _run_loop(
                 tuple(consumed),
                 tuple(heartbeat_events),
                 diagnostics.snapshot(),
+                _journal_entries(effects_log),
             )
         if config.cancel_event is not None and config.cancel_event.is_set():
             raise LoopCancelled(f"TL controller {run_id!r} was cancelled")
@@ -1663,11 +1711,17 @@ def _run_loop(
                     tuple(consumed),
                     tuple(heartbeat_events),
                     diagnostics.snapshot(),
+                    _journal_entries(effects_log),
                 )
             continue
         event_seq = event.run_seq
         if event_seq is None:
             raise TLLoopError(f"{event.event_type!r} has no run_seq")
+        if not replaying and event_seq <= state.events.last_consumed_offset:
+            diagnostics.filtered += 1
+            _ack_event(source, event, replaying, diagnostics)
+            state = store.load()
+            continue
         if not replaying:
             consumed.append(event_seq)
             diagnostics.received += 1
@@ -2018,6 +2072,7 @@ def _run_loop(
         tuple(consumed),
         tuple(heartbeat_events),
         diagnostics.snapshot(),
+        _journal_entries(effects_log),
     )
 
 
@@ -9255,6 +9310,15 @@ def _record_controller_event(
     return result
 
 
+def _journal_entries(
+    effects_log: list[EffectIntent],
+) -> tuple[Mapping[str, object], ...]:
+    """Expose journal evidence without allowing callers to mutate it."""
+    if not isinstance(effects_log, EffectJournal):
+        return ()
+    return effects_log.snapshot()
+
+
 def _invoke(
     operation: str,
     target: str,
@@ -9270,13 +9334,16 @@ def _invoke(
     intent = EffectIntent(operation, target, arguments, active)
     journal = effects_log if isinstance(effects_log, EffectJournal) else None
     try:
-        prior = journal.existing(intent) if journal and operation in MUTATING_OPERATIONS else None
+        probe = journal.probe(intent) if journal and operation in MUTATING_OPERATIONS else None
+        prior = probe.entry if probe is not None else None
     except DurableWriteError as error:
         raise error.with_context(operation=operation, target=target) from error
     if prior is not None:
         status = prior.get("status")
         if status in {"confirmed", "rejected"}:
-            result = journal.replay(prior)
+            if probe is None or probe.result is None:
+                raise TLLoopError(f"journal probe has no result for {operation} {target!r}")
+            result = probe.result
             if result.error_kind == "tool_unavailable":
                 raise ToolUnavailableError(operation, result, target=target)
             if result.success is False and raise_on_failure:

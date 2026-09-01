@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .plan_manifest import ManifestError, PlanManifest, build_legacy_manifest
-from .schema import SCHEMA_VERSION
+from .schema import REDUCER_VERSION, SCHEMA_VERSION
 from .serialization import dumps as dumps_json
 
 MIGRATION_VERSION = 1
@@ -70,6 +70,7 @@ def migrate_checkpoint_document(
     document.setdefault("budgets", {"ledger": {"tokens": 0, "wall_seconds": 0}})
     document.setdefault("gates", [])
     document.setdefault("events", {"last_consumed_offset": 0})
+    document.setdefault("reducer_version", REDUCER_VERSION)
     changes.extend(_migrate_slices(document["slices"]))
     if document.get("plan_manifest") is None:
         try:

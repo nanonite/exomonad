@@ -83,6 +83,29 @@ def test_confirmed_action_replays_after_journal_reload(tmp_path) -> None:
     assert reloaded.replay(entry).result == {"merge_id": "m-1"}
 
 
+def test_effect_probe_is_typed_and_never_dispatches(tmp_path) -> None:
+    path = tmp_path / "action-journal.json"
+    journal = EffectJournal("run-a", path)
+    intent = _intent()
+
+    absent = journal.probe(intent)
+    assert absent.status == "absent"
+    assert not absent.is_terminal
+
+    journal.append(intent)
+    intended = journal.probe(intent)
+    assert intended.status == "intended"
+    assert intended.result is None
+    assert not intended.is_terminal
+
+    journal.mark_result(intent, ToolResult.from_raw({"success": True, "result": {"id": "m-1"}}))
+    confirmed = journal.probe(intent)
+    assert confirmed.status == "confirmed"
+    assert confirmed.is_terminal
+    assert confirmed.result is not None
+    assert confirmed.result.result == {"id": "m-1"}
+
+
 def test_resume_action_is_journaled_and_replayed_after_reload(tmp_path) -> None:
     path = tmp_path / "action-journal.json"
     intent = _intent(operation="resume_pr")

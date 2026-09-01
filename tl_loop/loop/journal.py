@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.recovery import (
@@ -44,10 +45,33 @@ MUTATING_OPERATIONS = frozenset(
     }
 )
 RECOVERY_INTENT_STATES = frozenset({"intended", "confirmed", "unknown", "reconciled"})
+EffectProbeStatus = Literal[
+    "absent",
+    "intended",
+    "unknown",
+    "confirmed",
+    "rejected",
+    "compensated",
+    "not_dispatched",
+]
 
 
 class ActionJournalError(RuntimeError):
     """Raised when the durable idempotency record cannot be trusted."""
+
+
+@dataclass(frozen=True)
+class EffectProbe:
+    """Typed observation of a journaled effect before any retry decision."""
+
+    status: EffectProbeStatus
+    entry: Mapping[str, object] | None
+    result: ToolResult | None = None
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the journal has an authoritative effect outcome."""
+        return self.status in {"confirmed", "rejected"}
 
 
 def stable_action_key(
@@ -98,6 +122,24 @@ class EffectJournal(list[Any]):
             ),
             None,
         )
+
+    def probe(self, intent: Any) -> EffectProbe:
+        """Read one effect outcome without dispatching or guessing."""
+        entry = self.existing(intent)
+        if entry is None:
+            return EffectProbe("absent", None)
+        raw_status = entry.get("status")
+        if raw_status not in {
+            "intended",
+            "unknown",
+            "confirmed",
+            "rejected",
+            "compensated",
+            "not_dispatched",
+        }:
+            raise ActionJournalError(f"invalid action journal status {raw_status!r}")
+        result = self.replay(entry) if raw_status in {"confirmed", "rejected"} else None
+        return EffectProbe(cast(EffectProbeStatus, raw_status), entry, result)
 
     def append(self, intent: Any) -> None:
         if isinstance(intent, RecoveryIntent):
@@ -218,6 +260,10 @@ class EffectJournal(list[Any]):
             for entry in self._read()
             if isinstance(entry, dict) and entry.get("status") in {"intended", "unknown"}
         ]
+
+    def snapshot(self) -> tuple[dict[str, object], ...]:
+        """Return a defensive snapshot for replay traces and diagnostics."""
+        return tuple(json.loads(dumps_json(entry)) for entry in self._read())
 
     def confirmed_entries(self, operation: str, target: str) -> list[dict[str, object]]:
         """Confirmed entries for one operation+target.

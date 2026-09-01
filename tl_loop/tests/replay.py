@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +14,7 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
+from tl_loop.events.replay import ReplayEventSource
 from tl_loop.loop.driver import TLLoopConfig, TLLoopError, tl_run
 from tl_loop.loop.escalate import park
 from tl_loop.select.capability import CapabilityMap
@@ -28,24 +29,7 @@ POLICY_ROOT = Path(__file__).parent / "fixtures"
 REPLAY_REVIEW_NOW = datetime(2026, 8, 11, 17, 20, tzinfo=UTC)
 
 
-@dataclass
-class RecordedEventSource:
-    """FIFO source backed only by a committed JSON event stream."""
-
-    events: list[EventEnvelope]
-    acknowledged: list[int] = field(default_factory=list)
-
-    def get(self, timeout: float | None = None) -> EventEnvelope:
-        del timeout
-        if not self.events:
-            raise TypeError("recorded replay stream ended before TL completion")
-        return self.events.pop(0)
-
-    def acknowledge(self, event: EventEnvelope) -> int:
-        if event.run_seq is None:
-            raise TypeError("recorded event has no run_seq")
-        self.acknowledged.append(event.run_seq)
-        return event.run_seq
+RecordedEventSource = ReplayEventSource
 
 
 @dataclass
@@ -98,14 +82,29 @@ class ReplayResult:
 
     actions: tuple[dict[str, object], ...]
     state: dict[str, object]
+    durable_state: dict[str, object] = field(default_factory=dict)
+    cursor: int = 0
+    reducer_version: int = 1
+    transitions: tuple[dict[str, object], ...] = ()
+    journal_entries: tuple[Mapping[str, object], ...] = ()
+    acknowledged: tuple[int, ...] = ()
 
 
-def replay_fixture(fixture: str | Path, root_dir: str | Path) -> ReplayResult:
+def replay_fixture(
+    fixture: str | Path,
+    root_dir: str | Path,
+    *,
+    event_transform: Callable[[list[EventEnvelope]], Sequence[EventEnvelope]] | None = None,
+    max_events: int = 32,
+    journal: bool = False,
+) -> ReplayResult:
     """Run one committed event stream and return normalized observable output."""
     spec = _load_fixture(fixture)
     run_id = _string(spec.get("run_id"), "run_id")
     plan = _mapping(spec["plan"], "plan")
     events = _events(spec["events"])
+    if event_transform is not None:
+        events = list(event_transform(events))
     transport = RecordingTransport(
         current_head=_string(spec.get("current_head", "head-a"), "current_head")
     )
@@ -125,13 +124,19 @@ def replay_fixture(fixture: str | Path, root_dir: str | Path) -> ReplayResult:
         capabilities=capability,
         max_workers=2,
         max_leaves=1,
-        max_events=32,
+        max_events=max_events,
         poll_interval=0.001,
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
         review_clock=lambda: REPLAY_REVIEW_NOW,
+        ledger_run_id=run_id if journal else None,
     )
+    run_result = None
     try:
-        tl_run({"run_id": run_id, "plan": plan}, config, {"tokens": 0, "wall_seconds": 0})
+        run_result = tl_run(
+            {"run_id": run_id, "plan": plan},
+            config,
+            {"tokens": 0, "wall_seconds": 0},
+        )
     except TLLoopError as error:
         if not _bool(spec.get("expect_terminal_park"), "expect_terminal_park"):
             raise
@@ -164,7 +169,36 @@ def replay_fixture(fixture: str | Path, root_dir: str | Path) -> ReplayResult:
         )
         for tool_name, arguments in transport.calls
     )
-    return ReplayResult(actions, normalize_state(cast(dict[str, object], document)))
+    normalized = normalize_state(cast(dict[str, object], document))
+    durable = normalize_durable_state(cast(dict[str, object], document))
+    if run_result is None:
+        events_document = cast(dict[str, object], document["events"])
+        return ReplayResult(
+            actions,
+            normalized,
+            durable_state=durable,
+            cursor=cast(int, events_document["last_consumed_offset"]),
+            acknowledged=tuple(source.acknowledged),
+        )
+    transitions = tuple(
+        {
+            "event_seq": transition.event_seq,
+            "event_type": transition.event_type,
+            "before": transition.before.value,
+            "after": transition.after.value,
+        }
+        for transition in run_result.transitions
+    )
+    return ReplayResult(
+        actions,
+        normalized,
+        durable_state=durable,
+        cursor=run_result.cursor,
+        reducer_version=run_result.reducer_version,
+        transitions=transitions,
+        journal_entries=run_result.journal_entries,
+        acknowledged=tuple(source.acknowledged),
+    )
 
 
 def expected_actions(fixture: str | Path) -> tuple[dict[str, object], ...]:
@@ -193,16 +227,30 @@ def normalize_state(document: Mapping[str, object]) -> dict[str, object]:
     return cast(dict[str, object], _normalize_value("", document))
 
 
-def _normalize_value(key: str, value: object) -> object:
+def normalize_durable_state(document: Mapping[str, object]) -> dict[str, object]:
+    """Normalize volatile values while retaining every durable replay field."""
+    return cast(dict[str, object], _normalize_value("", document, strip_runtime=False))
+
+
+def _normalize_value(key: str, value: object, *, strip_runtime: bool = True) -> object:
     if isinstance(value, Mapping):
         return {
-            name: _normalize_value(name, item)
+            name: _normalize_value(name, item, strip_runtime=strip_runtime)
             for name, item in sorted(value.items())
-            if name not in {"plan_manifest", "manifest_node_id", "manifest_revision"}
-            and not (key == "fsm" and name in {"kind", "payload"})
+            if not strip_runtime
+            or (
+                name
+                not in {
+                    "plan_manifest",
+                    "manifest_node_id",
+                    "manifest_revision",
+                    "reducer_version",
+                }
+                and not (key == "fsm" and name in {"kind", "payload"})
+            )
         }
     if isinstance(value, list):
-        return [_normalize_value(key, item) for item in value]
+        return [_normalize_value(key, item, strip_runtime=strip_runtime) for item in value]
     if key in {"dispatch_intent_id", "intent_id"}:
         return "<intent-id>"
     if key == "dispatch_started_at":
@@ -258,6 +306,7 @@ __all__ = [
     "ReplayResult",
     "expected_actions",
     "expected_state",
+    "normalize_durable_state",
     "normalize_state",
     "replay_fixture",
 ]
