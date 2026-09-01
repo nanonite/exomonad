@@ -1,0 +1,150 @@
+{
+  "name": "recursive-recovery",
+  "run_id": "replay-recovery",
+  "policy": "selector_policy_cheap_only.toml",
+  "chainlink_issue_id": 1053,
+  "repository_identity": {
+    "owner": "org",
+    "repo": "repo",
+    "base_branch": "main"
+  },
+  "plan": {
+    "sub_tls": [
+      {
+        "name": "stage-a",
+        "order": 1,
+        "integration": {"aggregate_pr_required": false},
+        "plan": {
+          "leaves": [
+            {
+              "name": "child-leaf",
+              "task": "implement the recursive child",
+              "boundary": ["src/child.py"]
+            }
+          ]
+        }
+      },
+      {
+        "name": "stage-b",
+        "order": 2,
+        "integration": {"aggregate_pr_required": false},
+        "plan": {}
+      }
+    ]
+  },
+  "events": [],
+  "child_events": {
+    "stage-a": [
+      {
+        "schema_version": 1,
+        "event_id": "recovery-1",
+        "id": "recovery-1",
+        "event_time": "2026-08-11T17:20:00Z",
+        "observed_at": "2026-08-11T17:20:00Z",
+        "run_seq": 1,
+        "type": "agent.notify_parent",
+        "agent_id": "child-leaf",
+        "run_id": null,
+        "session_id": "recovery-session",
+        "lifecycle_state": "observed",
+        "data": {
+          "shadow_event": {
+            "kind": "child_spawned",
+            "slug": "child-leaf",
+            "branch": "main.stage-a.child-leaf",
+            "agent_type": "codex/gpt-luna",
+            "intent_id": "child-intent"
+          }
+        }
+      },
+      {
+        "schema_version": 1,
+        "event_id": "recovery-2",
+        "id": "recovery-2",
+        "event_time": "2026-08-11T17:20:01Z",
+        "observed_at": "2026-08-11T17:20:01Z",
+        "run_seq": 2,
+        "type": "pr.filed",
+        "agent_id": "child-leaf",
+        "run_id": null,
+        "session_id": "recovery-session",
+        "lifecycle_state": "observed",
+        "data": {
+          "pr_number": 42,
+          "head_sha": "head-a",
+          "head_branch": "main.stage-a.child-leaf",
+          "base_branch": "main.stage-a",
+          "invocation_id": "child-invocation"
+        }
+      },
+      {
+        "schema_version": 1,
+        "event_id": "recovery-3",
+        "id": "recovery-3",
+        "event_time": "2026-08-11T17:20:02Z",
+        "observed_at": "2026-08-11T17:20:02Z",
+        "run_seq": 3,
+        "type": "pr.review",
+        "agent_id": "review-pr-42-codex",
+        "run_id": null,
+        "session_id": "recovery-session",
+        "lifecycle_state": "observed",
+        "data": {
+          "slice_id": "child-leaf",
+          "pr_number": 42,
+          "head_sha": "head-a",
+          "review_head_sha": "head-a",
+          "review_id": 7,
+          "verdict": "GO",
+          "reviewer_agent_id": "review-pr-42-codex",
+          "reviewer_account_authenticated": true,
+          "reviewer_identity_unresolved": false,
+          "reviewer_identity_error": null,
+          "findings": []
+        }
+      },
+      {
+        "schema_version": 1,
+        "event_id": "recovery-4",
+        "id": "recovery-4",
+        "event_time": "2026-08-11T17:20:03Z",
+        "observed_at": "2026-08-11T17:20:03Z",
+        "run_seq": 4,
+        "type": "ci.status_changed",
+        "agent_id": "child-leaf",
+        "run_id": null,
+        "session_id": "recovery-session",
+        "lifecycle_state": "observed",
+        "data": {"pr_number": 42, "head_sha": "head-a", "status": "success"}
+      },
+      {
+        "schema_version": 1,
+        "event_id": "recovery-5",
+        "id": "recovery-5",
+        "event_time": "2026-08-11T17:20:04Z",
+        "observed_at": "2026-08-11T17:20:04Z",
+        "run_seq": 5,
+        "type": "agent.notify_parent",
+        "agent_id": "child-leaf",
+        "run_id": null,
+        "session_id": "recovery-session",
+        "lifecycle_state": "observed",
+        "data": {"shadow_event": {"kind": "child_completed", "slug": "child-leaf"}}
+      },
+      {
+        "schema_version": 1,
+        "event_id": "recovery-6",
+        "id": "recovery-6",
+        "event_time": "2026-08-11T17:20:05Z",
+        "observed_at": "2026-08-11T17:20:05Z",
+        "run_seq": 6,
+        "type": "agent.notify_parent",
+        "agent_id": null,
+        "run_id": null,
+        "session_id": "recovery-session",
+        "lifecycle_state": "observed",
+        "data": {"shadow_event": {"kind": "all_children_done"}}
+      }
+    ]
+  }
+}

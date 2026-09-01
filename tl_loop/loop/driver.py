@@ -844,6 +844,30 @@ def run_tl_loop(
     _validate_mode(selected, effects)
     store = RunStore(run_id, Path(root_dir))
     existing_state = store.load() if store.path.exists() else None
+    if existing_state is not None and _is_terminal_phase(_phase_from_state(existing_state)):
+        if existing_state.reducer_version != REDUCER_VERSION:
+            raise TLLoopError(
+                f"checkpoint reducer_version {existing_state.reducer_version} is incompatible "
+                f"with reducer {REDUCER_VERSION}"
+            )
+        terminal_ledger_id = selected.ledger_run_id or existing_state.ledger_run_id
+        terminal_log: list[EffectIntent] = (
+            EffectJournal(run_id, store.run_dir / "action-journal.json")
+            if terminal_ledger_id is not None
+            else []
+        )
+        return TLRunResult(
+            existing_state,
+            (),
+            (),
+            (),
+            (),
+            {
+                "reducer_version": existing_state.reducer_version,
+                "cursor": existing_state.events.last_consumed_offset,
+            },
+            _journal_entries(terminal_log),
+        )
     manifest: PlanManifest
     if existing_state is not None and existing_state.plan_manifest is not None:
         persisted_manifest = existing_state.plan_manifest
@@ -1040,17 +1064,6 @@ def run_tl_loop(
         if selected.ledger_run_id is not None
         else []
     )
-    if _is_terminal_phase(_phase_from_state(state)):
-        journal_entries = _journal_entries(effects_log)
-        return TLRunResult(
-            state,
-            (),
-            (),
-            (),
-            (),
-            {"reducer_version": state.reducer_version, "cursor": state.events.last_consumed_offset},
-            journal_entries,
-        )
     state = _initialize_ordered_runtime(work_plan, state, store)
     try:
         state = _reconcile_action_journal(

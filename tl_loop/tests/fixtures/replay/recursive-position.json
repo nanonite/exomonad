@@ -1,0 +1,53 @@
+{
+  "name": "recursive-position",
+  "run_id": "replay-recursive",
+  "policy": "selector_policy_cheap_only.toml",
+  "active": true,
+  "plan": {
+    "leaves": [
+      {
+        "name": "root-leaf",
+        "task": "retain direct root work while ordered children run",
+        "boundary": ["src/root.py"]
+      }
+    ],
+    "sub_tls": [
+      {
+        "name": "stage-a",
+        "order": 1,
+        "agent_id": "stage-a-owner",
+        "integration": {"aggregate_pr_required": false},
+        "plan": {
+          "leaves": [
+            {
+              "name": "child-leaf",
+              "task": "retain direct child work for the replay checkpoint",
+              "boundary": ["src/child.py"]
+            }
+          ],
+          "sub_tls": [
+            {
+              "name": "nested-a",
+              "order": 1,
+              "integration": {"aggregate_pr_required": false},
+              "plan": {}
+            },
+            {
+              "name": "nested-b",
+              "order": 1,
+              "integration": {"aggregate_pr_required": false},
+              "plan": {}
+            }
+          ]
+        }
+      },
+      {
+        "name": "stage-b",
+        "order": 2,
+        "integration": {"aggregate_pr_required": false},
+        "plan": {}
+      }
+    ]
+  },
+  "events": []
+}

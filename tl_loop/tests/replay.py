@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -15,13 +15,13 @@ from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.events.replay import ReplayEventSource
-from tl_loop.loop.driver import TLLoopConfig, TLLoopError, tl_run
+from tl_loop.loop.driver import SubTLTask, TLLoopConfig, TLLoopError, WorkPlan, tl_run
 from tl_loop.loop.escalate import park
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.policy import load_policy
 from tl_loop.shadow.diff import normalize_arguments
-from tl_loop.state.schema import ParkCause
+from tl_loop.state.schema import ParkCause, RepositoryIdentity
 from tl_loop.state.store import RunStore
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "replay"
@@ -62,6 +62,56 @@ class RecordingTransport:
                 "success": True,
                 "result": {"issue_id": self.issue_id},
             }
+        if tool_name == "chainlink_issue_close":
+            issue_id = arguments.get("issue_id")
+            return {
+                "success": True,
+                "result": {"issue_id": issue_id, "receipt_id": f"issue-close:{issue_id}"},
+            }
+        if tool_name == "merge_pr":
+            return {
+                "success": True,
+                "result": {"merged": True, "pr_number": arguments.get("pr_number")},
+            }
+        if tool_name == "post_merge_parent_sync":
+            merged_head = arguments.get("merged_head_sha")
+            parent_commit = "parent-after-merge"
+            return {
+                "success": True,
+                "result": {
+                    **arguments,
+                    "repository": "org/repo",
+                    "parent_commit_sha": parent_commit,
+                    "remote_head_sha": parent_commit,
+                    "ancestry_proof": f"ancestor:{merged_head}->{parent_commit}",
+                },
+            }
+        if tool_name == "post_merge_issue_close":
+            return {
+                "success": True,
+                "result": {
+                    **arguments,
+                    "receipt_id": f"issue-close:{arguments.get('issue_id')}",
+                },
+            }
+        if tool_name == "post_merge_changelog":
+            return {
+                "success": True,
+                "result": {**arguments, "commit_sha": "changelog-commit"},
+            }
+        if tool_name == "post_merge_push":
+            pushed = arguments.get("pushed_commit")
+            return {
+                "success": True,
+                "result": {
+                    **arguments,
+                    "push_receipt_id": "push-receipt",
+                    "observed_remote_head": pushed,
+                    "ancestry_proof": f"ancestor:{pushed}->{pushed}",
+                },
+            }
+        if tool_name == "resume_pr":
+            return {"success": True, "result": {"resumed": True}}
         return {"success": True, "result": None}
 
 
@@ -97,11 +147,16 @@ def replay_fixture(
     event_transform: Callable[[list[EventEnvelope]], Sequence[EventEnvelope]] | None = None,
     max_events: int = 32,
     journal: bool = False,
+    production_clock: bool = False,
+    session_mode: str | None = None,
 ) -> ReplayResult:
     """Run one committed event stream and return normalized observable output."""
     spec = _load_fixture(fixture)
     run_id = _string(spec.get("run_id"), "run_id")
-    plan = _mapping(spec["plan"], "plan")
+    plan = _plan_with_replay_sources(
+        _mapping(spec["plan"], "plan"),
+        spec.get("child_events"),
+    )
     events = _events(spec["events"])
     if event_transform is not None:
         events = list(event_transform(events))
@@ -127,8 +182,11 @@ def replay_fixture(
         max_events=max_events,
         poll_interval=0.001,
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
-        review_clock=lambda: REPLAY_REVIEW_NOW,
+        review_clock=None if production_clock else lambda: REPLAY_REVIEW_NOW,
         ledger_run_id=run_id if journal else None,
+        chainlink_issue_id=_optional_positive_int(spec.get("chainlink_issue_id")),
+        repository_identity=_repository_identity(spec.get("repository_identity")),
+        session_mode=session_mode,
     )
     run_result = None
     try:
@@ -278,6 +336,55 @@ def _events(value: object) -> list[EventEnvelope]:
     if not isinstance(value, list):
         raise TypeError("fixture.events must be an array")
     return [project(cast(dict[str, object], item)) for item in value]
+
+
+def _plan_with_replay_sources(value: Mapping[str, object], child_events: object) -> WorkPlan:
+    """Attach independently replayable event streams to recursive child scopes."""
+    plan = WorkPlan.from_mapping(value)
+    if child_events is None:
+        return plan
+    if not isinstance(child_events, Mapping):
+        raise TypeError("fixture.child_events must be an object")
+
+    def bind(current: WorkPlan) -> WorkPlan:
+        children: list[SubTLTask] = []
+        for task in current.sub_tls:
+            child_plan = task.plan
+            if isinstance(child_plan, Mapping):
+                child_plan = WorkPlan.from_mapping(child_plan)
+            if not isinstance(child_plan, WorkPlan):
+                raise TypeError(f"sub-TL {task.name!r} has no WorkPlan")
+            source_value = child_events.get(task.name)
+            source = task.source
+            if source_value is not None:
+                source = RecordedEventSource(_events(source_value))
+            children.append(replace(task, plan=bind(child_plan), source=source))
+        return replace(current, sub_tls=tuple(children))
+
+    return bind(plan)
+
+
+def _optional_positive_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise TypeError("fixture.chainlink_issue_id must be a positive integer or null")
+    return value
+
+
+def _repository_identity(value: object) -> RepositoryIdentity | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("fixture.repository_identity must be an object or null")
+    fields = {name: value.get(name) for name in ("owner", "repo", "base_branch")}
+    if any(not isinstance(item, str) or not item for item in fields.values()):
+        raise TypeError("fixture.repository_identity requires owner, repo, and base_branch")
+    return RepositoryIdentity(
+        fields["owner"],
+        fields["repo"],
+        fields["base_branch"],
+    )
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
