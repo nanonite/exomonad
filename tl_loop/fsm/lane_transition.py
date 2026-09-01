@@ -92,11 +92,14 @@ def _start_bookkeeping(lane: LaneState, event: LaneBookkeepingStarted) -> LaneSt
         (event.push_intent_id, "push intent ID"),
         (event.push_journal_id, "push journal ID"),
         (event.changelog_commit, "changelog commit"),
+        (event.expected_base_sha, "bookkeeping base SHA"),
     ):
         _require_text(value, f"lane {field}")
     if lane.phase is LanePhase.BOOKKEEPING:
         if lane.merge_journal_id != event.merge_journal_id:
             raise ValueError("lane bookkeeping merge journal does not match reservation")
+        if lane.expected_base_sha != event.expected_base_sha:
+            raise ValueError("lane bookkeeping base does not match reservation")
         return replace(
             lane,
             push_intent_id=event.push_intent_id,
@@ -110,6 +113,7 @@ def _start_bookkeeping(lane: LaneState, event: LaneBookkeepingStarted) -> LaneSt
         push_intent_id=event.push_intent_id,
         push_journal_id=event.push_journal_id,
         changelog_commit=event.changelog_commit,
+        expected_base_sha=event.expected_base_sha,
     )
 
 

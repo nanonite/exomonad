@@ -43,6 +43,7 @@ from tl_loop.fsm.event import (
 from tl_loop.fsm.lane import (
     LaneBookkeepingStarted,
     LaneIntegrationStarted,
+    LaneParkRequested,
     LanePhase,
     LaneRecoveryRequested,
     LaneReleased,
@@ -3054,6 +3055,7 @@ def _advance_post_merge_boundary(
                     _required_merge_identity(
                         evidence, ("changelog_commit_sha",), "changelog commit"
                     ),
+                    _required_current_base(current),
                 ),
             )
         if post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING:
@@ -3713,7 +3715,16 @@ def _block_post_merge_recovery(
 ) -> RunState:
     bounded = reason[:500]
     blocked = replace(state.slices[slice_id], dispatch_error=bounded, action=None)
-    blocked_state = _checkpoint_slice_action(store, state, slice_id, None, slice_state=blocked)
+    blocked_state = _checkpoint_slice_action(
+        store,
+        state,
+        slice_id,
+        None,
+        slice_state=blocked,
+        integration=_park_owned_lane_integration(
+            state, blocked, state.integration, "post_merge_gate", bounded
+        ),
+    )
     gate_name = f"tl-post-merge-{slice_id}"
     gate = next(
         (candidate for candidate in blocked_state.gates if candidate.name == gate_name), None
@@ -3815,6 +3826,17 @@ def _execute_direct_merge_intent(
     evidence = _direct_merge_evidence(current, watcher, config)
     if evidence is None:
         return _clear_action_for_reduction(store, state, current.id)
+    state, lane_ready = _ensure_candidate_lane(
+        state, current, evidence["base_sha"], store
+    )
+    if not lane_ready:
+        return state
+    state, lane_ready = _start_candidate_lane(
+        state, state.slices[current.id], evidence["head_sha"], store
+    )
+    if not lane_ready:
+        return state
+    current = state.slices[current.id]
     arguments = {
         "pr_number": current.pr_number,
         "expected_base_sha": evidence["base_sha"],
@@ -3941,7 +3963,19 @@ def _reconcile_unknown_merge(
         )
     refreshed = store.load()
     unknown = replace(action, phase=ActionPhase.UNKNOWN)
-    updated = _checkpoint_slice_action(store, refreshed, current.id, unknown)
+    updated = _checkpoint_slice_action(
+        store,
+        refreshed,
+        current.id,
+        unknown,
+        integration=_park_owned_lane_integration(
+            refreshed,
+            refreshed.slices[current.id],
+            refreshed.integration,
+            "merge_unknown",
+            "direct merge outcome is unknown",
+        ),
+    )
     _record_convergence_event(
         current.id,
         tracker.action_outcome(updated, intent, outcome="unknown", error=str(error)),
@@ -4027,7 +4061,17 @@ def _adopt_direct_merge_result(
     """Adopt a merge only after a second authoritative merged snapshot."""
     current = state.slices[slice_id]
     if result is not None and result.success is False:
-        return _clear_action_for_reduction(store, state, slice_id)
+        cleared = replace(current, action=None)
+        return _checkpoint_slice_action(
+            store,
+            state,
+            slice_id,
+            None,
+            slice_state=cleared,
+            integration=_park_owned_lane_integration(
+                state, cleared, state.integration, "merge_failed", "direct merge failed"
+            ),
+        )
     watcher = _invoke(
         "watcher_pr_state",
         slice_id,
@@ -7100,6 +7144,28 @@ def _candidate_lane_blocked_by_other(state: RunState, current: SliceState) -> bo
     return lane is not None and lane.phase is not LanePhase.IDLE and lane.child_id != current.id
 
 
+def _park_owned_lane_integration(
+    state: RunState,
+    current: SliceState,
+    integration: IntegrationRuntimeState,
+    cause: str,
+    diagnostic: str,
+) -> IntegrationRuntimeState:
+    """Park an owned lane when automatic progression reaches a durable gate."""
+    try:
+        repository, parent_branch = _candidate_lane_key(state, current)
+    except ValueError:
+        return integration
+    key = f"{repository}:{parent_branch}"
+    lane = integration.lanes.get(key)
+    if lane is None or lane.child_id != current.id:
+        return integration
+    if lane.phase in {LanePhase.IDLE, LanePhase.PARKED}:
+        return integration
+    parked = transition_lane(lane, LaneParkRequested(cause, diagnostic[:500]))
+    return replace(integration, lanes={**integration.lanes, key: parked})
+
+
 def _ensure_candidate_lane(
     state: RunState,
     current: SliceState,
@@ -7213,6 +7279,7 @@ def _ensure_bookkeeping_lane(
             push_journal_id
             or _required_merge_identity(evidence, ("push_journal_id",), "push journal"),
             _required_merge_identity(evidence, ("changelog_commit_sha",), "changelog commit"),
+            expected_base_sha,
         )
         state = store.transition_lane(repository, parent_branch, event)
     return state, state.integration.lanes[
@@ -7338,6 +7405,9 @@ def _open_integration_gate(
     )
     integration = _persist_candidate_runtime(
         replace(state.integration, sub_tl_states=sub_states), task.name, candidate_runtime
+    )
+    integration = _park_owned_lane_integration(
+        state, updated, integration, "integration_gate", reason
     )
     state = store.checkpoint(
         _phase_from_state(state),
@@ -7795,7 +7865,7 @@ def _integrate_one_candidate(
         effects,
         effects_log,
     )
-    lane_base_sha = candidate_runtime.aggregate_original_base_sha or base_sha
+    lane_base_sha = base_sha
     state, lane_ready = _ensure_candidate_lane(state, current, lane_base_sha, store)
     if not lane_ready:
         return state
@@ -7922,7 +7992,7 @@ def _checkpoint_aggregate_merged(
         )
     aggregate_merge_key = current.action.intent_id
     aggregate_head = integration.aggregate_head_sha or integration.head_sha
-    aggregate_base = integration.aggregate_original_base_sha or integration.validated_base_sha
+    aggregate_base = integration.validated_base_sha or integration.aggregate_original_base_sha
     if not aggregate_head or not aggregate_base:
         return _block_post_merge_recovery(
             store,

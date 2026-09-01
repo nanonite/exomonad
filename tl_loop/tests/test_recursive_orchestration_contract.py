@@ -288,6 +288,7 @@ def test_repository_lane_releases_only_after_bookkeeping_push() -> None:
             "push-intent-1",
             "push-journal-1",
             "bookkeeping-1",
+            "base-2",
         ),
     )
     receipt = _receipt(
@@ -295,12 +296,13 @@ def test_repository_lane_releases_only_after_bookkeeping_push() -> None:
         "bookkeeping-1",
         push_intent_id="push-intent-1",
         push_journal_id="push-journal-1",
-        expected_base_sha="base-1",
+        expected_base_sha="base-2",
     )
     released = transition_lane(bookkeeping, LaneReleased("aggregate", receipt))
 
     assert integrating.phase is LanePhase.INTEGRATING
     assert bookkeeping.phase is LanePhase.BOOKKEEPING
+    assert bookkeeping.expected_base_sha == "base-2"
     assert released.phase is LanePhase.IDLE
     assert released.repository == "repo"
     assert released.last_push_receipt_id == "receipt-aggregate"
@@ -389,7 +391,7 @@ def test_repository_lane_releases_only_after_bookkeeping_push() -> None:
                 "other-commit",
                 push_intent_id="push-intent-1",
                 push_journal_id="push-journal-1",
-                expected_base_sha="base-1",
+                expected_base_sha="base-2",
             ),
         ),
     )

@@ -11,11 +11,15 @@ import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import JsonObject
+from tl_loop.fsm.lane import LanePhase, LaneReserved
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
     EffectIntent,
+    SubTLTask,
     TLLoopConfig,
+    WorkPlan,
+    _open_integration_gate,
     _execute_direct_merge_intent,
 )
 from tl_loop.loop.reconcile import ExternalIntent
@@ -375,6 +379,9 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
     )
 
     assert result.slices["leaf"].status is SliceStatus.MERGED
+    lane = store.load().integration.lanes["org/repo:main"]
+    assert lane.child_id == "leaf"
+    assert lane.phase is LanePhase.PARKED
     assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
         "watcher_pr_state",
         "merge_pr",
@@ -389,6 +396,49 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
         "expected_patch_digest": "patch-a",
         "expected_merge_tree_sha": "tree-a",
     }
+
+
+def test_direct_merge_waits_for_an_existing_parent_lane(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.transition_lane("org/repo", "main", LaneReserved("other", 1, "base-a"))
+    transport = DirectMergeTransport(snapshots=[_snapshot(head_sha="abc123")])
+    effects_log: list[EffectIntent] = []
+
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
+        TLLoopConfig(poll_interval=0.001),
+        effects_log,
+    )
+
+    assert [name for name, _ in transport.calls if name == "merge_pr"] == []
+    lane = result.integration.lanes["org/repo:main"]
+    assert lane.child_id == "other"
+    assert lane.phase is LanePhase.RESERVED
+
+
+def test_integration_gate_parks_the_owned_parent_lane(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
+    transport = DirectMergeTransport()
+
+    result = _open_integration_gate(
+        SubTLTask("leaf", WorkPlan()),
+        state,
+        TLLoopConfig(poll_interval=0.001),
+        EffectClient(transport),
+        store,
+        [],
+        gate_name="tl-integration-conflict",
+        lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+        reason="conflicting parent update",
+    )
+
+    lane = result.integration.lanes["org/repo:main"]
+    assert lane.child_id == "leaf"
+    assert lane.phase is LanePhase.PARKED
+    assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.PARKED
 
 
 def test_missing_direct_compare_evidence_opens_integrity_gate(tmp_path: Path) -> None:

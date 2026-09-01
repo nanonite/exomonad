@@ -76,6 +76,7 @@ class LaneBookkeepingStarted(TLOrchestrationEvent):
     push_intent_id: str
     push_journal_id: str
     changelog_commit: str
+    expected_base_sha: str
 
 
 @dataclass(frozen=True)
