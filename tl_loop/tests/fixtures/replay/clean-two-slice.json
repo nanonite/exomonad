@@ -408,6 +408,15 @@
       }
     },
     {
+      "operation": "root_branch_finalize",
+      "arguments": {
+        "branch": "main",
+        "force": false,
+        "include_dead": false,
+        "sweep": false
+      }
+    },
+    {
       "operation": "emit_controller_event",
       "arguments": {
         "event_type": "tl.phase_changed",

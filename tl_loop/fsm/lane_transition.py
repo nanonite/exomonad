@@ -30,7 +30,11 @@ def transition_lane(lane: LaneState, event: object) -> LaneState:
         return _reserve_lane(lane, event)
     if lane.phase is LanePhase.RESERVED and isinstance(event, LaneIntegrationStarted):
         return _start_integration(lane, event)
-    if lane.phase is LanePhase.INTEGRATING and isinstance(event, LaneBookkeepingStarted):
+    if lane.phase is LanePhase.INTEGRATING and isinstance(event, LaneIntegrationStarted):
+        return _reenter_integration(lane, event)
+    if lane.phase in (LanePhase.INTEGRATING, LanePhase.BOOKKEEPING) and isinstance(
+        event, LaneBookkeepingStarted
+    ):
         return _start_bookkeeping(lane, event)
     if lane.phase is LanePhase.BOOKKEEPING and isinstance(event, LaneReleased):
         return _release_lane(lane, event)
@@ -47,6 +51,10 @@ def _reserve_lane(lane: LaneState, event: LaneReserved) -> LaneState:
     _require_text(event.child_id, "lane child ID")
     _require_positive(event.lane_epoch, "lane epoch")
     _require_text(event.expected_base_sha, "lane expected base SHA")
+    if lane.phase is LanePhase.RECOVERY and lane.child_id not in {None, event.child_id}:
+        raise ValueError("recovery lane remains owned by its unresolved child")
+    if event.lane_epoch <= lane.last_lane_epoch:
+        raise ValueError("lane epoch must advance beyond the previous reservation")
     return replace(
         lane,
         phase=LanePhase.RESERVED,
@@ -58,6 +66,7 @@ def _reserve_lane(lane: LaneState, event: LaneReserved) -> LaneState:
         push_intent_id=None,
         push_journal_id=None,
         changelog_commit=None,
+        last_lane_epoch=event.lane_epoch,
     )
 
 
@@ -65,6 +74,15 @@ def _start_integration(lane: LaneState, event: LaneIntegrationStarted) -> LaneSt
     _require_lane_child(lane, event.child_id)
     _require_text(event.head_sha, "lane integration head SHA")
     return replace(lane, phase=LanePhase.INTEGRATING, head_sha=event.head_sha)
+
+
+def _reenter_integration(lane: LaneState, event: LaneIntegrationStarted) -> LaneState:
+    """Accept an identical integration observation during replay."""
+    _require_lane_child(lane, event.child_id)
+    _require_text(event.head_sha, "lane integration head SHA")
+    if lane.head_sha != event.head_sha:
+        raise ValueError("lane integration head does not match reservation")
+    return lane
 
 
 def _start_bookkeeping(lane: LaneState, event: LaneBookkeepingStarted) -> LaneState:
@@ -76,6 +94,15 @@ def _start_bookkeeping(lane: LaneState, event: LaneBookkeepingStarted) -> LaneSt
         (event.changelog_commit, "changelog commit"),
     ):
         _require_text(value, f"lane {field}")
+    if lane.phase is LanePhase.BOOKKEEPING:
+        if lane.merge_journal_id != event.merge_journal_id:
+            raise ValueError("lane bookkeeping merge journal does not match reservation")
+        return replace(
+            lane,
+            push_intent_id=event.push_intent_id,
+            push_journal_id=event.push_journal_id,
+            changelog_commit=event.changelog_commit,
+        )
     return replace(
         lane,
         phase=LanePhase.BOOKKEEPING,

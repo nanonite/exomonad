@@ -339,6 +339,17 @@ class RecordingTransport:
                     ),
                 },
             }
+        if tool_name == "root_branch_finalize":
+            return {
+                "success": True,
+                "result": {
+                    "branch": arguments["branch"],
+                    "local_head_sha": "root-head",
+                    "remote_head_sha": "root-head",
+                    "ancestry_proof": "ancestor:root-before->root-head",
+                    "fast_forward": True,
+                },
+            }
         if tool_name == "merge_pr":
             return {"success": True, "result": {"merged": True}}
         return {"success": True, "result": None}
@@ -769,10 +780,12 @@ def test_active_loop_dispatches_direct_children_and_merges_leaf(
     assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
+        "root_branch_finalize",
     ]
     assert _effect_operations(result) == [
         "spawn_worker",
         "spawn_leaf",
+        "root_branch_finalize",
     ]
     assert all(intent.executed for intent in result.effects)
     assert result.final_state.fsm.phase is TLPhase.TLDone
@@ -1477,7 +1490,7 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
         root_dir=tmp_path,
     )
 
-    assert _effect_names(transport) == ["spawn_leaf", "spawn_reviewer"]
+    assert _effect_names(transport) == ["spawn_leaf", "spawn_reviewer", "root_branch_finalize"]
     assert sum(name == "spawn_reviewer" for name, _ in transport.calls) == 1
     reviewer_args = next(
         arguments for name, arguments in transport.calls if name == "spawn_reviewer"
@@ -2881,6 +2894,7 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
     assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
+        "root_branch_finalize",
     ]
     spawn_worker_call = next(
         arguments for name, arguments in transport.calls if name == "spawn_worker"
@@ -2923,7 +2937,7 @@ def test_tl_run_width_gate_dispatches_next_ready_slice_after_completion(
 
     result = tl_run({"run_id": run_id, "plan": plan}, config, BudgetLedger(0, 0))
 
-    assert _effect_names(transport) == ["spawn_worker", "spawn_worker"]
+    assert _effect_names(transport) == ["spawn_worker", "spawn_worker", "root_branch_finalize"]
     assert result.final_state.fsm.phase is TLPhase.TLDone
     assert result.final_state.budgets.role_reserved == {"worker": 500}
 
@@ -2974,6 +2988,7 @@ def test_canonical_completion_and_parent_notification_are_idempotent(
     assert _effect_names(transport) == [
         "spawn_worker",
         "spawn_leaf",
+        "root_branch_finalize",
     ]
     assert result.final_state.fsm.phase is TLPhase.TLDone
     assert source.acknowledged == [1, 2, 3, 4, 5, 6]
@@ -4245,6 +4260,7 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
         max_base_revalidations=1,
         keep_alive_on_waiting=False,
         chainlink_issue_id=1052,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     run_tl_loop(
         "serialized-run",
@@ -4487,6 +4503,7 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
         review_model_choice=_review_choice(backend),
         keep_alive_on_waiting=False,
         chainlink_issue_id=1052,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     run_tl_loop(
         "conflict-run",
@@ -4590,6 +4607,7 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
         poll_interval=0.001,
         max_integration_repairs=0,
         keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     run_tl_loop(
         "gate-run",

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, TypeAlias, cast
 
+from tl_loop.fsm.lane import LanePhase, LaneState
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState
@@ -502,6 +503,26 @@ INTEGRATION_KEYS = frozenset(
         "merge_attempts",
         "base_revalidation_count",
         "stage_verification",
+        "lanes",
+    }
+)
+LANE_KEYS = frozenset(
+    {
+        "repository",
+        "parent_branch",
+        "phase",
+        "child_id",
+        "lane_epoch",
+        "expected_base_sha",
+        "head_sha",
+        "merge_journal_id",
+        "push_intent_id",
+        "push_journal_id",
+        "changelog_commit",
+        "last_push_receipt_id",
+        "last_remote_head",
+        "last_ancestry_proof",
+        "last_lane_epoch",
     }
 )
 CHILD_RECOVERY_KEYS = frozenset(
@@ -939,6 +960,7 @@ class IntegrationRuntimeState:
     base_revalidation_count: int = 0
     stage_verification: str = "pending"
     candidates: Mapping[str, IntegrationCandidateState] = field(default_factory=dict)
+    lanes: Mapping[str, LaneState] = field(default_factory=dict)
 
 
 SliceMap: TypeAlias = Mapping[str, SliceState]
@@ -1200,6 +1222,7 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
             ("run.integration.stage_verification", "is not a recognised verification result")
         )
     _validate_integration_evidence_contract(integration, "run.integration", errors)
+    _validate_lanes(integration.get("lanes"), "run.integration.lanes", errors)
     candidates = integration.get("candidates")
     if candidates is not None:
         if not isinstance(candidates, dict):
@@ -1274,6 +1297,49 @@ def _validate_integration_evidence_contract(
         for key in ("head_sha", "patch_digest", "validated_base_sha", "merge_tree_sha"):
             if not value.get(key):
                 errors.append((f"{path}.{key}", "is required before merge"))
+
+
+def _validate_lanes(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+    """Validate durable repository/parent-branch lane records."""
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        errors.append((path, "must be an object"))
+        return
+    for key, raw_lane in value.items():
+        lane_path = f"{path}[{key!r}]"
+        if not isinstance(key, str) or not key:
+            errors.append((path, "keys must be non-empty strings"))
+            continue
+        lane = _object(raw_lane, lane_path, LANE_KEYS, errors)
+        if lane is None:
+            continue
+        for field_name in ("repository", "parent_branch"):
+            _non_empty_string(lane, field_name, lane_path, errors)
+        repository = lane.get("repository")
+        parent_branch = lane.get("parent_branch")
+        if (
+            isinstance(repository, str)
+            and isinstance(parent_branch, str)
+            and key != f"{repository}:{parent_branch}"
+        ):
+            errors.append((lane_path, "lane key must match repository and parent branch"))
+        _enum_value(lane, "phase", lane_path, LanePhase, errors)
+        for field_name in (
+            "child_id",
+            "expected_base_sha",
+            "head_sha",
+            "merge_journal_id",
+            "push_intent_id",
+            "push_journal_id",
+            "changelog_commit",
+            "last_push_receipt_id",
+            "last_remote_head",
+            "last_ancestry_proof",
+        ):
+            _nullable_string(lane, field_name, lane_path, errors)
+        _nullable_positive_int(lane, "lane_epoch", lane_path, errors)
+        _non_negative_int(lane, "last_lane_epoch", lane_path, errors)
 
 
 def _slice_map(value: object, errors: list[tuple[str, str]]) -> dict[str, dict[str, object]] | None:

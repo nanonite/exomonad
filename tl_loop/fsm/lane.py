@@ -39,12 +39,15 @@ class LaneState:
     last_push_receipt_id: str | None = None
     last_remote_head: str | None = None
     last_ancestry_proof: str | None = None
+    last_lane_epoch: int = 0
 
     def __post_init__(self) -> None:
         _require_text(self.repository, "lane repository")
         _require_text(self.parent_branch, "lane parent branch")
         if not isinstance(self.phase, LanePhase):
             raise TypeError("lane phase must be a LanePhase")
+        if type(self.last_lane_epoch) is not int or self.last_lane_epoch < 0:
+            raise ValueError("last lane epoch must be a non-negative integer")
 
 
 @dataclass(frozen=True)

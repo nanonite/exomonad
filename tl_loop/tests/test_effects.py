@@ -220,6 +220,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         expected_base_sha="base",
         pushed_commit="commit",
     )
+    client.root_branch_finalize(branch="main", working_dir=".")
     client.close_worker_pane(pane_id="%1")
     client.spawn_codex(
         task="sample",

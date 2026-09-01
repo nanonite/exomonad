@@ -38,8 +38,8 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkTimerStatus (..),
     ChainlinkTimerStop (..),
   )
-import ExoMonad.Guest.Tools.CleanupLeaf (CleanupLeaf (..))
 import ExoMonad.Guest.Tools.Cleanup (Cleanup (..))
+import ExoMonad.Guest.Tools.CleanupLeaf (CleanupLeaf (..))
 import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
@@ -56,8 +56,9 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
   )
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
-import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.ResumeBlockedLeaf (ResumeBlockedLeaf (..))
+import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
+import ExoMonad.Guest.Tools.RootBranchFinalize (RootBranchFinalize)
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
@@ -94,7 +95,6 @@ rootRedispatchMessage toolName =
     <> "\nIf a worker is blocked, use send_tmux_message to inject a clarification into the worker's pane. See Worker Correction Loop in .exo/roles/devswarm/context/root.md.\n"
     <> "If neither path fits, re-decompose with spawn_leaf or spawn_worker.\n"
     <> "See CLAUDE.md § Tech Lead Praxis for the full protocol."
-
 
 data RootSpawnLeaf
 
@@ -184,6 +184,7 @@ data Tools mode = Tools
     postMergeRemoteReconcile :: mode :- PostMergeRemoteReconcile,
     postMergeChangelog :: mode :- PostMergeChangelog,
     postMergePush :: mode :- PostMergePush,
+    rootBranchFinalize :: mode :- RootBranchFinalize,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
     spawnCodex :: mode :- RootSpawnCodex,
     sessionStatus :: mode :- SessionStatus,
@@ -242,6 +243,7 @@ config =
             postMergeRemoteReconcile = mkHandler @PostMergeRemoteReconcile,
             postMergeChangelog = mkHandler @PostMergeChangelog,
             postMergePush = mkHandler @PostMergePush,
+            rootBranchFinalize = mkHandler @RootBranchFinalize,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,
             spawnCodex = mkHandler @RootSpawnCodex,
             sessionStatus = mkHandler @SessionStatus,

@@ -9,14 +9,15 @@ module TLRole (config, Tools) where
 
 import Data.Aeson (FromJSON (..), ToJSON (..), object, withObject, (.:), (.=))
 import Data.Aeson qualified as Aeson
-import Data.ByteString.Lazy qualified as BSL
 import Data.Aeson.KeyMap qualified as KM
+import Data.ByteString.Lazy qualified as BSL
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import ExoMonad
 import ExoMonad.Effects.Tl qualified as Tl
 import ExoMonad.Guest.ReviewHandoff (reviewHandoffInstructions)
+import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
 import ExoMonad.Guest.Tools.Agents (ListAgents (..))
 import ExoMonad.Guest.Tools.Chainlink
   ( ChainlinkBlock (..),
@@ -39,8 +40,8 @@ import ExoMonad.Guest.Tools.Chainlink
     ChainlinkTimerStatus (..),
     ChainlinkTimerStop (..),
   )
-import ExoMonad.Guest.Tools.CleanupLeaf (CleanupLeaf (..))
 import ExoMonad.Guest.Tools.Cleanup (Cleanup (..))
+import ExoMonad.Guest.Tools.CleanupLeaf (CleanupLeaf (..))
 import ExoMonad.Guest.Tools.CleanupOrphan (CleanupOrphan (..))
 import ExoMonad.Guest.Tools.CleanupReviewerLeaf (CleanupReviewerLeaf (..))
 import ExoMonad.Guest.Tools.CloseIssueAndCleanup (CloseIssueAndCleanup (..))
@@ -66,8 +67,9 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.ResolveLivePrForSlice (ResolveLivePrForSlice (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
-import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
 import ExoMonad.Guest.Tools.ResumeBlockedLeaf (ResumeBlockedLeaf (..))
+import ExoMonad.Guest.Tools.ResumePr (ResumePr (..))
+import ExoMonad.Guest.Tools.RootBranchFinalize (RootBranchFinalize)
 import ExoMonad.Guest.Tools.SessionStatus (SessionStatus (..))
 import ExoMonad.Guest.Tools.Spawn
   ( CloseWorkerPaneArgs,
@@ -88,7 +90,6 @@ import ExoMonad.Guest.Tools.Spawn
 import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
 import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
-import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
 import ExoMonad.Types (HookConfig (..), teamRegistrationPostToolUse, tlSessionStartHook)
 import HookPolicy (preToolUseWithImplementationBlock)
@@ -132,7 +133,6 @@ instance MCPTool TLMergePR where
     case result of
       Left err -> pure $ errorResult err
       Right output -> pure $ mergePRRender output
-
 
 -- | TL-specific spawn_leaf RPC wrapper.
 data TLSpawnLeaf
@@ -287,6 +287,7 @@ data Tools mode = Tools
     postMergeRemoteReconcile :: mode :- PostMergeRemoteReconcile,
     postMergeChangelog :: mode :- PostMergeChangelog,
     postMergePush :: mode :- PostMergePush,
+    rootBranchFinalize :: mode :- RootBranchFinalize,
     discardWorkerOutput :: mode :- DiscardWorkerOutput,
     disposeLeaf :: mode :- DisposeLeaf,
     closeWorkerPane :: mode :- TLCloseWorkerPane,
@@ -350,6 +351,7 @@ config =
             postMergeRemoteReconcile = mkHandler @PostMergeRemoteReconcile,
             postMergeChangelog = mkHandler @PostMergeChangelog,
             postMergePush = mkHandler @PostMergePush,
+            rootBranchFinalize = mkHandler @RootBranchFinalize,
             discardWorkerOutput = mkHandler @DiscardWorkerOutput,
             disposeLeaf = mkHandler @DisposeLeaf,
             closeWorkerPane = mkHandler @TLCloseWorkerPane,

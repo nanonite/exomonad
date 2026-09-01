@@ -32,6 +32,7 @@ MUTATING_OPERATIONS = frozenset(
         "post_merge_issue_close",
         "post_merge_changelog",
         "post_merge_push",
+        "root_branch_finalize",
         "resume_pr",
         "cleanup_reviewer_leaf",
         "close_reviewer_window",

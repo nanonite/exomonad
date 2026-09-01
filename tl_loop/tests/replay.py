@@ -113,6 +113,19 @@ class RecordingTransport:
                     "ancestry_proof": f"ancestor:{pushed}->{pushed}",
                 },
             }
+        if tool_name == "root_branch_finalize":
+            branch = arguments.get("branch")
+            head = "root-head"
+            return {
+                "success": True,
+                "result": {
+                    "branch": branch,
+                    "local_head_sha": head,
+                    "remote_head_sha": head,
+                    "ancestry_proof": f"ancestor:{head}->{head}",
+                    "fast_forward": True,
+                },
+            }
         if tool_name == "resume_pr":
             return {"success": True, "result": {"resumed": True}}
         return {"success": True, "result": None}

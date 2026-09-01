@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -23,6 +25,7 @@ from tl_loop.fsm.orchestration import (
     transition,
     transition_lane,
 )
+from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.post_merge_events import (
     ChangelogCommitted,
@@ -63,6 +66,8 @@ from tl_loop.ordered import (
     IntegrationTransition,
     transition_integration,
 )
+from tl_loop.state.schema import BudgetLedger, FSMState, IntegrationRuntimeState
+from tl_loop.state.store import RunStore, create
 
 
 def _child(
@@ -394,10 +399,92 @@ def test_repository_lane_releases_only_after_bookkeeping_push() -> None:
 
     recovering = transition_lane(integrating, LaneRecoveryRequested("merge response unknown"))
     assert recovering.phase is LanePhase.RECOVERY
+    with pytest.raises(ValueError, match="unresolved child"):
+        transition_lane(recovering, LaneReserved("other-child", 2, "base-2"))
     parked = transition_lane(recovering, LaneParkRequested("operator_gate", "reconcile merge"))
     assert parked.phase is LanePhase.PARKED
     with pytest.raises(IllegalTransition):
         transition_lane(parked, LaneReserved("aggregate", 2, "base-2"))
+
+
+def test_repository_lanes_are_durable_and_reserve_atomically(tmp_path: Path) -> None:
+    store = RunStore("lane-run", tmp_path)
+    create("lane-run", {}, root_dir=tmp_path)
+    store.checkpoint(
+        FSMState(TLPhase.TLPlanning, ()),
+        {},
+        BudgetLedger(tokens=0, wall_seconds=0),
+        offset=0,
+        integration=IntegrationRuntimeState(),
+    )
+
+    reserved = store.transition_lane("repo", "main", LaneReserved("child-a", 1, "base-a"))
+    assert reserved.integration.lanes["repo:main"].child_id == "child-a"
+    assert reserved.integration.lanes["repo:main"].last_lane_epoch == 1
+
+    with pytest.raises(ValueError, match="no lane transition"):
+        store.transition_lane("repo", "main", LaneReserved("child-b", 1, "base-b"))
+    assert store.resume().integration.lanes["repo:main"].child_id == "child-a"
+
+    other_branch = store.transition_lane("repo", "release", LaneReserved("child-b", 1, "base-b"))
+    assert other_branch.integration.lanes["repo:release"].child_id == "child-b"
+    assert other_branch.integration.lanes["repo:main"].child_id == "child-a"
+
+
+def test_same_parent_race_serializes_but_different_parents_progress_concurrently(
+    tmp_path: Path,
+) -> None:
+    store = RunStore("lane-race", tmp_path)
+    create("lane-race", {}, root_dir=tmp_path)
+    store.checkpoint(
+        FSMState(TLPhase.TLPlanning, ()),
+        {},
+        BudgetLedger(tokens=0, wall_seconds=0),
+        offset=0,
+        integration=IntegrationRuntimeState(),
+    )
+
+    def reserve(branch: str, child_id: str, start: Barrier) -> tuple[str, str]:
+        start.wait(timeout=2)
+        try:
+            result = store.transition_lane(
+                "repo",
+                branch,
+                LaneReserved(child_id, 1, f"base-{child_id}"),
+            )
+        except ValueError as error:
+            return "error", str(error)
+        return "ok", result.integration.lanes[f"repo:{branch}"].child_id or ""
+
+    same_parent_start = Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        same_parent = list(
+            pool.map(
+                lambda args: reserve(*args),
+                (
+                    ("main", "child-a", same_parent_start),
+                    ("main", "child-b", same_parent_start),
+                ),
+            )
+        )
+    assert sorted(result[0] for result in same_parent) == ["error", "ok"]
+    assert store.load().integration.lanes["repo:main"].child_id in {"child-a", "child-b"}
+
+    different_parent_start = Barrier(2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        different_parents = list(
+            pool.map(
+                lambda args: reserve(*args),
+                (
+                    ("release", "child-c", different_parent_start),
+                    ("develop", "child-d", different_parent_start),
+                ),
+            )
+        )
+    assert [result[0] for result in different_parents] == ["ok", "ok"]
+    lanes = store.load().integration.lanes
+    assert lanes["repo:release"].child_id == "child-c"
+    assert lanes["repo:develop"].child_id == "child-d"
 
 
 def test_review_and_ci_evidence_remain_bound_to_head_and_base() -> None:

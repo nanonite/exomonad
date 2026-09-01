@@ -13,6 +13,11 @@ from types import MappingProxyType
 from typing import TypeAlias, cast
 
 from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.lane import (
+    LanePhase,
+    LaneState,
+    transition_lane,
+)
 from tl_loop.fsm.phase import (
     PhaseValue,
     TLAllMerged,
@@ -303,6 +308,28 @@ class RunStore:
         apply(self.run_dir, mutate)
         return self.load()
 
+    def set_repository_identity(self, identity: RepositoryIdentity) -> RunState:
+        """Persist the immutable repository identity supplied by the controller."""
+        if not isinstance(identity, RepositoryIdentity):
+            raise TypeError("repository identity must be a RepositoryIdentity")
+        encoded = {
+            "owner": identity.owner,
+            "repo": identity.repo,
+            "base_branch": identity.base_branch,
+            "forge_host": identity.forge_host,
+            "remote_url": identity.remote_url,
+        }
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            existing = document.get("repository_identity")
+            if existing is not None and _decode_repository_identity(existing) != identity:
+                raise ValueError("repository identity cannot change after run creation")
+            document["repository_identity"] = copy.deepcopy(encoded)
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
     def set_ordered_state(
         self,
         current_order: int,
@@ -319,6 +346,31 @@ class RunStore:
             document["current_order"] = current_order
             document["ordered_stages"] = copy.deepcopy(encoded_stages)
             document["integration"] = copy.deepcopy(encoded_integration)
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
+    def transition_lane(
+        self,
+        repository: str,
+        parent_branch: str,
+        event: object,
+    ) -> RunState:
+        """Atomically apply one repository-lane event under the run lock."""
+        if not repository or not parent_branch:
+            raise ValueError("lane identity requires repository and parent branch")
+        key = f"{repository}:{parent_branch}"
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            integration = _decode_integration(document.get("integration"))
+            lanes = dict(integration.lanes)
+            lane = lanes.get(key, LaneState(repository, parent_branch))
+            updated = transition_lane(lane, event)
+            if updated.repository != repository or updated.parent_branch != parent_branch:
+                raise ValueError("lane transition changed its repository identity")
+            lanes[key] = updated
+            document["integration"] = _encode_integration(replace(integration, lanes=lanes))
             return document
 
         apply(self.run_dir, mutate)
@@ -1456,6 +1508,7 @@ def _encode_integration(value: IntegrationInput) -> dict[str, object]:
                 name: _encode_integration_candidate(candidate)
                 for name, candidate in value.candidates.items()
             },
+            "lanes": {key: _encode_lane(lane) for key, lane in value.lanes.items()},
         }
         if value.integration_evidence_at is not None:
             record["integration_evidence_at"] = value.integration_evidence_at
@@ -1485,6 +1538,27 @@ def _encode_integration_candidate(value: IntegrationCandidateState) -> dict[str,
         "merge_attempts": value.merge_attempts,
         "base_revalidation_count": value.base_revalidation_count,
         "stage_verification": value.stage_verification,
+    }
+
+
+def _encode_lane(value: LaneState) -> dict[str, object]:
+    """Encode one durable repository/parent-branch lane."""
+    return {
+        "repository": value.repository,
+        "parent_branch": value.parent_branch,
+        "phase": value.phase.value,
+        "child_id": value.child_id,
+        "lane_epoch": value.lane_epoch,
+        "expected_base_sha": value.expected_base_sha,
+        "head_sha": value.head_sha,
+        "merge_journal_id": value.merge_journal_id,
+        "push_intent_id": value.push_intent_id,
+        "push_journal_id": value.push_journal_id,
+        "changelog_commit": value.changelog_commit,
+        "last_push_receipt_id": value.last_push_receipt_id,
+        "last_remote_head": value.last_remote_head,
+        "last_ancestry_proof": value.last_ancestry_proof,
+        "last_lane_epoch": value.last_lane_epoch,
     }
 
 
@@ -1877,6 +1951,16 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
         if isinstance(raw_states, dict)
         else {}
     )
+    raw_lanes = value.get("lanes", {})
+    lanes = (
+        {
+            key: _decode_lane(cast(dict[str, object], lane))
+            for key, lane in raw_lanes.items()
+            if isinstance(key, str) and isinstance(lane, dict)
+        }
+        if isinstance(raw_lanes, dict)
+        else {}
+    )
     return IntegrationRuntimeState(
         lifecycle=IntegrationLifecycle(cast(str, value.get("lifecycle", "RUNNING"))),
         sub_tl_states=MappingProxyType(states),
@@ -1913,6 +1997,31 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
                 if isinstance(name, str) and isinstance(candidate, dict)
             }
         ),
+        lanes=MappingProxyType(lanes),
+    )
+
+
+def _decode_lane(value: dict[str, object]) -> LaneState:
+    """Decode one schema-validated durable lane record."""
+    lane_epoch = value.get("lane_epoch")
+    if lane_epoch is not None:
+        lane_epoch = cast(int, lane_epoch)
+    return LaneState(
+        repository=cast(str, value["repository"]),
+        parent_branch=cast(str, value["parent_branch"]),
+        phase=LanePhase(cast(str, value.get("phase", LanePhase.IDLE.value))),
+        child_id=cast(str | None, value.get("child_id")),
+        lane_epoch=lane_epoch,
+        expected_base_sha=cast(str | None, value.get("expected_base_sha")),
+        head_sha=cast(str | None, value.get("head_sha")),
+        merge_journal_id=cast(str | None, value.get("merge_journal_id")),
+        push_intent_id=cast(str | None, value.get("push_intent_id")),
+        push_journal_id=cast(str | None, value.get("push_journal_id")),
+        changelog_commit=cast(str | None, value.get("changelog_commit")),
+        last_push_receipt_id=cast(str | None, value.get("last_push_receipt_id")),
+        last_remote_head=cast(str | None, value.get("last_remote_head")),
+        last_ancestry_proof=cast(str | None, value.get("last_ancestry_proof")),
+        last_lane_epoch=cast(int, value.get("last_lane_epoch", 0)),
     )
 
 

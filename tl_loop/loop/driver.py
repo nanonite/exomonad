@@ -40,6 +40,16 @@ from tl_loop.fsm.event import (
     PRUpdated,
     TLEvent,
 )
+from tl_loop.fsm.lane import (
+    LaneBookkeepingStarted,
+    LaneIntegrationStarted,
+    LanePhase,
+    LaneRecoveryRequested,
+    LaneReleased,
+    LaneReserved,
+    LaneState,
+    transition_lane,
+)
 from tl_loop.fsm.orchestration import transition as scope_transition
 from tl_loop.fsm.phase import (
     ChildHandle,
@@ -1019,6 +1029,14 @@ def run_tl_loop(
             f"checkpoint reducer_version {state.reducer_version} is incompatible "
             f"with reducer {REDUCER_VERSION}"
         )
+    if selected.repository_identity is not None:
+        if (
+            state.repository_identity is not None
+            and state.repository_identity != selected.repository_identity
+        ):
+            raise TLLoopError("continuation repository identity differs from the checkpoint")
+        if state.repository_identity is None:
+            state = store.set_repository_identity(selected.repository_identity)
     if state.plan_manifest is None:
         node_ids_by_name = {node.name: node.node_id for node in manifest.nodes}
         protected = {
@@ -1419,8 +1437,14 @@ def _checkpoint_scope_phase(
     )
 
 
-def _maybe_finalize_root_scope(state: RunState, store: RunStore) -> RunState:
-    """Persist and complete root finalization as two recoverable transitions."""
+def _maybe_finalize_root_scope(
+    state: RunState,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Fast-forward the root branch before durably completing finalization."""
     phase = state.recursive_fsm
     manifest = state.plan_manifest
     if manifest is None or manifest.role != "root":
@@ -1440,9 +1464,49 @@ def _maybe_finalize_root_scope(state: RunState, store: RunStore) -> RunState:
         if not finalizing.evidence:
             finalizing = replace(finalizing, evidence=evidence)
             state = _checkpoint_scope_phase(finalizing, state, store)
+    if not config.active:
+        completed = scope_transition(
+            finalizing,
+            ScopeFinalizationComplete(ScopeRole.ROOT, evidence),
+        )
+        return _checkpoint_scope_phase(completed, state, store)
+
+    branch = evidence["root_branch"]
+    if not isinstance(branch, str) or not branch:
+        return store.set_gate("tl-root-finalization", GateStatus.PENDING)
+    result = _post_merge_effect(
+        "root_branch_finalize",
+        state.run_id,
+        {"branch": branch, "working_dir": config.working_dir},
+        effects,
+        effects_log,
+        "root_branch_finalize",
+        active=True,
+        retryable_failure=False,
+    )
+    payload = _merge_result_payload(result)
+    if payload is None:
+        return store.set_gate("tl-root-finalization", GateStatus.PENDING)
+    if (
+        payload.get("branch") != branch
+        or payload.get("fast_forward") is not True
+        or not isinstance(payload.get("local_head_sha"), str)
+        or not isinstance(payload.get("remote_head_sha"), str)
+        or payload["local_head_sha"] != payload["remote_head_sha"]
+        or not isinstance(payload.get("ancestry_proof"), str)
+        or not payload["ancestry_proof"]
+    ):
+        return store.set_gate("tl-root-finalization", GateStatus.PENDING)
+    completion_evidence = {
+        **evidence,
+        "local_head_sha": payload["local_head_sha"],
+        "remote_head_sha": payload["remote_head_sha"],
+        "ancestry_proof": payload["ancestry_proof"],
+        "fast_forward": "true",
+    }
     completed = scope_transition(
         finalizing,
-        ScopeFinalizationComplete(ScopeRole.ROOT, evidence),
+        ScopeFinalizationComplete(ScopeRole.ROOT, completion_evidence),
     )
     return _checkpoint_scope_phase(completed, state, store)
 
@@ -1499,7 +1563,13 @@ def _maybe_finalize_non_root_scope(state: RunState, store: RunStore) -> RunState
     return _checkpoint_scope_phase(completed, state, store)
 
 
-def _maybe_finalize_scope(state: RunState, store: RunStore) -> RunState:
+def _maybe_finalize_scope(
+    state: RunState,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
     """Select the role-specific finalization reducer for one scope."""
     manifest = state.plan_manifest
     if manifest is None:
@@ -1515,7 +1585,7 @@ def _maybe_finalize_scope(state: RunState, store: RunStore) -> RunState:
             integration=state.integration,
         )
     if manifest.role == "root":
-        return _maybe_finalize_root_scope(state, store)
+        return _maybe_finalize_root_scope(state, store, config, effects, effects_log)
     return _maybe_finalize_non_root_scope(state, store)
 
 
@@ -1572,7 +1642,7 @@ def _run_loop(
             replace(state.goals, controller_started_at=diagnostics.controller_started_at)
         )
     before_finalization_phase = _phase_from_state(state)
-    state = _maybe_finalize_scope(state, store)
+    state = _maybe_finalize_scope(state, store, config, effects, effects_log)
     after_finalization_phase = _phase_from_state(state)
     if after_finalization_phase != before_finalization_phase:
         _emit_phase_change(
@@ -1623,7 +1693,7 @@ def _run_loop(
             and _source_has_pending(source)
         ):
             before_finalization_phase = _phase_from_state(state)
-            state = _maybe_finalize_scope(state, store)
+            state = _maybe_finalize_scope(state, store, config, effects, effects_log)
             after_finalization_phase = _phase_from_state(state)
             if after_finalization_phase != before_finalization_phase:
                 _emit_phase_change(
@@ -2592,7 +2662,7 @@ def _execute_post_merge_recovery_intent(
             current.id,
             "post-merge recovery has no durable merge journal identity",
         )
-    return _reconcile_merged_slice(
+    result = _reconcile_merged_slice(
         state,
         current.id,
         current.pr_number,
@@ -2603,6 +2673,7 @@ def _execute_post_merge_recovery_intent(
         effects_log,
         boundary="post_merge_recovery",
     )
+    return result
 
 
 def _reconcile_merged_slice(
@@ -2683,6 +2754,7 @@ def _adopt_post_merge_slice(
         ("base_sha", "expected_base_sha"),
         "merged PR base SHA",
     )
+    lane_epoch = _merge_adoption_lane_epoch(state, current, evidence)
     persisted_repository = _repository_identity(state)
     repository = (
         _required_merge_identity(evidence, ("repository",), "merged PR repository")
@@ -2710,7 +2782,7 @@ def _adopt_post_merge_slice(
                 journal_id=merge_journal_id,
                 repository=repository,
                 parent_branch=parent_branch,
-                lane_epoch=1,
+                lane_epoch=lane_epoch,
             )
         ),
     )
@@ -2753,11 +2825,31 @@ def _required_merge_identity(
     raise ValueError(f"{name} is unavailable in authoritative merge evidence")
 
 
+def _merge_adoption_lane_epoch(
+    state: RunState,
+    current: SliceState,
+    evidence: Mapping[str, object],
+) -> int:
+    value = evidence.get("lane_epoch")
+    if value is None:
+        try:
+            repository, parent_branch = _candidate_lane_key(state, current)
+            lane = state.integration.lanes.get(f"{repository}:{parent_branch}")
+            value = lane.lane_epoch if lane is not None else 1
+        except ValueError:
+            value = 1
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    if type(value) is not int or value <= 0:
+        raise ValueError("merged PR lane epoch is unavailable")
+    return value
+
+
 def _repository_identity(state: RunState) -> str:
     identity = state.repository_identity
-    if identity is None or not identity.repo:
+    if identity is None or not identity.owner or not identity.repo:
         raise ValueError("repository identity is unavailable")
-    return identity.repo
+    return f"{identity.owner}/{identity.repo}"
 
 
 def _publication_parent_branch_from_slice(current: SliceState) -> str:
@@ -2810,6 +2902,7 @@ def _checkpoint_post_merge_event(
     slice_id: str,
     event: object,
     reconciliation_additions: Mapping[str, object] | None = None,
+    lane_event: object | tuple[object, ...] | None = None,
 ) -> RunState:
     current = state.slices[slice_id]
     updated = slice_transition(current, PostMergeEventObserved(event))
@@ -2817,7 +2910,28 @@ def _checkpoint_post_merge_event(
         reconciliation = dict(updated.reconciliation or {})
         reconciliation.update(reconciliation_additions)
         updated = replace(updated, reconciliation=reconciliation)
-    return _checkpoint_slice_action(store, state, slice_id, None, slice_state=updated)
+    integration = state.integration
+    if lane_event is not None:
+        repository, parent_branch = _candidate_lane_key(state, current)
+        key = f"{repository}:{parent_branch}"
+        lane = integration.lanes.get(key)
+        if lane is None:
+            raise ValueError(f"lane {key!r} is not reserved for post-merge progress")
+        lanes = dict(integration.lanes)
+        lane_events = lane_event if isinstance(lane_event, tuple) else (lane_event,)
+        for lane_transition_event in lane_events:
+            lane = transition_lane(lane, lane_transition_event)
+        lanes[key] = lane
+        integration = replace(integration, lanes=lanes)
+    result = _checkpoint_slice_action(
+        store,
+        state,
+        slice_id,
+        None,
+        slice_state=updated,
+        integration=integration,
+    )
+    return result
 
 
 def _advance_post_merge_boundary(
@@ -2907,6 +3021,21 @@ def _advance_post_merge_boundary(
             journal_id = _post_merge_key(
                 state, journal_operation, current.id, pr_number, generation=generation
             )
+            try:
+                state, lane_ready = _ensure_bookkeeping_lane(
+                    state,
+                    current,
+                    evidence,
+                    store,
+                    push_intent_id=intent_id,
+                    push_journal_id=journal_id,
+                )
+            except (TypeError, ValueError) as error:
+                return _block_post_merge_recovery(store, state, slice_id, str(error))
+            if not lane_ready:
+                return state
+            current = state.slices[slice_id]
+            evidence = dict(current.post_merge.evidence) if current.post_merge else evidence
             return _checkpoint_post_merge_event(
                 store,
                 state,
@@ -2916,6 +3045,15 @@ def _advance_post_merge_boundary(
                     intent_id,
                     _required_current_base(current),
                     journal_id,
+                ),
+                lane_event=LaneBookkeepingStarted(
+                    current.id,
+                    _required_merge_identity(evidence, ("merge_journal_id",), "merge journal"),
+                    intent_id,
+                    journal_id,
+                    _required_merge_identity(
+                        evidence, ("changelog_commit_sha",), "changelog commit"
+                    ),
                 ),
             )
         if post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING:
@@ -3271,6 +3409,13 @@ def _run_parent_push(
     effects_log: list[EffectIntent],
     store: RunStore,
 ) -> RunState:
+    try:
+        state, lane_ready = _ensure_bookkeeping_lane(state, current, evidence, store)
+    except (TypeError, ValueError):
+        return state
+    if not lane_ready:
+        return state
+    current = state.slices[current.id]
     arguments = {
         "child_id": current.id,
         "repository": _required_merge_identity(evidence, ("repository",), "repository"),
@@ -3370,6 +3515,7 @@ def _run_parent_push(
             arguments["pushed_commit"],
             receipt,
         ),
+        lane_event=LaneReleased(current.id, receipt),
     )
 
 
@@ -3438,6 +3584,25 @@ def _recover_remote_advance(
             )
         ),
     )
+    repository, parent_branch = _candidate_lane_key(state, current)
+    lane_key = f"{repository}:{parent_branch}"
+    lane = state.integration.lanes.get(lane_key)
+    prior_epoch = (
+        lane.lane_epoch if lane is not None else _required_int(evidence, "lane_epoch", "lane epoch")
+    )
+    next_epoch = prior_epoch + 1
+    if committed_slice.post_merge is None:
+        raise ValueError("remote rebuild did not preserve post-merge state")
+    rebuilt_evidence = dict(committed_slice.post_merge.evidence)
+    rebuilt_evidence["lane_epoch"] = str(next_epoch)
+    rebuilt_evidence["expected_base_sha"] = observed_remote_head
+    committed_slice = replace(
+        committed_slice,
+        post_merge=replace(
+            committed_slice.post_merge,
+            evidence=rebuilt_evidence,
+        ),
+    )
     reconciliation = dict(committed_slice.reconciliation or {})
     reconciliation.update(
         {
@@ -3445,12 +3610,29 @@ def _recover_remote_advance(
             "merge_base_sha": observed_remote_head,
         }
     )
+    lane_for_rebuild = lane or LaneState(repository, parent_branch)
+    lane_events: tuple[object, ...] = (
+        (LaneRecoveryRequested(reason),) if lane is not None else ()
+    ) + (
+        LaneReserved(current.id, next_epoch, observed_remote_head),
+        LaneIntegrationStarted(current.id, payload["rebuilt_commit_sha"]),
+    )
+    rebuilt_lane = lane_for_rebuild
+    for lane_event in lane_events:
+        rebuilt_lane = transition_lane(rebuilt_lane, lane_event)
     return _checkpoint_slice_action(
         store,
         state,
         current.id,
         None,
         slice_state=replace(committed_slice, reconciliation=reconciliation),
+        integration=replace(
+            state.integration,
+            lanes={
+                **state.integration.lanes,
+                lane_key: rebuilt_lane,
+            },
+        ),
     )
 
 
@@ -3890,6 +4072,7 @@ def _checkpoint_slice_action(
     action: ActionState | None,
     *,
     slice_state: SliceState | None = None,
+    integration: IntegrationRuntimeState | None = None,
 ) -> RunState:
     """Persist one direct action phase without changing unrelated run state."""
     current = slice_state or state.slices[slice_id]
@@ -3911,7 +4094,7 @@ def _checkpoint_slice_action(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=state.integration,
+        integration=integration or state.integration,
     )
 
 
@@ -6896,8 +7079,145 @@ def _integrate_stage_candidates(
             return state
         state = _integrate_one_candidate(task, state, config, effects, store, effects_log)
         if state.slices[task.name].status is not SliceStatus.MERGED:
+            if _candidate_lane_blocked_by_other(state, state.slices[task.name]):
+                continue
             break
     return state
+
+
+def _candidate_lane_key(state: RunState, current: SliceState) -> tuple[str, str]:
+    """Resolve the durable lane identity for one aggregate candidate."""
+    return _repository_identity(state), _publication_parent_branch_from_slice(current)
+
+
+def _candidate_lane_blocked_by_other(state: RunState, current: SliceState) -> bool:
+    """Report whether another child currently owns this integration lane."""
+    try:
+        repository, parent_branch = _candidate_lane_key(state, current)
+    except ValueError:
+        return False
+    lane = state.integration.lanes.get(f"{repository}:{parent_branch}")
+    return lane is not None and lane.phase is not LanePhase.IDLE and lane.child_id != current.id
+
+
+def _ensure_candidate_lane(
+    state: RunState,
+    current: SliceState,
+    expected_base_sha: str,
+    store: RunStore,
+) -> tuple[RunState, bool]:
+    """Atomically reserve a parent lane, preserving cross-controller races."""
+    try:
+        repository, parent_branch = _candidate_lane_key(state, current)
+    except ValueError:
+        return state, False
+    key = f"{repository}:{parent_branch}"
+    lane = state.integration.lanes.get(key)
+    if lane is not None:
+        if lane.phase is LanePhase.PARKED:
+            return state, False
+        if lane.phase in {
+            LanePhase.RESERVED,
+            LanePhase.INTEGRATING,
+            LanePhase.BOOKKEEPING,
+            LanePhase.RECOVERY,
+        }:
+            return (state, lane.child_id == current.id)
+        next_epoch = lane.last_lane_epoch + 1
+    else:
+        next_epoch = 1
+    try:
+        return (
+            store.transition_lane(
+                repository,
+                parent_branch,
+                LaneReserved(current.id, next_epoch, expected_base_sha),
+            ),
+            True,
+        )
+    except ValueError:
+        return store.load(), False
+
+
+def _start_candidate_lane(
+    state: RunState,
+    current: SliceState,
+    head_sha: str,
+    store: RunStore,
+) -> tuple[RunState, bool]:
+    """Durably move a reservation into compare-bound integration."""
+    try:
+        repository, parent_branch = _candidate_lane_key(state, current)
+    except ValueError:
+        return state, False
+    lane = state.integration.lanes.get(f"{repository}:{parent_branch}")
+    if lane is None or lane.child_id != current.id:
+        return state, False
+    if lane.phase is LanePhase.INTEGRATING:
+        return state, lane.head_sha == head_sha
+    if lane.phase is not LanePhase.RESERVED:
+        return state, False
+    try:
+        return (
+            store.transition_lane(
+                repository,
+                parent_branch,
+                LaneIntegrationStarted(current.id, head_sha),
+            ),
+            True,
+        )
+    except ValueError:
+        return store.load(), False
+
+
+def _ensure_bookkeeping_lane(
+    state: RunState,
+    current: SliceState,
+    evidence: Mapping[str, object],
+    store: RunStore,
+    *,
+    push_intent_id: str | None = None,
+    push_journal_id: str | None = None,
+) -> tuple[RunState, bool]:
+    """Backfill a lane for a pre-lane checkpoint before pushing bookkeeping."""
+    try:
+        expected_base_sha = _required_current_base(current)
+    except ValueError:
+        expected_base_sha = _required_merge_identity(
+            evidence, ("expected_base_sha",), "push base SHA"
+        )
+    state, ready = _ensure_candidate_lane(state, current, expected_base_sha, store)
+    if not ready:
+        return state, False
+    repository, parent_branch = _candidate_lane_key(state, current)
+    lane = state.integration.lanes[f"{repository}:{parent_branch}"]
+    lane_epoch = _required_int(evidence, "lane_epoch", "lane epoch")
+    if lane.lane_epoch != lane_epoch:
+        return state, False
+    if lane.phase is LanePhase.RESERVED:
+        state, ready = _start_candidate_lane(
+            state,
+            current,
+            _required_merge_identity(evidence, ("head_sha",), "merged head SHA"),
+            store,
+        )
+        if not ready:
+            return state, False
+        lane = state.integration.lanes[f"{repository}:{parent_branch}"]
+    if lane.phase is LanePhase.INTEGRATING:
+        event = LaneBookkeepingStarted(
+            current.id,
+            _required_merge_identity(evidence, ("merge_journal_id",), "merge journal"),
+            push_intent_id
+            or _required_merge_identity(evidence, ("parent_push_intent_id",), "push intent"),
+            push_journal_id
+            or _required_merge_identity(evidence, ("push_journal_id",), "push journal"),
+            _required_merge_identity(evidence, ("changelog_commit_sha",), "changelog commit"),
+        )
+        state = store.transition_lane(repository, parent_branch, event)
+    return state, state.integration.lanes[
+        f"{repository}:{parent_branch}"
+    ].phase is LanePhase.BOOKKEEPING
 
 
 def _merge_result_is_authoritative(result: ToolResult | None) -> bool:
@@ -7475,6 +7795,13 @@ def _integrate_one_candidate(
         effects,
         effects_log,
     )
+    lane_base_sha = candidate_runtime.aggregate_original_base_sha or base_sha
+    state, lane_ready = _ensure_candidate_lane(state, current, lane_base_sha, store)
+    if not lane_ready:
+        return state
+    state, lane_ready = _start_candidate_lane(state, current, live_head_sha, store)
+    if not lane_ready:
+        return state
     merge_arguments = {
         "pr_number": current.pr_number,
         "strategy": config.merge_strategy or task.integration.merge_strategy,
@@ -7603,12 +7930,22 @@ def _checkpoint_aggregate_merged(
             task.name,
             f"aggregate merge for {task.name!r} has incomplete merge evidence",
         )
+    state, lane_ready = _ensure_candidate_lane(state, current, aggregate_base, store)
+    if not lane_ready:
+        return state
+    state, lane_ready = _start_candidate_lane(state, current, aggregate_head, store)
+    if not lane_ready:
+        return state
+    current = state.slices[task.name]
     try:
         merge_evidence = {
             "head_sha": aggregate_head,
             "base_sha": aggregate_base,
             "repository": _repository_identity(state),
             "parent_branch": _publication_parent_branch_from_slice(current),
+            "lane_epoch": state.integration.lanes[
+                f"{_repository_identity(state)}:{_publication_parent_branch_from_slice(current)}"
+            ].lane_epoch,
         }
     except ValueError as error:
         return _block_post_merge_recovery(

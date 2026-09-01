@@ -27,6 +27,7 @@ from tl_loop.state.schema import (
     DurableReviewEvidence,
     FSMState,
     GateStatus,
+    RepositoryIdentity,
     ReviewValidationDisposition,
     ReviewValidationObservation,
     SliceState,
@@ -883,7 +884,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
                     "result": {
                         "child_id": arguments["child_id"],
                         "pr_number": arguments["pr_number"],
-                        "repository": "repo",
+                        "repository": "org/repo",
                         "parent_branch": "main",
                         "merged_head_sha": arguments["merged_head_sha"],
                         "expected_base_sha": arguments["expected_base_sha"],
@@ -945,6 +946,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
         chainlink_issue_id=1039,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
 
@@ -1171,7 +1173,7 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
                     "result": {
                         "child_id": arguments["child_id"],
                         "pr_number": arguments["pr_number"],
-                        "repository": "repo",
+                        "repository": "org/repo",
                         "parent_branch": "main",
                         "merged_head_sha": arguments["merged_head_sha"],
                         "expected_base_sha": arguments["expected_base_sha"],
@@ -1234,6 +1236,7 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
         chainlink_issue_id=1039,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     client.post_merge_calls = []
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")

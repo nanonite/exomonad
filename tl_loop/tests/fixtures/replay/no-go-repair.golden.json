@@ -66,6 +66,7 @@
     "integration_owner_id": null,
     "integration_owner_run_id": null,
     "integration_owner_worktree": null,
+    "lanes": {},
     "lifecycle": "RUNNING",
     "merge_attempts": 0,
     "merge_tree_sha": null,

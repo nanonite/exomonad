@@ -446,6 +446,26 @@
       "name": "post_merge_push"
     },
     {
+      "description": "Finalize the root branch by fetching its remote and applying a verified fast-forward-only update.",
+      "inputSchema": {
+        "properties": {
+          "branch": {
+            "description": "Root branch that must be checked out.",
+            "type": "string"
+          },
+          "working_dir": {
+            "description": "Optional repository working directory.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "branch"
+        ],
+        "type": "object"
+      },
+      "name": "root_branch_finalize"
+    },
+    {
       "description": "Close an ephemeral worker tmux pane by pane_id. Use the pane_id returned by spawn_worker after you have received the worker's final result or no longer need the worker pane.",
       "inputSchema": {
         "properties": {

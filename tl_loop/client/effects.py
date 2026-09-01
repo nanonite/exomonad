@@ -120,6 +120,7 @@ TOOL_METHODS: tuple[str, ...] = (
     "post_merge_remote_reconcile",
     "post_merge_changelog",
     "post_merge_push",
+    "root_branch_finalize",
     "close_worker_pane",
     "spawn_codex",
     "session_status",
@@ -619,6 +620,17 @@ class EffectClient:
         }
         _put(arguments, "working_dir", working_dir)
         return self._call("post_merge_push", arguments)
+
+    def root_branch_finalize(
+        self,
+        *,
+        branch: str,
+        working_dir: str | None = None,
+    ) -> ToolResult:
+        """Fast-forward the root branch and return its verified remote head."""
+        arguments: JsonObject = {"branch": branch}
+        _put(arguments, "working_dir", working_dir)
+        return self._call("root_branch_finalize", arguments)
 
     def close_issue_and_cleanup(self, *, issue_id: int, leaf_name: str) -> ToolResult:
         return self._call("close_issue_and_cleanup", {"issue_id": issue_id, "leaf_name": leaf_name})
