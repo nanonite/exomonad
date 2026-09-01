@@ -14,6 +14,8 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
+from tl_loop.events.queue import LedgerQueue
+from tl_loop.events.reader import LedgerReader
 from tl_loop.events.replay import ReplayEventSource
 from tl_loop.loop.driver import SubTLTask, TLLoopConfig, TLLoopError, WorkPlan, tl_run
 from tl_loop.loop.escalate import park
@@ -151,6 +153,7 @@ def replay_fixture(
     production_clock: bool = False,
     session_mode: str | None = None,
     crash_after: str | None = None,
+    live_ledger: bool = False,
 ) -> ReplayResult:
     """Run one committed event stream and return normalized observable output."""
     spec = _load_fixture(fixture)
@@ -165,7 +168,29 @@ def replay_fixture(
     transport = RecordingTransport(
         current_head=_string(spec.get("current_head", "head-a"), "current_head")
     )
-    source = RecordedEventSource(events)
+    queues: list[LedgerQueue] = []
+    if live_ledger:
+        segments = Path(root_dir) / ".exo" / "ledger" / "segments"
+        _write_ledger_segment(segments, cast(list[Mapping[str, object]], spec["events"]))
+        source = LedgerQueue(
+            LedgerReader(
+                segments,
+                run_id=run_id,
+                state_root=root_dir,
+                ledger_run_id=run_id,
+            ),
+            poll_interval=0.001,
+        ).start()
+        queues.append(source)
+        plan = _attach_live_child_sources(
+            plan,
+            spec.get("child_events"),
+            Path(root_dir) / run_id,
+            Path(root_dir) / ".exo" / "child-ledger",
+            queues,
+        )
+    else:
+        source = RecordedEventSource(events)
     policy = load_policy(POLICY_ROOT / _string(spec["policy"], "policy"))
     capability = CapabilityMap({"codex/gpt-luna": Difficulty.STANDARD})
     effects = EffectClient(transport)
@@ -243,6 +268,8 @@ def replay_fixture(
     finally:
         if crash_after is not None:
             RunStore.checkpoint = original_checkpoint
+        for queue in queues:
+            queue.close(timeout=2)
     if crash_after is not None and not crashed:
         raise AssertionError(f"replay never reached crash boundary {crash_after!r}")
     store = RunStore(run_id, root_dir=Path(root_dir))
@@ -269,7 +296,7 @@ def replay_fixture(
             normalized,
             durable_state=durable,
             cursor=cast(int, events_document["last_consumed_offset"]),
-            acknowledged=tuple(source.acknowledged),
+            acknowledged=tuple(getattr(source, "acknowledged", ())),
         )
     transitions = tuple(
         {
@@ -288,7 +315,7 @@ def replay_fixture(
         reducer_version=run_result.reducer_version,
         transitions=transitions,
         journal_entries=run_result.journal_entries,
-        acknowledged=tuple(source.acknowledged),
+        acknowledged=tuple(getattr(source, "acknowledged", ())),
     )
 
 
@@ -395,6 +422,58 @@ def _plan_with_replay_sources(value: Mapping[str, object], child_events: object)
         return replace(current, sub_tls=tuple(children))
 
     return bind(plan)
+
+
+def _write_ledger_segment(segments: Path, rows: list[Mapping[str, object]]) -> None:
+    segments.mkdir(parents=True, exist_ok=True)
+    segment = segments / "segment-000000000001.jsonl"
+    segment.write_text(
+        "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _attach_live_child_sources(
+    plan: WorkPlan,
+    child_events: object,
+    parent_state_dir: Path,
+    ledger_root: Path,
+    queues: list[LedgerQueue],
+) -> WorkPlan:
+    """Give every recursive child an independent live or empty source."""
+    event_map = child_events if isinstance(child_events, Mapping) else {}
+    children: list[SubTLTask] = []
+    for task in plan.sub_tls:
+        child_plan = task.plan
+        if not isinstance(child_plan, WorkPlan):
+            raise TypeError(f"sub-TL {task.name!r} has no WorkPlan")
+        raw_events = event_map.get(task.name)
+        child_state_dir = parent_state_dir / task.name
+        child_ledger_dir = ledger_root / task.name
+        if isinstance(raw_events, list):
+            _write_ledger_segment(child_ledger_dir, cast(list[Mapping[str, object]], raw_events))
+            source = LedgerQueue(
+                LedgerReader(child_ledger_dir, run_dir=child_state_dir),
+                poll_interval=0.001,
+            ).start()
+            queues.append(source)
+        else:
+            source = ReplayEventSource([])
+        nested_events = raw_events if isinstance(raw_events, Mapping) else None
+        children.append(
+            replace(
+                task,
+                source=source,
+                plan=_attach_live_child_sources(
+                    child_plan,
+                    nested_events,
+                    child_state_dir,
+                    child_ledger_dir,
+                    queues,
+                ),
+            )
+        )
+    return replace(plan, sub_tls=tuple(children))
 
 
 def _optional_positive_int(value: object) -> int | None:

@@ -19,7 +19,6 @@ from tl_loop.loop.journal import MUTATING_OPERATIONS, EffectJournal
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse
 from tl_loop.select.policy import load_policy
 from tl_loop.state.schema import (
-    ActionPhase,
     DurableReviewEvidence,
     HandoffEvidence,
     PublicationBinding,
@@ -146,7 +145,10 @@ def test_recursive_replay_preserves_position_and_ownership_without_duplicate_eff
     tmp_path: Path,
 ) -> None:
     live = replay_fixture(
-        FIXTURE_ROOT / "recursive-position.json", tmp_path / "recursive-live", journal=True
+        FIXTURE_ROOT / "recursive-position.json",
+        tmp_path / "recursive-live",
+        journal=True,
+        live_ledger=True,
     )
     replay_root = tmp_path / "recursive-replay"
     first = replay_fixture(FIXTURE_ROOT / "recursive-position.json", replay_root, journal=True)
@@ -195,6 +197,7 @@ def test_recursive_replay_replays_review_checkpoint_and_journal_once(tmp_path: P
         FIXTURE_ROOT / "recursive-recovery.json",
         tmp_path / "recursive-recovery-live",
         journal=True,
+        live_ledger=True,
     )
     root = tmp_path / "recursive-recovery-replay"
     first = replay_fixture(FIXTURE_ROOT / "recursive-recovery.json", root, journal=True)
@@ -287,13 +290,6 @@ RECOVERY_BOUNDARIES = (
     "post_merge_changelog",
     "post_merge_push",
 )
-
-RECOVERY_BOUNDARY_PHASES = {
-    "post_merge_parent_sync": PostMergePhase.PARENT_BRANCH_SYNCED,
-    "post_merge_issue_close": PostMergePhase.ISSUE_CLOSE_CONFIRMED,
-    "post_merge_changelog": PostMergePhase.CHANGELOG_COMMITTED,
-    "post_merge_push": PostMergePhase.COMPLETE,
-}
 
 RECOVERY_EFFECT_TO_TOOL = {
     "post_merge_issue_close": "chainlink_issue_close",
@@ -593,25 +589,10 @@ def _run_recovery_tl(
 
     def crash_checkpoint(store: RunStore, *args: object, **kwargs: object) -> object:
         nonlocal crashed
-        checkpointed = original_checkpoint(store, *args, **kwargs)
-
-        persisted = store.load()
-        if operation == "resume_pr":
-            target_action = persisted.slices["leaf-a"].action
-            boundary_checkpointed = (
-                target_action is not None and target_action.phase is ActionPhase.CONFIRMED
-            )
-        else:
-            target_post_merge = persisted.slices["nested-a"].post_merge
-            boundary_checkpointed = (
-                target_post_merge is not None
-                and target_post_merge.phase is RECOVERY_BOUNDARY_PHASES[operation]
-            )
         if (
             not crashed
             and crash_after is not None
             and store.run_id == run_id
-            and boundary_checkpointed
             and any(
                 entry.get("operation") == crash_after and entry.get("status") == "confirmed"
                 for entry in journal.snapshot()
@@ -619,7 +600,7 @@ def _run_recovery_tl(
         ):
             crashed = True
             raise RuntimeError(f"simulated process death after {crash_after}")
-        return checkpointed
+        return original_checkpoint(store, *args, **kwargs)
 
     if monkeypatch is not None and crash_after is not None:
         monkeypatch.setattr(RunStore, "checkpoint", crash_checkpoint)
@@ -649,6 +630,14 @@ def _normalize_recovery_state(document: object, root: Path) -> object:
     if isinstance(document, str) and document.startswith(str(root)):
         return "<recovery-root>" + document[len(str(root)) :]
     return document
+
+
+def _semantic_recovery_state(document: object, root: Path) -> object:
+    """Compare durable FSM state without physical checkpoint-write counts."""
+    normalized = _normalize_recovery_state(document, root)
+    if isinstance(normalized, dict):
+        return {key: value for key, value in normalized.items() if key != "revision"}
+    return normalized
 
 
 @pytest.mark.parametrize("operation", RECOVERY_BOUNDARIES)
@@ -686,9 +675,9 @@ def test_tl_run_crash_resume_matches_live_and_probes_each_recovery_effect(
 
     live_document = json.loads((live_run_root / live_run_id / "run.json").read_text())
     resumed_document = json.loads((replay_run_root / replay_run_id / "run.json").read_text())
-    assert _normalize_recovery_state(
+    assert _semantic_recovery_state(
         normalize_durable_state(live_document), live_run_root
-    ) == _normalize_recovery_state(normalize_durable_state(resumed_document), replay_run_root)
+    ) == _semantic_recovery_state(normalize_durable_state(resumed_document), replay_run_root)
     assert live_state.state_version == resumed_state.state_version
     assert live_state.reducer_version == resumed_state.reducer_version
     effect_tool = RECOVERY_EFFECT_TO_TOOL.get(operation, operation)

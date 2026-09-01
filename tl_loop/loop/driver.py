@@ -212,7 +212,7 @@ from tl_loop.state.slice_transition import (
 )
 from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 
-from .journal import MUTATING_OPERATIONS, EffectJournal, stable_action_key
+from .journal import MUTATING_OPERATIONS, ActionJournalError, EffectJournal, stable_action_key
 from .observation import WatcherObservation
 from .reconcile import (
     ExternalIntent,
@@ -1074,6 +1074,7 @@ def run_tl_loop(
             project_root=selected.project_root,
             ledger_run_id=effective_ledger_run_id,
         )
+        state = _reconcile_confirmed_repair_actions(state, store, effects_log)
         state = _reconcile_dispatches(state, selected, effects, store, effects_log)
         state = _reconcile_nonterminal_slices(
             work_plan, state, selected, effects, store, effects_log
@@ -4421,6 +4422,72 @@ def _reconcile_action_journal(
                 },
             )
     return state
+
+
+def _reconcile_confirmed_repair_actions(
+    state: RunState,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Adopt a confirmed repair effect before retry derivation can run."""
+    if not isinstance(effects_log, EffectJournal):
+        return state
+    for slice_id, current in state.slices.items():
+        action = current.action
+        if (
+            action is None
+            or action.kind is not ActionKind.REPAIR
+            or action.phase not in {ActionPhase.INTENDED, ActionPhase.IN_FLIGHT}
+        ):
+            continue
+        confirmed = _confirmed_repair_entry(effects_log, current)
+        if confirmed is None:
+            continue
+        attempts = current.attempts
+        repair_attempts = current.repair_attempts
+        if attempts <= action.attempt:
+            attempts = action.attempt + 1
+            repair_attempts += 1
+        updated = slice_transition(
+            current,
+            ActionChanged(replace(action, phase=ActionPhase.CONFIRMED)),
+        )
+        updated = replace(
+            updated,
+            attempts=attempts,
+            repair_attempts=repair_attempts,
+        )
+        state = _checkpoint_slice_action(
+            store,
+            state,
+            slice_id,
+            updated.action,
+            slice_state=updated,
+        )
+    return state
+
+
+def _confirmed_repair_entry(
+    effects_log: EffectJournal,
+    current: SliceState,
+) -> Mapping[str, object] | None:
+    """Find successful resume evidence for the current PR, newest first."""
+    if current.pr_number is None:
+        return None
+    entries = effects_log.confirmed_entries("resume_pr", current.id)
+    if len(entries) < max(1, current.action.attempt if current.action else 1):
+        return None
+    for entry in reversed(entries):
+        arguments = entry.get("arguments")
+        if not isinstance(arguments, Mapping) or arguments.get("pr_number") != current.pr_number:
+            continue
+        try:
+            result = effects_log.replay(entry)
+        except ActionJournalError:
+            continue
+        if result.success is True:
+            return entry
+    return None
 
 
 def _reconcile_pending_merge_entry(
