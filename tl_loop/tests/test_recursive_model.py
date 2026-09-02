@@ -268,6 +268,7 @@ class RecursivePlanShape:
     depth: int
     width: int
     prefix: str = "root"
+    layout: str = "mixed"
 
     def to_mapping(self) -> dict[str, object]:
         worker_name = f"{self.prefix}-worker"
@@ -283,33 +284,46 @@ class RecursivePlanShape:
             "sub_tls": [
                 {
                     "name": f"{self.prefix}-scope-{self.depth}-{index}",
-                    "order": 1,
+                    "order": self._order_for(index),
                     "plan": RecursivePlanShape(
                         self.depth - 1,
                         self.width,
                         f"{self.prefix}-scope-{self.depth}-{index}",
+                        self.layout,
                     ).to_mapping(),
                 }
                 for index in range(self.width)
             ],
         }
 
+    def _order_for(self, index: int) -> int:
+        if self.layout == "parallel":
+            return 1
+        if self.layout == "serial":
+            return index + 1
+        if self.layout == "mixed":
+            return 1 if index < 2 else index
+        raise AssertionError(f"unknown recursive layout {self.layout!r}")
+
 
 @pytest.mark.parametrize("depth", (0, 1, 2))
-@pytest.mark.parametrize("width", (1, 2))
+@pytest.mark.parametrize("width", (1, 2, 3))
+@pytest.mark.parametrize("layout", ("parallel", "serial", "mixed"))
 def test_bounded_recursive_plans_preserve_nested_serial_and_parallel_scopes(
-    depth: int, width: int
+    depth: int, width: int, layout: str
 ) -> None:
-    shape = RecursivePlanShape(depth, width)
+    shape = RecursivePlanShape(depth, width, layout=layout)
     plan = WorkPlan.from_mapping(shape.to_mapping())
     manifest = build_plan_manifest(shape.to_mapping(), scope_id="root")
 
     assert len(plan.workers) == 1
     assert len(plan.leaves) == 1
-    assert len(plan.ordered_stages) == (1 if depth else 0)
+    expected_orders = {shape._order_for(index) for index in range(width)} if depth else set()
+    assert len(plan.ordered_stages) == len(expected_orders)
     assert len(manifest.child_manifests) == (width if depth else 0)
     if depth:
-        assert len(plan.ordered_stages[0].sub_tls) == width
+        assert {stage.order for stage in plan.ordered_stages} == expected_orders
+        assert sum(len(stage.sub_tls) for stage in plan.ordered_stages) == width
         assert all(manifest.child_manifests[node_id].nodes for node_id in manifest.child_manifests)
         assert all(node.parent_id == "root" for node in manifest.nodes if node.kind == "sub_tl")
 

@@ -145,6 +145,9 @@ def test_terminal_legacy_run_migrates_to_an_empty_authoritative_manifest() -> No
     [
         ("tl_planning", "pending"),
         ("tl_running", "spawned"),
+        ("tl_dispatching", "spawned"),
+        ("tl_waiting", "spawned"),
+        ("tl_merging", "merged"),
         ("tl_all_merged", "merged"),
         ("tl_finalizing", "merged"),
         ("tl_pr_filed", "merged"),
