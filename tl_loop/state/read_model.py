@@ -545,7 +545,7 @@ def project_read_model(
         lanes=lanes,
         replay=replay_model,
         blocking=blocking,
-        next_transition=_next_transition(state, slices, ordered_stages, integration),
+        next_transition=_next_transition(state, slices, ordered_stages, integration, scope),
     )
 
 
@@ -723,6 +723,7 @@ def _next_transition(
     slices: Mapping[str, SliceReadModel],
     stages: tuple[OrderedStageReadModel, ...],
     integration: IntegrationReadModel,
+    scope: ScopeReadModel,
 ) -> str:
     pending_gate = next(
         (gate.name for gate in state.gates if gate.status.value == "pending"),
@@ -779,6 +780,8 @@ def _next_transition(
         slice_model.status in {"in_review", "repairing"} for slice_model in state.slices.values()
     ):
         return "await_review_or_ci"
+    if scope.next_transition != "advance_scope":
+        return scope.next_transition
     if integration.lifecycle == IntegrationLifecycle.MERGED.value and stages:
         return "complete_ordered_stage"
     return "await_controller"

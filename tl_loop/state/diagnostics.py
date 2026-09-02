@@ -465,7 +465,7 @@ def project_scope(state: RunState) -> ScopeReadModel:
     elif isinstance(fsm, TLAllMerged):
         completed = tuple(sorted(fsm.completed_children))
         waiting = ()
-    elif isinstance(fsm, (TLDone, TLPRFiled, TLFailed, TLParked)):
+    elif isinstance(fsm, (TLFinalizing, TLDone, TLPRFiled, TLFailed, TLParked)):
         waiting = ()
     active = parallel + pending.get(str(current_order), ()) if current_order is not None else ()
     child_digests = dict(manifest.child_manifest_digests) if manifest is not None else {}

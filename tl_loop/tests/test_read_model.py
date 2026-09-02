@@ -15,7 +15,8 @@ from tl_loop.fsm.lane import LanePhase, LaneState
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import begin_recovery
-from tl_loop.fsm.scope import TLAllMerged, TLRunning
+from tl_loop.fsm.scope import TLAllMerged, TLDone, TLFinalizing, TLPRFiled, TLRunning
+from tl_loop.fsm.scope_events import ScopeRole
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.read_model import GateReadModel, project_read_model
 from tl_loop.state.schema import (
@@ -231,6 +232,68 @@ def test_control_status_boundary_exposes_hierarchical_diagnostics_read_only() ->
     assert {"scope", "lanes", "replay", "blocking"} <= document.keys()
     assert document["last_consumed_offset"] == cursor_before
     assert state.events.last_consumed_offset == cursor_before
+
+
+def test_top_level_scope_guidance_matches_root_and_non_root_terminal_states() -> None:
+    cases = (
+        (TLAllMerged(scope_path=("root",), plan_digest="root-digest"), False, "finalize_scope"),
+        (
+            TLAllMerged(scope_path=("root", "child"), plan_digest="child-digest"),
+            True,
+            "finalize_scope",
+        ),
+        (
+            TLFinalizing(
+                ScopeRole.ROOT,
+                scope_path=("root",),
+                plan_digest="root-digest",
+            ),
+            False,
+            "finalize_scope",
+        ),
+        (
+            TLFinalizing(
+                ScopeRole.NON_ROOT,
+                scope_path=("root", "child"),
+                plan_digest="child-digest",
+            ),
+            True,
+            "finalize_scope",
+        ),
+        (TLDone(scope_path=("root",), plan_digest="root-digest"), False, "terminal"),
+        (
+            TLPRFiled(
+                aggregate_pr="101",
+                head_sha="head",
+                base_sha="base",
+                parent_branch="main",
+                handoff="handoff",
+                scope_path=("root", "child"),
+                plan_digest="child-digest",
+            ),
+            True,
+            "terminal",
+        ),
+    )
+    for recursive_fsm, non_root, expected in cases:
+        state = _scope_without_blockers(recursive_fsm, non_root=non_root)
+        document = project_read_model(state).to_document()
+        scope = cast(dict[str, object], document["scope"])
+
+        assert document["next_transition"] == expected
+        assert scope["next_transition"] == expected
+
+
+def _scope_without_blockers(recursive_fsm: object, *, non_root: bool) -> RunState:
+    base = _state()
+    return replace(
+        base,
+        fsm=FSMState(TLPhase.TLWaiting, ("stale-child",)),
+        gates=(),
+        parent_run_id="root" if non_root else None,
+        recursive_fsm=recursive_fsm,
+        slices={},
+    )
 
 
 def test_projection_exposes_recursive_scope_and_durable_blocking_details() -> None:
