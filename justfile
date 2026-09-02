@@ -125,6 +125,21 @@ tl-loop-merge-convergence-e2e-3x:
         just tl-loop-merge-convergence-e2e
     done
 
+# Run the critical #1057 crash/restart matrix against dedicated real Forgejo
+# infrastructure and the captured Beast checkpoint. The script rejects the
+# mock API and fails closed when either acceptance environment is absent.
+tl-loop-recursive-crash-convergence-e2e:
+    nix develop --command cargo build -p exomonad
+    just wasm devswarm
+    ./tests/e2e/recursive-crash-convergence/run.sh
+
+check-e2e-recursive-crash-convergence:
+    bash -n tests/e2e/recursive-crash-convergence/run.sh
+    {{py}} -m py_compile tests/e2e/recursive-crash-convergence/*.py
+    {{py}} -m pytest -q tests/e2e/recursive-crash-convergence/test_contract.py
+    test -s tests/e2e/recursive-crash-convergence/e2e-test.md
+    test -s tests/e2e/recursive-crash-convergence/testrunner.md
+
 # Lint the programmatic TL controller
 tl-loop-lint:
     {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py

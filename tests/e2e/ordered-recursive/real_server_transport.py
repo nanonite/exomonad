@@ -21,8 +21,8 @@ import json
 import multiprocessing
 import os
 import queue
-import signal
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -39,17 +39,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from tl_loop.client.effects import EffectClient, ToolResult  # noqa: E402
-from tl_loop.client.transport import JsonObject, TransportClient, TransportError  # noqa: E402
+from tl_loop.client.transport import (  # noqa: E402
+    JsonObject,
+    TransportClient,
+    TransportError,
+)
 from tl_loop.events.envelope import EventEnvelope, EventKind, project  # noqa: E402
 from tl_loop.events.queue import LedgerQueue  # noqa: E402
 from tl_loop.events.reader import LedgerReader  # noqa: E402
-from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting  # noqa: E402
+from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting, TLDone  # noqa: E402
 from tl_loop.loop.driver import (  # noqa: E402
     LeafTask,
     SubTLTask,
     TLLoopConfig,
     WorkPlan,
     _initial_slices,
+    _manifest_for_plan,
     _supervise_live_sub_tl,
     run_tl_loop,  # noqa: E402
 )
@@ -58,9 +63,11 @@ from tl_loop.ordered import IntegrationLifecycle  # noqa: E402
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse  # noqa: E402
 from tl_loop.state.schema import (  # noqa: E402
     BudgetLedger,
+    HandoffEvidence,
     IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
+    PublicationBinding,
     SliceState,
     SliceStatus,
     Verdict,  # noqa: E402
@@ -592,10 +599,18 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def json_request(method: str, url: str, payload: JsonObject | None = None) -> Any:
+def json_request(
+    method: str,
+    url: str,
+    payload: JsonObject | None = None,
+    *,
+    token: str | None = None,
+) -> Any:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=body, method=method)
     request.add_header("Accept", "application/json")
+    if token:
+        request.add_header("Authorization", f"token {token}")
     if body is not None:
         request.add_header("Content-Type", "application/json")
     try:
@@ -670,6 +685,30 @@ def create_fixture(root: Path) -> tuple[Path, Path, str]:
     return repo, remote, "feature/ordered-server"
 
 
+def clone_external_fixture(root: Path) -> tuple[Path, Path, str]:
+    """Clone the dedicated Forgejo repository used by acceptance runs.
+
+    The clone is disposable; the remote must be a repository reserved for the
+    acceptance job.  Requiring the explicit remote prevents this harness from
+    accidentally publishing test branches into an operator checkout.
+    """
+    remote_url = os.environ.get("EXOMONAD_FORGEJO_E2E_GIT_REMOTE")
+    if not remote_url:
+        raise HarnessError(
+            "EXOMONAD_FORGEJO_E2E_GIT_REMOTE is required for real acceptance"
+        )
+    repo = root / "repo"
+    run_command(["git", "clone", "--quiet", remote_url, str(repo)])
+    git(repo, "config", "user.name", "recursive-crash-e2e")
+    git(repo, "config", "user.email", "recursive-crash-e2e@example.com")
+    branch = os.environ.get("EXOMONAD_FORGEJO_E2E_BASE_BRANCH", "main")
+    git(repo, "switch", "--quiet", branch)
+    # The clone is the only local repository involved in the run.  Returning it
+    # in both repository slots keeps this helper's fixture-shaped API while
+    # avoiding a misleading Path conversion for HTTPS/SSH remotes.
+    return repo, repo, branch
+
+
 def start_mock(
     root: Path, project_root: Path, remote: Path
 ) -> tuple[subprocess.Popen[str], str]:
@@ -707,7 +746,13 @@ def start_mock(
 
 
 def start_server(
-    root: Path, repo: Path, forgejo_url: str, project_root: Path
+    root: Path,
+    repo: Path,
+    forgejo_url: str,
+    project_root: Path,
+    *,
+    forgejo_token: str = "test-token",
+    forgejo_reviewer_token: str | None = None,
 ) -> tuple[subprocess.Popen[str], TransportClient]:
     wasm = project_root / ".exo/wasm/wasm-guest-devswarm.wasm"
     binary = Path(
@@ -718,7 +763,14 @@ def start_server(
             "build target/debug/exomonad and .exo/wasm/wasm-guest-devswarm.wasm first"
         )
     (repo / ".exo/wasm").mkdir(parents=True, exist_ok=True)
-    for child_name in ("sub-a", "sub-b", "recursive-root", "nested"):
+    for child_name in (
+        "sub-a",
+        "sub-b",
+        "sub-c",
+        "recursive-root",
+        "nested",
+        "nested-a",
+    ):
         agent_dir = repo / ".exo/agents" / child_name
         agent_dir.parent.mkdir(parents=True, exist_ok=True)
         run_command(
@@ -757,7 +809,9 @@ def start_server(
     (parent_agent_dir / ".birth_branch").write_text("main.parent\n", encoding="utf-8")
     shutil.copy2(wasm, repo / ".exo/wasm/wasm-guest-devswarm.wasm")
     port = free_port()
-    session = f"ordered-server-e2e-{os.getpid()}"
+    session = f"ordered-server-e2e-{os.getpid()}-{root.name[-8:]}"
+    (repo / ".exo").mkdir(parents=True, exist_ok=True)
+    (repo / ".exo" / "e2e-tmux-session").write_text(session + "\\n", encoding="utf-8")
     (repo / ".exo/config.toml").write_text(
         "\n".join(
             [
@@ -770,8 +824,8 @@ def start_server(
                 "yolo = true",
                 'spawn_agent_type = "codex"',
                 f'forgejo_url = "{forgejo_url}"',
-                'forgejo_token = "test-token"',
-                'forgejo_reviewer_token = "test-token"',
+                f'forgejo_token = "{forgejo_token}"',
+                f'forgejo_reviewer_token = "{forgejo_reviewer_token or forgejo_token}"',
             ]
         )
         + "\n",
@@ -800,7 +854,7 @@ def start_server(
     try:
         wait_for_server(client, process, Path(log.name))
     except BaseException:
-        stop_subprocess(process, "ExoMonad server startup")
+        stop_server(process, repo, "ExoMonad server startup")
         raise
     return process, client
 
@@ -816,6 +870,77 @@ def server_run_id(repo: Path) -> str:
                 return value
         time.sleep(0.05)
     raise HarnessError(f"server did not write a swarm UUID to {path}")
+
+
+def stop_server(process: subprocess.Popen[str], repo: Path, label: str) -> None:
+    """Stop the server and remove the tmux session it owns."""
+    stop_subprocess(process, label)
+    session_path = repo / ".exo" / "e2e-tmux-session"
+    try:
+        session = session_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if session:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
+def cleanup_external_case(
+    repo: Path,
+    forgejo_url: str,
+    forgejo_owner: str,
+    forgejo_repo: str,
+    forgejo_token: str,
+    case_name: str,
+) -> None:
+    """Close and delete only PRs/branches created by one acceptance case."""
+    pulls = json_request(
+        "GET",
+        f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls?state=all&limit=100",
+        token=forgejo_token,
+    )
+    if not isinstance(pulls, list):
+        raise HarnessError(f"Forgejo pull listing is not an array: {pulls!r}")
+    branch_prefix = f"aggregate/{case_name}/"
+    for pull in pulls:
+        if not isinstance(pull, Mapping):
+            continue
+        head = pull.get("head")
+        head_ref = head.get("ref") if isinstance(head, Mapping) else None
+        title = pull.get("title")
+        belongs = isinstance(head_ref, str) and head_ref.startswith(branch_prefix)
+        belongs = belongs or (
+            isinstance(title, str)
+            and title.startswith("Aggregate ")
+            and isinstance(head_ref, str)
+            and head_ref in {"main.sub-a", "main.sub-b", "main.sub-c"}
+        )
+        if not belongs:
+            continue
+        number = pull.get("number")
+        if type(number) is int and pull.get("state") == "open":
+            json_request(
+                "PATCH",
+                f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls/{number}",
+                {"state": "closed"},
+                token=forgejo_token,
+            )
+        if isinstance(head_ref, str):
+            result = subprocess.run(
+                ["git", "push", "origin", "--delete", head_ref],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode and "remote ref does not exist" not in result.stderr:
+                raise HarnessError(
+                    f"could not delete acceptance branch {head_ref!r}: {result.stderr}"
+                )
 
 
 def server_ledger_events(repo: Path) -> list[dict[str, Any]]:
@@ -1873,19 +1998,28 @@ def seed_delayed_restart_run(
     forgejo_url: str,
     *,
     boundary: str,
+    forgejo_owner: str = "owner",
+    forgejo_repo: str = "repo",
+    forgejo_token: str | None = None,
+    case_name: str | None = None,
+    plan: WorkPlan | None = None,
+    review_verdict: str = "approved",
 ) -> tuple[str, WorkPlan, int, int]:
     """Seed two real aggregate PRs, then resume them through the controller."""
     if boundary not in {"aggregate_review", "base_revalidation", "merging"}:
         raise HarnessError(f"unsupported aggregate restart boundary: {boundary}")
-    run_id = f"ordered-server-{boundary}-restart"
+    case_slug = case_name or boundary
+    run_id = f"ordered-server-{case_slug}-restart"
     state_root = root / "controller-state"
     parent_worktree = repo / ".exo/worktrees/parent"
-    plan = WorkPlan(
+    plan = plan or WorkPlan(
         sub_tls=(
             SubTLTask("sub-a", WorkPlan(), order=1),
             SubTLTask("sub-b", WorkPlan(), order=1),
         )
     )
+    if review_verdict not in {"approved", "changes_requested"}:
+        raise HarnessError(f"unsupported seeded review verdict: {review_verdict}")
     config = TLLoopConfig(
         active=True,
         keep_alive_on_waiting=True,
@@ -1910,6 +2044,11 @@ def seed_delayed_restart_run(
         root_dir=state_root,
     )
     state = seeded_slices.load()
+    seeded_slices.set_plan_manifest(
+        _manifest_for_plan(plan, run_id, config),
+        slices=state.slices,
+    )
+    state = seeded_slices.load()
     parent_effects = EffectClient(client, role="tl", name="parent")
     candidates: dict[str, IntegrationCandidateState] = {}
     updated_slices = dict(state.slices)
@@ -1919,19 +2058,22 @@ def seed_delayed_restart_run(
         "merging": IntegrationLifecycle.MERGING,
     }[boundary]
     verdict = None if boundary == "aggregate_review" else Verdict.GO
-    for name in ("sub-a", "sub-b"):
-        branch = f"aggregate/{boundary}/{name}"
+    direct_sub_tls = tuple(plan.sub_tls)
+    review_ids: dict[str, int] = {}
+    for name in (task.name for task in direct_sub_tls):
+        branch = f"aggregate/{case_slug}/{name}"
         git(repo, "branch", branch, "main")
         git(repo, "push", "-q", "origin", branch)
         filed = json_request(
             "POST",
-            f"{forgejo_url}/api/v1/repos/owner/repo/pulls",
+            f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls",
             {
                 "title": f"Delayed aggregate {name}",
                 "body": "Controller restart acceptance fixture",
                 "head": branch,
                 "base": "main",
             },
+            token=forgejo_token,
         )
         if not isinstance(filed, Mapping) or type(filed.get("number")) is not int:
             raise HarnessError(f"mock Forgejo did not create delayed PR: {filed!r}")
@@ -1943,11 +2085,24 @@ def seed_delayed_restart_run(
         )
         head_sha = str(evidence["head_sha"])
         patch_digest = str(evidence["patch_digest"])
-        json_request(
+        review = json_request(
             "POST",
-            f"{forgejo_url}/api/v1/repos/owner/repo/pulls/{pr_number}/reviews",
-            {"event": "APPROVED", "commit_id": head_sha},
+            f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls/{pr_number}/reviews",
+            {
+                "event": "APPROVED"
+                if review_verdict == "approved"
+                else "REQUEST_CHANGES",
+                "commit_id": head_sha,
+                "body": "Acceptance repair finding"
+                if review_verdict != "approved"
+                else "",
+            },
+            token=forgejo_token,
         )
+        review_id = review.get("id") if isinstance(review, Mapping) else None
+        if type(review_id) is not int or review_id <= 0:
+            raise HarnessError(f"Forgejo review omitted its durable ID: {review!r}")
+        review_ids[name] = review_id
         current = state.slices[name]
         owner_id = f"{run_id}:{name}:integration"
         updated_slices[name] = replace(
@@ -1965,6 +2120,24 @@ def seed_delayed_restart_run(
             dispatch_agent_id=owner_id,
             dispatch_authoritative_event_seq=1,
             verdict=verdict,
+            reviewer_attempt={head_sha: 1},
+            reviewer_agent_id=f"{owner_id}:reviewer",
+            publication=PublicationBinding(
+                pr_number=pr_number,
+                head_sha=head_sha,
+                head_branch=branch,
+                base_branch="main",
+                attempt=1,
+                invocation_id=f"{owner_id}:publication",
+            ),
+            handoff=HandoffEvidence(
+                pr_number=pr_number,
+                head_sha=head_sha,
+                attempt=1,
+                invocation_id=f"{owner_id}:handoff",
+                agent_id=owner_id,
+                observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            ),
         )
         candidates[name] = IntegrationCandidateState(
             lifecycle=lifecycle,
@@ -2001,12 +2174,13 @@ def seed_delayed_restart_run(
     )
     integration = IntegrationRuntimeState(
         sub_tl_states={
-            name: IntegrationLifecycle.AGGREGATE_PR_OPEN for name in ("sub-a", "sub-b")
+            task.name: IntegrationLifecycle.AGGREGATE_PR_OPEN for task in direct_sub_tls
         },
         candidates=candidates,
     )
     waiting = {
-        name: ChildHandle(name, f"main.{name}", "sub-tl") for name in ("sub-a", "sub-b")
+        task.name: ChildHandle(task.name, f"main.{task.name}", "sub-tl")
+        for task in direct_sub_tls
     }
     seeded_slices.checkpoint(
         TLWaiting(waiting),
@@ -2017,6 +2191,49 @@ def seed_delayed_restart_run(
         ordered_stages=stages,
         integration=integration,
     )
+    for task in direct_sub_tls:
+        current = updated_slices[task.name]
+        review_payload = {
+            "slice_id": task.name,
+            "pr_number": current.pr_number,
+            "head_sha": current.reviewed_head,
+            "review_head_sha": current.reviewed_head,
+            "review_id": review_ids[task.name],
+            "review_state": review_verdict,
+            "kind": "approved" if review_verdict == "approved" else "changes_requested",
+            "verdict": "GO" if review_verdict == "approved" else "NO-GO",
+            "reviewer_agent_id": current.reviewer_agent_id,
+            "reviewer_account_authenticated": True,
+            "reviewer_identity_unresolved": False,
+            "findings": []
+            if review_verdict == "approved"
+            else [
+                {
+                    "severity": "blocking",
+                    "path": "acceptance",
+                    "rationale": "Acceptance repair finding",
+                }
+            ],
+        }
+        review_result = parent_effects.emit_controller_event(
+            event_type="pr.review", payload=review_payload
+        )
+        if not review_result.success:
+            raise HarnessError(
+                f"could not seed review ledger evidence: {review_result.raw!r}"
+            )
+        ci_result = parent_effects.emit_controller_event(
+            event_type="ci.status_changed",
+            payload={
+                "slice_id": task.name,
+                "pr_number": current.pr_number,
+                "head_sha": current.reviewed_head,
+                "status": "success",
+                "ci_status": "success",
+            },
+        )
+        if not ci_result.success:
+            raise HarnessError(f"could not seed CI ledger evidence: {ci_result.raw!r}")
     return (
         run_id,
         plan,
@@ -2025,11 +2242,15 @@ def seed_delayed_restart_run(
     )
 
 
-def seed_dispatch_restart_run(root: Path, repo: Path) -> tuple[str, WorkPlan, int, int]:
+def seed_dispatch_restart_run(
+    root: Path,
+    repo: Path,
+    plan: WorkPlan | None = None,
+) -> tuple[str, WorkPlan, int, int]:
     """Leave both live sub-TL owners at the dispatch boundary before restart."""
     run_id = "ordered-server-dispatch-restart"
     state_root = root / "controller-state"
-    plan = WorkPlan(
+    plan = plan or WorkPlan(
         sub_tls=(
             SubTLTask("sub-a", WorkPlan(), order=1),
             SubTLTask("sub-b", WorkPlan(), order=1),
@@ -2057,6 +2278,10 @@ def seed_dispatch_restart_run(root: Path, repo: Path) -> tuple[str, WorkPlan, in
             "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
         },
         root_dir=state_root,
+    )
+    state = store.load()
+    store.set_plan_manifest(
+        _manifest_for_plan(plan, run_id, config), slices=state.slices
     )
     state = store.load()
     stages = tuple(

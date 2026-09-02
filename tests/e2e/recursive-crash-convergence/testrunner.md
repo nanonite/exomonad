@@ -1,0 +1,29 @@
+# Running the #1057 acceptance
+
+Static checks (no server or Forgejo required):
+
+    just check-e2e-recursive-crash-convergence
+
+The acceptance requires a dedicated Forgejo repository and Git remote. Set:
+
+    export EXOMONAD_FORGEJO_E2E_URL=...
+    export EXOMONAD_FORGEJO_E2E_TOKEN=...
+    export EXOMONAD_FORGEJO_E2E_OWNER=...
+    export EXOMONAD_FORGEJO_E2E_REPO=...
+    export EXOMONAD_FORGEJO_E2E_GIT_REMOTE=...
+    export EXOMONAD_BEAST_WORKSPACE=/path/to/captured/beast/workspace
+    export EXOMONAD_BEAST_CONTINUE_COMMAND='exomonad --project-root {workspace} init --continue'
+
+Run the real matrix with:
+
+    just tl-loop-recursive-crash-convergence-e2e
+
+The runner creates only temporary local state and always stops the server.
+The Forgejo repository and remote must be disposable, because the acceptance
+creates branches and pull requests. A missing environment, mock API, crash
+marker, journal receipt, authoritative merge observation, or convergence
+assertion is a failure; the harness never reports a partial run as passed.
+
+The server matrix defaults to three complete disposable repetitions. Set
+EXOMONAD_1057_SERVER_RUNS=1 for a single diagnostic pass; that is not the
+acceptance configuration.
