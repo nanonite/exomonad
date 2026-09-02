@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 from tl_loop.events.envelope import project
 from tl_loop.events.reader import SequenceStatus
+from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.lane import LanePhase, LaneState
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
+from tl_loop.fsm.recovery import begin_recovery
+from tl_loop.fsm.scope import TLAllMerged, TLRunning
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.read_model import GateReadModel, project_read_model
 from tl_loop.state.schema import (
+    ActionKind,
+    ActionPhase,
+    ActionState,
     BudgetCharge,
     BudgetLedger,
     EventCursor,
@@ -21,6 +30,7 @@ from tl_loop.state.schema import (
     GoalState,
     IntegrationCandidateState,
     IntegrationRuntimeState,
+    ObservationProvenance,
     OrderedStageState,
     ParkCause,
     RunState,
@@ -157,6 +167,202 @@ def test_projection_exposes_ordered_progress_and_next_transition() -> None:
     assert integration["merge_tree_sha"] == "tree-1"
     assert integration["base_revalidation_count"] == 2
     assert document["next_transition"] == "answer_gate:review"
+
+
+def test_projection_exposes_recursive_scope_and_durable_blocking_details() -> None:
+    worker = ChildRecord(
+        "worker-a",
+        ChildKind.WORKER,
+        manifest_node_id="root/worker-a",
+        manifest_revision=3,
+    )
+    sub_tl = ChildRecord(
+        "sub-tl-a",
+        ChildKind.SUB_TL,
+        dispatch_intent_id="dispatch-sub-tl-a",
+        invocation_id="invocation-sub-tl-a",
+        lane_id="repo/main",
+        manifest_node_id="root/sub-tl-a",
+        manifest_revision=3,
+    )
+    recursive = TLRunning(
+        current_order=1,
+        pending_by_order={1: (sub_tl,)},
+        scope_path=("root", "sub-tl-a"),
+        plan_digest="recursive-digest",
+        parallel_pending=(worker,),
+        dispatch_intents={"sub-tl-a": "dispatch-sub-tl-a"},
+        lane_bindings={"sub-tl-a": "repo/main"},
+    )
+    post_merge = PostMergeState(
+        PostMergePhase.REMOTE_MERGE_ADOPTED,
+        {
+            "child_id": "task-a",
+            "repository": "org/repo",
+            "parent_branch": "main",
+            "pr_number": "101",
+            "head_sha": "bbb222",
+            "merge_journal_id": "merge-journal",
+            "lane_epoch": "4",
+        },
+    )
+    recovery = begin_recovery(
+        cause="unknown merge result",
+        owner_run_id="run-1",
+        slice_attempt=2,
+        owner_agent_id="agent-a",
+        invocation_generation=3,
+        plan_revision=3,
+        evidence={"head_sha": "bbb222", "private_reason": "must not escape"},
+        entered_at=12.0,
+    )
+    lane = LaneState(
+        repository="org/repo",
+        parent_branch="main",
+        phase=LanePhase.RECOVERY,
+        child_id="task-a",
+        lane_epoch=4,
+        expected_base_sha="base-1",
+        merge_journal_id="merge-journal",
+    )
+    slice_state = replace(
+        _state().slices["task-a"],
+        status=SliceStatus.IN_REVIEW,
+        park_cause=None,
+        park_issue_id=None,
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.UNKNOWN,
+            state_version=7,
+            intent_id="merge-intent",
+            head_sha="bbb222",
+            attempt=2,
+            contract_digest="contract",
+        ),
+        post_merge=post_merge,
+        recovery=recovery,
+        manifest_node_id="root/task-a",
+        manifest_revision=3,
+    )
+    state = replace(
+        _state(),
+        parent_run_id="root",
+        recursive_fsm=recursive,
+        slices={"task-a": slice_state},
+        integration=replace(
+            _state().integration,
+            lanes={"org/repo:main": lane},
+        ),
+    )
+
+    document = project_read_model(state).to_document()
+    scope = cast(dict[str, object], document["scope"])
+    slice_document = cast(dict[str, object], cast(dict[str, object], document["slices"])["task-a"])
+    post_document = cast(dict[str, object], slice_document["post_merge"])
+    recovery_document = cast(dict[str, object], slice_document["recovery"])
+    lane_document = cast(
+        dict[str, object], cast(dict[str, object], document["lanes"])["org/repo:main"]
+    )
+
+    assert scope["scope_path"] == ["root", "sub-tl-a"]
+    assert scope["role"] == "non_root"
+    assert scope["plan_digest"] == "recursive-digest"
+    assert scope["phase"] == "tl_running"
+    assert scope["current_order"] == 1
+    assert scope["active_barrier"] == ["worker-a", "sub-tl-a"]
+    assert scope["parallel_pending"] == ["worker-a"]
+    assert cast(dict[str, object], scope["pending_by_order"])["1"] == ["sub-tl-a"]
+    assert slice_document["manifest_node_id"] == "root/task-a"
+    assert slice_document["authority"] == "ambiguous"
+    assert slice_document["blocking_state"] == "unknown_action:merge-intent"
+    assert cast(dict[str, object], document["blocking"]) == {
+        "task-a": "unknown_action:merge-intent"
+    }
+    assert document["recursive_phase"] == "tl_running"
+    assert document["scope_role"] == "non_root"
+    assert slice_document["next_transition"] == "reconcile_action:merge-intent"
+    action_document = cast(dict[str, object], slice_document["action"])
+    assert action_document["kind"] == "merge"
+    assert action_document["phase"] == "unknown"
+    assert action_document["intent_id"] == "merge-intent"
+    direct_integration = cast(dict[str, object], slice_document["integration"])
+    assert direct_integration["head_sha"] == "bbb222"
+    assert direct_integration["freshness"] == "observed"
+    assert post_document["phase"] == "remote_merge_adopted"
+    assert post_document["next_transition"] == "sync_parent_branch"
+    assert recovery_document["phase"] == "diagnosing"
+    assert recovery_document["owner_run_id"] == "run-1"
+    assert "private_reason" not in cast(str, json.dumps(recovery_document))
+    assert lane_document["phase"] == "recovery"
+    assert lane_document["child_id"] == "task-a"
+    assert lane_document["next_transition"] == "reconcile_or_gate_lane"
+    child_records = cast(dict[str, object], scope["child_records"])
+    assert cast(dict[str, object], child_records["sub-tl-a"])["kind"] == "sub_tl"
+    assert scope["dispatch_intents"] == {"sub-tl-a": "dispatch-sub-tl-a"}
+    replay = cast(dict[str, object], document["replay"])
+    assert replay["cursor"] == 112
+    assert replay["authority"] == "consumed_ledger_prefix"
+    assert replay["state_version"] == state.state_version
+
+
+def test_projection_distinguishes_stale_review_and_recursive_terminal_scope() -> None:
+    base = _state()
+    state = replace(
+        base,
+        gates=(),
+        recursive_fsm=TLAllMerged(scope_path=("root",), plan_digest="done-digest"),
+        slices={
+            "task-a": replace(
+                base.slices["task-a"],
+                status=SliceStatus.IN_REVIEW,
+                review_validation_required=True,
+                park_cause=None,
+                park_issue_id=None,
+            )
+        },
+    )
+
+    document = project_read_model(state).to_document()
+    slice_document = cast(dict[str, object], cast(dict[str, object], document["slices"])["task-a"])
+    scope = cast(dict[str, object], document["scope"])
+
+    assert slice_document["authority"] == "stale"
+    assert slice_document["blocking_state"] == "review_revalidation_required"
+    assert slice_document["waiting_reason"] == "revalidate exact-head review"
+    assert scope["phase"] == "tl_all_merged"
+    assert scope["next_transition"] == "finalize_scope"
+
+
+def test_projection_reports_observed_unknown_and_failed_states() -> None:
+    base = _state()
+    observed = replace(
+        base.slices["task-a"],
+        status=SliceStatus.IN_REVIEW,
+        park_cause=None,
+        park_issue_id=None,
+        observation_provenance=ObservationProvenance(
+            source="watcher",
+            observed_at="2026-08-30T00:00:00Z",
+            event_seq=12,
+            snapshot_id="snapshot-12",
+        ),
+    )
+    unknown = replace(
+        observed,
+        observation_provenance=None,
+        reviewed_head=None,
+        verdict=None,
+    )
+    failed = replace(unknown, status=SliceStatus.FAILED)
+    for slice_state, expected in (
+        (observed, "observed"),
+        (unknown, "unknown"),
+        (failed, "failed"),
+    ):
+        model = project_read_model(
+            replace(base, gates=(), slices={"task-a": slice_state}),
+        )
+        assert model.slices["task-a"].authority == expected
 
 
 def _state() -> RunState:

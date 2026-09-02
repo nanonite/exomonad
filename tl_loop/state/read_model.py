@@ -13,6 +13,31 @@ from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.reader import SequenceStatus
 from tl_loop.ordered import IntegrationLifecycle
 
+from .diagnostics import (
+    ActionReadModel,
+    LaneReadModel,
+    PostMergeReadModel,
+    RecoveryReadModel,
+    ReplayReadModel,
+    ScopeReadModel,
+    SliceIntegrationReadModel,
+    _integration_bookkeeping_commit,
+    _integration_freshness,
+    _integration_merge_receipt,
+    _integration_next_transition,
+    _safe_binding,
+    project_action,
+    project_lane,
+    project_post_merge,
+    project_recovery,
+    project_replay,
+    project_scope,
+    project_slice_integration,
+    slice_blocking_state,
+    slice_next_transition,
+    slice_status_classification,
+    slice_waiting_reason,
+)
 from .schema import BudgetCharge, BudgetLedger, RunState, SliceState, Verdict
 
 RecentLimit: TypeAlias = int
@@ -77,6 +102,19 @@ class SliceReadModel:
     dispatch_agent_id: str | None
     dispatch_authoritative_event_seq: int | None
     task_started_at: float | None
+    manifest_node_id: str | None = None
+    manifest_revision: int | None = None
+    authority: str = "unknown"
+    blocking_state: str | None = None
+    waiting_reason: str | None = None
+    next_transition: str = "await_controller"
+    integration: SliceIntegrationReadModel | None = None
+    action: ActionReadModel | None = None
+    post_merge: PostMergeReadModel | None = None
+    recovery: RecoveryReadModel | None = None
+    publication: Mapping[str, object] | None = None
+    handoff: Mapping[str, object] | None = None
+    observation_provenance: Mapping[str, object] | None = None
 
     def to_document(self) -> dict[str, object]:
         """Return the body-free JSON representation."""
@@ -106,6 +144,25 @@ class SliceReadModel:
             "dispatch_agent_id": self.dispatch_agent_id,
             "dispatch_authoritative_event_seq": self.dispatch_authoritative_event_seq,
             "task_started_at": self.task_started_at,
+            "manifest_node_id": self.manifest_node_id,
+            "manifest_revision": self.manifest_revision,
+            "authority": self.authority,
+            "blocking_state": self.blocking_state,
+            "waiting_reason": self.waiting_reason,
+            "next_transition": self.next_transition,
+            "integration": (
+                self.integration.to_document() if self.integration is not None else None
+            ),
+            "action": self.action.to_document() if self.action is not None else None,
+            "post_merge": (self.post_merge.to_document() if self.post_merge is not None else None),
+            "recovery": self.recovery.to_document() if self.recovery is not None else None,
+            "publication": dict(self.publication) if self.publication is not None else None,
+            "handoff": dict(self.handoff) if self.handoff is not None else None,
+            "observation_provenance": (
+                dict(self.observation_provenance)
+                if self.observation_provenance is not None
+                else None
+            ),
         }
 
 
@@ -187,6 +244,16 @@ class IntegrationReadModel:
     merge_attempts: int
     stage_verification: str
     owner_id: str | None
+    aggregate_patch_digest: str | None = None
+    aggregate_original_base_sha: str | None = None
+    owner_run_id: str | None = None
+    owner_branch: str | None = None
+    owner_worktree: str | None = None
+    merge_receipt: str | None = None
+    bookkeeping_commit: str | None = None
+    freshness: str = "unknown"
+    lanes: Mapping[str, LaneReadModel] = field(default_factory=dict)
+    next_transition: str = "await_controller"
 
     def to_document(self) -> dict[str, object]:
         """Return the body-free integration representation."""
@@ -201,6 +268,16 @@ class IntegrationReadModel:
             "merge_attempts": self.merge_attempts,
             "stage_verification": self.stage_verification,
             "owner_id": self.owner_id,
+            "aggregate_patch_digest": self.aggregate_patch_digest,
+            "aggregate_original_base_sha": self.aggregate_original_base_sha,
+            "owner_run_id": self.owner_run_id,
+            "owner_branch": self.owner_branch,
+            "owner_worktree": self.owner_worktree,
+            "merge_receipt": self.merge_receipt,
+            "bookkeeping_commit": self.bookkeeping_commit,
+            "freshness": self.freshness,
+            "lanes": {key: lane.to_document() for key, lane in self.lanes.items()},
+            "next_transition": self.next_transition,
         }
 
 
@@ -346,6 +423,10 @@ class ReadModel:
             owner_id=None,
         )
     )
+    scope: ScopeReadModel | None = None
+    lanes: Mapping[str, LaneReadModel] = field(default_factory=dict)
+    replay: ReplayReadModel | None = None
+    blocking: Mapping[str, str] = field(default_factory=dict)
     next_transition: str = "await_controller"
 
     def to_document(self) -> dict[str, object]:
@@ -375,6 +456,12 @@ class ReadModel:
             "current_order": self.current_order,
             "ordered_stages": [stage.to_document() for stage in self.ordered_stages],
             "integration": self.integration.to_document(),
+            "scope": self.scope.to_document() if self.scope is not None else None,
+            "lanes": {key: lane.to_document() for key, lane in self.lanes.items()},
+            "replay": self.replay.to_document() if self.replay is not None else None,
+            "blocking": dict(self.blocking),
+            "recursive_phase": self.scope.phase if self.scope is not None else None,
+            "scope_role": self.scope.role if self.scope is not None else None,
             "next_transition": self.next_transition,
         }
 
@@ -417,6 +504,23 @@ def project_read_model(
     )
     ordered_stages = _ordered_stage_models(state, slices)
     integration = _integration_model(state)
+    scope = project_scope(state)
+    replay_model = project_replay(
+        state,
+        consumed_event_count=len(event_list),
+        last_event_seq=event_list[-1].run_seq if event_list else None,
+        sequence_status=status,
+    )
+    blocking = MappingProxyType(
+        {
+            slice_id: slice_model.blocking_state
+            for slice_id, slice_model in slices.items()
+            if slice_model.blocking_state is not None
+        }
+    )
+    lanes = MappingProxyType(
+        {key: project_lane(key, lane) for key, lane in sorted(state.integration.lanes.items())}
+    )
     return ReadModel(
         run_id=state.run_id,
         session_mode=state.session_mode.value if state.session_mode is not None else None,
@@ -437,6 +541,10 @@ def project_read_model(
         current_order=state.current_order,
         ordered_stages=ordered_stages,
         integration=integration,
+        scope=scope,
+        lanes=lanes,
+        replay=replay_model,
+        blocking=blocking,
         next_transition=_next_transition(state, ordered_stages, integration),
     )
 
@@ -454,6 +562,18 @@ def _integration_model(state: RunState) -> IntegrationReadModel:
         merge_attempts=integration.merge_attempts,
         stage_verification=integration.stage_verification,
         owner_id=integration.integration_owner_id,
+        aggregate_patch_digest=integration.aggregate_patch_digest,
+        aggregate_original_base_sha=integration.aggregate_original_base_sha,
+        owner_run_id=integration.integration_owner_run_id,
+        owner_branch=integration.integration_owner_branch,
+        owner_worktree=integration.integration_owner_worktree,
+        merge_receipt=_integration_merge_receipt(integration),
+        bookkeeping_commit=_integration_bookkeeping_commit(integration),
+        freshness=_integration_freshness(integration),
+        lanes=MappingProxyType(
+            {key: project_lane(key, lane) for key, lane in sorted(integration.lanes.items())}
+        ),
+        next_transition=_integration_next_transition(integration),
     )
 
 
@@ -740,6 +860,19 @@ def _slice_model(state: SliceState, events: Mapping[str, EventEnvelope]) -> Slic
         dispatch_agent_id=state.dispatch_agent_id,
         dispatch_authoritative_event_seq=state.dispatch_authoritative_event_seq,
         task_started_at=state.dispatch_started_at,
+        manifest_node_id=state.manifest_node_id,
+        manifest_revision=state.manifest_revision,
+        authority=slice_status_classification(state, observed=bool(events)),
+        blocking_state=slice_blocking_state(state),
+        waiting_reason=slice_waiting_reason(state),
+        next_transition=slice_next_transition(state),
+        integration=project_slice_integration(state),
+        action=project_action(state.action),
+        post_merge=project_post_merge(state.post_merge),
+        recovery=project_recovery(state.recovery),
+        publication=_safe_binding(state.publication),
+        handoff=_safe_binding(state.handoff),
+        observation_provenance=_safe_binding(state.observation_provenance),
     )
 
 
@@ -838,15 +971,22 @@ def _transition(event: EventEnvelope) -> TransitionReadModel:
 
 
 __all__ = [
+    "ActionReadModel",
     "BudgetChargeReadModel",
     "BudgetReadModel",
     "GateReadModel",
     "HeadEvidence",
     "IntegrationReadModel",
+    "LaneReadModel",
     "OrderedStageReadModel",
     "OrderedSubTLReadModel",
+    "PostMergeReadModel",
     "ReadModel",
     "RecentLimit",
+    "RecoveryReadModel",
+    "ReplayReadModel",
+    "ScopeReadModel",
+    "SliceIntegrationReadModel",
     "SliceReadModel",
     "TransitionReadModel",
     "project_read_model",
