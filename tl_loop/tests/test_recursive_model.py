@@ -57,11 +57,13 @@ from tl_loop.fsm.scope import (
     ScopeRole,
     StageReleased,
     TLAllMerged,
+    TLFailed,
     TLDone,
     TLFinalizing,
     TLPlanning,
     TLPRFiled,
     TLRunning,
+    TLParked,
     WorkerCompleted,
 )
 from tl_loop.loop.driver import WorkPlan
@@ -183,13 +185,72 @@ def _scope_phase(phase: ModelScopePhase) -> object:
     return TLDone()
 
 
+def _scope_successor_type(phase: ModelScopePhase, event_name: str) -> type:
+    """Independent oracle for the phase class produced by each allowed edge."""
+    if event_name == "FailureRecorded":
+        return TLFailed
+    if event_name == "ParkRequested":
+        return TLParked
+    if phase is ModelScopePhase.PLANNING:
+        return TLRunning if event_name == "StageReleased" else TLPlanning
+    if phase is ModelScopePhase.RUNNING:
+        return TLRunning
+    if phase is ModelScopePhase.ALL_MERGED:
+        return TLFinalizing
+    if phase is ModelScopePhase.FINALIZING:
+        return TLDone
+    raise AssertionError(f"terminal phase unexpectedly allowed {event_name}")
+
+
 def test_scope_reference_matrix_closes_terminal_phases() -> None:
     events = _scope_events()
 
     for phase, allowed in _SCOPE_ALLOWED.items():
         for name, event in events.items():
             if name in allowed:
-                transition(_scope_phase(phase), event)  # type: ignore[arg-type]
+                before = _scope_phase(phase)
+                after = transition(before, event)  # type: ignore[arg-type]
+                assert isinstance(after, _scope_successor_type(phase, name))
+                if name == "StageReleased":
+                    assert isinstance(after, TLRunning)
+                    assert after.current_order == 1
+                    assert tuple(after.pending_by_order) == (1,)
+                elif name == "WorkerCompleted":
+                    assert isinstance(after, TLRunning)
+                    assert "worker" not in {child.child_id for child in after.parallel_pending}
+                    assert after.evidence["worker:worker_result"] == "worker-result"
+                elif name == "LeafCompleted":
+                    assert isinstance(after, TLRunning)
+                    assert "leaf" not in {child.child_id for child in after.parallel_pending}
+                    assert after.evidence["leaf:leaf_result"] == "leaf-result"
+                elif name == "FailureRecorded":
+                    assert isinstance(after, TLFailed)
+                    assert after.reason == "failure"
+                elif name == "ParkRequested":
+                    assert isinstance(after, TLParked)
+                    assert (after.cause, after.diagnostic) == ("gate", "diagnostic")
+                elif name in {
+                    "PlanLoaded",
+                    "ChildDispatchRequested",
+                    "ChildSpawned",
+                    "PublicationFiled",
+                    "ReviewObserved",
+                    "CIObserved",
+                    "BaseInvalidated",
+                    "IntegrationValidated",
+                    "MergeRequested",
+                    "PostMergeObserved",
+                    "RepairRequested",
+                    "RecoveryObserved",
+                    "Heartbeat",
+                }:
+                    assert after == before
+                elif name == "FinalizationRequested":
+                    assert isinstance(after, TLFinalizing)
+                    assert after.role is ScopeRole.ROOT
+                elif name == "FinalizationComplete":
+                    assert isinstance(after, TLDone)
+                    assert after.finalization_evidence["root_branch"] == "main"
             else:
                 with pytest.raises(IllegalTransition):
                     transition(_scope_phase(phase), event)  # type: ignore[arg-type]
@@ -206,21 +267,28 @@ def test_scope_model_has_no_automatic_terminal_successors() -> None:
 class RecursivePlanShape:
     depth: int
     width: int
+    prefix: str = "root"
 
     def to_mapping(self) -> dict[str, object]:
+        worker_name = f"{self.prefix}-worker"
+        leaf_name = f"{self.prefix}-leaf"
         if self.depth == 0:
             return {
-                "workers": [{"name": "worker", "task": "parallel"}],
-                "leaves": [{"name": "leaf", "task": "parallel"}],
+                "workers": [{"name": worker_name, "task": "parallel"}],
+                "leaves": [{"name": leaf_name, "task": "parallel"}],
             }
         return {
-            "workers": [{"name": "worker", "task": "parallel"}],
-            "leaves": [{"name": "leaf", "task": "parallel"}],
+            "workers": [{"name": worker_name, "task": "parallel"}],
+            "leaves": [{"name": leaf_name, "task": "parallel"}],
             "sub_tls": [
                 {
-                    "name": f"scope-{self.depth}-{index}",
-                    "order": index + 1,
-                    "plan": RecursivePlanShape(self.depth - 1, self.width).to_mapping(),
+                    "name": f"{self.prefix}-scope-{self.depth}-{index}",
+                    "order": 1,
+                    "plan": RecursivePlanShape(
+                        self.depth - 1,
+                        self.width,
+                        f"{self.prefix}-scope-{self.depth}-{index}",
+                    ).to_mapping(),
                 }
                 for index in range(self.width)
             ],
@@ -238,11 +306,47 @@ def test_bounded_recursive_plans_preserve_nested_serial_and_parallel_scopes(
 
     assert len(plan.workers) == 1
     assert len(plan.leaves) == 1
-    assert len(plan.ordered_stages) == (width if depth else 0)
+    assert len(plan.ordered_stages) == (1 if depth else 0)
     assert len(manifest.child_manifests) == (width if depth else 0)
     if depth:
+        assert len(plan.ordered_stages[0].sub_tls) == width
         assert all(manifest.child_manifests[node_id].nodes for node_id in manifest.child_manifests)
         assert all(node.parent_id == "root" for node in manifest.nodes if node.kind == "sub_tl")
+
+
+def test_same_order_sub_tls_form_one_stable_release_barrier() -> None:
+    planning = TLPlanning(((1, (_child("stage-z"), _child("stage-a"))),))
+
+    running = transition(planning, StageReleased(1, ("stage-a", "stage-z"), ("root",)))
+
+    assert isinstance(running, TLRunning)
+    assert running.current_order == 1
+    assert tuple(child.child_id for child in running.pending_by_order[1]) == (
+        "stage-a",
+        "stage-z",
+    )
+    with pytest.raises(IllegalTransition):
+        transition(planning, StageReleased(1, ("stage-z", "stage-a"), ("root",)))
+
+
+def test_parallel_direct_work_does_not_block_ordered_stage() -> None:
+    worker = _child("worker", ChildKind.WORKER)
+    leaf = _child("leaf", ChildKind.LEAF)
+    planning = TLPlanning(
+        ((1, (_child("stage"),)),),
+        parallel_children=(worker, leaf),
+    )
+
+    running = transition(planning, StageReleased(1, ("stage",), ("root",)))
+    assert isinstance(running, TLRunning)
+    after_worker = transition(running, WorkerCompleted("worker", "worker-result"))
+    assert isinstance(after_worker, TLRunning)
+    assert after_worker.current_order == 1
+    assert tuple(child.child_id for child in after_worker.parallel_pending) == ("leaf",)
+    after_leaf = transition(after_worker, LeafCompleted("leaf", "leaf-result"))
+    assert isinstance(after_leaf, TLRunning)
+    assert after_leaf.current_order == 1
+    assert tuple(child.child_id for child in after_leaf.parallel_pending) == ()
 
 
 _POST_PHASE_FIELDS: tuple[tuple[PostMergePhase, tuple[str, ...]], ...] = (
@@ -560,10 +664,65 @@ def _lane_events(phase: LanePhase) -> dict[str, object]:
 
 
 def test_lane_reference_matrix_rejects_cross_phase_edges() -> None:
+    expected = {
+        LanePhase.IDLE: {"reserved": LanePhase.RESERVED},
+        LanePhase.RESERVED: {
+            "integrating": LanePhase.INTEGRATING,
+            "recovery": LanePhase.RECOVERY,
+            "parked": LanePhase.PARKED,
+            "abandoned": LanePhase.IDLE,
+        },
+        LanePhase.INTEGRATING: {
+            "integrating": LanePhase.INTEGRATING,
+            "bookkeeping": LanePhase.BOOKKEEPING,
+            "recovery": LanePhase.RECOVERY,
+            "parked": LanePhase.PARKED,
+            "abandoned": LanePhase.IDLE,
+        },
+        LanePhase.BOOKKEEPING: {
+            "bookkeeping": LanePhase.BOOKKEEPING,
+            "released": LanePhase.IDLE,
+            "recovery": LanePhase.RECOVERY,
+            "parked": LanePhase.PARKED,
+            "abandoned": LanePhase.IDLE,
+        },
+        LanePhase.RECOVERY: {
+            "reserved": LanePhase.RESERVED,
+            "resolved": LanePhase.INTEGRATING,
+            "parked": LanePhase.PARKED,
+            "abandoned": LanePhase.IDLE,
+        },
+        LanePhase.PARKED: {
+            "recovery": LanePhase.RECOVERY,
+            "abandoned": LanePhase.IDLE,
+        },
+    }
+    assert set(expected) == set(_LANE_ALLOWED)
     for phase, allowed in _LANE_ALLOWED.items():
         for name, event in _lane_events(phase).items():
             if name in allowed:
-                transition_lane(_lane_state(phase), event)
+                before = _lane_state(phase)
+                after = transition_lane(before, event)
+                assert after.phase is expected[phase][name]
+                if name == "reserved":
+                    assert after.child_id == "child"
+                    assert after.lane_epoch == (2 if phase is LanePhase.RECOVERY else 1)
+                    assert after.expected_base_sha == "base"
+                elif name == "integrating":
+                    assert after.head_sha == "head"
+                elif name == "bookkeeping":
+                    assert after.push_intent_id == "push-intent"
+                    assert after.push_journal_id == "push-journal"
+                    assert after.changelog_commit == "commit"
+                elif name == "released":
+                    assert after.child_id is None
+                    assert after.last_push_receipt_id == "receipt"
+                    assert after.last_remote_head == "remote"
+                    assert after.last_ancestry_proof == "ancestor:commit"
+                elif name == "abandoned":
+                    assert after.child_id is None
+                    assert after.lane_epoch is None
+                    assert after.push_intent_id is None
             else:
                 with pytest.raises(IllegalTransition):
                     transition_lane(_lane_state(phase), event)
@@ -661,11 +820,83 @@ _INTEGRATION_MATRIX: dict[IntegrationLifecycle, frozenset[IntegrationTransition]
 
 
 def test_integration_reference_matrix_rejects_every_unlisted_edge() -> None:
+    expected = {
+        IntegrationLifecycle.RUNNING: {
+            IntegrationTransition.CHILDREN_MERGED: IntegrationLifecycle.CHILDREN_MERGED,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+            IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
+        },
+        IntegrationLifecycle.CHILDREN_MERGED: {
+            IntegrationTransition.AGGREGATE_PR_OPENED: IntegrationLifecycle.AGGREGATE_PR_OPEN,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+            IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
+        },
+        IntegrationLifecycle.AGGREGATE_PR_OPEN: {
+            IntegrationTransition.CODE_REVIEW_ACCEPTED: IntegrationLifecycle.CODE_REVIEWED,
+            IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+            IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
+        },
+        IntegrationLifecycle.CODE_REVIEWED: {
+            IntegrationTransition.CODE_REVIEW_ACCEPTED: IntegrationLifecycle.READY_FOR_INTEGRATION,
+            IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            IntegrationTransition.HEAD_INVALIDATED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+            IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
+        },
+        IntegrationLifecycle.READY_FOR_INTEGRATION: {
+            IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            IntegrationTransition.HEAD_INVALIDATED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationTransition.INTEGRATION_VALIDATED: IntegrationLifecycle.INTEGRATION_VALIDATED,
+            IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+            IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
+        },
+        IntegrationLifecycle.NEEDS_BASE_REVALIDATION: {
+            IntegrationTransition.INTEGRATION_VALIDATED: IntegrationLifecycle.INTEGRATION_VALIDATED,
+            IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+            IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
+        },
+        IntegrationLifecycle.INTEGRATION_VALIDATED: {
+            IntegrationTransition.MERGE_STARTED: IntegrationLifecycle.MERGING,
+            IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+        },
+        IntegrationLifecycle.MERGING: {
+            IntegrationTransition.MERGED: IntegrationLifecycle.MERGED,
+            IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+        },
+        IntegrationLifecycle.REPAIRING_AGGREGATE: {
+            IntegrationTransition.REPAIR_COMPLETED: IntegrationLifecycle.AGGREGATE_PR_OPEN,
+            IntegrationTransition.HEAD_INVALIDATED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+            IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
+        },
+        IntegrationLifecycle.INTEGRATION_CONFLICT: {
+            IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
+            IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
+        },
+        IntegrationLifecycle.MERGED: {},
+        IntegrationLifecycle.FAILED: {},
+        IntegrationLifecycle.PARKED: {},
+    }
+    assert set(expected) == set(_INTEGRATION_MATRIX)
     for lifecycle, allowed in _INTEGRATION_MATRIX.items():
         assert allowed_integration_transitions(lifecycle) == allowed
         for event in IntegrationTransition:
             if event in allowed:
-                transition_integration(IntegrationState(lifecycle), event)
+                before = IntegrationState(lifecycle)
+                after = transition_integration(before, event)
+                assert after == IntegrationState(expected[lifecycle][event])
             else:
                 with pytest.raises(IntegrationTransitionError):
                     transition_integration(IntegrationState(lifecycle), event)
@@ -690,6 +921,20 @@ def test_head_and_base_evidence_invalidate_different_integration_paths() -> None
     )
 
 
+def _canonical_run_state(phase: object) -> RunState:
+    return RunState(
+        version=1,
+        revision=0,
+        run_id="recursive-model-run",
+        fsm=FSMState(TLPhase.TLPlanning, ()),
+        slices={},
+        budgets=BudgetLedger(0, 0),
+        gates=(),
+        events=EventCursor(0),
+        recursive_fsm=phase,
+    )
+
+
 def test_heartbeat_model_step_is_a_state_version_noop() -> None:
     state = RunState(
         version=1,
@@ -707,3 +952,49 @@ def test_heartbeat_model_step_is_a_state_version_noop() -> None:
 
     assert heartbeat.state is state
     assert heartbeat.state.state_version == state.state_version
+
+
+@pytest.mark.parametrize(
+    ("phase", "event", "expected_type"),
+    [
+        (TLPlanning(), StageReleased(0, (), ("root",)), TLAllMerged),
+        (_running(), WorkerCompleted("worker", "worker-result"), TLRunning),
+        (TLAllMerged(), FinalizationRequested(ScopeRole.ROOT), TLFinalizing),
+        (
+            TLFinalizing(ScopeRole.ROOT),
+            FinalizationComplete(
+                ScopeRole.ROOT, {"root_branch": "main", "local_checkout": "checkout"}
+            ),
+            TLDone,
+        ),
+    ],
+)
+def test_recursive_scope_edges_advance_state_version_once(
+    phase: object, event: object, expected_type: type
+) -> None:
+    before = _canonical_run_state(phase)
+
+    result = step(before, event)  # type: ignore[arg-type]
+
+    assert isinstance(result.state.recursive_fsm, expected_type)
+    assert result.state.state_version == before.state_version + 1
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        TLPlanning(),
+        _running(),
+        TLAllMerged(),
+        TLFinalizing(ScopeRole.ROOT),
+        TLDone(),
+        TLPRFiled("43", "head", "base", "main", "handoff"),
+    ),
+)
+def test_recursive_fsm_heartbeat_is_idempotent_at_every_phase(phase: object) -> None:
+    before = _canonical_run_state(phase)
+
+    result = step(before, HeartbeatTick(10.0))
+
+    assert result.state is before
+    assert result.state.state_version == before.state_version

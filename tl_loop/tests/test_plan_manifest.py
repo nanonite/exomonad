@@ -444,6 +444,38 @@ def test_continuation_rejects_reordered_external_plan(tmp_path) -> None:
         )
 
 
+def test_continuation_rejects_changed_external_plan(tmp_path) -> None:
+    original = _plan()
+    manifest = build_plan_manifest(original, scope_id="changed")
+    create("changed", {"plan_manifest": manifest.to_document()}, root_dir=tmp_path)
+
+    class EmptySource:
+        def get(self, timeout=None):
+            raise queue.Empty
+
+        def acknowledge(self, event):
+            return event.run_seq
+
+    class NoopTransport:
+        def call_tool(self, role, name, tool_name, arguments):
+            return {"success": True, "result": {}}
+
+    changed = {
+        "workers": original["workers"],
+        "leaves": [{"name": "leaf", "task": "changed task"}],
+        "sub_tls": original["sub_tls"],
+    }
+    with pytest.raises(driver.TLLoopError, match="increase plan_revision"):
+        run_tl_loop(
+            "changed",
+            changed,
+            EmptySource(),
+            ReadOnlyEffectClient(EffectClient(NoopTransport(), role="tl", name="root")),
+            config=TLLoopConfig(active=False, max_events=1, root_dir=tmp_path),
+            root_dir=tmp_path,
+        )
+
+
 def test_recursive_running_fsm_preserves_dispatch_and_lane_payloads() -> None:
     child = ChildRecord(
         "stage-a",

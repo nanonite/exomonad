@@ -141,6 +141,32 @@ def test_terminal_legacy_run_migrates_to_an_empty_authoritative_manifest() -> No
 
 
 @pytest.mark.parametrize(
+    ("phase", "status"),
+    [
+        ("tl_planning", "pending"),
+        ("tl_running", "spawned"),
+        ("tl_all_merged", "merged"),
+        ("tl_finalizing", "merged"),
+        ("tl_pr_filed", "merged"),
+        ("tl_failed", "failed"),
+        ("tl_parked", "parked"),
+    ],
+)
+def test_every_recursive_legacy_phase_migrates_with_its_slice_binding(
+    phase: str, status: str
+) -> None:
+    legacy = _legacy_checkpoint({"child": _slice(status)}, phase=phase)
+
+    result = migrate_checkpoint_document(legacy, run_id="legacy-recursive")
+    manifest = _manifest(result)
+
+    assert result.document["fsm"]["phase"] == phase  # type: ignore[index]
+    migrated_slice = result.document["slices"]["child"]  # type: ignore[index]
+    assert migrated_slice["manifest_node_id"] == manifest.nodes[0].node_id  # type: ignore[index]
+    assert migrated_slice["manifest_revision"] == manifest.manifest_revision  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
     ("ordered_stages", "message"),
     [
         ([{"order": 1, "sub_tls": ["missing"]}], "absent from slices"),
