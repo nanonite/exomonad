@@ -545,7 +545,7 @@ def project_read_model(
         lanes=lanes,
         replay=replay_model,
         blocking=blocking,
-        next_transition=_next_transition(state, ordered_stages, integration),
+        next_transition=_next_transition(state, slices, ordered_stages, integration),
     )
 
 
@@ -720,6 +720,7 @@ def _current_ci_status(slice_model: SliceReadModel) -> str | None:
 
 def _next_transition(
     state: RunState,
+    slices: Mapping[str, SliceReadModel],
     stages: tuple[OrderedStageReadModel, ...],
     integration: IntegrationReadModel,
 ) -> str:
@@ -729,6 +730,28 @@ def _next_transition(
     )
     if pending_gate is not None:
         return f"answer_gate:{pending_gate}"
+    blocking_slice = next(
+        (
+            (slice_id, slice_model)
+            for slice_id, slice_model in sorted(slices.items())
+            if slice_model.blocking_state is not None
+        ),
+        None,
+    )
+    if blocking_slice is not None:
+        slice_id, slice_model = blocking_slice
+        return f"slice:{slice_id}:{slice_model.next_transition}"
+    blocking_lane = next(
+        (
+            (lane_key, lane)
+            for lane_key, lane in sorted(integration.lanes.items())
+            if lane.phase in {"recovery", "bookkeeping", "parked"}
+        ),
+        None,
+    )
+    if blocking_lane is not None:
+        lane_key, lane = blocking_lane
+        return f"lane:{lane_key}:{lane.next_transition}"
     sub_tls = [sub_tl for stage in stages for sub_tl in stage.sub_tls]
     conflict = next(
         (

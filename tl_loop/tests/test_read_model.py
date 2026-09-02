@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
+from tl_loop.__main__ import _state_document
 from tl_loop.events.envelope import project
 from tl_loop.events.reader import SequenceStatus
 from tl_loop.fsm.child import ChildKind, ChildRecord
@@ -99,6 +100,10 @@ def test_projection_ignores_events_after_state_cursor() -> None:
 
     assert model.recent_transitions
     assert max(transition.run_seq for transition in model.recent_transitions) == 112
+    replay = cast(dict[str, object], model.to_document()["replay"])
+    assert replay["cursor"] == 112
+    assert replay["last_event_seq"] == 112
+    assert replay["authority"] == "consumed_ledger_prefix"
 
 
 def test_projection_exposes_ordered_progress_and_next_transition() -> None:
@@ -169,6 +174,65 @@ def test_projection_exposes_ordered_progress_and_next_transition() -> None:
     assert document["next_transition"] == "answer_gate:review"
 
 
+def test_top_level_transition_identifies_blocking_slice_after_gate_resolution() -> None:
+    base = _state()
+    state = replace(
+        base,
+        gates=(),
+        slices={
+            "task-a": replace(
+                base.slices["task-a"],
+                status=SliceStatus.IN_REVIEW,
+                park_cause=None,
+                park_issue_id=None,
+                action=ActionState(
+                    ActionKind.MERGE,
+                    ActionPhase.UNKNOWN,
+                    state_version=7,
+                    intent_id="merge-intent",
+                    head_sha="bbb222",
+                    attempt=2,
+                    contract_digest="contract",
+                ),
+            )
+        },
+    )
+    document = project_read_model(state).to_document()
+
+    assert document["next_transition"] == "slice:task-a:reconcile_action:merge-intent"
+
+
+def test_watcher_projection_is_read_only_and_cursor_bounded() -> None:
+    state = _state()
+    raw_events = cast(list[dict[str, object]], json.loads(FIXTURE.read_text(encoding="utf-8")))
+    events = tuple(project(raw_event) for raw_event in raw_events)
+    cursor_before = state.events.last_consumed_offset
+
+    document = project_read_model(
+        state,
+        events,
+        sequence_status=SequenceStatus.COMPLETE,
+    ).to_document()
+
+    assert state.events.last_consumed_offset == cursor_before
+    replay = cast(dict[str, object], document["replay"])
+    assert replay["cursor"] == cursor_before
+    assert replay["authority"] == "consumed_ledger_prefix"
+
+
+def test_control_status_boundary_exposes_hierarchical_diagnostics_read_only() -> None:
+    state = _state()
+    raw_events = cast(list[dict[str, object]], json.loads(FIXTURE.read_text(encoding="utf-8")))
+    events = tuple(project(raw_event) for raw_event in raw_events)
+    cursor_before = state.events.last_consumed_offset
+
+    document = _state_document(state, events, SequenceStatus.COMPLETE)
+
+    assert {"scope", "lanes", "replay", "blocking"} <= document.keys()
+    assert document["last_consumed_offset"] == cursor_before
+    assert state.events.last_consumed_offset == cursor_before
+
+
 def test_projection_exposes_recursive_scope_and_durable_blocking_details() -> None:
     worker = ChildRecord(
         "worker-a",
@@ -213,7 +277,13 @@ def test_projection_exposes_recursive_scope_and_durable_blocking_details() -> No
         owner_agent_id="agent-a",
         invocation_generation=3,
         plan_revision=3,
-        evidence={"head_sha": "bbb222", "private_reason": "must not escape"},
+        evidence={
+            "head_sha": "bbb222",
+            "private_reason": "must not escape",
+            "candidate_body": "SECRET AGENT AUTHORED TEXT",
+            "invalid_payload": "SECRET TWO",
+            "reviewer_id": "SECRET THREE",
+        },
         entered_at=12.0,
     )
     lane = LaneState(
@@ -293,6 +363,11 @@ def test_projection_exposes_recursive_scope_and_durable_blocking_details() -> No
     assert recovery_document["phase"] == "diagnosing"
     assert recovery_document["owner_run_id"] == "run-1"
     assert "private_reason" not in cast(str, json.dumps(recovery_document))
+    assert "candidate_body" not in cast(str, json.dumps(document))
+    assert "invalid_payload" not in cast(str, json.dumps(document))
+    assert "reviewer_id" not in cast(str, json.dumps(document))
+    ungated_document = project_read_model(replace(state, gates=())).to_document()
+    assert ungated_document["next_transition"] == "slice:task-a:reconcile_action:merge-intent"
     assert lane_document["phase"] == "recovery"
     assert lane_document["child_id"] == "task-a"
     assert lane_document["next_transition"] == "reconcile_or_gate_lane"

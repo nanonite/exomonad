@@ -96,6 +96,9 @@ def test_status_renders_live_state_without_watch_controls(tmp_path: Path, capsys
     assert any(gate["name"].startswith("plan-manifest-migration:") for gate in document["gates"])
     assert document["park_causes"] == {"task-a": "review_stuck"}
     assert document["last_consumed_offset"] == 112
+    assert {"scope", "lanes", "replay", "blocking"} <= document.keys()
+    assert document["replay"]["cursor"] == 112
+    assert document["replay"]["authority"] == "consumed_ledger_prefix"
     assert document["controller_fingerprint"]["status"] == "source"
 
 

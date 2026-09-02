@@ -341,7 +341,7 @@ def project_recovery(recovery: RecoveryState | None) -> RecoveryReadModel | None
         last_probe_at=recovery.last_probe_at,
         next_probe_at=recovery.next_probe_at,
         probe_count=recovery.probe_count,
-        evidence=_safe_object_evidence(recovery.evidence),
+        evidence=_safe_object_evidence(recovery.evidence, _RECOVERY_SAFE_KEYS),
     )
 
 
@@ -461,7 +461,7 @@ def project_scope(state: RunState) -> ScopeReadModel:
         records = _child_documents(all_records)
         dispatch_intents = dict(fsm.dispatch_intents)
         lane_bindings = dict(fsm.lane_bindings)
-        scope_evidence = dict(_safe_evidence(fsm.evidence))
+        scope_evidence = dict(_safe_evidence(fsm.evidence, _SCOPE_SAFE_KEYS))
     elif isinstance(fsm, TLAllMerged):
         completed = tuple(sorted(fsm.completed_children))
         waiting = ()
@@ -644,7 +644,7 @@ def _child_documents(records: tuple[ChildRecord, ...]) -> dict[str, Mapping[str,
                 "lane_id": record.lane_id,
                 "manifest_node_id": record.manifest_node_id,
                 "manifest_revision": record.manifest_revision,
-                "evidence": dict(_safe_evidence(record.evidence)),
+                "evidence": dict(_safe_evidence(record.evidence, _CHILD_SAFE_KEYS)),
             }
         )
         for record in records
@@ -749,39 +749,103 @@ def _safe_binding(value: object | None) -> Mapping[str, object] | None:
     )
 
 
-def _safe_evidence(evidence: Mapping[str, str]) -> Mapping[str, str]:
+_POST_MERGE_SAFE_KEYS = frozenset(
+    {
+        "child_id",
+        "repository",
+        "parent_branch",
+        "pr_number",
+        "head_sha",
+        "merge_journal_id",
+        "lane_epoch",
+        "parent_commit_sha",
+        "issue_id",
+        "issue_close_intent_id",
+        "issue_close_journal_id",
+        "changelog_intent_id",
+        "changelog_generation",
+        "changelog_commit_sha",
+        "parent_push_intent_id",
+        "push_journal_id",
+        "expected_base_sha",
+        "push_receipt_id",
+        "pushed_commit",
+        "bookkeeping_commit",
+        "observed_remote_head",
+        "ancestry_proof",
+    }
+)
+_CHILD_SAFE_KEYS = frozenset(
+    {
+        "child_id",
+        "dispatch_intent_id",
+        "invocation_id",
+        "lane_id",
+        "manifest_node_id",
+        "manifest_revision",
+        "head_sha",
+        "base_sha",
+        "branch",
+        "result_id",
+    }
+)
+_SCOPE_SAFE_KEYS = frozenset(
+    {
+        "child_id",
+        "dispatch_intent_id",
+        "invocation_id",
+        "lane_id",
+        "manifest_node_id",
+        "manifest_revision",
+        "head_sha",
+        "base_sha",
+        "branch",
+        "parent_branch",
+        "repository",
+        "order",
+        "stage",
+    }
+)
+_RECOVERY_SAFE_KEYS = frozenset(
+    {
+        "child_id",
+        "repository",
+        "parent_branch",
+        "pr_number",
+        "head_sha",
+        "base_sha",
+        "remote_head_sha",
+        "new_base_sha",
+        "observed_remote_head",
+        "ancestry_proof",
+        "intent_id",
+        "journal_id",
+        "generation",
+        "recovery_round",
+        "lane_epoch",
+        "invocation_generation",
+        "plan_revision",
+    }
+)
+
+
+def _safe_evidence(
+    evidence: Mapping[str, str], allowed: frozenset[str] = _POST_MERGE_SAFE_KEYS
+) -> Mapping[str, str]:
     return MappingProxyType(
-        {key: value for key, value in evidence.items() if _safe_key(key) and isinstance(value, str)}
+        {key: value for key, value in evidence.items() if key in allowed and isinstance(value, str)}
     )
 
 
-def _safe_object_evidence(evidence: Mapping[str, object]) -> Mapping[str, object]:
+def _safe_object_evidence(
+    evidence: Mapping[str, object], allowed: frozenset[str]
+) -> Mapping[str, object]:
     return MappingProxyType(
         {
             key: value
             for key, value in evidence.items()
-            if _safe_key(key) and isinstance(value, (str, int, float, bool))
+            if key in allowed and isinstance(value, (str, int, float, bool))
         }
-    )
-
-
-def _safe_key(key: str) -> bool:
-    lowered = key.lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "id",
-            "sha",
-            "branch",
-            "base",
-            "commit",
-            "receipt",
-            "epoch",
-            "generation",
-            "proof",
-            "pr_number",
-            "head",
-        )
     )
 
 
