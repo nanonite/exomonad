@@ -167,6 +167,8 @@ def replay_fixture(
     session_mode: str | None = None,
     crash_after: str | None = None,
     live_ledger: bool = False,
+    child_event_transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]]
+    | None = None,
 ) -> ReplayResult:
     """Run one committed event stream and return normalized observable output."""
     spec = _load_fixture(fixture)
@@ -174,6 +176,7 @@ def replay_fixture(
     plan = _plan_with_replay_sources(
         _mapping(spec["plan"], "plan"),
         spec.get("child_events"),
+        child_event_transform=child_event_transform,
     )
     events = _events(spec["events"])
     if event_transform is not None:
@@ -201,6 +204,7 @@ def replay_fixture(
             Path(root_dir) / run_id,
             Path(root_dir) / ".exo" / "child-ledger",
             queues,
+            child_event_transform=child_event_transform,
         )
     else:
         source = RecordedEventSource(events)
@@ -411,7 +415,13 @@ def _events(value: object) -> list[EventEnvelope]:
     return [project(cast(dict[str, object], item)) for item in value]
 
 
-def _plan_with_replay_sources(value: Mapping[str, object], child_events: object) -> WorkPlan:
+def _plan_with_replay_sources(
+    value: Mapping[str, object],
+    child_events: object,
+    *,
+    child_event_transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]]
+    | None = None,
+) -> WorkPlan:
     """Attach independently replayable event streams to recursive child scopes."""
     plan = WorkPlan.from_mapping(value)
     if child_events is None:
@@ -430,7 +440,12 @@ def _plan_with_replay_sources(value: Mapping[str, object], child_events: object)
             source_value = child_events.get(task.name)
             source = task.source
             if source_value is not None:
-                source = RecordedEventSource(_events(source_value))
+                if child_event_transform is not None:
+                    source_value = child_event_transform(
+                        cast(list[Mapping[str, object]], source_value)
+                    )
+                events = _events(source_value)
+                source = RecordedEventSource(events)
             children.append(replace(task, plan=bind(child_plan), source=source))
         return replace(current, sub_tls=tuple(children))
 
@@ -452,6 +467,9 @@ def _attach_live_child_sources(
     parent_state_dir: Path,
     ledger_root: Path,
     queues: list[LedgerQueue],
+    *,
+    child_event_transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]]
+    | None = None,
 ) -> WorkPlan:
     """Give every recursive child an independent live or empty source."""
     event_map = child_events if isinstance(child_events, Mapping) else {}
@@ -464,7 +482,10 @@ def _attach_live_child_sources(
         child_state_dir = parent_state_dir / task.name
         child_ledger_dir = ledger_root / task.name
         if isinstance(raw_events, list):
-            _write_ledger_segment(child_ledger_dir, cast(list[Mapping[str, object]], raw_events))
+            rows = raw_events
+            if child_event_transform is not None:
+                rows = list(child_event_transform(cast(list[Mapping[str, object]], raw_events)))
+            _write_ledger_segment(child_ledger_dir, cast(list[Mapping[str, object]], rows))
             source = LedgerQueue(
                 LedgerReader(child_ledger_dir, run_dir=child_state_dir),
                 poll_interval=0.001,
@@ -483,6 +504,7 @@ def _attach_live_child_sources(
                     child_state_dir,
                     child_ledger_dir,
                     queues,
+                    child_event_transform=child_event_transform,
                 ),
             )
         )

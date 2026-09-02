@@ -22,7 +22,7 @@ from .lane import (
 
 def transition_lane(lane: LaneState, event: object) -> LaneState:
     """Apply one serialized lane event."""
-    active = (LanePhase.IDLE, LanePhase.RESERVED, LanePhase.INTEGRATING, LanePhase.BOOKKEEPING)
+    active = (LanePhase.RESERVED, LanePhase.INTEGRATING, LanePhase.BOOKKEEPING)
     if isinstance(event, LaneAbandoned) and lane.phase in active + (
         LanePhase.RECOVERY,
         LanePhase.PARKED,

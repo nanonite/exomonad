@@ -1,0 +1,159 @@
+"""Independent migration matrix for recursive checkpoint compatibility."""
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+
+from tl_loop.state.migration import MigrationError, migrate_checkpoint_document
+from tl_loop.state.plan_manifest import PlanManifest
+
+
+def _legacy_checkpoint(
+    slices: dict[str, dict[str, object]],
+    *,
+    phase: str = "tl_planning",
+    ordered_stages: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    document: dict[str, object] = {
+        "version": 3,
+        "revision": 7,
+        "run_id": "legacy-recursive",
+        "fsm": {"phase": phase, "waiting": list(slices)},
+        "slices": slices,
+        "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
+        "gates": [],
+        "events": {"last_consumed_offset": 19},
+    }
+    if ordered_stages is not None:
+        document["ordered_stages"] = ordered_stages
+    return document
+
+
+def _slice(status: str = "pending", **fields: object) -> dict[str, object]:
+    return {"state": status, "paths": ["."], **fields}
+
+
+def _manifest(result: object) -> PlanManifest:
+    assert hasattr(result, "document")
+    document = result.document  # type: ignore[attr-defined]
+    return PlanManifest.from_document(document["plan_manifest"])  # type: ignore[arg-type]
+
+
+def test_flat_parallel_legacy_plan_binds_every_slice() -> None:
+    legacy = _legacy_checkpoint(
+        {
+            "worker-a": _slice(),
+            "worker-b": _slice("completed"),
+            "leaf-a": _slice("pending"),
+        }
+    )
+
+    result = migrate_checkpoint_document(legacy, run_id="legacy-recursive")
+    manifest = _manifest(result)
+
+    assert {node.name for node in manifest.nodes} == {"worker-a", "worker-b", "leaf-a"}
+    assert all(node.kind == "legacy" for node in manifest.nodes)
+    assert result.document["gates"]
+    for slice_id, state in result.document["slices"].items():  # type: ignore[union-attr]
+        node = manifest.node(state["manifest_node_id"])  # type: ignore[index]
+        assert node.name == slice_id
+        assert state["manifest_revision"] == manifest.manifest_revision  # type: ignore[index]
+
+
+def test_ordered_legacy_plan_preserves_barriers_and_source_order() -> None:
+    legacy = _legacy_checkpoint(
+        {
+            "direct-worker": _slice(),
+            "stage-a": _slice(),
+            "stage-b": _slice(),
+            "stage-c": _slice(),
+        },
+        ordered_stages=[
+            {"order": 1, "sub_tls": ["stage-a", "stage-b"]},
+            {"order": 2, "sub_tls": ["stage-c"]},
+        ],
+    )
+
+    manifest = _manifest(migrate_checkpoint_document(legacy, run_id="legacy-recursive"))
+
+    assert manifest.ordered_stages == (
+        (1, ("legacy-recursive/sub_tl/stage-a", "legacy-recursive/sub_tl/stage-b")),
+        (2, ("legacy-recursive/sub_tl/stage-c",)),
+    )
+    ordered_nodes = [
+        manifest.node(node_id) for _, ids in manifest.ordered_stages for node_id in ids
+    ]
+    assert [node.name for node in ordered_nodes] == ["stage-a", "stage-b", "stage-c"]
+    assert [node.order for node in ordered_nodes] == [1, 1, 2]
+    assert all(node.kind == "sub_tl" for node in ordered_nodes)
+    assert manifest.node("legacy-recursive/worker/direct-worker").kind == "legacy"
+
+
+def test_nested_legacy_scope_fails_closed_instead_of_flattening() -> None:
+    legacy = _legacy_checkpoint({"parent": _slice(sub_tls=[{"name": "child", "state": "pending"}])})
+
+    with pytest.raises(MigrationError, match="nested scope.*cannot be reconstructed"):
+        migrate_checkpoint_document(legacy, run_id="legacy-recursive")
+
+
+def test_active_partial_legacy_run_preserves_dispatch_and_completion_evidence() -> None:
+    legacy = _legacy_checkpoint(
+        {
+            "active-worker": _slice(
+                "spawned",
+                dispatch_intent_id="dispatch-intent",
+                dispatch_agent_id="worker-agent",
+                dispatch_authoritative_event_seq=12,
+            ),
+            "merged-leaf": _slice(
+                "merged",
+                pr_number=43,
+                reviewed_head="head-a",
+                verdict="GO",
+            ),
+        },
+        phase="tl_running",
+    )
+
+    result = migrate_checkpoint_document(legacy, run_id="legacy-recursive")
+
+    assert result.document["slices"]["active-worker"]["status"] == "spawned"  # type: ignore[index]
+    assert result.document["slices"]["active-worker"]["dispatch_intent_id"] == "dispatch-intent"  # type: ignore[index]
+    assert result.document["slices"]["merged-leaf"]["status"] == "merged"  # type: ignore[index]
+    assert result.document["slices"]["merged-leaf"]["reviewed_head"] == "head-a"  # type: ignore[index]
+    assert all(
+        state["manifest_node_id"]
+        for state in result.document["slices"].values()  # type: ignore[union-attr]
+    )
+
+
+def test_terminal_legacy_run_migrates_to_an_empty_authoritative_manifest() -> None:
+    legacy = _legacy_checkpoint({}, phase="tl_done")
+
+    first = migrate_checkpoint_document(legacy, run_id="legacy-recursive")
+    second = migrate_checkpoint_document(copy.deepcopy(legacy), run_id="legacy-recursive")
+
+    assert _manifest(first).nodes == ()
+    assert first.document["gates"] == []
+    assert first.document == second.document
+
+
+@pytest.mark.parametrize(
+    ("ordered_stages", "message"),
+    [
+        ([{"order": 1, "sub_tls": ["missing"]}], "absent from slices"),
+        ([{"order": 1, "sub_tls": ["stage"]}, {"order": 2, "sub_tls": ["stage"]}], "repeat"),
+    ],
+)
+def test_irrecoverable_ordered_legacy_state_is_actionably_rejected(
+    ordered_stages: list[dict[str, object]], message: str
+) -> None:
+    legacy = _legacy_checkpoint(
+        {"stage": _slice()},
+        ordered_stages=ordered_stages,
+    )
+
+    with pytest.raises(MigrationError, match=message):
+        migrate_checkpoint_document(legacy, run_id="legacy-recursive")

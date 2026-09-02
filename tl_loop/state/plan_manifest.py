@@ -462,8 +462,19 @@ def build_legacy_manifest(document: Mapping[str, object], *, run_id: str) -> Pla
     raw_slices = document.get("slices", {})
     if not isinstance(raw_slices, Mapping):
         raise ManifestError("legacy slices must be an object")
+    _reject_ambiguous_nested_slices(raw_slices)
     stages = document.get("ordered_stages", [])
-    ordered_names = _legacy_ordered_names(stages)
+    normalized_stages = _legacy_stages(stages)
+    ordered_sequence = tuple(name for stage in normalized_stages for name in stage["sub_tls"])
+    if len(set(ordered_sequence)) != len(ordered_sequence):
+        raise ManifestError("legacy ordered stages repeat a sub-TL name")
+    ordered_names = set(ordered_sequence)
+    if not ordered_names.issubset(raw_slices):
+        missing = sorted(ordered_names - set(raw_slices))
+        raise ManifestError(
+            "legacy ordered stage names are absent from slices: "
+            + ", ".join(repr(name) for name in missing)
+        )
     plan = {
         "workers": [
             {"name": name, "task": "legacy", "order": None}
@@ -473,7 +484,7 @@ def build_legacy_manifest(document: Mapping[str, object], *, run_id: str) -> Pla
         "leaves": [],
         "sub_tls": [
             {"name": name, "order": _legacy_order(stages, name), "plan": {}}
-            for name in ordered_names
+            for name in ordered_sequence
         ],
     }
     # Legacy kind is retained in the node declaration to make the ambiguity
@@ -483,9 +494,11 @@ def build_legacy_manifest(document: Mapping[str, object], *, run_id: str) -> Pla
         ManifestNode(
             **{
                 **node.to_document(),
-                "kind": "legacy",
-                "order": None,
-                "child_manifest_digest": None,
+                "kind": "sub_tl" if node.name in ordered_names else "legacy",
+                "order": node.order if node.name in ordered_names else None,
+                "child_manifest_digest": (
+                    node.child_manifest_digest if node.name in ordered_names else None
+                ),
             }
         )
         for node in manifest.nodes
@@ -498,6 +511,17 @@ def build_legacy_manifest(document: Mapping[str, object], *, run_id: str) -> Pla
         parent_integration_target=None,
         source_order=tuple(node.node_id for node in legacy_nodes),
         nodes=legacy_nodes,
+        ordered_stages=manifest.ordered_stages,
+        child_manifest_digests={
+            node_id: digest
+            for node_id, digest in manifest.child_manifest_digests.items()
+            if node_id.rsplit("/", 1)[-1] in ordered_names
+        },
+        child_manifests={
+            node_id: child
+            for node_id, child in manifest.child_manifests.items()
+            if node_id.rsplit("/", 1)[-1] in ordered_names
+        },
         manifest_revision=1,
     )
 
@@ -665,10 +689,6 @@ def _legacy_order(stages: object, name: str) -> int:
     return 1
 
 
-def _legacy_ordered_names(stages: object) -> set[str]:
-    return {name for stage in _legacy_stages(stages) for name in stage["sub_tls"]}
-
-
 def _legacy_stages(stages: object) -> tuple[dict[str, object], ...]:
     if not isinstance(stages, list):
         raise ManifestError("legacy ordered_stages must be an array")
@@ -683,6 +703,21 @@ def _legacy_stages(stages: object) -> tuple[dict[str, object], ...]:
             raise ManifestError(f"legacy ordered_stages[{index}].sub_tls must be an array of names")
         normalized.append({**value, "sub_tls": list(members)})
     return tuple(normalized)
+
+
+def _reject_ambiguous_nested_slices(raw_slices: Mapping[object, object]) -> None:
+    nested_keys = frozenset(
+        {"children", "sub_tls", "child_scopes", "parent_scope_id", "scope_path"}
+    )
+    for slice_id, raw in raw_slices.items():
+        if not isinstance(raw, Mapping):
+            continue
+        present = sorted(nested_keys.intersection(raw))
+        if present:
+            raise ManifestError(
+                f"legacy nested scope for {slice_id!r} cannot be reconstructed from "
+                + ", ".join(present)
+            )
 
 
 def _require_text(value: object, field_name: str) -> str:
