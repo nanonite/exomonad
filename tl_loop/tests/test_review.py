@@ -27,8 +27,9 @@ from tl_loop.loop.driver import (
     _apply_convergence,
     _execute_direct_merge_intent,
     _open_integration_gate,
-    _reconcile_legacy_parked_lanes,
     _reconcile_action_journal,
+    _reconcile_legacy_parked_lanes,
+    _reconcile_nonterminal_slices,
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.reconcile import ExternalIntent
@@ -53,10 +54,11 @@ from tl_loop.loop.review import (
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import (
+    SCHEMA_VERSION,
     ActionKind,
     ActionPhase,
     ActionState,
-    SCHEMA_VERSION,
+    GateStatus,
     IntegrationRuntimeState,
     RunState,
     SchemaError,
@@ -539,6 +541,46 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
     assert [name for name, _ in recovery.calls].count("merge_pr") == 0
 
 
+def test_authoritative_nonmerge_clears_pending_action_and_releases_lane(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    current = replace(
+        state.slices["leaf"],
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.UNKNOWN,
+            intent_id="merge-intent",
+            head_sha="abc123",
+            attempt=1,
+        ),
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "leaf": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+        integration=state.integration,
+    )
+    journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
+    journal.append(EffectIntent("merge_pr", "leaf", {"pr_number": 42}, True))
+
+    transport = DirectMergeTransport(
+        snapshots=[{"merged": False, "pr_number": 42, "pr_state": "open"}]
+    )
+    reconciled = _reconcile_action_journal(
+        state,
+        store,
+        journal,
+        effects=EffectClient(transport),
+    )
+
+    assert reconciled.slices["leaf"].action is None
+    assert reconciled.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert journal.pending_entries() == []
+    assert journal.snapshot()[0]["status"] == "compensated"
+
+
 def test_direct_merge_waits_for_an_existing_parent_lane(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
     state = store.transition_lane("org/repo", "main", LaneReserved("other", 1, "base-a"))
@@ -629,6 +671,67 @@ def test_continuation_keeps_legacy_parked_unknown_merge_in_recovery(tmp_path: Pa
 
     assert migrated.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
     assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+
+
+def test_journal_less_legacy_unknown_merge_reaches_operator_terminal_gate(
+    tmp_path: Path,
+) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    state = store.transition_lane(
+        "org/repo",
+        "main",
+        LaneParkRequested("legacy_unknown", "merge response was lost before migration"),
+    )
+    current = replace(
+        state.slices["leaf"],
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.UNKNOWN,
+            intent_id="legacy-merge-intent",
+            head_sha="abc123",
+            attempt=1,
+        ),
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "leaf": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+        integration=state.integration,
+    )
+    migrated = _reconcile_legacy_parked_lanes(state, store)
+    config = TLLoopConfig(active=False)
+
+    waiting = _reconcile_nonterminal_slices(
+        WorkPlan(),
+        migrated,
+        config,
+        EffectClient(DirectMergeTransport()),
+        store,
+        [],
+    )
+    gate_name = "tl-merge-recovery-leaf"
+    assert (
+        next(gate for gate in waiting.gates if gate.name == gate_name).status is GateStatus.PENDING
+    )
+    assert waiting.slices["leaf"].action is not None
+    assert waiting.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+
+    store.answer_gate(gate_name, GateStatus.REJECTED)
+    terminal = _reconcile_nonterminal_slices(
+        WorkPlan(),
+        store.load(),
+        config,
+        EffectClient(DirectMergeTransport()),
+        store,
+        [],
+    )
+
+    assert terminal.slices["leaf"].action is None
+    assert terminal.slices["leaf"].status is SliceStatus.PARKED
+    assert terminal.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
 
 
 def test_missing_direct_compare_evidence_opens_integrity_gate(tmp_path: Path) -> None:

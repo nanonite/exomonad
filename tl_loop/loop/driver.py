@@ -243,6 +243,7 @@ DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
+MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 MAX_CONVERGENCE_STEPS = 8
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
 REMOTE_ADVANCE_FAILURE_MARKERS = (
@@ -3929,6 +3930,99 @@ def _execute_direct_merge_intent(
     )
 
 
+def _resolve_nonmerged_merge(
+    state: RunState,
+    slice_id: str,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    journal_key: str | None,
+    diagnostic: str,
+    terminal: bool = False,
+) -> RunState:
+    """Clear a disproved merge and release its durable integration lane."""
+    refreshed = store.load()
+    current = refreshed.slices[slice_id]
+    cleared = slice_transition(current, ActionChanged(None))
+    if terminal:
+        cleared = slice_transition(cleared, SliceStatusChanged(SliceStatus.PARKED))
+        cleared = replace(
+            cleared,
+            park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+            dispatch_error=diagnostic[:500],
+        )
+    integration = _abandon_owned_lane_integration(
+        refreshed,
+        cleared,
+        refreshed.integration,
+        "merge_not_confirmed",
+        diagnostic,
+    )
+    updated = _checkpoint_slice_action(
+        store,
+        refreshed,
+        slice_id,
+        None,
+        slice_state=cleared,
+        integration=integration,
+    )
+    if journal_key and isinstance(effects_log, EffectJournal):
+        try:
+            status = "rejected" if terminal else "compensated"
+            effects_log.resolve_by_key(
+                journal_key,
+                status=status,
+                result={
+                    "success": False,
+                    "result": {"merged": False, "reconciled": True},
+                    "error": diagnostic,
+                },
+                error=diagnostic,
+            )
+        except ActionJournalError:
+            LOGGER.info(
+                "[TL loop] merge journal key=%s was already absent during non-merge recovery",
+                journal_key,
+            )
+    return store.load() if updated != refreshed else updated
+
+
+def _merge_recovery_gate_name(slice_id: str) -> str:
+    """Return the durable operator gate for a journal-less merge attempt."""
+    return f"{MERGE_RECOVERY_GATE_PREFIX}{slice_id}"
+
+
+def _reconcile_merge_recovery_gate(
+    state: RunState,
+    current: SliceState,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> tuple[RunState, bool]:
+    """Resolve a journal-less unknown merge through an explicit operator gate."""
+    gate_name = _merge_recovery_gate_name(current.id)
+    gate = next((item for item in state.gates if item.name == gate_name), None)
+    if gate is None:
+        return store.set_gate(gate_name, GateStatus.PENDING), True
+    if gate.status is GateStatus.PENDING:
+        return state, True
+    return (
+        _resolve_nonmerged_merge(
+            state,
+            current.id,
+            store,
+            effects_log,
+            journal_key=None,
+            diagnostic=(
+                "operator approved a fresh merge attempt"
+                if gate.status is GateStatus.APPROVED
+                else "operator abandoned journal-less unknown merge"
+            ),
+            terminal=gate.status is GateStatus.REJECTED,
+        ),
+        True,
+    )
+
+
 def _reconcile_unknown_merge(
     state: RunState,
     intent: ExternalIntent,
@@ -3983,26 +4077,38 @@ def _reconcile_unknown_merge(
                 **_watcher_merge_evidence(observation),
             },
         )
-    refreshed = store.load()
-    unknown = replace(action, phase=ActionPhase.UNKNOWN)
-    lane_integration = (
-        _abandon_owned_lane_integration(
-            refreshed,
-            refreshed.slices[current.id],
-            refreshed.integration,
-            "merge_not_confirmed",
-            "authoritative watcher state says the merge did not happen",
-        )
-        if watcher is not None
+    if (
+        watcher is not None
         and watcher.success is True
         and observation is not None
-        and not observation.merged
-        else _recover_owned_lane_integration(
-            refreshed,
-            refreshed.slices[current.id],
-            refreshed.integration,
-            "direct merge outcome is unknown",
+        and observation.merged is False
+        and observation.pr_number in {None, current.pr_number}
+    ):
+        diagnostic = "authoritative watcher state says the merge did not happen"
+        key = stable_action_key(state.run_id, "merge_pr", current.id, arguments)
+        updated = _resolve_nonmerged_merge(
+            state,
+            current.id,
+            store,
+            effects_log,
+            journal_key=key,
+            diagnostic=diagnostic,
         )
+        _record_convergence_event(
+            current.id,
+            tracker.action_outcome(updated, intent, outcome="rejected", error=diagnostic),
+            config,
+            effects,
+            effects_log,
+        )
+        return updated
+    refreshed = store.load()
+    unknown = replace(action, phase=ActionPhase.UNKNOWN)
+    lane_integration = _recover_owned_lane_integration(
+        refreshed,
+        refreshed.slices[current.id],
+        refreshed.integration,
+        "direct merge outcome is unknown",
     )
     updated = _checkpoint_slice_action(
         store,
@@ -4769,33 +4875,25 @@ def _reconcile_pending_merge_entry(
     target = entry.get("target")
     if type(pr_number) is not int or not isinstance(target, str) or target not in state.slices:
         return False
+    key = entry.get("key")
+    if not isinstance(key, str) or not key:
+        return False
     try:
         watcher = effects.watcher_pr_state(pr_number=pr_number)
     except (ConnectionError, OSError, RuntimeError, TimeoutError):
         return False
     observation = _watcher_result_observation(watcher)
     if watcher.success is True and observation is not None and observation.merged is False:
-        current = state.slices[target]
-        integration = _abandon_owned_lane_integration(
+        _resolve_nonmerged_merge(
             state,
-            current,
-            state.integration,
-            "merge_not_confirmed",
-            "authoritative watcher state says the merge did not happen",
+            target,
+            store,
+            effects_log,
+            journal_key=key,
+            diagnostic="authoritative watcher state says the merge did not happen",
         )
-        if integration != state.integration:
-            _checkpoint_slice_action(
-                store,
-                state,
-                target,
-                None,
-                slice_state=current,
-                integration=integration,
-            )
+        return True
     if watcher.success is not True or observation is None or observation.merged is not True:
-        return False
-    key = entry.get("key")
-    if not isinstance(key, str) or not key:
         return False
     chainlink_issue_id = arguments.get("chainlink_issue_id")
     if chainlink_issue_id is not None and type(chainlink_issue_id) is not int:
@@ -5028,6 +5126,60 @@ def _reconcile_nonterminal_slices(
             recovered_pr_number = watcher.get("pr_number") if watcher else None
             if isinstance(recovered_pr_number, int) and recovered_pr_number > 0:
                 snapshots[recovered_pr_number] = watcher
+        if (
+            current.action is not None
+            and current.action.kind is ActionKind.MERGE
+            and current.action.phase is ActionPhase.UNKNOWN
+        ):
+            if watcher is not None and watcher.merged is True:
+                merge_evidence = _watcher_merge_evidence(watcher)
+                if (
+                    current.action.intent_id
+                    and isinstance(merge_evidence.get("head_sha"), str)
+                    and isinstance(merge_evidence.get("base_sha"), str)
+                    and watcher.pr_number in {None, current.pr_number}
+                ):
+                    state = _reconcile_merged_slice(
+                        store.load(),
+                        current.id,
+                        watcher.pr_number or current.pr_number or 0,
+                        current.action.intent_id,
+                        config,
+                        effects,
+                        store,
+                        effects_log,
+                        boundary="legacy_unknown_merge_reconciled",
+                        merge_evidence=merge_evidence,
+                    )
+                    updated = dict(state.slices)
+                    changed = False
+                    continue
+            if (
+                watcher is not None
+                and watcher.merged is False
+                and watcher.pr_number in {None, current.pr_number}
+            ):
+                state = _resolve_nonmerged_merge(
+                    state,
+                    current.id,
+                    store,
+                    effects_log,
+                    journal_key=None,
+                    diagnostic="authoritative watcher state says the merge did not happen",
+                )
+                updated = dict(state.slices)
+                changed = False
+                continue
+            state, handled = _reconcile_merge_recovery_gate(
+                state,
+                current,
+                store,
+                effects_log,
+            )
+            if handled:
+                updated = dict(state.slices)
+                changed = False
+                continue
         if watcher is not None and watcher.merged is True:
             merge_entry = _confirmed_merge_entry(
                 effects_log,
