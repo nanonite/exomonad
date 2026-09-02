@@ -46,6 +46,7 @@ from tl_loop.fsm.lane import (
     LaneIntegrationStarted,
     LanePhase,
     LaneRecoveryRequested,
+    LaneRecoveryResolved,
     LaneReleased,
     LaneReserved,
     LaneState,
@@ -1083,6 +1084,7 @@ def run_tl_loop(
         if selected.ledger_run_id is not None
         else []
     )
+    state = _reconcile_legacy_parked_lanes(state, store, effects_log)
     state = _initialize_ordered_runtime(work_plan, state, store)
     try:
         state = _reconcile_action_journal(
@@ -2692,6 +2694,7 @@ def _reconcile_merged_slice(
 ) -> RunState:
     """Adopt a confirmed merge and execute at most one recovery boundary."""
     current = state.slices[slice_id]
+    checkpoint_needed = False
     if current.post_merge is None or current.post_merge.phase is PostMergePhase.NOT_STARTED:
         try:
             current = _adopt_post_merge_slice(
@@ -2709,7 +2712,27 @@ def _reconcile_merged_slice(
                 slice_id,
                 f"cannot adopt merged PR #{pr_number}: {error}",
             )
-        state = _checkpoint_slice_action(store, state, slice_id, None, slice_state=current)
+        checkpoint_needed = True
+    try:
+        integration = _resolve_recovered_lane_integration(state, current, merge_evidence)
+    except ValueError as error:
+        return _block_post_merge_recovery(
+            store,
+            state,
+            slice_id,
+            f"cannot resolve recovered lane for merged PR #{pr_number}: {error}",
+        )
+    if integration != state.integration:
+        checkpoint_needed = True
+    if checkpoint_needed:
+        state = _checkpoint_slice_action(
+            store,
+            state,
+            slice_id,
+            None,
+            slice_state=current,
+            integration=integration,
+        )
     return _advance_post_merge_boundary(
         store.load(),
         slice_id,
@@ -3930,11 +3953,12 @@ def _reconcile_unknown_merge(
         effects_log,
         raise_on_failure=False,
     )
+    observation = _watcher_result_observation(watcher)
     if (
         watcher is not None
         and watcher.success is True
-        and (_watcher_result_observation(watcher) is not None)
-        and _watcher_result_observation(watcher).merged is True
+        and observation is not None
+        and observation.merged
     ):
         if isinstance(effects_log, EffectJournal):
             key = stable_action_key(state.run_id, "merge_pr", current.id, arguments)
@@ -3956,22 +3980,36 @@ def _reconcile_unknown_merge(
             boundary="direct_merge_reconciled",
             merge_evidence={
                 **arguments,
-                **_watcher_merge_evidence(_watcher_result_observation(watcher)),
+                **_watcher_merge_evidence(observation),
             },
         )
     refreshed = store.load()
     unknown = replace(action, phase=ActionPhase.UNKNOWN)
+    lane_integration = (
+        _abandon_owned_lane_integration(
+            refreshed,
+            refreshed.slices[current.id],
+            refreshed.integration,
+            "merge_not_confirmed",
+            "authoritative watcher state says the merge did not happen",
+        )
+        if watcher is not None
+        and watcher.success is True
+        and observation is not None
+        and not observation.merged
+        else _recover_owned_lane_integration(
+            refreshed,
+            refreshed.slices[current.id],
+            refreshed.integration,
+            "direct merge outcome is unknown",
+        )
+    )
     updated = _checkpoint_slice_action(
         store,
         refreshed,
         current.id,
         unknown,
-        integration=_recover_owned_lane_integration(
-            refreshed,
-            refreshed.slices[current.id],
-            refreshed.integration,
-            "direct merge outcome is unknown",
-        ),
+        integration=lane_integration,
     )
     _record_convergence_event(
         current.id,
@@ -4735,11 +4773,26 @@ def _reconcile_pending_merge_entry(
         watcher = effects.watcher_pr_state(pr_number=pr_number)
     except (ConnectionError, OSError, RuntimeError, TimeoutError):
         return False
-    if (
-        watcher.success is not True
-        or _watcher_result_observation(watcher) is None
-        or _watcher_result_observation(watcher).merged is not True
-    ):
+    observation = _watcher_result_observation(watcher)
+    if watcher.success is True and observation is not None and observation.merged is False:
+        current = state.slices[target]
+        integration = _abandon_owned_lane_integration(
+            state,
+            current,
+            state.integration,
+            "merge_not_confirmed",
+            "authoritative watcher state says the merge did not happen",
+        )
+        if integration != state.integration:
+            _checkpoint_slice_action(
+                store,
+                state,
+                target,
+                None,
+                slice_state=current,
+                integration=integration,
+            )
+    if watcher.success is not True or observation is None or observation.merged is not True:
         return False
     key = entry.get("key")
     if not isinstance(key, str) or not key:
@@ -7184,6 +7237,81 @@ def _recover_owned_lane_integration(
     return replace(integration, lanes={**integration.lanes, key: recovered})
 
 
+def _resolve_recovered_lane_integration(
+    state: RunState,
+    current: SliceState,
+    merge_evidence: Mapping[str, object] | None = None,
+) -> IntegrationRuntimeState:
+    """Resolve a lost merge response once the watcher proves the merge."""
+    try:
+        repository, parent_branch = _candidate_lane_key(state, current)
+    except ValueError:
+        return state.integration
+    key = f"{repository}:{parent_branch}"
+    lane = state.integration.lanes.get(key)
+    if lane is None or lane.child_id != current.id or lane.phase is not LanePhase.RECOVERY:
+        return state.integration
+    if current.post_merge is None:
+        raise ValueError("merged slice has no post-merge evidence")
+    evidence = merge_evidence or current.post_merge.evidence
+    head_sha = _required_merge_identity(evidence, ("head_sha",), "recovered merge head SHA")
+    resolved = transition_lane(lane, LaneRecoveryResolved(current.id, head_sha))
+    return replace(state.integration, lanes={**state.integration.lanes, key: resolved})
+
+
+def _reconcile_legacy_parked_lanes(
+    state: RunState,
+    store: RunStore,
+    effects_log: list[EffectIntent] | None = None,
+) -> RunState:
+    """Move legacy parked resources into explicit, recoverable ownership."""
+    for lane in tuple(state.integration.lanes.values()):
+        if lane.phase is not LanePhase.PARKED:
+            continue
+        current = state.slices.get(lane.child_id or "")
+        if not _legacy_parked_lane_needs_recovery(current, effects_log):
+            state = store.transition_lane(
+                lane.repository,
+                lane.parent_branch,
+                LaneAbandoned(
+                    "legacy_parked_failure",
+                    "legacy parked lane has no ambiguous merge effect to recover",
+                ),
+            )
+            continue
+        state = store.transition_lane(
+            lane.repository,
+            lane.parent_branch,
+            LaneRecoveryRequested("legacy parked lane requires authoritative reconciliation"),
+        )
+    return state
+
+
+def _legacy_parked_lane_needs_recovery(
+    current: SliceState | None,
+    effects_log: list[EffectIntent] | None,
+) -> bool:
+    """Keep only ambiguous legacy merge attempts behind recovery."""
+    if (
+        current is not None
+        and current.action is not None
+        and current.action.kind is ActionKind.MERGE
+        and current.action.phase
+        in {
+            ActionPhase.INTENDED,
+            ActionPhase.IN_FLIGHT,
+            ActionPhase.UNKNOWN,
+        }
+    ):
+        return True
+    if not isinstance(effects_log, EffectJournal) or current is None:
+        return False
+    return any(
+        entry.get("operation") == "merge_pr" and entry.get("target") == current.id
+        for entry in effects_log.pending_entries()
+    )
+
+
 def _ensure_candidate_lane(
     state: RunState,
     current: SliceState,
@@ -7199,7 +7327,34 @@ def _ensure_candidate_lane(
     lane = state.integration.lanes.get(key)
     if lane is not None:
         if lane.phase is LanePhase.PARKED:
-            return state, False
+            if lane.child_id is None:
+                try:
+                    return (
+                        store.transition_lane(
+                            repository,
+                            parent_branch,
+                            LaneAbandoned(
+                                "legacy_parked_without_owner",
+                                "parked lane had no durable owner",
+                            ),
+                        ),
+                        False,
+                    )
+                except ValueError:
+                    return store.load(), False
+            try:
+                return (
+                    store.transition_lane(
+                        repository,
+                        parent_branch,
+                        LaneRecoveryRequested(
+                            "legacy parked lane requires authoritative reconciliation"
+                        ),
+                    ),
+                    False,
+                )
+            except ValueError:
+                return store.load(), False
         if lane.phase in {
             LanePhase.RESERVED,
             LanePhase.INTEGRATING,
@@ -7275,6 +7430,14 @@ def _ensure_bookkeeping_lane(
         return state, False
     repository, parent_branch = _candidate_lane_key(state, current)
     lane = state.integration.lanes[f"{repository}:{parent_branch}"]
+    if lane.phase is LanePhase.RECOVERY:
+        head_sha = _required_merge_identity(evidence, ("head_sha",), "merged head SHA")
+        state = store.transition_lane(
+            repository,
+            parent_branch,
+            LaneRecoveryResolved(current.id, head_sha),
+        )
+        lane = state.integration.lanes[f"{repository}:{parent_branch}"]
     lane_epoch = _required_int(evidence, "lane_epoch", "lane epoch")
     if lane.lane_epoch != lane_epoch:
         return state, False

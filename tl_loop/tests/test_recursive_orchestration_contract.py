@@ -16,6 +16,7 @@ from tl_loop.fsm.lane import (
     LaneParkRequested,
     LanePhase,
     LaneRecoveryRequested,
+    LaneRecoveryResolved,
     LaneReleased,
     LaneReserved,
     LaneState,
@@ -402,6 +403,10 @@ def test_repository_lane_releases_only_after_bookkeeping_push() -> None:
 
     recovering = transition_lane(integrating, LaneRecoveryRequested("merge response unknown"))
     assert recovering.phase is LanePhase.RECOVERY
+    resolved = transition_lane(recovering, LaneRecoveryResolved("aggregate", "head-1"))
+    assert resolved.phase is LanePhase.INTEGRATING
+    with pytest.raises(ValueError, match="head"):
+        transition_lane(recovering, LaneRecoveryResolved("aggregate", "different-head"))
     with pytest.raises(ValueError, match="unresolved child"):
         transition_lane(recovering, LaneReserved("other-child", 2, "base-2"))
     parked = transition_lane(recovering, LaneParkRequested("operator_gate", "reconcile merge"))

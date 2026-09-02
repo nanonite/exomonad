@@ -95,6 +95,14 @@ class LaneRecoveryRequested(TLOrchestrationEvent):
 
 
 @dataclass(frozen=True)
+class LaneRecoveryResolved(TLOrchestrationEvent):
+    """Re-enter integration after an authoritative merged observation."""
+
+    child_id: str
+    head_sha: str
+
+
+@dataclass(frozen=True)
 class LaneParkRequested(TLOrchestrationEvent):
     """Park a lane when automatic progression is unsafe."""
 
@@ -124,6 +132,7 @@ __all__ = [
     "LaneParkRequested",
     "LanePhase",
     "LaneRecoveryRequested",
+    "LaneRecoveryResolved",
     "LaneReleased",
     "LaneReserved",
     "LaneState",

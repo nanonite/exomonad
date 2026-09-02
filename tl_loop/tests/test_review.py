@@ -11,7 +11,12 @@ import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import JsonObject
-from tl_loop.fsm.lane import LanePhase, LaneReserved
+from tl_loop.fsm.lane import (
+    LaneIntegrationStarted,
+    LaneParkRequested,
+    LanePhase,
+    LaneReserved,
+)
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
@@ -19,9 +24,13 @@ from tl_loop.loop.driver import (
     SubTLTask,
     TLLoopConfig,
     WorkPlan,
+    _apply_convergence,
     _execute_direct_merge_intent,
     _open_integration_gate,
+    _reconcile_legacy_parked_lanes,
+    _reconcile_action_journal,
 )
+from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.reconcile import ExternalIntent
 from tl_loop.loop.review import (
     CIStatusNotApproved,
@@ -44,6 +53,9 @@ from tl_loop.loop.review import (
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import (
+    ActionKind,
+    ActionPhase,
+    ActionState,
     SCHEMA_VERSION,
     IntegrationRuntimeState,
     RunState,
@@ -398,6 +410,135 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
     }
 
 
+def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
+
+    class LostMergeTransport(DirectMergeTransport):
+        watcher_count: int = 0
+        merge_count: int = 0
+
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            if tool_name == "watcher_pr_state":
+                self.calls.append((tool_name, arguments))
+                self.watcher_count += 1
+                if self.watcher_count == 1:
+                    return {"success": True, "result": _snapshot(head_sha="abc123")}
+                return {"success": False, "error": "watcher unavailable"}
+            if tool_name == "merge_pr":
+                self.calls.append((tool_name, arguments))
+                self.merge_count += 1
+                raise RuntimeError("merge response lost")
+            return super().call_tool(role, name, tool_name, arguments)
+
+    lost = LostMergeTransport()
+    first = _run_direct_merge(
+        state,
+        store,
+        lost,
+        TLLoopConfig(active=True, chainlink_issue_id=599),
+        journal,
+    )
+
+    assert first.slices["leaf"].action is not None
+    assert first.slices["leaf"].action.phase.value == "unknown"
+    assert first.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+    assert lost.merge_count == 1
+
+    class RecoveryTransport(DirectMergeTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            del role, name
+            self.calls.append((tool_name, arguments))
+            if tool_name == "watcher_pr_state":
+                return {
+                    "success": True,
+                    "result": {
+                        "merged": True,
+                        "pr_number": 42,
+                        "head_sha": "abc123",
+                        "base_sha": "base-a",
+                        "pr_state": "closed",
+                    },
+                }
+            if tool_name == "post_merge_parent_sync":
+                return {
+                    "success": True,
+                    "result": {
+                        **arguments,
+                        "parent_commit_sha": "parent-a",
+                        "remote_head_sha": "parent-a",
+                        "ancestry_proof": "ancestor:abc123->parent-a",
+                    },
+                }
+            if tool_name == "chainlink_issue_close":
+                return {
+                    "success": True,
+                    "result": {"issue_id": arguments["issue_id"], "receipt_id": "close-599"},
+                }
+            if tool_name == "post_merge_changelog":
+                return {
+                    "success": True,
+                    "result": {**arguments, "commit_sha": "changelog-a"},
+                }
+            if tool_name == "post_merge_push":
+                return {
+                    "success": True,
+                    "result": {
+                        **arguments,
+                        "push_receipt_id": "receipt-a",
+                        "observed_remote_head": arguments["pushed_commit"],
+                        "ancestry_proof": (
+                            f"ancestor:{arguments['pushed_commit']}->{arguments['pushed_commit']}"
+                        ),
+                    },
+                }
+            return {"success": True, "result": None}
+
+    recovery = RecoveryTransport()
+    restarted = _reconcile_action_journal(
+        store.load(),
+        store,
+        EffectJournal("review-test", store.run_dir / "action-journal.json"),
+        effects=EffectClient(recovery),
+    )
+    assert restarted.integration.lanes["org/repo:main"].phase is LanePhase.INTEGRATING
+
+    config = TLLoopConfig(active=True, chainlink_issue_id=599)
+    for _ in range(8):
+        restarted = _apply_convergence(
+            store.load(),
+            ConvergenceTracker(),
+            store,
+            config,
+            EffectClient(recovery),
+            EffectJournal("review-test", store.run_dir / "action-journal.json"),
+        )
+        if restarted.slices["leaf"].post_merge is not None and (
+            restarted.slices["leaf"].post_merge.phase.value == "complete"
+        ):
+            break
+
+    assert restarted.slices["leaf"].post_merge is not None
+    assert restarted.slices["leaf"].post_merge.phase.value == "complete"
+    assert restarted.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert lost.merge_count == 1
+    assert [name for name, _ in recovery.calls].count("merge_pr") == 0
+
+
 def test_direct_merge_waits_for_an_existing_parent_lane(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
     state = store.transition_lane("org/repo", "main", LaneReserved("other", 1, "base-a"))
@@ -439,6 +580,55 @@ def test_integration_gate_releases_the_owned_parent_lane(tmp_path: Path) -> None
     assert lane.child_id is None
     assert lane.phase is LanePhase.IDLE
     assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+
+
+def test_continuation_releases_legacy_parked_deterministic_lane(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    state = store.transition_lane(
+        "org/repo",
+        "main",
+        LaneParkRequested("legacy_gate", "persisted before lane recovery migration"),
+    )
+
+    migrated = _reconcile_legacy_parked_lanes(state, store)
+
+    assert migrated.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+
+
+def test_continuation_keeps_legacy_parked_unknown_merge_in_recovery(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    state = store.transition_lane(
+        "org/repo",
+        "main",
+        LaneParkRequested("legacy_unknown", "merge response was lost before migration"),
+    )
+    current = replace(
+        state.slices["leaf"],
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.UNKNOWN,
+            intent_id="merge-intent",
+            head_sha="abc123",
+            attempt=1,
+        ),
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "leaf": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+        integration=state.integration,
+    )
+
+    migrated = _reconcile_legacy_parked_lanes(state, store)
+
+    assert migrated.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+    assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
 
 
 def test_missing_direct_compare_evidence_opens_integrity_gate(tmp_path: Path) -> None:

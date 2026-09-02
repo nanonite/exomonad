@@ -13,6 +13,7 @@ from .lane import (
     LaneParkRequested,
     LanePhase,
     LaneRecoveryRequested,
+    LaneRecoveryResolved,
     LaneReleased,
     LaneReserved,
     LaneState,
@@ -30,6 +31,8 @@ def transition_lane(lane: LaneState, event: object) -> LaneState:
     if isinstance(event, LaneRecoveryRequested) and lane.phase in active + (LanePhase.PARKED,):
         _require_text(event.diagnostic, "lane recovery diagnostic")
         return replace(lane, phase=LanePhase.RECOVERY)
+    if lane.phase is LanePhase.RECOVERY and isinstance(event, LaneRecoveryResolved):
+        return _resolve_recovery(lane, event)
     if isinstance(event, LaneParkRequested) and lane.phase in active + (LanePhase.RECOVERY,):
         return _park_lane(lane, event)
     if isinstance(event, LaneReserved) and lane.phase in (LanePhase.IDLE, LanePhase.RECOVERY):
@@ -91,6 +94,14 @@ def _reserve_lane(lane: LaneState, event: LaneReserved) -> LaneState:
         changelog_commit=None,
         last_lane_epoch=event.lane_epoch,
     )
+
+
+def _resolve_recovery(lane: LaneState, event: LaneRecoveryResolved) -> LaneState:
+    _require_lane_child(lane, event.child_id)
+    _require_text(event.head_sha, "recovered integration head SHA")
+    if lane.head_sha != event.head_sha:
+        raise ValueError("recovered integration head does not match merge evidence")
+    return replace(lane, phase=LanePhase.INTEGRATING)
 
 
 def _start_integration(lane: LaneState, event: LaneIntegrationStarted) -> LaneState:
