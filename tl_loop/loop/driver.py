@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import logging
 import math
 import multiprocessing
@@ -3999,15 +4000,23 @@ def _merge_recovery_gate_name(state: RunState, current: SliceState) -> str:
         if current.action is not None and current.action.attempt is not None
         else current.attempts
     )
-    lane_epoch = "missing-epoch"
+    lane_epoch: int | None = None
     try:
         repository, parent_branch = _candidate_lane_key(state, current)
         lane = state.integration.lanes.get(f"{repository}:{parent_branch}")
         if lane is not None and lane.lane_epoch is not None:
-            lane_epoch = str(lane.lane_epoch)
+            lane_epoch = lane.lane_epoch
     except ValueError:
         pass
-    return f"{MERGE_RECOVERY_GATE_PREFIX}{current.id}-{intent_id}-{lane_epoch}-{attempt}"
+    occurrence = {
+        "attempt": attempt,
+        "intent_id": intent_id,
+        "lane_epoch": lane_epoch,
+        "slice_id": current.id,
+    }
+    encoded = json.dumps(occurrence, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return f"{MERGE_RECOVERY_GATE_PREFIX}{digest}"
 
 
 def _reconcile_merge_recovery_gate(

@@ -789,6 +789,41 @@ def test_journal_less_legacy_unknown_merge_reaches_operator_terminal_gate(
     assert terminal.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
 
 
+def test_merge_recovery_gate_hash_separates_hyphenated_slice_and_intent_ids(
+    tmp_path: Path,
+) -> None:
+    state, _ = _state(tmp_path, "abc123", _fresh_verdict_at())
+    first = replace(
+        state.slices["leaf"],
+        id="a",
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.UNKNOWN,
+            intent_id="b-c",
+            head_sha="abc123",
+            attempt=1,
+        ),
+    )
+    second = replace(
+        state.slices["leaf"],
+        id="a-b",
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.UNKNOWN,
+            intent_id="c",
+            head_sha="abc123",
+            attempt=1,
+        ),
+    )
+
+    first_gate = _merge_recovery_gate_name(state, first)
+    second_gate = _merge_recovery_gate_name(state, second)
+
+    assert first_gate != second_gate
+    assert first_gate.startswith("tl-merge-recovery-")
+    assert second_gate.startswith("tl-merge-recovery-")
+
+
 def test_missing_direct_compare_evidence_opens_integrity_gate(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
     transport = DirectMergeTransport(snapshots=[_snapshot(head_sha="abc123", merge_tree_sha=None)])
