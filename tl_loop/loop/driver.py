@@ -3987,9 +3987,27 @@ def _resolve_nonmerged_merge(
     return store.load() if updated != refreshed else updated
 
 
-def _merge_recovery_gate_name(slice_id: str) -> str:
-    """Return the durable operator gate for a journal-less merge attempt."""
-    return f"{MERGE_RECOVERY_GATE_PREFIX}{slice_id}"
+def _merge_recovery_gate_name(state: RunState, current: SliceState) -> str:
+    """Return an occurrence-scoped gate for a journal-less merge attempt."""
+    intent_id = (
+        current.action.intent_id
+        if current.action is not None and current.action.intent_id
+        else "missing-intent"
+    )
+    attempt = (
+        current.action.attempt
+        if current.action is not None and current.action.attempt is not None
+        else current.attempts
+    )
+    lane_epoch = "missing-epoch"
+    try:
+        repository, parent_branch = _candidate_lane_key(state, current)
+        lane = state.integration.lanes.get(f"{repository}:{parent_branch}")
+        if lane is not None and lane.lane_epoch is not None:
+            lane_epoch = str(lane.lane_epoch)
+    except ValueError:
+        pass
+    return f"{MERGE_RECOVERY_GATE_PREFIX}{current.id}-{intent_id}-{lane_epoch}-{attempt}"
 
 
 def _reconcile_merge_recovery_gate(
@@ -3999,7 +4017,7 @@ def _reconcile_merge_recovery_gate(
     effects_log: list[EffectIntent],
 ) -> tuple[RunState, bool]:
     """Resolve a journal-less unknown merge through an explicit operator gate."""
-    gate_name = _merge_recovery_gate_name(current.id)
+    gate_name = _merge_recovery_gate_name(state, current)
     gate = next((item for item in state.gates if item.name == gate_name), None)
     if gate is None:
         return store.set_gate(gate_name, GateStatus.PENDING), True

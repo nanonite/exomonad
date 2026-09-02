@@ -26,6 +26,7 @@ from tl_loop.loop.driver import (
     WorkPlan,
     _apply_convergence,
     _execute_direct_merge_intent,
+    _merge_recovery_gate_name,
     _open_integration_gate,
     _reconcile_action_journal,
     _reconcile_legacy_parked_lanes,
@@ -712,14 +713,68 @@ def test_journal_less_legacy_unknown_merge_reaches_operator_terminal_gate(
         store,
         [],
     )
-    gate_name = "tl-merge-recovery-leaf"
+    gate_name = _merge_recovery_gate_name(migrated, migrated.slices["leaf"])
     assert (
         next(gate for gate in waiting.gates if gate.name == gate_name).status is GateStatus.PENDING
     )
     assert waiting.slices["leaf"].action is not None
     assert waiting.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
 
-    store.answer_gate(gate_name, GateStatus.REJECTED)
+    store.answer_gate(gate_name, GateStatus.APPROVED)
+    approved = _reconcile_nonterminal_slices(
+        WorkPlan(),
+        store.load(),
+        config,
+        EffectClient(DirectMergeTransport()),
+        store,
+        [],
+    )
+    assert approved.slices["leaf"].action is None
+    assert approved.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+
+    approved = store.transition_lane(
+        "org/repo",
+        "main",
+        LaneReserved("leaf", 2, "base-b"),
+    )
+    approved = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "def456"))
+    second_current = replace(
+        approved.slices["leaf"],
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.UNKNOWN,
+            intent_id="legacy-merge-intent-2",
+            head_sha="def456",
+            attempt=2,
+        ),
+    )
+    approved = store.checkpoint(
+        approved.fsm,
+        {**approved.slices, "leaf": second_current},
+        approved.budgets,
+        approved.events.last_consumed_offset,
+        integration=approved.integration,
+    )
+    second = _reconcile_nonterminal_slices(
+        WorkPlan(),
+        approved,
+        config,
+        EffectClient(DirectMergeTransport()),
+        store,
+        [],
+    )
+    second_gate_name = _merge_recovery_gate_name(second, second.slices["leaf"])
+    assert second_gate_name != gate_name
+    assert (
+        next(gate for gate in second.gates if gate.name == gate_name).status is GateStatus.APPROVED
+    )
+    assert (
+        next(gate for gate in second.gates if gate.name == second_gate_name).status
+        is GateStatus.PENDING
+    )
+    assert second.slices["leaf"].action is not None
+
+    store.answer_gate(second_gate_name, GateStatus.REJECTED)
     terminal = _reconcile_nonterminal_slices(
         WorkPlan(),
         store.load(),
