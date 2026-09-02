@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 
 import pytest
 
 from tl_loop.state.migration import MigrationError, migrate_checkpoint_document
 from tl_loop.state.plan_manifest import PlanManifest
+from tl_loop.state.store import RunStore
 
 
 def _legacy_checkpoint(
@@ -16,11 +19,29 @@ def _legacy_checkpoint(
     phase: str = "tl_planning",
     ordered_stages: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    waiting_phases = {"tl_running", "tl_waiting", "tl_merging"}
+    waiting = (
+        [
+            slice_id
+            for slice_id, raw in slices.items()
+            if raw.get("state", raw.get("status")) in {"spawned", "in_review", "repairing"}
+            or (
+                raw.get("state", raw.get("status")) == "merged"
+                and isinstance(raw.get("post_merge"), dict)
+                and raw["post_merge"].get("phase") != "complete"
+            )
+        ]
+        if phase in waiting_phases
+        else []
+    )
     document: dict[str, object] = {
         "version": 3,
         "revision": 7,
         "run_id": "legacy-recursive",
-        "fsm": {"phase": phase, "waiting": list(slices)},
+        "fsm": {
+            "phase": phase,
+            "waiting": waiting,
+        },
         "slices": slices,
         "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
         "gates": [],
@@ -167,6 +188,38 @@ def test_every_recursive_legacy_phase_migrates_with_its_slice_binding(
     migrated_slice = result.document["slices"]["child"]  # type: ignore[index]
     assert migrated_slice["manifest_node_id"] == manifest.nodes[0].node_id  # type: ignore[index]
     assert migrated_slice["manifest_revision"] == manifest.manifest_revision  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("phase", "status"),
+    [
+        ("tl_planning", "pending"),
+        ("tl_dispatching", "spawned"),
+        ("tl_running", "in_review"),
+        ("tl_waiting", "in_review"),
+        ("tl_merging", "in_review"),
+        ("tl_all_merged", "merged"),
+        ("tl_finalizing", "merged"),
+        ("tl_pr_filed", "merged"),
+        ("tl_done", "merged"),
+        ("tl_failed", "failed"),
+        ("tl_parked", "parked"),
+    ],
+)
+def test_phase_valid_legacy_fixture_loads_through_run_store(
+    tmp_path: Path, phase: str, status: str
+) -> None:
+    legacy = _legacy_checkpoint({"child": _slice(status)}, phase=phase)
+    run_dir = tmp_path / "legacy-store"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    state = RunStore("legacy-store", root_dir=tmp_path).load()
+
+    assert state.fsm.phase.value == phase
+    assert state.fsm.waiting == (
+        ("child",) if phase in {"tl_running", "tl_waiting", "tl_merging"} else ()
+    )
 
 
 @pytest.mark.parametrize(
