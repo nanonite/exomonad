@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Expose hierarchical TL orchestration and recovery diagnostics (#1055)
 - Serialize parent-branch integration and bookkeeping with durable lanes (#1054)
 - Replay ledger evidence through the normal TL reducers (#1053)
 - Restore ordered recursive sub-TL scheduling and aggregate PR integration (#1052)
