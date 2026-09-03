@@ -6,6 +6,8 @@ import json
 import multiprocessing
 import os
 import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -58,6 +60,8 @@ def _environment() -> dict[str, str]:
 
 
 def _issue_id(value: Any) -> int | None:
+    if type(value) is int and value > 0:
+        return value
     if isinstance(value, Mapping):
         for key in ("id", "issue_id", "number"):
             candidate = value.get(key)
@@ -75,21 +79,43 @@ def _issue_id(value: Any) -> int | None:
     return None
 
 
-def _chainlink_command(*arguments: str) -> Any:
-    result = real.run_command(
+def _chainlink_command_with_db(database: Path, *arguments: str) -> Any:
+    environment = {**os.environ, "CHAINLINK_DB": str(database)}
+    result = subprocess.run(
         ["chainlink", *arguments],
         cwd=PROJECT_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
     )
+    if result.returncode:
+        raise AcceptanceError(
+            f"Chainlink command failed ({result.returncode}): {result.stderr.strip()}"
+        )
     try:
-        return json.loads(result)
+        return json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise AcceptanceError(
-            f"Chainlink command returned non-JSON output: {result!r}"
+            f"Chainlink command returned non-JSON output: {result.stdout!r}"
         ) from error
 
 
-def _create_fixture_issue(case_name: str) -> int:
-    value = _chainlink_command(
+def _copy_chainlink_database(source: Path, destination: Path) -> None:
+    """Snapshot the operator DB without mutating its SQLite/WAL files."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    destination_connection = sqlite3.connect(destination)
+    try:
+        source_connection.backup(destination_connection)
+    finally:
+        destination_connection.close()
+        source_connection.close()
+
+
+def _create_fixture_issue(database: Path, case_name: str) -> int:
+    value = _chainlink_command_with_db(
+        database,
         "create",
         f"Verify recursive crash convergence {case_name}",
         "--priority",
@@ -105,15 +131,23 @@ def _create_fixture_issue(case_name: str) -> int:
     return issue_id
 
 
-def _cleanup_fixture_issue(issue_id: int) -> None:
-    value = _chainlink_command("show", str(issue_id), "--json")
+def _cleanup_fixture_issue(database: Path, issue_id: int) -> None:
+    value = _chainlink_command_with_db(database, "show", str(issue_id), "--json")
     status = _status(value)
     if status == "closed":
         return
-    real.run_command(
+    result = subprocess.run(
         ["chainlink", "close", str(issue_id), "--no-changelog", "--quiet"],
         cwd=PROJECT_ROOT,
+        env={**os.environ, "CHAINLINK_DB": str(database)},
+        text=True,
+        capture_output=True,
+        check=False,
     )
+    if result.returncode:
+        raise AcceptanceError(
+            f"Chainlink cleanup failed ({result.returncode}): {result.stderr.strip()}"
+        )
 
 
 def _status(value: Any) -> str | None:
@@ -151,8 +185,24 @@ def _case_name(root: Path, boundary: CrashBoundary) -> str:
     return f"crash-{boundary.name}-{boundary.point}-{root.name[-8:]}"
 
 
-def _assert_nested_aggregate_pr(config: dict[str, str], forgejo_url: str) -> None:
+def _assert_nested_aggregate_pr(
+    config: dict[str, str], forgejo_url: str, repo: Path, case_name: str
+) -> None:
     """Prove production created the nested aggregate against its direct parent."""
+    marker = repo / ".exo" / f"1057-nested-heads-{case_name}.json"
+    try:
+        nested_heads = json.loads(marker.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+        raise AcceptanceError(
+            f"nested fixture head marker is missing: {marker}"
+        ) from error
+    expected_head = (
+        nested_heads.get("nested-a") if isinstance(nested_heads, Mapping) else None
+    )
+    if not isinstance(expected_head, str) or not expected_head:
+        raise AcceptanceError(
+            f"nested fixture head marker lacks nested-a: {nested_heads!r}"
+        )
     pulls = real.json_request(
         "GET",
         f"{forgejo_url}/api/v1/repos/{config['EXOMONAD_FORGEJO_E2E_OWNER']}/"
@@ -169,11 +219,13 @@ def _assert_nested_aggregate_pr(config: dict[str, str], forgejo_url: str) -> Non
         base = pull.get("base")
         head_ref = head.get("ref") if isinstance(head, Mapping) else None
         base_ref = base.get("ref") if isinstance(base, Mapping) else None
+        head_sha = head.get("sha") if isinstance(head, Mapping) else None
         title = pull.get("title")
         if (
             head_ref == "main.sub-a.nested-a"
             and base_ref == "main.sub-a"
             and title == "Aggregate nested-a into main.sub-a"
+            and head_sha == expected_head
         ):
             matches.append(pull)
     if len(matches) != 1:
@@ -190,6 +242,7 @@ def run_case(
     config: dict[str, str],
     boundary: CrashBoundary,
     chainlink_issue_id: int,
+    chainlink_db: Path,
 ) -> dict[str, Any]:
     work_plan = plan()
     case_name = _case_name(root, boundary)
@@ -239,6 +292,7 @@ def run_case(
             marker,
             boundary.name == "review",
             chainlink_issue_id,
+            chainlink_db,
         ),
         name=case_name,
     )
@@ -255,6 +309,7 @@ def run_case(
         ledger_run_id,
         resume_trace,
         chainlink_issue_id,
+        chainlink_db,
     )
     after_restart = root / "crash-traces" / f"{case_name}.after.json"
     shutil.copy2(checkpoint, after_restart)
@@ -263,7 +318,7 @@ def run_case(
     if final_state.fsm.phase is not real.TLPhase.TLDone:
         raise AcceptanceError(f"{case_name} did not converge to TLDone")
     if boundary.name in {"publication", "aggregate_publication"}:
-        _assert_nested_aggregate_pr(config, forgejo_url)
+        _assert_nested_aggregate_pr(config, forgejo_url, repo, case_name)
     identity = assert_crash_record(marker, boundary.name, boundary.point)
     counts = assert_recursive_effect_cardinality(state_root / run_id)
     assert_checkpoint_progression([before_restart, after_restart])
@@ -313,7 +368,12 @@ def run_matrix() -> dict[str, Any]:
                 root = Path(raw)
                 repo, _, _ = real.clone_external_fixture(root)
                 case_name = _case_name(root, boundary)
-                issue_id = _create_fixture_issue(case_name)
+                chainlink_db = root / ".chainlink" / "issues.db"
+                _copy_chainlink_database(
+                    Path(config["CHAINLINK_DB"]).expanduser().resolve(),
+                    chainlink_db,
+                )
+                issue_id = _create_fixture_issue(chainlink_db, case_name)
                 server = None
                 try:
                     server, _ = real.start_server(
@@ -326,6 +386,7 @@ def run_matrix() -> dict[str, Any]:
                             "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"
                         ],
                         identity_agents=_identity_agents(plan()),
+                        chainlink_db=chainlink_db,
                     )
                     result = run_case(
                         root,
@@ -334,6 +395,7 @@ def run_matrix() -> dict[str, Any]:
                         config,
                         boundary,
                         issue_id,
+                        chainlink_db,
                     )
                     result["server_run"] = repetition
                     results.append(result)
@@ -356,7 +418,7 @@ def run_matrix() -> dict[str, Any]:
                             case_name,
                         )
                     finally:
-                        _cleanup_fixture_issue(issue_id)
+                        _cleanup_fixture_issue(chainlink_db, issue_id)
     assert_required_effects(operation_totals)
     return {
         "passed": True,

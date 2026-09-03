@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 import beast
+import runner
 from boundaries import (
     CRASH_BOUNDARIES,
     LOGICAL_BOUNDARY_NAMES,
@@ -287,6 +289,52 @@ def test_remote_ancestry_checks_the_authoritative_git_ref(tmp_path: Path) -> Non
             remote=str(remote),
             remote_branch="main",
         )
+
+
+def test_nested_aggregate_assertion_ignores_historical_pr_heads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_head = "current-nested-head"
+    marker = tmp_path / ".exo" / "1057-nested-heads-case.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"nested-a": expected_head}), encoding="utf-8")
+    pulls = [
+        {
+            "title": "Aggregate nested-a into main.sub-a",
+            "head": {"ref": "main.sub-a.nested-a", "sha": "historical-head"},
+            "base": {"ref": "main.sub-a"},
+        },
+        {
+            "title": "Aggregate nested-a into main.sub-a",
+            "head": {"ref": "main.sub-a.nested-a", "sha": expected_head},
+            "base": {"ref": "main.sub-a"},
+        },
+    ]
+    monkeypatch.setattr(runner.real, "json_request", lambda *args, **kwargs: pulls)
+    runner._assert_nested_aggregate_pr(
+        {
+            "EXOMONAD_FORGEJO_E2E_OWNER": "owner",
+            "EXOMONAD_FORGEJO_E2E_REPO": "repo",
+            "EXOMONAD_FORGEJO_E2E_TOKEN": "token",
+        },
+        "http://forgejo",
+        tmp_path,
+        "case",
+    )
+
+
+def test_chainlink_case_database_is_a_non_mutating_snapshot(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    destination = tmp_path / "case" / "issues.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO marker VALUES ('source')")
+    runner._copy_chainlink_database(source, destination)
+    with sqlite3.connect(destination) as connection:
+        connection.execute("INSERT INTO marker VALUES ('case')")
+    with sqlite3.connect(source) as connection:
+        values = connection.execute("SELECT value FROM marker").fetchall()
+    assert values == [("source",)]
 
 
 def test_effect_event_assertion_requires_one_merge_lifecycle(tmp_path: Path) -> None:

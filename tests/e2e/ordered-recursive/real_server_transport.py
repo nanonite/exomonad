@@ -812,6 +812,7 @@ def start_server(
     forgejo_token: str = "test-token",
     forgejo_reviewer_token: str | None = None,
     identity_agents: Mapping[str, str] | None = None,
+    chainlink_db: Path | None = None,
 ) -> tuple[subprocess.Popen[str], TransportClient]:
     wasm = project_root / ".exo/wasm/wasm-guest-devswarm.wasm"
     binary = Path(
@@ -940,11 +941,25 @@ def start_server(
         ["tmux", "new-session", "-d", "-s", session, "-n", "TL", "sleep", "300"]
     )
     run_command(["tmux", "set-environment", "-t", session, "PATH", test_path])
+    if chainlink_db is not None:
+        run_command(
+            [
+                "tmux",
+                "set-environment",
+                "-t",
+                session,
+                "CHAINLINK_DB",
+                str(chainlink_db),
+            ]
+        )
     log = (root / "server.log").open("w", encoding="utf-8")
+    environment = {**os.environ, "PATH": test_path}
+    if chainlink_db is not None:
+        environment["CHAINLINK_DB"] = str(chainlink_db)
     process = subprocess.Popen(
         [str(binary), "serve"],
         cwd=repo,
-        env={**os.environ, "PATH": test_path},
+        env=environment,
         stdout=log,
         stderr=log,
         text=True,
@@ -1070,6 +1085,8 @@ def cleanup_external_case(
         parent_marker.unlink()
     except FileNotFoundError:
         pass
+    for marker in repo.glob(f".exo/1057-nested-heads-{case_name}.json"):
+        marker.unlink()
 
 
 def server_ledger_events(repo: Path) -> list[dict[str, Any]]:

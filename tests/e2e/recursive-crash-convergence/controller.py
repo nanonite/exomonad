@@ -24,8 +24,10 @@ def controller(
     trace_path: Path,
     advance_base: bool,
     chainlink_issue_id: int,
+    chainlink_db: Path,
 ) -> None:
     """Run one controller invocation until the injected process death."""
+    os.environ["CHAINLINK_DB"] = str(chainlink_db)
     transport = CrashBoundaryTransport(
         repo,
         trace_path,
@@ -95,8 +97,10 @@ def resume(
     ledger_run_id: str,
     trace_path: Path,
     chainlink_issue_id: int,
+    chainlink_db: Path,
 ) -> Any:
     """Resume from the persisted manifest, recording all resumed UDS calls."""
+    os.environ["CHAINLINK_DB"] = str(chainlink_db)
     source = real.LazyLedgerSource(
         repo / ".exo" / "ledger" / "segments",
         state_root,

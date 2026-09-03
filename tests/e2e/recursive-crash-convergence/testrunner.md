@@ -21,6 +21,9 @@ Run the real matrix with:
     just tl-loop-recursive-crash-convergence-e2e
 
 The runner creates only temporary local state and always stops the server.
+The supplied CHAINLINK_DB is read-only source state: every matrix case receives
+an isolated SQLite backup, and issue creation, server effects, and cleanup use
+that temporary database. No fixture issue is written to the supplied database.
 The Forgejo repository and remote must be disposable, because the acceptance
 creates branches and pull requests. A missing environment, mock API, crash
 marker, journal receipt, authoritative merge observation, or convergence

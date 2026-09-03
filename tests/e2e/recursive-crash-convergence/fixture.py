@@ -55,7 +55,9 @@ def seed_aggregate_publication(
     """Seed only root state; production child controllers own nested work."""
     run_id, seeded_plan, _, _ = real.seed_dispatch_restart_run(root, repo, work_plan)
     parent_marker = repo / ".exo" / f"1057-parent-branches-{case_name}.json"
+    nested_marker = repo / ".exo" / f"1057-nested-heads-{case_name}.json"
     parent_branches: list[str] = []
+    nested_heads: dict[str, str] = {}
     for task in seeded_plan.sub_tls:
         owner_branch = f"main.{task.name}"
         owner_worktree = real.agent_worktree(repo, owner_branch)
@@ -80,6 +82,19 @@ def seed_aggregate_publication(
     parent_marker.parent.mkdir(parents=True, exist_ok=True)
     parent_marker.write_text(
         json.dumps(sorted(set(parent_branches)), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    for task in seeded_plan.sub_tls:
+        child_plan = (
+            task.plan
+            if isinstance(task.plan, real.WorkPlan)
+            else real.WorkPlan.from_mapping(task.plan)
+        )
+        for nested in child_plan.sub_tls:
+            nested_branch = f"main.{task.name}.{nested.name}"
+            nested_heads[nested.name] = real.git(repo, "rev-parse", nested_branch)
+    nested_marker.write_text(
+        json.dumps(nested_heads, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return run_id, seeded_plan
