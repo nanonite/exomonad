@@ -621,6 +621,23 @@ class RunStore:
         apply(self.run_dir, mutate)
         return self.load()
 
+    def clear_gate(self, name: str) -> RunState:
+        """Remove one resolved gate through the atomic writer."""
+        if not isinstance(name, str) or not name:
+            raise ValueError("gate name must be a non-empty string")
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            gates = document.get("gates")
+            if not isinstance(gates, list):
+                raise CorruptCheckpoint("run state gates are not an array")
+            document["gates"] = [
+                gate for gate in gates if not isinstance(gate, dict) or gate.get("name") != name
+            ]
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
     def answer_gate(self, name: str, status: GateStatus) -> RunState:
         """Answer an existing named gate without creating a new one."""
         if not isinstance(name, str) or not name:
@@ -1223,6 +1240,10 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["dispatch_generation"] = value.dispatch_generation
         if value.reconciliation is not None:
             record["reconciliation"] = copy.deepcopy(dict(value.reconciliation))
+        if value.legacy_manifest_migration is not None:
+            record["legacy_manifest_migration"] = copy.deepcopy(
+                dict(value.legacy_manifest_migration)
+            )
         if value.task_timeout_seconds is not None:
             record["task_timeout_seconds"] = value.task_timeout_seconds
         if value.task_timeout_source is not None:
@@ -2241,6 +2262,13 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         reconciliation=(
             MappingProxyType(copy.deepcopy(cast(dict[str, object], value["reconciliation"])))
             if isinstance(value.get("reconciliation"), dict)
+            else None
+        ),
+        legacy_manifest_migration=(
+            MappingProxyType(
+                copy.deepcopy(cast(dict[str, object], value["legacy_manifest_migration"]))
+            )
+            if isinstance(value.get("legacy_manifest_migration"), dict)
             else None
         ),
         task_timeout_seconds=cast(float | None, value.get("task_timeout_seconds")),

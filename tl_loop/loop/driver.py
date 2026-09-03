@@ -173,6 +173,7 @@ from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
 from tl_loop.select.policy import HarnessPolicy, load_policy
+from tl_loop.state.legacy_manifest import reconcile_legacy_manifest
 from tl_loop.state.plan_manifest import (
     ManifestError,
     PlanManifest,
@@ -893,22 +894,42 @@ def run_tl_loop(
                 )
             supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
             candidate = _manifest_for_plan(supplied_plan, run_id, selected)
-            protected = {
-                slice_state.manifest_node_id
-                for slice_state in existing_state.slices.values()
-                if slice_state.status not in {SliceStatus.PENDING, SliceStatus.READY}
-                and slice_state.manifest_node_id is not None
-            }
-            if protected and selected.active:
-                store.set_gate(
-                    "plan-manifest-migration: existing active run has no unambiguous immutable manifest"
+            reconciliation = None
+            if selected.active:
+                journal_path = store.run_dir / "action-journal.json"
+                migration_journal: list[EffectIntent] = (
+                    EffectJournal(run_id, journal_path)
+                    if selected.ledger_run_id is not None or journal_path.exists()
+                    else []
                 )
-                raise TLLoopError(
-                    "continuation cannot replace an ambiguous legacy manifest for an active run"
+                reconciliation = reconcile_legacy_manifest(
+                    persisted_manifest,
+                    candidate,
+                    existing_state,
+                    migration_journal,
+                    child_checkpoint_root=store.run_dir,
+                )
+                if not reconciliation.proven:
+                    store.set_gate(reconciliation.gate_name())
+                    raise TLLoopError(
+                        "continuation cannot replace the legacy manifest: "
+                        f"{reconciliation.disposition.value}: {reconciliation.reason}"
+                    )
+            proofs = (
+                {proof.slice_id: proof for proof in reconciliation.proofs} if reconciliation else {}
+            )
+            rebound: dict[str, SliceState] = {}
+            for slice_id, slice_state in existing_state.slices.items():
+                proof = proofs.get(slice_id)
+                rebound[slice_id] = replace(
+                    slice_state,
+                    branch=(proof.branch if proof else None) or slice_state.branch,
+                    worktree=(proof.worktree if proof else None) or slice_state.worktree,
+                    legacy_manifest_migration=proof.to_document() if proof else None,
                 )
             generated = _initial_slices(supplied_plan, selected, root_dir, run_id)
             initial_slices = {
-                **dict(existing_state.slices),
+                **rebound,
                 **{
                     name: value
                     for name, value in generated.items()
@@ -916,13 +937,16 @@ def run_tl_loop(
                 },
             }
             try:
-                store.set_plan_manifest(
+                existing_state = store.set_plan_manifest(
                     candidate,
                     slices=initial_slices,
-                    protected_node_ids=protected,
                 )
             except ManifestError as error:
                 raise TLLoopError(f"legacy plan manifest replacement rejected: {error}") from error
+            if reconciliation:
+                for gate in existing_state.gates:
+                    if gate.name.startswith("plan-manifest-migration:"):
+                        existing_state = store.clear_gate(gate.name)
             work_plan = _work_plan_from_manifest(candidate)
             manifest = candidate
             initial_slices = None
@@ -1083,7 +1107,7 @@ def run_tl_loop(
     state = _release_canonical_scope(state, store)
     effects_log: list[EffectIntent] = (
         EffectJournal(run_id, store.run_dir / "action-journal.json")
-        if selected.ledger_run_id is not None
+        if selected.ledger_run_id is not None or (store.run_dir / "action-journal.json").exists()
         else []
     )
     state = _reconcile_legacy_parked_lanes(state, store, effects_log)

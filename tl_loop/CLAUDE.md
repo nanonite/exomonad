@@ -96,6 +96,19 @@ server or network query. Legacy checkpoints receive deterministic manifest
 bindings; ambiguous child kind or ownership is recorded as an actionable
 recovery gate rather than guessed.
 
+Active legacy manifests are upgraded only through
+`tl_loop.state.legacy_manifest.reconcile_legacy_manifest`. The external plan
+is a candidate, never authority: each existing scope/name binding must be
+proved by the confirmed spawn intent and result, immutable declaration,
+branch/worktree, publication and handoff coordinates, exact-head review, and
+the current action journal. Nested scopes additionally require the child
+checkpoint and its complete manifest digest. The atomic store mutation then
+rebinds every slice to the canonical node and revision while retaining runtime
+evidence and writes a bounded `legacy_manifest_migration` proof record. Missing
+or conflicting evidence creates a deterministic `plan-manifest-migration`
+gate and leaves the legacy checkpoint untouched; only a proven migration may
+clear those gates.
+
 ## Durable post-merge recovery boundaries
 
 Remote merge adoption opens a per-slice recovery FSM; it does not complete the

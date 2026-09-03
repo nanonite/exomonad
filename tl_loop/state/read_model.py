@@ -28,6 +28,7 @@ from .diagnostics import (
     _safe_binding,
     project_action,
     project_lane,
+    project_legacy_manifest_migration,
     project_post_merge,
     project_recovery,
     project_replay,
@@ -115,6 +116,7 @@ class SliceReadModel:
     publication: Mapping[str, object] | None = None
     handoff: Mapping[str, object] | None = None
     observation_provenance: Mapping[str, object] | None = None
+    legacy_manifest_migration: Mapping[str, object] | None = None
 
     def to_document(self) -> dict[str, object]:
         """Return the body-free JSON representation."""
@@ -161,6 +163,11 @@ class SliceReadModel:
             "observation_provenance": (
                 dict(self.observation_provenance)
                 if self.observation_provenance is not None
+                else None
+            ),
+            "legacy_manifest_migration": (
+                dict(self.legacy_manifest_migration)
+                if self.legacy_manifest_migration is not None
                 else None
             ),
         }
@@ -899,6 +906,9 @@ def _slice_model(state: SliceState, events: Mapping[str, EventEnvelope]) -> Slic
         publication=_safe_binding(state.publication),
         handoff=_safe_binding(state.handoff),
         observation_provenance=_safe_binding(state.observation_provenance),
+        legacy_manifest_migration=project_legacy_manifest_migration(
+            state.legacy_manifest_migration
+        ),
     )
 
 

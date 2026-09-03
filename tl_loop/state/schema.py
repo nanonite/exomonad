@@ -614,6 +614,7 @@ SLICE_KEYS = frozenset(
         "dispatch_authoritative_event_seq",
         "dispatch_generation",
         "reconciliation",
+        "legacy_manifest_migration",
         "task_timeout_seconds",
         "task_timeout_source",
         "recovery",
@@ -640,6 +641,19 @@ RECONCILIATION_KEYS = frozenset(
         "merge_journal_id",
         "remote_head_sha",
         "ancestry_proof",
+    }
+)
+LEGACY_MANIFEST_MIGRATION_KEYS = frozenset(
+    {
+        "old_node_id",
+        "new_node_id",
+        "slice_id",
+        "disposition",
+        "evidence",
+        "missing",
+        "conflicts",
+        "branch",
+        "worktree",
     }
 )
 PARK_AUDIT_KEYS = frozenset(
@@ -822,6 +836,7 @@ class SliceState:
     dispatch_authoritative_event_seq: int | None = None
     dispatch_generation: int = 0
     reconciliation: Mapping[str, object] | None = None
+    legacy_manifest_migration: Mapping[str, object] | None = None
     task_timeout_seconds: float | None = None
     task_timeout_source: str | None = None
     recovery: RecoveryState | None = None
@@ -1415,6 +1430,7 @@ def _validate_slice(
     if "dispatch_generation" in value:
         _non_negative_int(value, "dispatch_generation", path, errors)
     _reconciliation(value.get("reconciliation"), path, errors)
+    _legacy_manifest_migration(value.get("legacy_manifest_migration"), path, errors)
     _nullable_number(value, "task_timeout_seconds", path, errors)
     _nullable_string(value, "task_timeout_source", path, errors)
     _validate_recovery(value.get("recovery"), path, errors)
@@ -1603,6 +1619,35 @@ def _reconciliation(value: object, path: str, errors: list[tuple[str, str]]) -> 
         "ancestry_proof",
     ):
         _nullable_string(reconciliation, key, f"{path}.reconciliation", errors)
+
+
+def _legacy_manifest_migration(
+    value: object,
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    if value is None:
+        return
+    migration = _object(
+        value,
+        f"{path}.legacy_manifest_migration",
+        LEGACY_MANIFEST_MIGRATION_KEYS,
+        errors,
+    )
+    if migration is None:
+        return
+    for key in ("old_node_id", "slice_id", "disposition"):
+        _non_empty_string(migration, key, f"{path}.legacy_manifest_migration", errors)
+    for key in ("new_node_id", "branch", "worktree"):
+        _nullable_string(migration, key, f"{path}.legacy_manifest_migration", errors)
+    for key in ("evidence", "missing", "conflicts"):
+        _string_list(
+            migration,
+            key,
+            f"{path}.legacy_manifest_migration",
+            errors,
+            allow_empty=True,
+        )
 
 
 def _validate_post_merge(value: object, path: str, errors: list[tuple[str, str]]) -> None:

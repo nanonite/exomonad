@@ -827,6 +827,19 @@ _RECOVERY_SAFE_KEYS = frozenset(
         "plan_revision",
     }
 )
+_LEGACY_MIGRATION_SAFE_KEYS = frozenset(
+    {
+        "old_node_id",
+        "new_node_id",
+        "slice_id",
+        "disposition",
+        "evidence",
+        "missing",
+        "conflicts",
+        "branch",
+        "worktree",
+    }
+)
 
 
 def _safe_evidence(
@@ -849,6 +862,23 @@ def _safe_object_evidence(
     )
 
 
+def project_legacy_manifest_migration(
+    value: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    """Project only the bounded proof record, never legacy task text."""
+    if not isinstance(value, Mapping):
+        return None
+    result: dict[str, object] = {}
+    for key in _LEGACY_MIGRATION_SAFE_KEYS:
+        item = value.get(key)
+        if key in {"evidence", "missing", "conflicts"}:
+            if isinstance(item, (list, tuple)) and all(isinstance(entry, str) for entry in item):
+                result[key] = list(item)
+        elif isinstance(item, str) or item is None:
+            result[key] = item
+    return MappingProxyType(result)
+
+
 __all__ = [
     "ActionReadModel",
     "LaneReadModel",
@@ -859,6 +889,7 @@ __all__ = [
     "SliceIntegrationReadModel",
     "project_action",
     "project_lane",
+    "project_legacy_manifest_migration",
     "project_post_merge",
     "project_recovery",
     "project_replay",
