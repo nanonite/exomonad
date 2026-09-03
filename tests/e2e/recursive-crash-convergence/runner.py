@@ -187,6 +187,23 @@ def _identity_agents(work_plan: real.WorkPlan) -> dict[str, str]:
     return identities
 
 
+def _leaf_branches(work_plan: real.WorkPlan) -> tuple[str, ...]:
+    branches: list[str] = []
+
+    def add_scope(scope: real.WorkPlan, branch: str) -> None:
+        branches.extend(f"{branch}.{leaf.name}" for leaf in scope.leaves)
+        for task in scope.sub_tls:
+            child_plan = (
+                task.plan
+                if isinstance(task.plan, real.WorkPlan)
+                else real.WorkPlan.from_mapping(task.plan)
+            )
+            add_scope(child_plan, f"{branch}.{task.name}")
+
+    add_scope(work_plan, "main")
+    return tuple(sorted(branches))
+
+
 def _case_name(root: Path, boundary: CrashBoundary) -> str:
     return f"crash-{boundary.name}-{boundary.point}-{root.name[-8:]}"
 
@@ -445,6 +462,7 @@ def run_matrix() -> dict[str, Any]:
                             "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"
                         ],
                         identity_agents=_identity_agents(plan()),
+                        leaf_branches=_leaf_branches(plan()),
                         chainlink_db=chainlink_db,
                     )
                     result = run_case(

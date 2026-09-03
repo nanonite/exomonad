@@ -32,3 +32,8 @@ assertion is a failure; the harness never reports a partial run as passed.
 The server matrix defaults to three complete disposable repetitions. Set
 EXOMONAD_1057_SERVER_RUNS=1 for a single diagnostic pass; that is not the
 acceptance configuration.
+
+For this matrix only, the Codex shim is a deterministic leaf publisher. It
+publishes each prepared leaf branch through real Forgejo, allowing the
+production watcher and recursive reducers to observe a genuine non-aggregate
+file_pr. Other ordered-recursive server probes keep their idle agent shim.

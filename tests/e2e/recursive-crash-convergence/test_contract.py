@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 import beast
+import leaf_publication_agent
 import runner
 from boundaries import (
     CRASH_BOUNDARIES,
@@ -66,6 +67,25 @@ def test_boundary_lookup_and_effect_identity_are_canonical() -> None:
     first = effect_identity({"intent_id": "x", "body": "secret", "child_id": "a"})
     second = effect_identity({"child_id": "a", "intent_id": "x"})
     assert first == second
+
+
+def test_leaf_publication_actor_is_limited_to_recursive_leaf_branches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert runner._leaf_branches(runner.plan()) == (
+        "main.sub-a.nested-a.nested-output",
+        "main.sub-b.sub-b-output",
+        "main.sub-c.sub-c-output",
+    )
+    monkeypatch.setenv(
+        "EXOMONAD_1057_LEAF_BRANCHES",
+        "main.sub-a.nested-a.nested-output,main.sub-b.sub-b-output",
+    )
+    assert leaf_publication_agent._target_leaf_branch(
+        "main.sub-a.nested-a.nested-output"
+    )
+    assert not leaf_publication_agent._target_leaf_branch("main.sub-a.nested-a")
+    assert not leaf_publication_agent._target_leaf_branch("review-pr-43")
     assert "body" not in redacted_arguments({"body": "secret", "child_id": "a"})
     nested = redacted_arguments(
         {

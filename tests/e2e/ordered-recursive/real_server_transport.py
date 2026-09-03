@@ -22,6 +22,7 @@ import json
 import multiprocessing
 import os
 import queue
+import shlex
 import shutil
 import signal
 import socket
@@ -31,7 +32,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -813,6 +814,7 @@ def start_server(
     forgejo_reviewer_token: str | None = None,
     identity_agents: Mapping[str, str] | None = None,
     chainlink_db: Path | None = None,
+    leaf_branches: Sequence[str] | None = None,
 ) -> tuple[subprocess.Popen[str], TransportClient]:
     wasm = project_root / ".exo/wasm/wasm-guest-devswarm.wasm"
     binary = Path(
@@ -934,7 +936,20 @@ def start_server(
     fake_bin = root / "fake-bin"
     fake_bin.mkdir()
     fake_codex = fake_bin / "codex"
-    fake_codex.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
+    if leaf_branches:
+        actor = (
+            project_root
+            / "tests/e2e/recursive-crash-convergence/leaf_publication_agent.py"
+        )
+        configured_branches = ",".join(sorted(set(leaf_branches)))
+        fake_codex.write_text(
+            "#!/bin/sh\n"
+            f"export EXOMONAD_1057_LEAF_BRANCHES={shlex.quote(configured_branches)}\n"
+            f'exec {shlex.quote(sys.executable)} {shlex.quote(str(actor))} "$@"\n',
+            encoding="utf-8",
+        )
+    else:
+        fake_codex.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
     fake_codex.chmod(0o755)
     test_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
     run_command(
