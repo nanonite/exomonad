@@ -24,7 +24,15 @@ module-level contracts.
 | `.exo/review-policy.toml` | **yes** | Review rounds, timeouts, second-reviewer triggers |
 | `.exo/harness_capability.toml` | **yes** | Difficulty ratings for every harness/model allowed by the policy |
 
-The structured work plan lives separately at `.exo/tl-loop/plan.json`.
+`.exo/tl-loop/plan.json` is the input for a new run. On the first durable
+checkpoint, the controller canonicalizes it into the immutable
+`run.json.plan_manifest`, which contains the complete recursive scope and node
+declarations. That persisted manifest—not a later external file—is the
+continuation authority. A continuation may omit `plan.json`; if an external
+file is supplied, missing, changed, or reordered content must not silently
+change the run. Only a strictly higher explicit manifest revision can change
+the declaration, and revisions are additive-only: dispatched ownership,
+parent scope, branch targets, and completed history are immutable.
 
 An externally blocked leaf may receive one bounded continuation clarification.
 The clarification carries the prior and proposed plan revision plus a
@@ -39,8 +47,11 @@ A missing or invalid `harness_policy.toml` is a startup error. The controller
 never synthesizes a permissive default, and it never widens an allowlist or a
 ceiling to make a run continue.
 
-`plan.json` is the only accepted form of a root specification. A
+For a new run, `plan.json` is the only accepted form of a root specification. A
 natural-language TL prompt is rejected — there is no interactive TL fallback.
+After the first checkpoint, the persisted manifest is the root specification
+for continuation; editing or replacing the external plan is not a recovery
+mechanism.
 
 ---
 
@@ -232,7 +243,10 @@ human.
 ## 3. `.exo/tl-loop/plan.json` — the work
 
 The plan document is a closed-key JSON object. Unknown keys are rejected at
-load, not ignored.
+load, not ignored. This document declares the initial recursive work only.
+After it is accepted, its canonical recursive manifest is persisted in
+`run.json`; activation, evidence, effects, and repository lanes remain mutable
+FSM state alongside that immutable declaration.
 
 ```json
 {
@@ -847,6 +861,14 @@ python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> -
 `--poll-interval` (0.25s), `--wait-for-plan` (block until `plan.json` appears),
 `--verbose`. `EXOMONAD_TL_LOOP_PROJECT_ROOT` and `EXOMONAD_TL_LOOP_RUN_ID` set
 the defaults.
+
+For continuation, first inspect the persisted checkpoint with `status` and
+prefer running without `--plan`; the controller reconstructs the complete
+recursive work from `run.json.plan_manifest`. Do not restore or hand-edit
+`run.json` or use a changed external plan to bypass a gate. Inspect
+`scope_path`, `manifest_revision`, `current_order`, `next_transition`, action
+and journal identities, post-merge phase, and repository-lane coordinates when
+diagnosing a blocked run.
 
 The focused ordered integration checks are:
 

@@ -3,6 +3,7 @@
 Date: 2026-08-12
 Status: Accepted
 Builds on: [tl-as-loop.md](tl-as-loop.md), [watcher-as-sensor.md](watcher-as-sensor.md), [agent-loop-and-steering.md](agent-loop-and-steering.md)
+Reconciled: 2026-09-03 in #1058
 
 ## Context
 
@@ -11,18 +12,21 @@ conversation was also the query interface: you could ask what the run was
 doing, why a PR was stuck, and what it planned next, and the TL would answer
 from its own context.
 
-M9 replaced that session with `tl_loop`. The architecture is better — durable,
-replayable, testable — but the operator surface regressed to two commands:
+M9 replaced that session with `tl_loop`. The architecture is durable,
+replayable, and testable. The operator surface remains two commands:
 
 ```bash
 python3 ~/.exo/tl_loop.pyz status --run-id root
 python3 ~/.exo/tl_loop.pyz gate   --run-id root --name <gate> --approve
 ```
 
-`status` prints a fixed JSON view; `gate` answers a gate you already knew the
-name of. Neither answers "why is slice X still open" or "what is this run
-waiting on". The affordance that was lost is **conversational query over
-orchestrator state**, and nothing replaced it.
+`status` prints the hierarchical read model; `gate` answers a gate you already
+knew the name of. The read model answers "why is slice X still open" and "what
+is this run waiting on" without granting mutation authority. It reports the
+scope path, manifest revision, current order, next transition, child and
+post-merge state, repository-lane coordinates, replay cursor, journal state,
+and the specific blocking guard. It is a projection, so operators should
+check its cursor and refresh it before acting on a gate.
 
 M11 ([agent-loop-and-steering.md](agent-loop-and-steering.md)) covers the
 opposite direction — durable TL→agent guidance with batches, leases, and
@@ -52,9 +56,11 @@ and its corollary that orchestration is server-side:
 
 ### 2. The console may do exactly three things
 
-1. **Read projections.** A read model over run state and the ledger: phase,
-   slices, per-head review/CI evidence, budget ledger, gates, park causes,
-   recent transitions.
+1. **Read projections.** A hierarchical read model over run state and the
+   ledger: scope path and role, manifest revision, current order, typed child
+   lifecycle, per-head review/CI evidence, post-merge progress, repository
+   lanes, replay cursor, budget ledger, gates, park causes, recent transitions,
+   and next-transition guidance.
 2. **Answer named gates.** Approve or reject a gate that already exists. The
    console cannot invent a gate name.
 3. **Propose plan mutations.** A proposal is validated by the same closed-key
@@ -244,8 +250,8 @@ ledger. Its proposals become durable gate/plan records, not a parallel log.
 
 Positive:
 
-- The lost query affordance returns without restoring an interactive
-  coordinator.
+- Hierarchical diagnostics explain blocked recursive work without restoring an
+  interactive coordinator or creating a second state authority.
 - Escalation reaches the operator instead of waiting to be polled: a park
   cause becomes a `signal/` the console surfaces.
 - The authority boundary is explicit and enforced server-side, so a console

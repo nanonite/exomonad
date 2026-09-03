@@ -63,8 +63,14 @@ First build downloads Nix dependencies and initializes the WASM toolchain — su
 ExoMonad works on any Git repository. The canonical PR, review, and CI loop is
 Forgejo-backed. Four controller files under `.exo/` are required:
 `config.toml`, `harness_policy.toml`, `review-policy.toml`, and
-`harness_capability.toml`. The structured work plan lives separately at
-`.exo/tl-loop/plan.json`.
+`harness_capability.toml`. A new run starts from
+`.exo/tl-loop/plan.json`; its first checkpoint stores the complete immutable
+recursive `plan_manifest` in `run.json`. Continuations use that manifest as
+authority and may omit the external plan, so a missing, changed, or reordered
+`plan.json` cannot silently alter active work. See the
+[recursive recovery reconciliation](docs/decisions/tl-recovery-backlog-reconciliation.md)
+and [programming guide](docs/guides/programming-the-tl.md) for the durable
+contract.
 
 ```bash
 cd your-project/

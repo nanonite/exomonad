@@ -8,6 +8,8 @@ Issue: #1048
 
 Parent: #1047
 
+Last reconciled: 2026-09-03 in #1058
+
 ## ANTI-PATTERNS
 
 - Do not implement a second orchestration algebra in a scheduler, watcher, or
@@ -468,13 +470,13 @@ There is no production constructor or persisted target payload that gives either
 justify preserving them as target phases.
 
 The target constructors and durable payloads live in
-`tl_loop/fsm/orchestration.py`. Until #1050 migrates the root and non-root
-drivers, `tl_loop/fsm/transition.py`, `tl_loop/ordered.py`, and their callers
-may act as adapters, but they must not assert or extend the legacy phase
-graph. #1050 must route every top-level transition through the target reducer;
-#1051/#1054 must route slice and repository-lane recovery through its typed
-events. A compatibility adapter is not permission to construct a second
-orchestration state machine.
+`tl_loop/fsm/orchestration.py`. The root and non-root drivers now route
+production transitions through the target reducers. `tl_loop/fsm/transition.py`,
+`tl_loop/ordered.py`, and legacy phase values remain compatibility adapters for
+old checkpoints and inputs only; they must not assert or extend the canonical
+phase graph. Slice, post-merge, and repository-lane recovery likewise use the
+typed reducers delivered by #1051 and #1054. New code must not construct a
+second legacy state machine.
 
 ## Migration boundaries for the epic
 
@@ -491,11 +493,13 @@ orchestration state machine.
 | #1057 | prove recursive crash recovery and exactly-once convergence with real Forgejo |
 | #1058 | reconcile superseded recovery tasks and publish the final contract |
 
-This issue intentionally does not implement manifest persistence, production
-scheduler migration, or real-server convergence. Those are constrained by this
-ADR and belong to the listed follow-up issues. Its executable model does
-include the scope, child, post-merge, and lane reducers so those later issues
-cannot invent or weaken their transition semantics.
+The original #1048 scope deferred manifest persistence, production scheduling,
+and real-server convergence. Those concerns were subsequently delivered by
+#1049–#1057 and are reconciled in
+`docs/decisions/tl-recovery-backlog-reconciliation.md`. This ADR remains the
+semantic authority: implementation and acceptance evidence must satisfy it,
+but a follow-up issue must not use the historical deferral as permission to
+invent a competing contract.
 
 ## Verification obligations
 
@@ -550,5 +554,6 @@ evidence, one merge journal entry, and post-merge bookkeeping.
   whether order is parallel or sequential, who owns aggregate PRs, or when a
   stage is released.
 - The contract tests pass with `just tl-loop-test`.
-- No live Forgejo or Beast convergence claim is made by #1048; #1057 owns that
-  proof.
+- Real Forgejo and captured-workspace convergence evidence belongs to #1057,
+  whose tracker entry is closed. This ADR does not replace those acceptance
+  artifacts or claim that an unavailable external environment was run locally.
