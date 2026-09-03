@@ -944,6 +944,7 @@ def start_server(
         configured_branches = ",".join(sorted(set(leaf_branches)))
         fake_codex.write_text(
             "#!/bin/sh\n"
+            f"export EXOMONAD_SOCKET={shlex.quote(str(repo / '.exo/server.sock'))}\n"
             f"export EXOMONAD_1057_LEAF_BRANCHES={shlex.quote(configured_branches)}\n"
             f'exec {shlex.quote(sys.executable)} {shlex.quote(str(actor))} "$@"\n',
             encoding="utf-8",

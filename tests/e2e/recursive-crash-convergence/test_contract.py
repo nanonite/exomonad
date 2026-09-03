@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import http.server
+import socketserver
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -96,6 +99,112 @@ def test_leaf_publication_actor_is_limited_to_recursive_leaf_branches(
     assert nested["payload"]["review_id"] == 7
     assert nested["payload"]["body"] == "<redacted>"
     assert nested["payload"]["findings"] == "<redacted>"
+
+
+def test_leaf_publication_uses_the_explicit_root_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[tuple[str, bytes]] = []
+
+    class UnixHTTPHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+            length = int(self.headers["Content-Length"])
+            requests.append((self.path, self.rfile.read(length)))
+            response = b'{"success": true, "result": {}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, *_: object) -> None:
+            return
+
+    class UnixHTTPServer(socketserver.UnixStreamServer):
+        allow_reuse_address = True
+
+    socket_path = tmp_path / "root" / ".exo" / "server.sock"
+    socket_path.parent.mkdir(parents=True)
+    server = UnixHTTPServer(str(socket_path), UnixHTTPHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv(
+        "EXOMONAD_1057_LEAF_BRANCHES", "main.sub-a.nested-a.nested-output"
+    )
+    monkeypatch.setenv("EXOMONAD_SOCKET", str(socket_path))
+    monkeypatch.setattr(
+        leaf_publication_agent,
+        "_current_branch",
+        lambda: "main.sub-a.nested-a.nested-output",
+    )
+    monkeypatch.setattr(leaf_publication_agent, "_current_head", lambda: "leaf-head")
+    try:
+        assert leaf_publication_agent.publish_leaf()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert len(requests) == 1
+    path, body = requests[0]
+    assert path == "/agents/tl/nested-output/tools/call"
+    assert json.loads(body)["arguments"]["base_branch"] == "main.sub-a.nested-a"
+
+
+def test_leaf_publication_requires_the_root_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("EXOMONAD_SOCKET", raising=False)
+    with pytest.raises(
+        leaf_publication_agent.LeafPublicationError, match="EXOMONAD_SOCKET"
+    ):
+        leaf_publication_agent._server_socket()
+
+
+def test_reviewer_actor_approves_the_authoritative_current_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FORGEJO_URL", "http://forgejo")
+    monkeypatch.setenv("FORGEJO_OWNER", "owner")
+    monkeypatch.setenv("FORGEJO_REPO", "repo")
+    monkeypatch.setenv("FORGEJO_REVIEWER_TOKEN", "reviewer-token")
+    requests: list[tuple[str, str, object, str]] = []
+
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        token: str,
+        payload: object = None,
+    ) -> object:
+        requests.append((method, url, payload, token))
+        if url.endswith("/api/v1/user"):
+            return {"login": "reviewer"}
+        if url.endswith("/pulls/43"):
+            return {"head": {"sha": "exact-head"}}
+        if url.endswith("/pulls/43/reviews"):
+            return []
+        return {"id": 12}
+
+    monkeypatch.setattr(leaf_publication_agent, "_request", fake_request)
+    assert leaf_publication_agent.review_assigned_pr(43)
+    assert requests[-1] == (
+        "POST",
+        "http://forgejo/api/v1/repos/owner/repo/pulls/43/reviews",
+        {"event": "APPROVED", "commit_id": "exact-head"},
+        "reviewer-token",
+    )
+
+
+def test_non_target_actor_remains_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("EXOMONAD_1057_LEAF_BRANCHES", raising=False)
+    monkeypatch.setattr(
+        leaf_publication_agent, "_current_branch", lambda: "review-pr-43"
+    )
+    monkeypatch.setattr(sys, "argv", ["leaf_publication_agent.py"])
+    slept: list[float] = []
+    monkeypatch.setattr(leaf_publication_agent.time, "sleep", slept.append)
+    assert leaf_publication_agent.main() == 0
+    assert slept == [300]
 
 
 def test_crash_record_requires_one_identity(tmp_path: Path) -> None:
