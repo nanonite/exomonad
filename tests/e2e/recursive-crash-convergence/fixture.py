@@ -55,9 +55,9 @@ def seed_aggregate_publication(
     """Seed only root state; production child controllers own nested work."""
     run_id, seeded_plan, _, _ = real.seed_dispatch_restart_run(root, repo, work_plan)
     parent_marker = repo / ".exo" / f"1057-parent-branches-{case_name}.json"
-    nested_marker = repo / ".exo" / f"1057-nested-heads-{case_name}.json"
+    nested_marker = repo / ".exo" / f"1057-nested-baseline-heads-{case_name}.json"
     parent_branches: list[str] = []
-    nested_heads: dict[str, str] = {}
+    nested_baselines: dict[str, str] = {}
     for task in seeded_plan.sub_tls:
         owner_branch = f"main.{task.name}"
         owner_worktree = real.agent_worktree(repo, owner_branch)
@@ -79,22 +79,33 @@ def seed_aggregate_publication(
             real.git(nested_worktree, "merge", "-q", "--ff-only", owner_branch)
             real.git(nested_worktree, "push", "-q", "origin", nested_branch)
             parent_branches.append(nested_branch)
+            nested_baselines[nested.name] = real.git(repo, "rev-parse", nested_branch)
+            nested_plan = (
+                nested.plan
+                if isinstance(nested.plan, real.WorkPlan)
+                else real.WorkPlan.from_mapping(nested.plan)
+            )
+            for leaf in nested_plan.leaves:
+                leaf_branch = f"{nested_branch}.{leaf.name}"
+                leaf_worktree = real.agent_worktree(repo, leaf_branch)
+                real.git(leaf_worktree, "merge", "-q", "--ff-only", nested_branch)
+                real.commit_fixture_worktree(
+                    leaf_worktree,
+                    relative_path=(
+                        f"e2e-fixtures/{case_name}/"
+                        f"{task.name}-{nested.name}-{leaf.name}.txt"
+                    ),
+                    content=f"{leaf.name} nested source\n",
+                    message=f"Prepare {leaf.name} nested source",
+                )
+                parent_branches.append(leaf_branch)
     parent_marker.parent.mkdir(parents=True, exist_ok=True)
     parent_marker.write_text(
         json.dumps(sorted(set(parent_branches)), indent=2) + "\n",
         encoding="utf-8",
     )
-    for task in seeded_plan.sub_tls:
-        child_plan = (
-            task.plan
-            if isinstance(task.plan, real.WorkPlan)
-            else real.WorkPlan.from_mapping(task.plan)
-        )
-        for nested in child_plan.sub_tls:
-            nested_branch = f"main.{task.name}.{nested.name}"
-            nested_heads[nested.name] = real.git(repo, "rev-parse", nested_branch)
     nested_marker.write_text(
-        json.dumps(nested_heads, indent=2, sort_keys=True) + "\n",
+        json.dumps(nested_baselines, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return run_id, seeded_plan

@@ -295,16 +295,34 @@ def test_nested_aggregate_assertion_ignores_historical_pr_heads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     expected_head = "current-nested-head"
-    marker = tmp_path / ".exo" / "1057-nested-heads-case.json"
+    marker = tmp_path / ".exo" / "1057-nested-baseline-heads-case.json"
     marker.parent.mkdir(parents=True)
-    marker.write_text(json.dumps({"nested-a": expected_head}), encoding="utf-8")
+    marker.write_text(json.dumps({"nested-a": "seed-head"}), encoding="utf-8")
+    state_root = tmp_path / "controller-state"
+    checkpoint = state_root / "nested-a" / "run.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "integration": {
+                    "integration_owner_run_id": "nested-a",
+                    "integration_owner_branch": "main.sub-a.nested-a",
+                    "aggregate_pr_number": 7,
+                    "aggregate_head_sha": expected_head,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     pulls = [
         {
+            "number": 6,
             "title": "Aggregate nested-a into main.sub-a",
             "head": {"ref": "main.sub-a.nested-a", "sha": "historical-head"},
             "base": {"ref": "main.sub-a"},
         },
         {
+            "number": 7,
             "title": "Aggregate nested-a into main.sub-a",
             "head": {"ref": "main.sub-a.nested-a", "sha": expected_head},
             "base": {"ref": "main.sub-a"},
@@ -320,6 +338,7 @@ def test_nested_aggregate_assertion_ignores_historical_pr_heads(
         "http://forgejo",
         tmp_path,
         "case",
+        state_root,
     )
 
 

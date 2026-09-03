@@ -1085,7 +1085,7 @@ def cleanup_external_case(
         parent_marker.unlink()
     except FileNotFoundError:
         pass
-    for marker in repo.glob(f".exo/1057-nested-heads-{case_name}.json"):
+    for marker in repo.glob(f".exo/1057-nested-baseline-heads-{case_name}.json"):
         marker.unlink()
 
 

@@ -169,15 +169,21 @@ def _status(value: Any) -> str | None:
 
 def _identity_agents(work_plan: real.WorkPlan) -> dict[str, str]:
     identities: dict[str, str] = {}
-    for task in work_plan.sub_tls:
-        identities[task.name] = f"main.{task.name}"
-        child_plan = (
-            task.plan
-            if isinstance(task.plan, real.WorkPlan)
-            else real.WorkPlan.from_mapping(task.plan)
-        )
-        for nested in child_plan.sub_tls:
-            identities[nested.name] = f"main.{task.name}.{nested.name}"
+
+    def add_scope(scope: real.WorkPlan, branch: str) -> None:
+        for task in (*scope.workers, *scope.leaves):
+            identities[task.name] = f"{branch}.{task.name}"
+        for task in scope.sub_tls:
+            child_branch = f"{branch}.{task.name}"
+            identities[task.name] = child_branch
+            child_plan = (
+                task.plan
+                if isinstance(task.plan, real.WorkPlan)
+                else real.WorkPlan.from_mapping(task.plan)
+            )
+            add_scope(child_plan, child_branch)
+
+    add_scope(work_plan, "main")
     return identities
 
 
@@ -185,24 +191,76 @@ def _case_name(root: Path, boundary: CrashBoundary) -> str:
     return f"crash-{boundary.name}-{boundary.point}-{root.name[-8:]}"
 
 
-def _assert_nested_aggregate_pr(
-    config: dict[str, str], forgejo_url: str, repo: Path, case_name: str
-) -> None:
-    """Prove production created the nested aggregate against its direct parent."""
-    marker = repo / ".exo" / f"1057-nested-heads-{case_name}.json"
+def _nested_aggregate_evidence(
+    state_root: Path, baseline_marker: Path
+) -> tuple[int, str, str]:
+    """Read the nested aggregate identity from the durable child checkpoint."""
     try:
-        nested_heads = json.loads(marker.read_text(encoding="utf-8"))
+        baseline_document = json.loads(baseline_marker.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
         raise AcceptanceError(
-            f"nested fixture head marker is missing: {marker}"
+            f"nested baseline head marker is missing: {baseline_marker}"
         ) from error
-    expected_head = (
-        nested_heads.get("nested-a") if isinstance(nested_heads, Mapping) else None
+    baseline_head = (
+        baseline_document.get("nested-a")
+        if isinstance(baseline_document, Mapping)
+        else None
     )
-    if not isinstance(expected_head, str) or not expected_head:
+    if not isinstance(baseline_head, str) or not baseline_head:
         raise AcceptanceError(
-            f"nested fixture head marker lacks nested-a: {nested_heads!r}"
+            f"nested baseline marker lacks nested-a: {baseline_document!r}"
         )
+
+    evidence: set[tuple[int, str]] = set()
+    for checkpoint in state_root.rglob("run.json"):
+        try:
+            document = json.loads(checkpoint.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        integration = document.get("integration")
+        if not isinstance(integration, Mapping):
+            continue
+        records: list[Mapping[str, Any]] = [integration]
+        candidates = integration.get("candidates")
+        if isinstance(candidates, Mapping):
+            records.extend(
+                candidate
+                for candidate in candidates.values()
+                if isinstance(candidate, Mapping)
+            )
+        for record in records:
+            if (
+                record.get("integration_owner_run_id") != "nested-a"
+                or record.get("integration_owner_branch") != "main.sub-a.nested-a"
+            ):
+                continue
+            pr_number = record.get("aggregate_pr_number")
+            head_sha = record.get("aggregate_head_sha")
+            if type(pr_number) is int and pr_number > 0 and isinstance(head_sha, str):
+                evidence.add((pr_number, head_sha))
+    if len(evidence) != 1:
+        raise AcceptanceError(
+            "nested aggregate checkpoint must contain exactly one durable PR/head: "
+            f"{sorted(evidence)!r}"
+        )
+    pr_number, head_sha = next(iter(evidence))
+    if head_sha == baseline_head:
+        raise AcceptanceError(
+            "nested aggregate head did not advance beyond the pre-work baseline"
+        )
+    return pr_number, head_sha, baseline_head
+
+
+def _assert_nested_aggregate_pr(
+    config: dict[str, str],
+    forgejo_url: str,
+    repo: Path,
+    case_name: str,
+    state_root: Path,
+) -> None:
+    """Prove production created the nested aggregate against its direct parent."""
+    marker = repo / ".exo" / f"1057-nested-baseline-heads-{case_name}.json"
+    expected_pr, expected_head, _ = _nested_aggregate_evidence(state_root, marker)
     pulls = real.json_request(
         "GET",
         f"{forgejo_url}/api/v1/repos/{config['EXOMONAD_FORGEJO_E2E_OWNER']}/"
@@ -222,7 +280,8 @@ def _assert_nested_aggregate_pr(
         head_sha = head.get("sha") if isinstance(head, Mapping) else None
         title = pull.get("title")
         if (
-            head_ref == "main.sub-a.nested-a"
+            pull.get("number") == expected_pr
+            and head_ref == "main.sub-a.nested-a"
             and base_ref == "main.sub-a"
             and title == "Aggregate nested-a into main.sub-a"
             and head_sha == expected_head
@@ -318,7 +377,7 @@ def run_case(
     if final_state.fsm.phase is not real.TLPhase.TLDone:
         raise AcceptanceError(f"{case_name} did not converge to TLDone")
     if boundary.name in {"publication", "aggregate_publication"}:
-        _assert_nested_aggregate_pr(config, forgejo_url, repo, case_name)
+        _assert_nested_aggregate_pr(config, forgejo_url, repo, case_name, state_root)
     identity = assert_crash_record(marker, boundary.name, boundary.point)
     counts = assert_recursive_effect_cardinality(state_root / run_id)
     assert_checkpoint_progression([before_restart, after_restart])
