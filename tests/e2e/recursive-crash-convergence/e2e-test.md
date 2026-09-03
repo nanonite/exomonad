@@ -20,7 +20,11 @@ bookkeeping push, stage release, aggregate publication, and root finalization.
 Same-order sub-TLs run together, later orders remain barriers, and nested
 children publish only to their direct parent branches.
 
-The separately configured Beast runner applies the supplied continuation
 command to the captured checkpoint three times. It requires monotonic versions
 and cursors, one merge intent, terminal journal entries, and no more than one
-new merge reconciliation per continuation.
+The separately configured Beast runner applies the supplied continuation command
+to the captured checkpoint three times. It requires monotonic versions and
+cursors, one merge intent, terminal journal entries, and no more than one new
+merge reconciliation overall. If the captured checkpoint already contains the
+confirmed merge, the runner baselines it and requires adoption/bookkeeping
+without redispatching that merge.

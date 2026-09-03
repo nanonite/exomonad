@@ -228,8 +228,14 @@ def _values_for_keys(value: Any, keys: set[str]) -> list[str]:
     return values
 
 
-def assert_remote_ancestry(document: Any, *, workspace: Path | None = None) -> None:
-    """Require durable remote-head and Git-verifiable ancestry evidence."""
+def assert_remote_ancestry(
+    document: Any,
+    *,
+    workspace: Path | None = None,
+    remote: str | None = None,
+    remote_branch: str = "main",
+) -> None:
+    """Require durable remote-head evidence tied to an authoritative ref."""
     proofs = _values_for_keys(
         document, {"ancestry_proof", "remote_ancestry_proof", "last_ancestry_proof"}
     )
@@ -245,9 +251,14 @@ def assert_remote_ancestry(document: Any, *, workspace: Path | None = None) -> N
         raise AcceptanceError(
             f"final checkpoint has no canonical ancestry proof: {proofs!r}"
         )
-    if workspace is None:
-        return
+    proof_descendants = {descendant for _, descendant in pairs}
+    if not proof_descendants.intersection(remote_heads):
+        raise AcceptanceError(
+            "remote head is not the descendant in the durable ancestry proof"
+        )
     for ancestor, descendant in pairs:
+        if workspace is None:
+            continue
         result = subprocess.run(
             [
                 "git",
@@ -266,6 +277,35 @@ def assert_remote_ancestry(document: Any, *, workspace: Path | None = None) -> N
             raise AcceptanceError(
                 f"remote ancestry proof failed Git verification: {ancestor}->{descendant}"
             )
+    if workspace is None or remote is None:
+        return
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "ls-remote",
+            "--exit-code",
+            remote,
+            f"refs/heads/{remote_branch}",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AcceptanceError(
+            f"authoritative remote branch is unavailable: {remote}:{remote_branch}"
+        )
+    remote_sha = result.stdout.split(maxsplit=1)[0] if result.stdout else ""
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", remote_sha):
+        raise AcceptanceError(
+            f"authoritative remote branch returned an invalid head: {result.stdout!r}"
+        )
+    if remote_sha not in remote_heads or remote_sha not in proof_descendants:
+        raise AcceptanceError(
+            "authoritative remote head is not correlated to the ancestry proof"
+        )
 
 
 def assert_checkpoint_progression(paths: Sequence[Path]) -> None:

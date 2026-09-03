@@ -557,6 +557,17 @@ def git(repo: Path, *args: str) -> str:
     return run_command(["git", "-C", str(repo), *args])
 
 
+def agent_worktree(repo: Path, branch: str) -> Path:
+    """Map a recursive main.* branch to its hierarchical fixture worktree."""
+    prefix = "main."
+    if not branch.startswith(prefix):
+        raise HarnessError(f"recursive fixture branch has no main.* root: {branch!r}")
+    parts = tuple(part for part in branch[len(prefix) :].split(".") if part)
+    if not parts:
+        raise HarnessError(f"recursive fixture branch has no agent path: {branch!r}")
+    return repo / ".exo" / "agents" / Path(*parts)
+
+
 def create_branch_with_commit(
     repo: Path,
     branch: str,
@@ -819,8 +830,8 @@ def start_server(
         "nested": "main.nested",
     }
     default_branches.update(identity_agents or {})
-    for child_name, branch_name in default_branches.items():
-        agent_dir = repo / ".exo/agents" / child_name
+    for branch_name in default_branches.values():
+        agent_dir = agent_worktree(repo, branch_name)
         agent_dir.parent.mkdir(parents=True, exist_ok=True)
         parent_branch = (
             branch_name.rsplit(".", 1)[0] if branch_name.count(".") >= 2 else "main"
@@ -860,9 +871,9 @@ def start_server(
     parent_agent_dir.mkdir(parents=True, exist_ok=True)
     (parent_agent_dir / ".birth_branch").write_text("main.parent\n", encoding="utf-8")
     for agent_id, branch in (identity_agents or {}).items():
-        agent_dir = repo / ".exo" / "agents" / agent_id
+        agent_dir = agent_worktree(repo, branch)
         agent_dir.mkdir(parents=True, exist_ok=True)
-        worktree = repo / ".exo" / "agents" / agent_id
+        worktree = agent_dir
         identity = {
             "agent_name": agent_id,
             "slug": agent_id,
@@ -1005,7 +1016,13 @@ def cleanup_external_case(
             isinstance(title, str)
             and title.startswith("Aggregate ")
             and isinstance(head_ref, str)
-            and head_ref in {"main.sub-a", "main.sub-b", "main.sub-c"}
+            and head_ref
+            in {
+                "main.sub-a",
+                "main.sub-b",
+                "main.sub-c",
+                "main.sub-a.nested-a",
+            }
         )
         if not belongs:
             continue

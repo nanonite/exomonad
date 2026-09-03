@@ -8870,6 +8870,7 @@ def _child_config(
         parent_run_id=store.run_id,
         parent_agent_id=config.agent_id or store.run_id,
         agent_id=task.agent_id or task.name,
+        working_dir=worktree,
         depth=config.depth + 1,
         dispatch_names={},
         keep_alive_on_waiting=False,

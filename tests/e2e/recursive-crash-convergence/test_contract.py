@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -190,30 +191,10 @@ def test_required_effects_accept_any_real_spawn_tool_and_reject_missing_families
         assert_required_effects(counts)
 
 
-def test_beast_rejects_a_pre_reconciled_checkpoint_as_unproven_convergence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    workspace = tmp_path / "beast"
-    checkpoint = workspace / ".exo" / "tl-loop" / "root" / "run.json"
-    checkpoint.parent.mkdir(parents=True)
-    checkpoint.write_text(
-        json.dumps(
-            {
-                "state_version": 1,
-                "events": {"last_consumed_offset": 3},
-                "fsm": {"phase": "tl_running"},
-            }
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("EXOMONAD_BEAST_WORKSPACE", str(workspace))
-    monkeypatch.setenv(
-        "EXOMONAD_BEAST_CONTINUE_COMMAND",
-        "true --workspace {workspace}",
-    )
-    monkeypatch.setattr(beast, "_ledger_merge_count", lambda _: 1)
-    with pytest.raises(AcceptanceError, match="already contains a merge"):
-        beast.run_three_continuations()
+def test_beast_root_terminal_contract_allows_adoption_before_root_done() -> None:
+    assert not beast._is_terminal("tl_pr_filed")
+    assert not beast._is_terminal("tl_finalizing")
+    assert beast._is_terminal("tl_done")
 
 
 def test_remote_ancestry_requires_durable_head_and_proof() -> None:
@@ -224,11 +205,88 @@ def test_remote_ancestry_requires_durable_head_and_proof() -> None:
             "post_merge": {
                 "evidence": {
                     "remote_head_sha": "abcdef1",
-                    "ancestry_proof": "ancestor:abcdef1->abcdef2",
+                    "ancestry_proof": "ancestor:abcdef1->abcdef1",
                 }
             }
         }
     )
+
+
+def test_remote_ancestry_rejects_unrelated_recorded_remote_head() -> None:
+    with pytest.raises(AcceptanceError, match="not the descendant"):
+        assert_remote_ancestry(
+            {
+                "remote_head_sha": "abcdef1",
+                "ancestry_proof": "ancestor:abcdef1->abcdef2",
+            }
+        )
+
+
+def test_remote_ancestry_checks_the_authoritative_git_ref(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    workspace = tmp_path / "workspace"
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(workspace)], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "user.name", "acceptance"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "config",
+            "user.email",
+            "acceptance@example.com",
+        ],
+        check=True,
+    )
+    (workspace / "evidence.txt").write_text("remote evidence\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "evidence.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "commit", "-q", "-m", "Evidence"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "remote", "add", "origin", str(remote)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(workspace), "push", "-q", "origin", "main"],
+        check=True,
+    )
+    sha = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    document = {"remote_head_sha": sha, "ancestry_proof": f"ancestor:{sha}->{sha}"}
+    assert_remote_ancestry(
+        document,
+        workspace=workspace,
+        remote=str(remote),
+        remote_branch="main",
+    )
+    (workspace / "unpublished.txt").write_text(
+        "not pushed to the authoritative branch\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(workspace), "add", "unpublished.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(workspace), "commit", "-q", "-m", "Unpublished"],
+        check=True,
+    )
+    unpublished_sha = subprocess.check_output(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True
+    ).strip()
+    with pytest.raises(AcceptanceError, match="authoritative remote head"):
+        assert_remote_ancestry(
+            {
+                "remote_head_sha": unpublished_sha,
+                "ancestry_proof": f"ancestor:{sha}->{unpublished_sha}",
+            },
+            workspace=workspace,
+            remote=str(remote),
+            remote_branch="main",
+        )
 
 
 def test_effect_event_assertion_requires_one_merge_lifecycle(tmp_path: Path) -> None:

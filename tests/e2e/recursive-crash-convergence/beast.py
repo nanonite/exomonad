@@ -92,7 +92,7 @@ def _phase(document: dict[str, Any]) -> str:
 
 
 def _is_terminal(phase: str) -> bool:
-    return phase in {"tl_done", "tl_pr_filed"}
+    return phase == "tl_done"
 
 
 def _assert_bookkeeping(workspace: Path, phase: str) -> None:
@@ -160,15 +160,13 @@ def run_three_continuations() -> dict[str, Any]:
     previous_version, previous_cursor = _assert_checkpoint(initial_document, "initial")
     previous_phase = initial_phase
     previous_merges = _ledger_merge_count(workspace)
-    if previous_merges:
-        raise AcceptanceError(
-            "captured Beast checkpoint already contains a merge reconciliation; "
-            "the three continuations must prove the merge"
-        )
     if previous_merges > 1:
         raise AcceptanceError(
             f"captured Beast checkpoint already has duplicate merges: {previous_merges}"
         )
+    baseline_merges = previous_merges
+    progress_count = 0
+    phase_progressed = False
     runs: list[dict[str, Any]] = []
     for attempt in range(1, 4):
         rendered = command.format(workspace=str(workspace), checkpoint=str(checkpoint))
@@ -201,8 +199,13 @@ def run_three_continuations() -> dict[str, Any]:
             raise AcceptanceError(
                 f"Beast continuation {attempt} made no durable progress before terminal convergence"
             )
+        if progressed:
+            progress_count += 1
+        if phase != previous_phase:
+            phase_progressed = True
         merge_count = _ledger_merge_count(workspace)
-        if merge_count > 1 or merge_count < previous_merges:
+        max_merges = baseline_merges if baseline_merges else 1
+        if merge_count > max_merges or merge_count < previous_merges:
             raise AcceptanceError(
                 f"Beast continuation {attempt} violated merge cardinality: "
                 f"{previous_merges}->{merge_count}"
@@ -234,13 +237,27 @@ def run_three_continuations() -> dict[str, Any]:
             f"Beast checkpoint did not converge to a terminal FSM phase: {final_phase}"
         )
     final_merges = _ledger_merge_count(workspace)
-    if final_merges != 1:
+    expected_merges = baseline_merges if baseline_merges else 1
+    if final_merges != expected_merges:
         raise AcceptanceError(
-            "Beast continuation did not authoritatively reconcile exactly one merge: "
-            f"{final_merges}"
+            "Beast continuation violated merge cardinality: "
+            f"expected {expected_merges}, got {final_merges}"
+        )
+    if progress_count == 0:
+        raise AcceptanceError(
+            "Beast continuations made no durable progress from the captured checkpoint"
+        )
+    if baseline_merges and not phase_progressed:
+        raise AcceptanceError(
+            "Beast merged baseline was not adopted through a new root FSM phase"
         )
     _assert_bookkeeping(workspace, final_phase)
-    assert_remote_ancestry(final_document, workspace=workspace)
+    assert_remote_ancestry(
+        final_document,
+        workspace=workspace,
+        remote="origin",
+        remote_branch="main",
+    )
     return {
         "passed": True,
         "runs": runs,

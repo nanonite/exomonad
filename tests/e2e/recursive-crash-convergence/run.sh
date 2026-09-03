@@ -10,7 +10,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 : "${EXOMONAD_FORGEJO_E2E_OWNER:?set the dedicated Forgejo owner}"
 : "${EXOMONAD_FORGEJO_E2E_REPO:?set the dedicated Forgejo repository}"
 : "${EXOMONAD_FORGEJO_E2E_GIT_REMOTE:?set the disposable Forgejo Git remote}"
-: "${EXOMONAD_1057_CHAINLINK_ISSUE_ID:?set the disposable fixture Chainlink issue ID}"
+: "${CHAINLINK_DB:?set the absolute Chainlink database path}"
 : "${EXOMONAD_BEAST_WORKSPACE:?set the captured Beast workspace}"
 : "${EXOMONAD_BEAST_CONTINUE_COMMAND:?set the Beast continuation command}"
 

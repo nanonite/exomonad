@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,7 @@ def _environment() -> dict[str, str]:
         "EXOMONAD_FORGEJO_E2E_OWNER",
         "EXOMONAD_FORGEJO_E2E_REPO",
         "EXOMONAD_FORGEJO_E2E_GIT_REMOTE",
-        "EXOMONAD_1057_CHAINLINK_ISSUE_ID",
+        "CHAINLINK_DB",
     )
     missing = [name for name in required if not os.environ.get(name)]
     if missing:
@@ -50,18 +51,86 @@ def _environment() -> dict[str, str]:
         )
     if os.environ.get("EXOMONAD_FORGEJO_E2E_MOCK") == "1":
         raise AcceptanceError("#1057 cannot run with the Forgejo-shaped mock API")
-    try:
-        issue_id = int(os.environ["EXOMONAD_1057_CHAINLINK_ISSUE_ID"])
-    except ValueError as error:
-        raise AcceptanceError(
-            "EXOMONAD_1057_CHAINLINK_ISSUE_ID must be a positive integer"
-        ) from error
-    if issue_id <= 0 or issue_id == 1057:
-        raise AcceptanceError(
-            "EXOMONAD_1057_CHAINLINK_ISSUE_ID must identify a disposable fixture issue, "
-            "not #1057"
-        )
+    database = Path(os.environ["CHAINLINK_DB"]).expanduser().resolve()
+    if not database.is_file():
+        raise AcceptanceError(f"CHAINLINK_DB is not a file: {database}")
     return {name: os.environ[name] for name in required}
+
+
+def _issue_id(value: Any) -> int | None:
+    if isinstance(value, Mapping):
+        for key in ("id", "issue_id", "number"):
+            candidate = value.get(key)
+            if type(candidate) is int and candidate > 0:
+                return candidate
+        for child in value.values():
+            found = _issue_id(child)
+            if found is not None:
+                return found
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for child in value:
+            found = _issue_id(child)
+            if found is not None:
+                return found
+    return None
+
+
+def _chainlink_command(*arguments: str) -> Any:
+    result = real.run_command(
+        ["chainlink", *arguments],
+        cwd=PROJECT_ROOT,
+    )
+    try:
+        return json.loads(result)
+    except json.JSONDecodeError as error:
+        raise AcceptanceError(
+            f"Chainlink command returned non-JSON output: {result!r}"
+        ) from error
+
+
+def _create_fixture_issue(case_name: str) -> int:
+    value = _chainlink_command(
+        "create",
+        f"Verify recursive crash convergence {case_name}",
+        "--priority",
+        "low",
+        "--label",
+        "test",
+        "--json",
+        "--quiet",
+    )
+    issue_id = _issue_id(value)
+    if issue_id is None or issue_id == 1057:
+        raise AcceptanceError(f"Chainlink did not create a disposable issue: {value!r}")
+    return issue_id
+
+
+def _cleanup_fixture_issue(issue_id: int) -> None:
+    value = _chainlink_command("show", str(issue_id), "--json")
+    status = _status(value)
+    if status == "closed":
+        return
+    real.run_command(
+        ["chainlink", "close", str(issue_id), "--no-changelog", "--quiet"],
+        cwd=PROJECT_ROOT,
+    )
+
+
+def _status(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        status = value.get("status")
+        if isinstance(status, str):
+            return status.lower()
+        for child in value.values():
+            found = _status(child)
+            if found is not None:
+                return found
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for child in value:
+            found = _status(child)
+            if found is not None:
+                return found
+    return None
 
 
 def _identity_agents(work_plan: real.WorkPlan) -> dict[str, str]:
@@ -82,12 +151,45 @@ def _case_name(root: Path, boundary: CrashBoundary) -> str:
     return f"crash-{boundary.name}-{boundary.point}-{root.name[-8:]}"
 
 
+def _assert_nested_aggregate_pr(config: dict[str, str], forgejo_url: str) -> None:
+    """Prove production created the nested aggregate against its direct parent."""
+    pulls = real.json_request(
+        "GET",
+        f"{forgejo_url}/api/v1/repos/{config['EXOMONAD_FORGEJO_E2E_OWNER']}/"
+        f"{config['EXOMONAD_FORGEJO_E2E_REPO']}/pulls?state=all&limit=100",
+        token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
+    )
+    if not isinstance(pulls, list):
+        raise AcceptanceError(f"Forgejo pull listing is not an array: {pulls!r}")
+    matches = []
+    for pull in pulls:
+        if not isinstance(pull, Mapping):
+            continue
+        head = pull.get("head")
+        base = pull.get("base")
+        head_ref = head.get("ref") if isinstance(head, Mapping) else None
+        base_ref = base.get("ref") if isinstance(base, Mapping) else None
+        title = pull.get("title")
+        if (
+            head_ref == "main.sub-a.nested-a"
+            and base_ref == "main.sub-a"
+            and title == "Aggregate nested-a into main.sub-a"
+        ):
+            matches.append(pull)
+    if len(matches) != 1:
+        raise AcceptanceError(
+            "production did not create exactly one nested aggregate PR targeting "
+            f"main.sub-a: {matches!r}"
+        )
+
+
 def run_case(
     root: Path,
     repo: Path,
     forgejo_url: str,
     config: dict[str, str],
     boundary: CrashBoundary,
+    chainlink_issue_id: int,
 ) -> dict[str, Any]:
     work_plan = plan()
     case_name = _case_name(root, boundary)
@@ -96,11 +198,6 @@ def run_case(
             root,
             repo,
             work_plan,
-            forgejo_url=forgejo_url,
-            forgejo_owner=config["EXOMONAD_FORGEJO_E2E_OWNER"],
-            forgejo_repo=config["EXOMONAD_FORGEJO_E2E_REPO"],
-            forgejo_token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
-            forgejo_reviewer_token=config["EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"],
             case_name=case_name,
         )
     elif boundary.name == "spawn":
@@ -141,7 +238,7 @@ def run_case(
             boundary,
             marker,
             boundary.name == "review",
-            int(config["EXOMONAD_1057_CHAINLINK_ISSUE_ID"]),
+            chainlink_issue_id,
         ),
         name=case_name,
     )
@@ -157,7 +254,7 @@ def run_case(
         repo,
         ledger_run_id,
         resume_trace,
-        int(config["EXOMONAD_1057_CHAINLINK_ISSUE_ID"]),
+        chainlink_issue_id,
     )
     after_restart = root / "crash-traces" / f"{case_name}.after.json"
     shutil.copy2(checkpoint, after_restart)
@@ -165,10 +262,17 @@ def run_case(
     final_state = real.RunStore(run_id, state_root).load()
     if final_state.fsm.phase is not real.TLPhase.TLDone:
         raise AcceptanceError(f"{case_name} did not converge to TLDone")
+    if boundary.name in {"publication", "aggregate_publication"}:
+        _assert_nested_aggregate_pr(config, forgejo_url)
     identity = assert_crash_record(marker, boundary.name, boundary.point)
     counts = assert_recursive_effect_cardinality(state_root / run_id)
     assert_checkpoint_progression([before_restart, after_restart])
-    assert_remote_ancestry(after_document, workspace=repo)
+    assert_remote_ancestry(
+        after_document,
+        workspace=repo,
+        remote=config["EXOMONAD_FORGEJO_E2E_GIT_REMOTE"],
+        remote_branch="main",
+    )
     resumed_calls = assert_resume_not_redispatched(
         resume_trace, identity, boundary=boundary.name, point=boundary.point
     )
@@ -208,20 +312,28 @@ def run_matrix() -> dict[str, Any]:
             ) as raw:
                 root = Path(raw)
                 repo, _, _ = real.clone_external_fixture(root)
-                server, _ = real.start_server(
-                    root,
-                    repo,
-                    config["EXOMONAD_FORGEJO_E2E_URL"],
-                    PROJECT_ROOT,
-                    forgejo_token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
-                    forgejo_reviewer_token=config[
-                        "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"
-                    ],
-                    identity_agents=_identity_agents(plan()),
-                )
+                case_name = _case_name(root, boundary)
+                issue_id = _create_fixture_issue(case_name)
+                server = None
                 try:
+                    server, _ = real.start_server(
+                        root,
+                        repo,
+                        config["EXOMONAD_FORGEJO_E2E_URL"],
+                        PROJECT_ROOT,
+                        forgejo_token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
+                        forgejo_reviewer_token=config[
+                            "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"
+                        ],
+                        identity_agents=_identity_agents(plan()),
+                    )
                     result = run_case(
-                        root, repo, config["EXOMONAD_FORGEJO_E2E_URL"], config, boundary
+                        root,
+                        repo,
+                        config["EXOMONAD_FORGEJO_E2E_URL"],
+                        config,
+                        boundary,
+                        issue_id,
                     )
                     result["server_run"] = repetition
                     results.append(result)
@@ -231,16 +343,20 @@ def run_matrix() -> dict[str, Any]:
                         )
                 finally:
                     try:
-                        real.stop_server(server, repo, "#1057 real-server acceptance")
-                    finally:
+                        if server is not None:
+                            real.stop_server(
+                                server, repo, "#1057 real-server acceptance"
+                            )
                         real.cleanup_external_case(
                             repo,
                             config["EXOMONAD_FORGEJO_E2E_URL"],
                             config["EXOMONAD_FORGEJO_E2E_OWNER"],
                             config["EXOMONAD_FORGEJO_E2E_REPO"],
                             config["EXOMONAD_FORGEJO_E2E_TOKEN"],
-                            _case_name(root, boundary),
+                            case_name,
                         )
+                    finally:
+                        _cleanup_fixture_issue(issue_id)
     assert_required_effects(operation_totals)
     return {
         "passed": True,
