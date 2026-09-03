@@ -71,16 +71,17 @@ models are adapters over those authorities, not alternate state machines.
 | #1054 | Accepted — closed | Durable repository lanes, unknown-merge recovery, journal-less abandonment, and collision-free occurrence gates are recorded in its tracker notes. |
 | #1055 | Accepted — closed | Body-free hierarchical diagnostics and consistent top-level/scope guidance are recorded in its tracker notes. |
 | #1056 | Accepted — closed | Exhaustive recursive, slice, lane, integration, replay, and phase-valid migration coverage are recorded in its tracker notes. |
-| #1057 | Accepted — closed | The tracker records the final recursive crash-convergence task closed at 139e200c; its harness and acceptance evidence remain under tests/e2e/recursive-crash-convergence/. |
-| #975 | Superseded implementation — retain for review | Its event-driven merge objective is distributed across #1048–#1057. Preserve its original defect record and any independent acceptance work; no second merge architecture should be implemented under this issue. |
-| #984 | Superseded implementation — retain for review | Its merge-only real-server acceptance is covered by the broader #1057 recursive crash/convergence harness. Its historical timeout and direct-leaf findings remain in the issue comments and are not erased. |
-| #1039 | Satisfied by #1046 and #1057 — retain for review | Exact-head evidence, reviewer attribution, WASM preservation, final merge gates, and durable bookkeeping are covered by the revalidation path and final convergence task. |
-| #1046 | Satisfied by #1057 — retain for review | Durable review revalidation, superseding-review ordering, fail-closed freshness, merged adoption, and migration recovery are covered by the closed convergence task. |
+| #1057 | Operator-accepted — live acceptance outstanding | The tracker records the recursive crash-convergence task closed at 139e200c, but the required live Forgejo matrix and captured Beast continuation were unavailable. Its closure is not convergence evidence; the residual execution is tracked by #1059. |
+| #1059 | Open — residual acceptance | Run three isolated real-Forgejo recursive convergences and three captured Beast continuations, then attach exact merge, replay, ancestry, bookkeeping, and cleanup evidence before closing the affected acceptance records. |
+| #975 | Superseded implementation — retain for review | Its event-driven merge objective is distributed across #1048–#1057. Preserve its original defect history and independent acceptance work; the outstanding live convergence evidence is tracked by #1059. |
+| #984 | Implementation-satisfied — acceptance pending (#1059) | Its merge-only real-server guarantee is not proven by the unavailable #1057 environment. Historical timeout, direct-leaf, and real-server findings remain intact; #1059 owns the three-run evidence. |
+| #1039 | Implementation-satisfied — acceptance pending (#1059) | Exact-head evidence, reviewer attribution, WASM preservation, final merge gates, and durable bookkeeping are implemented, but the required live convergence is not proven. #1059 owns the remaining three-run/three-continuation evidence. |
+| #1046 | Implementation-satisfied — acceptance pending (#1059) | Durable review revalidation, superseding-review ordering, fail-closed freshness, merged adoption, and migration recovery are implemented, but the required live convergence is not proven. #1059 owns the remaining acceptance evidence. |
 | #1040 | Superseded by #1046/#1057 — retain for review | Shared reviewer-account authorization and snapshot recovery are part of the final review/revalidation and convergence contract; the original issue remains available as defect history. |
 | #1041 | Superseded by #1050/#1053 — retain for review | The single slice_transition reducer and live/replay routing are now part of the canonical implementation; the original issue remains available as defect history. |
 | #1043 | Superseded by #1046 — retain for review | Its proposed ordinary-event stale-verdict replay is intentionally replaced by the explicit RevalidateReview transition; its original design record is preserved. |
-| #1027 | Satisfied by #1039/#1057 — retain for review | Durable watcher author attribution and the authenticated reviewer path are included in the final exact-head acceptance chain; the original issue remains available as defect history. |
-| #1029 | Satisfied by #1039/#1057 — retain for review | Forgejo review deserialization compatibility is covered by the corrected transport and final acceptance path; the original issue remains available as defect history. |
+| #1027 | Implementation-satisfied — acceptance pending (#1059) | Durable watcher author attribution and the authenticated reviewer path are implemented; the final live acceptance chain remains unexecuted and is tracked by #1059. |
+| #1029 | Implementation-satisfied — acceptance pending (#1059) | Forgejo review deserialization compatibility is implemented; the final live acceptance chain remains unexecuted and is tracked by #1059. |
 | #1026 | Retain as independent | Its broader event-alphabet migration is not required to invent or alter the recursive contract; keep any remaining migration work scoped to that issue. |
 | #989 | Retain as independent | The earlier restart epic has additional historical acceptance dependencies outside the recursive contract; do not claim #1057 closes them wholesale. |
 | #1006 | Retain as independent | Its single-path review documentation and acceptance graph remain a separate backlog item unless its own dependencies are proven. |
@@ -90,6 +91,17 @@ The retain entries are deliberately not treated as blockers for the completed
 recursive implementation. They remain visible because their own acceptance
 criteria are not identical to #1057’s. Any future closure must cite its own
 run evidence.
+
+## Acceptance status correction
+
+The #1057 tracker closure is an operator acceptance of the committed harness
+and implementation, not proof that its external environments ran. The live
+Forgejo matrix and captured Beast checkpoint were unavailable at closure, so
+the implementation-satisfied entries above remain open for acceptance. #1059
+is the single narrow residual for that missing evidence: it requires three
+isolated real-Forgejo runs and three captured Beast continuations. No affected
+issue may be closed, or described as convergence-proven, until #1059 records
+those results or an explicit operator waiver is attached.
 
 ## Operator continuation contract
 
@@ -123,5 +135,6 @@ including just tl-loop-test, just tl-loop-lint, just proto-check, Ruff
 formatting, and git diff --check. The final recursive acceptance artifacts and
 machine-readable harness checks live under
 tests/e2e/recursive-crash-convergence/; unavailable external Forgejo or
-captured-workspace environments must be reported as unavailable rather than
-replaced by a mock claim.
+captured-workspace environments were reported as unavailable rather than
+replaced by a mock claim. Execution of those environments is the remaining
+acceptance work in #1059.
