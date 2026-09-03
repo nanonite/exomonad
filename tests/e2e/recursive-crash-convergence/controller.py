@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ def controller(
     boundary: CrashBoundary,
     trace_path: Path,
     advance_base: bool,
+    chainlink_issue_id: int,
 ) -> None:
     """Run one controller invocation until the injected process death."""
     transport = CrashBoundaryTransport(
@@ -29,6 +31,7 @@ def controller(
         trace_path,
         boundary,
         advance_base_after_watcher=advance_base,
+        crash_owner_pid=os.getpid(),
     )
     source = real.LazyLedgerSource(
         repo / ".exo" / "ledger" / "segments",
@@ -45,6 +48,7 @@ def controller(
             real.EffectClient(transport, role="tl", name="parent"),
             config=real.TLLoopConfig(
                 active=True,
+                enable_reviewer_spawn=True,
                 session_mode="continue",
                 keep_alive_on_waiting=True,
                 max_parallel_slices=2,
@@ -55,6 +59,7 @@ def controller(
                 working_dir=str(repo / ".exo/worktrees/parent"),
                 project_root=repo,
                 ledger_run_id=ledger_run_id,
+                chainlink_issue_id=chainlink_issue_id,
                 review_model_choice=real._recovery_review_choice(),
             ),
             root_dir=state_root,
@@ -89,6 +94,7 @@ def resume(
     repo: Path,
     ledger_run_id: str,
     trace_path: Path,
+    chainlink_issue_id: int,
 ) -> Any:
     """Resume from the persisted manifest, recording all resumed UDS calls."""
     source = real.LazyLedgerSource(
@@ -110,6 +116,7 @@ def resume(
             ),
             config=real.TLLoopConfig(
                 active=True,
+                enable_reviewer_spawn=True,
                 session_mode="continue",
                 keep_alive_on_waiting=False,
                 max_parallel_slices=2,
@@ -120,6 +127,7 @@ def resume(
                 working_dir=str(repo / ".exo/worktrees/parent"),
                 project_root=repo,
                 ledger_run_id=ledger_run_id,
+                chainlink_issue_id=chainlink_issue_id,
                 review_model_choice=real._recovery_review_choice(),
             ),
             root_dir=state_root,

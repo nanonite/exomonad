@@ -24,7 +24,9 @@ from evidence import (
     assert_checkpoint_progression,
     assert_crash_record,
     assert_effect_events,
-    assert_journal_terminal,
+    assert_recursive_effect_cardinality,
+    assert_remote_ancestry,
+    assert_required_effects,
     assert_resume_not_redispatched,
 )
 from fixture import plan, seed_aggregate_publication
@@ -34,9 +36,11 @@ def _environment() -> dict[str, str]:
     required = (
         "EXOMONAD_FORGEJO_E2E_URL",
         "EXOMONAD_FORGEJO_E2E_TOKEN",
+        "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN",
         "EXOMONAD_FORGEJO_E2E_OWNER",
         "EXOMONAD_FORGEJO_E2E_REPO",
         "EXOMONAD_FORGEJO_E2E_GIT_REMOTE",
+        "EXOMONAD_1057_CHAINLINK_ISSUE_ID",
     )
     missing = [name for name in required if not os.environ.get(name)]
     if missing:
@@ -46,7 +50,32 @@ def _environment() -> dict[str, str]:
         )
     if os.environ.get("EXOMONAD_FORGEJO_E2E_MOCK") == "1":
         raise AcceptanceError("#1057 cannot run with the Forgejo-shaped mock API")
+    try:
+        issue_id = int(os.environ["EXOMONAD_1057_CHAINLINK_ISSUE_ID"])
+    except ValueError as error:
+        raise AcceptanceError(
+            "EXOMONAD_1057_CHAINLINK_ISSUE_ID must be a positive integer"
+        ) from error
+    if issue_id <= 0 or issue_id == 1057:
+        raise AcceptanceError(
+            "EXOMONAD_1057_CHAINLINK_ISSUE_ID must identify a disposable fixture issue, "
+            "not #1057"
+        )
     return {name: os.environ[name] for name in required}
+
+
+def _identity_agents(work_plan: real.WorkPlan) -> dict[str, str]:
+    identities: dict[str, str] = {}
+    for task in work_plan.sub_tls:
+        identities[task.name] = f"main.{task.name}"
+        child_plan = (
+            task.plan
+            if isinstance(task.plan, real.WorkPlan)
+            else real.WorkPlan.from_mapping(task.plan)
+        )
+        for nested in child_plan.sub_tls:
+            identities[nested.name] = f"main.{task.name}.{nested.name}"
+    return identities
 
 
 def _case_name(root: Path, boundary: CrashBoundary) -> str:
@@ -63,7 +92,17 @@ def run_case(
     work_plan = plan()
     case_name = _case_name(root, boundary)
     if boundary.name in {"publication", "aggregate_publication"}:
-        run_id, work_plan = seed_aggregate_publication(root, repo, work_plan)
+        run_id, work_plan = seed_aggregate_publication(
+            root,
+            repo,
+            work_plan,
+            forgejo_url=forgejo_url,
+            forgejo_owner=config["EXOMONAD_FORGEJO_E2E_OWNER"],
+            forgejo_repo=config["EXOMONAD_FORGEJO_E2E_REPO"],
+            forgejo_token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
+            forgejo_reviewer_token=config["EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"],
+            case_name=case_name,
+        )
     elif boundary.name == "spawn":
         run_id, work_plan, _, _ = real.seed_dispatch_restart_run(root, repo, work_plan)
     else:
@@ -81,6 +120,7 @@ def run_case(
             forgejo_owner=config["EXOMONAD_FORGEJO_E2E_OWNER"],
             forgejo_repo=config["EXOMONAD_FORGEJO_E2E_REPO"],
             forgejo_token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
+            forgejo_reviewer_token=config["EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"],
             case_name=case_name,
             plan=work_plan,
             review_verdict=(
@@ -101,6 +141,7 @@ def run_case(
             boundary,
             marker,
             boundary.name == "review",
+            int(config["EXOMONAD_1057_CHAINLINK_ISSUE_ID"]),
         ),
         name=case_name,
     )
@@ -110,15 +151,24 @@ def run_case(
     before_restart = root / "crash-traces" / f"{case_name}.before.json"
     shutil.copy2(checkpoint, before_restart)
     resume_trace = root / "crash-traces" / f"{case_name}.resume.jsonl"
-    result = resume(run_id, state_root, repo, ledger_run_id, resume_trace)
+    result = resume(
+        run_id,
+        state_root,
+        repo,
+        ledger_run_id,
+        resume_trace,
+        int(config["EXOMONAD_1057_CHAINLINK_ISSUE_ID"]),
+    )
     after_restart = root / "crash-traces" / f"{case_name}.after.json"
     shutil.copy2(checkpoint, after_restart)
+    after_document = json.loads(checkpoint.read_text(encoding="utf-8"))
     final_state = real.RunStore(run_id, state_root).load()
     if final_state.fsm.phase is not real.TLPhase.TLDone:
         raise AcceptanceError(f"{case_name} did not converge to TLDone")
     identity = assert_crash_record(marker, boundary.name, boundary.point)
-    counts = assert_journal_terminal(state_root / run_id / "action-journal.json")
+    counts = assert_recursive_effect_cardinality(state_root / run_id)
     assert_checkpoint_progression([before_restart, after_restart])
+    assert_remote_ancestry(after_document, workspace=repo)
     resumed_calls = assert_resume_not_redispatched(
         resume_trace, identity, boundary=boundary.name, point=boundary.point
     )
@@ -150,6 +200,7 @@ def run_matrix() -> dict[str, Any]:
     validate_matrix()
     config = _environment()
     results: list[dict[str, Any]] = []
+    operation_totals: dict[str, int] = {}
     for repetition in range(1, _server_repetitions() + 1):
         for boundary in CRASH_BOUNDARIES:
             with tempfile.TemporaryDirectory(
@@ -163,9 +214,10 @@ def run_matrix() -> dict[str, Any]:
                     config["EXOMONAD_FORGEJO_E2E_URL"],
                     PROJECT_ROOT,
                     forgejo_token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
-                    forgejo_reviewer_token=os.environ.get(
+                    forgejo_reviewer_token=config[
                         "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"
-                    ),
+                    ],
+                    identity_agents=_identity_agents(plan()),
                 )
                 try:
                     result = run_case(
@@ -173,6 +225,10 @@ def run_matrix() -> dict[str, Any]:
                     )
                     result["server_run"] = repetition
                     results.append(result)
+                    for operation, count in result["journal_operations"].items():
+                        operation_totals[operation] = (
+                            operation_totals.get(operation, 0) + count
+                        )
                 finally:
                     try:
                         real.stop_server(server, repo, "#1057 real-server acceptance")
@@ -185,7 +241,12 @@ def run_matrix() -> dict[str, Any]:
                             config["EXOMONAD_FORGEJO_E2E_TOKEN"],
                             _case_name(root, boundary),
                         )
-    return {"passed": True, "server_runs": results}
+    assert_required_effects(operation_totals)
+    return {
+        "passed": True,
+        "server_runs": results,
+        "operation_totals": dict(sorted(operation_totals.items())),
+    }
 
 
 if __name__ == "__main__":

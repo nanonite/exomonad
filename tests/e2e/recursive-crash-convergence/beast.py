@@ -9,7 +9,14 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from evidence import AcceptanceError, assert_journal_terminal, event_payload, read_json
+from evidence import (
+    AcceptanceError,
+    assert_journal_terminal,
+    assert_recursive_effect_cardinality,
+    assert_remote_ancestry,
+    event_payload,
+    read_json,
+)
 
 
 def _required_environment() -> tuple[Path, str]:
@@ -74,6 +81,41 @@ def _entry_pr_number(entry: dict[str, Any]) -> int | None:
     return value if type(value) is int and value > 0 else None
 
 
+def _phase(document: dict[str, Any]) -> str:
+    fsm = document.get("fsm")
+    if not isinstance(fsm, dict):
+        raise AcceptanceError("Beast checkpoint lacks its discriminated FSM")
+    phase = fsm.get("phase", fsm.get("kind"))
+    if not isinstance(phase, str) or not phase:
+        raise AcceptanceError("Beast checkpoint lacks its FSM phase")
+    return phase
+
+
+def _is_terminal(phase: str) -> bool:
+    return phase in {"tl_done", "tl_pr_filed"}
+
+
+def _assert_bookkeeping(workspace: Path, phase: str) -> None:
+    counts = assert_recursive_effect_cardinality(_checkpoint(workspace).parent)
+    required = {
+        "merge_pr",
+        "post_merge_parent_sync",
+        "chainlink_issue_close",
+        "post_merge_changelog",
+        "post_merge_push",
+    }
+    if phase == "tl_done":
+        required.add("root_branch_finalize")
+    missing = sorted(
+        operation for operation in required if counts.get(operation, 0) < 1
+    )
+    if missing:
+        raise AcceptanceError(
+            "Beast bookkeeping is incomplete; expected one of each "
+            f"{missing!r}, got {counts!r}"
+        )
+
+
 def _ledger_merge_count(workspace: Path) -> int:
     target_pr = _target_pr_number()
     count = 0
@@ -109,10 +151,24 @@ def _assert_checkpoint(document: Any, label: str) -> tuple[int, int]:
 def run_three_continuations() -> dict[str, Any]:
     workspace, command = _required_environment()
     checkpoint = _checkpoint(workspace)
-    previous_version, previous_cursor = _assert_checkpoint(
-        read_json(checkpoint), "initial"
-    )
+    initial_document = read_json(checkpoint)
+    initial_phase = _phase(initial_document)
+    if _is_terminal(initial_phase):
+        raise AcceptanceError(
+            "captured Beast checkpoint is already terminal; no continuation convergence was tested"
+        )
+    previous_version, previous_cursor = _assert_checkpoint(initial_document, "initial")
+    previous_phase = initial_phase
     previous_merges = _ledger_merge_count(workspace)
+    if previous_merges:
+        raise AcceptanceError(
+            "captured Beast checkpoint already contains a merge reconciliation; "
+            "the three continuations must prove the merge"
+        )
+    if previous_merges > 1:
+        raise AcceptanceError(
+            f"captured Beast checkpoint already has duplicate merges: {previous_merges}"
+        )
     runs: list[dict[str, Any]] = []
     for attempt in range(1, 4):
         rendered = command.format(workspace=str(workspace), checkpoint=str(checkpoint))
@@ -130,15 +186,25 @@ def run_three_continuations() -> dict[str, Any]:
             )
         document = read_json(checkpoint)
         version, cursor = _assert_checkpoint(document, f"continuation {attempt}")
+        phase = _phase(document)
         if version < previous_version or cursor < previous_cursor:
             raise AcceptanceError(
                 f"Beast checkpoint regressed on continuation {attempt}: "
                 f"version {previous_version}->{version}, cursor {previous_cursor}->{cursor}"
             )
-        merge_count = _ledger_merge_count(workspace)
-        if merge_count - previous_merges > 1:
+        progressed = (
+            version > previous_version
+            or cursor > previous_cursor
+            or phase != previous_phase
+        )
+        if not _is_terminal(phase) and not progressed:
             raise AcceptanceError(
-                f"Beast continuation {attempt} created duplicate merges: "
+                f"Beast continuation {attempt} made no durable progress before terminal convergence"
+            )
+        merge_count = _ledger_merge_count(workspace)
+        if merge_count > 1 or merge_count < previous_merges:
+            raise AcceptanceError(
+                f"Beast continuation {attempt} violated merge cardinality: "
                 f"{previous_merges}->{merge_count}"
             )
         runs.append(
@@ -146,6 +212,7 @@ def run_three_continuations() -> dict[str, Any]:
                 "attempt": attempt,
                 "state_version": version,
                 "cursor": cursor,
+                "phase": phase,
                 "merge_reconciliations": merge_count,
             }
         )
@@ -154,9 +221,29 @@ def run_three_continuations() -> dict[str, Any]:
             cursor,
             merge_count,
         )
+        previous_phase = phase
     merge_entries = _merge_entries(workspace)
     if len(merge_entries) != 1:
         raise AcceptanceError(
             f"Beast checkpoint does not contain exactly one merge intent: {merge_entries!r}"
         )
-    return {"passed": True, "runs": runs, "merge_intents": len(merge_entries)}
+    final_document = read_json(checkpoint)
+    final_phase = _phase(final_document)
+    if not _is_terminal(final_phase):
+        raise AcceptanceError(
+            f"Beast checkpoint did not converge to a terminal FSM phase: {final_phase}"
+        )
+    final_merges = _ledger_merge_count(workspace)
+    if final_merges != 1:
+        raise AcceptanceError(
+            "Beast continuation did not authoritatively reconcile exactly one merge: "
+            f"{final_merges}"
+        )
+    _assert_bookkeeping(workspace, final_phase)
+    assert_remote_ancestry(final_document, workspace=workspace)
+    return {
+        "passed": True,
+        "runs": runs,
+        "merge_intents": len(merge_entries),
+        "final_phase": final_phase,
+    }

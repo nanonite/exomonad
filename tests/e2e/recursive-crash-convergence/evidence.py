@@ -3,10 +3,29 @@
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 from collections.abc import Mapping, Sequence
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
+
+REQUIRED_RECURSIVE_EFFECTS = frozenset(
+    {
+        "file_pr",
+        "resume_pr",
+        "merge_pr",
+        "chainlink_issue_close",
+        "post_merge_parent_sync",
+        "post_merge_remote_reconcile",
+        "post_merge_changelog",
+        "post_merge_push",
+        "root_branch_finalize",
+    }
+)
+REQUIRED_RECURSIVE_EFFECT_GROUPS = {
+    "spawn": frozenset({"spawn_leaf", "spawn_worker", "spawn_reviewer"}),
+}
 
 
 class AcceptanceError(RuntimeError):
@@ -101,6 +120,154 @@ def assert_journal_terminal(path: Path) -> dict[str, int]:
     return counts
 
 
+def assert_effect_cardinality(path: Path) -> dict[str, int]:
+    """Reject duplicate side effects within one target and generation."""
+    entries = journal(path)
+    seen: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        operation = entry.get("operation")
+        if not isinstance(operation, str):
+            continue
+        if operation not in {
+            "spawn_worker",
+            "spawn_leaf",
+            "spawn_reviewer",
+            "file_pr",
+            "resume_pr",
+            "merge_pr",
+            "chainlink_issue_close",
+            "post_merge_parent_sync",
+            "post_merge_remote_reconcile",
+            "post_merge_changelog",
+            "post_merge_push",
+            "root_branch_finalize",
+        }:
+            continue
+        arguments = entry.get("arguments")
+        arguments = arguments if isinstance(arguments, Mapping) else {}
+        target = entry.get("target")
+        scope = (
+            arguments.get("child_id")
+            or arguments.get("slice_id")
+            or target
+            or "controller"
+        )
+        generation = next(
+            (
+                arguments[key]
+                for key in (
+                    "generation",
+                    "dispatch_generation",
+                    "recovery_generation",
+                    "lane_epoch",
+                    "attempt",
+                )
+                if arguments.get(key) is not None
+            ),
+            0,
+        )
+        key = (operation, str(scope), str(generation))
+        if key in seen:
+            raise AcceptanceError(
+                "effect was dispatched more than once for one generation: "
+                f"{operation}/{scope}/{generation}"
+            )
+        seen.add(key)
+    return assert_journal_terminal(path)
+
+
+def assert_recursive_effect_cardinality(root: Path) -> dict[str, int]:
+    """Validate every scope journal, then return the recursive operation totals."""
+    paths = sorted(root.rglob("action-journal.json"))
+    if not paths:
+        raise AcceptanceError(f"recursive action journals are missing below {root}")
+    totals: dict[str, int] = {}
+    for path in paths:
+        for operation, count in assert_effect_cardinality(path).items():
+            totals[operation] = totals.get(operation, 0) + count
+    return totals
+
+
+def assert_required_effects(counts: Mapping[str, int]) -> None:
+    """Require the acceptance run to exercise every recursive effect family."""
+    missing = sorted(
+        operation
+        for operation in REQUIRED_RECURSIVE_EFFECTS
+        if counts.get(operation, 0) < 1
+    )
+    if missing:
+        raise AcceptanceError(
+            "recursive acceptance did not exercise required effects: "
+            f"{missing!r}; observed {dict(sorted(counts.items()))!r}"
+        )
+    missing_groups = sorted(
+        name
+        for name, operations in REQUIRED_RECURSIVE_EFFECT_GROUPS.items()
+        if not any(counts.get(operation, 0) > 0 for operation in operations)
+    )
+    if missing_groups:
+        raise AcceptanceError(
+            "recursive acceptance did not exercise required effect groups: "
+            f"{missing_groups!r}; observed {dict(sorted(counts.items()))!r}"
+        )
+
+
+_ANCESTRY_PROOF = re.compile(r"^ancestor:([0-9a-fA-F]{7,64})->([0-9a-fA-F]{7,64})$")
+
+
+def _values_for_keys(value: Any, keys: set[str]) -> list[str]:
+    values: list[str] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if key in keys and isinstance(child, str) and child:
+                values.append(child)
+            values.extend(_values_for_keys(child, keys))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for child in value:
+            values.extend(_values_for_keys(child, keys))
+    return values
+
+
+def assert_remote_ancestry(document: Any, *, workspace: Path | None = None) -> None:
+    """Require durable remote-head and Git-verifiable ancestry evidence."""
+    proofs = _values_for_keys(
+        document, {"ancestry_proof", "remote_ancestry_proof", "last_ancestry_proof"}
+    )
+    remote_heads = _values_for_keys(
+        document, {"remote_head_sha", "last_remote_head", "parent_commit_sha"}
+    )
+    if not proofs or not remote_heads:
+        raise AcceptanceError("final checkpoint lacks remote ancestry evidence")
+    pairs = [
+        match.groups() for proof in proofs if (match := _ANCESTRY_PROOF.match(proof))
+    ]
+    if not pairs:
+        raise AcceptanceError(
+            f"final checkpoint has no canonical ancestry proof: {proofs!r}"
+        )
+    if workspace is None:
+        return
+    for ancestor, descendant in pairs:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AcceptanceError(
+                f"remote ancestry proof failed Git verification: {ancestor}->{descendant}"
+            )
+
+
 def assert_checkpoint_progression(paths: Sequence[Path]) -> None:
     if not paths:
         raise AcceptanceError("no checkpoints were captured")
@@ -177,6 +344,19 @@ def assert_effect_events(repo: Path, expected_run_id: str) -> dict[str, int]:
         raise AcceptanceError(
             f"merge action was queued more than once: {action_keys!r}"
         )
+    for event_type, events in (
+        ("queued", queued),
+        ("decision", decisions),
+        ("reconciled", reconciled),
+    ):
+        identities = [
+            item.get("action_key") or item.get("merge_journal_id") for item in events
+        ]
+        identities = [identity for identity in identities if isinstance(identity, str)]
+        if len(identities) != len(set(identities)):
+            raise AcceptanceError(
+                f"duplicate merge {event_type} evidence: {identities!r}"
+            )
     if len(decisions) != len(queued) or len(reconciled) != len(queued):
         raise AcceptanceError(
             "merge effect cardinality did not converge: "

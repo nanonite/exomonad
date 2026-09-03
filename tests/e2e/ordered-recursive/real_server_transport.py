@@ -17,6 +17,7 @@ restart boundaries, and tmux cleanup in the same temporary server session.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -38,17 +39,17 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from tl_loop.client.effects import EffectClient, ToolResult  # noqa: E402
-from tl_loop.client.transport import (  # noqa: E402
+from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.transport import (
     JsonObject,
     TransportClient,
     TransportError,
 )
-from tl_loop.events.envelope import EventEnvelope, EventKind, project  # noqa: E402
-from tl_loop.events.queue import LedgerQueue  # noqa: E402
-from tl_loop.events.reader import LedgerReader  # noqa: E402
-from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting, TLDone  # noqa: E402
-from tl_loop.loop.driver import (  # noqa: E402
+from tl_loop.events.envelope import EventEnvelope, EventKind, project
+from tl_loop.events.queue import LedgerQueue
+from tl_loop.events.reader import LedgerReader
+from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
+from tl_loop.loop.driver import (
     LeafTask,
     SubTLTask,
     TLLoopConfig,
@@ -56,12 +57,12 @@ from tl_loop.loop.driver import (  # noqa: E402
     _initial_slices,
     _manifest_for_plan,
     _supervise_live_sub_tl,
-    run_tl_loop,  # noqa: E402
+    run_tl_loop,
 )
-from tl_loop.loop.heartbeat import HeartbeatConfig  # noqa: E402
-from tl_loop.ordered import IntegrationLifecycle  # noqa: E402
-from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse  # noqa: E402
-from tl_loop.state.schema import (  # noqa: E402
+from tl_loop.loop.heartbeat import HeartbeatConfig
+from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse
+from tl_loop.state.schema import (
     BudgetLedger,
     HandoffEvidence,
     IntegrationCandidateState,
@@ -70,9 +71,9 @@ from tl_loop.state.schema import (  # noqa: E402
     PublicationBinding,
     SliceState,
     SliceStatus,
-    Verdict,  # noqa: E402
+    Verdict,
 )
-from tl_loop.state.store import CorruptCheckpoint, RunStore, create  # noqa: E402
+from tl_loop.state.store import CorruptCheckpoint, RunStore, create
 
 
 class HarnessError(RuntimeError):
@@ -556,6 +557,52 @@ def git(repo: Path, *args: str) -> str:
     return run_command(["git", "-C", str(repo), *args])
 
 
+def create_branch_with_commit(
+    repo: Path,
+    branch: str,
+    base: str,
+    *,
+    relative_path: str,
+    content: str,
+    message: str,
+) -> str:
+    """Create and publish a non-empty fixture branch from an exact base."""
+    git(repo, "branch", branch, base)
+    worktree = (
+        repo.parent
+        / f".e2e-1057-commit-{hashlib.sha256(branch.encode()).hexdigest()[:12]}"
+    )
+    run_command(
+        ["git", "-C", str(repo), "worktree", "add", "-q", str(worktree), branch]
+    )
+    try:
+        path = worktree / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        git(worktree, "add", relative_path)
+        git(worktree, "commit", "-q", "-m", message)
+        git(worktree, "push", "-q", "origin", branch)
+        return git(worktree, "rev-parse", "HEAD")
+    finally:
+        run_command(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)]
+        )
+
+
+def commit_fixture_worktree(
+    worktree: Path, *, relative_path: str, content: str, message: str
+) -> str:
+    """Add one deterministic fixture commit to an already-owned child branch."""
+    path = worktree / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    git(worktree, "add", relative_path)
+    git(worktree, "commit", "-q", "-m", message)
+    branch = git(worktree, "branch", "--show-current")
+    git(worktree, "push", "-q", "origin", branch)
+    return git(worktree, "rev-parse", "HEAD")
+
+
 def advance_remote_base(repo: Path, sequence: int) -> None:
     """Publish one new main commit while a candidate is being revalidated."""
     worktree = repo.parent / f".base-revalidation-{sequence}"
@@ -753,6 +800,7 @@ def start_server(
     *,
     forgejo_token: str = "test-token",
     forgejo_reviewer_token: str | None = None,
+    identity_agents: Mapping[str, str] | None = None,
 ) -> tuple[subprocess.Popen[str], TransportClient]:
     wasm = project_root / ".exo/wasm/wasm-guest-devswarm.wasm"
     binary = Path(
@@ -763,16 +811,20 @@ def start_server(
             "build target/debug/exomonad and .exo/wasm/wasm-guest-devswarm.wasm first"
         )
     (repo / ".exo/wasm").mkdir(parents=True, exist_ok=True)
-    for child_name in (
-        "sub-a",
-        "sub-b",
-        "sub-c",
-        "recursive-root",
-        "nested",
-        "nested-a",
-    ):
+    default_branches = {
+        "sub-a": "main.sub-a",
+        "sub-b": "main.sub-b",
+        "sub-c": "main.sub-c",
+        "recursive-root": "main.recursive-root",
+        "nested": "main.nested",
+    }
+    default_branches.update(identity_agents or {})
+    for child_name, branch_name in default_branches.items():
         agent_dir = repo / ".exo/agents" / child_name
         agent_dir.parent.mkdir(parents=True, exist_ok=True)
+        parent_branch = (
+            branch_name.rsplit(".", 1)[0] if branch_name.count(".") >= 2 else "main"
+        )
         run_command(
             [
                 "git",
@@ -782,12 +834,12 @@ def start_server(
                 "add",
                 "-q",
                 "-b",
-                f"main.{child_name}",
+                branch_name,
                 str(agent_dir),
-                "main",
+                parent_branch,
             ]
         )
-        (agent_dir / ".birth_branch").write_text("main\n", encoding="utf-8")
+        (agent_dir / ".birth_branch").write_text(f"{branch_name}\n", encoding="utf-8")
     parent_worktree = repo / ".exo/worktrees/parent"
     parent_worktree.parent.mkdir(parents=True, exist_ok=True)
     run_command(
@@ -807,6 +859,42 @@ def start_server(
     parent_agent_dir = repo / ".exo/agents/parent"
     parent_agent_dir.mkdir(parents=True, exist_ok=True)
     (parent_agent_dir / ".birth_branch").write_text("main.parent\n", encoding="utf-8")
+    for agent_id, branch in (identity_agents or {}).items():
+        agent_dir = repo / ".exo" / "agents" / agent_id
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        worktree = repo / ".exo" / "agents" / agent_id
+        identity = {
+            "agent_name": agent_id,
+            "slug": agent_id,
+            "agent_type": "codex",
+            "birth_branch": branch,
+            "parent_branch": branch.rsplit(".", 1)[0] if "." in branch else "main",
+            "working_dir": str(worktree),
+            "display_name": f"🤖 {agent_id}",
+            "topology": "worktree_per_agent",
+            "ledger_owned": True,
+            "slice_id": agent_id,
+        }
+        (agent_dir / "identity.json").write_text(
+            json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        invocation = {
+            "invocation_id": f"1057-seeded-{agent_id}",
+            "runtime": "codex",
+            "trigger": "spawn",
+            "mode": "interactive",
+            "routing": {"parent_tab": "TL"},
+            "started_at": int(time.time()),
+            "status": "running",
+            "generation": 1,
+            "runtime_agent_id": agent_id,
+            "slice_id": agent_id,
+            "branch": branch,
+            "worktree": str(worktree),
+        }
+        (agent_dir / "invocation.json").write_text(
+            json.dumps(invocation, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     shutil.copy2(wasm, repo / ".exo/wasm/wasm-guest-devswarm.wasm")
     port = free_port()
     session = f"ordered-server-e2e-{os.getpid()}-{root.name[-8:]}"
@@ -941,6 +1029,30 @@ def cleanup_external_case(
                 raise HarnessError(
                     f"could not delete acceptance branch {head_ref!r}: {result.stderr}"
                 )
+    parent_marker = repo / ".exo" / f"1057-parent-branches-{case_name}.json"
+    try:
+        parent_branches = json.loads(parent_marker.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        parent_branches = []
+    if isinstance(parent_branches, list):
+        for branch in parent_branches:
+            if not isinstance(branch, str) or not branch:
+                continue
+            result = subprocess.run(
+                ["git", "push", "origin", "--delete", branch],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode and "remote ref does not exist" not in result.stderr:
+                raise HarnessError(
+                    f"could not delete acceptance parent branch {branch!r}: {result.stderr}"
+                )
+    try:
+        parent_marker.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def server_ledger_events(repo: Path) -> list[dict[str, Any]]:
@@ -2001,6 +2113,7 @@ def seed_delayed_restart_run(
     forgejo_owner: str = "owner",
     forgejo_repo: str = "repo",
     forgejo_token: str | None = None,
+    forgejo_reviewer_token: str | None = None,
     case_name: str | None = None,
     plan: WorkPlan | None = None,
     review_verdict: str = "approved",
@@ -2062,8 +2175,14 @@ def seed_delayed_restart_run(
     review_ids: dict[str, int] = {}
     for name in (task.name for task in direct_sub_tls):
         branch = f"aggregate/{case_slug}/{name}"
-        git(repo, "branch", branch, "main")
-        git(repo, "push", "-q", "origin", branch)
+        create_branch_with_commit(
+            repo,
+            branch,
+            "main",
+            relative_path=f"e2e-fixtures/{case_slug}/{name}.txt",
+            content=f"{name} aggregate source\n",
+            message=f"Prepare delayed {name} aggregate source",
+        )
         filed = json_request(
             "POST",
             f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls",
@@ -2097,7 +2216,7 @@ def seed_delayed_restart_run(
                 if review_verdict != "approved"
                 else "",
             },
-            token=forgejo_token,
+            token=forgejo_reviewer_token or forgejo_token,
         )
         review_id = review.get("id") if isinstance(review, Mapping) else None
         if type(review_id) is not int or review_id <= 0:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -25,11 +26,13 @@ class CrashBoundaryTransport(TransportClient):
         boundary: CrashBoundary,
         *,
         advance_base_after_watcher: bool = False,
+        crash_owner_pid: int | None = None,
     ) -> None:
         super().__init__(project_root=project_root, timeout=10)
         self.trace_path = trace_path
         self.boundary = boundary
         self.advance_base_after_watcher = advance_base_after_watcher
+        self.crash_owner_pid = crash_owner_pid
         self._watcher_calls = 0
         self._base_advanced = False
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,7 +57,7 @@ class CrashBoundaryTransport(TransportClient):
                 }
             )
             if self.boundary.point == "before":
-                os._exit(CRASH_EXIT_CODE)
+                self._terminate_for_boundary()
         response = super().call_tool(role, name, tool_name, arguments)
         if (
             self.advance_base_after_watcher
@@ -77,15 +80,24 @@ class CrashBoundaryTransport(TransportClient):
                 }
             )
             if self.boundary.point == "after":
-                os._exit(CRASH_EXIT_CODE)
+                self._terminate_for_boundary()
         return response
+
+    def _terminate_for_boundary(self) -> None:
+        """Kill the controller even when a tool is executing in a child."""
+        if self.crash_owner_pid is not None and self.crash_owner_pid != os.getpid():
+            try:
+                os.kill(self.crash_owner_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        os._exit(CRASH_EXIT_CODE)
 
     def _matches(self, tool_name: str, arguments: JsonObject) -> bool:
         if self.boundary.name == "spawn":
-            return (
-                tool_name == "emit_controller_event"
-                and arguments.get("event_type") == "tl.dispatch_confirmed"
-            )
+            # A dispatch-confirmed ledger event is only bookkeeping.  The
+            # selected boundary must be the actual child-process creation
+            # effect, after the child checkpoint and scheduler handoff.
+            return tool_name in {"spawn_leaf", "spawn_worker"}
         if self.boundary.name == "publication":
             return tool_name == "file_pr" and not str(
                 arguments.get("title", "")
