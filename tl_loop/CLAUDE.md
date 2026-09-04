@@ -122,6 +122,31 @@ remote heads, ancestry proofs, or push receipts. Parent pushes use
 pending when that compare fails, so restart can reconcile the exact durable
 intent without redispatching an already confirmed effect.
 
+## Repository identity resolution
+
+`RunState.repository_identity` (owner, repo, base branch, forge host,
+sanitized remote URL) is static run configuration -- identical for every
+slice, never changing during a run -- resolved through the `repository_identity`
+effect (`agent.repository_identity`), never through the watcher: the watcher
+relays live per-PR observations, and identity is neither live nor per-PR.
+
+A caller-supplied `TLLoopConfig.repository_identity` is persisted once at
+continuation and any mismatch against an already-persisted value raises
+(`"continuation repository identity differs from the checkpoint"`) -- this
+path is unchanged by #1062. A checkpoint that predates this field (or was
+never supplied one) is healed lazily: `_reconcile_merged_slice` catches the
+exact `_repository_identity` fail-closed error the first time a merge
+adoption actually needs it, resolves the effect once, persists it, and
+retries the same adoption within the same call. Resolution is *not*
+attempted proactively on every continuation -- a run whose slices never reach
+merge adoption (e.g. a crash-restart mid-dispatch) must never pay for or gate
+on an effect it doesn't need, and unconditional resolution at startup
+regressed exactly that invariant during development. Failure to resolve
+opens the named `tl-repository-identity` gate rather than raising or
+guessing an owner/repo; the blocked slice recovers through this same
+lazy path on a later call once the effect succeeds, with no second post-merge
+entry point.
+
 ## Direct-leaf/worker scope draining
 
 `WorkPlan.sub_tls` empty is the direct-leaf/worker scope shape. It has no

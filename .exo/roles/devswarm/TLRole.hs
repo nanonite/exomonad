@@ -88,6 +88,7 @@ import ExoMonad.Guest.Tools.Spawn
     spawnWorkerToolSchema,
   )
 import ExoMonad.Guest.Tools.SpawnCodex (handleSpawnCodex, spawnCodexDescription, spawnCodexSchema)
+import ExoMonad.Guest.Tools.RepositoryIdentity (RepositoryIdentity (..))
 import ExoMonad.Guest.Tools.SpawnReviewer (SpawnReviewer (..))
 import ExoMonad.Guest.Tools.WatcherPrState (WatcherPrState (..))
 import ExoMonad.Guest.Types (AfterModelOutput (..), BeforeModelOutput (..), allowResponse, allowStopResponse)
@@ -283,6 +284,7 @@ data Tools mode = Tools
     resumeBlockedLeaf :: mode :- ResumeBlockedLeaf,
     resolveLivePrForSlice :: mode :- ResolveLivePrForSlice,
     watcherPrState :: mode :- WatcherPrState,
+    repositoryIdentity :: mode :- RepositoryIdentity,
     postMergeParentSync :: mode :- PostMergeParentSync,
     postMergeRemoteReconcile :: mode :- PostMergeRemoteReconcile,
     postMergeChangelog :: mode :- PostMergeChangelog,
@@ -347,6 +349,7 @@ config =
             resumeBlockedLeaf = mkHandler @ResumeBlockedLeaf,
             resolveLivePrForSlice = mkHandler @ResolveLivePrForSlice,
             watcherPrState = mkHandler @WatcherPrState,
+            repositoryIdentity = mkHandler @RepositoryIdentity,
             postMergeParentSync = mkHandler @PostMergeParentSync,
             postMergeRemoteReconcile = mkHandler @PostMergeRemoteReconcile,
             postMergeChangelog = mkHandler @PostMergeChangelog,

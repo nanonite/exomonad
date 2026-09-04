@@ -116,6 +116,7 @@ TOOL_METHODS: tuple[str, ...] = (
     "resume_pr",
     "resolve_live_pr_for_slice",
     "watcher_pr_state",
+    "repository_identity",
     "post_merge_parent_sync",
     "post_merge_remote_reconcile",
     "post_merge_changelog",
@@ -296,6 +297,9 @@ class EffectClient:
 
     def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
         return self._call("watcher_pr_state", {"pr_number": pr_number})
+
+    def repository_identity(self) -> ToolResult:
+        return self._call("repository_identity", {})
 
     def resolve_live_pr_for_slice(self, *, slice_id: str) -> ToolResult:
         return self._call("resolve_live_pr_for_slice", {"slice_id": slice_id})

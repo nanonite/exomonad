@@ -340,6 +340,14 @@
       "name": "watcher_pr_state"
     },
     {
+      "description": "Resolve the run's repository identity (owner, repo, base branch, forge host) from the pinned git remote. Read-only, no arguments, one call per continuation. Fails closed when the remote is missing, ambiguous, or unparseable. This is static run configuration, not a per-PR observation -- it is never sourced from watcher_pr_state.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "repository_identity"
+    },
+    {
       "description": "Synchronize a merged child into its parent branch and return Git-verified remote-head and ancestry evidence.",
       "inputSchema": {
         "properties": {

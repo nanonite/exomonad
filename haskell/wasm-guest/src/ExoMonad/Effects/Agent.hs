@@ -16,6 +16,7 @@ module ExoMonad.Effects.Agent
     AgentRestartReview,
     AgentResolveLivePrForSlice,
     AgentWatcherPrState,
+    AgentRepositoryIdentity,
     AgentSpawnLeafSubtree,
     AgentCleanup,
     AgentDisposeOrphan,
@@ -96,6 +97,13 @@ instance Effect AgentWatcherPrState where
   type Input AgentWatcherPrState = WatcherPrStateRequest
   type Output AgentWatcherPrState = WatcherPrStateResponse
   effectId = "agent.watcher_pr_state"
+
+data AgentRepositoryIdentity
+
+instance Effect AgentRepositoryIdentity where
+  type Input AgentRepositoryIdentity = RepositoryIdentityRequest
+  type Output AgentRepositoryIdentity = RepositoryIdentityResponse
+  effectId = "agent.repository_identity"
 
 data AgentResolveLivePrForSlice
 

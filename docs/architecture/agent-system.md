@@ -125,7 +125,13 @@ raw ledger payloads. `NEEDS_BASE_REVALIDATION` refreshes base-bound evidence;
 | `cleanup_leaf` | x | x | | | |
 | `cleanup` | x | x | | | |
 | `watcher_pr_state` | x | x | | | |
+| `repository_identity` | x | x | | | |
 | `resolve_live_pr_for_slice` | | x | | | |
+| `post_merge_parent_sync` | x | x | | | |
+| `post_merge_remote_reconcile` | x | x | | | |
+| `post_merge_changelog` | x | x | | | |
+| `post_merge_push` | x | x | | | |
+| `root_branch_finalize` | x | x | | | |
 | `file_pr` | | x | x | | |
 | `merge_pr` | x | x | | | |
 | `notify_parent` | | x | x | | x |

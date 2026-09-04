@@ -73,6 +73,7 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.CloseReviewerWindow
         ExoMonad.Guest.Tools.RestartReview
         ExoMonad.Guest.Tools.WatcherPrState
+        ExoMonad.Guest.Tools.RepositoryIdentity
         ExoMonad.Guest.Tools.ResolveLivePrForSlice
         ExoMonad.Guest.Tools.SessionStatus
         ExoMonad.Guest.Tools.PollWorkers
@@ -167,6 +168,7 @@ test-suite wasm-guest-tests
         ExoMonad.Guest.Tools.PostMergeRecoveryTest
         ExoMonad.Guest.Tools.RootBranchFinalizeTest
         ExoMonad.Guest.Tools.WatcherPrStateTest
+        ExoMonad.Guest.Tools.RepositoryIdentityTest
     build-depends:
         wasm-guest:wasm-guest-internal,
         tasty,

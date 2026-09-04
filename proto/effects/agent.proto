@@ -451,6 +451,27 @@ message WatcherPrStateResponse {
 }
 
 // ============================================================================
+// RepositoryIdentity - Resolve static run configuration from the pinned
+// git remote (owner, repo, default branch, forge host). Not a per-PR
+// observation: called once per continuation, never through the watcher.
+// ============================================================================
+
+message RepositoryIdentityRequest {}
+
+message RepositoryIdentityResponse {
+  bool success = 1;
+  string error = 2;
+  string owner = 3;
+  string repo = 4;
+  string base_branch = 5;
+  string forge_host = 6;
+  // Sanitized: any embedded credentials (userinfo) are stripped before this
+  // ever leaves the Rust handler.
+  string remote_url = 7;
+  string remote_name = 8;
+}
+
+// ============================================================================
 // SpawnLeafSubtree - Spawn a leaf agent in a new git worktree
 // ============================================================================
 
@@ -639,6 +660,7 @@ service AgentEffects {
   rpc RestartReview(RestartReviewRequest) returns (RestartReviewResponse);
   rpc ResolveLivePrForSlice(ResolveLivePrForSliceRequest) returns (ResolveLivePrForSliceResponse);
   rpc WatcherPrState(WatcherPrStateRequest) returns (WatcherPrStateResponse);
+  rpc RepositoryIdentity(RepositoryIdentityRequest) returns (RepositoryIdentityResponse);
   rpc SpawnLeafSubtree(SpawnLeafSubtreeRequest) returns (SpawnLeafSubtreeResponse);
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);
   rpc DisposeOrphan(DisposeOrphanRequest) returns (DisposeOrphanResponse);

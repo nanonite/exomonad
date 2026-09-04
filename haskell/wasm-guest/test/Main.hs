@@ -5,6 +5,7 @@ import ExoMonad.Guest.Tools.EventsTest (eventsTests)
 import ExoMonad.Guest.Tools.MergePRTest (mergePrTests)
 import ExoMonad.Guest.Tools.PollWorkersTest (pollWorkersTests)
 import ExoMonad.Guest.Tools.PostMergeRecoveryTest (postMergeRecoveryTests)
+import ExoMonad.Guest.Tools.RepositoryIdentityTest (repositoryIdentityTests)
 import ExoMonad.Guest.Tools.ResumeBlockedLeafTest (resumeBlockedLeafTests)
 import ExoMonad.Guest.Tools.ResumePrTest (resumePrTests)
 import ExoMonad.Guest.Tools.RootBranchFinalizeTest (rootBranchFinalizeTests)
@@ -12,4 +13,4 @@ import ExoMonad.Guest.Tools.WatcherPrStateTest (watcherPrStateTests)
 import Test.Tasty (defaultMain, testGroup)
 
 main :: IO ()
-main = defaultMain $ testGroup "WASM guest" [pureTests, eventsTests, mergePrTests, resumePrTests, resumeBlockedLeafTests, pollWorkersTests, watcherPrStateTests, postMergeRecoveryTests, rootBranchFinalizeTests]
+main = defaultMain $ testGroup "WASM guest" [pureTests, eventsTests, mergePrTests, resumePrTests, resumeBlockedLeafTests, pollWorkersTests, watcherPrStateTests, repositoryIdentityTests, postMergeRecoveryTests, rootBranchFinalizeTests]

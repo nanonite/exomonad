@@ -6397,6 +6397,298 @@ instance (HsJSONPB.ToJSON WatcherPrStateResponse) where
 instance (HsJSONPB.FromJSON WatcherPrStateResponse) where
   parseJSON = HsJSONPB.parseJSONPB
 
+data RepositoryIdentityRequest
+  = RepositoryIdentityRequest {}
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData RepositoryIdentityRequest)
+
+instance (HsProtobuf.Named RepositoryIdentityRequest) where
+  nameOf _ = Hs.fromString "RepositoryIdentityRequest"
+
+instance (HsProtobuf.HasDefault RepositoryIdentityRequest)
+
+instance (HsProtobuf.Message RepositoryIdentityRequest) where
+  encodeMessage _ RepositoryIdentityRequest {} = Hs.mempty
+  decodeMessage _ = Hs.pure RepositoryIdentityRequest
+  dotProto _ = []
+
+instance (HsJSONPB.ToJSONPB RepositoryIdentityRequest) where
+  toJSONPB RepositoryIdentityRequest = HsJSONPB.object []
+  toEncodingPB RepositoryIdentityRequest = HsJSONPB.pairs []
+
+instance (HsJSONPB.FromJSONPB RepositoryIdentityRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "RepositoryIdentityRequest"
+      (\obj -> Hs.pure RepositoryIdentityRequest)
+
+instance (HsJSONPB.ToJSON RepositoryIdentityRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON RepositoryIdentityRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data RepositoryIdentityResponse
+  = RepositoryIdentityResponse
+  { repositoryIdentityResponseSuccess :: Hs.Bool,
+    repositoryIdentityResponseError :: Hs.Text,
+    repositoryIdentityResponseOwner :: Hs.Text,
+    repositoryIdentityResponseRepo :: Hs.Text,
+    repositoryIdentityResponseBaseBranch :: Hs.Text,
+    repositoryIdentityResponseForgeHost :: Hs.Text,
+    repositoryIdentityResponseRemoteUrl :: Hs.Text,
+    repositoryIdentityResponseRemoteName :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData RepositoryIdentityResponse)
+
+instance (HsProtobuf.Named RepositoryIdentityResponse) where
+  nameOf _ = Hs.fromString "RepositoryIdentityResponse"
+
+instance (HsProtobuf.HasDefault RepositoryIdentityResponse)
+
+instance (HsProtobuf.Message RepositoryIdentityResponse) where
+  encodeMessage
+    _
+    RepositoryIdentityResponse
+      { repositoryIdentityResponseSuccess,
+        repositoryIdentityResponseError,
+        repositoryIdentityResponseOwner,
+        repositoryIdentityResponseRepo,
+        repositoryIdentityResponseBaseBranch,
+        repositoryIdentityResponseForgeHost,
+        repositoryIdentityResponseRemoteUrl,
+        repositoryIdentityResponseRemoteName
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 1)
+                                    repositoryIdentityResponseSuccess
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 2)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        repositoryIdentityResponseError
+                                    )
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 3)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    repositoryIdentityResponseOwner
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 4)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                repositoryIdentityResponseRepo
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 5)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            repositoryIdentityResponseBaseBranch
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 6)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        repositoryIdentityResponseForgeHost
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 7)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    repositoryIdentityResponseRemoteUrl
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 8)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                repositoryIdentityResponseRemoteName
+            )
+        )
+  decodeMessage _ =
+    Hs.pure RepositoryIdentityResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 6)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "owner")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "repo")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "base_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "forge_host")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "remote_url")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "remote_name")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB RepositoryIdentityResponse) where
+  toJSONPB (RepositoryIdentityResponse f1 f2 f3 f4 f5 f6 f7 f8) =
+    HsJSONPB.object
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "owner" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "repo" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "base_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "forge_host"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "remote_url"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "remote_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+      ]
+  toEncodingPB (RepositoryIdentityResponse f1 f2 f3 f4 f5 f6 f7 f8) =
+    HsJSONPB.pairs
+      [ "success" .= f1,
+        "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "owner" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "repo" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "base_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "forge_host"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "remote_url"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "remote_name"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+      ]
+
+instance (HsJSONPB.FromJSONPB RepositoryIdentityResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "RepositoryIdentityResponse"
+      ( \obj ->
+          Hs.pure RepositoryIdentityResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "owner")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "repo")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "base_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "forge_host")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "remote_url")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "remote_name")
+                )
+      )
+
+instance (HsJSONPB.ToJSON RepositoryIdentityResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON RepositoryIdentityResponse) where
+  parseJSON = HsJSONPB.parseJSONPB
+
 data SpawnLeafSubtreeRequest
   = SpawnLeafSubtreeRequest
   { spawnLeafSubtreeRequestTask :: Hs.Text,

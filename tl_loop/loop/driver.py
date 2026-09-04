@@ -248,6 +248,7 @@ DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
+REPOSITORY_IDENTITY_GATE_NAME = "tl-repository-identity"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 MAX_CONVERGENCE_STEPS = 8
 # A per-call fairness cap on _drain_direct_scope_convergence, not a
@@ -2844,12 +2845,41 @@ def _reconcile_merged_slice(
                 merge_evidence,
             )
         except ValueError as error:
-            return _block_post_merge_recovery(
-                store,
-                state,
-                slice_id,
-                f"cannot adopt merged PR #{pr_number}: {error}",
-            )
+            if state.repository_identity is None and "repository identity is unavailable" in str(
+                error
+            ):
+                # Lazily heal exactly the #1062 gap: identity is resolved the
+                # first time a merge adoption actually needs it and finds it
+                # missing, not proactively on every continuation (which would
+                # fire even for runs that never touch a merged PR). Retried
+                # once, immediately, so the adoption below still completes
+                # within this same call when the effect succeeds.
+                state = _heal_missing_repository_identity(state, config, effects, effects_log, store)
+                if state.repository_identity is None:
+                    return state
+                try:
+                    current = _adopt_post_merge_slice(
+                        current,
+                        state,
+                        pr_number,
+                        merge_journal_id,
+                        boundary,
+                        merge_evidence,
+                    )
+                except ValueError as retry_error:
+                    return _block_post_merge_recovery(
+                        store,
+                        state,
+                        slice_id,
+                        f"cannot adopt merged PR #{pr_number}: {retry_error}",
+                    )
+            else:
+                return _block_post_merge_recovery(
+                    store,
+                    state,
+                    slice_id,
+                    f"cannot adopt merged PR #{pr_number}: {error}",
+                )
         checkpoint_needed = True
     try:
         integration = _resolve_recovered_lane_integration(state, current, merge_evidence)
@@ -2880,6 +2910,28 @@ def _reconcile_merged_slice(
         effects_log,
         store,
     )
+
+
+def _heal_missing_repository_identity(
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    """Resolve repository identity the first time a merge adoption needs it.
+
+    Repository identity is static run configuration -- identical for every
+    slice, never changing during a run -- so it is resolved once and cached
+    on the checkpoint. Persists it on success. On failure, opens the named
+    REPOSITORY_IDENTITY_GATE_NAME gate rather than raising or guessing an
+    owner/repo (#1062); the caller re-checks state.repository_identity to
+    decide whether to retry the adoption that triggered this healing.
+    """
+    resolved = _resolve_repository_identity(config, effects, effects_log)
+    if resolved is None:
+        return store.set_gate(REPOSITORY_IDENTITY_GATE_NAME)
+    return store.set_repository_identity(resolved)
 
 
 def _adopt_post_merge_slice(
@@ -8675,6 +8727,62 @@ def _checkpoint_integration_retry(
         ordered_stages=state.ordered_stages,
         integration=replace(persisted, sub_tl_states=sub_states),
     )
+
+
+def _resolve_repository_identity(
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RepositoryIdentity | None:
+    """Resolve repository identity once from the pinned git remote.
+
+    A single read-only effect call through the same EffectJournal executor as
+    every other effect -- never the watcher, since identity is static run
+    configuration (owner, repo, base branch), not a per-PR observation.
+    Returns None on any failure so the caller opens a durable gate instead of
+    raising or guessing an identity (#1062).
+    """
+    result = _invoke(
+        "repository_identity",
+        "repository_identity",
+        {},
+        config.active,
+        cast(EffectClient, effects),
+        lambda client: client.repository_identity(),
+        effects_log,
+        raise_on_failure=False,
+    )
+    if result is None or result.success is not True or not isinstance(result.result, Mapping):
+        return None
+    payload = result.result
+    owner = payload.get("owner")
+    repo = payload.get("repo")
+    base_branch = payload.get("base_branch")
+    if not isinstance(owner, str) or not owner:
+        return None
+    if not isinstance(repo, str) or not repo:
+        return None
+    if not isinstance(base_branch, str) or not base_branch:
+        return None
+    forge_host = payload.get("forge_host")
+    remote_url = payload.get("remote_url")
+    try:
+        identity = RepositoryIdentity(
+            owner=owner,
+            repo=repo,
+            base_branch=base_branch,
+            forge_host=forge_host if isinstance(forge_host, str) and forge_host else None,
+            remote_url=remote_url if isinstance(remote_url, str) and remote_url else None,
+        )
+    except ValueError:
+        return None
+    LOGGER.info(
+        "[TL loop] Resolved repository identity owner=%s repo=%s base_branch=%s",
+        owner,
+        repo,
+        base_branch,
+    )
+    return identity
 
 
 def _watcher_snapshot(

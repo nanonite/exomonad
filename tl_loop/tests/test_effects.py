@@ -183,6 +183,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     )
     client.resolve_live_pr_for_slice(slice_id="slice-a")
     client.watcher_pr_state(pr_number=1)
+    client.repository_identity()
     client.post_merge_parent_sync(
         child_id="child",
         pr_number=1,

@@ -798,6 +798,19 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
     }
 }
 
+fn repository_identity_error(error: impl Into<String>) -> RepositoryIdentityResponse {
+    RepositoryIdentityResponse {
+        success: false,
+        error: error.into(),
+        owner: String::new(),
+        repo: String::new(),
+        base_branch: String::new(),
+        forge_host: String::new(),
+        remote_url: String::new(),
+        remote_name: String::new(),
+    }
+}
+
 fn published_head_evidence(publication: Option<&PublishedHead>) -> Option<PublishedHeadEvidence> {
     publication.map(|head| PublishedHeadEvidence {
         invocation_id: head.invocation_id.clone().unwrap_or_default(),
@@ -2098,6 +2111,38 @@ impl<
             reviewer_agent_id,
             reviewer_identity_error,
             review_body,
+        })
+    }
+
+    async fn repository_identity(
+        &self,
+        _req: RepositoryIdentityRequest,
+        _ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<RepositoryIdentityResponse> {
+        let dir = self.ctx.project_dir();
+        tracing::info!(dir = ?dir, "Resolving repository identity");
+        let identity = match crate::services::repo::get_repository_identity(dir).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::error!(%error, "Repository identity resolution failed");
+                return Ok(repository_identity_error(error.to_string()));
+            }
+        };
+        tracing::info!(
+            owner = %identity.owner,
+            repo = %identity.repo,
+            base_branch = %identity.base_branch,
+            "Resolved repository identity"
+        );
+        Ok(RepositoryIdentityResponse {
+            success: true,
+            error: String::new(),
+            owner: identity.owner.to_string(),
+            repo: identity.repo.to_string(),
+            base_branch: identity.base_branch,
+            forge_host: identity.forge_host,
+            remote_url: identity.remote_url,
+            remote_name: identity.remote_name,
         })
     }
 
