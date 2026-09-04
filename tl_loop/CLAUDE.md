@@ -122,6 +122,25 @@ remote heads, ancestry proofs, or push receipts. Parent pushes use
 pending when that compare fails, so restart can reconcile the exact durable
 intent without redispatching an already confirmed effect.
 
+## Direct-leaf/worker scope draining
+
+`WorkPlan.sub_tls` empty is the direct-leaf/worker scope shape. It has no
+recursive sub-child dispatch to await, so once the ledger event source is
+empty, remaining work (post-merge boundary steps, scope finalization) is
+entirely internal to already-persisted state -- there is no future event
+that will ever nudge it. `_run_loop`'s "no event" branch calls
+`_drain_direct_scope_convergence` for this shape only; it repeats
+`_apply_convergence` with a fresh `ConvergenceTracker` per step (a fresh
+tracker sidesteps the shared tracker's repeated-action/state_version dedup
+guard, since most post-merge boundary steps do not bump `state_version`)
+until `derive_next_action` reports `Quiescent`, bounded at
+`MAX_CONVERGENCE_STEPS`. Exhausting that bound without reaching `Quiescent`
+raises `TLLoopError` rather than silently re-attempting a non-progressing
+action on every subsequent empty poll. This is a parallel, whole-scope-level
+drain next to `_run_sub_tls`'s own per-child `_drain_post_merge_recovery`
+loop for the `sub_tls` shape; the two are gated on disjoint plan shapes and
+neither substitutes for the other.
+
 ## Long-running wave goals and heartbeats
 
 RunState.goals is optional durable metadata for a long-running wave:

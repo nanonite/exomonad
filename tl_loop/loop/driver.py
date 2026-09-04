@@ -2298,6 +2298,13 @@ def _drain_direct_scope_convergence(
     within this call instead of only advancing on the next ledger event.
     The caller's shared ``convergence`` tracker is refreshed with the final
     decision so its own wait/Quiescent bookkeeping reflects drained state.
+
+    A fresh tracker per step means the dedup guard that would normally catch
+    a non-progressing action repeated against an unchanged state_version
+    cannot fire here. If MAX_CONVERGENCE_STEPS elapses without the state
+    ever reporting Quiescent, that guard's job is done here instead: raise
+    rather than let the caller's "no event" poll silently re-attempt the
+    same non-progressing intent forever.
     """
     for _ in range(MAX_CONVERGENCE_STEPS):
         decision = derive_next_action(
@@ -2307,7 +2314,8 @@ def _drain_direct_scope_convergence(
             now=convergence.review_now,
         )
         if isinstance(decision, Quiescent):
-            break
+            convergence.last_decision = decision
+            return state
         state = _apply_convergence(
             state,
             ConvergenceTracker(
@@ -2320,13 +2328,10 @@ def _drain_direct_scope_convergence(
             effects,
             effects_log,
         )
-    convergence.last_decision = derive_next_action(
-        state,
-        reviewer_max_rounds=convergence.reviewer_max_rounds,
-        review_freshness_window_secs=convergence.review_freshness_window_secs,
-        now=convergence.review_now,
+    raise TLLoopError(
+        "direct-leaf/worker scope did not reach a stable action or wait state "
+        f"within {MAX_CONVERGENCE_STEPS} internal convergence steps"
     )
-    return state
 
 
 def _park_review_rounds_exhausted(

@@ -23,10 +23,20 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from tl_loop.client.effects import EffectClient
 from tl_loop.fsm.post_merge import PostMergePhase
 from tl_loop.fsm.scope import TLDone as RecursiveTLDone
-from tl_loop.loop.driver import LoopCancelled, TLLoopConfig, run_tl_loop
+from tl_loop.loop.convergence import ConvergenceTracker
+from tl_loop.loop.driver import (
+    ExternalIntent,
+    LoopCancelled,
+    TLLoopConfig,
+    TLLoopError,
+    _drain_direct_scope_convergence,
+    run_tl_loop,
+)
 from tl_loop.state.schema import SliceStatus
 from tl_loop.tests.test_driver import SyntheticQueue
 from tl_loop.tests.test_legacy_manifest_convergence import (
@@ -113,3 +123,31 @@ def test_direct_leaf_plan_repeated_continuation_after_tl_done_is_a_no_op(tmp_pat
 
     assert isinstance(second.final_state.recursive_fsm, RecursiveTLDone)
     assert transport.calls == calls_after_first
+
+
+def test_direct_leaf_drain_raises_instead_of_silently_spinning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-progressing decision must fail loudly, not retry forever.
+
+    _drain_direct_scope_convergence gives each step a fresh ConvergenceTracker,
+    which sidesteps the shared tracker's usual repeated-action/state_version
+    dedup guard. If a decision never actually advances state (e.g. an
+    ExternalIntent whose execution can't make progress), that guard can never
+    catch it here -- so the drain must itself raise once its bounded step
+    budget is exhausted, rather than exit silently and let the caller's "no
+    event" poll re-attempt the same non-progressing action forever.
+    """
+    store, migrated, _reconciliation = _seed_and_migrate(tmp_path)
+    config = _config()
+    effects = EffectClient(_merged_watcher_transport())
+
+    stuck_intent = ExternalIntent("post_merge_recovery", SLICE_ID, {})
+    monkeypatch.setattr("tl_loop.loop.driver.derive_next_action", lambda *a, **k: stuck_intent)
+    monkeypatch.setattr(
+        "tl_loop.loop.driver._apply_convergence",
+        lambda state, tracker, store, config, effects, effects_log: state,
+    )
+
+    with pytest.raises(TLLoopError, match="did not reach a stable action or wait state"):
+        _drain_direct_scope_convergence(migrated, ConvergenceTracker(), store, config, effects, [])
