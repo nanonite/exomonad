@@ -154,6 +154,38 @@ def test_direct_leaf_drain_raises_instead_of_silently_spinning(
         _drain_direct_scope_convergence(migrated, ConvergenceTracker(), store, config, effects, [])
 
 
+def test_direct_leaf_drain_raises_when_only_state_version_moves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state_version-only delta must still count as non-progression.
+
+    _apply_convergence's InternalTransition branch calls
+    store.set_state_version() before _apply_internal_transition runs, then
+    can early-return on ``state == prior`` -- a state whose only delta is
+    state_version, exactly like the version/revision write counters the
+    content comparison already excludes. Without state_version excluded
+    too, this reads as "progress" and the drain would silently return
+    after DIRECT_SCOPE_DRAIN_STEP_LIMIT such steps instead of raising --
+    the original silent-spin bug surviving in a narrower form.
+    """
+    store, migrated, _reconciliation = _seed_and_migrate(tmp_path)
+    config = _config()
+    effects = EffectClient(_merged_watcher_transport())
+
+    stuck_intent = ExternalIntent("post_merge_recovery", SLICE_ID, {})
+    monkeypatch.setattr("tl_loop.loop.driver.derive_next_action", lambda *a, **k: stuck_intent)
+    monkeypatch.setattr(
+        "tl_loop.loop.driver._apply_convergence",
+        lambda state, tracker, store, config, effects, effects_log: replace(
+            state, state_version=state.state_version + 1
+        ),
+    )
+    monkeypatch.setattr(driver_module, "DIRECT_SCOPE_DRAIN_STEP_LIMIT", 3)
+
+    with pytest.raises(TLLoopError, match="made no progress advancing"):
+        _drain_direct_scope_convergence(migrated, ConvergenceTracker(), store, config, effects, [])
+
+
 def test_direct_leaf_drain_does_not_raise_when_progress_needs_more_than_one_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

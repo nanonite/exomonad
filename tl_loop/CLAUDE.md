@@ -136,8 +136,10 @@ guard, since most post-merge boundary steps do not bump `state_version`)
 until `derive_next_action` reports `Quiescent`.
 
 Each step compares persisted content -- every `RunState` field except the
-`version`/`revision` write counters, which a checkpoint bumps even when
-nothing meaningful changed -- before and after. A step whose content doesn't
+`version`/`revision`/`state_version` write counters, which a checkpoint (or,
+for `state_version`, `_apply_convergence`'s own `InternalTransition`
+handling) can bump even when nothing meaningful changed -- before and after.
+A step whose content doesn't
 move is a non-progressing action and raises `TLLoopError` immediately,
 rather than letting a later empty poll silently re-attempt it forever. A
 step that does move content is real progress and never raises merely for

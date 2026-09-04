@@ -2311,11 +2311,13 @@ def _drain_direct_scope_convergence(
     A fresh tracker per step means the dedup guard that would normally catch
     a non-progressing action repeated against an unchanged state_version
     cannot fire here. This drain owns that check itself instead, comparing
-    persisted content (every field but the ``version``/``revision`` write
-    counters, which a checkpoint bumps even when nothing meaningful
-    changed) before and after each step: a step whose content doesn't move
-    is a non-progressing action, and raises immediately rather than letting
-    the caller's "no event" poll silently re-attempt it forever. A step
+    persisted content (every field but the ``version``/``revision``/
+    ``state_version`` write counters, which a checkpoint -- or, for
+    state_version, _apply_convergence's own InternalTransition handling --
+    can bump even when nothing meaningful changed) before and after each
+    step: a step whose content doesn't move is a non-progressing action,
+    and raises immediately rather than letting the caller's "no event" poll
+    silently re-attempt it forever. A step
     that *does* move content is real progress, so exhausting
     DIRECT_SCOPE_DRAIN_STEP_LIMIT is only a per-call fairness cap -- it
     returns normally, exactly as if the event source had been empty from
@@ -2333,7 +2335,7 @@ def _drain_direct_scope_convergence(
         if isinstance(decision, Quiescent):
             convergence.last_decision = decision
             return state
-        before = replace(state, version=0, revision=0)
+        before = replace(state, version=0, revision=0, state_version=0)
         state = _apply_convergence(
             state,
             ConvergenceTracker(
@@ -2346,7 +2348,7 @@ def _drain_direct_scope_convergence(
             effects,
             effects_log,
         )
-        if replace(state, version=0, revision=0) == before:
+        if replace(state, version=0, revision=0, state_version=0) == before:
             raise TLLoopError(
                 "direct-leaf/worker scope made no progress advancing "
                 f"{decision!r}; refusing to retry a non-progressing action"
