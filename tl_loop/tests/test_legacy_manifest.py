@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+from tl_loop.loop.review import ReviewContract
 from tl_loop.state.legacy_manifest import (
     LegacyManifestDisposition,
     reconcile_legacy_manifest,
@@ -10,12 +11,12 @@ from tl_loop.state.plan_manifest import build_legacy_manifest, build_plan_manife
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
+    ActionState,
     DurableReviewEvidence,
     HandoffEvidence,
     PublicationBinding,
     SliceStatus,
     Verdict,
-    ActionState,
 )
 
 
@@ -149,6 +150,128 @@ def test_active_legacy_binding_rejects_conflicting_branch_evidence():
     assert "owned branch" in result.reason
 
 
+def test_active_legacy_binding_rejects_candidate_nodes_not_in_old_manifest():
+    legacy, _ = _manifests()
+    candidate = build_plan_manifest(
+        {
+            "leaves": [
+                {
+                    "name": "leaf",
+                    "task": "implement the leaf",
+                    "agent_type": "opencode",
+                    "boundary": ["src"],
+                },
+                {
+                    "name": "extra",
+                    "task": "do unrelated work",
+                    "agent_type": "opencode",
+                    "boundary": ["other"],
+                },
+            ]
+        },
+        scope_id="run",
+        owned_branch="main",
+    )
+    result = reconcile_legacy_manifest(
+        legacy,
+        candidate,
+        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _journal(),
+    )
+
+    assert result.disposition is LegacyManifestDisposition.CONFLICTING_EVIDENCE
+    assert "extra" in result.reason
+    assert result.proofs[0].new_node_id == "run/leaf/extra"
+
+
+def test_active_legacy_binding_proves_the_complete_leaf_declaration():
+    candidate = build_plan_manifest(
+        {
+            "leaves": [
+                {
+                    "name": "leaf",
+                    "task": "implement the leaf",
+                    "agent_type": "opencode",
+                    "boundary": ["src"],
+                    "context": "preserve the contract",
+                    "read_first": ["README.md"],
+                    "steps": ["implement", "verify"],
+                    "verify": ["pytest"],
+                    "done_criteria": ["all tests pass"],
+                }
+            ]
+        },
+        scope_id="run",
+        owned_branch="main",
+    )
+    state = _active_slice()
+    state.review_contract = ReviewContract.from_criteria(
+        ("DONE CRITERIA: all tests pass",)
+    ).as_mapping()
+    entries = list(_journal().entries)
+    entries[0]["arguments"].update(
+        {
+            "context": "preserve the contract",
+            "read_first": ["README.md"],
+            "steps": ["implement", "verify"],
+            "verify": ["pytest"],
+        }
+    )
+    legacy, _ = _manifests()
+    result = reconcile_legacy_manifest(
+        legacy,
+        candidate,
+        SimpleNamespace(slices={"leaf": state}),
+        SnapshotJournal(entries),
+    )
+
+    assert result.disposition is LegacyManifestDisposition.PROVEN
+
+    changed = build_plan_manifest(
+        {
+            "leaves": [
+                {
+                    "name": "leaf",
+                    "task": "implement the leaf",
+                    "agent_type": "opencode",
+                    "boundary": ["src"],
+                    "context": "changed contract",
+                    "read_first": ["README.md"],
+                    "steps": ["implement", "verify"],
+                    "verify": ["pytest"],
+                    "done_criteria": ["all tests pass"],
+                }
+            ]
+        },
+        scope_id="run",
+        owned_branch="main",
+    )
+    assert (
+        "declaration context"
+        in reconcile_legacy_manifest(
+            legacy,
+            changed,
+            SimpleNamespace(slices={"leaf": state}),
+            SnapshotJournal(entries),
+        ).reason
+    )
+
+
+def test_active_legacy_binding_rejects_publication_from_another_branch():
+    legacy, candidate = _manifests()
+    state = _active_slice()
+    state.publication = PublicationBinding(43, "head-a", "main.other", "main", 1, "invocation")
+    result = reconcile_legacy_manifest(
+        legacy,
+        candidate,
+        SimpleNamespace(slices={"leaf": state}),
+        _journal(),
+    )
+
+    assert result.disposition is LegacyManifestDisposition.CONFLICTING_EVIDENCE
+    assert "publication head branch" in result.reason
+
+
 def test_migration_proof_projection_is_body_free():
     from tl_loop.state.diagnostics import project_legacy_manifest_migration
 
@@ -168,9 +291,98 @@ def test_migration_proof_projection_is_body_free():
     assert projected["disposition"] == "proven"
 
 
+def test_migration_cleanup_removes_only_the_exact_resolved_gate(tmp_path):
+    from tl_loop.loop.driver import _clear_resolved_migration_gate
+    from tl_loop.state.legacy_manifest import LegacyManifestReconciliation
+    from tl_loop.state.store import RunStore, create
+
+    create(
+        "gates",
+        {
+            "gates": [
+                {
+                    "name": "plan-manifest-migration:proven:resolved",
+                    "status": "approved",
+                },
+                {
+                    "name": "plan-manifest-migration:proven:unrelated",
+                    "status": "pending",
+                },
+                {"name": "operator-review", "status": "pending"},
+            ]
+        },
+        root_dir=tmp_path,
+    )
+    store = RunStore("gates", tmp_path)
+    reconciliation = LegacyManifestReconciliation(
+        LegacyManifestDisposition.PROVEN,
+        {},
+        (),
+        "resolved",
+    )
+
+    updated = _clear_resolved_migration_gate(store, store.load(), reconciliation)
+
+    assert [gate.name for gate in updated.gates] == [
+        "plan-manifest-migration:proven:unrelated",
+        "operator-review",
+    ]
+
+
+def test_active_legacy_binding_rejects_worker_versus_leaf_kind_mismatch() -> None:
+    legacy, _ = _manifests()
+    candidate = build_plan_manifest(
+        {"workers": [{"name": "leaf", "task": "implement the leaf"}]},
+        scope_id="run",
+        owned_branch="main",
+    )
+    result = reconcile_legacy_manifest(
+        legacy,
+        candidate,
+        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _journal(),
+    )
+
+    assert result.disposition is LegacyManifestDisposition.MISSING_EVIDENCE
+    assert "confirmed spawn operation" in result.reason
+
+
+def test_active_legacy_binding_rejects_sub_tl_without_nested_checkpoint(tmp_path) -> None:
+    legacy, _ = _manifests()
+    candidate = build_plan_manifest(
+        {"sub_tls": [{"name": "leaf", "order": 1, "plan": {}}]},
+        scope_id="run",
+        owned_branch="main",
+    )
+    result = reconcile_legacy_manifest(
+        legacy,
+        candidate,
+        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _journal(),
+        child_checkpoint_root=tmp_path,
+    )
+
+    assert result.disposition is LegacyManifestDisposition.MISSING_EVIDENCE
+    assert "nested child checkpoint" in result.reason
+
+
+def test_active_legacy_binding_rejects_in_flight_merge_without_action_journal_entry() -> None:
+    legacy, candidate = _manifests()
+    entries = list(_journal().entries)[:1]  # confirmed spawn only, no merge_pr entry
+    result = reconcile_legacy_manifest(
+        legacy,
+        candidate,
+        SimpleNamespace(slices={"leaf": _active_slice()}),
+        SnapshotJournal(entries),
+    )
+
+    assert result.disposition is LegacyManifestDisposition.MISSING_EVIDENCE
+    assert "matching action journal entry" in result.reason
+
+
 def test_migration_proof_round_trips_through_the_slice_schema(tmp_path):
     from tl_loop.state.plan_manifest import build_plan_manifest
-    from tl_loop.state.store import create, RunStore
+    from tl_loop.state.store import RunStore, create
 
     manifest = build_plan_manifest(
         {"workers": [{"name": "worker", "task": "work"}]}, scope_id="schema"

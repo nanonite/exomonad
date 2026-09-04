@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix evidence-bound continuation of active legacy plan manifests (#1060)
 - Reconcile superseded TL recovery tasks and publish the orchestration contract (#1058)
 - Prove recursive crash recovery and exactly-once convergence end to end (#1057)
 - Add exhaustive recursive orchestration model and migration coverage (#1056)

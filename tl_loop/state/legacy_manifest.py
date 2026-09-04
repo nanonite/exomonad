@@ -104,6 +104,24 @@ def reconcile_legacy_manifest(
     candidate_nodes = {node.name: node for node in candidate.nodes}
     if len(old_nodes) != len(previous.nodes) or len(candidate_nodes) != len(candidate.nodes):
         return _failure((), "duplicate legacy or candidate node names", ambiguous=True)
+    extra_names = sorted(set(candidate_nodes) - set(old_nodes))
+    if extra_names:
+        proofs = tuple(
+            LegacyNodeProof(
+                old_node_id=f"{previous.scope_id}/unknown/{name}",
+                new_node_id=candidate_nodes[name].node_id,
+                slice_id=name,
+                disposition=LegacyManifestDisposition.CONFLICTING_EVIDENCE,
+                conflicts=("candidate adds undeclared active node",),
+            )
+            for name in extra_names
+        )
+        return LegacyManifestReconciliation(
+            disposition=LegacyManifestDisposition.CONFLICTING_EVIDENCE,
+            bindings={},
+            proofs=proofs,
+            reason="candidate adds undeclared active node(s): " + ", ".join(extra_names),
+        )
     entries = journal.snapshot() if hasattr(journal, "snapshot") else tuple(journal)
     proofs: list[LegacyNodeProof] = []
     bindings: dict[str, str] = {}
@@ -219,7 +237,7 @@ def _prove_node(
             branch=spawn[4],
             worktree=spawn[5],
         )
-    identity = _prove_publication_and_review(old, new, current)
+    identity = _prove_publication_and_review(old, new, current, spawn[4])
     if identity[0] is not LegacyManifestDisposition.PROVEN:
         return _proof(
             old,
@@ -305,6 +323,7 @@ def _prove_spawn(
         conflicts += ("owned branch",)
     if not worktree or current.worktree and current.worktree != worktree:
         conflicts += ("worktree",)
+    conflicts += _declaration_conflicts(new, current, args)
     if conflicts:
         return _conflict(*conflicts)
     evidence = (
@@ -359,6 +378,7 @@ def _prove_publication_and_review(
     old: ManifestNode,
     new: ManifestNode,
     current: SliceState,
+    spawn_branch: str | None,
 ) -> tuple[LegacyManifestDisposition, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     if new.kind == "worker":
         return LegacyManifestDisposition.PROVEN, (), (), ()
@@ -400,6 +420,8 @@ def _prove_publication_and_review(
         conflicts.append("PR/head identity")
     if publication.base_branch != new.parent_integration_target:
         conflicts.append("parent integration target")
+    if not spawn_branch or publication.head_branch != spawn_branch:
+        conflicts.append("publication head branch")
     invocation_id = _invocation_id(current)
     if invocation_id and any(
         value != invocation_id for value in (publication.invocation_id, handoff.invocation_id)
@@ -420,6 +442,65 @@ def _prove_publication_and_review(
         (),
         (),
     )
+
+
+_DECLARATION_KEYS = (
+    "context",
+    "read_first",
+    "steps",
+    "verify",
+    "done_criteria",
+    "task_timeout_seconds",
+)
+
+
+def _declaration_conflicts(
+    node: ManifestNode,
+    current: SliceState,
+    arguments: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Require every meaningful plan declaration to have durable evidence."""
+    conflicts: list[str] = []
+    declaration = node.declaration
+    for key in _DECLARATION_KEYS:
+        expected = declaration.get(key)
+        observed = arguments.get(key)
+        if key in arguments:
+            if not _same(observed, expected):
+                conflicts.append(f"declaration {key}")
+            continue
+        if key == "done_criteria":
+            observed = _review_done_criteria(getattr(current, "review_contract", None))
+            if observed is not None:
+                if not _same(observed, expected):
+                    conflicts.append("declaration done_criteria")
+            elif _meaningful(expected):
+                conflicts.append("declaration done_criteria missing")
+        elif key == "task_timeout_seconds":
+            observed = getattr(current, key, None)
+            if _meaningful(expected) and not _same(observed, expected):
+                conflicts.append("declaration task_timeout_seconds")
+        elif _meaningful(expected):
+            conflicts.append(f"declaration {key} missing")
+    return tuple(conflicts)
+
+
+def _review_done_criteria(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, Mapping):
+        return None
+    criteria = value.get("acceptance_criteria")
+    if not isinstance(criteria, (list, tuple)):
+        return None
+    prefix = "DONE CRITERIA: "
+    return tuple(
+        item.removeprefix(prefix)
+        for item in criteria
+        if isinstance(item, str) and item.startswith(prefix)
+    )
+
+
+def _meaningful(value: object) -> bool:
+    return value not in (None, "", [], (), {})
 
 
 def _prove_action(

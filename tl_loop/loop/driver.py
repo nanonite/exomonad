@@ -173,7 +173,10 @@ from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
 from tl_loop.select.policy import HarnessPolicy, load_policy
-from tl_loop.state.legacy_manifest import reconcile_legacy_manifest
+from tl_loop.state.legacy_manifest import (
+    LegacyManifestReconciliation,
+    reconcile_legacy_manifest,
+)
 from tl_loop.state.plan_manifest import (
     ManifestError,
     PlanManifest,
@@ -943,10 +946,11 @@ def run_tl_loop(
                 )
             except ManifestError as error:
                 raise TLLoopError(f"legacy plan manifest replacement rejected: {error}") from error
-            if reconciliation:
-                for gate in existing_state.gates:
-                    if gate.name.startswith("plan-manifest-migration:"):
-                        existing_state = store.clear_gate(gate.name)
+            existing_state = _clear_resolved_migration_gate(
+                store,
+                existing_state,
+                reconciliation,
+            )
             work_plan = _work_plan_from_manifest(candidate)
             manifest = candidate
             initial_slices = None
@@ -1143,6 +1147,20 @@ def run_tl_loop(
         return _recover_tool_unavailable(store, effects, effects_log, error)
     except DurableWriteError as error:
         return _recover_durable_write_failure(store, effects, effects_log, error)
+
+
+def _clear_resolved_migration_gate(
+    store: RunStore,
+    state: RunState,
+    reconciliation: LegacyManifestReconciliation | None,
+) -> RunState:
+    """Clear only the gate whose exact proof has just been resolved."""
+    if reconciliation is None:
+        return state
+    gate_name = reconciliation.gate_name()
+    if not any(gate.name == gate_name for gate in state.gates):
+        return state
+    return store.clear_gate(gate_name)
 
 
 def _failure_phase(state: RunState, reason: str) -> PhaseValue:
