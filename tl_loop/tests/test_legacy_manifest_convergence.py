@@ -15,9 +15,8 @@ followed by the same reconciliation/convergence pipeline run_tl_loop drives
 (_reconcile_nonterminal_slices, _apply_convergence) to drain post-merge
 bookkeeping to completion -- the same pipeline-level entry points
 test_startup_reconciliation.py already uses for the non-legacy case. It does
-not drive the full run_tl_loop() outer loop, whose scope-level completion
-signal for a *direct* (non-sub-TL) root leaf with no further incoming ledger
-events is a separate, pre-existing gap unrelated to #1060's migration fix.
+not drive the full run_tl_loop() outer loop; test_direct_leaf_scope_completion.py
+covers that end-to-end, including reaching TLDone from these same fixtures.
 """
 
 from __future__ import annotations

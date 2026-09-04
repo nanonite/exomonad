@@ -1844,6 +1844,16 @@ def _run_loop(
                     diagnostics.snapshot(),
                     _journal_entries(effects_log),
                 )
+            # A direct-leaf/worker scope (no sub_tls) has no recursive
+            # sub-child dispatch to await, so an empty poll carries no new
+            # information: any remaining work (post-merge boundary steps,
+            # scope finalization) is entirely internal to already-persisted
+            # state. Drain it here instead of relying on the next ledger
+            # event, which will never come.
+            if not plan.sub_tls:
+                state = _drain_direct_scope_convergence(
+                    state, convergence, store, config, effects, effects_log
+                )
             continue
         event_seq = event.run_seq
         if event_seq is None:
@@ -2266,6 +2276,57 @@ def _apply_convergence(
             )
         return state
     raise TLLoopError("convergence did not reach a stable action or wait state")
+
+
+def _drain_direct_scope_convergence(
+    state: RunState,
+    convergence: ConvergenceTracker,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Advance a direct-leaf/worker scope's internal-only work to a real wait.
+
+    _apply_convergence advances at most one post-merge boundary (or other
+    internal) step per call, and its ConvergenceTracker deliberately rejects
+    repeating the same action against an unchanged ``state_version`` -- most
+    post-merge boundary steps do not bump it. Each step below therefore uses
+    its own fresh tracker (the same bounded-drain idiom already used by
+    tests exercising this pipeline directly), so a direct-leaf scope with no
+    remaining child dispatch to observe can reach TLDone, or a genuine wait,
+    within this call instead of only advancing on the next ledger event.
+    The caller's shared ``convergence`` tracker is refreshed with the final
+    decision so its own wait/Quiescent bookkeeping reflects drained state.
+    """
+    for _ in range(MAX_CONVERGENCE_STEPS):
+        decision = derive_next_action(
+            state,
+            reviewer_max_rounds=convergence.reviewer_max_rounds,
+            review_freshness_window_secs=convergence.review_freshness_window_secs,
+            now=convergence.review_now,
+        )
+        if isinstance(decision, Quiescent):
+            break
+        state = _apply_convergence(
+            state,
+            ConvergenceTracker(
+                reviewer_max_rounds=convergence.reviewer_max_rounds,
+                review_freshness_window_secs=convergence.review_freshness_window_secs,
+                review_now=convergence.review_now,
+            ),
+            store,
+            config,
+            effects,
+            effects_log,
+        )
+    convergence.last_decision = derive_next_action(
+        state,
+        reviewer_max_rounds=convergence.reviewer_max_rounds,
+        review_freshness_window_secs=convergence.review_freshness_window_secs,
+        now=convergence.review_now,
+    )
+    return state
 
 
 def _park_review_rounds_exhausted(
@@ -4361,13 +4422,19 @@ def _recursive_phase_after_slice_update(
     phase = state.recursive_fsm
     if not isinstance(phase, RecursiveTLRunning) or current.post_merge is None:
         return None
-    post_merge = dict(phase.post_merge)
-    if slice_id not in post_merge:
+    if slice_id not in phase.post_merge:
         return None
-    post_merge[slice_id] = current.post_merge
-    projected = replace(phase, post_merge=post_merge)
     if current.post_merge.phase is not PostMergePhase.COMPLETE:
-        return projected
+        post_merge = dict(phase.post_merge)
+        post_merge[slice_id] = current.post_merge
+        return replace(phase, post_merge=post_merge)
+    # The terminal boundary is dispatched as a PostMergeComplete scope event
+    # against the pre-update phase (not a pre-projected copy already showing
+    # COMPLETE) so post_merge_transition's own not-yet-complete branch runs
+    # and removes this child from parallel_pending/pending_by_order. Handing
+    # it an already-COMPLETE phase makes it treat the call as a no-op repeat,
+    # leaving the child parked in the FSM's pending set forever even once its
+    # post-merge recovery has truly finished.
     evidence = current.post_merge.evidence
     try:
         receipt = PushReceipt(
@@ -4384,7 +4451,7 @@ def _recursive_phase_after_slice_update(
             ancestry_proof=evidence["ancestry_proof"],
         )
         return scope_transition(
-            projected,
+            phase,
             PostMergeComplete(
                 child_id=slice_id,
                 journal_id=evidence["merge_journal_id"],
@@ -4394,7 +4461,9 @@ def _recursive_phase_after_slice_update(
             ),
         )
     except (KeyError, TypeError, ValueError, IllegalTransition):
-        return projected
+        post_merge = dict(phase.post_merge)
+        post_merge[slice_id] = current.post_merge
+        return replace(phase, post_merge=post_merge)
 
 
 def _phase_after_slice_merge(
