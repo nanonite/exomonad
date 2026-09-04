@@ -133,13 +133,24 @@ that will ever nudge it. `_run_loop`'s "no event" branch calls
 `_apply_convergence` with a fresh `ConvergenceTracker` per step (a fresh
 tracker sidesteps the shared tracker's repeated-action/state_version dedup
 guard, since most post-merge boundary steps do not bump `state_version`)
-until `derive_next_action` reports `Quiescent`, bounded at
-`MAX_CONVERGENCE_STEPS`. Exhausting that bound without reaching `Quiescent`
-raises `TLLoopError` rather than silently re-attempting a non-progressing
-action on every subsequent empty poll. This is a parallel, whole-scope-level
-drain next to `_run_sub_tls`'s own per-child `_drain_post_merge_recovery`
-loop for the `sub_tls` shape; the two are gated on disjoint plan shapes and
-neither substitutes for the other.
+until `derive_next_action` reports `Quiescent`.
+
+Each step compares persisted content -- every `RunState` field except the
+`version`/`revision` write counters, which a checkpoint bumps even when
+nothing meaningful changed -- before and after. A step whose content doesn't
+move is a non-progressing action and raises `TLLoopError` immediately,
+rather than letting a later empty poll silently re-attempt it forever. A
+step that does move content is real progress and never raises merely for
+running long: exhausting `DIRECT_SCOPE_DRAIN_STEP_LIMIT` (a per-call
+fairness cap, deliberately distinct from `MAX_CONVERGENCE_STEPS`, which
+bounds only the internal steps *within* one `_apply_convergence` call to
+reach a single action or wait state) just returns the partially-drained
+state for the next empty poll to continue -- a scope needing many action
+boundaries (e.g. several leaves' post-merge sequences) must never be
+mistaken for a stuck one. This is a parallel, whole-scope-level drain next
+to `_run_sub_tls`'s own per-child `_drain_post_merge_recovery` loop for the
+`sub_tls` shape; the two are gated on disjoint plan shapes and neither
+substitutes for the other.
 
 ## Long-running wave goals and heartbeats
 

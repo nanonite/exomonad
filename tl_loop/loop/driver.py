@@ -250,6 +250,15 @@ INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 MAX_CONVERGENCE_STEPS = 8
+# A per-call fairness cap on _drain_direct_scope_convergence, not a
+# correctness bound: that function raises the moment a step makes no
+# progress, so exhausting this many *progressing* steps in one call just
+# means the next "no event" poll picks up and continues draining -- it is
+# not evidence of being stuck. Distinct from MAX_CONVERGENCE_STEPS, which
+# bounds internal steps *within* a single _apply_convergence call to reach
+# one action or wait state, not the number of action boundaries a whole
+# direct-leaf/worker scope may need.
+DIRECT_SCOPE_DRAIN_STEP_LIMIT = 64
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
 REMOTE_ADVANCE_FAILURE_MARKERS = (
     "force-with-lease",
@@ -2301,12 +2310,20 @@ def _drain_direct_scope_convergence(
 
     A fresh tracker per step means the dedup guard that would normally catch
     a non-progressing action repeated against an unchanged state_version
-    cannot fire here. If MAX_CONVERGENCE_STEPS elapses without the state
-    ever reporting Quiescent, that guard's job is done here instead: raise
-    rather than let the caller's "no event" poll silently re-attempt the
-    same non-progressing intent forever.
+    cannot fire here. This drain owns that check itself instead, comparing
+    persisted content (every field but the ``version``/``revision`` write
+    counters, which a checkpoint bumps even when nothing meaningful
+    changed) before and after each step: a step whose content doesn't move
+    is a non-progressing action, and raises immediately rather than letting
+    the caller's "no event" poll silently re-attempt it forever. A step
+    that *does* move content is real progress, so exhausting
+    DIRECT_SCOPE_DRAIN_STEP_LIMIT is only a per-call fairness cap -- it
+    returns normally, exactly as if the event source had been empty from
+    the start, and the next "no event" poll continues draining. A scope
+    that legitimately needs more action boundaries than one call's budget
+    must never be mistaken for a stuck one.
     """
-    for _ in range(MAX_CONVERGENCE_STEPS):
+    for _ in range(DIRECT_SCOPE_DRAIN_STEP_LIMIT):
         decision = derive_next_action(
             state,
             reviewer_max_rounds=convergence.reviewer_max_rounds,
@@ -2316,6 +2333,7 @@ def _drain_direct_scope_convergence(
         if isinstance(decision, Quiescent):
             convergence.last_decision = decision
             return state
+        before = replace(state, version=0, revision=0)
         state = _apply_convergence(
             state,
             ConvergenceTracker(
@@ -2328,10 +2346,18 @@ def _drain_direct_scope_convergence(
             effects,
             effects_log,
         )
-    raise TLLoopError(
-        "direct-leaf/worker scope did not reach a stable action or wait state "
-        f"within {MAX_CONVERGENCE_STEPS} internal convergence steps"
+        if replace(state, version=0, revision=0) == before:
+            raise TLLoopError(
+                "direct-leaf/worker scope made no progress advancing "
+                f"{decision!r}; refusing to retry a non-progressing action"
+            )
+    convergence.last_decision = derive_next_action(
+        state,
+        reviewer_max_rounds=convergence.reviewer_max_rounds,
+        review_freshness_window_secs=convergence.review_freshness_window_secs,
+        now=convergence.review_now,
     )
+    return state
 
 
 def _park_review_rounds_exhausted(

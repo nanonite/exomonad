@@ -28,6 +28,7 @@ import pytest
 from tl_loop.client.effects import EffectClient
 from tl_loop.fsm.post_merge import PostMergePhase
 from tl_loop.fsm.scope import TLDone as RecursiveTLDone
+from tl_loop.loop import driver as driver_module
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
     ExternalIntent,
@@ -132,11 +133,11 @@ def test_direct_leaf_drain_raises_instead_of_silently_spinning(
 
     _drain_direct_scope_convergence gives each step a fresh ConvergenceTracker,
     which sidesteps the shared tracker's usual repeated-action/state_version
-    dedup guard. If a decision never actually advances state (e.g. an
-    ExternalIntent whose execution can't make progress), that guard can never
-    catch it here -- so the drain must itself raise once its bounded step
-    budget is exhausted, rather than exit silently and let the caller's "no
-    event" poll re-attempt the same non-progressing action forever.
+    dedup guard. If a decision never actually advances persisted content
+    (e.g. an ExternalIntent whose execution can't make progress), that guard
+    can never catch it here -- so the drain must itself raise the moment a
+    step makes no progress, rather than exit silently and let the caller's
+    "no event" poll re-attempt the same non-progressing action forever.
     """
     store, migrated, _reconciliation = _seed_and_migrate(tmp_path)
     config = _config()
@@ -149,5 +150,37 @@ def test_direct_leaf_drain_raises_instead_of_silently_spinning(
         lambda state, tracker, store, config, effects, effects_log: state,
     )
 
-    with pytest.raises(TLLoopError, match="did not reach a stable action or wait state"):
+    with pytest.raises(TLLoopError, match="made no progress advancing"):
         _drain_direct_scope_convergence(migrated, ConvergenceTracker(), store, config, effects, [])
+
+
+def test_direct_leaf_drain_does_not_raise_when_progress_needs_more_than_one_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exhausting the per-call step budget while still progressing must not raise.
+
+    Reproduces a regression an independent review found in an earlier version
+    of this drain: reusing MAX_CONVERGENCE_STEPS (8, sized for
+    _apply_convergence's *internal* steps to reach one action boundary) as a
+    whole-scope budget meant any direct scope needing more action boundaries
+    than that -- an ordinary multi-leaf case -- would hard-fail even while
+    making real progress every step. DIRECT_SCOPE_DRAIN_STEP_LIMIT is forced
+    down to 1 here, so this single leaf's multi-boundary post-merge sequence
+    (parent sync, issue close, changelog, push) always exceeds one call's
+    budget: run_tl_loop's outer while loop keeps calling the drain on every
+    "no event" poll regardless, so correctness (reaching TLDone) must be
+    unaffected -- it must simply never raise while genuinely progressing.
+    """
+    monkeypatch.setattr(driver_module, "DIRECT_SCOPE_DRAIN_STEP_LIMIT", 1)
+    _seed_and_migrate(tmp_path)
+    config = _config()
+    effects = EffectClient(_merged_watcher_transport())
+
+    try:
+        result = _run_bounded(config, effects, tmp_path)
+    except LoopCancelled:
+        raise AssertionError(
+            "run_tl_loop did not converge to TLDone with a 1-step drain budget"
+        ) from None
+
+    assert isinstance(result.final_state.recursive_fsm, RecursiveTLDone)
