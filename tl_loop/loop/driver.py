@@ -3102,6 +3102,7 @@ def _forgejo_merge_evidence(evidence: Mapping[str, object]) -> dict[str, str]:
 
 
 def _attach_forgejo_merge_evidence(current: SliceState, evidence: Mapping[str, str]) -> SliceState:
+    """Attach merge-time Forgejo proof without replacing historical evidence."""
     if current.post_merge is None or not evidence:
         return current
     proof_keys = {
@@ -3113,13 +3114,20 @@ def _attach_forgejo_merge_evidence(current: SliceState, evidence: Mapping[str, s
         "prospective_merge_tree_sha",
         "reviewed_pr_head_tree_sha",
     }
-    retained = {
-        key: value for key, value in current.post_merge.evidence.items() if key not in proof_keys
-    }
-    post_merge = replace(
-        current.post_merge,
-        evidence={**retained, **evidence},
-    )
+    merged = dict(current.post_merge.evidence)
+    for key, value in evidence.items():
+        if key == "prospective_merge_tree_sha":
+            continue
+        if key not in proof_keys or key not in merged:
+            merged[key] = value
+    if "prospective_merge_tree_sha" not in merged:
+        historical_tree = merged.get(
+            "forgejo_merge_commit_tree_sha",
+            evidence.get("prospective_merge_tree_sha"),
+        )
+        if isinstance(historical_tree, str) and historical_tree:
+            merged["prospective_merge_tree_sha"] = historical_tree
+    post_merge = replace(current.post_merge, evidence=merged)
     return replace(current, post_merge=post_merge)
 
 

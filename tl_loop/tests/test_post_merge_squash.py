@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -11,6 +13,8 @@ from tl_loop.loop.driver import (
     TLLoopConfig,
     _adopt_post_merge_slice,
     _advance_post_merge_boundary,
+    _attach_forgejo_merge_evidence,
+    _forgejo_merge_evidence,
     _refresh_post_merge_evidence,
     _remote_reconcile_effect,
     _validate_parent_sync_proof,
@@ -309,3 +313,185 @@ def test_ancestry_receipt_keeps_the_existing_proof_contract() -> None:
         arguments,
         receipt,
     )
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _squash_git_history(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    repo = tmp_path / "squash-repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.invalid")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "branch", "-M", "main")
+    (repo / "base.txt").write_text("base\\n")
+    _git(repo, "add", "base.txt")
+    _git(repo, "commit", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "switch", "-c", "feature")
+    (repo / "feature.txt").write_text("feature\\n")
+    _git(repo, "add", "feature.txt")
+    _git(repo, "commit", "-m", "feature")
+    pr_head = _git(repo, "rev-parse", "HEAD")
+    pr_head_tree = _git(repo, "rev-parse", f"{pr_head}^{{tree}}")
+    _git(repo, "switch", "main")
+    _git(repo, "merge", "--squash", "feature")
+    _git(repo, "commit", "-m", "squash")
+    merge_commit = _git(repo, "rev-parse", "HEAD")
+    merge_commit_tree = _git(repo, "rev-parse", f"{merge_commit}^{{tree}}")
+    historical_prospective = _git(repo, "merge-tree", "--write-tree", base, pr_head)
+    (repo / "later.txt").write_text("later parent change\\n")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-m", "advance parent")
+    advanced_parent = _git(repo, "rev-parse", "HEAD")
+    current_prospective = _git(repo, "merge-tree", "--write-tree", advanced_parent, pr_head)
+    assert historical_prospective == merge_commit_tree
+    assert historical_prospective == pr_head_tree
+    assert current_prospective != historical_prospective
+    return repo, {
+        "base": base,
+        "pr_head": pr_head,
+        "pr_head_tree": pr_head_tree,
+        "merge_commit": merge_commit,
+        "merge_commit_tree": merge_commit_tree,
+        "historical_prospective": historical_prospective,
+        "advanced_parent": advanced_parent,
+        "current_prospective": current_prospective,
+    }
+
+
+def test_advanced_parent_refresh_preserves_historical_squash_tree(tmp_path: Path) -> None:
+    _, trees = _squash_git_history(tmp_path)
+
+    def watcher_result(base_sha: str, merge_tree_sha: str) -> ToolResult:
+        return ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    "pr_number": 99,
+                    "found": True,
+                    "merged": True,
+                    "head_sha": trees["pr_head"],
+                    "base_sha": base_sha,
+                    "base_branch": "main",
+                    "pr_state": "closed",
+                    "pr_head_tree_sha": trees["pr_head_tree"],
+                    "merge_tree_sha": merge_tree_sha,
+                    "merge_commit_sha": trees["merge_commit"],
+                    "merge_commit_tree_sha": trees["merge_commit_tree"],
+                },
+            }
+        )
+
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+
+    class RefreshClient:
+        def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
+            assert pr_number == 99
+            return watcher_result(trees["advanced_parent"], trees["current_prospective"])
+
+    refreshed = _refresh_post_merge_evidence(
+        state.slices["slice-a"], TLLoopConfig(active=True), RefreshClient()
+    )
+    assert refreshed is not None
+    assert refreshed["merge_tree_sha"] == trees["current_prospective"]
+    observation = _watcher_result_observation(
+        watcher_result(trees["advanced_parent"], trees["current_prospective"])
+    )
+    assert isinstance(observation, WatcherObservation)
+    evidence = {
+        **_watcher_merge_evidence(observation),
+        "repository": "org/repo",
+        "parent_branch": "main",
+        "lane_epoch": 7,
+    }
+    adopted = _adopt_post_merge_slice(
+        state.slices["slice-a"],
+        state,
+        99,
+        "merge-journal",
+        "post_merge_recovery",
+        evidence,
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": adopted},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    refreshed = _refresh_post_merge_evidence(
+        state.slices["slice-a"], TLLoopConfig(active=True), RefreshClient()
+    )
+    assert refreshed is not None
+    assert refreshed["merge_tree_sha"] == trees["current_prospective"]
+    refreshed_slice = _attach_forgejo_merge_evidence(
+        state.slices["slice-a"], _forgejo_merge_evidence(refreshed)
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": refreshed_slice},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    persisted = dict(state.slices["slice-a"].post_merge.evidence)
+    assert persisted["prospective_merge_tree_sha"] == trees["historical_prospective"]
+    assert persisted["forgejo_merge_commit_tree_sha"] == trees["merge_commit_tree"]
+
+    class RemoteReconcileClient:
+        def post_merge_remote_reconcile(self, **arguments: object) -> ToolResult:
+            proof = {
+                "kind": "squash",
+                "pr_number": arguments["pr_number"],
+                "pr_head_sha": arguments["merged_head_sha"],
+                "merge_commit_sha": arguments["expected_base_sha"],
+                "pr_head_tree_sha": arguments["reviewed_pr_head_tree_sha"],
+                "merge_commit_tree_sha": arguments["forgejo_merge_commit_tree_sha"],
+                "prospective_merge_tree_sha": arguments["prospective_merge_tree_sha"],
+                "reviewed_pr_head_tree_sha": arguments["reviewed_pr_head_tree_sha"],
+                "forgejo_merged": True,
+                "forgejo_head_sha": arguments["forgejo_head_sha"],
+                "forgejo_pr_number": arguments["forgejo_pr_number"],
+                "forgejo_merge_commit_sha": arguments["forgejo_merge_commit_sha"],
+                "forgejo_merge_commit_tree_sha": arguments["forgejo_merge_commit_tree_sha"],
+            }
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        **arguments,
+                        "parent_commit_sha": "rebuilt-bookkeeping",
+                        "rebuilt_commit_sha": "rebuilt-bookkeeping",
+                        "remote_head_sha": trees["advanced_parent"],
+                        "new_base_sha": trees["advanced_parent"],
+                        "remote_ancestry_proof": (
+                            "ancestor:" + trees["advanced_parent"] + "->rebuilt-bookkeeping"
+                        ),
+                        "ancestry_proof": "squash-tree-match",
+                        "merge_integration_proof": proof,
+                    },
+                }
+            )
+
+    journal = EffectJournal("advanced-parent", tmp_path / "advanced-parent-journal.json")
+    arguments, payload = _remote_reconcile_effect(
+        state.slices["slice-a"],
+        99,
+        persisted,
+        TLLoopConfig(active=True, ledger_run_id="advanced-parent"),
+        RemoteReconcileClient(),
+        journal,
+        expected_base_sha=trees["merge_commit"],
+    )
+    assert arguments["prospective_merge_tree_sha"] == trees["historical_prospective"]
+    assert arguments["forgejo_merge_commit_tree_sha"] == trees["merge_commit_tree"]
+    assert payload["new_base_sha"] == trees["advanced_parent"]

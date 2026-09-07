@@ -450,6 +450,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advanced_parent_has_distinct_prospective_squash_tree() {
+        use std::process::Command;
+
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let repo = tempfile::tempdir().expect("repo");
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        git(repo.path(), &["branch", "-M", "main"]);
+        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write base");
+        git(repo.path(), &["add", "base.txt"]);
+        git(repo.path(), &["commit", "-qm", "base"]);
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+        git(repo.path(), &["switch", "-c", "feature"]);
+        std::fs::write(repo.path().join("feature.txt"), "feature\n").expect("write feature");
+        git(repo.path(), &["add", "feature.txt"]);
+        git(repo.path(), &["commit", "-qm", "feature"]);
+        let pr_head = git(repo.path(), &["rev-parse", "HEAD"]);
+        git(repo.path(), &["switch", "main"]);
+        git(repo.path(), &["merge", "--squash", "feature"]);
+        git(repo.path(), &["commit", "-qm", "squash"]);
+        let merge_commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let merge_commit_tree = git(
+            repo.path(),
+            &["rev-parse", &format!("{merge_commit}^{{tree}}")],
+        );
+        let historical_prospective = git(
+            repo.path(),
+            &["merge-tree", "--write-tree", &base, &pr_head],
+        );
+        std::fs::write(repo.path().join("later.txt"), "later parent change\n")
+            .expect("write later parent");
+        git(repo.path(), &["add", "later.txt"]);
+        git(repo.path(), &["commit", "-qm", "advance parent"]);
+        let advanced_parent = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let observed = observe_merge_evidence(
+            repo.path().to_str().expect("repo path"),
+            &advanced_parent,
+            &pr_head,
+            Some(&merge_commit),
+        )
+        .await
+        .expect("collector should observe squash evidence");
+
+        assert_eq!(
+            observed.merge_commit_tree_sha.as_deref(),
+            Some(merge_commit_tree.as_str())
+        );
+        assert_eq!(historical_prospective, merge_commit_tree);
+        assert_ne!(observed.merge_tree_sha, merge_commit_tree);
+    }
+
+    #[tokio::test]
     async fn missing_pr_head_is_recovered_from_pull_ref_once() {
         use std::process::Command;
 

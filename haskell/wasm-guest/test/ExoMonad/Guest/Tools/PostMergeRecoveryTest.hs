@@ -249,6 +249,7 @@ postMergeRecoveryTests =
                 Nothing
                 Nothing
                 Nothing
+                Nothing
             responses =
               [ processResponse 0 "main" "",
                 processResponse 0 "" "",
