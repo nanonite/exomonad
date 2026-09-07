@@ -6,8 +6,8 @@ import Control.Monad.Freer (run)
 import Control.Monad.Freer.Coroutine (Status (Continue, Done), runC)
 import Data.Aeson (Value, decode, encode, object, toJSON, (.=))
 import Data.ByteString qualified as BS
-import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.ByteString.Lazy qualified as BL
+import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.Int (Int32)
 import Data.List qualified as List
 import Data.Text (Text)
@@ -21,19 +21,19 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
     PostMergeParentSyncArgs (..),
     PostMergePushArgs (..),
     interpretGitResult,
-    postMergeChangelogCore,
     postMergeChangelogCommitArgs,
-    postMergeChangelogStageArgs,
+    postMergeChangelogCore,
     postMergeChangelogSchema,
+    postMergeChangelogStageArgs,
     postMergeParentSyncCore,
     postMergeParentSyncFetchArgs,
     postMergeParentSyncMergeArgs,
+    postMergeParentSyncSchema,
+    postMergePushGitArgs,
+    postMergePushSchema,
     postMergeRemoteReconcileCore,
     postMergeRemoteReconcileRebaseArgs,
     postMergeRemoteReconcileSchema,
-    postMergeParentSyncSchema,
-    postMergePushGitArgs,
-    postMergePushSchema
   )
 import Proto3.Suite.Class (toLazyByteString)
 import Test.Tasty (TestTree, testGroup)
@@ -63,6 +63,8 @@ postMergeRecoveryTests =
                 "merge-head"
                 "base-head"
                 7
+                Nothing
+                Nothing
                 Nothing
                 Nothing
                 Nothing
@@ -183,7 +185,9 @@ postMergeRecoveryTests =
                 (Just True)
                 (Just "pr-head")
                 (Just "merge-commit")
-                (Just "tree-a")
+                (Just "merged-tree-a")
+                (Just "merged-tree-a")
+                (Just "pr-tree-a")
             responses =
               [ processResponse 0 "main" "",
                 processResponse 0 "" "",
@@ -191,8 +195,8 @@ postMergeRecoveryTests =
                 processResponse 0 "merge-commit" "",
                 processResponse 0 "merge-commit" "",
                 processResponse 1 "" "",
-                processResponse 0 "tree-a" "",
-                processResponse 0 "tree-a" ""
+                processResponse 0 "pr-tree-a" "",
+                processResponse 0 "merged-tree-a" ""
               ]
         assertEqual
           "squash proof receipt"
@@ -207,18 +211,21 @@ postMergeRecoveryTests =
                     "lane_epoch" .= (7 :: Int),
                     "parent_commit_sha" .= ("merge-commit" :: Text),
                     "remote_head_sha" .= ("merge-commit" :: Text),
-                    "ancestry_proof" .= ("squash-tree-equality" :: Text),
+                    "ancestry_proof" .= ("squash-tree-match" :: Text),
                     "merge_integration_proof"
                       .= object
                         [ "kind" .= ("squash" :: Text),
                           "pr_number" .= (43 :: Int),
                           "pr_head_sha" .= ("pr-head" :: Text),
                           "merge_commit_sha" .= ("merge-commit" :: Text),
-                          "pr_head_tree_sha" .= ("tree-a" :: Text),
-                          "merge_commit_tree_sha" .= ("tree-a" :: Text),
-                          "reviewed_pr_head_tree_sha" .= ("tree-a" :: Text),
+                          "pr_head_tree_sha" .= ("pr-tree-a" :: Text),
+                          "merge_commit_tree_sha" .= ("merged-tree-a" :: Text),
+                          "reviewed_pr_head_tree_sha" .= ("pr-tree-a" :: Text),
+                          "prospective_merge_tree_sha" .= ("merged-tree-a" :: Text),
                           "forgejo_merged" .= True,
                           "forgejo_head_sha" .= ("pr-head" :: Text),
+                          "forgejo_merge_commit_sha" .= ("merge-commit" :: Text),
+                          "forgejo_merge_commit_tree_sha" .= ("merged-tree-a" :: Text),
                           "forgejo_pr_number" .= (43 :: Int)
                         ]
                   ]
@@ -235,6 +242,7 @@ postMergeRecoveryTests =
                 "pr-head"
                 "base-head"
                 7
+                Nothing
                 Nothing
                 Nothing
                 Nothing
@@ -262,12 +270,12 @@ postMergeRecoveryTests =
                 processResponse 0 "merge-commit" "",
                 processResponse 0 "merge-commit" "",
                 processResponse 1 "" "",
-                processResponse 0 "tree-a" "",
-                processResponse 0 "tree-b" ""
+                processResponse 0 "pr-tree-a" "",
+                processResponse 0 "wrong-authoritative-tree" ""
               ]
         assertEqual
           "divergent tree is rejected"
-          (Left "squash merge proof found a divergent merge tree")
+          (Left "squash merge proof disagrees with the authoritative merge tree")
           (runParentSync args responses),
       testCase "tree equality without authoritative Forgejo binding is rejected" $ do
         let args =
@@ -279,6 +287,8 @@ postMergeRecoveryTests =
                 "pr-head"
                 "base-head"
                 7
+                Nothing
+                Nothing
                 Nothing
                 Nothing
                 Nothing
@@ -343,6 +353,8 @@ postMergeRecoveryTests =
                 Nothing
                 Nothing
                 Nothing
+                Nothing
+                Nothing
         assertEqual
           "remote reconciliation returns rebuilt evidence"
           ( Right
@@ -359,11 +371,88 @@ postMergeRecoveryTests =
                     "remote_head_sha" .= ("remote-head" :: Text),
                     "new_base_sha" .= ("remote-head" :: Text),
                     "remote_ancestry_proof" .= ("ancestor:remote-head->rebuilt-head" :: Text),
-                    "ancestry_proof" .= ("ancestor:merged-head->rebuilt-head" :: Text)
+                    "ancestry_proof" .= ("ancestor:merged-head->rebuilt-head" :: Text),
+                    "merge_integration_proof"
+                      .= object
+                        [ "kind" .= ("ancestry" :: Text),
+                          "pr_number" .= (43 :: Int),
+                          "pr_head_sha" .= ("merged-head" :: Text),
+                          "merge_commit_sha" .= ("rebuilt-head" :: Text),
+                          "ancestry" .= ("ancestor:merged-head->rebuilt-head" :: Text)
+                        ]
                   ]
               )
           )
           (runRemoteReconcile args),
+      testCase "squash remote reconciliation does not require PR-head ancestry" $ do
+        let args =
+              PostMergeParentSyncArgs
+                "slice-a"
+                43
+                "org/repo"
+                "main"
+                "pr-head"
+                "merge-commit"
+                7
+                Nothing
+                (Just 43)
+                (Just True)
+                (Just "pr-head")
+                (Just "merge-commit")
+                (Just "merged-tree-a")
+                (Just "merged-tree-a")
+                (Just "pr-tree-a")
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "remote-head" "",
+                processResponse 0 "local-bookkeeping" "",
+                processResponse 0 "" "",
+                processResponse 0 "" "",
+                processResponse 0 "rebuilt-head" "",
+                processResponse 0 "remote-head" "",
+                processResponse 0 "" "",
+                processResponse 1 "" "",
+                processResponse 0 "pr-tree-a" "",
+                processResponse 0 "merged-tree-a" ""
+              ]
+        assertEqual
+          "squash remote proof receipt"
+          ( Right
+              ( object
+                  [ "child_id" .= ("slice-a" :: Text),
+                    "pr_number" .= (43 :: Int),
+                    "repository" .= ("org/repo" :: Text),
+                    "parent_branch" .= ("main" :: Text),
+                    "merged_head_sha" .= ("pr-head" :: Text),
+                    "expected_base_sha" .= ("merge-commit" :: Text),
+                    "lane_epoch" .= (7 :: Int),
+                    "parent_commit_sha" .= ("rebuilt-head" :: Text),
+                    "rebuilt_commit_sha" .= ("rebuilt-head" :: Text),
+                    "remote_head_sha" .= ("remote-head" :: Text),
+                    "new_base_sha" .= ("remote-head" :: Text),
+                    "remote_ancestry_proof" .= ("ancestor:remote-head->rebuilt-head" :: Text),
+                    "ancestry_proof" .= ("squash-tree-match" :: Text),
+                    "merge_integration_proof"
+                      .= object
+                        [ "kind" .= ("squash" :: Text),
+                          "pr_number" .= (43 :: Int),
+                          "pr_head_sha" .= ("pr-head" :: Text),
+                          "merge_commit_sha" .= ("merge-commit" :: Text),
+                          "pr_head_tree_sha" .= ("pr-tree-a" :: Text),
+                          "merge_commit_tree_sha" .= ("merged-tree-a" :: Text),
+                          "reviewed_pr_head_tree_sha" .= ("pr-tree-a" :: Text),
+                          "prospective_merge_tree_sha" .= ("merged-tree-a" :: Text),
+                          "forgejo_merged" .= True,
+                          "forgejo_head_sha" .= ("pr-head" :: Text),
+                          "forgejo_merge_commit_sha" .= ("merge-commit" :: Text),
+                          "forgejo_merge_commit_tree_sha" .= ("merged-tree-a" :: Text),
+                          "forgejo_pr_number" .= (43 :: Int)
+                        ]
+                  ]
+              )
+          )
+          (runRemoteReconcileWith responses args),
       testCase "schemas expose every boundary identity and CAS field" $ do
         let schemaText schema = L8.unpack (encode schema)
             parentSchema = schemaText postMergeParentSyncSchema
@@ -372,10 +461,10 @@ postMergeRecoveryTests =
             pushSchema = schemaText postMergePushSchema
         mapM_
           (\field -> assertBool ("parent schema field: " <> field) (List.isInfixOf field parentSchema))
-          ["child_id", "repository", "parent_branch", "merged_head_sha", "expected_base_sha", "lane_epoch"]
+          ["child_id", "repository", "parent_branch", "merged_head_sha", "expected_base_sha", "lane_epoch", "forgejo_merge_commit_sha", "forgejo_merge_commit_tree_sha", "prospective_merge_tree_sha"]
         mapM_
           (\field -> assertBool ("remote schema field: " <> field) (List.isInfixOf field remoteSchema))
-          ["child_id", "repository", "parent_branch", "merged_head_sha", "expected_base_sha", "lane_epoch"]
+          ["child_id", "repository", "parent_branch", "merged_head_sha", "expected_base_sha", "lane_epoch", "forgejo_merge_commit_sha", "forgejo_merge_commit_tree_sha", "prospective_merge_tree_sha"]
         mapM_
           (\field -> assertBool ("changelog schema field: " <> field) (List.isInfixOf field changelogSchema))
           ["child_id", "issue_id", "repository", "parent_branch", "expected_base_sha", "generation", "intent_id"]
@@ -408,7 +497,9 @@ squashArgs =
     (Just True)
     (Just "pr-head")
     (Just "merge-commit")
-    (Just "tree-a")
+    (Just "merged-tree-a")
+    (Just "merged-tree-a")
+    (Just "pr-tree-a")
 
 runParentSync :: PostMergeParentSyncArgs -> [Value] -> Either Text Value
 runParentSync args responses =
@@ -432,6 +523,15 @@ runRemoteReconcile args =
     handleResponses _ (Done result) = pure result
     handleResponses processCount (Continue request resume) =
       resume (remoteResponseFor processCount request)
+        >>= handleResponses (if erType request == "process.run" then processCount + 1 else processCount)
+
+runRemoteReconcileWith :: [Value] -> PostMergeParentSyncArgs -> Either Text Value
+runRemoteReconcileWith responses args =
+  run $ runC (postMergeRemoteReconcileCore args) >>= handleResponses 0
+  where
+    handleResponses _ (Done result) = pure result
+    handleResponses processCount (Continue request resume) =
+      resume (parentResponseFor responses processCount request)
         >>= handleResponses (if erType request == "process.run" then processCount + 1 else processCount)
 
 remoteResponseFor :: Int -> EffectRequest -> Value
@@ -478,5 +578,6 @@ encodedEffectResponse payload =
             ( toLazyByteString
                 (Envelope.EffectResponse (Just (Envelope.EffectResponseResultPayload payload)))
             )
-        ) :: [Word8]
+        ) ::
+        [Word8]
     )

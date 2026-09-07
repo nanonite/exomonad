@@ -581,6 +581,7 @@ Reviewer-Agent: review-pr-7-codex"
             merged: false,
             head_sha: Some("abc123".to_string()),
             base_sha: None,
+            merge_commit_sha: None,
         };
 
         let response = forgejo_pr_response(&pr);
@@ -608,6 +609,7 @@ Reviewer-Agent: review-pr-7-codex"
             merged: false,
             head_sha: None,
             base_sha: None,
+            merge_commit_sha: None,
         };
 
         let response = forgejo_pr_response(&pr);

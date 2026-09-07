@@ -2996,6 +2996,8 @@ def _adopt_post_merge_slice(
                 "forgejo_merged",
                 "forgejo_head_sha",
                 "forgejo_merge_commit_sha",
+                "forgejo_merge_commit_tree_sha",
+                "prospective_merge_tree_sha",
                 "reviewed_pr_head_tree_sha",
             )
             if key in current.reconciliation
@@ -3088,8 +3090,10 @@ def _forgejo_merge_evidence(evidence: Mapping[str, object]) -> dict[str, str]:
         result["forgejo_merged"] = "true" if merged else "false"
     for source, target in (
         ("head_sha", "forgejo_head_sha"),
+        ("pr_head_tree_sha", "reviewed_pr_head_tree_sha"),
         ("merge_commit_sha", "forgejo_merge_commit_sha"),
-        ("merge_tree_sha", "reviewed_pr_head_tree_sha"),
+        ("merge_commit_tree_sha", "forgejo_merge_commit_tree_sha"),
+        ("merge_tree_sha", "prospective_merge_tree_sha"),
     ):
         value = evidence.get(source, evidence.get(target))
         if isinstance(value, str) and value:
@@ -3100,9 +3104,21 @@ def _forgejo_merge_evidence(evidence: Mapping[str, object]) -> dict[str, str]:
 def _attach_forgejo_merge_evidence(current: SliceState, evidence: Mapping[str, str]) -> SliceState:
     if current.post_merge is None or not evidence:
         return current
+    proof_keys = {
+        "forgejo_pr_number",
+        "forgejo_merged",
+        "forgejo_head_sha",
+        "forgejo_merge_commit_sha",
+        "forgejo_merge_commit_tree_sha",
+        "prospective_merge_tree_sha",
+        "reviewed_pr_head_tree_sha",
+    }
+    retained = {
+        key: value for key, value in current.post_merge.evidence.items() if key not in proof_keys
+    }
     post_merge = replace(
         current.post_merge,
-        evidence={**current.post_merge.evidence, **evidence},
+        evidence={**retained, **evidence},
     )
     return replace(current, post_merge=post_merge)
 
@@ -3511,43 +3527,100 @@ def _validate_parent_sync_proof(
 ) -> None:
     proof = payload.get("merge_integration_proof")
     if proof is None:
-        # The exact legacy ancestry receipt remains valid for ancestry-preserving
-        # merges. A squash merge cannot reach this branch: its source head is
-        # not an ancestor of the fetched parent head, so the Haskell tool must
-        # return the structured squash proof below.
         return
-    if not isinstance(proof, Mapping):
-        raise TypeError("parent synchronization integration proof is not structured")
-    if str(proof.get("pr_number")) != str(arguments["pr_number"]):
-        raise ValueError("parent synchronization proof PR binding mismatch")
-    if proof.get("pr_head_sha") != arguments["merged_head_sha"]:
-        raise ValueError("parent synchronization proof head binding mismatch")
-    if proof.get("merge_commit_sha") != receipt["parent_commit_sha"]:
-        raise ValueError("parent synchronization proof merge commit mismatch")
-    kind = proof.get("kind")
-    if kind == "ancestry":
-        if proof.get("ancestry") != (
-            f"ancestor:{arguments['merged_head_sha']}->{receipt['parent_commit_sha']}"
+    _validate_structured_merge_proof(
+        proof,
+        arguments,
+        expected_merge_commit=receipt["parent_commit_sha"],
+        ancestry=f"ancestor:{arguments['merged_head_sha']}->{receipt['parent_commit_sha']}",
+        operation="parent synchronization",
+    )
+
+
+def _validate_remote_reconcile_proof(
+    payload: Mapping[str, object],
+    arguments: Mapping[str, object],
+    receipt: Mapping[str, str],
+) -> None:
+    proof = payload.get("merge_integration_proof")
+    if proof is None:
+        if receipt["ancestry_proof"] != (
+            f"ancestor:{arguments['merged_head_sha']}->{receipt['rebuilt_commit_sha']}"
         ):
-            raise ValueError("parent synchronization ancestry proof mismatch")
+            raise ValueError("remote rebuild receipt has unverifiable merge ancestry")
         return
-    if kind != "squash":
-        raise ValueError("parent synchronization proof kind is unsupported")
+    _validate_structured_merge_proof(
+        proof,
+        arguments,
+        expected_merge_commit=(
+            receipt["rebuilt_commit_sha"]
+            if isinstance(proof, Mapping) and proof.get("kind") == "ancestry"
+            else arguments["expected_base_sha"]
+        ),
+        ancestry=f"ancestor:{arguments['merged_head_sha']}->{receipt['rebuilt_commit_sha']}",
+        operation="remote rebuild",
+    )
+
+
+def _validate_structured_merge_proof(
+    proof: object,
+    arguments: Mapping[str, object],
+    *,
+    expected_merge_commit: object,
+    ancestry: str,
+    operation: str,
+) -> None:
+    if not isinstance(proof, Mapping):
+        raise TypeError(f"{operation} integration proof is not structured")
+    if str(proof.get("pr_number")) != str(arguments["pr_number"]):
+        raise ValueError(f"{operation} proof PR binding mismatch")
+    if proof.get("pr_head_sha") != arguments["merged_head_sha"]:
+        raise ValueError(f"{operation} proof head binding mismatch")
+    if proof.get("kind") == "ancestry":
+        if proof.get("merge_commit_sha") != expected_merge_commit:
+            raise ValueError(f"{operation} ancestry proof merge commit mismatch")
+        if proof.get("ancestry") != ancestry:
+            raise ValueError(f"{operation} ancestry proof mismatch")
+        return
+    if proof.get("kind") != "squash":
+        raise ValueError(f"{operation} proof kind is unsupported")
     if proof.get("forgejo_merged") is not True:
-        raise ValueError("parent synchronization squash proof is not Forgejo-merged")
-    if proof.get("forgejo_pr_number") != arguments.get("forgejo_pr_number"):
-        raise ValueError("parent synchronization squash proof PR binding mismatch")
-    if proof.get("forgejo_head_sha") != arguments.get("forgejo_head_sha"):
-        raise ValueError("parent synchronization squash proof head binding mismatch")
-    reviewed_tree = arguments.get("reviewed_pr_head_tree_sha")
-    if not isinstance(reviewed_tree, str) or not reviewed_tree:
-        raise ValueError("parent synchronization squash proof lacks reviewed tree evidence")
-    for field_name in ("pr_head_tree_sha", "merge_commit_tree_sha", "reviewed_pr_head_tree_sha"):
-        if proof.get(field_name) != reviewed_tree:
-            raise ValueError("parent synchronization squash proof tree identity mismatch")
-    forgejo_merge_commit = arguments.get("forgejo_merge_commit_sha")
-    if forgejo_merge_commit is not None and proof.get("merge_commit_sha") != forgejo_merge_commit:
-        raise ValueError("parent synchronization squash proof merge commit binding mismatch")
+        raise ValueError(f"{operation} squash proof is not Forgejo-merged")
+    required_fields = (
+        "forgejo_pr_number",
+        "forgejo_head_sha",
+        "forgejo_merge_commit_sha",
+        "forgejo_merge_commit_tree_sha",
+        "prospective_merge_tree_sha",
+        "reviewed_pr_head_tree_sha",
+    )
+    if any(field not in arguments for field in required_fields):
+        raise ValueError(f"{operation} squash proof lacks authoritative Forgejo evidence")
+    if proof.get("forgejo_pr_number") != arguments["forgejo_pr_number"]:
+        raise ValueError(f"{operation} squash proof PR binding mismatch")
+    if proof.get("forgejo_head_sha") != arguments["forgejo_head_sha"]:
+        raise ValueError(f"{operation} squash proof head binding mismatch")
+    if proof.get("forgejo_merge_commit_sha") != arguments["forgejo_merge_commit_sha"]:
+        raise ValueError(f"{operation} squash proof merge commit binding mismatch")
+    if proof.get("merge_commit_sha") != expected_merge_commit:
+        raise ValueError(f"{operation} squash proof merge commit mismatch")
+    if arguments["forgejo_merge_commit_sha"] != expected_merge_commit:
+        raise ValueError(f"{operation} squash proof expected base is not the Forgejo merge commit")
+    reviewed_tree = arguments["reviewed_pr_head_tree_sha"]
+    authoritative_tree = arguments["forgejo_merge_commit_tree_sha"]
+    prospective_tree = arguments["prospective_merge_tree_sha"]
+    if proof.get("reviewed_pr_head_tree_sha") != reviewed_tree:
+        raise ValueError(f"{operation} squash proof reviewed tree mismatch")
+    if proof.get("pr_head_tree_sha") != reviewed_tree:
+        raise ValueError(f"{operation} squash proof PR-head tree mismatch")
+    if proof.get("forgejo_merge_commit_tree_sha") != authoritative_tree:
+        raise ValueError(f"{operation} squash proof authoritative tree binding mismatch")
+    if proof.get("merge_commit_tree_sha") != authoritative_tree:
+        raise ValueError(f"{operation} squash proof merge tree mismatch")
+    if proof.get("prospective_merge_tree_sha") != prospective_tree:
+        raise ValueError(f"{operation} squash proof prospective tree mismatch")
+    if authoritative_tree != prospective_tree:
+        raise ValueError(f"{operation} squash proof found divergent prospective and authoritative merge trees")
 
 
 def _parent_sync_arguments(
@@ -3570,6 +3643,9 @@ def _parent_sync_arguments(
     forgejo_pr_number = evidence.get("forgejo_pr_number")
     forgejo_merged = evidence.get("forgejo_merged")
     forgejo_head_sha = evidence.get("forgejo_head_sha")
+    forgejo_merge_commit_sha = evidence.get("forgejo_merge_commit_sha")
+    forgejo_merge_commit_tree_sha = evidence.get("forgejo_merge_commit_tree_sha")
+    prospective_tree = evidence.get("prospective_merge_tree_sha")
     reviewed_tree = evidence.get("reviewed_pr_head_tree_sha")
     complete_forgejo_binding = (
         isinstance(forgejo_pr_number, str)
@@ -3578,6 +3654,12 @@ def _parent_sync_arguments(
         and forgejo_merged == "true"
         and isinstance(forgejo_head_sha, str)
         and bool(forgejo_head_sha)
+        and isinstance(forgejo_merge_commit_sha, str)
+        and bool(forgejo_merge_commit_sha)
+        and isinstance(forgejo_merge_commit_tree_sha, str)
+        and bool(forgejo_merge_commit_tree_sha)
+        and isinstance(prospective_tree, str)
+        and bool(prospective_tree)
         and isinstance(reviewed_tree, str)
         and bool(reviewed_tree)
     )
@@ -3587,12 +3669,12 @@ def _parent_sync_arguments(
                 "forgejo_pr_number": int(forgejo_pr_number),
                 "forgejo_merged": True,
                 "forgejo_head_sha": forgejo_head_sha,
+                "forgejo_merge_commit_sha": forgejo_merge_commit_sha,
+                "forgejo_merge_commit_tree_sha": forgejo_merge_commit_tree_sha,
+                "prospective_merge_tree_sha": prospective_tree,
                 "reviewed_pr_head_tree_sha": reviewed_tree,
             }
         )
-        forgejo_merge_commit = evidence.get("forgejo_merge_commit_sha")
-        if isinstance(forgejo_merge_commit, str) and forgejo_merge_commit:
-            arguments["forgejo_merge_commit_sha"] = forgejo_merge_commit
     return arguments
 
 
@@ -3658,10 +3740,10 @@ def _remote_reconcile_effect(
         f"ancestor:{payload['remote_head_sha']}->{payload['rebuilt_commit_sha']}"
     ):
         raise ValueError("remote rebuild receipt has unverifiable parent ancestry")
-    if payload["ancestry_proof"] != (
-        f"ancestor:{arguments['merged_head_sha']}->{payload['rebuilt_commit_sha']}"
-    ):
-        raise ValueError("remote rebuild receipt has unverifiable merge ancestry")
+    raw_payload = _merge_result_payload(result)
+    if raw_payload is None:
+        raise ValueError("remote rebuild returned no authoritative receipt")
+    _validate_remote_reconcile_proof(raw_payload, arguments, payload)
     return arguments, payload
 
 
@@ -4520,8 +4602,10 @@ def _watcher_merge_evidence(observation: object) -> dict[str, object]:
         "base_sha",
         "base_branch",
         "merged",
+        "pr_head_tree_sha",
         "merge_tree_sha",
         "merge_commit_sha",
+        "merge_commit_tree_sha",
     ):
         value = getattr(observation, name, None)
         if value is not None:

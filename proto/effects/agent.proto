@@ -448,6 +448,12 @@ message WatcherPrStateResponse {
   string review_body = 28;
   // Immutable Forgejo submission time for the selected exact-head review.
   string review_submitted_at = 29;
+  // Git tree of the exact Forgejo PR head commit, never the prospective merge tree.
+  string pr_head_tree_sha = 30;
+  // Forgejo's authoritative commit produced by merging this PR, when merged.
+  string merge_commit_sha = 31;
+  // Git tree resolved from the authoritative Forgejo merge commit.
+  string merge_commit_tree_sha = 32;
 }
 
 // ============================================================================

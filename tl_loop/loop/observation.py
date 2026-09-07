@@ -72,6 +72,9 @@ class WatcherObservation:
     review_state: str | None
     patch_digest: str | None
     merge_tree_sha: str | None
+    pr_head_tree_sha: str | None
+    merge_commit_sha: str | None
+    merge_commit_tree_sha: str | None
     head_branch: str | None
     base_branch: str | None
     head_reachable: bool | None
@@ -111,6 +114,9 @@ class WatcherObservation:
             review_state=_optional_text(raw.get("review_state")),
             patch_digest=_optional_text(raw.get("patch_digest")),
             merge_tree_sha=_optional_text(raw.get("merge_tree_sha")),
+            pr_head_tree_sha=_optional_text(raw.get("pr_head_tree_sha")),
+            merge_commit_sha=_optional_text(raw.get("merge_commit_sha")),
+            merge_commit_tree_sha=_optional_text(raw.get("merge_commit_tree_sha")),
             head_branch=_optional_text(raw.get("head_branch")),
             base_branch=_optional_text(raw.get("base_branch")),
             head_reachable=_optional_bool(raw.get("head_reachable")),
@@ -155,6 +161,9 @@ class WatcherObservation:
             "review_state",
             "ci_status",
             "pr_state",
+            "pr_head_tree_sha",
+            "merge_commit_sha",
+            "merge_commit_tree_sha",
             "merged",
             "head_reachable",
             "evidence_error",
@@ -188,6 +197,9 @@ class WatcherObservation:
             review_state=self.review_state,
             patch_digest=self.patch_digest,
             merge_tree_sha=self.merge_tree_sha,
+            pr_head_tree_sha=self.pr_head_tree_sha,
+            merge_commit_sha=self.merge_commit_sha,
+            merge_commit_tree_sha=self.merge_commit_tree_sha,
             head_branch=self.head_branch,
             base_branch=self.base_branch,
             head_reachable=self.head_reachable,

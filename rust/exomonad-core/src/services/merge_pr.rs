@@ -34,6 +34,9 @@ pub struct MergeObservedEvidence {
     pub head_sha: String,
     pub patch_digest: String,
     pub merge_tree_sha: String,
+    pub pr_head_tree_sha: String,
+    pub merge_commit_sha: Option<String>,
+    pub merge_commit_tree_sha: Option<String>,
 }
 
 pub struct MergeAuthority<'a> {
@@ -126,6 +129,7 @@ pub async fn merge_pr_async(
             pr.base_ref.as_str(),
             actual_head,
             pr_number.as_u64(),
+            None,
         )
         .await
         {
@@ -236,7 +240,7 @@ pub async fn observe_pr_evidence(
 ) -> Result<MergeObservedEvidence> {
     let base_sha = authoritative_base_sha(dir, base_ref).await?;
     ensure_head_object(dir, head_sha, None).await?;
-    observe_merge_evidence(dir, &base_sha, head_sha).await
+    observe_merge_evidence(dir, &base_sha, head_sha, None).await
 }
 
 /// Observe PR evidence after attempting one bounded recovery of a missing
@@ -248,10 +252,11 @@ pub async fn observe_pr_evidence_for_pr(
     base_ref: &str,
     head_sha: &str,
     pr_number: u64,
+    merge_commit_sha: Option<&str>,
 ) -> Result<MergeObservedEvidence> {
     let base_sha = authoritative_base_sha(dir, base_ref).await?;
     ensure_head_object(dir, head_sha, Some(pr_number)).await?;
-    observe_merge_evidence(dir, &base_sha, head_sha).await
+    observe_merge_evidence(dir, &base_sha, head_sha, merge_commit_sha).await
 }
 
 async fn ensure_head_object(dir: &str, head_sha: &str, pr_number: Option<u64>) -> Result<()> {
@@ -299,6 +304,7 @@ async fn observe_merge_evidence(
     dir: &str,
     base_sha: &str,
     head_sha: &str,
+    merge_commit_sha: Option<&str>,
 ) -> Result<MergeObservedEvidence> {
     let diff = run_git_bytes(
         dir,
@@ -316,12 +322,30 @@ async fn observe_merge_evidence(
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("git merge-tree returned no tree SHA"))?;
+    let pr_head_tree_sha = commit_tree_sha(dir, head_sha).await?;
+    let merge_commit_sha = merge_commit_sha
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let merge_commit_tree_sha = match merge_commit_sha.as_deref() {
+        Some(commit_sha) => Some(commit_tree_sha(dir, commit_sha).await?),
+        None => None,
+    };
     Ok(MergeObservedEvidence {
         base_sha: base_sha.to_string(),
         head_sha: head_sha.to_string(),
         patch_digest: format!("{:x}", Sha256::digest(&diff)),
         merge_tree_sha: merge_tree_sha.to_string(),
+        pr_head_tree_sha,
+        merge_commit_sha,
+        merge_commit_tree_sha,
     })
+}
+
+async fn commit_tree_sha(dir: &str, commit_sha: &str) -> Result<String> {
+    let commit_object = format!("{commit_sha}^{{commit}}");
+    run_git(dir, &["rev-parse", "--verify", &commit_object]).await?;
+    let tree_object = format!("{commit_sha}^{{tree}}");
+    run_git(dir, &["rev-parse", "--verify", &tree_object]).await
 }
 
 async fn run_git(dir: &str, args: &[&str]) -> Result<String> {
@@ -404,6 +428,9 @@ mod tests {
             head_sha: "head".to_string(),
             patch_digest: "patch".to_string(),
             merge_tree_sha: "tree".to_string(),
+            pr_head_tree_sha: "pr-tree".to_string(),
+            merge_commit_sha: None,
+            merge_commit_tree_sha: None,
         };
         for (label, value) in [
             ("base", "other-base"),

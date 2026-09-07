@@ -270,6 +270,7 @@ mod tests {
             merged,
             head_sha: head_sha.map(ToString::to_string),
             base_sha: None,
+            merge_commit_sha: None,
         }
     }
 

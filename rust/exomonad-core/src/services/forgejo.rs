@@ -43,6 +43,7 @@ pub struct ForgejoPullRequest {
     pub merged: bool,
     pub head_sha: Option<String>,
     pub base_sha: Option<String>,
+    pub merge_commit_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +166,8 @@ struct PullRequestResponse {
     state: String,
     #[serde(default)]
     merged: bool,
+    #[serde(default)]
+    merge_commit_sha: Option<String>,
     html_url: Option<String>,
     url: Option<String>,
     head: PullRequestBranch,
@@ -1912,6 +1915,7 @@ impl TryFrom<PullRequestResponse> for ForgejoPullRequest {
             merged: value.merged,
             head_sha: value.head.sha,
             base_sha: value.base.sha,
+            merge_commit_sha: value.merge_commit_sha,
         })
     }
 }
@@ -2404,6 +2408,7 @@ mod tests {
             body: String::new(),
             state: "open".to_string(),
             merged: false,
+            merge_commit_sha: None,
             html_url: None,
             url: None,
             head: PullRequestBranch {

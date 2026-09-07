@@ -780,6 +780,9 @@ fn watcher_pr_state_error(pr_number: u64, error: impl Into<String>) -> WatcherPr
         base_sha: String::new(),
         patch_digest: String::new(),
         merge_tree_sha: String::new(),
+        pr_head_tree_sha: String::new(),
+        merge_commit_sha: String::new(),
+        merge_commit_tree_sha: String::new(),
         pr_state: String::new(),
         merged: false,
         review_count: 0,
@@ -1949,6 +1952,7 @@ impl<
                 pr.base_ref.as_str(),
                 &head_sha,
                 pr_number,
+                pr.merge_commit_sha.as_deref(),
             )
             .await
             {
@@ -2095,6 +2099,18 @@ impl<
             merge_tree_sha: evidence
                 .as_ref()
                 .map(|value| value.merge_tree_sha.clone())
+                .unwrap_or_default(),
+            pr_head_tree_sha: evidence
+                .as_ref()
+                .map(|value| value.pr_head_tree_sha.clone())
+                .unwrap_or_default(),
+            merge_commit_sha: evidence
+                .as_ref()
+                .and_then(|value| value.merge_commit_sha.clone())
+                .unwrap_or_default(),
+            merge_commit_tree_sha: evidence
+                .as_ref()
+                .and_then(|value| value.merge_commit_tree_sha.clone())
                 .unwrap_or_default(),
             pr_state: pr.state,
             merged: pr.merged,
@@ -4838,6 +4854,7 @@ mod tests {
             merged: false,
             head_sha: Some("abc123".to_string()),
             base_sha: None,
+            merge_commit_sha: None,
         }
     }
 
@@ -5917,6 +5934,7 @@ mod tests {
             merged: false,
             head_sha: Some("abc123".to_string()),
             base_sha: None,
+            merge_commit_sha: None,
         }
     }
 

@@ -988,6 +988,7 @@ mod tests {
             merged: false,
             head_sha: None,
             base_sha: None,
+            merge_commit_sha: None,
         }
     }
 

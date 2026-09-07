@@ -34,6 +34,9 @@ watcherPrStateTests =
                   PA.watcherPrStateResponseBaseSha = TL.pack "base-a",
                   PA.watcherPrStateResponsePatchDigest = TL.pack "patch-a",
                   PA.watcherPrStateResponseMergeTreeSha = TL.pack "tree-a",
+                  PA.watcherPrStateResponsePrHeadTreeSha = TL.pack "pr-tree-a",
+                  PA.watcherPrStateResponseMergeCommitSha = TL.pack "merge-commit-a",
+                  PA.watcherPrStateResponseMergeCommitTreeSha = TL.pack "merge-tree-a",
                   PA.watcherPrStateResponseHeadReachable = True,
                   PA.watcherPrStateResponseEvidenceError = "",
                   PA.watcherPrStateResponsePublicationOwnershipVerified = True,
@@ -55,5 +58,8 @@ watcherPrStateTests =
             assertEqual "reviewer_agent_id" (Just (Aeson.toJSON ("review-pr-43-codex" :: String))) (KeyMap.lookup (Key.fromString "reviewer_agent_id") fields)
             assertEqual "reviewer_identity_error" (Just (Aeson.toJSON ("" :: String))) (KeyMap.lookup (Key.fromString "reviewer_identity_error") fields)
             assertEqual "review_body" (Just (Aeson.toJSON ("Looks good" :: String))) (KeyMap.lookup (Key.fromString "review_body") fields)
+            assertEqual "pr_head_tree_sha" (Just (Aeson.toJSON ("pr-tree-a" :: String))) (KeyMap.lookup (Key.fromString "pr_head_tree_sha") fields)
+            assertEqual "merge_commit_sha" (Just (Aeson.toJSON ("merge-commit-a" :: String))) (KeyMap.lookup (Key.fromString "merge_commit_sha") fields)
+            assertEqual "merge_commit_tree_sha" (Just (Aeson.toJSON ("merge-tree-a" :: String))) (KeyMap.lookup (Key.fromString "merge_commit_tree_sha") fields)
           _ -> assertFailure "watcher_pr_state projection must serialize as a JSON object"
     ]

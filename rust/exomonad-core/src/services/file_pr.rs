@@ -470,6 +470,7 @@ mod tests {
             merged: false,
             head_sha: head_sha.map(ToOwned::to_owned),
             base_sha: None,
+            merge_commit_sha: None,
         }
     }
 
