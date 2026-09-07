@@ -15,6 +15,7 @@ from tl_loop.loop.driver import (
     _advance_post_merge_boundary,
     _attach_forgejo_merge_evidence,
     _forgejo_merge_evidence,
+    _reconcile_merged_slice,
     _refresh_post_merge_evidence,
     _remote_reconcile_effect,
     _validate_parent_sync_proof,
@@ -495,3 +496,69 @@ def test_advanced_parent_refresh_preserves_historical_squash_tree(tmp_path: Path
     assert arguments["prospective_merge_tree_sha"] == trees["historical_prospective"]
     assert arguments["forgejo_merge_commit_tree_sha"] == trees["merge_commit_tree"]
     assert payload["new_base_sha"] == trees["advanced_parent"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pr_number", 44),
+        ("merged", False),
+        ("head_sha", "other-head"),
+        ("merge_commit_sha", "other-merge"),
+        ("merge_commit_tree_sha", "other-tree"),
+        ("pr_head_tree_sha", "other-pr-tree"),
+    ],
+)
+def test_conflicting_refreshed_identity_blocks_recovery(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _review_recovery_state(store)
+    evidence = {
+        "pr_number": 43,
+        "merged": True,
+        "head_sha": "pr-head",
+        "base_sha": "base-head",
+        "base_branch": "main",
+        "pr_state": "closed",
+        "pr_head_tree_sha": "pr-tree",
+        "merge_tree_sha": "merged-tree",
+        "merge_commit_sha": "merge-commit",
+        "merge_commit_tree_sha": "merged-tree",
+        "repository": "org/repo",
+        "parent_branch": "main",
+        "lane_epoch": 7,
+    }
+    adopted = _adopt_post_merge_slice(
+        state.slices["slice-a"],
+        state,
+        43,
+        "merge-journal",
+        "post_merge_recovery",
+        evidence,
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": adopted},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    conflicting = {**evidence, field: value}
+    blocked = _reconcile_merged_slice(
+        state,
+        "slice-a",
+        43,
+        "merge-journal",
+        TLLoopConfig(active=True),
+        object(),
+        store,
+        [],
+        boundary="post_merge_recovery",
+        merge_evidence=conflicting,
+    )
+
+    current = blocked.slices["slice-a"]
+    assert current.dispatch_error is not None
+    assert "conflicting refreshed Forgejo evidence" in current.dispatch_error
+    assert any(gate.name == "tl-post-merge-slice-a" for gate in blocked.gates)

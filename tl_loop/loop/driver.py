@@ -2915,10 +2915,18 @@ def _reconcile_merged_slice(
             f"cannot resolve recovered lane for merged PR #{pr_number}: {error}",
         )
     if merge_evidence and current.post_merge is not None:
-        current = _attach_forgejo_merge_evidence(
-            current,
-            _forgejo_merge_evidence(merge_evidence),
-        )
+        try:
+            current = _attach_forgejo_merge_evidence(
+                current,
+                _forgejo_merge_evidence(merge_evidence),
+            )
+        except ValueError as error:
+            return _block_post_merge_recovery(
+                store,
+                state,
+                slice_id,
+                f"cannot refresh merged PR #{pr_number} evidence: {error}",
+            )
         checkpoint_needed = True
     if integration != state.integration:
         checkpoint_needed = True
@@ -3102,24 +3110,26 @@ def _forgejo_merge_evidence(evidence: Mapping[str, object]) -> dict[str, str]:
 
 
 def _attach_forgejo_merge_evidence(current: SliceState, evidence: Mapping[str, str]) -> SliceState:
-    """Attach merge-time Forgejo proof without replacing historical evidence."""
+    """Attach merge-time Forgejo proof and reject identity conflicts."""
     if current.post_merge is None or not evidence:
         return current
-    proof_keys = {
+    immutable_keys = {
         "forgejo_pr_number",
         "forgejo_merged",
         "forgejo_head_sha",
         "forgejo_merge_commit_sha",
         "forgejo_merge_commit_tree_sha",
-        "prospective_merge_tree_sha",
         "reviewed_pr_head_tree_sha",
     }
     merged = dict(current.post_merge.evidence)
     for key, value in evidence.items():
         if key == "prospective_merge_tree_sha":
             continue
-        if key not in proof_keys or key not in merged:
-            merged[key] = value
+        if key in immutable_keys:
+            previous = merged.get(key)
+            if previous is not None and previous != value:
+                raise ValueError(f"conflicting refreshed Forgejo evidence for {key}")
+        merged[key] = value
     if "prospective_merge_tree_sha" not in merged:
         historical_tree = merged.get(
             "forgejo_merge_commit_tree_sha",
