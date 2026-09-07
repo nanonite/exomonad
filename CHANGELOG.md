@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Reject conflicting refreshed squash merge evidence (#1066)
 - Fix squash recovery after parent branch advancement (#1065)
 - Fix post-merge recovery for squash-merged pull requests (#1064)
 - Resolve repository identity at continuation so merged PRs can be adopted (#1062)
