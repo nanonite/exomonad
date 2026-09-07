@@ -2835,7 +2835,7 @@ def _refresh_post_merge_evidence(
     except (ConnectionError, IndexError, OSError, RuntimeError, TimeoutError):
         return None
     observation = _watcher_result_observation(watcher)
-    if observation is None or observation.merged is not True:
+    if observation is None:
         return None
     return _watcher_merge_evidence(observation)
 

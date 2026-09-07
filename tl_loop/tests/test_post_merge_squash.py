@@ -545,6 +545,28 @@ def test_conflicting_refreshed_identity_blocks_recovery(
     )
 
     conflicting = {**evidence, field: value}
+
+    class RefreshClient:
+        def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
+            assert pr_number == 99
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        **conflicting,
+                        "found": True,
+                        "pr_state": "closed",
+                    },
+                }
+            )
+
+    refreshed = _refresh_post_merge_evidence(
+        state.slices["slice-a"], TLLoopConfig(active=True), RefreshClient()
+    )
+    assert refreshed is not None
+    if field == "merged":
+        assert refreshed["merged"] is False
+
     blocked = _reconcile_merged_slice(
         state,
         "slice-a",
@@ -555,7 +577,7 @@ def test_conflicting_refreshed_identity_blocks_recovery(
         store,
         [],
         boundary="post_merge_recovery",
-        merge_evidence=conflicting,
+        merge_evidence=refreshed,
     )
 
     current = blocked.slices["slice-a"]
