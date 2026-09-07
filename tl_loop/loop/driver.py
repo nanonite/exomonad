@@ -2804,6 +2804,7 @@ def _execute_post_merge_recovery_intent(
             current.id,
             "post-merge recovery has no durable merge journal identity",
         )
+    merge_evidence = _refresh_post_merge_evidence(current, config, effects)
     result = _reconcile_merged_slice(
         state,
         current.id,
@@ -2814,8 +2815,29 @@ def _execute_post_merge_recovery_intent(
         store,
         effects_log,
         boundary="post_merge_recovery",
+        merge_evidence=merge_evidence,
     )
     return result
+
+
+def _refresh_post_merge_evidence(
+    current: SliceState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+) -> Mapping[str, object] | None:
+    """Re-read merged Forgejo identity before recovering an older checkpoint."""
+    if current.pr_number is None:
+        return None
+    if not config.active:
+        return None
+    try:
+        watcher = cast(EffectClient, effects).watcher_pr_state(pr_number=current.pr_number or 0)
+    except (ConnectionError, IndexError, OSError, RuntimeError, TimeoutError):
+        return None
+    observation = _watcher_result_observation(watcher)
+    if observation is None or observation.merged is not True:
+        return None
+    return _watcher_merge_evidence(observation)
 
 
 def _reconcile_merged_slice(
@@ -2854,7 +2876,9 @@ def _reconcile_merged_slice(
                 # fire even for runs that never touch a merged PR). Retried
                 # once, immediately, so the adoption below still completes
                 # within this same call when the effect succeeds.
-                state = _heal_missing_repository_identity(state, config, effects, effects_log, store)
+                state = _heal_missing_repository_identity(
+                    state, config, effects, effects_log, store
+                )
                 if state.repository_identity is None:
                     return state
                 try:
@@ -2890,6 +2914,12 @@ def _reconcile_merged_slice(
             slice_id,
             f"cannot resolve recovered lane for merged PR #{pr_number}: {error}",
         )
+    if merge_evidence and current.post_merge is not None:
+        current = _attach_forgejo_merge_evidence(
+            current,
+            _forgejo_merge_evidence(merge_evidence),
+        )
+        checkpoint_needed = True
     if integration != state.integration:
         checkpoint_needed = True
     if checkpoint_needed:
@@ -2957,7 +2987,19 @@ def _adopt_post_merge_slice(
             action=None,
             dispatch_last_boundary=boundary,
         )
-    evidence = merge_evidence or {}
+    evidence = dict(merge_evidence or {})
+    if not evidence and isinstance(current.reconciliation, Mapping):
+        evidence = {
+            key: current.reconciliation[key]
+            for key in (
+                "forgejo_pr_number",
+                "forgejo_merged",
+                "forgejo_head_sha",
+                "forgejo_merge_commit_sha",
+                "reviewed_pr_head_tree_sha",
+            )
+            if key in current.reconciliation
+        }
     head_sha = _required_merge_identity(
         evidence,
         ("head_sha", "expected_head_sha"),
@@ -3015,6 +3057,7 @@ def _adopt_post_merge_slice(
             key not in {"confirmed_stage", "next_action"} and not isinstance(value, list)
         ):
             reconciliation[key] = default
+    authoritative = _forgejo_merge_evidence(evidence)
     reconciliation.update(
         {
             "merge_base_sha": expected_base_sha,
@@ -3022,11 +3065,46 @@ def _adopt_post_merge_slice(
             "merge_journal_id": merge_journal_id,
         }
     )
+    adopted = _attach_forgejo_merge_evidence(adopted, authoritative)
     return replace(
         adopted,
         dispatch_last_boundary=boundary,
         reconciliation=reconciliation,
     )
+
+
+def _forgejo_merge_evidence(evidence: Mapping[str, object]) -> dict[str, str]:
+    """Persist only typed Forgejo fields needed by squash proof validation."""
+    result: dict[str, str] = {}
+    pr_number = evidence.get("pr_number", evidence.get("forgejo_pr_number"))
+    if isinstance(pr_number, str) and pr_number.isdigit():
+        pr_number = int(pr_number)
+    if type(pr_number) is int and pr_number > 0:
+        result["forgejo_pr_number"] = str(pr_number)
+    merged = evidence.get("merged", evidence.get("forgejo_merged"))
+    if isinstance(merged, str) and merged in {"true", "false"}:
+        merged = merged == "true"
+    if type(merged) is bool:
+        result["forgejo_merged"] = "true" if merged else "false"
+    for source, target in (
+        ("head_sha", "forgejo_head_sha"),
+        ("merge_commit_sha", "forgejo_merge_commit_sha"),
+        ("merge_tree_sha", "reviewed_pr_head_tree_sha"),
+    ):
+        value = evidence.get(source, evidence.get(target))
+        if isinstance(value, str) and value:
+            result[target] = value
+    return result
+
+
+def _attach_forgejo_merge_evidence(current: SliceState, evidence: Mapping[str, str]) -> SliceState:
+    if current.post_merge is None or not evidence:
+        return current
+    post_merge = replace(
+        current.post_merge,
+        evidence={**current.post_merge.evidence, **evidence},
+    )
+    return replace(current, post_merge=post_merge)
 
 
 def _required_merge_identity(
@@ -3413,11 +3491,63 @@ def _parent_sync_effect(
         raise ValueError("parent synchronization receipt mismatch for lane_epoch")
     if payload["parent_commit_sha"] != payload["remote_head_sha"]:
         raise ValueError("parent synchronization returned divergent local and remote heads")
-    if payload["ancestry_proof"] != (
-        f"ancestor:{arguments['merged_head_sha']}->{payload['parent_commit_sha']}"
+    raw_payload = _merge_result_payload(result)
+    if raw_payload is None:
+        raise ValueError("parent synchronization returned no authoritative receipt")
+    if (
+        payload["ancestry_proof"]
+        != (f"ancestor:{arguments['merged_head_sha']}->{payload['parent_commit_sha']}")
+        and "merge_integration_proof" not in raw_payload
     ):
         raise ValueError("parent synchronization returned unverifiable ancestry evidence")
+    _validate_parent_sync_proof(raw_payload, arguments, payload)
     return arguments, payload
+
+
+def _validate_parent_sync_proof(
+    payload: Mapping[str, object],
+    arguments: Mapping[str, object],
+    receipt: Mapping[str, str],
+) -> None:
+    proof = payload.get("merge_integration_proof")
+    if proof is None:
+        # The exact legacy ancestry receipt remains valid for ancestry-preserving
+        # merges. A squash merge cannot reach this branch: its source head is
+        # not an ancestor of the fetched parent head, so the Haskell tool must
+        # return the structured squash proof below.
+        return
+    if not isinstance(proof, Mapping):
+        raise TypeError("parent synchronization integration proof is not structured")
+    if str(proof.get("pr_number")) != str(arguments["pr_number"]):
+        raise ValueError("parent synchronization proof PR binding mismatch")
+    if proof.get("pr_head_sha") != arguments["merged_head_sha"]:
+        raise ValueError("parent synchronization proof head binding mismatch")
+    if proof.get("merge_commit_sha") != receipt["parent_commit_sha"]:
+        raise ValueError("parent synchronization proof merge commit mismatch")
+    kind = proof.get("kind")
+    if kind == "ancestry":
+        if proof.get("ancestry") != (
+            f"ancestor:{arguments['merged_head_sha']}->{receipt['parent_commit_sha']}"
+        ):
+            raise ValueError("parent synchronization ancestry proof mismatch")
+        return
+    if kind != "squash":
+        raise ValueError("parent synchronization proof kind is unsupported")
+    if proof.get("forgejo_merged") is not True:
+        raise ValueError("parent synchronization squash proof is not Forgejo-merged")
+    if proof.get("forgejo_pr_number") != arguments.get("forgejo_pr_number"):
+        raise ValueError("parent synchronization squash proof PR binding mismatch")
+    if proof.get("forgejo_head_sha") != arguments.get("forgejo_head_sha"):
+        raise ValueError("parent synchronization squash proof head binding mismatch")
+    reviewed_tree = arguments.get("reviewed_pr_head_tree_sha")
+    if not isinstance(reviewed_tree, str) or not reviewed_tree:
+        raise ValueError("parent synchronization squash proof lacks reviewed tree evidence")
+    for field_name in ("pr_head_tree_sha", "merge_commit_tree_sha", "reviewed_pr_head_tree_sha"):
+        if proof.get(field_name) != reviewed_tree:
+            raise ValueError("parent synchronization squash proof tree identity mismatch")
+    forgejo_merge_commit = arguments.get("forgejo_merge_commit_sha")
+    if forgejo_merge_commit is not None and proof.get("merge_commit_sha") != forgejo_merge_commit:
+        raise ValueError("parent synchronization squash proof merge commit binding mismatch")
 
 
 def _parent_sync_arguments(
@@ -3427,7 +3557,7 @@ def _parent_sync_arguments(
     expected_base_sha: str,
     working_dir: str | None,
 ) -> dict[str, object]:
-    return {
+    arguments: dict[str, object] = {
         "child_id": current.id,
         "pr_number": pr_number,
         "repository": _required_merge_identity(evidence, ("repository",), "repository"),
@@ -3437,6 +3567,33 @@ def _parent_sync_arguments(
         "lane_epoch": _required_int(evidence, "lane_epoch", "lane epoch"),
         "working_dir": working_dir,
     }
+    forgejo_pr_number = evidence.get("forgejo_pr_number")
+    forgejo_merged = evidence.get("forgejo_merged")
+    forgejo_head_sha = evidence.get("forgejo_head_sha")
+    reviewed_tree = evidence.get("reviewed_pr_head_tree_sha")
+    complete_forgejo_binding = (
+        isinstance(forgejo_pr_number, str)
+        and forgejo_pr_number.isdigit()
+        and isinstance(forgejo_merged, str)
+        and forgejo_merged == "true"
+        and isinstance(forgejo_head_sha, str)
+        and bool(forgejo_head_sha)
+        and isinstance(reviewed_tree, str)
+        and bool(reviewed_tree)
+    )
+    if complete_forgejo_binding:
+        arguments.update(
+            {
+                "forgejo_pr_number": int(forgejo_pr_number),
+                "forgejo_merged": True,
+                "forgejo_head_sha": forgejo_head_sha,
+                "reviewed_pr_head_tree_sha": reviewed_tree,
+            }
+        )
+        forgejo_merge_commit = evidence.get("forgejo_merge_commit_sha")
+        if isinstance(forgejo_merge_commit, str) and forgejo_merge_commit:
+            arguments["forgejo_merge_commit_sha"] = forgejo_merge_commit
+    return arguments
 
 
 def _remote_reconcile_effect(
@@ -4353,11 +4510,19 @@ def _direct_compare_evidence_complete(watcher: ToolResult) -> bool:
 
 
 def _watcher_merge_evidence(observation: object) -> dict[str, object]:
-    """Copy only authoritative merge identity from a watcher observation."""
+    """Copy only authoritative Forgejo merge evidence from a watcher snapshot."""
     if observation is None:
         return {}
     values: dict[str, object] = {}
-    for name in ("head_sha", "base_sha", "base_branch"):
+    for name in (
+        "pr_number",
+        "head_sha",
+        "base_sha",
+        "base_branch",
+        "merged",
+        "merge_tree_sha",
+        "merge_commit_sha",
+    ):
         value = getattr(observation, name, None)
         if value is not None:
             values[name] = value

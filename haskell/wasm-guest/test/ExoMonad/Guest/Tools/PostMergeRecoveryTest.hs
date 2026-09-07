@@ -25,6 +25,7 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
     postMergeChangelogCommitArgs,
     postMergeChangelogStageArgs,
     postMergeChangelogSchema,
+    postMergeParentSyncCore,
     postMergeParentSyncFetchArgs,
     postMergeParentSyncMergeArgs,
     postMergeRemoteReconcileCore,
@@ -62,6 +63,11 @@ postMergeRecoveryTests =
                 "merge-head"
                 "base-head"
                 7
+                Nothing
+                Nothing
+                Nothing
+                Nothing
+                Nothing
                 Nothing
         assertEqual "parent sync JSON arguments" (Just expected) (decode (encode value))
         assertEqual
@@ -162,6 +168,150 @@ postMergeRecoveryTests =
           "stderr is preserved in the failure"
           (Left "git command failed (128): rejected by remote")
           (interpretGitResult 128 "ignored stdout" "rejected by remote\n"),
+      testCase "squash merge accepts exact Forgejo and Git tree proof" $ do
+        let args =
+              PostMergeParentSyncArgs
+                "slice-a"
+                43
+                "org/repo"
+                "main"
+                "pr-head"
+                "base-head"
+                7
+                Nothing
+                (Just 43)
+                (Just True)
+                (Just "pr-head")
+                (Just "merge-commit")
+                (Just "tree-a")
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 1 "" "",
+                processResponse 0 "tree-a" "",
+                processResponse 0 "tree-a" ""
+              ]
+        assertEqual
+          "squash proof receipt"
+          ( Right
+              ( object
+                  [ "child_id" .= ("slice-a" :: Text),
+                    "pr_number" .= (43 :: Int),
+                    "repository" .= ("org/repo" :: Text),
+                    "parent_branch" .= ("main" :: Text),
+                    "merged_head_sha" .= ("pr-head" :: Text),
+                    "expected_base_sha" .= ("base-head" :: Text),
+                    "lane_epoch" .= (7 :: Int),
+                    "parent_commit_sha" .= ("merge-commit" :: Text),
+                    "remote_head_sha" .= ("merge-commit" :: Text),
+                    "ancestry_proof" .= ("squash-tree-equality" :: Text),
+                    "merge_integration_proof"
+                      .= object
+                        [ "kind" .= ("squash" :: Text),
+                          "pr_number" .= (43 :: Int),
+                          "pr_head_sha" .= ("pr-head" :: Text),
+                          "merge_commit_sha" .= ("merge-commit" :: Text),
+                          "pr_head_tree_sha" .= ("tree-a" :: Text),
+                          "merge_commit_tree_sha" .= ("tree-a" :: Text),
+                          "reviewed_pr_head_tree_sha" .= ("tree-a" :: Text),
+                          "forgejo_merged" .= True,
+                          "forgejo_head_sha" .= ("pr-head" :: Text),
+                          "forgejo_pr_number" .= (43 :: Int)
+                        ]
+                  ]
+              )
+          )
+          (runParentSync args responses),
+      testCase "ancestry-preserving parent synchronization remains valid" $ do
+        let args =
+              PostMergeParentSyncArgs
+                "slice-a"
+                43
+                "org/repo"
+                "main"
+                "pr-head"
+                "base-head"
+                7
+                Nothing
+                Nothing
+                Nothing
+                Nothing
+                Nothing
+                Nothing
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "" ""
+              ]
+        assertEqual
+          "ancestry proof receipt"
+          (Right True)
+          (fmap (const True) (runParentSync args responses)),
+      testCase "squash merge rejects a divergent merge tree" $ do
+        let args = squashArgs
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 1 "" "",
+                processResponse 0 "tree-a" "",
+                processResponse 0 "tree-b" ""
+              ]
+        assertEqual
+          "divergent tree is rejected"
+          (Left "squash merge proof found a divergent merge tree")
+          (runParentSync args responses),
+      testCase "tree equality without authoritative Forgejo binding is rejected" $ do
+        let args =
+              PostMergeParentSyncArgs
+                "slice-a"
+                43
+                "org/repo"
+                "main"
+                "pr-head"
+                "base-head"
+                7
+                Nothing
+                Nothing
+                Nothing
+                Nothing
+                Nothing
+                (Just "tree-a")
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 1 "" "",
+                processResponse 0 "tree-a" "",
+                processResponse 0 "tree-a" ""
+              ]
+        assertEqual
+          "missing merged binding is rejected"
+          (Left "squash merge proof requires the authoritative Forgejo PR number")
+          (runParentSync args responses),
+      testCase "parent synchronization requires equal local and fetched remote heads" $ do
+        let args = squashArgs
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "" "",
+                processResponse 0 "local-head" "",
+                processResponse 0 "remote-head" ""
+              ]
+        assertEqual
+          "divergent local and remote heads are rejected"
+          (Left "parent synchronization produced divergent local and remote heads")
+          (runParentSync args responses),
       testCase "changelog core propagates a failed commit" $ do
         let args =
               PostMergeChangelogArgs
@@ -187,6 +337,11 @@ postMergeRecoveryTests =
                 "merged-head"
                 "old-base"
                 7
+                Nothing
+                Nothing
+                Nothing
+                Nothing
+                Nothing
                 Nothing
         assertEqual
           "remote reconciliation returns rebuilt evidence"
@@ -237,6 +392,38 @@ runChangelogWithFailedCommit args =
     handleResponses processCount (Continue request resume) =
       resume (responseFor processCount request)
         >>= handleResponses (if erType request == "process.run" then processCount + 1 else processCount)
+
+squashArgs :: PostMergeParentSyncArgs
+squashArgs =
+  PostMergeParentSyncArgs
+    "slice-a"
+    43
+    "org/repo"
+    "main"
+    "pr-head"
+    "base-head"
+    7
+    Nothing
+    (Just 43)
+    (Just True)
+    (Just "pr-head")
+    (Just "merge-commit")
+    (Just "tree-a")
+
+runParentSync :: PostMergeParentSyncArgs -> [Value] -> Either Text Value
+runParentSync args responses =
+  run $ runC (postMergeParentSyncCore args) >>= handleResponses 0
+  where
+    handleResponses _ (Done result) = pure result
+    handleResponses processCount (Continue request resume) =
+      resume (parentResponseFor responses processCount request)
+        >>= handleResponses (if erType request == "process.run" then processCount + 1 else processCount)
+
+parentResponseFor :: [Value] -> Int -> EffectRequest -> Value
+parentResponseFor responses processCount request
+  | erType request /= "process.run" = encodedEffectResponse BS.empty
+  | processCount < length responses = responses !! processCount
+  | otherwise = processResponse 1 "" "unexpected process request"
 
 runRemoteReconcile :: PostMergeParentSyncArgs -> Either Text Value
 runRemoteReconcile args =

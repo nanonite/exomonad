@@ -534,8 +534,13 @@ class EffectClient:
         expected_base_sha: str,
         lane_epoch: int,
         working_dir: str | None = None,
+        forgejo_pr_number: int | None = None,
+        forgejo_merged: bool | None = None,
+        forgejo_head_sha: str | None = None,
+        forgejo_merge_commit_sha: str | None = None,
+        reviewed_pr_head_tree_sha: str | None = None,
     ) -> ToolResult:
-        """Synchronize the parent lane and return verified ancestry evidence."""
+        """Synchronize the parent lane and return structured merge-integration evidence."""
         arguments: JsonObject = {
             "child_id": child_id,
             "pr_number": pr_number,
@@ -546,6 +551,11 @@ class EffectClient:
             "lane_epoch": lane_epoch,
         }
         _put(arguments, "working_dir", working_dir)
+        _put(arguments, "forgejo_pr_number", forgejo_pr_number)
+        _put(arguments, "forgejo_merged", forgejo_merged)
+        _put(arguments, "forgejo_head_sha", forgejo_head_sha)
+        _put(arguments, "forgejo_merge_commit_sha", forgejo_merge_commit_sha)
+        _put(arguments, "reviewed_pr_head_tree_sha", reviewed_pr_head_tree_sha)
         return self._call("post_merge_parent_sync", arguments)
 
     def post_merge_remote_reconcile(
@@ -559,6 +569,11 @@ class EffectClient:
         expected_base_sha: str,
         lane_epoch: int,
         working_dir: str | None = None,
+        forgejo_pr_number: int | None = None,
+        forgejo_merged: bool | None = None,
+        forgejo_head_sha: str | None = None,
+        forgejo_merge_commit_sha: str | None = None,
+        reviewed_pr_head_tree_sha: str | None = None,
     ) -> ToolResult:
         """Rebase local bookkeeping onto an advanced parent and return evidence."""
         arguments: JsonObject = {
@@ -571,6 +586,11 @@ class EffectClient:
             "lane_epoch": lane_epoch,
         }
         _put(arguments, "working_dir", working_dir)
+        _put(arguments, "forgejo_pr_number", forgejo_pr_number)
+        _put(arguments, "forgejo_merged", forgejo_merged)
+        _put(arguments, "forgejo_head_sha", forgejo_head_sha)
+        _put(arguments, "forgejo_merge_commit_sha", forgejo_merge_commit_sha)
+        _put(arguments, "reviewed_pr_head_tree_sha", reviewed_pr_head_tree_sha)
         return self._call("post_merge_remote_reconcile", arguments)
 
     def post_merge_changelog(

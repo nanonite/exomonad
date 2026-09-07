@@ -12,6 +12,7 @@
 module ExoMonad.Guest.Tools.PostMergeRecovery
   ( PostMergeParentSync,
     PostMergeParentSyncArgs (..),
+    MergeIntegrationProof (..),
     postMergeParentSyncCore,
     postMergeParentSyncFetchArgs,
     postMergeParentSyncMergeArgs,
@@ -41,7 +42,7 @@ where
 
 import Control.Monad (void)
 import Control.Monad.Freer (Eff, Member)
-import Data.Aeson (FromJSON (..), Value, object, withObject, (.:), (.:?), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Int (Int32)
 import Data.Map qualified as Map
@@ -68,6 +69,48 @@ data PostMergeParentSync
 
 data PostMergeRemoteReconcile
 
+-- | Git-verified evidence that the reviewed PR was integrated into the
+-- fetched parent head. Squash merges deliberately have no source-head
+-- ancestry, so their proof carries exact Forgejo binding and Git tree
+-- identities instead of manufacturing an ancestry string.
+data MergeIntegrationProof
+  = AncestryMergeIntegrationProof Int Text Text Text
+  | SquashMergeIntegrationProof Int Text Text Text Text Text Bool Text Int
+  deriving (Show, Eq)
+
+instance ToJSON MergeIntegrationProof where
+  toJSON proof = case proof of
+    AncestryMergeIntegrationProof prNumber prHead mergeCommit ancestry ->
+      object
+        [ "kind" .= ("ancestry" :: Text),
+          "pr_number" .= prNumber,
+          "pr_head_sha" .= prHead,
+          "merge_commit_sha" .= mergeCommit,
+          "ancestry" .= ancestry
+        ]
+    SquashMergeIntegrationProof
+      prNumber
+      prHead
+      mergeCommit
+      prTree
+      mergeTree
+      reviewedTree
+      forgejoMerged
+      forgejoHead
+      forgejoPr ->
+        object
+          [ "kind" .= ("squash" :: Text),
+            "pr_number" .= prNumber,
+            "pr_head_sha" .= prHead,
+            "merge_commit_sha" .= mergeCommit,
+            "pr_head_tree_sha" .= prTree,
+            "merge_commit_tree_sha" .= mergeTree,
+            "reviewed_pr_head_tree_sha" .= reviewedTree,
+            "forgejo_merged" .= forgejoMerged,
+            "forgejo_head_sha" .= forgejoHead,
+            "forgejo_pr_number" .= forgejoPr
+          ]
+
 data PostMergeParentSyncArgs = PostMergeParentSyncArgs
   { pmpChildId :: Text,
     pmpPrNumber :: Int,
@@ -76,7 +119,12 @@ data PostMergeParentSyncArgs = PostMergeParentSyncArgs
     pmpMergedHeadSha :: Text,
     pmpExpectedBaseSha :: Text,
     pmpLaneEpoch :: Int,
-    pmpWorkingDir :: Maybe Text
+    pmpWorkingDir :: Maybe Text,
+    pmpForgejoPrNumber :: Maybe Int,
+    pmpForgejoMerged :: Maybe Bool,
+    pmpForgejoHeadSha :: Maybe Text,
+    pmpForgejoMergeCommitSha :: Maybe Text,
+    pmpReviewedPrHeadTreeSha :: Maybe Text
   }
   deriving (Show, Eq, Generic)
 
@@ -91,6 +139,11 @@ instance FromJSON PostMergeParentSyncArgs where
       <*> v .: "expected_base_sha"
       <*> v .: "lane_epoch"
       <*> v .:? "working_dir"
+      <*> v .:? "forgejo_pr_number"
+      <*> v .:? "forgejo_merged"
+      <*> v .:? "forgejo_head_sha"
+      <*> v .:? "forgejo_merge_commit_sha"
+      <*> v .:? "reviewed_pr_head_tree_sha"
 
 data PostMergeChangelog
 
@@ -148,7 +201,7 @@ instance FromJSON PostMergePushArgs where
 
 postMergeParentSyncDescription :: Text
 postMergeParentSyncDescription =
-  "Synchronize a merged child into its parent branch and return Git-verified remote-head and ancestry evidence."
+  "Synchronize a merged child into its parent branch and return Git-verified remote-head and structured merge-integration evidence."
 
 postMergeParentSyncSchema :: Aeson.Object
 postMergeParentSyncSchema =
@@ -160,6 +213,11 @@ postMergeParentSyncSchema =
       ("merged_head_sha", "Exact merged child head SHA."),
       ("expected_base_sha", "Base SHA captured by the merge boundary."),
       ("lane_epoch", "Durable integration-lane epoch."),
+      ("forgejo_pr_number", "Authoritative Forgejo PR number bound to the merge evidence."),
+      ("forgejo_merged", "Authoritative Forgejo merged flag for the exact PR."),
+      ("forgejo_head_sha", "Authoritative Forgejo source head bound to the PR."),
+      ("forgejo_merge_commit_sha", "Optional authoritative Forgejo merge commit SHA."),
+      ("reviewed_pr_head_tree_sha", "Tree SHA reviewed for the exact PR head."),
       ("working_dir", "Optional relative repository working directory.")
     ]
 
@@ -177,6 +235,11 @@ postMergeRemoteReconcileSchema =
       ("merged_head_sha", "Exact merged child head SHA."),
       ("expected_base_sha", "The stale parent base captured by the failed push."),
       ("lane_epoch", "Durable integration-lane epoch."),
+      ("forgejo_pr_number", "Authoritative Forgejo PR number bound to the merge evidence."),
+      ("forgejo_merged", "Authoritative Forgejo merged flag for the exact PR."),
+      ("forgejo_head_sha", "Authoritative Forgejo source head bound to the PR."),
+      ("forgejo_merge_commit_sha", "Optional authoritative Forgejo merge commit SHA."),
+      ("reviewed_pr_head_tree_sha", "Tree SHA reviewed for the exact PR head."),
       ("working_dir", "Optional relative repository working directory.")
     ]
 
@@ -243,7 +306,7 @@ instance MCPTool PostMergePush where
   toolSchema = postMergePushSchema
   toolHandlerEff args = either errorResult successResult <$> postMergePushCore args
 
-postMergeParentSyncCore :: PostMergeParentSyncArgs -> Eff Effects (Either Text Value)
+postMergeParentSyncCore :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Eff effs (Either Text Value)
 postMergeParentSyncCore args = do
   case validateParentSync args of
     Left err -> pure $ Left err
@@ -273,10 +336,10 @@ postMergeParentSyncCore args = do
                         (Right parent, Right remote)
                           | parent /= remote -> pure $ Left "parent synchronization produced divergent local and remote heads"
                           | otherwise -> do
-                              ancestry <- verifyAncestryAt (pmpWorkingDir args) (pmpMergedHeadSha args) parent
-                              case ancestry of
+                              integration <- verifyMergeIntegrationAt (pmpWorkingDir args) args parent
+                              case integration of
                                 Left err -> pure $ Left err
-                                Right proof ->
+                                Right integrationProof ->
                                   pure $
                                     Right
                                       ( object
@@ -289,7 +352,8 @@ postMergeParentSyncCore args = do
                                             "lane_epoch" .= pmpLaneEpoch args,
                                             "parent_commit_sha" .= parent,
                                             "remote_head_sha" .= remote,
-                                            "ancestry_proof" .= proof
+                                            "ancestry_proof" .= legacyProof integrationProof,
+                                            "merge_integration_proof" .= integrationProof
                                           ]
                                       )
                         _ -> pure $ Left "parent synchronization could not read authoritative heads"
@@ -545,6 +609,80 @@ verifyAncestryAt :: (Member SuspendYield effs) => Maybe Text -> Text -> Text -> 
 verifyAncestryAt workingDir mergedHead parent = do
   result <- runGitAt workingDir ["merge-base", "--is-ancestor", mergedHead, parent]
   pure $ fmap (const ("ancestor:" <> mergedHead <> "->" <> parent)) result
+
+verifyMergeIntegrationAt :: (Member SuspendYield effs) => Maybe Text -> PostMergeParentSyncArgs -> Text -> Eff effs (Either Text MergeIntegrationProof)
+verifyMergeIntegrationAt workingDir args parent = do
+  ancestry <- verifyAncestryAt workingDir (pmpMergedHeadSha args) parent
+  case ancestry of
+    Right proof ->
+      pure $
+        Right
+          ( AncestryMergeIntegrationProof
+              (pmpPrNumber args)
+              (pmpMergedHeadSha args)
+              parent
+              proof
+          )
+    Left err
+      | err /= "git command failed (1): " -> pure (Left err)
+      | otherwise -> verifySquashIntegrationAt workingDir args parent
+
+verifySquashIntegrationAt :: (Member SuspendYield effs) => Maybe Text -> PostMergeParentSyncArgs -> Text -> Eff effs (Either Text MergeIntegrationProof)
+verifySquashIntegrationAt workingDir args parent =
+  case squashEvidence args of
+    Left err -> pure (Left err)
+    Right (forgejoPr, forgejoHead, reviewedTree) -> do
+      prTree <- runGitAt workingDir ["rev-parse", pmpMergedHeadSha args <> "^{tree}"]
+      mergeTree <- runGitAt workingDir ["rev-parse", parent <> "^{tree}"]
+      case (prTree, mergeTree) of
+        (Right prTreeSha, Right mergeTreeSha)
+          | prTreeSha /= reviewedTree ->
+              pure $ Left "squash merge proof disagrees with the reviewed PR head tree"
+          | mergeTreeSha /= reviewedTree ->
+              pure $ Left "squash merge proof found a divergent merge tree"
+          | otherwise ->
+              case pmpForgejoMergeCommitSha args of
+                Just forgejoMergeCommit
+                  | forgejoMergeCommit /= parent ->
+                      pure $ Left "squash merge proof disagrees with the authoritative merge commit"
+                _ ->
+                  pure $
+                    Right
+                      ( SquashMergeIntegrationProof
+                          forgejoPr
+                          (pmpMergedHeadSha args)
+                          parent
+                          prTreeSha
+                          mergeTreeSha
+                          reviewedTree
+                          True
+                          forgejoHead
+                          forgejoPr
+                      )
+        _ -> pure $ Left "squash merge proof could not read Git tree identities"
+
+squashEvidence :: PostMergeParentSyncArgs -> Either Text (Int, Text, Text)
+squashEvidence args = do
+  forgejoPr <- maybe (Left "squash merge proof requires the authoritative Forgejo PR number") Right (pmpForgejoPrNumber args)
+  if forgejoPr /= pmpPrNumber args
+    then Left "squash merge proof PR number does not match the requested PR"
+    else pure ()
+  case pmpForgejoMerged args of
+    Just True -> pure ()
+    _ -> Left "squash merge proof requires authoritative Forgejo merged evidence"
+  forgejoHead <- maybe (Left "squash merge proof requires the authoritative Forgejo PR head") Right (pmpForgejoHeadSha args)
+  if forgejoHead /= pmpMergedHeadSha args
+    then Left "squash merge proof PR head does not match the requested head"
+    else pure ()
+  reviewedTree <- maybe (Left "squash merge proof requires the reviewed PR head tree") Right (pmpReviewedPrHeadTreeSha args)
+  if validToken reviewedTree
+    then Right (forgejoPr, forgejoHead, reviewedTree)
+    else Left "squash merge proof reviewed PR head tree is invalid"
+
+legacyProof :: MergeIntegrationProof -> Text
+legacyProof proof = case proof of
+  AncestryMergeIntegrationProof _ _ _ ancestry -> ancestry
+  SquashMergeIntegrationProof _ _ _ _ _ _ _ _ _ -> "squash-tree-equality"
 
 remoteRef :: Text -> Text
 remoteRef branch = "origin/" <> branch
