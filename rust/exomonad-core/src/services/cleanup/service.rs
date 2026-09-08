@@ -9,6 +9,8 @@ use crate::services::repo::get_repository_identity;
 use crate::services::Services;
 use anyhow::{bail, Result};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -23,6 +25,10 @@ pub struct VerifiedCleanupService {
     pub(super) git_worktree: Arc<GitWorktreeService>,
     pub(super) forgejo: Option<Arc<ForgejoClient>>,
     pub(super) mutex: Arc<MutexRegistry>,
+    #[cfg(test)]
+    pub(super) receipt_persist_calls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    pub(super) fail_receipt_persist_on: Arc<AtomicUsize>,
 }
 
 impl VerifiedCleanupService {
@@ -41,6 +47,10 @@ impl VerifiedCleanupService {
             git_worktree,
             forgejo,
             mutex,
+            #[cfg(test)]
+            receipt_persist_calls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_receipt_persist_on: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -58,15 +68,21 @@ impl VerifiedCleanupService {
         self.project_dir.join(".exo/cleanup/receipts")
     }
 
+    #[cfg(test)]
+    pub(super) fn fail_receipt_persist_on_call(&self, call: usize) {
+        self.fail_receipt_persist_on.store(call, Ordering::SeqCst);
+    }
+
     pub async fn plan(&self, request: &CleanupRequest) -> Result<CleanupPlan> {
         request.validate()?;
         let resources = self.discover_resources(request).await?;
         let requires_remote = resources.iter().any(|resource| {
-            resource.worktree_path.is_some()
-                || resource
-                    .identity
-                    .as_ref()
-                    .is_some_and(|identity| identity.topology == Topology::WorktreePerAgent)
+            !resource.resolver_only
+                && (resource.worktree_path.is_some()
+                    || resource
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.topology == Topology::WorktreePerAgent))
         });
         let (repository, repository_error) = if requires_remote {
             match get_repository_identity(&self.project_dir).await {
@@ -138,7 +154,7 @@ impl VerifiedCleanupService {
         let started_at = unix_timestamp();
         let result = async {
             let plan = self.plan(request).await?;
-            let mut receipt = in_progress_receipt(&plan, started_at);
+            let mut receipt = self.resume_or_create_receipt(&plan, started_at).await?;
             self.persist_receipt(&receipt).await?;
             self.execute_plan(&plan, &mut receipt).await?;
             receipt.finished_at = unix_timestamp();

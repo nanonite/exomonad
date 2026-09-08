@@ -23,6 +23,7 @@ impl VerifiedCleanupService {
             worktree_path: discovered_worktree,
             identity,
             mut identity_error,
+            resolver_only,
         } = resource;
         let resolved_working_dir = identity
             .as_ref()
@@ -104,22 +105,24 @@ impl VerifiedCleanupService {
             }
         }
 
-        if let Some(branch) = branch_name {
-            match local_branch_state(&self.project_dir, branch).await {
-                Ok(Some(sha)) => {
-                    local_branch = Some(branch.to_string());
-                    local_head_sha = Some(sha);
-                }
-                Ok(None) => {
-                    identity_error = Some("managed local branch is unavailable".to_string());
-                }
-                Err(error) => {
-                    identity_error = Some(format!("read local branch: {error}"));
+        if !resolver_only {
+            if let Some(branch) = branch_name {
+                match local_branch_state(&self.project_dir, branch).await {
+                    Ok(Some(sha)) => {
+                        local_branch = Some(branch.to_string());
+                        local_head_sha = Some(sha);
+                    }
+                    Ok(None) => {
+                        identity_error = Some("managed local branch is unavailable".to_string());
+                    }
+                    Err(error) => {
+                        identity_error = Some(format!("read local branch: {error}"));
+                    }
                 }
             }
         }
 
-        let (remote_branch, remote_head_sha, remote_error) =
+        let (remote_branch, remote_head_sha, remote_error) = if !resolver_only {
             if let (Some(repository), Some(branch)) = (repository, branch_name) {
                 match remote_branch_state(&self.project_dir, &repository.remote_name, branch).await
                 {
@@ -129,12 +132,15 @@ impl VerifiedCleanupService {
                 }
             } else {
                 (None, None, None)
-            };
+            }
+        } else {
+            (None, None, None)
+        };
 
         let (pull_request, pr_error) = self
             .pull_request_state(
                 branch_name,
-                worktree_path.is_some(),
+                worktree_path.is_some() && !resolver_only,
                 repository,
                 repository_error,
             )
@@ -152,7 +158,14 @@ impl VerifiedCleanupService {
                 || repository.is_some_and(|repo| branch == repo.base_branch)
                 || matches!(branch, "main" | "master" | "trunk" | "develop")
         });
-        let liveness = self.liveness(&agent_dir).await;
+        let liveness = if resolver_only
+            && !agent_dir.exists()
+            && worktree_path.as_ref().is_none_or(|path| !path.exists())
+        {
+            CleanupLiveness::Dead
+        } else {
+            self.liveness(&agent_dir).await
+        };
         let decision = candidate_decision(DecisionContext {
             identity: identity.as_ref(),
             identity_error: identity_error.as_deref(),
@@ -167,6 +180,7 @@ impl VerifiedCleanupService {
             pr_error: pr_error.as_deref(),
             head_matches_pull_request,
             remote_head_matches_pull_request,
+            resolver_only,
         });
         let agent_name = identity
             .as_ref()
@@ -175,6 +189,7 @@ impl VerifiedCleanupService {
         CleanupCandidate {
             id,
             managed: true,
+            resolver_only,
             agent_name,
             issue: read_active_issue(&agent_dir).await,
             agent_dir,

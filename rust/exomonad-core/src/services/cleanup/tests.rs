@@ -78,6 +78,7 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
         candidate_decision(DecisionContext {
             identity: Some(&identity),
             identity_error: None,
+            resolver_only: false,
             liveness: &CleanupLiveness::Dead,
             dirty: Some(false),
             protected: false,
@@ -97,6 +98,7 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
     assert!(!candidate_decision(DecisionContext {
         identity: Some(&identity),
         identity_error: None,
+        resolver_only: false,
         liveness: &CleanupLiveness::Dead,
         dirty: Some(false),
         protected: false,
@@ -144,6 +146,7 @@ fn remote_branch_head_must_match_the_pull_request_head() {
     assert!(!candidate_decision(DecisionContext {
         identity: Some(&identity),
         identity_error: None,
+        resolver_only: false,
         liveness: &CleanupLiveness::Dead,
         dirty: Some(false),
         protected: false,
@@ -164,6 +167,7 @@ fn duplicate_local_branches_are_refused() {
     let make_candidate = |id: &str| CleanupCandidate {
         id: id.to_string(),
         managed: true,
+        resolver_only: false,
         agent_name: id.to_string(),
         issue: None,
         agent_dir: PathBuf::from(".exo/agents").join(id),
@@ -257,6 +261,130 @@ async fn apply_is_idempotent_for_shared_agent_directory() {
     assert_eq!(persisted, receipt);
     let second = service.run(&request).await.unwrap();
     assert!(second.entries.is_empty());
+}
+
+#[tokio::test]
+async fn apply_resumes_an_interrupted_resolver_only_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+    );
+    let request = CleanupRequest {
+        apply: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let operation_id = "interrupted-cleanup";
+    let mut interrupted = in_progress_receipt(&plan, 1);
+    interrupted.operation_id = operation_id.to_string();
+    interrupted.entries[0].actions = vec!["remove_agent_directory".to_string()];
+    service.persist_receipt(&interrupted).await.unwrap();
+    tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+    let resumed_plan = service.plan(&request).await.unwrap();
+    let resumed = service
+        .resume_or_create_receipt(&resumed_plan, 2)
+        .await
+        .unwrap();
+    assert_eq!(resumed.operation_id, operation_id);
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.operation_id, operation_id);
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(resolver.get(&record.agent_name).await.is_none());
+}
+
+#[tokio::test]
+async fn receipt_persistence_failure_stops_before_resolver_deregistration() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+    );
+    service.fail_receipt_persist_on_call(3);
+    let request = CleanupRequest {
+        apply: true,
+        ..CleanupRequest::default()
+    };
+    assert!(service.run(&request).await.is_err());
+    assert!(!agent_dir.exists());
+    assert!(resolver.get(&record.agent_name).await.is_some());
+
+    service.fail_receipt_persist_on_call(0);
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(resolver.get(&record.agent_name).await.is_none());
+}
+
+#[tokio::test]
+async fn sweep_discovers_resolver_records_without_filesystem_resources() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::WorktreePerAgent);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+    );
+
+    let plan = service.plan(&CleanupRequest::default()).await.unwrap();
+    let candidate = &plan.candidates[0];
+    assert!(candidate.resolver_only);
+    assert_eq!(candidate.liveness, CleanupLiveness::Dead);
+    assert!(candidate.decision.is_cleanable());
+
+    let receipt = service
+        .run(&CleanupRequest {
+            apply: true,
+            ..CleanupRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(resolver.get(&record.agent_name).await.is_none());
 }
 
 #[tokio::test]

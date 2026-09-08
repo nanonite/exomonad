@@ -129,6 +129,8 @@ impl From<ForgejoPullRequest> for CleanupPullRequest {
 pub struct CleanupCandidate {
     pub id: String,
     pub managed: bool,
+    #[serde(default)]
+    pub resolver_only: bool,
     pub agent_name: String,
     pub issue: Option<String>,
     pub agent_dir: PathBuf,

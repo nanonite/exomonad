@@ -161,6 +161,7 @@ pub(super) struct DecisionContext<'a> {
     pub(super) pr_error: Option<&'a str>,
     pub(super) head_matches_pull_request: Option<bool>,
     pub(super) remote_head_matches_pull_request: Option<bool>,
+    pub(super) resolver_only: bool,
 }
 
 pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecision {
@@ -189,6 +190,9 @@ pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecisio
     }
     if context.protected {
         return CleanupDecision::refusal("branch is protected or is the current/base branch");
+    }
+    if context.resolver_only {
+        return CleanupDecision::Cleanable;
     }
     if identity.topology != Topology::WorktreePerAgent {
         return CleanupDecision::Cleanable;
@@ -291,13 +295,13 @@ pub(super) fn dry_run_receipt(plan: &CleanupPlan) -> CleanupReceipt {
         .map(|candidate| {
             let actions = if candidate.decision.is_cleanable() {
                 let mut actions = Vec::new();
-                if candidate.worktree_path.is_some() {
+                if candidate.worktree_path.is_some() && !candidate.resolver_only {
                     actions.push("remove_worktree".to_string());
                 }
-                actions.extend([
-                    "remove_agent_directory".to_string(),
-                    "deregister_identity".to_string(),
-                ]);
+                if !candidate.resolver_only {
+                    actions.push("remove_agent_directory".to_string());
+                }
+                actions.push("deregister_identity".to_string());
                 actions
             } else {
                 Vec::new()

@@ -14,6 +14,7 @@ pub(super) struct DiscoveredResource {
     pub(super) worktree_path: Option<PathBuf>,
     pub(super) identity: Option<AgentIdentityRecord>,
     pub(super) identity_error: Option<String>,
+    pub(super) resolver_only: bool,
 }
 
 impl VerifiedCleanupService {
@@ -23,6 +24,7 @@ impl VerifiedCleanupService {
     ) -> Result<Vec<DiscoveredResource>> {
         let agents_dir = self.project_dir.join(".exo/agents");
         let mut resources = Vec::new();
+        let resolver_records = self.resolver.all().await;
         let agent_entries = match fs::read_dir(&agents_dir).await {
             Ok(entries) => Some(entries),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -49,6 +51,7 @@ impl VerifiedCleanupService {
                     }),
                     identity,
                     identity_error,
+                    resolver_only: false,
                 });
             }
         }
@@ -67,10 +70,12 @@ impl VerifiedCleanupService {
                 if !file_type.is_dir() || file_type.is_symlink() {
                     continue;
                 }
-                self.attach_worktree_resource(&mut resources, entry.path())
+                self.attach_worktree_resource(&mut resources, entry.path(), &resolver_records)
                     .await;
             }
         }
+
+        self.append_resolver_only_resources(&mut resources, &resolver_records);
 
         resources.retain(|resource| {
             requested_target_matches(
@@ -135,6 +140,7 @@ impl VerifiedCleanupService {
         &self,
         resources: &mut Vec<DiscoveredResource>,
         path: PathBuf,
+        resolver_records: &[AgentIdentityRecord],
     ) {
         let worktree_name = path
             .file_name()
@@ -169,11 +175,13 @@ impl VerifiedCleanupService {
         let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
             return;
         };
-        let resolver_records = self.resolver.all().await;
-        let matching_identity = resolver_records.into_iter().find(|identity| {
-            identity.topology == Topology::WorktreePerAgent
-                && resolve_path(&self.project_dir, &identity.working_dir) == path
-        });
+        let matching_identity = resolver_records
+            .iter()
+            .find(|identity| {
+                identity.topology == Topology::WorktreePerAgent
+                    && resolve_path(&self.project_dir, &identity.working_dir) == path
+            })
+            .cloned();
         resources.push(DiscoveredResource {
             id: id.to_string(),
             agent_dir: matching_identity
@@ -187,6 +195,45 @@ impl VerifiedCleanupService {
             worktree_path: Some(path),
             identity: matching_identity,
             identity_error: Some("worktree is not backed by a verified identity".to_string()),
+            resolver_only: false,
         });
+    }
+
+    fn append_resolver_only_resources(
+        &self,
+        resources: &mut Vec<DiscoveredResource>,
+        resolver_records: &[AgentIdentityRecord],
+    ) {
+        for identity in resolver_records {
+            let agent_dir = self
+                .project_dir
+                .join(".exo/agents")
+                .join(identity.agent_name.as_str());
+            let worktree_path = (identity.topology == Topology::WorktreePerAgent)
+                .then(|| resolve_path(&self.project_dir, &identity.working_dir));
+            let represented = resources.iter().any(|resource| {
+                resource.id == identity.agent_name.as_str()
+                    || resource.agent_dir == agent_dir
+                    || resource.identity.as_ref() == Some(identity)
+                    || resource
+                        .worktree_path
+                        .as_ref()
+                        .zip(worktree_path.as_ref())
+                        .is_some_and(|(resource_path, expected_path)| {
+                            resource_path == expected_path
+                        })
+            });
+            if represented {
+                continue;
+            }
+            resources.push(DiscoveredResource {
+                id: identity.agent_name.to_string(),
+                agent_dir,
+                worktree_path,
+                identity: Some(identity.clone()),
+                identity_error: None,
+                resolver_only: true,
+            });
+        }
     }
 }
