@@ -1,3 +1,6 @@
+mod discovery;
+mod execution;
+mod inspection;
 mod service;
 mod support;
 #[cfg(test)]

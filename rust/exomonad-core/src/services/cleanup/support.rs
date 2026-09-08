@@ -13,12 +13,13 @@ use uuid::Uuid;
 pub(super) fn requested_target_matches(
     target: Option<&str>,
     entry_name: &str,
-    identity: &AgentIdentityRecord,
+    identity: Option<&AgentIdentityRecord>,
 ) -> bool {
     target.is_none_or(|target| {
         target == entry_name
-            || target == identity.agent_name.as_str()
-            || target == identity.slug.as_str()
+            || identity.is_some_and(|identity| {
+                target == identity.agent_name.as_str() || target == identity.slug.as_str()
+            })
     })
 }
 
@@ -44,6 +45,15 @@ pub(super) async fn current_branch(project_dir: &Path) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub(super) async fn read_active_issue(agent_dir: &Path) -> Option<String> {
+    let value = fs::read_to_string(agent_dir.join("active_issue"))
+        .await
+        .ok()?;
+    let value = value.trim();
+    (!value.is_empty() && value.chars().all(|character| character.is_ascii_digit()))
+        .then(|| value.to_string())
 }
 
 pub(super) async fn workspace_git_root(worktree: &Path) -> Result<Option<PathBuf>> {
@@ -138,7 +148,8 @@ pub(super) fn git_command(directory: &Path) -> Command {
 }
 
 pub(super) struct DecisionContext<'a> {
-    pub(super) identity: &'a AgentIdentityRecord,
+    pub(super) identity: Option<&'a AgentIdentityRecord>,
+    pub(super) identity_error: Option<&'a str>,
     pub(super) liveness: &'a CleanupLiveness,
     pub(super) dirty: Option<bool>,
     pub(super) protected: bool,
@@ -149,13 +160,20 @@ pub(super) struct DecisionContext<'a> {
     pub(super) pull_request: Option<&'a CleanupPullRequest>,
     pub(super) pr_error: Option<&'a str>,
     pub(super) head_matches_pull_request: Option<bool>,
+    pub(super) remote_head_matches_pull_request: Option<bool>,
 }
 
 pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecision {
-    if context.identity.ledger_owned {
+    if let Some(error) = context.identity_error {
+        return CleanupDecision::refusal(error);
+    }
+    let Some(identity) = context.identity else {
+        return CleanupDecision::refusal("managed identity is missing or malformed");
+    };
+    if identity.ledger_owned {
         return CleanupDecision::refusal("ledger-owned agent requires controller reconciliation");
     }
-    if context.identity.topology == Topology::Unspecified {
+    if identity.topology == Topology::Unspecified {
         return CleanupDecision::refusal("agent topology is unspecified");
     }
     if context.identity_drift {
@@ -172,7 +190,7 @@ pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecisio
     if context.protected {
         return CleanupDecision::refusal("branch is protected or is the current/base branch");
     }
-    if context.identity.topology != Topology::WorktreePerAgent {
+    if identity.topology != Topology::WorktreePerAgent {
         return CleanupDecision::Cleanable;
     }
     if context.repository.is_none() {
@@ -210,13 +228,26 @@ pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecisio
     if pr.base_ref != repository.base_branch {
         return CleanupDecision::refusal("pull request targets a different base branch");
     }
-    if pr.head_ref != context.identity.birth_branch.as_str() {
+    if pr.head_ref != identity.birth_branch.as_str() {
         return CleanupDecision::refusal("pull request head does not match the managed branch");
     }
     if context.head_matches_pull_request == Some(false) {
         return CleanupDecision::refusal("managed branch head differs from the pull-request head");
     }
+    if context.remote_head_matches_pull_request == Some(false) {
+        return CleanupDecision::refusal(
+            "configured remote branch head differs from the pull-request head",
+        );
+    }
     CleanupDecision::Cleanable
+}
+
+pub(super) fn classify_routing_target(result: Result<bool>) -> CleanupLiveness {
+    match result {
+        Ok(true) => CleanupLiveness::Live,
+        Ok(false) => CleanupLiveness::Dead,
+        Err(_) => CleanupLiveness::Unknown,
+    }
 }
 
 pub(super) fn refuse_duplicate_branches(candidates: &mut [CleanupCandidate]) {
@@ -291,6 +322,35 @@ pub(super) fn dry_run_receipt(plan: &CleanupPlan) -> CleanupReceipt {
         started_at: plan.generated_at,
         finished_at: unix_timestamp(),
         dry_run: true,
+        entries,
+    }
+}
+
+pub(super) fn in_progress_receipt(plan: &CleanupPlan, started_at: u64) -> CleanupReceipt {
+    let entries = plan
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let status = if candidate.decision.is_cleanable() {
+                CleanupReceiptStatus::InProgress
+            } else {
+                CleanupReceiptStatus::Refused
+            };
+            receipt_entry(
+                candidate,
+                status,
+                Vec::new(),
+                candidate.decision.reason().map(ToOwned::to_owned),
+            )
+        })
+        .collect();
+    CleanupReceipt {
+        schema_version: CLEANUP_RECEIPT_SCHEMA_VERSION,
+        operation_id: Uuid::new_v4().to_string(),
+        plan_id: plan.plan_id.clone(),
+        started_at,
+        finished_at: 0,
+        dry_run: false,
         entries,
     }
 }

@@ -142,8 +142,10 @@ pub struct CleanupCandidate {
     pub dirty: Option<bool>,
     pub protected: bool,
     pub identity_drift: bool,
+    pub identity_error: Option<String>,
     pub head_matches_pull_request: Option<bool>,
-    pub identity: AgentIdentityRecord,
+    pub remote_head_matches_pull_request: Option<bool>,
+    pub identity: Option<AgentIdentityRecord>,
     pub decision: CleanupDecision,
 }
 
@@ -162,6 +164,7 @@ pub struct CleanupPlan {
 #[serde(rename_all = "snake_case")]
 pub enum CleanupReceiptStatus {
     WouldClean,
+    InProgress,
     Cleaned,
     Skipped,
     Refused,
