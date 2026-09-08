@@ -5,6 +5,7 @@ use axum::{
     http::{header::HeaderName, HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ impl RouteAuth {
     }
 
     #[cfg(test)]
-    fn with_credentials(control: Option<&str>, agent: Option<&str>) -> Self {
+    pub(crate) fn with_credentials(control: Option<&str>, agent: Option<&str>) -> Self {
         Self {
             control_credential: control.map(Arc::<str>::from),
             agent_credential: agent.map(Arc::<str>::from),
@@ -74,7 +75,10 @@ pub fn unauthorized_response() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(axum::http::header::WWW_AUTHENTICATE, "ExoMonad-Control")],
-        "control credential required",
+        Json(serde_json::json!({
+            "kind": "unauthorized",
+            "error": "control credential required",
+        })),
     )
         .into_response()
 }
@@ -136,5 +140,22 @@ mod tests {
 
         headers.insert(AGENT_CREDENTIAL_HEADER, "control-secret".parse().unwrap());
         assert!(!auth.agent_request_authorized(&headers));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_is_structured_json() {
+        let response = unauthorized_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_TYPE),
+            Some(&"application/json".parse().unwrap())
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["kind"], "unauthorized");
+        assert_eq!(document["error"], "control credential required");
     }
 }

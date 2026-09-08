@@ -653,7 +653,9 @@ fn append_cleanup_entry(
                     .iter()
                     .any(|action| action == "remove_agent_directory");
         }
-        CleanupReceiptStatus::WouldClean => {}
+        CleanupReceiptStatus::WouldClean => {
+            response.cleaned_agents.push(name);
+        }
         _ => {
             response.skipped_agents.push(name);
             response.errors.push(
@@ -4730,6 +4732,35 @@ mod tests {
     use prost::Message;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cleanup_dry_run_reports_candidates_that_would_be_cleaned() {
+        let receipt = CleanupReceipt {
+            schema_version: 1,
+            operation_id: "operation".to_string(),
+            plan_id: "plan".to_string(),
+            started_at: 1,
+            finished_at: 2,
+            dry_run: true,
+            entries: vec![CleanupReceiptEntry {
+                candidate_id: "candidate".to_string(),
+                agent_name: "leaf-codex".to_string(),
+                agent_slug: "feature-codex".to_string(),
+                identity_snapshot: None,
+                pull_request: None,
+                status: CleanupReceiptStatus::WouldClean,
+                actions: vec!["remove_worktree".to_string()],
+                reason: None,
+            }],
+        };
+
+        let response = cleanup_receipt_response(&receipt);
+        assert_eq!(response.cleaned_agents, vec!["leaf-codex"]);
+        assert!(response.skipped_agents.is_empty());
+        assert!(!response.removed_worktree);
+        assert!(!response.removed_agent_dir);
+        assert!(response.dry_run);
+    }
 
     fn restart_test_pr() -> ForgejoPullRequest {
         ForgejoPullRequest {

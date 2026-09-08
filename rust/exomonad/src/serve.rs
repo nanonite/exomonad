@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{rejection::JsonRejection, DefaultBodyLimit, Extension, Path, Query, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Extension, FromRef, Path, Query, State},
     http::Request,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -1013,8 +1013,21 @@ async fn control_transitions(
     ))
 }
 
+#[derive(Clone)]
+struct CleanupControlState {
+    service: exomonad_core::services::VerifiedCleanupService,
+}
+
+impl FromRef<AppState> for CleanupControlState {
+    fn from_ref(state: &AppState) -> Self {
+        Self {
+            service: state.cleanup_service.clone(),
+        }
+    }
+}
+
 async fn control_cleanup(
-    State(state): State<AppState>,
+    State(state): State<CleanupControlState>,
     request: Result<Json<exomonad_core::services::CleanupRequest>, JsonRejection>,
 ) -> Response {
     let request = match request {
@@ -1030,7 +1043,7 @@ async fn control_cleanup(
                 .into_response();
         }
     };
-    match control_cleanup::execute(&state.cleanup_service, request).await {
+    match control_cleanup::execute(&state.service, request).await {
         Ok(receipt) => Json(receipt).into_response(),
         Err(error) => (
             control_cleanup::status_code(&error),
@@ -2078,6 +2091,92 @@ mod tests {
                 .iter()
                 .any(|value| value == action));
         }
+    }
+
+    async fn cleanup_test_router() -> (tempfile::TempDir, Router) {
+        let temp_dir = tempfile::tempdir().expect("cleanup route fixture directory");
+        let project_dir = temp_dir.path().to_path_buf();
+        let resolver = exomonad_core::services::AgentResolver::load(project_dir.clone()).await;
+        let service = exomonad_core::services::VerifiedCleanupService::new(
+            project_dir.clone(),
+            Arc::new(resolver),
+            Arc::new(exomonad_core::services::GitWorktreeService::new(
+                project_dir,
+            )),
+            None,
+            Arc::new(exomonad_core::services::MutexRegistry::new()),
+        );
+        let router = Router::new()
+            .route(
+                "/cleanup",
+                post(control_cleanup)
+                    .layer(DefaultBodyLimit::max(control_cleanup::MAX_REQUEST_BYTES)),
+            )
+            .layer(middleware::from_fn_with_state(
+                control::RouteAuth::with_credentials(Some("control-secret"), None),
+                control::require_control,
+            ))
+            .with_state(CleanupControlState { service });
+        (temp_dir, router)
+    }
+
+    #[tokio::test]
+    async fn cleanup_route_rejects_unauthenticated_requests_with_json() {
+        let (_temp_dir, router) = cleanup_test_router().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/cleanup")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+
+        let response = tower::ServiceExt::oneshot(router, request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["kind"], "unauthorized");
+        assert_eq!(document["error"], "control credential required");
+    }
+
+    #[tokio::test]
+    async fn cleanup_route_rejects_requests_over_the_body_limit() {
+        let (_temp_dir, router) = cleanup_test_router().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/cleanup")
+            .header("content-type", "application/json")
+            .header(control::CONTROL_CREDENTIAL_HEADER, "control-secret")
+            .body(axum::body::Body::from(vec![
+                b'x';
+                control_cleanup::MAX_REQUEST_BYTES
+                    + 1
+            ]))
+            .unwrap();
+
+        let response = tower::ServiceExt::oneshot(router, request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn cleanup_route_rejects_malformed_json_as_structured_error() {
+        let (_temp_dir, router) = cleanup_test_router().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/cleanup")
+            .header("content-type", "application/json")
+            .header(control::CONTROL_CREDENTIAL_HEADER, "control-secret")
+            .body(axum::body::Body::from("{not-json"))
+            .unwrap();
+
+        let response = tower::ServiceExt::oneshot(router, request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["kind"], "invalid_request");
     }
 
     fn message() -> InboxMessageRecord {
