@@ -90,6 +90,7 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
             pr_error: None,
             head_matches_pull_request: None,
             remote_head_matches_pull_request: None,
+            recovery_receipt: false,
         }),
         CleanupDecision::Cleanable
     );
@@ -110,6 +111,7 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
         pr_error: None,
         head_matches_pull_request: None,
         remote_head_matches_pull_request: None,
+        recovery_receipt: false,
     })
     .is_cleanable());
 }
@@ -158,6 +160,7 @@ fn remote_branch_head_must_match_the_pull_request_head() {
         pr_error: None,
         head_matches_pull_request: Some(true),
         remote_head_matches_pull_request: Some(false),
+        recovery_receipt: false,
     })
     .is_cleanable());
 }
@@ -168,6 +171,7 @@ fn duplicate_local_branches_are_refused() {
         id: id.to_string(),
         managed: true,
         resolver_only: false,
+        recovery_receipt: false,
         agent_name: id.to_string(),
         issue: None,
         agent_dir: PathBuf::from(".exo/agents").join(id),
@@ -299,7 +303,7 @@ async fn apply_resumes_an_interrupted_resolver_only_cleanup() {
     tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
     let resumed_plan = service.plan(&request).await.unwrap();
     let resumed = service
-        .resume_or_create_receipt(&resumed_plan, 2)
+        .resume_or_create_receipt(&resumed_plan, None, 2)
         .await
         .unwrap();
     assert_eq!(resumed.operation_id, operation_id);
@@ -349,7 +353,89 @@ async fn receipt_persistence_failure_stops_before_resolver_deregistration() {
 }
 
 #[tokio::test]
-async fn sweep_discovers_resolver_records_without_filesystem_resources() {
+async fn receipt_persistence_failure_after_deregistration_is_recovered() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+    );
+    service.fail_receipt_persist_on_call(5);
+    let request = CleanupRequest {
+        apply: true,
+        ..CleanupRequest::default()
+    };
+    assert!(service.run(&request).await.is_err());
+    assert!(!agent_dir.exists());
+    assert!(resolver.get(&record.agent_name).await.is_none());
+
+    service.fail_receipt_persist_on_call(0);
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"deregister_identity".to_string()));
+}
+
+#[tokio::test]
+async fn interrupted_cleanup_can_resume_by_slug_after_candidate_identity_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+    );
+    let request = CleanupRequest {
+        target: Some(record.slug.to_string()),
+        sweep: false,
+        apply: true,
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let mut interrupted = in_progress_receipt(&plan, 1);
+    interrupted.operation_id = "slug-resume".to_string();
+    interrupted.entries[0].candidate_id = "historical-worktree".to_string();
+    service.persist_receipt(&interrupted).await.unwrap();
+    tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+    assert!(resolver.get(&record.agent_name).await.is_some());
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.operation_id, "slug-resume");
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(resolver.get(&record.agent_name).await.is_none());
+}
+
+#[tokio::test]
+async fn resolver_only_cleanup_requires_an_in_progress_receipt() {
     let temp = tempfile::tempdir().unwrap();
     let agent_dir = temp.path().join(".exo/agents/stale-codex");
     tokio::fs::create_dir_all(&agent_dir).await.unwrap();
@@ -373,8 +459,8 @@ async fn sweep_discovers_resolver_records_without_filesystem_resources() {
     let plan = service.plan(&CleanupRequest::default()).await.unwrap();
     let candidate = &plan.candidates[0];
     assert!(candidate.resolver_only);
-    assert_eq!(candidate.liveness, CleanupLiveness::Dead);
-    assert!(candidate.decision.is_cleanable());
+    assert_eq!(candidate.liveness, CleanupLiveness::Unknown);
+    assert!(!candidate.decision.is_cleanable());
 
     let receipt = service
         .run(&CleanupRequest {
@@ -383,8 +469,8 @@ async fn sweep_discovers_resolver_records_without_filesystem_resources() {
         })
         .await
         .unwrap();
-    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
-    assert!(resolver.get(&record.agent_name).await.is_none());
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Refused);
+    assert!(resolver.get(&record.agent_name).await.is_some());
 }
 
 #[tokio::test]

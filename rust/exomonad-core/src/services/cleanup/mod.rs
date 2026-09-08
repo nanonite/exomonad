@@ -1,6 +1,11 @@
+mod actions;
+mod candidate;
 mod discovery;
 mod execution;
 mod inspection;
+mod inspection_observation;
+mod inspection_support;
+mod receipts;
 mod service;
 mod support;
 #[cfg(test)]

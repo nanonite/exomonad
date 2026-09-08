@@ -10,6 +10,9 @@ use tokio::fs;
 use tokio::process::Command;
 use uuid::Uuid;
 
+pub(super) const DEREGISTER_PENDING: &str = "deregister_identity_pending";
+pub(super) const PROGRESS_PERSISTENCE_FAILURE: &str = "persist cleanup progress";
+
 pub(super) fn requested_target_matches(
     target: Option<&str>,
     entry_name: &str,
@@ -162,6 +165,7 @@ pub(super) struct DecisionContext<'a> {
     pub(super) head_matches_pull_request: Option<bool>,
     pub(super) remote_head_matches_pull_request: Option<bool>,
     pub(super) resolver_only: bool,
+    pub(super) recovery_receipt: bool,
 }
 
 pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecision {
@@ -190,6 +194,11 @@ pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecisio
     }
     if context.protected {
         return CleanupDecision::refusal("branch is protected or is the current/base branch");
+    }
+    if context.resolver_only && !context.recovery_receipt {
+        return CleanupDecision::refusal(
+            "resolver-only cleanup lacks a matching in-progress receipt",
+        );
     }
     if context.resolver_only {
         return CleanupDecision::Cleanable;
@@ -282,6 +291,12 @@ pub(super) fn receipt_entry(
 ) -> CleanupReceiptEntry {
     CleanupReceiptEntry {
         candidate_id: candidate.id.clone(),
+        agent_name: candidate.agent_name.clone(),
+        agent_slug: candidate
+            .identity
+            .as_ref()
+            .map(|identity| identity.slug.to_string())
+            .unwrap_or_default(),
         status,
         actions,
         reason,

@@ -15,6 +15,7 @@ pub(super) struct DiscoveredResource {
     pub(super) identity: Option<AgentIdentityRecord>,
     pub(super) identity_error: Option<String>,
     pub(super) resolver_only: bool,
+    pub(super) recovery_receipt: bool,
 }
 
 impl VerifiedCleanupService {
@@ -25,6 +26,7 @@ impl VerifiedCleanupService {
         let agents_dir = self.project_dir.join(".exo/agents");
         let mut resources = Vec::new();
         let resolver_records = self.resolver.all().await;
+        let recovery_candidates = self.in_progress_identity_keys().await?;
         let agent_entries = match fs::read_dir(&agents_dir).await {
             Ok(entries) => Some(entries),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -52,6 +54,7 @@ impl VerifiedCleanupService {
                     identity,
                     identity_error,
                     resolver_only: false,
+                    recovery_receipt: false,
                 });
             }
         }
@@ -75,7 +78,11 @@ impl VerifiedCleanupService {
             }
         }
 
-        self.append_resolver_only_resources(&mut resources, &resolver_records);
+        self.append_resolver_only_resources(
+            &mut resources,
+            &resolver_records,
+            &recovery_candidates,
+        );
 
         resources.retain(|resource| {
             requested_target_matches(
@@ -85,7 +92,7 @@ impl VerifiedCleanupService {
             )
         });
         if let Some(target) = &request.target {
-            if resources.is_empty() {
+            if resources.is_empty() && !recovery_candidates.contains(target) {
                 bail!("managed cleanup target {:?} was not found", target);
             }
         }
@@ -196,6 +203,7 @@ impl VerifiedCleanupService {
             identity: matching_identity,
             identity_error: Some("worktree is not backed by a verified identity".to_string()),
             resolver_only: false,
+            recovery_receipt: false,
         });
     }
 
@@ -203,6 +211,7 @@ impl VerifiedCleanupService {
         &self,
         resources: &mut Vec<DiscoveredResource>,
         resolver_records: &[AgentIdentityRecord],
+        recovery_candidates: &std::collections::HashSet<String>,
     ) {
         for identity in resolver_records {
             let agent_dir = self
@@ -233,6 +242,7 @@ impl VerifiedCleanupService {
                 identity: Some(identity.clone()),
                 identity_error: None,
                 resolver_only: true,
+                recovery_receipt: recovery_candidates.contains(identity.agent_name.as_str()),
             });
         }
     }

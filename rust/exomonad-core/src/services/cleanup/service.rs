@@ -154,7 +154,9 @@ impl VerifiedCleanupService {
         let started_at = unix_timestamp();
         let result = async {
             let plan = self.plan(request).await?;
-            let mut receipt = self.resume_or_create_receipt(&plan, started_at).await?;
+            let mut receipt = self
+                .resume_or_create_receipt(&plan, request.target.as_deref(), started_at)
+                .await?;
             self.persist_receipt(&receipt).await?;
             self.execute_plan(&plan, &mut receipt).await?;
             receipt.finished_at = unix_timestamp();

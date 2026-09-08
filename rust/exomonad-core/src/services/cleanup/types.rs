@@ -131,6 +131,8 @@ pub struct CleanupCandidate {
     pub managed: bool,
     #[serde(default)]
     pub resolver_only: bool,
+    #[serde(default)]
+    pub recovery_receipt: bool,
     pub agent_name: String,
     pub issue: Option<String>,
     pub agent_dir: PathBuf,
@@ -176,6 +178,10 @@ pub enum CleanupReceiptStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CleanupReceiptEntry {
     pub candidate_id: String,
+    #[serde(default)]
+    pub agent_name: String,
+    #[serde(default)]
+    pub agent_slug: String,
     pub status: CleanupReceiptStatus,
     pub actions: Vec<String>,
     pub reason: Option<String>,
