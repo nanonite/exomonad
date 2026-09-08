@@ -267,7 +267,7 @@ impl VerifiedCleanupService {
             }
         }
 
-        let mut actions = Vec::new();
+        let mut actions = receipt.entries[index].actions.clone();
         if let Some(worktree) = &candidate.worktree_path {
             if worktree.exists() {
                 let git_worktree = self.git_worktree.clone();
@@ -425,7 +425,10 @@ impl VerifiedCleanupService {
                 Some("resolver identity changed since planning".to_string()),
             );
         }
-        let mut actions = vec!["managed_resources_already_absent".to_string()];
+        let mut actions = receipt.entries[index].actions.clone();
+        if actions.is_empty() {
+            actions.push("managed_resources_already_absent".to_string());
+        }
         if let Err(error) = self
             .resolver
             .deregister(&expected_identity.agent_name)
