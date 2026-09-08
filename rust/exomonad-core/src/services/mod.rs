@@ -5,6 +5,7 @@ pub mod agent_resources;
 pub mod analysis_import;
 pub mod claude_adapter;
 pub mod claude_session_registry;
+pub mod cleanup;
 pub mod codex_adapter;
 pub mod command;
 pub mod complexity_classifier;
@@ -66,6 +67,11 @@ pub use self::analysis_import::{
 };
 pub use self::claude_adapter::ClaudeCodeAdapter;
 pub use self::claude_session_registry::ClaudeSessionRegistry;
+pub use self::cleanup::{
+    CleanupCandidate, CleanupDecision, CleanupLiveness, CleanupPlan, CleanupPullRequest,
+    CleanupReceipt, CleanupReceiptEntry, CleanupReceiptStatus, CleanupRequest,
+    VerifiedCleanupService, CLEANUP_PLAN_SCHEMA_VERSION, CLEANUP_RECEIPT_SCHEMA_VERSION,
+};
 pub use self::codex_adapter::CodexAdapter;
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
@@ -219,6 +225,11 @@ impl Services {
     /// Read the configured model for spawned OpenCode workers.
     pub fn opencode_worker_model(&self) -> Option<&str> {
         self.opencode_worker_model.as_deref()
+    }
+
+    /// Construct the shared verified cleanup service for this project.
+    pub fn cleanup_service(&self) -> VerifiedCleanupService {
+        VerifiedCleanupService::from_services(self)
     }
 }
 
