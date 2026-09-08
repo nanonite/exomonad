@@ -159,4 +159,5 @@ opencode-*.md
 docs/markdown
 docs/pdfs
 tl_loop.pyz
+tl_loop/uv.lock
 pytest-of-*/
