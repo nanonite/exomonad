@@ -435,6 +435,54 @@ async fn interrupted_cleanup_can_resume_by_slug_after_candidate_identity_changes
 }
 
 #[tokio::test]
+async fn resolver_identity_reuse_does_not_authorize_an_old_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let old_record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&old_record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+    );
+    let request = CleanupRequest {
+        target: Some(old_record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let mut interrupted = in_progress_receipt(&plan, 1);
+    interrupted.operation_id = "identity-reuse".to_string();
+    service.persist_receipt(&interrupted).await.unwrap();
+    tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+
+    let mut replacement = old_record.clone();
+    replacement.slug = Slug::try_from_str("replacement").unwrap();
+    replacement.birth_branch = BirthBranch::try_from_str("main.replacement").unwrap();
+    replacement.working_dir = PathBuf::from(".exo/worktrees/replacement");
+    replacement.topology = Topology::WorktreePerAgent;
+    replacement.slice_id = Some("different-slice".to_string());
+    resolver.register(replacement).await.unwrap();
+    tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Refused);
+    assert!(resolver.get(&old_record.agent_name).await.is_some());
+}
+
+#[tokio::test]
 async fn resolver_only_cleanup_requires_an_in_progress_receipt() {
     let temp = tempfile::tempdir().unwrap();
     let agent_dir = temp.path().join(".exo/agents/stale-codex");

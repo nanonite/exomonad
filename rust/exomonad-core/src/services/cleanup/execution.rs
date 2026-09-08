@@ -26,8 +26,12 @@ impl VerifiedCleanupService {
                 continue;
             }
             let actions = in_progress_actions(&receipt.entries[index]);
-            receipt.entries[index] =
+            let historical_identity = receipt.entries[index].identity_snapshot.clone();
+            let mut in_progress =
                 receipt_entry(candidate, CleanupReceiptStatus::InProgress, actions, None);
+            in_progress.identity_snapshot =
+                historical_identity.or_else(|| candidate.identity.clone());
+            receipt.entries[index] = in_progress;
             self.persist_receipt(receipt).await?;
             let entry = self.execute_candidate(candidate, receipt, index).await;
             let progress_failed = is_progress_persistence_failure(&entry);

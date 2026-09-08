@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 /// All fields are determined at spawn time. Consumers never need to re-derive
 /// slug from agent_name, or birth_branch from worktree git state, or display_name
 /// from agent_type — it's all here.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentIdentityRecord {
     /// Suffixed internal name (e.g., "feature-a-claude").
     pub agent_name: AgentName,

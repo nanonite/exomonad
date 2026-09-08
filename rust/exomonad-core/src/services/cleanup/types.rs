@@ -182,6 +182,8 @@ pub struct CleanupReceiptEntry {
     pub agent_name: String,
     #[serde(default)]
     pub agent_slug: String,
+    #[serde(default)]
+    pub identity_snapshot: Option<AgentIdentityRecord>,
     pub status: CleanupReceiptStatus,
     pub actions: Vec<String>,
     pub reason: Option<String>,

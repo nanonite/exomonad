@@ -2,6 +2,7 @@ use super::service::VerifiedCleanupService;
 use super::support::*;
 use super::types::*;
 use crate::domain::AgentName;
+use crate::services::agent_resolver::AgentIdentityRecord;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::Write;
@@ -10,21 +11,15 @@ use std::sync::atomic::Ordering;
 use tokio::fs;
 
 impl VerifiedCleanupService {
-    pub(super) async fn in_progress_identity_keys(&self) -> Result<HashSet<String>> {
+    pub(super) async fn in_progress_identity_snapshots(&self) -> Result<Vec<AgentIdentityRecord>> {
         let receipts = self.read_receipts().await?;
         Ok(receipts
             .into_iter()
             .filter(|receipt| !receipt.dry_run)
             .flat_map(|receipt| receipt.entries)
             .filter(|entry| matches!(&entry.status, CleanupReceiptStatus::InProgress))
-            .flat_map(|entry| {
-                [
-                    (!entry.agent_name.is_empty()).then_some(entry.agent_name),
-                    (!entry.agent_slug.is_empty()).then_some(entry.agent_slug),
-                ]
-                .into_iter()
-                .flatten()
-            })
+            .filter(receipt_snapshot_is_coherent)
+            .filter_map(|entry| entry.identity_snapshot)
             .collect())
     }
 
@@ -167,7 +162,7 @@ fn receipt_entry_matches(
                 .candidates
                 .iter()
                 .any(|candidate| receipt_entry_matches_candidate(entry, candidate))
-    })
+    }) && receipt_snapshot_is_coherent(entry)
 }
 
 fn has_deregister_intent(entry: &CleanupReceiptEntry) -> bool {
@@ -178,7 +173,9 @@ fn has_deregister_intent(entry: &CleanupReceiptEntry) -> bool {
 }
 
 fn receipt_entry_agent_name(entry: &CleanupReceiptEntry) -> Option<AgentName> {
-    let name = if entry.agent_name.is_empty() {
+    let name = if let Some(identity) = &entry.identity_snapshot {
+        identity.agent_name.as_str()
+    } else if entry.agent_name.is_empty() {
         entry.candidate_id.as_str()
     } else {
         entry.agent_name.as_str()
@@ -256,18 +253,30 @@ fn receipt_entry_matches_candidate(
     entry: &CleanupReceiptEntry,
     candidate: &CleanupCandidate,
 ) -> bool {
-    let same_identity = entry.candidate_id == candidate.id
-        || (!entry.agent_name.is_empty() && entry.agent_name == candidate.agent_name)
-        || (!entry.agent_slug.is_empty()
-            && candidate
-                .identity
-                .as_ref()
-                .is_some_and(|identity| entry.agent_slug == identity.slug.as_str()));
+    let same_identity = entry
+        .identity_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| candidate.identity.as_ref() == Some(snapshot))
+        || (entry.identity_snapshot.is_none()
+            && (entry.candidate_id == candidate.id
+                || (!entry.agent_name.is_empty() && entry.agent_name == candidate.agent_name)
+                || (!entry.agent_slug.is_empty()
+                    && candidate
+                        .identity
+                        .as_ref()
+                        .is_some_and(|identity| entry.agent_slug == identity.slug.as_str()))));
     let names_agree = entry.agent_name.is_empty() || entry.agent_name == candidate.agent_name;
     let slugs_agree = entry.agent_slug.is_empty()
         || candidate
             .identity
             .as_ref()
             .is_some_and(|identity| entry.agent_slug == identity.slug.as_str());
-    same_identity && names_agree && slugs_agree
+    same_identity && names_agree && slugs_agree && receipt_snapshot_is_coherent(entry)
+}
+
+fn receipt_snapshot_is_coherent(entry: &CleanupReceiptEntry) -> bool {
+    entry.identity_snapshot.as_ref().is_none_or(|snapshot| {
+        entry.agent_name == snapshot.agent_name.as_str()
+            && entry.agent_slug == snapshot.slug.as_str()
+    })
 }

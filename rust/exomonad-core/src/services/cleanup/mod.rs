@@ -1,10 +1,15 @@
 mod actions;
 mod candidate;
+mod decision;
 mod discovery;
 mod execution;
 mod inspection;
+mod inspection_branch;
+mod inspection_build;
+mod inspection_collect;
 mod inspection_observation;
 mod inspection_support;
+mod receipt_support;
 mod receipts;
 mod service;
 mod support;

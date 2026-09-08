@@ -26,7 +26,7 @@ impl VerifiedCleanupService {
         let agents_dir = self.project_dir.join(".exo/agents");
         let mut resources = Vec::new();
         let resolver_records = self.resolver.all().await;
-        let recovery_candidates = self.in_progress_identity_keys().await?;
+        let recovery_identities = self.in_progress_identity_snapshots().await?;
         let agent_entries = match fs::read_dir(&agents_dir).await {
             Ok(entries) => Some(entries),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -81,7 +81,7 @@ impl VerifiedCleanupService {
         self.append_resolver_only_resources(
             &mut resources,
             &resolver_records,
-            &recovery_candidates,
+            &recovery_identities,
         );
 
         resources.retain(|resource| {
@@ -92,7 +92,11 @@ impl VerifiedCleanupService {
             )
         });
         if let Some(target) = &request.target {
-            if resources.is_empty() && !recovery_candidates.contains(target) {
+            if resources.is_empty()
+                && !recovery_identities.iter().any(|identity| {
+                    target == identity.agent_name.as_str() || target == identity.slug.as_str()
+                })
+            {
                 bail!("managed cleanup target {:?} was not found", target);
             }
         }
@@ -211,7 +215,7 @@ impl VerifiedCleanupService {
         &self,
         resources: &mut Vec<DiscoveredResource>,
         resolver_records: &[AgentIdentityRecord],
-        recovery_candidates: &std::collections::HashSet<String>,
+        recovery_identities: &[AgentIdentityRecord],
     ) {
         for identity in resolver_records {
             let agent_dir = self
@@ -242,7 +246,9 @@ impl VerifiedCleanupService {
                 identity: Some(identity.clone()),
                 identity_error: None,
                 resolver_only: true,
-                recovery_receipt: recovery_candidates.contains(identity.agent_name.as_str()),
+                recovery_receipt: recovery_identities
+                    .iter()
+                    .any(|historical| historical == identity),
             });
         }
     }

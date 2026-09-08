@@ -59,6 +59,14 @@ impl VerifiedCleanupService {
         if self.resolver.get(&expected.agent_name).await.as_ref() != Some(expected) {
             return refused(candidate, "resolver identity changed since planning");
         }
+        if receipt.entries[index].identity_snapshot.as_ref() != Some(expected)
+            || !receipt_entry_identity_is_coherent(&receipt.entries[index], expected)
+        {
+            return refused(
+                candidate,
+                "cleanup receipt identity differs from the resolver",
+            );
+        }
         let mut actions = receipt.entries[index].actions.clone();
         if actions.is_empty() {
             actions.push("managed_resources_already_absent".to_string());
@@ -209,4 +217,11 @@ fn failed(candidate: &CleanupCandidate, reason: impl Into<String>) -> CleanupRec
         Vec::new(),
         Some(reason.into()),
     )
+}
+
+fn receipt_entry_identity_is_coherent(
+    entry: &CleanupReceiptEntry,
+    identity: &AgentIdentityRecord,
+) -> bool {
+    entry.agent_name == identity.agent_name.as_str() && entry.agent_slug == identity.slug.as_str()
 }
