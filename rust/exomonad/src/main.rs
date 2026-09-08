@@ -7,6 +7,7 @@
 //! WASM plugins are loaded from file (server-side only).
 
 mod app_state;
+mod clean;
 mod control;
 mod control_cleanup;
 mod control_gate;
@@ -60,6 +61,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect or safely clean stale managed-agent resources through the server.
+    Clean(clean::CleanArgs),
+
     /// Handle a Claude Code hook event (thin HTTP client → server)
     Hook {
         /// The hook event type to handle
@@ -509,6 +513,10 @@ async fn main() -> Result<()> {
                 }
                 Err(_) => println!("{}", fail_open_stdout()),
             }
+        }
+
+        Commands::Clean(args) => {
+            return clean::run(args).await;
         }
 
         Commands::Init {

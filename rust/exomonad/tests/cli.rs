@@ -154,3 +154,40 @@ fn test_no_subcommand_shows_help() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn test_clean_help_exposes_safe_targeting_and_apply_flags() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut cmd = cargo_bin_cmd!("exomonad");
+
+    let output = cmd
+        .args(["clean", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(output)?;
+    assert!(help.contains("--name <NAME>"));
+    assert!(help.contains("--sweep"));
+    assert!(help.contains("--apply"));
+    Ok(())
+}
+
+#[test]
+fn test_clean_requires_a_target_before_contacting_server() {
+    let mut cmd = cargo_bin_cmd!("exomonad");
+    cmd.args(["clean"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid exomonad clean arguments"));
+}
+
+#[test]
+fn test_clean_rejects_name_and_sweep_together() {
+    let mut cmd = cargo_bin_cmd!("exomonad");
+    cmd.args(["clean", "--name", "leaf", "--sweep"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}

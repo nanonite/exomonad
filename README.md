@@ -198,9 +198,9 @@ python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root          # phas
 python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root --watch   # refresh continuously
 python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --approve
 export EXOMONAD_CONTROL_TOKEN=...                                  # unlocks /control
-curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Token: $EXOMONAD_CONTROL_TOKEN" \
+curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Credential: $EXOMONAD_CONTROL_TOKEN" \
      http://localhost/control/runs/root
-curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Token: $EXOMONAD_CONTROL_TOKEN" \
+curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Credential: $EXOMONAD_CONTROL_TOKEN" \
      -H "Content-Type: application/json" -X POST http://localhost/control/cleanup \
      --data '{"sweep":true,"apply":false}'
 ```
@@ -213,6 +213,18 @@ that stays inert until confirmed, and running the verified cleanup planner.
 Cleanup is dry-run by default; set `apply` to true only after reviewing the
 receipt. It can never merge, approve a review, set a verdict, or widen a
 policy — those stay with the controller.
+
+For the same verified cleanup flow from the command line, use the exomonad
+clean command. It always performs a dry run unless --apply is explicitly
+supplied:
+
+    exomonad clean --name <managed-agent-name-or-slug>  # inspect one candidate
+    exomonad clean --sweep                              # inspect all candidates
+    exomonad clean --sweep --apply                      # apply the reviewed sweep
+
+The command requires EXOMONAD_CONTROL_TOKEN and a running project server.
+exomonad init --continue may report a dry-run cleanup candidate count and the
+command to review it, but never applies cleanup automatically.
 
 Afterwards, the run is measurable rather than merely reviewable. The controller's own decisions — gates opened and answered, slices parked and why, merge decisions, RLM judgment retries — land in the same append-only ledger as agent and PR activity:
 

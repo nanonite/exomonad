@@ -1,4 +1,4 @@
-use crate::uds_client;
+use crate::{clean, uds_client};
 use anyhow::{Context, Result};
 use exomonad::config::{
     Config, EffortLevel, ResolvedEffort, REVIEWER_EFFORT_ENV, REVIEWER_MAX_ROUNDS_ENV,
@@ -2752,6 +2752,9 @@ pub async fn run(
             verbose,
         )
         .await?;
+        if mode == SessionMode::Continue {
+            clean::report_continue_cleanup(&cwd).await;
+        }
         report_orphaned_agent_windows(&session, &cwd).await;
         info!(session = %session, "Attaching to existing session");
         return TmuxIpc::attach_session(&session).await;
@@ -3199,6 +3202,9 @@ pub async fn run(
     // 4. Wait for the server before launching the controller or Watcher.
     wait_for_server_socket(&cwd).await?;
     report_observability_health(&cwd);
+    if mode == SessionMode::Continue {
+        clean::report_continue_cleanup(&cwd).await;
+    }
     ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await?;
 
     // The human-facing TL window runs one coordinator: the Python controller.
@@ -4073,6 +4079,36 @@ mod tests {
         .unwrap();
         assert_eq!(value["session_mode"], "start");
         assert!(!tmp.path().join(".exo/tl-loop/session-mode.tmp").exists());
+    }
+
+    #[test]
+    fn continue_cleanup_suggestion_is_advisory_and_cannot_apply() {
+        let request = clean::continue_cleanup_request();
+        assert_eq!(request.target, None);
+        assert!(request.sweep);
+        assert!(!request.apply);
+
+        let receipt = exomonad_core::services::CleanupReceipt {
+            schema_version: 1,
+            operation_id: "operation".to_string(),
+            plan_id: "plan".to_string(),
+            started_at: 1,
+            finished_at: 2,
+            dry_run: true,
+            entries: vec![exomonad_core::services::CleanupReceiptEntry {
+                candidate_id: "candidate".to_string(),
+                agent_name: "leaf".to_string(),
+                agent_slug: "leaf-slug".to_string(),
+                identity_snapshot: None,
+                pull_request: None,
+                status: exomonad_core::services::CleanupReceiptStatus::WouldClean,
+                actions: Vec::new(),
+                reason: None,
+            }],
+        };
+        let suggestion = clean::continue_suggestion(&receipt).unwrap();
+        assert!(suggestion.contains("1 verified cleanup candidate(s)"));
+        assert!(suggestion.contains("exomonad clean --sweep --apply"));
     }
 
     fn write_test_invocation(
