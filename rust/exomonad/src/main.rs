@@ -8,6 +8,7 @@
 
 mod app_state;
 mod control;
+mod control_cleanup;
 mod control_gate;
 mod control_plan;
 mod control_read_model;

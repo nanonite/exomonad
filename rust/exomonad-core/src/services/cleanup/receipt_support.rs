@@ -17,6 +17,7 @@ pub(super) fn receipt_entry(
             .map(|identity| identity.slug.to_string())
             .unwrap_or_default(),
         identity_snapshot: candidate.identity.clone(),
+        pull_request: candidate.pull_request.clone(),
         status,
         actions,
         reason,

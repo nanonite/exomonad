@@ -200,14 +200,19 @@ python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> -
 export EXOMONAD_CONTROL_TOKEN=...                                  # unlocks /control
 curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Token: $EXOMONAD_CONTROL_TOKEN" \
      http://localhost/control/runs/root
+curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Token: $EXOMONAD_CONTROL_TOKEN" \
+     -H "Content-Type: application/json" -X POST http://localhost/control/cleanup \
+     --data '{"sweep":true,"apply":false}'
 ```
 
 The `/control` surface adds a schema-versioned read model over run state
 (slices, ordered stages, per-head review evidence, base-bound integration
-evidence, budgets, transitions, and `next_transition`) plus the only two
-mutations an operator may make: answer an existing named gate, and propose a
-plan change that stays inert until confirmed. It can never merge, approve a
-review, set a verdict, or widen a policy — those stay with the controller.
+evidence, budgets, transitions, and `next_transition`) plus authenticated
+operator actions for answering an existing named gate, proposing a plan change
+that stays inert until confirmed, and running the verified cleanup planner.
+Cleanup is dry-run by default; set `apply` to true only after reviewing the
+receipt. It can never merge, approve a review, set a verdict, or widen a
+policy — those stay with the controller.
 
 Afterwards, the run is measurable rather than merely reviewable. The controller's own decisions — gates opened and answered, slices parked and why, merge decisions, RLM judgment retries — land in the same append-only ledger as agent and PR activity:
 

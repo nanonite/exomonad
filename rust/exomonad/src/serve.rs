@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
 use crate::control;
+use crate::control_cleanup;
 use crate::control_gate;
 use crate::control_plan;
 use crate::control_read_model;
@@ -10,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{Extension, Path, Query, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Extension, Path, Query, State},
     http::Request,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -957,6 +958,7 @@ async fn control_root() -> Json<serde_json::Value> {
         "route_group": "/control",
         "allowed_actions": [
             "read_projection",
+            "cleanup_plan_apply",
             "answer_named_gate",
             "propose_plan_mutation",
             "inspect_recovery",
@@ -1009,6 +1011,36 @@ async fn control_transitions(
         &run_id,
         query.limit,
     ))
+}
+
+async fn control_cleanup(
+    State(state): State<AppState>,
+    request: Result<Json<exomonad_core::services::CleanupRequest>, JsonRejection>,
+) -> Response {
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(error) => {
+            return (
+                error.status(),
+                Json(serde_json::json!({
+                    "kind": "invalid_request",
+                    "error": error.body_text(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    match control_cleanup::execute(&state.cleanup_service, request).await {
+        Ok(receipt) => Json(receipt).into_response(),
+        Err(error) => (
+            control_cleanup::status_code(&error),
+            Json(serde_json::json!({
+                "kind": control_cleanup::kind(&error),
+                "error": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn control_answer_gate(
@@ -1847,6 +1879,7 @@ Run `exomonad recompile` first to build it.",
         agent_resolver: agent_resolver.clone(),
         inbox_store: inbox_store.clone(),
         session_memory,
+        cleanup_service: services.cleanup_service(),
     };
 
     let forgejo_ci_state = exomonad_core::services::forgejo_ci::ForgejoCiWebhookState {
@@ -1888,6 +1921,10 @@ Run `exomonad recompile` first to build it.",
         .route("/runs/{run_id}", get(control_run))
         .route("/runs/{run_id}/slices/{slice_id}", get(control_slice))
         .route("/runs/{run_id}/transitions", get(control_transitions))
+        .route(
+            "/cleanup",
+            post(control_cleanup).layer(DefaultBodyLimit::max(control_cleanup::MAX_REQUEST_BYTES)),
+        )
         .route(
             "/runs/{run_id}/gates/{gate_name}",
             post(control_answer_gate),
@@ -2019,13 +2056,14 @@ mod tests {
     async fn control_root_exposes_only_non_authoritative_actions() {
         let Json(document) = control_root().await;
         assert_eq!(document["allowed_actions"][0], "read_projection");
-        assert_eq!(document["allowed_actions"][1], "answer_named_gate");
-        assert_eq!(document["allowed_actions"][2], "propose_plan_mutation");
-        assert_eq!(document["allowed_actions"][3], "inspect_recovery");
-        assert_eq!(document["allowed_actions"][4], "retry_recovery");
-        assert_eq!(document["allowed_actions"][5], "wait_for_recovery");
-        assert_eq!(document["allowed_actions"][6], "approve_recovery_scope");
-        assert_eq!(document["allowed_actions"][7], "abandon_recovery");
+        assert_eq!(document["allowed_actions"][1], "cleanup_plan_apply");
+        assert_eq!(document["allowed_actions"][2], "answer_named_gate");
+        assert_eq!(document["allowed_actions"][3], "propose_plan_mutation");
+        assert_eq!(document["allowed_actions"][4], "inspect_recovery");
+        assert_eq!(document["allowed_actions"][5], "retry_recovery");
+        assert_eq!(document["allowed_actions"][6], "wait_for_recovery");
+        assert_eq!(document["allowed_actions"][7], "approve_recovery_scope");
+        assert_eq!(document["allowed_actions"][8], "abandon_recovery");
         for action in [
             "merge_pr",
             "approve_review",

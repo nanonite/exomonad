@@ -1,5 +1,7 @@
 use exomonad_core::effects::EffectRegistry;
-use exomonad_core::services::{AgentResolver, EventLog, InboxStore, SessionMemoryService};
+use exomonad_core::services::{
+    AgentResolver, EventLog, InboxStore, SessionMemoryService, VerifiedCleanupService,
+};
 use exomonad_core::{AgentName, PluginManager, Role};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,4 +23,5 @@ pub struct AppState {
     pub agent_resolver: Arc<AgentResolver>,
     pub inbox_store: Arc<InboxStore>,
     pub session_memory: Arc<SessionMemoryService>,
+    pub cleanup_service: VerifiedCleanupService,
 }

@@ -12,6 +12,7 @@ pub const CLEANUP_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const MAX_CLEANUP_TARGET_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupRequest {
     #[serde(default)]
     pub target: Option<String>,
@@ -184,6 +185,8 @@ pub struct CleanupReceiptEntry {
     pub agent_slug: String,
     #[serde(default)]
     pub identity_snapshot: Option<AgentIdentityRecord>,
+    #[serde(default)]
+    pub pull_request: Option<CleanupPullRequest>,
     pub status: CleanupReceiptStatus,
     pub actions: Vec<String>,
     pub reason: Option<String>,

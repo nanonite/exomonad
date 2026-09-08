@@ -187,6 +187,9 @@ pub trait HasCiStatusMap: Send + Sync {
 pub trait HasWatcherRuntimeState: Send + Sync {
     fn watcher_runtime_state(&self) -> &Arc<WatcherRuntimeState>;
 }
+pub trait HasCleanupService: Send + Sync {
+    fn cleanup_service(&self) -> VerifiedCleanupService;
+}
 // ============================================================================
 // Services — the concrete type that implements all traits
 // ============================================================================
@@ -230,6 +233,12 @@ impl Services {
     /// Construct the shared verified cleanup service for this project.
     pub fn cleanup_service(&self) -> VerifiedCleanupService {
         VerifiedCleanupService::from_services(self)
+    }
+}
+
+impl HasCleanupService for Services {
+    fn cleanup_service(&self) -> VerifiedCleanupService {
+        Services::cleanup_service(self)
     }
 }
 

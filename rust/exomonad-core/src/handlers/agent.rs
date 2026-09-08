@@ -47,10 +47,11 @@ use tokio::{fs, process::Command};
 use tracing::{info, warn};
 
 use crate::services::{
-    capture_memory, HasAgentResolver, HasClaudeSessionRegistry, HasEventLog, HasForgejoClient,
-    HasForgejoReviewerClient, HasGitHubClient, HasGitWorktreeService, HasInboxStore, HasProjectDir,
-    HasSessionMemory, HasSupervisorRegistry, HasTeamRegistry, HasWatcherRuntimeState,
-    MemoryCapture, MemoryKind,
+    capture_memory, CleanupReceipt, CleanupReceiptEntry, CleanupReceiptStatus,
+    CleanupRequest as VerifiedCleanupRequest, HasAgentResolver, HasClaudeSessionRegistry,
+    HasCleanupService, HasEventLog, HasForgejoClient, HasForgejoReviewerClient, HasGitHubClient,
+    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory, HasSupervisorRegistry,
+    HasTeamRegistry, HasWatcherRuntimeState, MemoryCapture, MemoryKind,
 };
 
 /// Agent effect handler.
@@ -390,6 +391,7 @@ impl<
             + HasEventLog
             + HasForgejoClient
             + HasForgejoReviewerClient
+            + HasCleanupService
             + HasWatcherRuntimeState
             + 'static,
     > EffectHandler for AgentHandler<C>
@@ -568,30 +570,6 @@ async fn spawn_dirty_worktree_entries(project_dir: &Path) -> Result<SpawnPreflig
     ))
 }
 
-struct VerifiedOrphan {
-    worktree_path: PathBuf,
-    agent_dir: PathBuf,
-    pr_number: u64,
-    pr_state: String,
-}
-
-fn cleanup_pr_state(pr: &ForgejoPullRequest) -> Result<String, String> {
-    if pr.merged {
-        return Ok("merged".to_string());
-    }
-    if pr.state.eq_ignore_ascii_case("closed") {
-        return Ok("closed".to_string());
-    }
-    if pr.state.eq_ignore_ascii_case("open") {
-        return Err(format!("PR #{} is still open", pr.number.as_u64()));
-    }
-    Err(format!(
-        "PR #{} has unsupported state {:?}",
-        pr.number.as_u64(),
-        pr.state
-    ))
-}
-
 fn dirty_worktree_message(entries: &[String]) -> String {
     let listed = entries
         .iter()
@@ -605,6 +583,87 @@ fn dirty_worktree_message(entries: &[String]) -> String {
         String::new()
     };
     format!("worktree check failed: uncommitted or untracked files are present\n{listed}{suffix}")
+}
+
+fn cleanup_receipt_response(receipt: &CleanupReceipt) -> DisposeOrphanResponse {
+    let mut response = empty_cleanup_response(receipt.dry_run);
+    for entry in &receipt.entries {
+        response.pr_number = response.pr_number.max(
+            entry
+                .pull_request
+                .as_ref()
+                .map(|request| request.number)
+                .unwrap_or_default(),
+        );
+        if response.pr_state.is_empty() {
+            response.pr_state = entry
+                .pull_request
+                .as_ref()
+                .map(|request| request.state.clone())
+                .unwrap_or_default();
+        }
+        append_cleanup_entry(&mut response, entry, receipt.dry_run);
+    }
+    response.verified = response.errors.is_empty();
+    response.message = format!(
+        "Verified cleanup complete: cleaned={}, skipped={}, dry_run={}",
+        response.cleaned_agents.len(),
+        response.skipped_agents.len(),
+        receipt.dry_run
+    );
+    response
+}
+
+fn empty_cleanup_response(dry_run: bool) -> DisposeOrphanResponse {
+    DisposeOrphanResponse {
+        removed_worktree: false,
+        removed_agent_dir: false,
+        message: String::new(),
+        pr_state: String::new(),
+        pr_number: 0,
+        verified: true,
+        dry_run,
+        cleaned_agents: Vec::new(),
+        skipped_agents: Vec::new(),
+        errors: Vec::new(),
+    }
+}
+
+fn append_cleanup_entry(
+    response: &mut DisposeOrphanResponse,
+    entry: &CleanupReceiptEntry,
+    dry_run: bool,
+) {
+    let name = if entry.agent_name.is_empty() {
+        entry.candidate_id.clone()
+    } else {
+        entry.agent_name.clone()
+    };
+    match &entry.status {
+        CleanupReceiptStatus::Cleaned => {
+            response.cleaned_agents.push(name);
+            response.removed_worktree |= !dry_run
+                && entry
+                    .actions
+                    .iter()
+                    .any(|action| action == "remove_worktree");
+            response.removed_agent_dir |= !dry_run
+                && entry
+                    .actions
+                    .iter()
+                    .any(|action| action == "remove_agent_directory");
+        }
+        CleanupReceiptStatus::WouldClean => {}
+        _ => {
+            response.skipped_agents.push(name);
+            response.errors.push(
+                entry
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "cleanup entry was not cleaned".to_string()),
+            );
+        }
+    }
 }
 
 fn tl_preflight_acknowledged() -> bool {
@@ -943,6 +1002,7 @@ impl<
             + HasEventLog
             + HasForgejoClient
             + HasForgejoReviewerClient
+            + HasCleanupService
             + HasWatcherRuntimeState
             + 'static,
     > AgentEffects for AgentHandler<C>
@@ -2357,7 +2417,7 @@ impl<
             if !req.verify_pr_state {
                 return Err(EffectError::invalid_input("sweep requires verify_pr_state"));
             }
-            return self.sweep_verified_orphans(req.dry_run).await;
+            return self.run_verified_cleanup(req).await;
         }
 
         let agent_slug = req.agent_slug.trim();
@@ -2365,7 +2425,7 @@ impl<
             return Err(EffectError::invalid_input("agent_slug is required"));
         }
         if req.verify_pr_state {
-            return self.dispose_verified_orphan(agent_slug, req.dry_run).await;
+            return self.run_verified_cleanup(req).await;
         }
 
         match orphan_agent_window_alive(self.ctx.project_dir(), agent_slug).await {
@@ -2804,209 +2864,38 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasCleanupService
             + HasWatcherRuntimeState
             + 'static,
     > AgentHandler<C>
 {
-    async fn dispose_verified_orphan(
+    async fn run_verified_cleanup(
         &self,
-        agent_slug: &str,
-        dry_run: bool,
+        req: DisposeOrphanRequest,
     ) -> EffectResult<DisposeOrphanResponse> {
-        let candidate = self
-            .verify_orphan_cleanup(agent_slug)
-            .await
-            .map_err(EffectError::invalid_input)?;
-        let mut response = DisposeOrphanResponse {
-            removed_worktree: false,
-            removed_agent_dir: false,
-            message: format!(
-                "Verified orphan {agent_slug}: PR #{} is {}; worktree is clean and tmux is dead",
-                candidate.pr_number, candidate.pr_state
-            ),
-            pr_state: candidate.pr_state.clone(),
-            pr_number: candidate.pr_number,
-            verified: true,
-            dry_run,
-            cleaned_agents: Vec::new(),
-            skipped_agents: Vec::new(),
-            errors: Vec::new(),
+        let target = (!req.sweep).then(|| req.agent_slug.trim().to_string());
+        let cleanup_request = VerifiedCleanupRequest {
+            target,
+            sweep: req.sweep,
+            apply: !req.dry_run,
         };
-        if dry_run {
-            info!(
-                agent = %agent_slug,
-                pr_number = candidate.pr_number,
-                pr_state = %candidate.pr_state,
-                "Verified cleanup_leaf dry run; resources were not disposed"
-            );
-            return Ok(response);
-        }
-
-        dispose_agent_resources(
-            self.ctx.project_dir(),
-            self.ctx.git_worktree_service().clone(),
-            agent_slug,
-        )
-        .await;
-        response.removed_worktree = !candidate.worktree_path.exists();
-        response.removed_agent_dir = !candidate.agent_dir.exists();
-        response.cleaned_agents.push(agent_slug.to_string());
-        response.message = format!(
-            "Disposed verified orphan {agent_slug}: PR #{} is {}; worktree_removed={}, agent_dir_removed={}",
-            candidate.pr_number,
-            candidate.pr_state,
-            response.removed_worktree,
-            response.removed_agent_dir
-        );
-        info!(
-            agent = %agent_slug,
-            pr_number = candidate.pr_number,
-            pr_state = %candidate.pr_state,
-            removed_worktree = response.removed_worktree,
-            removed_agent_dir = response.removed_agent_dir,
-            "Disposed verified cleanup_leaf target"
-        );
-        Ok(response)
-    }
-
-    async fn sweep_verified_orphans(&self, dry_run: bool) -> EffectResult<DisposeOrphanResponse> {
-        let worktrees_dir = self.ctx.project_dir().join(".exo/worktrees");
-        let mut entries = tokio::fs::read_dir(&worktrees_dir).await.map_err(|error| {
-            EffectError::invalid_input(format!("Could not list orphan worktrees: {error}"))
-        })?;
-        let mut slugs = Vec::new();
-        while let Some(entry) = entries.next_entry().await.map_err(|error| {
-            EffectError::invalid_input(format!("Could not read orphan worktrees: {error}"))
-        })? {
-            if entry
-                .file_type()
-                .await
-                .map_err(|error| {
-                    EffectError::invalid_input(format!(
-                        "Could not inspect orphan worktree: {error}"
-                    ))
-                })?
-                .is_dir()
-            {
-                if let Some(slug) = entry.file_name().to_str() {
-                    slugs.push(slug.to_string());
-                }
-            }
-        }
-        slugs.sort();
-
-        let mut response = DisposeOrphanResponse {
-            removed_worktree: false,
-            removed_agent_dir: false,
-            message: String::new(),
-            pr_state: String::new(),
-            pr_number: 0,
-            verified: true,
-            dry_run,
-            cleaned_agents: Vec::new(),
-            skipped_agents: Vec::new(),
-            errors: Vec::new(),
-        };
-        for slug in slugs {
-            match self.dispose_verified_orphan(&slug, dry_run).await {
-                Ok(candidate) => {
-                    response.removed_worktree |= candidate.removed_worktree;
-                    response.removed_agent_dir |= candidate.removed_agent_dir;
-                    response.cleaned_agents.extend(candidate.cleaned_agents);
-                }
-                Err(error) => {
-                    warn!(agent = %slug, error = %error, "cleanup_leaf sweep refused orphan");
-                    response.skipped_agents.push(slug.clone());
-                    response.errors.push(format!("{slug}: {error}"));
-                    response.verified = false;
-                }
-            }
-        }
-        response.message = format!(
-            "cleanup_leaf sweep complete: cleaned={}, skipped={}, dry_run={dry_run}",
-            response.cleaned_agents.len(),
-            response.skipped_agents.len()
-        );
-        info!(
-            cleaned = response.cleaned_agents.len(),
-            skipped = response.skipped_agents.len(),
-            dry_run,
-            "Completed cleanup_leaf sweep"
-        );
-        Ok(response)
-    }
-
-    async fn verify_orphan_cleanup(&self, agent_slug: &str) -> Result<VerifiedOrphan, String> {
-        info!(agent = %agent_slug, "Verifying cleanup_leaf target before disposal");
-        match orphan_agent_window_alive(self.ctx.project_dir(), agent_slug).await {
-            Ok(true) => return Err("tmux window or pane is still alive".to_string()),
-            Ok(false) => {}
-            Err(error) => return Err(format!("could not verify tmux is dead: {error}")),
-        }
-
-        let worktree_path = self
+        let receipt = self
             .ctx
-            .project_dir()
-            .join(".exo/worktrees")
-            .join(agent_slug);
-        if !worktree_path.is_dir() {
-            return Err(format!(
-                "worktree does not exist: {}",
-                worktree_path.display()
+            .cleanup_service()
+            .run(&cleanup_request)
+            .await
+            .effect_err("agent")?;
+        let response = cleanup_receipt_response(&receipt);
+        if !req.sweep && !response.errors.is_empty() {
+            return Err(EffectError::invalid_input(
+                response
+                    .errors
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "verified cleanup refused the requested agent".to_string()),
             ));
         }
-        let dirty = dirty_worktree_entries(&worktree_path).await?;
-        if !dirty.is_empty() {
-            return Err(dirty_worktree_message(&dirty));
-        }
-
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&worktree_path)
-            .args(["branch", "--show-current"])
-            .output()
-            .await
-            .map_err(|error| format!("failed to read worktree branch: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "failed to read worktree branch: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if branch.is_empty() {
-            return Err("worktree is detached or has no branch".to_string());
-        }
-        let branch = BranchName::try_from_str(&branch)
-            .map_err(|error| format!("invalid worktree branch {branch}: {error}"))?;
-
-        let forgejo = self
-            .ctx
-            .forgejo_client()
-            .ok_or_else(|| "Forgejo is not configured; cannot verify PR state".to_string())?;
-        let repo_info = crate::services::repo::get_repo_info(self.ctx.project_dir())
-            .await
-            .map_err(|error| format!("could not resolve repository for PR lookup: {error}"))?;
-        let prs = forgejo
-            .find_pull_requests_by_head(&repo_info.owner, &repo_info.repo, &branch)
-            .await
-            .map_err(|error| format!("could not query PR state: {error}"))?;
-        if prs.len() != 1 {
-            return Err(match prs.len() {
-                0 => format!("no PR found for branch {branch}"),
-                count => {
-                    format!("found {count} PRs for branch {branch}; refusing ambiguous cleanup")
-                }
-            });
-        }
-        let pr = &prs[0];
-        let pr_state = cleanup_pr_state(pr)?;
-        Ok(VerifiedOrphan {
-            worktree_path,
-            agent_dir: self.ctx.project_dir().join(".exo/agents").join(agent_slug),
-            pr_number: pr.number.as_u64(),
-            pr_state,
-        })
+        Ok(response)
     }
 
     async fn resolve_forgejo_pr(&self, pr_number: u64) -> EffectResult<ForgejoPullRequest> {
@@ -3111,6 +3000,7 @@ impl<
             + HasClaudeSessionRegistry
             + HasEventLog
             + HasForgejoClient
+            + HasCleanupService
             + HasWatcherRuntimeState
             + 'static,
     > AgentHandler<C>
@@ -5919,40 +5809,6 @@ mod tests {
         assert!(tombstone_agent_by_pane(project_dir, "%42").await);
         assert!(agent_dir.join("exited_at").exists());
         assert!(agent_dir.join("routing.json").exists());
-    }
-
-    fn test_forgejo_pr() -> ForgejoPullRequest {
-        ForgejoPullRequest {
-            number: PRNumber::new(7),
-            url: "https://forgejo.local/pr/7".to_string(),
-            title: "Test PR".to_string(),
-            body: String::new(),
-            head_ref: BranchName::try_from_str("main.feature-codex")
-                .expect("literal branch is non-empty"),
-            base_ref: BranchName::try_from_str("main").expect("literal branch is non-empty"),
-            state: "open".to_string(),
-            merged: false,
-            head_sha: Some("abc123".to_string()),
-            base_sha: None,
-            merge_commit_sha: None,
-        }
-    }
-
-    #[test]
-    fn cleanup_pr_state_refuses_open_pr() {
-        let pr = test_forgejo_pr();
-        assert_eq!(cleanup_pr_state(&pr).unwrap_err(), "PR #7 is still open");
-    }
-
-    #[test]
-    fn cleanup_pr_state_accepts_closed_and_merged_prs() {
-        let mut pr = test_forgejo_pr();
-        pr.state = "closed".to_string();
-        assert_eq!(cleanup_pr_state(&pr).unwrap(), "closed");
-
-        pr.state = "open".to_string();
-        pr.merged = true;
-        assert_eq!(cleanup_pr_state(&pr).unwrap(), "merged");
     }
 
     fn test_review(state: &str, commit_id: Option<&str>) -> ForgejoPullRequestReview {
