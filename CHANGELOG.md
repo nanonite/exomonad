@@ -436,6 +436,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Extract a shared verified cleanup planner and executor (#1069)
+- Extract a shared verified cleanup planner and executor (#1069)
 - Unify publication ownership verification across watcher and handler (#1024)
 - Single watcher-response projection for tl_loop/loop (63 raw readers) (#1025)
 - Adopt plan.json as the snapshot when continuing a legacy run (#1021)
