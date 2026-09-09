@@ -18,6 +18,7 @@ pub(super) fn receipt_entry(
             .unwrap_or_default(),
         identity_snapshot: candidate.identity.clone(),
         pull_request: candidate.pull_request.clone(),
+        branch: candidate.branch.clone(),
         status,
         actions,
         reason,
@@ -39,6 +40,7 @@ pub(super) fn dry_run_receipt(plan: &CleanupPlan) -> CleanupReceipt {
 fn dry_run_entry(candidate: &CleanupCandidate) -> CleanupReceiptEntry {
     let actions = if candidate.decision.is_cleanable() {
         let mut actions = Vec::new();
+        append_branch_preview(&mut actions, candidate.branch.as_ref());
         if candidate.worktree_path.is_some() && !candidate.resolver_only {
             actions.push("remove_worktree".to_string());
         }
@@ -61,6 +63,18 @@ fn dry_run_entry(candidate: &CleanupCandidate) -> CleanupReceiptEntry {
         actions,
         candidate.decision.reason().map(ToOwned::to_owned),
     )
+}
+
+fn append_branch_preview(actions: &mut Vec<String>, branch: Option<&CleanupBranchEvidence>) {
+    let Some(branch) = branch else {
+        return;
+    };
+    if matches!(branch.local.status, CleanupBranchActionStatus::WouldDelete) {
+        actions.push("would_delete_local_branch".to_string());
+    }
+    if matches!(branch.remote.status, CleanupBranchActionStatus::WouldDelete) {
+        actions.push("would_delete_remote_branch".to_string());
+    }
 }
 
 pub(super) fn in_progress_receipt(plan: &CleanupPlan, started_at: u64) -> CleanupReceipt {

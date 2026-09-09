@@ -25,22 +25,22 @@ pub(super) struct PullRequestObservation {
     pub(super) error: Option<String>,
     pub(super) head_matches: Option<bool>,
     pub(super) remote_head_matches: Option<bool>,
+    pub(super) merge_commit_reachable: Option<Result<bool, String>>,
 }
 
 impl VerifiedCleanupService {
     pub(super) async fn inspect_candidate_facts(
         &self,
         resource: DiscoveredResource,
-        repository: Option<&RepositoryIdentity>,
-        repository_error: Option<&str>,
-        current_branch: Option<&str>,
+        context: InspectionContext<'_>,
     ) -> CandidateFacts {
+        let repository = context.repository;
         let observed = self.observe_resource(resource).await;
         let (local, remote) = self
             .inspect_branch_observations(&observed, repository)
             .await;
         let pull_request = self
-            .inspect_pull_request(&observed, repository, repository_error, &local, &remote)
+            .inspect_pull_request(&observed, context, &local, &remote)
             .await;
         let liveness = self
             .candidate_liveness(
@@ -50,18 +50,7 @@ impl VerifiedCleanupService {
                 observed.worktree.worktree_path.as_ref(),
             )
             .await;
-        CandidateFacts::from_observations(
-            observed,
-            local,
-            remote,
-            pull_request,
-            liveness,
-            InspectionContext {
-                repository,
-                repository_error,
-                current_branch,
-            },
-        )
+        CandidateFacts::from_observations(observed, local, remote, pull_request, liveness, context)
     }
 
     async fn inspect_branch_observations(
@@ -120,11 +109,14 @@ impl VerifiedCleanupService {
     async fn inspect_pull_request(
         &self,
         observed: &ObservedResource,
-        repository: Option<&RepositoryIdentity>,
-        repository_error: Option<&str>,
+        context: InspectionContext<'_>,
         local: &LocalBranchObservation,
         remote: &RemoteBranchObservation,
     ) -> PullRequestObservation {
+        let repository = context.repository;
+        let repository_error = context.repository_error;
+        let fetched_target = context.fetched_target;
+        let target_error = context.target_error;
         let (request, error) = self
             .pull_request_state(
                 observed.worktree.branch_name.as_deref(),
@@ -135,12 +127,32 @@ impl VerifiedCleanupService {
             .await;
         let (head_matches, remote_head_matches) =
             pull_request_head_matches(&local.local_head_sha, &remote.head_sha, &request);
+        let merge_commit_reachable = self
+            .inspect_merge_reachability(request.as_ref(), fetched_target, target_error)
+            .await;
         PullRequestObservation {
             request,
             error,
             head_matches,
             remote_head_matches,
+            merge_commit_reachable,
         }
+    }
+
+    async fn inspect_merge_reachability(
+        &self,
+        pull_request: Option<&CleanupPullRequest>,
+        fetched_target: Option<&CleanupTargetBranch>,
+        target_error: Option<&str>,
+    ) -> Option<Result<bool, String>> {
+        let pull_request = pull_request?;
+        let merge_commit = pull_request.merge_commit_sha.as_deref()?;
+        let target = fetched_target?;
+        Some(
+            merge_commit_reachable(&self.project_dir, merge_commit, target)
+                .await
+                .map_err(|error| target_error.map_or_else(|| error.to_string(), ToOwned::to_owned)),
+        )
     }
 
     async fn candidate_liveness(

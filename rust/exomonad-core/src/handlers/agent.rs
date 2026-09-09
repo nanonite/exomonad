@@ -2880,6 +2880,7 @@ impl<
             target,
             sweep: req.sweep,
             apply: !req.dry_run,
+            delete_remote_branch: false,
         };
         let receipt = self
             .ctx
@@ -4748,6 +4749,7 @@ mod tests {
                 agent_slug: "feature-codex".to_string(),
                 identity_snapshot: None,
                 pull_request: None,
+                branch: None,
                 status: CleanupReceiptStatus::WouldClean,
                 actions: vec!["remove_worktree".to_string()],
                 reason: None,

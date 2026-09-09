@@ -1,3 +1,4 @@
+use super::inspection_build::InspectionContext;
 use super::support::*;
 use super::types::*;
 use crate::services::agent_control::Topology;
@@ -92,18 +93,31 @@ impl VerifiedCleanupService {
         } else {
             (None, None)
         };
+        let (fetched_target, target_error) = match repository.as_ref() {
+            Some(repository) => match fetch_target_branch(
+                &self.project_dir,
+                &repository.remote_name,
+                &repository.base_branch,
+            )
+            .await
+            {
+                Ok(target) => (Some(target), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, None),
+        };
         let current_branch = current_branch(&self.project_dir).await;
         let mut candidates = Vec::with_capacity(resources.len());
         for resource in resources {
-            candidates.push(
-                self.inspect_candidate(
-                    resource,
-                    repository.as_ref(),
-                    repository_error.as_deref(),
-                    current_branch.as_deref(),
-                )
-                .await,
-            );
+            let context = InspectionContext {
+                repository: repository.as_ref(),
+                repository_error: repository_error.as_deref(),
+                current_branch: current_branch.as_deref(),
+                fetched_target: fetched_target.as_ref(),
+                target_error: target_error.as_deref(),
+                delete_remote_branch: request.delete_remote_branch,
+            };
+            candidates.push(self.inspect_candidate(resource, context).await);
         }
         refuse_duplicate_branches(&mut candidates);
         Ok(CleanupPlan {
@@ -114,6 +128,7 @@ impl VerifiedCleanupService {
             repository,
             repository_error,
             candidates,
+            fetched_target,
         })
     }
 

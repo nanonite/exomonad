@@ -101,6 +101,16 @@ mod tests {
         assert!(serde_json::from_value::<CleanupRequest>(request).is_err());
     }
 
+    #[test]
+    fn cleanup_remote_branch_deletion_defaults_to_disabled() {
+        let request = serde_json::from_value::<CleanupRequest>(serde_json::json!({
+            "sweep": true,
+            "apply": true,
+        }))
+        .unwrap();
+        assert!(!request.delete_remote_branch);
+    }
+
     #[tokio::test]
     async fn dry_run_uses_the_shared_service_and_persists_a_receipt() {
         let project = tempdir().expect("temporary project");

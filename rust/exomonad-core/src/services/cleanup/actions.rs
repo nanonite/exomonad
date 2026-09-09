@@ -13,6 +13,12 @@ impl VerifiedCleanupService {
         receipt: &mut CleanupReceipt,
         index: usize,
     ) -> CleanupReceiptEntry {
+        if let Some(entry) = self
+            .execute_remote_branch_action(candidate, receipt, index)
+            .await
+        {
+            return entry;
+        }
         let mut actions = receipt.entries[index].actions.clone();
         if let Some(entry) = self
             .remove_worktree(candidate, receipt, index, &mut actions)
@@ -20,6 +26,13 @@ impl VerifiedCleanupService {
         {
             return entry;
         }
+        if let Some(entry) = self
+            .execute_local_branch_action(candidate, receipt, index)
+            .await
+        {
+            return entry;
+        }
+        actions = receipt.entries[index].actions.clone();
         if let Some(entry) = self
             .remove_agent_directory(candidate, receipt, index, &mut actions)
             .await
@@ -32,7 +45,10 @@ impl VerifiedCleanupService {
         {
             return entry;
         }
-        receipt_entry(candidate, CleanupReceiptStatus::Cleaned, actions, None)
+        let branch = receipt.entries[index].branch.clone();
+        let mut entry = receipt_entry(candidate, CleanupReceiptStatus::Cleaned, actions, None);
+        entry.branch = branch;
+        entry
     }
 
     pub(super) async fn execute_resolver_only(
@@ -195,10 +211,6 @@ impl VerifiedCleanupService {
 
 async fn path_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).await.is_ok()
-}
-
-fn path_exists_sync(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
 }
 
 fn refused(candidate: &CleanupCandidate, reason: impl Into<String>) -> CleanupReceiptEntry {

@@ -35,7 +35,7 @@ impl VerifiedCleanupService {
                 local_head_sha: Some(sha),
             },
             Ok(None) => LocalBranchObservation {
-                identity_error: Some("managed local branch is unavailable".to_string()),
+                identity_error,
                 ..LocalBranchObservation::without_branch(None)
             },
             Err(error) => LocalBranchObservation {

@@ -1,4 +1,8 @@
 mod actions;
+mod branch_actions;
+mod branch_preparation;
+mod branch_receipts;
+mod branch_validation;
 mod candidate;
 mod decision;
 mod discovery;
@@ -19,7 +23,8 @@ mod types;
 
 pub use self::service::VerifiedCleanupService;
 pub use self::types::{
-    CleanupCandidate, CleanupDecision, CleanupLiveness, CleanupPlan, CleanupPullRequest,
-    CleanupReceipt, CleanupReceiptEntry, CleanupReceiptStatus, CleanupRequest,
+    CleanupBranchAction, CleanupBranchActionStatus, CleanupBranchEvidence, CleanupCandidate,
+    CleanupDecision, CleanupLiveness, CleanupPlan, CleanupPullRequest, CleanupReceipt,
+    CleanupReceiptEntry, CleanupReceiptStatus, CleanupRequest, CleanupTargetBranch,
     CLEANUP_PLAN_SCHEMA_VERSION, CLEANUP_RECEIPT_SCHEMA_VERSION,
 };

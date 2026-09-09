@@ -26,12 +26,18 @@ pub(super) struct CandidateFacts {
     agent_name: String,
     issue: Option<String>,
     decision: CleanupDecision,
+    branch: Option<CleanupBranchEvidence>,
+    delete_remote_branch: bool,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct InspectionContext<'a> {
     pub(super) repository: Option<&'a RepositoryIdentity>,
     pub(super) repository_error: Option<&'a str>,
     pub(super) current_branch: Option<&'a str>,
+    pub(super) fetched_target: Option<&'a CleanupTargetBranch>,
+    pub(super) target_error: Option<&'a str>,
+    pub(super) delete_remote_branch: bool,
 }
 
 struct DecisionObservations<'a> {
@@ -73,6 +79,7 @@ impl CandidateFacts {
             .as_ref()
             .map(|identity| identity.agent_name.to_string())
             .unwrap_or_else(|| observed.id.clone());
+        let branch = branch_evidence(&local, &remote, &pull_request, context, &decision);
         Self {
             id: observed.id,
             agent_dir: observed.agent_dir,
@@ -95,6 +102,8 @@ impl CandidateFacts {
             agent_name,
             issue: observed.issue,
             decision,
+            branch,
+            delete_remote_branch: context.delete_remote_branch,
         }
     }
 
@@ -121,6 +130,8 @@ impl CandidateFacts {
             head_matches_pull_request: self.head_matches_pull_request,
             remote_head_matches_pull_request: self.remote_head_matches_pull_request,
             identity: self.identity,
+            branch: self.branch,
+            delete_remote_branch: self.delete_remote_branch,
             decision: self.decision,
         }
     }
@@ -144,9 +155,88 @@ fn decision_for(
         pr_error: observations.pull_request.error.as_deref(),
         head_matches_pull_request: observations.pull_request.head_matches,
         remote_head_matches_pull_request: observations.pull_request.remote_head_matches,
+        merge_commit_reachable: observations.pull_request.merge_commit_reachable.clone(),
+        target_error: context.target_error,
         resolver_only: observations.observed.resolver_only,
         recovery_receipt: observations.observed.recovery_receipt,
     })
+}
+
+fn branch_evidence(
+    local: &LocalBranchObservation,
+    remote: &RemoteBranchObservation,
+    pull_request: &PullRequestObservation,
+    context: InspectionContext<'_>,
+    decision: &CleanupDecision,
+) -> Option<CleanupBranchEvidence> {
+    let branch = local.local_branch.clone().or_else(|| {
+        pull_request
+            .request
+            .as_ref()
+            .map(|pull_request| pull_request.head_ref.clone())
+    })?;
+    let local_action = if local.local_branch.is_some() {
+        CleanupBranchAction {
+            status: CleanupBranchActionStatus::WouldDelete,
+            reason: None,
+        }
+    } else {
+        CleanupBranchAction {
+            status: CleanupBranchActionStatus::AlreadyAbsent,
+            reason: Some("managed local branch is already absent".to_string()),
+        }
+    };
+    let remote_action = if !context.delete_remote_branch {
+        CleanupBranchAction {
+            status: CleanupBranchActionStatus::NotRequested,
+            reason: Some("remote branch deletion was not requested".to_string()),
+        }
+    } else if let Some(error) = &remote.error {
+        CleanupBranchAction {
+            status: CleanupBranchActionStatus::Refused,
+            reason: Some(error.clone()),
+        }
+    } else if remote.head_sha.is_some() {
+        CleanupBranchAction {
+            status: CleanupBranchActionStatus::WouldDelete,
+            reason: None,
+        }
+    } else {
+        CleanupBranchAction {
+            status: CleanupBranchActionStatus::AlreadyAbsent,
+            reason: Some("managed remote branch is already absent".to_string()),
+        }
+    };
+    let mut evidence = CleanupBranchEvidence {
+        branch: Some(branch),
+        local_head_sha: local.local_head_sha.clone(),
+        remote_name: context
+            .fetched_target
+            .map(|target| target.remote_name.clone()),
+        remote_branch: remote.branch.clone(),
+        remote_head_sha: remote.head_sha.clone(),
+        target_branch: context.fetched_target.map(|target| target.branch.clone()),
+        target_head_sha: context.fetched_target.map(|target| target.head_sha.clone()),
+        merge_commit_reachable: pull_request
+            .merge_commit_reachable
+            .as_ref()
+            .and_then(|result| result.as_ref().ok().copied()),
+        local: local_action,
+        remote: remote_action,
+    };
+    if let Some(reason) = decision.reason() {
+        evidence.local = CleanupBranchAction {
+            status: CleanupBranchActionStatus::Refused,
+            reason: Some(reason.to_string()),
+        };
+        if context.delete_remote_branch {
+            evidence.remote = CleanupBranchAction {
+                status: CleanupBranchActionStatus::Refused,
+                reason: Some(reason.to_string()),
+            };
+        }
+    }
+    Some(evidence)
 }
 
 fn protected_branch(

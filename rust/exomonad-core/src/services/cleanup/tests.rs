@@ -29,6 +29,33 @@ fn identity(topology: Topology) -> AgentIdentityRecord {
     }
 }
 
+fn decision_for_pr(
+    identity: &AgentIdentityRecord,
+    repository: &RepositoryIdentity,
+    pull_request: &CleanupPullRequest,
+    merge_commit_reachable: Option<Result<bool, String>>,
+) -> CleanupDecision {
+    candidate_decision(DecisionContext {
+        identity: Some(identity),
+        identity_error: None,
+        resolver_only: false,
+        liveness: &CleanupLiveness::Dead,
+        dirty: Some(false),
+        protected: false,
+        identity_drift: false,
+        repository: Some(repository),
+        repository_error: None,
+        remote_error: None,
+        pull_request: Some(pull_request),
+        pr_error: None,
+        head_matches_pull_request: None,
+        remote_head_matches_pull_request: None,
+        recovery_receipt: false,
+        merge_commit_reachable,
+        target_error: None,
+    })
+}
+
 #[test]
 fn cleanup_defaults_to_a_non_mutating_sweep() {
     let request = CleanupRequest::default();
@@ -42,6 +69,7 @@ fn target_validation_rejects_paths_and_ambiguous_requests() {
         target: Some("a/b".to_string()),
         sweep: false,
         apply: false,
+        delete_remote_branch: false,
     }
     .validate()
     .is_err());
@@ -49,6 +77,7 @@ fn target_validation_rejects_paths_and_ambiguous_requests() {
         target: Some("agent".to_string()),
         sweep: true,
         apply: false,
+        delete_remote_branch: false,
     }
     .validate()
     .is_err());
@@ -71,7 +100,7 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
         base_ref: "main".to_string(),
         state: "closed".to_string(),
         merged: true,
-        head_sha: None,
+        head_sha: Some("head".to_string()),
         merge_commit_sha: Some("merge".to_string()),
     };
     assert_eq!(
@@ -91,10 +120,12 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
             head_matches_pull_request: None,
             remote_head_matches_pull_request: None,
             recovery_receipt: false,
+            merge_commit_reachable: Some(Ok(true)),
+            target_error: None,
         }),
         CleanupDecision::Cleanable
     );
-    let mut wrong_base = pr;
+    let mut wrong_base = pr.clone();
     wrong_base.base_ref = "release".to_string();
     assert!(!candidate_decision(DecisionContext {
         identity: Some(&identity),
@@ -112,8 +143,14 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
         head_matches_pull_request: None,
         remote_head_matches_pull_request: None,
         recovery_receipt: false,
+        merge_commit_reachable: Some(Ok(true)),
+        target_error: None,
     })
     .is_cleanable());
+    assert!(!decision_for_pr(&identity, &repo, &pr, Some(Ok(false))).is_cleanable());
+    let mut missing_merge = pr;
+    missing_merge.merge_commit_sha = None;
+    assert!(!decision_for_pr(&identity, &repo, &missing_merge, None).is_cleanable());
 }
 
 #[test]
@@ -161,6 +198,8 @@ fn remote_branch_head_must_match_the_pull_request_head() {
         head_matches_pull_request: Some(true),
         remote_head_matches_pull_request: Some(false),
         recovery_receipt: false,
+        merge_commit_reachable: Some(Ok(true)),
+        target_error: None,
     })
     .is_cleanable());
 }
@@ -190,6 +229,8 @@ fn duplicate_local_branches_are_refused() {
         identity_error: None,
         remote_head_matches_pull_request: None,
         decision: CleanupDecision::Cleanable,
+        branch: None,
+        delete_remote_branch: false,
     };
     let mut candidates = vec![make_candidate("a"), make_candidate("b")];
     refuse_duplicate_branches(&mut candidates);
@@ -252,6 +293,7 @@ async fn apply_is_idempotent_for_shared_agent_directory() {
     );
     let request = CleanupRequest {
         apply: true,
+        delete_remote_branch: false,
         ..CleanupRequest::default()
     };
     let receipt = service.run(&request).await.unwrap();
@@ -292,6 +334,7 @@ async fn apply_resumes_an_interrupted_resolver_only_cleanup() {
     );
     let request = CleanupRequest {
         apply: true,
+        delete_remote_branch: false,
         ..CleanupRequest::default()
     };
     let plan = service.plan(&request).await.unwrap();
@@ -419,6 +462,7 @@ async fn interrupted_cleanup_can_resume_by_slug_after_candidate_identity_changes
         target: Some(record.slug.to_string()),
         sweep: false,
         apply: true,
+        delete_remote_branch: false,
     };
     let plan = service.plan(&request).await.unwrap();
     let mut interrupted = in_progress_receipt(&plan, 1);
@@ -461,6 +505,7 @@ async fn resolver_identity_reuse_does_not_authorize_an_old_receipt() {
         target: Some(old_record.agent_name.to_string()),
         sweep: false,
         apply: true,
+        delete_remote_branch: false,
     };
     let plan = service.plan(&request).await.unwrap();
     let mut interrupted = in_progress_receipt(&plan, 1);
@@ -635,4 +680,154 @@ fn run_git(directory: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test]
+async fn fetched_target_and_squash_merge_reachability_use_the_configured_remote() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    run_git(remote.path(), &["init", "--bare", "-q"]);
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(
+        temp.path(),
+        &["config", "user.email", "cleanup@example.test"],
+    );
+    run_git(temp.path(), &["config", "user.name", "Cleanup Test"]);
+    tokio::fs::write(temp.path().join("README"), "initial\n")
+        .await
+        .unwrap();
+    run_git(temp.path(), &["add", "README"]);
+    run_git(temp.path(), &["commit", "-qm", "initial"]);
+    run_git(temp.path(), &["branch", "-M", "main"]);
+    run_git(
+        temp.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    run_git(temp.path(), &["push", "-q", "origin", "main"]);
+    run_git(temp.path(), &["remote", "set-head", "origin", "main"]);
+    run_git(temp.path(), &["checkout", "-qb", "main.stale"]);
+    tokio::fs::write(temp.path().join("README"), "feature\n")
+        .await
+        .unwrap();
+    run_git(temp.path(), &["commit", "-qam", "feature"]);
+    run_git(temp.path(), &["checkout", "main"]);
+    run_git(temp.path(), &["merge", "--squash", "main.stale"]);
+    run_git(temp.path(), &["commit", "-qm", "squash"]);
+    let merge = String::from_utf8_lossy(
+        &Command::new("git")
+            .current_dir(temp.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let branch_head = String::from_utf8_lossy(
+        &Command::new("git")
+            .current_dir(temp.path())
+            .args(["rev-parse", "main.stale"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let ancestry = Command::new("git")
+        .current_dir(temp.path())
+        .args(["merge-base", "--is-ancestor", &branch_head, "main"])
+        .output()
+        .unwrap();
+    assert!(
+        !ancestry.status.success(),
+        "squash merge must not preserve ancestry"
+    );
+    run_git(temp.path(), &["push", "-q", "origin", "main"]);
+    let target = fetch_target_branch(temp.path(), "origin", "main")
+        .await
+        .unwrap();
+    assert_eq!(target.branch, "main");
+    assert!(merge_commit_reachable(temp.path(), &merge, &target)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn remote_branch_deletion_uses_an_exact_expected_head_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    run_git(remote.path(), &["init", "--bare", "-q"]);
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(
+        temp.path(),
+        &["config", "user.email", "cleanup@example.test"],
+    );
+    run_git(temp.path(), &["config", "user.name", "Cleanup Test"]);
+    tokio::fs::write(temp.path().join("README"), "initial\n")
+        .await
+        .unwrap();
+    run_git(temp.path(), &["add", "README"]);
+    run_git(temp.path(), &["commit", "-qm", "initial"]);
+    run_git(temp.path(), &["branch", "-M", "main"]);
+    run_git(temp.path(), &["branch", "main.stale"]);
+    run_git(
+        temp.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    run_git(temp.path(), &["push", "-q", "origin", "main.stale"]);
+    let expected = local_branch_state(temp.path(), "main.stale")
+        .await
+        .unwrap()
+        .unwrap();
+    let conflicting = "0".repeat(expected.len());
+    assert!(
+        delete_remote_branch_with_lease(temp.path(), "origin", "main.stale", &conflicting,)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        remote_branch_state(temp.path(), "origin", "main.stale")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(expected.as_str())
+    );
+    delete_remote_branch_with_lease(temp.path(), "origin", "main.stale", &expected)
+        .await
+        .unwrap();
+    assert_eq!(
+        remote_branch_state(temp.path(), "origin", "main.stale")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn local_branch_deletion_removes_only_the_validated_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(
+        temp.path(),
+        &["config", "user.email", "cleanup@example.test"],
+    );
+    run_git(temp.path(), &["config", "user.name", "Cleanup Test"]);
+    tokio::fs::write(temp.path().join("README"), "initial\n")
+        .await
+        .unwrap();
+    run_git(temp.path(), &["add", "README"]);
+    run_git(temp.path(), &["commit", "-qm", "initial"]);
+    run_git(temp.path(), &["branch", "-M", "main"]);
+    run_git(temp.path(), &["branch", "main.stale"]);
+    delete_local_branch(temp.path(), "main.stale")
+        .await
+        .unwrap();
+    assert_eq!(
+        local_branch_state(temp.path(), "main.stale").await.unwrap(),
+        None
+    );
+    assert!(local_branch_state(temp.path(), "main")
+        .await
+        .unwrap()
+        .is_some());
 }

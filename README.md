@@ -221,10 +221,18 @@ supplied:
     exomonad clean --name <managed-agent-name-or-slug>  # inspect one candidate
     exomonad clean --sweep                              # inspect all candidates
     exomonad clean --sweep --apply                      # apply the reviewed sweep
+    exomonad clean --sweep --apply --delete-remote-branch  # opt in to leased remote deletion
 
 The command requires EXOMONAD_CONTROL_TOKEN and a running project server.
 exomonad init --continue may report a dry-run cleanup candidate count and the
 command to review it, but never applies cleanup automatically.
+Local branch deletion is reported and applied only after a merged PR, matching
+head SHA, and reachability of its merge commit from a freshly fetched
+configured target branch are verified. Remote deletion is never implied by
+--apply: --delete-remote-branch is a separate opt-in and uses an exact
+expected-head force-with-lease. Current, protected, base, dirty, live,
+ambiguous, open, and closed-unmerged branches are preserved. Without --apply,
+both local and explicitly requested remote actions are preview-only.
 
 Afterwards, the run is measurable rather than merely reviewable. The controller's own decisions — gates opened and answered, slices parked and why, merge decisions, RLM judgment retries — land in the same append-only ledger as agent and PR activity:
 

@@ -21,6 +21,9 @@ pub(crate) struct CleanArgs {
     /// Confirm resource removal. Without this flag the command is a dry run.
     #[arg(long)]
     pub(crate) apply: bool,
+    /// Also delete the managed branch from the configured remote.
+    #[arg(long)]
+    pub(crate) delete_remote_branch: bool,
 }
 
 impl CleanArgs {
@@ -29,6 +32,7 @@ impl CleanArgs {
             target: self.name.clone(),
             sweep: self.sweep,
             apply: self.apply,
+            delete_remote_branch: self.delete_remote_branch,
         };
         request
             .validate()
@@ -82,6 +86,7 @@ pub(crate) fn continue_cleanup_request() -> CleanupRequest {
         target: None,
         sweep: true,
         apply: false,
+        delete_remote_branch: false,
     }
 }
 
@@ -146,7 +151,59 @@ fn append_receipt_entries(lines: &mut Vec<String>, receipt: &CleanupReceipt) {
                 append_reason(lines, "In progress", name, entry);
             }
         }
+        append_branch_actions(lines, entry, receipt.dry_run);
     }
+}
+
+fn append_branch_actions(lines: &mut Vec<String>, entry: &CleanupReceiptEntry, dry_run: bool) {
+    let Some(branch) = &entry.branch else {
+        return;
+    };
+    append_branch_action(lines, "local", &branch.branch, &branch.local, dry_run);
+    append_branch_action(lines, "remote", &branch.branch, &branch.remote, dry_run);
+}
+
+fn append_branch_action(
+    lines: &mut Vec<String>,
+    scope: &str,
+    branch: &Option<String>,
+    action: &exomonad_core::services::CleanupBranchAction,
+    dry_run: bool,
+) {
+    let Some(branch) = branch.as_deref() else {
+        return;
+    };
+    let label = match action.status {
+        exomonad_core::services::CleanupBranchActionStatus::WouldDelete
+        | exomonad_core::services::CleanupBranchActionStatus::DeletePending
+            if dry_run =>
+        {
+            format!("Would delete {scope} branch")
+        }
+        exomonad_core::services::CleanupBranchActionStatus::WouldDelete
+        | exomonad_core::services::CleanupBranchActionStatus::DeletePending => {
+            format!("Pending {scope} branch deletion")
+        }
+        exomonad_core::services::CleanupBranchActionStatus::Deleted => {
+            format!("Deleted {scope} branch")
+        }
+        exomonad_core::services::CleanupBranchActionStatus::AlreadyAbsent => {
+            format!("{scope} branch already absent")
+        }
+        exomonad_core::services::CleanupBranchActionStatus::Skipped => {
+            format!("Skipped {scope} branch deletion")
+        }
+        exomonad_core::services::CleanupBranchActionStatus::Refused => {
+            format!("Refused {scope} branch deletion")
+        }
+        exomonad_core::services::CleanupBranchActionStatus::NotRequested => return,
+    };
+    let reason = action
+        .reason
+        .as_deref()
+        .map(|reason| format!(" — {reason}"))
+        .unwrap_or_default();
+    lines.push(format!("{label}: {branch}{reason}"));
 }
 
 fn append_reason(lines: &mut Vec<String>, status: &str, name: &str, entry: &CleanupReceiptEntry) {
@@ -225,6 +282,7 @@ mod tests {
                     agent_slug: "would-slug".to_string(),
                     identity_snapshot: None,
                     pull_request: None,
+                    branch: None,
                     status: CleanupReceiptStatus::WouldClean,
                     actions: Vec::new(),
                     reason: None,
@@ -235,6 +293,7 @@ mod tests {
                     agent_slug: "cleaned-slug".to_string(),
                     identity_snapshot: None,
                     pull_request: None,
+                    branch: None,
                     status: CleanupReceiptStatus::Cleaned,
                     actions: Vec::new(),
                     reason: None,
@@ -245,6 +304,7 @@ mod tests {
                     agent_slug: "refused-slug".to_string(),
                     identity_snapshot: None,
                     pull_request: None,
+                    branch: None,
                     status: CleanupReceiptStatus::Refused,
                     actions: Vec::new(),
                     reason: Some("agent is still live".to_string()),
@@ -255,6 +315,7 @@ mod tests {
                     agent_slug: "skipped-slug".to_string(),
                     identity_snapshot: None,
                     pull_request: None,
+                    branch: None,
                     status: CleanupReceiptStatus::Skipped,
                     actions: Vec::new(),
                     reason: Some("worktree is dirty".to_string()),
@@ -272,6 +333,7 @@ mod tests {
                 target: Some("leaf".to_string()),
                 sweep: false,
                 apply: false,
+                delete_remote_branch: false,
             }
         );
     }
@@ -285,6 +347,7 @@ mod tests {
                 target: None,
                 sweep: true,
                 apply: true,
+                delete_remote_branch: false,
             }
         );
     }
@@ -296,6 +359,53 @@ mod tests {
     }
 
     #[test]
+    fn remote_branch_deletion_is_explicit_and_dry_run_by_default() {
+        let args = parse(&["exomonad", "clean", "--sweep", "--delete-remote-branch"]).unwrap();
+        let request = args.request().unwrap();
+        assert!(request.delete_remote_branch);
+        assert!(!request.apply);
+        assert!(
+            !parse(&["exomonad", "clean", "--sweep", "--apply"])
+                .unwrap()
+                .request()
+                .unwrap()
+                .delete_remote_branch
+        );
+    }
+
+    #[test]
+    fn receipt_rendering_reports_local_and_remote_branch_actions() {
+        let mut preview = receipt(true);
+        preview.entries[0].branch = Some(exomonad_core::services::CleanupBranchEvidence {
+            branch: Some("main.feature".to_string()),
+            local: exomonad_core::services::CleanupBranchAction {
+                status: exomonad_core::services::CleanupBranchActionStatus::WouldDelete,
+                reason: None,
+            },
+            remote: exomonad_core::services::CleanupBranchAction {
+                status: exomonad_core::services::CleanupBranchActionStatus::WouldDelete,
+                reason: None,
+            },
+            ..Default::default()
+        });
+        let rendered = render_receipt(&preview);
+        assert!(rendered.contains("Would delete local branch: main.feature"));
+        assert!(rendered.contains("Would delete remote branch: main.feature"));
+
+        preview.dry_run = false;
+        preview.entries[0].branch.as_mut().unwrap().local.status =
+            exomonad_core::services::CleanupBranchActionStatus::Deleted;
+        preview.entries[0].branch.as_mut().unwrap().remote.status =
+            exomonad_core::services::CleanupBranchActionStatus::Refused;
+        preview.entries[0].branch.as_mut().unwrap().remote.reason =
+            Some("remote branch head conflict".to_string());
+        let rendered = render_receipt(&preview);
+        assert!(rendered.contains("Deleted local branch: main.feature"));
+        assert!(rendered.contains("Refused remote branch deletion: main.feature"));
+        assert!(rendered.contains("remote branch head conflict"));
+    }
+
+    #[test]
     fn clean_arguments_reuse_cleanup_target_validation() {
         let invalid = ["", "a/b"];
         for name in invalid {
@@ -303,6 +413,7 @@ mod tests {
                 name: Some(name.to_string()),
                 sweep: false,
                 apply: false,
+                delete_remote_branch: false,
             };
             assert!(
                 args.request().is_err(),
@@ -313,6 +424,7 @@ mod tests {
             name: Some("x".repeat(257)),
             sweep: false,
             apply: false,
+            delete_remote_branch: false,
         };
         assert!(args.request().is_err());
     }

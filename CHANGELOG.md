@@ -222,6 +222,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Delete verified stale branches with merge and lease safeguards (#1072)
 - Add the exomonad clean command with dry-run defaults (#1071)
 - Expose verified cleanup through the local control API (#1070)
 - Add bounded pre-publication recovery orchestration (#952)

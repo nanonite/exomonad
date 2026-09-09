@@ -20,6 +20,8 @@ pub struct CleanupRequest {
     pub sweep: bool,
     #[serde(default)]
     pub apply: bool,
+    #[serde(default)]
+    pub delete_remote_branch: bool,
 }
 
 const fn default_sweep() -> bool {
@@ -32,6 +34,7 @@ impl Default for CleanupRequest {
             target: None,
             sweep: true,
             apply: false,
+            delete_remote_branch: false,
         }
     }
 }
@@ -42,6 +45,7 @@ impl CleanupRequest {
             target: Some(target.into()),
             sweep: false,
             apply: false,
+            delete_remote_branch: false,
         }
     }
 
@@ -112,6 +116,51 @@ pub struct CleanupPullRequest {
     pub merge_commit_sha: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupBranchActionStatus {
+    #[default]
+    NotRequested,
+    WouldDelete,
+    DeletePending,
+    Deleted,
+    AlreadyAbsent,
+    Skipped,
+    Refused,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CleanupBranchAction {
+    #[serde(default)]
+    pub status: CleanupBranchActionStatus,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CleanupBranchEvidence {
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub local_head_sha: Option<String>,
+    #[serde(default)]
+    pub remote_name: Option<String>,
+    #[serde(default)]
+    pub remote_branch: Option<String>,
+    #[serde(default)]
+    pub remote_head_sha: Option<String>,
+    #[serde(default)]
+    pub target_branch: Option<String>,
+    #[serde(default)]
+    pub target_head_sha: Option<String>,
+    #[serde(default)]
+    pub merge_commit_reachable: Option<bool>,
+    #[serde(default)]
+    pub local: CleanupBranchAction,
+    #[serde(default)]
+    pub remote: CleanupBranchAction,
+}
+
 impl From<ForgejoPullRequest> for CleanupPullRequest {
     fn from(pr: ForgejoPullRequest) -> Self {
         Self {
@@ -151,6 +200,10 @@ pub struct CleanupCandidate {
     pub head_matches_pull_request: Option<bool>,
     pub remote_head_matches_pull_request: Option<bool>,
     pub identity: Option<AgentIdentityRecord>,
+    #[serde(default)]
+    pub branch: Option<CleanupBranchEvidence>,
+    #[serde(default)]
+    pub delete_remote_branch: bool,
     pub decision: CleanupDecision,
 }
 
@@ -163,6 +216,15 @@ pub struct CleanupPlan {
     pub repository: Option<RepositoryIdentity>,
     pub repository_error: Option<String>,
     pub candidates: Vec<CleanupCandidate>,
+    #[serde(default)]
+    pub fetched_target: Option<CleanupTargetBranch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CleanupTargetBranch {
+    pub remote_name: String,
+    pub branch: String,
+    pub head_sha: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +249,8 @@ pub struct CleanupReceiptEntry {
     pub identity_snapshot: Option<AgentIdentityRecord>,
     #[serde(default)]
     pub pull_request: Option<CleanupPullRequest>,
+    #[serde(default)]
+    pub branch: Option<CleanupBranchEvidence>,
     pub status: CleanupReceiptStatus,
     pub actions: Vec<String>,
     pub reason: Option<String>,

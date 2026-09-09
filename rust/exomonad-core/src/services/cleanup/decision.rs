@@ -4,7 +4,7 @@ use crate::services::repo::RepositoryIdentity;
 use anyhow::Result;
 use std::collections::HashMap;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct DecisionContext<'a> {
     pub(super) identity: Option<&'a crate::services::agent_resolver::AgentIdentityRecord>,
     pub(super) identity_error: Option<&'a str>,
@@ -19,6 +19,8 @@ pub(super) struct DecisionContext<'a> {
     pub(super) pr_error: Option<&'a str>,
     pub(super) head_matches_pull_request: Option<bool>,
     pub(super) remote_head_matches_pull_request: Option<bool>,
+    pub(super) merge_commit_reachable: Option<Result<bool, String>>,
+    pub(super) target_error: Option<&'a str>,
     pub(super) resolver_only: bool,
     pub(super) recovery_receipt: bool,
 }
@@ -135,6 +137,32 @@ fn pull_request_safety_decision(
     }
     if pr.head_ref != identity.birth_branch.as_str() {
         return CleanupDecision::refusal("pull request head does not match the managed branch");
+    }
+    if pr.head_sha.as_deref().is_none_or(str::is_empty) {
+        return CleanupDecision::refusal("pull request head SHA is unavailable");
+    }
+    if let Some(error) = context.target_error {
+        return CleanupDecision::refusal(format!(
+            "configured target branch is unavailable: {error}"
+        ));
+    }
+    match &context.merge_commit_reachable {
+        Some(Ok(true)) => {}
+        Some(Ok(false)) => {
+            return CleanupDecision::refusal(
+                "pull request merge commit is not reachable from the fetched target branch",
+            )
+        }
+        Some(Err(error)) => {
+            return CleanupDecision::refusal(format!(
+                "pull request merge reachability is unverifiable: {error}"
+            ))
+        }
+        None => {
+            return CleanupDecision::refusal(
+                "pull request merge commit reachability is unavailable",
+            )
+        }
     }
     reject_head_mismatch(context).unwrap_or(CleanupDecision::Cleanable)
 }
