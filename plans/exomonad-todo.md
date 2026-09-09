@@ -6,10 +6,7 @@
 
 The `merge_pr` MCP tool (in `MergePR.hs:285-296`) already runs `agent.cleanup` after merging: closes agent tab, removes worktree, unregisters from routing. No additional TL prompt instruction needed.
 
-**Orphan cleanup (not yet exposed):** The `agent.cleanup_merged` effect exists in proto/effects/agent.proto and the Rust handler but has no MCP tool wrapper. Stale worktrees from crashed/failed agents accumulate. Options:
-- Expose `cleanup_merged` as a TL MCP tool
-- Cron-style server-side sweep on startup
-- `git worktree prune` in the prompt as fallback
+Orphan cleanup: cleanup_orphan and cleanup_leaf provide safety-checked named and sweep cleanup through the shared verified service.
 
 ---
 
@@ -47,7 +44,6 @@ Moved from top-level `ExoMonad.Chainlink.Pure` to `ExoMonad.Guest.Tools.Chainlin
 
 ## 6. Pending / TODO
 
-- [ ] Expose `cleanup_merged` as TL MCP tool for orphaned worktree cleanup
 - [ ] E2E test for OpenCode worker `notify_parent` delivery
 - [ ] E2E test for autonomous TL loop (chainlink issue → worker → notify_parent → merge_pr → cleanup)
 - [ ] Worker chainlink protocol injection into opencode worker prompt (currently only in workerProfileText for Codex)

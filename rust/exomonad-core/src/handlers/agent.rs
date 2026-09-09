@@ -19,7 +19,6 @@ use crate::services::agent_control::{
     RecoveryAuthorization, RecoveryInvocationLineage, SpawnLeafOptions, SpawnOptions,
     SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
 };
-use crate::services::agent_resources::dispose_agent_resources;
 use crate::services::configured_tl_preflight_runtime_paths;
 use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
 use crate::services::forgejo::{
@@ -2415,67 +2414,14 @@ impl<
         req: DisposeOrphanRequest,
         _ctx: &crate::effects::EffectContext,
     ) -> EffectResult<DisposeOrphanResponse> {
-        if req.sweep {
-            if !req.verify_pr_state {
-                return Err(EffectError::invalid_input("sweep requires verify_pr_state"));
-            }
-            return self.run_verified_cleanup(req).await;
-        }
-
         let agent_slug = req.agent_slug.trim();
-        if agent_slug.is_empty() {
+        if !req.sweep && agent_slug.is_empty() {
             return Err(EffectError::invalid_input("agent_slug is required"));
         }
-        if req.verify_pr_state {
-            return self.run_verified_cleanup(req).await;
-        }
 
-        match orphan_agent_window_alive(self.ctx.project_dir(), agent_slug).await {
-            Ok(true) => {
-                return Err(EffectError::invalid_input(format!(
-                    "Agent {agent_slug} window is still alive; refusing orphan cleanup"
-                )));
-            }
-            Ok(false) => {}
-            Err(error) => {
-                return Err(EffectError::invalid_input(format!(
-                    "Could not verify {agent_slug} is dead: {error}"
-                )));
-            }
-        }
-
-        let worktree_path = self
-            .ctx
-            .project_dir()
-            .join(".exo/worktrees")
-            .join(agent_slug);
-        let agent_dir = self.ctx.project_dir().join(".exo/agents").join(agent_slug);
-        let had_worktree = worktree_path.exists();
-        let had_agent_dir = agent_dir.exists();
-
-        dispose_agent_resources(
-            self.ctx.project_dir(),
-            self.ctx.git_worktree_service().clone(),
-            agent_slug,
-        )
-        .await;
-
-        let removed_worktree = had_worktree && !worktree_path.exists();
-        let removed_agent_dir = had_agent_dir && !agent_dir.exists();
-        Ok(DisposeOrphanResponse {
-            removed_worktree,
-            removed_agent_dir,
-            message: format!(
-                "Cleaned orphan {agent_slug}: worktree_removed={removed_worktree}, agent_dir_removed={removed_agent_dir}"
-            ),
-            pr_state: String::new(),
-            pr_number: 0,
-            verified: false,
-            dry_run: false,
-            cleaned_agents: Vec::new(),
-            skipped_agents: Vec::new(),
-            errors: Vec::new(),
-        })
+        // Keep the wire-level flag for compatibility, but route every disposal
+        // request through the verified service so callers cannot bypass safety checks.
+        self.run_verified_cleanup(req).await
     }
 
     async fn cleanup_batch(
@@ -2495,28 +2441,6 @@ impl<
         Ok(CleanupBatchResponse {
             cleaned: result.cleaned,
             failed: failed_ids,
-            errors,
-        })
-    }
-
-    async fn cleanup_merged(
-        &self,
-        req: CleanupMergedRequest,
-        _ctx: &crate::effects::EffectContext,
-    ) -> EffectResult<CleanupMergedResponse> {
-        let subrepo = non_empty(req.subrepo);
-        let result = self
-            .service
-            .cleanup_merged_agents(&req.issues, subrepo.as_deref())
-            .await
-            .effect_err("agent")?;
-
-        let skipped: Vec<String> = result.failed.iter().map(|(id, _)| id.clone()).collect();
-        let errors: Vec<String> = result.failed.iter().map(|(_, err)| err.clone()).collect();
-
-        Ok(CleanupMergedResponse {
-            cleaned: result.cleaned,
-            skipped,
             errors,
         })
     }
@@ -4297,25 +4221,6 @@ async fn tombstone_agent_by_pane(project_dir: &Path, pane_id: &str) -> bool {
         }
     }
     false
-}
-
-async fn orphan_agent_window_alive(project_dir: &Path, agent_slug: &str) -> Result<bool, String> {
-    let agent_dir = project_dir.join(".exo/agents").join(agent_slug);
-    let Ok(routing) = RoutingInfo::read_from_dir(&agent_dir).await else {
-        return Ok(false);
-    };
-    if routing.window_id.is_none() && routing.pane_id.is_none() {
-        return Ok(false);
-    }
-    let session = std::env::var("EXOMONAD_TMUX_SESSION")
-        .map_err(|_| "EXOMONAD_TMUX_SESSION is not set".to_string())?;
-    if session.trim().is_empty() {
-        return Err("EXOMONAD_TMUX_SESSION is empty".to_string());
-    }
-    let tmux = crate::services::tmux_ipc::TmuxIpc::new(&session);
-    crate::services::tmux_ipc::routing_target_alive(&routing, &tmux)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 fn close_issue_cleanup_error(message: &str) -> CloseIssueAndCleanupResponse {

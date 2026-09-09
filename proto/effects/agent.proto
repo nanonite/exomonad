@@ -160,7 +160,7 @@ message CleanupResponse {
 message DisposeOrphanRequest {
   // Agent slug to clean when sweep is false.
   string agent_slug = 1;
-  // Require a dead window, clean worktree, and merged/closed PR before cleanup.
+  // Retained for wire compatibility; every disposal request is verified.
   bool verify_pr_state = 2;
   // Report the verification result without disposing resources.
   bool dry_run = 3;
@@ -207,26 +207,6 @@ message CleanupBatchResponse {
   // Failed issue IDs.
   repeated string failed = 2;
   // Error messages (parallel to failed list).
-  repeated string errors = 3;
-}
-
-// ============================================================================
-// CleanupMerged - Clean up agents whose branches are merged
-// ============================================================================
-
-message CleanupMergedRequest {
-  // Optional: only check specific issues.
-  repeated string issues = 1;
-  // Sub-repository path relative to project_dir.
-  string subrepo = 2;
-}
-
-message CleanupMergedResponse {
-  // Cleaned up issue IDs.
-  repeated string cleaned = 1;
-  // Issues that still have open branches.
-  repeated string skipped = 2;
-  // Error messages for failures.
   repeated string errors = 3;
 }
 
@@ -671,7 +651,6 @@ service AgentEffects {
   rpc Cleanup(CleanupRequest) returns (CleanupResponse);
   rpc DisposeOrphan(DisposeOrphanRequest) returns (DisposeOrphanResponse);
   rpc CleanupBatch(CleanupBatchRequest) returns (CleanupBatchResponse);
-  rpc CleanupMerged(CleanupMergedRequest) returns (CleanupMergedResponse);
   rpc List(ListRequest) returns (ListResponse);
   rpc CloseSelf(CloseSelfRequest) returns (CloseSelfResponse);
   rpc CloseWorkerPane(CloseWorkerPaneRequest) returns (CloseWorkerPaneResponse);

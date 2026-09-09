@@ -1199,7 +1199,7 @@
       "name": "close_issue_and_cleanup"
     },
     {
-      "description": "Remove stale resources for an orphan agent whose tmux window or pane is no longer alive. Refuses to clean live agents. Use dry_run=true to inspect what would be removed.",
+      "description": "Safely dispose an orphan agent after verifying its tmux window is dead, its worktree is clean, and its PR is merged or closed-unmerged. Use dry_run=true to inspect without disposal.",
       "inputSchema": {
         "properties": {
           "dry_run": {

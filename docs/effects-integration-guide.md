@@ -44,7 +44,7 @@ One host function (`yield_effect`) routes all effects. The `effect_type` string 
 | `github` | `ExoMonad.Effects.GitHub` | list_issues, get_issue, list_pull_requests, get_pull_request, get_pull_request_for_branch, create_pull_request |
 | `log` | `ExoMonad.Effects.Log` | info, error, debug, warn, emit_event |
 | `fs` | (proto defined, Haskell wrapper pending) | read_file, write_file, file_exists, list_directory, delete_file |
-| `agent` | `ExoMonad.Effects.Agent` | spawn_subtree, spawn_leaf_subtree, spawn_workers, cleanup_merged, close_self |
+| `agent` | `ExoMonad.Effects.Agent` | spawn_subtree, spawn_leaf_subtree, spawn_workers, dispose_orphan, close_self |
 
 ### Invoking Effects
 

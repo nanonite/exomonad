@@ -505,12 +505,6 @@ impl EffectHandler for MockAgentHandler {
                 }
                 .encode_to_vec())
             }
-            "agent.cleanup_merged" => Ok(CleanupMergedResponse {
-                cleaned: vec![],
-                skipped: vec![],
-                errors: vec![],
-            }
-            .encode_to_vec()),
             "agent.restart_review" => Ok(RestartReviewResponse {
                 success: true,
                 error: String::new(),

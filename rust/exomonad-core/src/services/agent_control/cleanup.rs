@@ -312,55 +312,6 @@ impl<
         result
     }
 
-    /// Clean up agents whose work is complete.
-    ///
-    /// Without worktrees, there are no per-agent branches to check for merge status.
-    /// This now simply cleans up stopped agents matching the given issue filter.
-    #[tracing::instrument(skip(self))]
-    pub async fn cleanup_merged_agents(
-        &self,
-        issues: &[String],
-        subrepo: Option<&str>,
-    ) -> Result<BatchCleanupResult> {
-        let agents = self.list_agents().await?;
-        let mut to_cleanup = Vec::new();
-
-        let issue_filter: Option<HashSet<&str>> = if issues.is_empty() {
-            None
-        } else {
-            Some(issues.iter().map(|s| s.as_str()).collect())
-        };
-
-        for agent in agents {
-            if let Some(ref filter) = issue_filter {
-                if !filter.contains(agent.internal_name.as_str()) {
-                    continue;
-                }
-            }
-
-            // Skip SharedDir (worker pane) agents — their liveness can't be
-            // reliably detected via tab queries, so "Stopped" may be wrong.
-            if agent.topology == Topology::SharedDir {
-                continue;
-            }
-
-            // Only clean up stopped agents (no running tab)
-            if !agent.has_tab {
-                info!(agent = %agent.internal_name, "Agent is stopped, marking for cleanup");
-                to_cleanup.push(agent.internal_name.to_string());
-            }
-        }
-
-        if to_cleanup.is_empty() {
-            return Ok(BatchCleanupResult {
-                cleaned: Vec::new(),
-                failed: Vec::new(),
-            });
-        }
-
-        Ok(self.cleanup_agents(&to_cleanup, subrepo).await)
-    }
-
     /// List all active agents by scanning the filesystem and verifying with tmux.
     ///
     /// Discovery process:

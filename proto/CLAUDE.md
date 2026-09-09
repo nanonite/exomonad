@@ -126,7 +126,7 @@ Agent management:
 - `AgentType` (enum): Supported harness type; the retired wire value remains reserved for compatibility
 - `AgentInfo`: Agent metadata with `alive` bool (tmux liveness)
 - Spawn messages: `SpawnRequest`, `SpawnBatchRequest`, `SpawnSubtreeRequest`, `SpawnLeafSubtreeRequest`, `SpawnWorkerRequest`
-- Cleanup messages: `CleanupRequest`, `CleanupBatchRequest`, `CleanupMergedRequest`
+- Cleanup messages: `CleanupRequest`, `DisposeOrphanRequest`, `CleanupBatchRequest`
 - `ListRequest/Response`: Active agent listing
 - `RepositoryIdentityRequest/Response`: Resolve owner/repo/base branch/forge host from the pinned git remote (`agent.repository_identity`). Static run configuration, not a per-PR observation; `remote_url` is sanitized (credentials stripped) before it leaves the Rust handler.
 
@@ -183,7 +183,7 @@ Agent lifecycle (`agent.*` namespace):
 - `SpawnBatch`: Spawn multiple agents
 - `Cleanup`: Clean up single agent
 - `CleanupBatch`: Clean up multiple agents
-- `CleanupMerged`: Clean up agents with merged branches
+- `DisposeOrphan`: Verify and optionally clean up orphan agents
 - `List`: List active agents
 
 ### effects/copilot.proto

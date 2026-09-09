@@ -100,7 +100,7 @@ Handles effects in the `agent.*` namespace.
 - **`spawn_worker`**: Spawns a configured worker pane in the parent directory.
 - **`spawn_subtree`**: Creates a Claude subtree in a new git worktree + tmux window.
 - **`spawn_leaf_subtree`**: Creates a configured leaf in a new git worktree + tmux window (used by `spawn_leaf` worktree/standalone modes).
-- **`cleanup_merged`**: Removes worktrees for merged branches.
+- **`dispose_orphan`**: Routes named and sweep cleanup through `VerifiedCleanupService`, which requires dead tmux state, a clean worktree, and a merged or closed-unmerged PR.
 
 ### Type Safety
 
@@ -134,7 +134,7 @@ Handles effects in the `merge_pr.*` namespace.
 
 ### Branch Preservation
 
-`gh pr merge` runs WITHOUT `--delete-branch` because worktree branches cannot be deleted while checked out. Branch cleanup happens via `cleanup_merged` instead.
+`gh pr merge` runs WITHOUT `--delete-branch` because worktree branches cannot be deleted while checked out. Verified orphan cleanup removes eligible worktrees and their local branches afterward.
 
 Post-merge, the Haskell tool handler runs `git pull` via `process.run` to fast-forward the local branch. If pull fails, the tool response includes guidance to run `git pull --rebase` manually.
 

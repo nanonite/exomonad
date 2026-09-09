@@ -35,7 +35,7 @@ pub(crate) use crate::ffi::FFIBoundary;
 pub(crate) use crate::{GithubOwner, GithubRepo, IssueNumber};
 pub(crate) use anyhow::{anyhow, Context, Result};
 pub(crate) use serde::{Deserialize, Serialize};
-pub(crate) use std::collections::{HashMap, HashSet};
+pub(crate) use std::collections::HashMap;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use tokio::fs;
 pub(crate) use tokio::process::Command;

@@ -21,7 +21,6 @@ module ExoMonad.Effects.Agent
     AgentCleanup,
     AgentDisposeOrphan,
     AgentCleanupBatch,
-    AgentCleanupMerged,
     AgentList,
     AgentCloseSelf,
     AgentCloseWorkerPane,
@@ -139,13 +138,6 @@ instance Effect AgentCleanupBatch where
   type Input AgentCleanupBatch = CleanupBatchRequest
   type Output AgentCleanupBatch = CleanupBatchResponse
   effectId = "agent.cleanup_batch"
-
-data AgentCleanupMerged
-
-instance Effect AgentCleanupMerged where
-  type Input AgentCleanupMerged = CleanupMergedRequest
-  type Output AgentCleanupMerged = CleanupMergedResponse
-  effectId = "agent.cleanup_merged"
 
 data AgentList
 

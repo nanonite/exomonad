@@ -216,7 +216,7 @@ Proto field helpers in `handlers/mod.rs`: `non_empty(String) → Option<String>`
 | `git.*` | GitHandler | get_branch, get_status, get_recent_commits, get_worktree, has_unpushed_commits, get_remote_url, get_repo_info |
 | `github.*` | GitHubHandler | list_issues, get_issue, create_pr, list_prs, get_pr_for_branch, get_pr_review_comments |
 | `log.*` | LogHandler | info, error, emit_event |
-| `agent.*` | AgentHandler | spawn_subtree, spawn_leaf_subtree, spawn_workers, cleanup_merged |
+| `agent.*` | AgentHandler | spawn_subtree, spawn_leaf_subtree, spawn_workers, dispose_orphan |
 | `fs.*` | FsHandler | read_file, write_file |
 | `file_pr.*` | FilePRHandler | file_pr |
 | `copilot.*` | CopilotHandler | wait_for_copilot_review |

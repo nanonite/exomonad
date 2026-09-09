@@ -20,9 +20,7 @@ import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Effects.Agent qualified as PA
-import Effects.Session qualified as PS
 import ExoMonad.Effects.Agent qualified as Agent
-import ExoMonad.Effects.Session qualified as Session
 import ExoMonad.Guest.Proto (fromText)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
@@ -49,7 +47,7 @@ instance ToJSON CleanupOrphanArgs where
   toJSON args = object ["name" .= coaName args, "dry_run" .= coaDryRun args]
 
 cleanupOrphanDescription :: Text
-cleanupOrphanDescription = "Remove stale resources for an orphan agent whose tmux window or pane is no longer alive. Refuses to clean live agents. Use dry_run=true to inspect what would be removed."
+cleanupOrphanDescription = "Safely dispose an orphan agent after verifying its tmux window is dead, its worktree is clean, and its PR is merged or closed-unmerged. Use dry_run=true to inspect without disposal."
 
 cleanupOrphanSchema :: Aeson.Object
 cleanupOrphanSchema =
@@ -62,65 +60,34 @@ cleanupOrphanCore :: CleanupOrphanArgs -> Eff Effects (Either Text Aeson.Value)
 cleanupOrphanCore args
   | T.null (T.strip (coaName args)) = pure $ Left "name is required"
   | otherwise = do
-      statusResult <- listAgents
-      case statusResult of
-        Left err -> pure $ Left err
-        Right agents -> case findAgent agents (coaName args) of
-          Just agent
-            | PS.agentStatusWindowAlive agent ->
-                pure $ Left ("Agent " <> coaName args <> " window is still alive. Use dispose_leaf to close it gracefully.")
-          found
-            | coaDryRun args -> pure $ Right (dryRunOutput args found)
-            | otherwise -> disposeOrphan args found
+      let req =
+            PA.DisposeOrphanRequest
+              { PA.disposeOrphanRequestAgentSlug = fromText (coaName args),
+                PA.disposeOrphanRequestVerifyPrState = True,
+                PA.disposeOrphanRequestDryRun = coaDryRun args,
+                PA.disposeOrphanRequestSweep = False
+              }
+      result <- suspendEffect @Agent.AgentDisposeOrphan req
+      pure $ case result of
+        Left err -> Left (spawnErrorMessage err)
+        Right resp -> Right (cleanupOrphanOutput args resp)
 
-listAgents :: Eff Effects (Either Text [PS.AgentStatus])
-listAgents = do
-  let req = PS.ListAgentsRequest {PS.listAgentsRequestIncludeDead = True}
-  result <- suspendEffect @Session.SessionListAgents req
-  pure $ case result of
-    Left err -> Left (spawnErrorMessage err)
-    Right resp -> Right (V.toList (PS.listAgentsResponseAgents resp))
-
-findAgent :: [PS.AgentStatus] -> Text -> Maybe PS.AgentStatus
-findAgent agents name =
-  let needle = T.strip name
-   in case filter (\agent -> lazyText (PS.agentStatusName agent) == needle) agents of
-        [] -> Nothing
-        (agent : _) -> Just agent
-
-dryRunOutput :: CleanupOrphanArgs -> Maybe PS.AgentStatus -> Aeson.Value
-dryRunOutput args found =
+cleanupOrphanOutput :: CleanupOrphanArgs -> PA.DisposeOrphanResponse -> Aeson.Value
+cleanupOrphanOutput args resp =
   object
     [ "success" .= True,
-      "dry_run" .= True,
       "agent" .= coaName args,
-      "found" .= maybe False (const True) found,
-      "window_alive" .= maybe False PS.agentStatusWindowAlive found,
-      "would_remove" .= (not (maybe False PS.agentStatusWindowAlive found))
+      "dry_run" .= coaDryRun args,
+      "verified" .= PA.disposeOrphanResponseVerified resp,
+      "pr_state" .= lazyText (PA.disposeOrphanResponsePrState resp),
+      "pr_number" .= PA.disposeOrphanResponsePrNumber resp,
+      "removed_worktree" .= PA.disposeOrphanResponseRemovedWorktree resp,
+      "removed_agent_dir" .= PA.disposeOrphanResponseRemovedAgentDir resp,
+      "message" .= lazyText (PA.disposeOrphanResponseMessage resp),
+      "cleaned_agents" .= map lazyText (V.toList (PA.disposeOrphanResponseCleanedAgents resp)),
+      "skipped_agents" .= map lazyText (V.toList (PA.disposeOrphanResponseSkippedAgents resp)),
+      "errors" .= map lazyText (V.toList (PA.disposeOrphanResponseErrors resp))
     ]
-
-disposeOrphan :: CleanupOrphanArgs -> Maybe PS.AgentStatus -> Eff Effects (Either Text Aeson.Value)
-disposeOrphan args found = do
-  let req =
-        PA.DisposeOrphanRequest
-          { PA.disposeOrphanRequestAgentSlug = fromText (coaName args),
-            PA.disposeOrphanRequestVerifyPrState = False,
-            PA.disposeOrphanRequestDryRun = False,
-            PA.disposeOrphanRequestSweep = False
-          }
-  result <- suspendEffect @Agent.AgentDisposeOrphan req
-  pure $ case result of
-    Left err -> Left (spawnErrorMessage err)
-    Right resp ->
-      Right $
-        object
-          [ "success" .= True,
-            "agent" .= coaName args,
-            "removed_worktree" .= PA.disposeOrphanResponseRemovedWorktree resp,
-            "removed_agent_dir" .= PA.disposeOrphanResponseRemovedAgentDir resp,
-            "message" .= lazyText (PA.disposeOrphanResponseMessage resp),
-            "was_listed" .= maybe False (const True) found
-          ]
 
 lazyText :: TL.Text -> Text
 lazyText = TL.toStrict
