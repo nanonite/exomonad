@@ -22,6 +22,7 @@ pub(super) fn receipt_entry(
         status,
         actions,
         reason,
+        dirty_evidence: candidate.dirty_evidence.clone(),
     }
 }
 
@@ -41,6 +42,12 @@ fn dry_run_entry(candidate: &CleanupCandidate) -> CleanupReceiptEntry {
     let actions = if candidate.decision.is_cleanable() {
         let mut actions = Vec::new();
         append_branch_preview(&mut actions, candidate.branch.as_ref());
+        if candidate.allow_no_pr && candidate.pull_request.is_none() {
+            actions.push("allow_no_pr_override".to_string());
+        }
+        if candidate.discard_dirty && candidate.dirty == Some(true) {
+            actions.push("record_dirty_evidence".to_string());
+        }
         if candidate.worktree_path.is_some() && !candidate.resolver_only {
             actions.push("remove_worktree".to_string());
         }

@@ -23,6 +23,8 @@ pub(super) struct DecisionContext<'a> {
     pub(super) target_error: Option<&'a str>,
     pub(super) resolver_only: bool,
     pub(super) recovery_receipt: bool,
+    pub(super) allow_no_pr: bool,
+    pub(super) discard_dirty: bool,
 }
 
 pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecision {
@@ -68,8 +70,15 @@ fn reject_liveness(context: &DecisionContext<'_>) -> Option<CleanupDecision> {
 }
 
 fn reject_candidate_state(context: &DecisionContext<'_>) -> Option<CleanupDecision> {
-    if context.dirty != Some(false) {
-        return Some(CleanupDecision::refusal("worktree is dirty or unavailable"));
+    match context.dirty {
+        Some(false) => {}
+        Some(true) if context.discard_dirty => {}
+        Some(true) => {
+            return Some(CleanupDecision::refusal(
+                "worktree is dirty; discard_dirty authorization is required",
+            ))
+        }
+        None => return Some(CleanupDecision::refusal("worktree is dirty or unavailable")),
     }
     if context.protected {
         return Some(CleanupDecision::refusal(
@@ -107,6 +116,9 @@ fn pull_request_decision(context: &DecisionContext<'_>) -> CleanupDecision {
         ));
     }
     let Some(pr) = context.pull_request else {
+        if context.allow_no_pr {
+            return CleanupDecision::Cleanable;
+        }
         return CleanupDecision::refusal("pull-request ownership is not verified");
     };
     let Some(repository) = context.repository else {

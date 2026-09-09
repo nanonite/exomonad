@@ -39,6 +39,12 @@ impl ClaudeSessionRegistry {
         let map = self.inner.lock().await;
         map.get(key).cloned()
     }
+
+    /// Remove all session registrations for an agent identity key.
+    pub async fn deregister(&self, key: &str) {
+        let mut map = self.inner.lock().await;
+        map.remove(key);
+    }
 }
 
 #[cfg(test)]

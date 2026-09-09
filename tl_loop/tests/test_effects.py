@@ -59,6 +59,46 @@ def test_generated_payloads_conform_to_live_tool_snapshot() -> None:
         _assert_value_matches_schema(arguments, schemas[tool_name])
 
 
+def test_cleanup_overrides_are_forwarded() -> None:
+    transport = RecordingTransport()
+    client = EffectClient(transport)
+
+    client.cleanup_orphan(
+        name="abandoned",
+        dry_run=False,
+        allow_no_pr=True,
+        discard_dirty=True,
+    )
+    client.cleanup_leaf(
+        name="abandoned",
+        dry_run=False,
+        sweep=False,
+        allow_no_pr=True,
+        discard_dirty=True,
+    )
+
+    assert transport.calls == [
+        (
+            "cleanup_orphan",
+            {
+                "name": "abandoned",
+                "dry_run": False,
+                "allow_no_pr": True,
+                "discard_dirty": True,
+            },
+        ),
+        (
+            "cleanup_leaf",
+            {
+                "name": "abandoned",
+                "dry_run": False,
+                "sweep": False,
+                "allow_no_pr": True,
+                "discard_dirty": True,
+            },
+        ),
+    ]
+
 def test_effect_result_decodes_the_server_envelope() -> None:
     """Effects expose a typed envelope while leaving tool-specific results opaque."""
     transport = RecordingTransport()

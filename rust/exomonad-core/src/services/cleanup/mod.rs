@@ -24,7 +24,7 @@ mod types;
 pub use self::service::VerifiedCleanupService;
 pub use self::types::{
     CleanupBranchAction, CleanupBranchActionStatus, CleanupBranchEvidence, CleanupCandidate,
-    CleanupDecision, CleanupLiveness, CleanupPlan, CleanupPullRequest, CleanupReceipt,
-    CleanupReceiptEntry, CleanupReceiptStatus, CleanupRequest, CleanupTargetBranch,
+    CleanupDecision, CleanupDirtyEvidence, CleanupLiveness, CleanupPlan, CleanupPullRequest,
+    CleanupReceipt, CleanupReceiptEntry, CleanupReceiptStatus, CleanupRequest, CleanupTargetBranch,
     CLEANUP_PLAN_SCHEMA_VERSION, CLEANUP_RECEIPT_SCHEMA_VERSION,
 };

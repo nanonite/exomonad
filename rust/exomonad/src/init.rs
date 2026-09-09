@@ -4105,6 +4105,7 @@ mod tests {
                 status: exomonad_core::services::CleanupReceiptStatus::WouldClean,
                 actions: Vec::new(),
                 reason: None,
+                dirty_evidence: None,
             }],
         };
         let suggestion = clean::continue_suggestion(&receipt).unwrap();

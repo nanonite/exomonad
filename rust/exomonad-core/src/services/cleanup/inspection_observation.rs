@@ -1,5 +1,6 @@
 use super::service::VerifiedCleanupService;
 use super::support::*;
+use super::types::CleanupDirtyEvidence;
 use crate::services::agent_control::Topology;
 use crate::services::agent_resolver::AgentIdentityRecord;
 use std::path::PathBuf;
@@ -9,6 +10,7 @@ pub(super) struct WorktreeObservation {
     pub(super) worktree_path: Option<PathBuf>,
     pub(super) branch_name: Option<String>,
     pub(super) dirty: Option<bool>,
+    pub(super) dirty_evidence: Option<CleanupDirtyEvidence>,
     pub(super) identity_drift: bool,
 }
 
@@ -44,7 +46,7 @@ impl VerifiedCleanupService {
                 .map(|identity| identity.birth_branch.to_string())
                 .or(observed_branch)
         });
-        let (dirty, worktree_drift) = self
+        let (dirty, dirty_evidence, worktree_drift) = self
             .observe_existing_worktree(
                 &worktree_path,
                 identity.map(|identity| identity.birth_branch.as_str()),
@@ -55,6 +57,7 @@ impl VerifiedCleanupService {
             worktree_path,
             branch_name,
             dirty,
+            dirty_evidence,
             identity_drift,
         }
     }
@@ -85,15 +88,15 @@ impl VerifiedCleanupService {
         &self,
         worktree_path: &Option<PathBuf>,
         expected_branch: Option<&str>,
-    ) -> (Option<bool>, bool) {
+    ) -> (Option<bool>, Option<CleanupDirtyEvidence>, bool) {
         let Some(worktree) = worktree_path else {
-            return (Some(false), false);
+            return (Some(false), None, false);
         };
         if !worktree.exists() {
-            return (Some(false), false);
+            return (Some(false), None, false);
         }
         let Ok(canonical_worktree) = fs::canonicalize(worktree).await else {
-            return (None, true);
+            return (None, None, true);
         };
         let mut drift = !path_within(&self.project_dir, &canonical_worktree)
             || !path_within(
@@ -108,6 +111,13 @@ impl VerifiedCleanupService {
             Ok(Some(branch)) => expected_branch.is_some_and(|expected| branch != expected),
             Ok(None) | Err(_) => true,
         };
-        (workspace_dirty(worktree).await.ok(), drift)
+        match workspace_status(worktree).await {
+            Ok(evidence) => (
+                Some(!evidence.porcelain.is_empty()),
+                (!evidence.porcelain.is_empty()).then_some(evidence),
+                drift,
+            ),
+            Err(_) => (None, None, drift),
+        }
     }
 }

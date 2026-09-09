@@ -33,7 +33,9 @@ newtype CleanupOrphan = CleanupOrphan ()
 
 data CleanupOrphanArgs = CleanupOrphanArgs
   { coaName :: Text,
-    coaDryRun :: Bool
+    coaDryRun :: Bool,
+    coaAllowNoPr :: Bool,
+    coaDiscardDirty :: Bool
   }
   deriving (Generic, Show)
 
@@ -42,18 +44,28 @@ instance FromJSON CleanupOrphanArgs where
     CleanupOrphanArgs
       <$> v .: "name"
       <*> v .:? "dry_run" .!= False
+      <*> v .:? "allow_no_pr" .!= False
+      <*> v .:? "discard_dirty" .!= False
 
 instance ToJSON CleanupOrphanArgs where
-  toJSON args = object ["name" .= coaName args, "dry_run" .= coaDryRun args]
+  toJSON args =
+    object
+      [ "name" .= coaName args,
+        "dry_run" .= coaDryRun args,
+        "allow_no_pr" .= coaAllowNoPr args,
+        "discard_dirty" .= coaDiscardDirty args
+      ]
 
 cleanupOrphanDescription :: Text
-cleanupOrphanDescription = "Safely dispose an orphan agent after verifying its tmux window is dead, its worktree is clean, and its PR is merged or closed-unmerged. Use dry_run=true to inspect without disposal."
+cleanupOrphanDescription = "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply."
 
 cleanupOrphanSchema :: Aeson.Object
 cleanupOrphanSchema =
   genericToolSchemaWith @CleanupOrphanArgs
     [ ("name", "Agent slug to clean up, as shown by session_status"),
-      ("dry_run", "When true, report what would be removed without removing it. Defaults to false.")
+      ("dry_run", "When true, report what would be removed without removing it. Defaults to false."),
+      ("allow_no_pr", "Explicitly authorize cleanup when no pull request owns the managed branch."),
+      ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires apply.")
     ]
 
 cleanupOrphanCore :: CleanupOrphanArgs -> Eff Effects (Either Text Aeson.Value)
@@ -65,7 +77,9 @@ cleanupOrphanCore args
               { PA.disposeOrphanRequestAgentSlug = fromText (coaName args),
                 PA.disposeOrphanRequestVerifyPrState = True,
                 PA.disposeOrphanRequestDryRun = coaDryRun args,
-                PA.disposeOrphanRequestSweep = False
+                PA.disposeOrphanRequestSweep = False,
+                PA.disposeOrphanRequestAllowNoPr = coaAllowNoPr args,
+                PA.disposeOrphanRequestDiscardDirty = coaDiscardDirty args
               }
       result <- suspendEffect @Agent.AgentDisposeOrphan req
       pure $ case result of
@@ -86,7 +100,11 @@ cleanupOrphanOutput args resp =
       "message" .= lazyText (PA.disposeOrphanResponseMessage resp),
       "cleaned_agents" .= map lazyText (V.toList (PA.disposeOrphanResponseCleanedAgents resp)),
       "skipped_agents" .= map lazyText (V.toList (PA.disposeOrphanResponseSkippedAgents resp)),
-      "errors" .= map lazyText (V.toList (PA.disposeOrphanResponseErrors resp))
+      "errors" .= map lazyText (V.toList (PA.disposeOrphanResponseErrors resp)),
+      "discarded_porcelain" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedPorcelain resp)),
+      "discarded_tracked_paths" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedTrackedPaths resp)),
+      "discarded_untracked_paths" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedUntrackedPaths resp)),
+      "discarded_changes_truncated" .= PA.disposeOrphanResponseDiscardedChangesTruncated resp
     ]
 
 lazyText :: TL.Text -> Text

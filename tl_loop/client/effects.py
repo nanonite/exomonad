@@ -667,8 +667,23 @@ class EffectClient:
     def close_issue_and_cleanup(self, *, issue_id: int, leaf_name: str) -> ToolResult:
         return self._call("close_issue_and_cleanup", {"issue_id": issue_id, "leaf_name": leaf_name})
 
-    def cleanup_orphan(self, *, name: str, dry_run: bool) -> ToolResult:
-        return self._call("cleanup_orphan", {"name": name, "dry_run": dry_run})
+    def cleanup_orphan(
+        self,
+        *,
+        name: str,
+        dry_run: bool,
+        allow_no_pr: bool = False,
+        discard_dirty: bool = False,
+    ) -> ToolResult:
+        return self._call(
+            "cleanup_orphan",
+            {
+                "name": name,
+                "dry_run": dry_run,
+                "allow_no_pr": allow_no_pr,
+                "discard_dirty": discard_dirty,
+            },
+        )
 
     def cleanup_leaf(
         self,
@@ -676,8 +691,15 @@ class EffectClient:
         dry_run: bool,
         sweep: bool,
         name: str | None = None,
+        allow_no_pr: bool = False,
+        discard_dirty: bool = False,
     ) -> ToolResult:
-        arguments: JsonObject = {"dry_run": dry_run, "sweep": sweep}
+        arguments: JsonObject = {
+            "dry_run": dry_run,
+            "sweep": sweep,
+            "allow_no_pr": allow_no_pr,
+            "discard_dirty": discard_dirty,
+        }
         _put(arguments, "name", name)
         return self._call("cleanup_leaf", arguments)
 

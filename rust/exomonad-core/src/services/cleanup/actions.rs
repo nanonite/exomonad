@@ -3,6 +3,7 @@ use super::support::*;
 use super::types::*;
 use crate::domain::AgentName;
 use crate::services::agent_resolver::AgentIdentityRecord;
+use std::collections::BTreeSet;
 use std::path::Path;
 use tokio::fs;
 
@@ -13,6 +14,21 @@ impl VerifiedCleanupService {
         receipt: &mut CleanupReceipt,
         index: usize,
     ) -> CleanupReceiptEntry {
+        let mut authorization_actions = receipt.entries[index].actions.clone();
+        if candidate.allow_no_pr && candidate.pull_request.is_none() {
+            authorization_actions.push("allow_no_pr_override".to_string());
+        }
+        if candidate.discard_dirty && candidate.dirty == Some(true) {
+            authorization_actions.push("record_dirty_evidence".to_string());
+        }
+        authorization_actions.sort();
+        authorization_actions.dedup();
+        if let Some(entry) = self
+            .persist_action_or_failure(candidate, receipt, index, &authorization_actions)
+            .await
+        {
+            return entry;
+        }
         if let Some(entry) = self
             .execute_remote_branch_action(candidate, receipt, index)
             .await
@@ -35,6 +51,12 @@ impl VerifiedCleanupService {
         actions = receipt.entries[index].actions.clone();
         if let Some(entry) = self
             .remove_agent_directory(candidate, receipt, index, &mut actions)
+            .await
+        {
+            return entry;
+        }
+        if let Some(entry) = self
+            .cleanup_ephemeral_registrations(candidate, receipt, index, &mut actions)
             .await
         {
             return entry;
@@ -96,6 +118,12 @@ impl VerifiedCleanupService {
         {
             return entry;
         }
+        if let Some(entry) = self
+            .cleanup_ephemeral_registrations(candidate, receipt, index, &mut actions)
+            .await
+        {
+            return entry;
+        }
         if let Err(error) = self.resolver.deregister(&expected.agent_name).await {
             return failed(
                 candidate,
@@ -125,11 +153,17 @@ impl VerifiedCleanupService {
         let Some(worktree) = &candidate.worktree_path else {
             return None;
         };
-        if path_exists(worktree).await {
+        let worktree_present = path_exists(worktree).await;
+        if worktree_present {
             let git_worktree = self.git_worktree.clone();
             let path = worktree.clone();
             match tokio::task::spawn_blocking(move || git_worktree.remove_workspace(&path)).await {
-                Ok(Ok(())) => actions.push("remove_worktree".to_string()),
+                Ok(Ok(())) => {
+                    actions.push("remove_worktree".to_string());
+                    if candidate.discard_dirty && candidate.dirty == Some(true) {
+                        actions.push("discard_dirty_changes".to_string());
+                    }
+                }
                 Ok(Err(error)) => {
                     return Some(failed(
                         candidate,
@@ -177,6 +211,67 @@ impl VerifiedCleanupService {
         }
         self.persist_action_or_failure(candidate, receipt, index, actions)
             .await
+    }
+
+    async fn cleanup_ephemeral_registrations(
+        &self,
+        candidate: &CleanupCandidate,
+        receipt: &mut CleanupReceipt,
+        index: usize,
+        actions: &mut Vec<String>,
+    ) -> Option<CleanupReceiptEntry> {
+        let identity = candidate.identity.as_ref()?;
+        let keys = [
+            identity.agent_name.as_str(),
+            identity.slug.as_str(),
+            identity.birth_branch.as_str(),
+            identity.parent_branch.as_str(),
+        ];
+        if let Err(reason) = self.remove_synthetic_members(&keys, identity).await {
+            return Some(failed(candidate, receipt, index, reason));
+        }
+        self.deregister_ephemeral_registrations(&keys, identity)
+            .await;
+        actions.push("remove_ephemeral_registrations".to_string());
+        self.persist_action_or_failure(candidate, receipt, index, actions)
+            .await
+    }
+
+    async fn remove_synthetic_members(
+        &self,
+        keys: &[&str; 4],
+        identity: &AgentIdentityRecord,
+    ) -> Result<(), String> {
+        let mut teams = BTreeSet::new();
+        for key in keys {
+            if let Some(info) = self.team_registry.get(key).await {
+                teams.insert(info.team_name);
+            }
+        }
+        for team_name in teams {
+            let team_name = crate::domain::TeamName::try_from_str(&team_name)
+                .map_err(|error| format!("remove synthetic member: invalid team name: {error}"))?;
+            crate::services::synthetic_members::remove_synthetic_member(
+                &team_name,
+                &identity.agent_name,
+            )
+            .map_err(|error| format!("remove synthetic member: {error}"))?;
+        }
+        Ok(())
+    }
+
+    async fn deregister_ephemeral_registrations(
+        &self,
+        keys: &[&str; 4],
+        identity: &AgentIdentityRecord,
+    ) {
+        for key in keys {
+            self.team_registry.deregister(key).await;
+            self.claude_session_registry.deregister(key).await;
+        }
+        self.supervisor_registry
+            .deregister(&[identity.birth_branch.to_string()])
+            .await;
     }
 
     async fn deregister_identity(
@@ -295,6 +390,7 @@ mod tests {
             pull_request: None,
             liveness: CleanupLiveness::Dead,
             dirty: Some(false),
+            dirty_evidence: None,
             protected: false,
             identity_drift: false,
             identity_error: None,
@@ -303,6 +399,8 @@ mod tests {
             identity: None,
             branch: None,
             delete_remote_branch: false,
+            allow_no_pr: false,
+            discard_dirty: false,
             decision: CleanupDecision::Cleanable,
         }
     }

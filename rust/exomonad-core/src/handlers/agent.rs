@@ -601,6 +601,24 @@ fn cleanup_receipt_response(receipt: &CleanupReceipt) -> DisposeOrphanResponse {
                 .map(|request| request.state.clone())
                 .unwrap_or_default();
         }
+        if entry
+            .actions
+            .iter()
+            .any(|action| action == "discard_dirty_changes")
+        {
+            if let Some(evidence) = &entry.dirty_evidence {
+                response
+                    .discarded_porcelain
+                    .extend(evidence.porcelain.iter().cloned());
+                response
+                    .discarded_tracked_paths
+                    .extend(evidence.tracked_paths.iter().cloned());
+                response
+                    .discarded_untracked_paths
+                    .extend(evidence.untracked_paths.iter().cloned());
+                response.discarded_changes_truncated |= evidence.truncated;
+            }
+        }
         append_cleanup_entry(&mut response, entry, receipt.dry_run);
     }
     response.verified = response.errors.is_empty();
@@ -625,6 +643,10 @@ fn empty_cleanup_response(dry_run: bool) -> DisposeOrphanResponse {
         cleaned_agents: Vec::new(),
         skipped_agents: Vec::new(),
         errors: Vec::new(),
+        discarded_porcelain: Vec::new(),
+        discarded_tracked_paths: Vec::new(),
+        discarded_untracked_paths: Vec::new(),
+        discarded_changes_truncated: false,
     }
 }
 
@@ -2805,6 +2827,8 @@ impl<
             sweep: req.sweep,
             apply: !req.dry_run,
             delete_remote_branch: false,
+            allow_no_pr: req.allow_no_pr,
+            discard_dirty: req.discard_dirty,
         };
         let receipt = self
             .ctx
@@ -4658,6 +4682,7 @@ mod tests {
                 status: CleanupReceiptStatus::WouldClean,
                 actions: vec!["remove_worktree".to_string()],
                 reason: None,
+                dirty_evidence: None,
             }],
         };
 

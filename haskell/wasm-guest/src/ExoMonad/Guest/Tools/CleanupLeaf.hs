@@ -34,7 +34,9 @@ data CleanupLeaf = CleanupLeaf ()
 data CleanupLeafArgs = CleanupLeafArgs
   { claName :: Maybe Text,
     claDryRun :: Bool,
-    claSweep :: Bool
+    claSweep :: Bool,
+    claAllowNoPr :: Bool,
+    claDiscardDirty :: Bool
   }
   deriving (Generic, Show)
 
@@ -44,37 +46,46 @@ instance FromJSON CleanupLeafArgs where
       <$> v .:? "name"
       <*> v .:? "dry_run" .!= False
       <*> v .:? "sweep" .!= False
+      <*> v .:? "allow_no_pr" .!= False
+      <*> v .:? "discard_dirty" .!= False
 
 instance ToJSON CleanupLeafArgs where
   toJSON args =
     object
       [ "name" .= claName args,
         "dry_run" .= claDryRun args,
-        "sweep" .= claSweep args
+        "sweep" .= claSweep args,
+        "allow_no_pr" .= claAllowNoPr args,
+        "discard_dirty" .= claDiscardDirty args
       ]
 
 cleanupLeafDescription :: Text
 cleanupLeafDescription =
-  "Safely dispose an orphan leaf after verifying its tmux window is dead, its worktree is clean, and its PR is merged or closed-unmerged. Use sweep=true for all orphan worktrees or dry_run=true to inspect without disposal."
+  "Safely dispose an orphan leaf after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply."
 
 cleanupLeafSchema :: Aeson.Object
 cleanupLeafSchema =
   genericToolSchemaWith @CleanupLeafArgs
     [ ("name", "Optional agent slug to verify and clean; required unless sweep=true."),
       ("dry_run", "Verify and report without disposing resources. Defaults to false."),
-      ("sweep", "Verify and clean every orphan worktree. Defaults to false.")
+      ("sweep", "Verify and clean every orphan worktree. Defaults to false."),
+      ("allow_no_pr", "Explicitly authorize cleanup when no pull request owns the managed branch; requires a named target."),
+      ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires a named target and apply.")
     ]
 
 cleanupLeafCore :: CleanupLeafArgs -> Eff Effects (Either Text Aeson.Value)
 cleanupLeafCore args
   | not (claSweep args) && maybe True (T.null . T.strip) (claName args) = pure $ Left "name is required unless sweep=true"
+  | (claAllowNoPr args || claDiscardDirty args) && claSweep args = pure $ Left "cleanup overrides require a named target"
   | otherwise = do
       let req =
             PA.DisposeOrphanRequest
               { PA.disposeOrphanRequestAgentSlug = fromText (maybe "" id (claName args)),
                 PA.disposeOrphanRequestVerifyPrState = True,
                 PA.disposeOrphanRequestDryRun = claDryRun args,
-                PA.disposeOrphanRequestSweep = claSweep args
+                PA.disposeOrphanRequestSweep = claSweep args,
+                PA.disposeOrphanRequestAllowNoPr = claAllowNoPr args,
+                PA.disposeOrphanRequestDiscardDirty = claDiscardDirty args
               }
       result <- suspendEffect @Agent.AgentDisposeOrphan req
       pure $ case result of
@@ -88,6 +99,8 @@ cleanupLeafOutput args resp =
       "agent" .= claName args,
       "dry_run" .= claDryRun args,
       "sweep" .= claSweep args,
+      "allow_no_pr" .= claAllowNoPr args,
+      "discard_dirty" .= claDiscardDirty args,
       "verified" .= PA.disposeOrphanResponseVerified resp,
       "pr_state" .= lazyText (PA.disposeOrphanResponsePrState resp),
       "pr_number" .= PA.disposeOrphanResponsePrNumber resp,
@@ -96,7 +109,11 @@ cleanupLeafOutput args resp =
       "message" .= lazyText (PA.disposeOrphanResponseMessage resp),
       "cleaned_agents" .= map lazyText (V.toList (PA.disposeOrphanResponseCleanedAgents resp)),
       "skipped_agents" .= map lazyText (V.toList (PA.disposeOrphanResponseSkippedAgents resp)),
-      "errors" .= map lazyText (V.toList (PA.disposeOrphanResponseErrors resp))
+      "errors" .= map lazyText (V.toList (PA.disposeOrphanResponseErrors resp)),
+      "discarded_porcelain" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedPorcelain resp)),
+      "discarded_tracked_paths" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedTrackedPaths resp)),
+      "discarded_untracked_paths" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedUntrackedPaths resp)),
+      "discarded_changes_truncated" .= PA.disposeOrphanResponseDiscardedChangesTruncated resp
     ]
 
 lazyText :: TL.Text -> Text

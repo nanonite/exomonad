@@ -111,6 +111,28 @@ mod tests {
         assert!(!request.delete_remote_branch);
     }
 
+    #[test]
+    fn cleanup_override_fields_are_decoded_and_defaulted() {
+        let request = serde_json::from_value::<CleanupRequest>(serde_json::json!({
+            "target": "abandoned-codex",
+            "sweep": false,
+            "apply": true,
+            "allow_no_pr": true,
+            "discard_dirty": true,
+        }))
+        .unwrap();
+        assert!(request.allow_no_pr);
+        assert!(request.discard_dirty);
+
+        let defaults = serde_json::from_value::<CleanupRequest>(serde_json::json!({
+            "sweep": true,
+            "apply": false,
+        }))
+        .unwrap();
+        assert!(!defaults.allow_no_pr);
+        assert!(!defaults.discard_dirty);
+    }
+
     #[tokio::test]
     async fn dry_run_uses_the_shared_service_and_persists_a_receipt() {
         let project = tempdir().expect("temporary project");

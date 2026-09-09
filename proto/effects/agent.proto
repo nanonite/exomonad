@@ -166,6 +166,10 @@ message DisposeOrphanRequest {
   bool dry_run = 3;
   // Verify and clean every worktree whose agent window is dead.
   bool sweep = 4;
+  // Explicitly authorize cleanup when the managed branch has no pull request.
+  bool allow_no_pr = 5;
+  // Explicitly authorize discarding the named worktree's dirty changes.
+  bool discard_dirty = 6;
 }
 
 message DisposeOrphanResponse {
@@ -186,6 +190,14 @@ message DisposeOrphanResponse {
   repeated string skipped_agents = 9;
   // Per-agent errors from a sweep.
   repeated string errors = 10;
+  // Bounded porcelain status captured before an authorized dirty discard.
+  repeated string discarded_porcelain = 11;
+  // Tracked paths captured before an authorized dirty discard.
+  repeated string discarded_tracked_paths = 12;
+  // Untracked paths captured before an authorized dirty discard.
+  repeated string discarded_untracked_paths = 13;
+  // True when the bounded dirty manifest was truncated.
+  bool discarded_changes_truncated = 14;
 }
 
 // ============================================================================

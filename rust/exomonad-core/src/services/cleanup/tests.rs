@@ -56,6 +56,8 @@ fn decision_for_pr(
         head_matches_pull_request: None,
         remote_head_matches_pull_request: None,
         recovery_receipt: false,
+        allow_no_pr: false,
+        discard_dirty: false,
         merge_commit_reachable,
         target_error: None,
     })
@@ -75,6 +77,8 @@ fn target_validation_rejects_paths_and_ambiguous_requests() {
         sweep: false,
         apply: false,
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
     }
     .validate()
     .is_err());
@@ -83,9 +87,112 @@ fn target_validation_rejects_paths_and_ambiguous_requests() {
         sweep: true,
         apply: false,
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
     }
     .validate()
     .is_err());
+}
+
+#[test]
+fn cleanup_overrides_require_named_apply_for_dirty_discard() {
+    let request = CleanupRequest {
+        allow_no_pr: true,
+        ..CleanupRequest::default()
+    };
+    assert!(request.validate().is_err());
+
+    let request = CleanupRequest {
+        target: Some("abandoned-codex".to_string()),
+        sweep: false,
+        allow_no_pr: true,
+        ..CleanupRequest::default()
+    };
+    assert!(request.validate().is_ok());
+
+    let request = CleanupRequest {
+        discard_dirty: true,
+        ..request
+    };
+    assert!(request.validate().is_err());
+    let request = CleanupRequest {
+        apply: true,
+        ..request
+    };
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn no_pr_override_only_bypasses_missing_pr_observation() {
+    let identity = identity(Topology::WorktreePerAgent);
+    let repository = RepositoryIdentity {
+        owner: crate::domain::GithubOwner::try_from_str("owner").unwrap(),
+        repo: crate::domain::GithubRepo::try_from_str("repo").unwrap(),
+        base_branch: "main".to_string(),
+        forge_host: "forgejo.test".to_string(),
+        remote_url: "https://forgejo.test/owner/repo.git".to_string(),
+        remote_name: "origin".to_string(),
+    };
+    let base = DecisionContext {
+        identity: Some(&identity),
+        identity_error: None,
+        resolver_only: false,
+        liveness: &CleanupLiveness::Dead,
+        dirty: Some(false),
+        protected: false,
+        identity_drift: false,
+        repository: Some(&repository),
+        repository_error: None,
+        remote_error: None,
+        pull_request: None,
+        pr_error: None,
+        head_matches_pull_request: None,
+        remote_head_matches_pull_request: None,
+        merge_commit_reachable: None,
+        target_error: None,
+        recovery_receipt: false,
+        allow_no_pr: true,
+        discard_dirty: false,
+    };
+    assert!(candidate_decision(base.clone()).is_cleanable());
+
+    let unavailable = DecisionContext {
+        pr_error: Some("Forgejo unavailable"),
+        ..base
+    };
+    assert!(!candidate_decision(unavailable).is_cleanable());
+}
+
+#[test]
+fn dirty_worktree_requires_discard_authorization() {
+    let identity = identity(Topology::SharedDir);
+    let base = DecisionContext {
+        identity: Some(&identity),
+        identity_error: None,
+        resolver_only: false,
+        liveness: &CleanupLiveness::Dead,
+        dirty: Some(true),
+        protected: false,
+        identity_drift: false,
+        repository: None,
+        repository_error: None,
+        remote_error: None,
+        pull_request: None,
+        pr_error: None,
+        head_matches_pull_request: None,
+        remote_head_matches_pull_request: None,
+        merge_commit_reachable: None,
+        target_error: None,
+        recovery_receipt: false,
+        allow_no_pr: false,
+        discard_dirty: false,
+    };
+    assert!(!candidate_decision(base.clone()).is_cleanable());
+    assert!(candidate_decision(DecisionContext {
+        discard_dirty: true,
+        ..base
+    })
+    .is_cleanable());
 }
 
 #[test]
@@ -125,6 +232,8 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
             head_matches_pull_request: None,
             remote_head_matches_pull_request: None,
             recovery_receipt: false,
+            allow_no_pr: false,
+            discard_dirty: false,
             merge_commit_reachable: Some(Ok(true)),
             target_error: None,
         }),
@@ -148,6 +257,8 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
         head_matches_pull_request: None,
         remote_head_matches_pull_request: None,
         recovery_receipt: false,
+        allow_no_pr: false,
+        discard_dirty: false,
         merge_commit_reachable: Some(Ok(true)),
         target_error: None,
     })
@@ -233,6 +344,18 @@ fn services_propagate_configured_tmux_session_to_cleanup_service() {
         cleanup_service.tmux_session.as_deref(),
         Some("configured-cleanup-session")
     );
+    assert!(Arc::ptr_eq(
+        &cleanup_service.team_registry,
+        &services.team_registry
+    ));
+    assert!(Arc::ptr_eq(
+        &cleanup_service.supervisor_registry,
+        &services.supervisor_registry
+    ));
+    assert!(Arc::ptr_eq(
+        &cleanup_service.claude_session_registry,
+        &services.claude_session_registry
+    ));
 }
 
 #[test]
@@ -271,6 +394,8 @@ fn remote_branch_head_must_match_the_pull_request_head() {
         head_matches_pull_request: Some(true),
         remote_head_matches_pull_request: Some(false),
         recovery_receipt: false,
+        allow_no_pr: false,
+        discard_dirty: false,
         merge_commit_reachable: Some(Ok(true)),
         target_error: None,
     })
@@ -295,6 +420,7 @@ fn duplicate_local_branches_are_refused() {
         pull_request: None,
         liveness: CleanupLiveness::Dead,
         dirty: Some(false),
+        dirty_evidence: None,
         protected: false,
         identity_drift: false,
         head_matches_pull_request: None,
@@ -304,6 +430,8 @@ fn duplicate_local_branches_are_refused() {
         decision: CleanupDecision::Cleanable,
         branch: None,
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
     };
     let mut candidates = vec![make_candidate("a"), make_candidate("b")];
     refuse_duplicate_branches(&mut candidates);
@@ -369,6 +497,8 @@ async fn apply_is_idempotent_for_shared_agent_directory() {
     let request = CleanupRequest {
         apply: true,
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
         ..CleanupRequest::default()
     };
     let receipt = service.run(&request).await.unwrap();
@@ -411,6 +541,8 @@ async fn apply_resumes_an_interrupted_resolver_only_cleanup() {
     let request = CleanupRequest {
         apply: true,
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
         ..CleanupRequest::default()
     };
     let plan = service.plan(&request).await.unwrap();
@@ -457,7 +589,7 @@ async fn receipt_persistence_failure_stops_before_resolver_deregistration() {
         Arc::new(MutexRegistry::new()),
         None,
     );
-    service.fail_receipt_persist_on_call(3);
+    service.fail_receipt_persist_on_call(4);
     let request = CleanupRequest {
         apply: true,
         ..CleanupRequest::default()
@@ -496,7 +628,7 @@ async fn receipt_persistence_failure_after_deregistration_is_recovered() {
         Arc::new(MutexRegistry::new()),
         None,
     );
-    service.fail_receipt_persist_on_call(5);
+    service.fail_receipt_persist_on_call(7);
     let request = CleanupRequest {
         apply: true,
         ..CleanupRequest::default()
@@ -542,6 +674,8 @@ async fn interrupted_cleanup_can_resume_by_slug_after_candidate_identity_changes
         sweep: false,
         apply: true,
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
     };
     let plan = service.plan(&request).await.unwrap();
     let mut interrupted = in_progress_receipt(&plan, 1);
@@ -586,6 +720,8 @@ async fn resolver_identity_reuse_does_not_authorize_an_old_receipt() {
         sweep: false,
         apply: true,
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
     };
     let plan = service.plan(&request).await.unwrap();
     let mut interrupted = in_progress_receipt(&plan, 1);
@@ -1103,6 +1239,7 @@ async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
         pull_request: Some(pull_request),
         liveness: CleanupLiveness::Dead,
         dirty: Some(false),
+        dirty_evidence: None,
         protected: false,
         identity_drift: false,
         identity_error: None,
@@ -1125,6 +1262,8 @@ async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
             remote: CleanupBranchAction::default(),
         }),
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
         decision: CleanupDecision::Cleanable,
     };
     let linked = temp.path().join("linked-stale");

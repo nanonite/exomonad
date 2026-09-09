@@ -15,6 +15,7 @@ pub(super) struct CandidateFacts {
     pull_request: Option<CleanupPullRequest>,
     liveness: CleanupLiveness,
     dirty: Option<bool>,
+    dirty_evidence: Option<CleanupDirtyEvidence>,
     protected: bool,
     identity_drift: bool,
     identity_error: Option<String>,
@@ -28,6 +29,8 @@ pub(super) struct CandidateFacts {
     decision: CleanupDecision,
     branch: Option<CleanupBranchEvidence>,
     delete_remote_branch: bool,
+    allow_no_pr: bool,
+    discard_dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -38,6 +41,8 @@ pub(super) struct InspectionContext<'a> {
     pub(super) fetched_target: Option<&'a CleanupTargetBranch>,
     pub(super) target_error: Option<&'a str>,
     pub(super) delete_remote_branch: bool,
+    pub(super) allow_no_pr: bool,
+    pub(super) discard_dirty: bool,
 }
 
 struct DecisionObservations<'a> {
@@ -91,6 +96,7 @@ impl CandidateFacts {
             pull_request: pull_request.request,
             liveness,
             dirty: observed.worktree.dirty,
+            dirty_evidence: observed.worktree.dirty_evidence.clone(),
             protected,
             identity_drift: observed.worktree.identity_drift,
             identity_error: local.identity_error,
@@ -104,6 +110,8 @@ impl CandidateFacts {
             decision,
             branch,
             delete_remote_branch: context.delete_remote_branch,
+            allow_no_pr: context.allow_no_pr,
+            discard_dirty: context.discard_dirty,
         }
     }
 
@@ -132,6 +140,9 @@ impl CandidateFacts {
             identity: self.identity,
             branch: self.branch,
             delete_remote_branch: self.delete_remote_branch,
+            dirty_evidence: self.dirty_evidence,
+            allow_no_pr: self.allow_no_pr,
+            discard_dirty: self.discard_dirty,
             decision: self.decision,
         }
     }
@@ -159,6 +170,8 @@ fn decision_for(
         target_error: context.target_error,
         resolver_only: observations.observed.resolver_only,
         recovery_receipt: observations.observed.recovery_receipt,
+        allow_no_pr: context.allow_no_pr,
+        discard_dirty: context.discard_dirty,
     })
 }
 

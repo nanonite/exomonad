@@ -22,6 +22,12 @@ pub struct CleanupRequest {
     pub apply: bool,
     #[serde(default)]
     pub delete_remote_branch: bool,
+    /// Explicitly authorize cleanup when Forgejo has no pull request for this managed branch.
+    #[serde(default)]
+    pub allow_no_pr: bool,
+    /// Explicitly authorize disposal of an observed dirty worktree.
+    #[serde(default)]
+    pub discard_dirty: bool,
 }
 
 const fn default_sweep() -> bool {
@@ -35,6 +41,8 @@ impl Default for CleanupRequest {
             sweep: true,
             apply: false,
             delete_remote_branch: false,
+            allow_no_pr: false,
+            discard_dirty: false,
         }
     }
 }
@@ -46,6 +54,8 @@ impl CleanupRequest {
             sweep: false,
             apply: false,
             delete_remote_branch: false,
+            allow_no_pr: false,
+            discard_dirty: false,
         }
     }
 
@@ -55,6 +65,12 @@ impl CleanupRequest {
         }
         if !self.sweep && self.target.is_none() {
             bail!("cleanup requires a named target or sweep=true");
+        }
+        if (self.allow_no_pr || self.discard_dirty) && self.sweep {
+            bail!("cleanup overrides require a named target");
+        }
+        if self.discard_dirty && !self.apply {
+            bail!("discard_dirty requires apply=true");
         }
         if let Some(target) = &self.target {
             if target.trim().is_empty() {
@@ -138,6 +154,25 @@ pub struct CleanupBranchAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// Bounded evidence captured from a dirty managed worktree before disposal.
+pub struct CleanupDirtyEvidence {
+    #[serde(default)]
+    pub porcelain: Vec<String>,
+    #[serde(default)]
+    pub tracked_paths: Vec<String>,
+    #[serde(default)]
+    pub untracked_paths: Vec<String>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub worktree_path: Option<PathBuf>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CleanupBranchEvidence {
     #[serde(default)]
     pub branch: Option<String>,
@@ -194,6 +229,8 @@ pub struct CleanupCandidate {
     pub pull_request: Option<CleanupPullRequest>,
     pub liveness: CleanupLiveness,
     pub dirty: Option<bool>,
+    #[serde(default)]
+    pub dirty_evidence: Option<CleanupDirtyEvidence>,
     pub protected: bool,
     pub identity_drift: bool,
     pub identity_error: Option<String>,
@@ -204,6 +241,10 @@ pub struct CleanupCandidate {
     pub branch: Option<CleanupBranchEvidence>,
     #[serde(default)]
     pub delete_remote_branch: bool,
+    #[serde(default)]
+    pub allow_no_pr: bool,
+    #[serde(default)]
+    pub discard_dirty: bool,
     pub decision: CleanupDecision,
 }
 
@@ -254,6 +295,9 @@ pub struct CleanupReceiptEntry {
     pub status: CleanupReceiptStatus,
     pub actions: Vec<String>,
     pub reason: Option<String>,
+    /// Dirty-state manifest captured before an authorized discard.
+    #[serde(default)]
+    pub dirty_evidence: Option<CleanupDirtyEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

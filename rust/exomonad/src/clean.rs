@@ -24,6 +24,12 @@ pub(crate) struct CleanArgs {
     /// Also delete the managed branch from the configured remote.
     #[arg(long)]
     pub(crate) delete_remote_branch: bool,
+    /// Explicitly allow cleanup when no pull request owns the managed branch.
+    #[arg(long = "allow-no-pr")]
+    pub(crate) allow_no_pr: bool,
+    /// Confirm that dirty worktree changes may be discarded.
+    #[arg(long = "discard-dirty")]
+    pub(crate) discard_dirty: bool,
 }
 
 impl CleanArgs {
@@ -33,6 +39,8 @@ impl CleanArgs {
             sweep: self.sweep,
             apply: self.apply,
             delete_remote_branch: self.delete_remote_branch,
+            allow_no_pr: self.allow_no_pr,
+            discard_dirty: self.discard_dirty,
         };
         request
             .validate()
@@ -87,6 +95,8 @@ pub(crate) fn continue_cleanup_request() -> CleanupRequest {
         sweep: true,
         apply: false,
         delete_remote_branch: false,
+        allow_no_pr: false,
+        discard_dirty: false,
     }
 }
 
@@ -152,7 +162,55 @@ fn append_receipt_entries(lines: &mut Vec<String>, receipt: &CleanupReceipt) {
             }
         }
         append_branch_actions(lines, entry, receipt.dry_run);
+        append_dirty_evidence(lines, entry);
     }
+}
+
+fn append_dirty_evidence(lines: &mut Vec<String>, entry: &CleanupReceiptEntry) {
+    let Some(evidence) = &entry.dirty_evidence else {
+        return;
+    };
+    let discarded = entry
+        .actions
+        .iter()
+        .any(|action| action == "discard_dirty_changes");
+    let label = if discarded {
+        "Discarded dirty changes"
+    } else {
+        "Dirty worktree evidence"
+    };
+    lines.push(format!("{}: {}", label, evidence.porcelain.len()));
+    append_dirty_metadata(lines, evidence, discarded);
+    append_dirty_paths(lines, "tracked", &evidence.tracked_paths, discarded);
+    append_dirty_paths(lines, "untracked", &evidence.untracked_paths, discarded);
+    if evidence.truncated {
+        lines.push(format!("{} was truncated", label));
+    }
+}
+
+fn append_dirty_metadata(
+    lines: &mut Vec<String>,
+    evidence: &exomonad_core::services::CleanupDirtyEvidence,
+    discarded: bool,
+) {
+    let action = if discarded { "Discarded" } else { "Observed" };
+    if let Some(path) = &evidence.worktree_path {
+        lines.push(format!("{action} worktree: {}", path.display()));
+    }
+    if let Some(branch) = &evidence.branch {
+        lines.push(format!("{action} branch: {branch}"));
+    }
+    if let Some(head_sha) = &evidence.head_sha {
+        lines.push(format!("{action} HEAD: {head_sha}"));
+    }
+}
+
+fn append_dirty_paths(lines: &mut Vec<String>, kind: &str, paths: &[String], discarded: bool) {
+    if paths.is_empty() {
+        return;
+    }
+    let action = if discarded { "Discarded" } else { "Observed" };
+    lines.push(format!("{action} {kind} paths: {}", paths.join(", ")));
 }
 
 fn append_branch_actions(lines: &mut Vec<String>, entry: &CleanupReceiptEntry, dry_run: bool) {
@@ -286,6 +344,7 @@ mod tests {
                     status: CleanupReceiptStatus::WouldClean,
                     actions: Vec::new(),
                     reason: None,
+                    dirty_evidence: None,
                 },
                 CleanupReceiptEntry {
                     candidate_id: "cleaned-id".to_string(),
@@ -297,6 +356,7 @@ mod tests {
                     status: CleanupReceiptStatus::Cleaned,
                     actions: Vec::new(),
                     reason: None,
+                    dirty_evidence: None,
                 },
                 CleanupReceiptEntry {
                     candidate_id: "refused-id".to_string(),
@@ -308,6 +368,7 @@ mod tests {
                     status: CleanupReceiptStatus::Refused,
                     actions: Vec::new(),
                     reason: Some("agent is still live".to_string()),
+                    dirty_evidence: None,
                 },
                 CleanupReceiptEntry {
                     candidate_id: "skipped-id".to_string(),
@@ -319,6 +380,7 @@ mod tests {
                     status: CleanupReceiptStatus::Skipped,
                     actions: Vec::new(),
                     reason: Some("worktree is dirty".to_string()),
+                    dirty_evidence: None,
                 },
             ],
         }
@@ -334,6 +396,8 @@ mod tests {
                 sweep: false,
                 apply: false,
                 delete_remote_branch: false,
+                allow_no_pr: false,
+                discard_dirty: false,
             }
         );
     }
@@ -348,8 +412,41 @@ mod tests {
                 sweep: true,
                 apply: true,
                 delete_remote_branch: false,
+                allow_no_pr: false,
+                discard_dirty: false,
             }
         );
+    }
+
+    #[test]
+    fn clean_arguments_require_explicit_abandoned_overrides() {
+        let args = parse(&[
+            "exomonad",
+            "clean",
+            "--name",
+            "abandoned-codex",
+            "--apply",
+            "--allow-no-pr",
+            "--discard-dirty",
+        ])
+        .unwrap();
+        let request = args.request().unwrap();
+        assert!(request.allow_no_pr);
+        assert!(request.discard_dirty);
+        assert!(request.apply);
+
+        let args = parse(&[
+            "exomonad",
+            "clean",
+            "--name",
+            "abandoned-codex",
+            "--discard-dirty",
+        ])
+        .unwrap();
+        assert!(args.request().is_err());
+
+        let args = parse(&["exomonad", "clean", "--sweep", "--apply", "--allow-no-pr"]).unwrap();
+        assert!(args.request().is_err());
     }
 
     #[test]
@@ -414,6 +511,8 @@ mod tests {
                 sweep: false,
                 apply: false,
                 delete_remote_branch: false,
+                allow_no_pr: false,
+                discard_dirty: false,
             };
             assert!(
                 args.request().is_err(),
@@ -425,6 +524,8 @@ mod tests {
             sweep: false,
             apply: false,
             delete_remote_branch: false,
+            allow_no_pr: false,
+            discard_dirty: false,
         };
         assert!(args.request().is_err());
     }

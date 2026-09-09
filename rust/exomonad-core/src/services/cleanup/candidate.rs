@@ -113,8 +113,20 @@ impl VerifiedCleanupService {
         expected: &AgentIdentityRecord,
         worktree: &std::path::Path,
     ) -> Option<CleanupReceiptEntry> {
-        if !matches!(workspace_dirty(worktree).await, Ok(false)) {
-            return Some(refused(candidate, "worktree is dirty or unavailable"));
+        let status = match workspace_status(worktree).await {
+            Ok(status) => status,
+            Err(_) => return Some(refused(candidate, "worktree status is unavailable")),
+        };
+        if !status.porcelain.is_empty() {
+            if !candidate.discard_dirty {
+                return Some(refused(
+                    candidate,
+                    "worktree is dirty; discard_dirty authorization is required",
+                ));
+            }
+            if candidate.dirty_evidence.as_ref() != Some(&status) {
+                return Some(refused(candidate, "dirty worktree changed since planning"));
+            }
         }
         match workspace_branch(worktree).await {
             Ok(Some(branch)) if branch == expected.birth_branch.as_str() => None,

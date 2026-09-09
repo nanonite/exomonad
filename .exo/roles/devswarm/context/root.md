@@ -116,9 +116,12 @@ Use `cleanup_leaf` when a dead dev leaf needs on-demand disposal and the normal
 Chainlink close/reconciler path is not the right trigger. Pass `name` for one
 leaf, or `sweep=true` to inspect every orphan worktree; use `dry_run=true`
 first when the target set is uncertain. The host performs the safety checks
-itself: tmux must be dead, the worktree must be clean, exactly one PR must
-match its branch, and that PR must be merged or closed-unmerged. Dirty,
-open, missing, or ambiguous targets are reported and left in place. This tool
+itself: tmux must be dead, the worktree must be clean unless the named
+target explicitly confirms discard_dirty, exactly one PR must match its
+branch unless the named target explicitly confirms allow_no_pr, and that PR
+must be merged or closed-unmerged. Missing, open, or ambiguous targets, and
+dirty targets without the separate discard confirmation, are reported and
+left in place. This tool
 shares the existing resource-disposal implementation with `cleanup_orphan`;
 it does not force cleanup, close PRs, or replace the automatic reconciler.
 

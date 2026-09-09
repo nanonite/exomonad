@@ -171,6 +171,8 @@ fn test_clean_help_exposes_safe_targeting_and_apply_flags() -> Result<(), Box<dy
     assert!(help.contains("--name <NAME>"));
     assert!(help.contains("--sweep"));
     assert!(help.contains("--apply"));
+    assert!(help.contains("--allow-no-pr"));
+    assert!(help.contains("--discard-dirty"));
     Ok(())
 }
 

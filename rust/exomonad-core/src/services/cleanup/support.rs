@@ -96,16 +96,61 @@ pub(super) async fn workspace_branch(worktree: &Path) -> Result<Option<String>> 
     Ok((!branch.is_empty()).then_some(branch))
 }
 
-pub(super) async fn workspace_dirty(worktree: &Path) -> Result<bool> {
+const MAX_DIRTY_EVIDENCE_BYTES: usize = 16 * 1024;
+const MAX_DIRTY_EVIDENCE_ENTRIES: usize = 256;
+
+async fn workspace_head_sha(worktree: &Path) -> Result<String> {
     let output = git_command(worktree)
-        .args(["status", "--porcelain", "--untracked-files=all"])
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .await
+        .context("read worktree head")?;
+    if !output.status.success() {
+        bail!("read worktree head failed");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub(super) async fn workspace_status(worktree: &Path) -> Result<CleanupDirtyEvidence> {
+    let output = git_command(worktree)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .output()
         .await
         .context("read worktree status")?;
     if !output.status.success() {
         bail!("read worktree status failed");
     }
-    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    let branch = workspace_branch(worktree).await.ok().flatten();
+    let head_sha = workspace_head_sha(worktree).await.ok();
+    let truncated = output.stdout.len() > MAX_DIRTY_EVIDENCE_BYTES;
+    let bytes = &output.stdout[..output.stdout.len().min(MAX_DIRTY_EVIDENCE_BYTES)];
+    let text = String::from_utf8_lossy(bytes);
+    let mut porcelain = Vec::new();
+    let mut tracked_paths = Vec::new();
+    let mut untracked_paths = Vec::new();
+    for line in text.lines().take(MAX_DIRTY_EVIDENCE_ENTRIES) {
+        if line.len() < 3 {
+            continue;
+        }
+        let line = line.to_string();
+        let path = line[3..].to_string();
+        if line.starts_with("??") {
+            untracked_paths.push(path);
+        } else {
+            tracked_paths.push(path);
+        }
+        porcelain.push(line);
+    }
+    let truncated = truncated || text.lines().count() > MAX_DIRTY_EVIDENCE_ENTRIES;
+    Ok(CleanupDirtyEvidence {
+        porcelain,
+        tracked_paths,
+        untracked_paths,
+        truncated,
+        worktree_path: Some(worktree.to_path_buf()),
+        branch,
+        head_sha,
+    })
 }
 
 pub(super) async fn local_branch_state(project_dir: &Path, branch: &str) -> Result<Option<String>> {

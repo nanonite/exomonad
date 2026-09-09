@@ -69,8 +69,8 @@ pub use self::claude_adapter::ClaudeCodeAdapter;
 pub use self::claude_session_registry::ClaudeSessionRegistry;
 pub use self::cleanup::{
     CleanupBranchAction, CleanupBranchActionStatus, CleanupBranchEvidence, CleanupCandidate,
-    CleanupDecision, CleanupLiveness, CleanupPlan, CleanupPullRequest, CleanupReceipt,
-    CleanupReceiptEntry, CleanupReceiptStatus, CleanupRequest, CleanupTargetBranch,
+    CleanupDecision, CleanupDirtyEvidence, CleanupLiveness, CleanupPlan, CleanupPullRequest,
+    CleanupReceipt, CleanupReceiptEntry, CleanupReceiptStatus, CleanupRequest, CleanupTargetBranch,
     VerifiedCleanupService, CLEANUP_PLAN_SCHEMA_VERSION, CLEANUP_RECEIPT_SCHEMA_VERSION,
 };
 pub use self::codex_adapter::CodexAdapter;

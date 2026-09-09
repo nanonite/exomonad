@@ -37,8 +37,8 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 
 ### Cleanup Tools
 
-- **`cleanup_orphan`**: Safety-checked cleanup for a named orphan agent. The host verifies dead tmux state, a clean worktree, exactly one matching PR, and a merged or closed-unmerged PR before disposal. Use `dry_run=true` to inspect without disposal.
-- **`cleanup_leaf`**: On-demand safety-checked cleanup for a named orphan or a `sweep=true` set. The host verifies dead tmux state, a clean worktree, exactly one matching PR, and a merged or closed-unmerged PR before using the shared disposal path. Use `dry_run=true` to inspect; it never force-cleans dirty or ambiguous targets.
+- **`cleanup_orphan`**: Safety-checked cleanup for a named orphan agent. The host verifies dead tmux state, exactly one matching PR, and a merged or closed-unmerged PR before disposal. Use `dry_run=true` to inspect without disposal. `allow_no_pr=true` explicitly authorizes an abandoned target without a PR; `discard_dirty=true` separately authorizes discarding a named dirty worktree and requires apply.
+- **`cleanup_leaf`**: On-demand safety-checked cleanup for a named orphan or a `sweep=true` set. The host verifies dead tmux state, exactly one matching PR, and a merged or closed-unmerged PR before using the shared disposal path. Use `dry_run=true` to inspect; `allow_no_pr=true` and `discard_dirty=true` are separate explicit overrides, and dirty discard requires apply.
 
 ### Task Tools (`ExoMonad.Guest.Tools.Tasks`)
 

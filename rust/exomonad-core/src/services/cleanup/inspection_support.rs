@@ -39,9 +39,7 @@ impl VerifiedCleanupService {
             .await
         {
             Ok(prs) if prs.len() == 1 => (Some(prs[0].clone().into()), None),
-            Ok(prs) if prs.is_empty() => {
-                (None, Some("no pull request owns this branch".to_string()))
-            }
+            Ok(prs) if prs.is_empty() => (None, None),
             Ok(prs) => (
                 None,
                 Some(format!("{} pull requests own this branch", prs.len())),

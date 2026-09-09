@@ -8,7 +8,9 @@ use crate::services::git_worktree::GitWorktreeService;
 use crate::services::mutex_registry::MutexRegistry;
 use crate::services::repo::get_repository_identity;
 use crate::services::Services;
+use crate::services::{ClaudeSessionRegistry, SupervisorRegistry};
 use anyhow::{bail, Result};
+use claude_teams_bridge::TeamRegistry;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,6 +29,9 @@ pub struct VerifiedCleanupService {
     pub(super) forgejo: Option<Arc<ForgejoClient>>,
     pub(super) mutex: Arc<MutexRegistry>,
     pub(super) tmux_session: Option<String>,
+    pub(super) team_registry: Arc<TeamRegistry>,
+    pub(super) supervisor_registry: Arc<SupervisorRegistry>,
+    pub(super) claude_session_registry: Arc<ClaudeSessionRegistry>,
     #[cfg(test)]
     pub(super) receipt_persist_calls: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -51,6 +56,9 @@ impl VerifiedCleanupService {
             forgejo,
             mutex,
             tmux_session,
+            team_registry: Arc::new(TeamRegistry::new()),
+            supervisor_registry: Arc::new(SupervisorRegistry::new()),
+            claude_session_registry: Arc::new(ClaudeSessionRegistry::new()),
             #[cfg(test)]
             receipt_persist_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -59,14 +67,18 @@ impl VerifiedCleanupService {
     }
 
     pub fn from_services(services: &Services) -> Self {
-        Self::new(
+        let mut cleanup = Self::new(
             services.project_dir.clone(),
             services.agent_resolver.clone(),
             services.git_wt.clone(),
             services.forgejo_client.clone(),
             services.mutex_registry.clone(),
             services.tmux_session.clone(),
-        )
+        );
+        cleanup.team_registry = services.team_registry.clone();
+        cleanup.supervisor_registry = services.supervisor_registry.clone();
+        cleanup.claude_session_registry = services.claude_session_registry.clone();
+        cleanup
     }
 
     pub fn receipt_dir(&self) -> PathBuf {
@@ -120,6 +132,8 @@ impl VerifiedCleanupService {
                 fetched_target: fetched_target.as_ref(),
                 target_error: target_error.as_deref(),
                 delete_remote_branch: request.delete_remote_branch,
+                allow_no_pr: request.allow_no_pr,
+                discard_dirty: request.discard_dirty,
             };
             candidates.push(self.inspect_candidate(resource, context).await);
         }

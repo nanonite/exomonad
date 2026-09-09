@@ -1199,7 +1199,7 @@
       "name": "close_issue_and_cleanup"
     },
     {
-      "description": "Safely dispose an orphan agent after verifying its tmux window is dead, its worktree is clean, and its PR is merged or closed-unmerged. Use dry_run=true to inspect without disposal.",
+      "description": "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply.",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -1209,18 +1209,28 @@
           "name": {
             "description": "Agent slug to clean up, as shown by session_status",
             "type": "string"
+          },
+          "allow_no_pr": {
+            "description": "Explicitly authorize cleanup when no pull request owns the managed branch.",
+            "type": "boolean"
+          },
+          "discard_dirty": {
+            "description": "Explicitly authorize discarding dirty changes for this named agent; requires apply.",
+            "type": "boolean"
           }
         },
         "required": [
           "name",
-          "dry_run"
+          "dry_run",
+          "allow_no_pr",
+          "discard_dirty"
         ],
         "type": "object"
       },
       "name": "cleanup_orphan"
     },
     {
-      "description": "Safely dispose an orphan leaf after verifying its tmux window is dead, its worktree is clean, and its PR is merged or closed-unmerged. Use sweep=true for all orphan worktrees or dry_run=true to inspect without disposal.",
+      "description": "Safely dispose an orphan leaf after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply.",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -1234,11 +1244,21 @@
           "sweep": {
             "description": "Verify and clean every orphan worktree. Defaults to false.",
             "type": "boolean"
+          },
+          "allow_no_pr": {
+            "description": "Explicitly authorize cleanup when no pull request owns the managed branch; requires a named target.",
+            "type": "boolean"
+          },
+          "discard_dirty": {
+            "description": "Explicitly authorize discarding dirty changes for this named agent; requires a named target and apply.",
+            "type": "boolean"
           }
         },
         "required": [
           "dry_run",
-          "sweep"
+          "sweep",
+          "allow_no_pr",
+          "discard_dirty"
         ],
         "type": "object"
       },
