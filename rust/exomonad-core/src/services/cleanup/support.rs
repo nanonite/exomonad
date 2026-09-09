@@ -221,6 +221,9 @@ pub(super) async fn delete_local_branch(
 ) -> Result<()> {
     validate_branch_arg(branch, "managed local branch")?;
     validate_commit_arg(expected_sha).context("validate expected local branch head")?;
+    if branch_checked_out_in_any_worktree(project_dir, branch).await? {
+        bail!("cannot delete checked-out branch {branch}");
+    }
     let ref_name = format!("refs/heads/{branch}");
     let output = git_command(project_dir)
         .args(["update-ref", "-d", &ref_name, expected_sha])
@@ -234,6 +237,24 @@ pub(super) async fn delete_local_branch(
         );
     }
     Ok(())
+}
+
+async fn branch_checked_out_in_any_worktree(project_dir: &Path, branch: &str) -> Result<bool> {
+    let output = git_command(project_dir)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .await
+        .context("read checked-out worktree branches")?;
+    if !output.status.success() {
+        bail!(
+            "read checked-out worktree branches: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("branch refs/heads/"))
+        .any(|checked_out| checked_out == branch))
 }
 
 pub(super) async fn delete_remote_branch_with_lease(

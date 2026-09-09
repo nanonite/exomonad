@@ -9,8 +9,9 @@ use crate::services::mutex_registry::MutexRegistry;
 use crate::services::repo::RepositoryIdentity;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
 fn identity(topology: Topology) -> AgentIdentityRecord {
     AgentIdentityRecord {
@@ -682,6 +683,21 @@ fn run_git(directory: &Path, args: &[&str]) {
     );
 }
 
+fn git_stdout(directory: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 #[tokio::test]
 async fn fetched_target_and_squash_merge_reachability_use_the_configured_remote() {
     let temp = tempfile::tempdir().unwrap();
@@ -804,7 +820,7 @@ async fn remote_branch_deletion_uses_an_exact_expected_head_lease() {
 }
 
 #[tokio::test]
-async fn local_branch_deletion_removes_only_the_validated_branch() {
+async fn local_branch_deletion_rejects_checked_out_worktrees_and_races() {
     let temp = tempfile::tempdir().unwrap();
     run_git(temp.path(), &["init", "-q"]);
     run_git(
@@ -833,12 +849,37 @@ async fn local_branch_deletion_removes_only_the_validated_branch() {
         .await
         .unwrap()
         .unwrap();
+    assert!(delete_local_branch(temp.path(), "main.stale", &advanced)
+        .await
+        .is_err());
+    assert_eq!(
+        local_branch_state(temp.path(), "main.stale").await.unwrap(),
+        Some(advanced.clone())
+    );
+    run_git(temp.path(), &["checkout", "-q", "main"]);
     assert!(delete_local_branch(temp.path(), "main.stale", &expected)
         .await
         .is_err());
     assert_eq!(
         local_branch_state(temp.path(), "main.stale").await.unwrap(),
         Some(advanced.clone())
+    );
+    let linked = temp.path().join("linked-stale");
+    let linked_arg = linked.to_str().unwrap().to_string();
+    run_git(
+        temp.path(),
+        &["worktree", "add", "-q", linked_arg.as_str(), "main.stale"],
+    );
+    assert!(delete_local_branch(temp.path(), "main.stale", &advanced)
+        .await
+        .is_err());
+    assert_eq!(
+        local_branch_state(temp.path(), "main.stale").await.unwrap(),
+        Some(advanced.clone())
+    );
+    run_git(
+        temp.path(),
+        &["worktree", "remove", "--force", linked_arg.as_str()],
     );
     delete_local_branch(temp.path(), "main.stale", &advanced)
         .await
@@ -851,4 +892,198 @@ async fn local_branch_deletion_removes_only_the_validated_branch() {
         .await
         .unwrap()
         .is_some());
+}
+
+#[tokio::test]
+async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let remote_repo = remote.path().join("owner/repo.git");
+    tokio::fs::create_dir_all(&remote_repo).await.unwrap();
+    run_git(&remote_repo, &["init", "--bare", "-q"]);
+    run_git(temp.path(), &["init", "-q"]);
+    run_git(
+        temp.path(),
+        &["config", "user.email", "cleanup@example.test"],
+    );
+    run_git(temp.path(), &["config", "user.name", "Cleanup Test"]);
+    tokio::fs::write(temp.path().join("README"), "initial\n")
+        .await
+        .unwrap();
+    run_git(temp.path(), &["add", "README"]);
+    run_git(temp.path(), &["commit", "-qm", "initial"]);
+    run_git(temp.path(), &["branch", "-M", "main"]);
+    run_git(temp.path(), &["checkout", "-qb", "main.stale"]);
+    tokio::fs::write(temp.path().join("README"), "feature\n")
+        .await
+        .unwrap();
+    run_git(temp.path(), &["commit", "-qam", "feature"]);
+    run_git(temp.path(), &["checkout", "main"]);
+    run_git(
+        temp.path(),
+        &["merge", "--no-ff", "-q", "-m", "merge stale", "main.stale"],
+    );
+    let merge_sha = git_stdout(temp.path(), &["rev-parse", "HEAD"]);
+    let branch_sha = git_stdout(temp.path(), &["rev-parse", "main.stale"]);
+    run_git(
+        temp.path(),
+        &["remote", "add", "origin", remote_repo.to_str().unwrap()],
+    );
+    run_git(temp.path(), &["push", "-q", "origin", "main", "main.stale"]);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    drop(listener);
+    let mut daemon = Command::new("git")
+        .args([
+            "daemon",
+            "--reuseaddr",
+            "--export-all",
+            &format!("--base-path={}", remote.path().display()),
+            "--listen=127.0.0.1",
+            &format!("--port={port}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let remote_url = format!("git://127.0.0.1:{port}/owner/repo.git");
+    run_git(temp.path(), &["remote", "set-url", "origin", &remote_url]);
+    run_git(
+        temp.path(),
+        &["fetch", "-q", "origin", "main", "main.stale"],
+    );
+    run_git(temp.path(), &["remote", "set-head", "origin", "main"]);
+    let repository = crate::services::repo::get_repository_identity(temp.path())
+        .await
+        .expect("test repository identity must be resolvable");
+    assert_eq!(repository.base_branch, "main");
+
+    let server = MockServer::start().await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/api/v1/repos/owner/repo/pulls"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "number": 1,
+                "title": "Merged stale branch",
+                "body": "",
+                "state": "closed",
+                "merged": true,
+                "merge_commit_sha": merge_sha,
+                "html_url": "http://forgejo.test/owner/repo/pulls/1",
+                "head": {"ref": "main.stale", "sha": branch_sha},
+                "base": {"ref": "main", "sha": merge_sha}
+            }])),
+        )
+        .mount(&server)
+        .await;
+
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver,
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        Some(crate::services::forgejo::ForgejoClient::new(&server.uri(), "token").unwrap()),
+        Arc::new(MutexRegistry::new()),
+    );
+    let pull_request = CleanupPullRequest {
+        number: 1,
+        head_ref: "main.stale".to_string(),
+        base_ref: "main".to_string(),
+        state: "closed".to_string(),
+        merged: true,
+        head_sha: Some(branch_sha.clone()),
+        merge_commit_sha: Some(merge_sha.clone()),
+    };
+    let candidate = CleanupCandidate {
+        id: "stale-codex".to_string(),
+        managed: true,
+        resolver_only: false,
+        recovery_receipt: false,
+        agent_name: record.agent_name.to_string(),
+        issue: None,
+        agent_dir,
+        worktree_path: None,
+        local_branch: Some("main.stale".to_string()),
+        local_head_sha: Some(branch_sha.clone()),
+        remote_branch: Some("main.stale".to_string()),
+        remote_head_sha: Some(branch_sha.clone()),
+        pull_request: Some(pull_request),
+        liveness: CleanupLiveness::Dead,
+        dirty: Some(false),
+        protected: false,
+        identity_drift: false,
+        identity_error: None,
+        head_matches_pull_request: Some(true),
+        remote_head_matches_pull_request: Some(true),
+        identity: Some(record),
+        branch: Some(CleanupBranchEvidence {
+            branch: Some("main.stale".to_string()),
+            local_head_sha: Some(branch_sha.clone()),
+            remote_name: Some("origin".to_string()),
+            remote_branch: Some("main.stale".to_string()),
+            remote_head_sha: Some(branch_sha.clone()),
+            target_branch: Some("main".to_string()),
+            target_head_sha: Some(merge_sha),
+            merge_commit_reachable: Some(true),
+            local: CleanupBranchAction {
+                status: CleanupBranchActionStatus::WouldDelete,
+                reason: None,
+            },
+            remote: CleanupBranchAction::default(),
+        }),
+        delete_remote_branch: false,
+        decision: CleanupDecision::Cleanable,
+    };
+    let linked = temp.path().join("linked-stale");
+    let linked_arg = linked.to_str().unwrap().to_string();
+    run_git(
+        temp.path(),
+        &["worktree", "add", "-q", linked_arg.as_str(), "main.stale"],
+    );
+    let mut receipt = CleanupReceipt {
+        schema_version: CLEANUP_RECEIPT_SCHEMA_VERSION,
+        operation_id: "linked-worktree".to_string(),
+        plan_id: "linked-worktree-plan".to_string(),
+        started_at: 0,
+        finished_at: 0,
+        dry_run: false,
+        entries: vec![receipt_entry(
+            &candidate,
+            CleanupReceiptStatus::InProgress,
+            Vec::new(),
+            None,
+        )],
+    };
+    let entry = service
+        .execute_local_branch_action(&candidate, &mut receipt, 0)
+        .await
+        .expect("linked worktree must refuse local deletion");
+    assert_eq!(entry.status, CleanupReceiptStatus::Refused);
+    assert!(
+        entry
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("checked-out branch")),
+        "unexpected refusal: {entry:?}"
+    );
+    assert_eq!(
+        local_branch_state(temp.path(), "main.stale").await.unwrap(),
+        Some(branch_sha)
+    );
+    run_git(
+        temp.path(),
+        &["worktree", "remove", "--force", linked_arg.as_str()],
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
 }
