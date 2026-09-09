@@ -674,6 +674,7 @@ class EffectClient:
         dry_run: bool,
         allow_no_pr: bool = False,
         discard_dirty: bool = False,
+        reason: str | None = None,
     ) -> ToolResult:
         return self._call(
             "cleanup_orphan",
@@ -682,6 +683,7 @@ class EffectClient:
                 "dry_run": dry_run,
                 "allow_no_pr": allow_no_pr,
                 "discard_dirty": discard_dirty,
+                **({"reason": reason} if reason is not None else {}),
             },
         )
 
@@ -693,6 +695,7 @@ class EffectClient:
         name: str | None = None,
         allow_no_pr: bool = False,
         discard_dirty: bool = False,
+        reason: str | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {
             "dry_run": dry_run,
@@ -701,6 +704,7 @@ class EffectClient:
             "discard_dirty": discard_dirty,
         }
         _put(arguments, "name", name)
+        _put(arguments, "reason", reason);
         return self._call("cleanup_leaf", arguments)
 
     def chainlink_timer_start(self, *, issue_id: int) -> ToolResult:

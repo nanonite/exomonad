@@ -1199,7 +1199,7 @@
       "name": "close_issue_and_cleanup"
     },
     {
-      "description": "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply.",
+      "description": "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Supply reason for auditable operator context.",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -1208,6 +1208,10 @@
           },
           "name": {
             "description": "Agent slug to clean up, as shown by session_status",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Optional operator context recorded in the cleanup receipt.",
             "type": "string"
           },
           "allow_no_pr": {
@@ -1230,7 +1234,7 @@
       "name": "cleanup_orphan"
     },
     {
-      "description": "Safely dispose an orphan leaf after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply.",
+      "description": "Safely dispose an orphan leaf after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Supply reason for auditable operator context.",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -1239,6 +1243,10 @@
           },
           "name": {
             "description": "Optional agent slug to verify and clean; required unless sweep=true.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Optional operator context recorded in the cleanup receipt.",
             "type": "string"
           },
           "sweep": {

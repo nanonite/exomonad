@@ -188,6 +188,7 @@ fn resume_receipt(plan: &CleanupPlan, previous: CleanupReceipt) -> CleanupReceip
         operation_id,
         plan_id,
         started_at,
+        operator_reason: previous_reason,
         entries: previous_entries,
         ..
     } = previous;
@@ -245,6 +246,7 @@ fn resume_receipt(plan: &CleanupPlan, previous: CleanupReceipt) -> CleanupReceip
         started_at,
         finished_at: 0,
         dry_run: false,
+        operator_reason: plan.operator_reason.clone().or(previous_reason),
         entries,
     }
 }

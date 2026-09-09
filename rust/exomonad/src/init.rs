@@ -4095,6 +4095,7 @@ mod tests {
             started_at: 1,
             finished_at: 2,
             dry_run: true,
+            operator_reason: None,
             entries: vec![exomonad_core::services::CleanupReceiptEntry {
                 candidate_id: "candidate".to_string(),
                 agent_name: "leaf".to_string(),

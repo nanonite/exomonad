@@ -34,6 +34,7 @@ pub(super) fn dry_run_receipt(plan: &CleanupPlan) -> CleanupReceipt {
         started_at: plan.generated_at,
         finished_at: unix_timestamp(),
         dry_run: true,
+        operator_reason: plan.operator_reason.clone(),
         entries: plan.candidates.iter().map(dry_run_entry).collect(),
     }
 }
@@ -92,6 +93,7 @@ pub(super) fn in_progress_receipt(plan: &CleanupPlan, started_at: u64) -> Cleanu
         started_at,
         finished_at: 0,
         dry_run: false,
+        operator_reason: plan.operator_reason.clone(),
         entries: plan
             .candidates
             .iter()

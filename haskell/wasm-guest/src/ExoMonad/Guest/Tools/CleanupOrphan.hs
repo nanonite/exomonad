@@ -33,6 +33,7 @@ newtype CleanupOrphan = CleanupOrphan ()
 
 data CleanupOrphanArgs = CleanupOrphanArgs
   { coaName :: Text,
+    coaReason :: Maybe Text,
     coaDryRun :: Bool,
     coaAllowNoPr :: Bool,
     coaDiscardDirty :: Bool
@@ -43,6 +44,7 @@ instance FromJSON CleanupOrphanArgs where
   parseJSON = withObject "CleanupOrphanArgs" $ \v ->
     CleanupOrphanArgs
       <$> v .: "name"
+      <*> v .:? "reason"
       <*> v .:? "dry_run" .!= False
       <*> v .:? "allow_no_pr" .!= False
       <*> v .:? "discard_dirty" .!= False
@@ -51,18 +53,20 @@ instance ToJSON CleanupOrphanArgs where
   toJSON args =
     object
       [ "name" .= coaName args,
+        "reason" .= coaReason args,
         "dry_run" .= coaDryRun args,
         "allow_no_pr" .= coaAllowNoPr args,
         "discard_dirty" .= coaDiscardDirty args
       ]
 
 cleanupOrphanDescription :: Text
-cleanupOrphanDescription = "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply."
+cleanupOrphanDescription = "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Supply reason for auditable operator context."
 
 cleanupOrphanSchema :: Aeson.Object
 cleanupOrphanSchema =
   genericToolSchemaWith @CleanupOrphanArgs
     [ ("name", "Agent slug to clean up, as shown by session_status"),
+      ("reason", "Optional operator context recorded in the cleanup receipt."),
       ("dry_run", "When true, report what would be removed without removing it. Defaults to false."),
       ("allow_no_pr", "Explicitly authorize cleanup when no pull request owns the managed branch."),
       ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires apply.")
@@ -75,6 +79,7 @@ cleanupOrphanCore args
       let req =
             PA.DisposeOrphanRequest
               { PA.disposeOrphanRequestAgentSlug = fromText (coaName args),
+                PA.disposeOrphanRequestReason = fromText (maybe "" id (coaReason args)),
                 PA.disposeOrphanRequestVerifyPrState = True,
                 PA.disposeOrphanRequestDryRun = coaDryRun args,
                 PA.disposeOrphanRequestSweep = False,
@@ -92,6 +97,7 @@ cleanupOrphanOutput args resp =
     [ "success" .= True,
       "agent" .= coaName args,
       "dry_run" .= coaDryRun args,
+      "operator_reason" .= lazyText (PA.disposeOrphanResponseOperatorReason resp),
       "verified" .= PA.disposeOrphanResponseVerified resp,
       "pr_state" .= lazyText (PA.disposeOrphanResponsePrState resp),
       "pr_number" .= PA.disposeOrphanResponsePrNumber resp,

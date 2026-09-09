@@ -10,6 +10,7 @@ pub const CLEANUP_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const CLEANUP_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
 const MAX_CLEANUP_TARGET_BYTES: usize = 256;
+const MAX_CLEANUP_REASON_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +23,9 @@ pub struct CleanupRequest {
     pub apply: bool,
     #[serde(default)]
     pub delete_remote_branch: bool,
+    /// Optional operator context recorded with the cleanup receipt.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// Explicitly authorize cleanup when Forgejo has no pull request for this managed branch.
     #[serde(default)]
     pub allow_no_pr: bool,
@@ -41,6 +45,7 @@ impl Default for CleanupRequest {
             sweep: true,
             apply: false,
             delete_remote_branch: false,
+            reason: None,
             allow_no_pr: false,
             discard_dirty: false,
         }
@@ -54,6 +59,7 @@ impl CleanupRequest {
             sweep: false,
             apply: false,
             delete_remote_branch: false,
+            reason: None,
             allow_no_pr: false,
             discard_dirty: false,
         }
@@ -71,6 +77,14 @@ impl CleanupRequest {
         }
         if self.discard_dirty && !self.apply {
             bail!("discard_dirty requires apply=true");
+        }
+        if let Some(reason) = &self.reason {
+            if reason.trim().is_empty() {
+                bail!("cleanup reason cannot be empty");
+            }
+            if reason.len() > MAX_CLEANUP_REASON_BYTES {
+                bail!("cleanup reason exceeds the maximum length");
+            }
         }
         if let Some(target) = &self.target {
             if target.trim().is_empty() {
@@ -256,6 +270,8 @@ pub struct CleanupPlan {
     pub project_dir: PathBuf,
     pub repository: Option<RepositoryIdentity>,
     pub repository_error: Option<String>,
+    #[serde(default)]
+    pub operator_reason: Option<String>,
     pub candidates: Vec<CleanupCandidate>,
     #[serde(default)]
     pub fetched_target: Option<CleanupTargetBranch>,
@@ -308,5 +324,7 @@ pub struct CleanupReceipt {
     pub started_at: u64,
     pub finished_at: u64,
     pub dry_run: bool,
+    #[serde(default)]
+    pub operator_reason: Option<String>,
     pub entries: Vec<CleanupReceiptEntry>,
 }

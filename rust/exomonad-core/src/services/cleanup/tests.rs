@@ -71,12 +71,40 @@ fn cleanup_defaults_to_a_non_mutating_sweep() {
 }
 
 #[test]
+fn cleanup_reason_is_bounded_and_round_trips() {
+    let request = CleanupRequest {
+        target: Some("abandoned-codex".to_string()),
+        sweep: false,
+        reason: Some("operator confirmed abandonment".to_string()),
+        ..CleanupRequest::default()
+    };
+    assert!(request.validate().is_ok());
+
+    let encoded = serde_json::to_value(&request).unwrap();
+    let decoded: CleanupRequest = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, request);
+
+    let empty_reason = CleanupRequest {
+        reason: Some("   ".to_string()),
+        ..request.clone()
+    };
+    assert!(empty_reason.validate().is_err());
+
+    let oversized_reason = CleanupRequest {
+        reason: Some("x".repeat(1025)),
+        ..request
+    };
+    assert!(oversized_reason.validate().is_err());
+}
+
+#[test]
 fn target_validation_rejects_paths_and_ambiguous_requests() {
     assert!(CleanupRequest {
         target: Some("a/b".to_string()),
         sweep: false,
         apply: false,
         delete_remote_branch: false,
+        reason: None,
         allow_no_pr: false,
         discard_dirty: false,
     }
@@ -87,6 +115,7 @@ fn target_validation_rejects_paths_and_ambiguous_requests() {
         sweep: true,
         apply: false,
         delete_remote_branch: false,
+        reason: None,
         allow_no_pr: false,
         discard_dirty: false,
     }
@@ -497,6 +526,7 @@ async fn apply_is_idempotent_for_shared_agent_directory() {
     let request = CleanupRequest {
         apply: true,
         delete_remote_branch: false,
+        reason: None,
         allow_no_pr: false,
         discard_dirty: false,
         ..CleanupRequest::default()
@@ -541,6 +571,7 @@ async fn apply_resumes_an_interrupted_resolver_only_cleanup() {
     let request = CleanupRequest {
         apply: true,
         delete_remote_branch: false,
+        reason: None,
         allow_no_pr: false,
         discard_dirty: false,
         ..CleanupRequest::default()
@@ -674,6 +705,7 @@ async fn interrupted_cleanup_can_resume_by_slug_after_candidate_identity_changes
         sweep: false,
         apply: true,
         delete_remote_branch: false,
+        reason: None,
         allow_no_pr: false,
         discard_dirty: false,
     };
@@ -720,6 +752,7 @@ async fn resolver_identity_reuse_does_not_authorize_an_old_receipt() {
         sweep: false,
         apply: true,
         delete_remote_branch: false,
+        reason: None,
         allow_no_pr: false,
         discard_dirty: false,
     };
@@ -1279,6 +1312,7 @@ async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
         started_at: 0,
         finished_at: 0,
         dry_run: false,
+        operator_reason: None,
         entries: vec![receipt_entry(
             &candidate,
             CleanupReceiptStatus::InProgress,

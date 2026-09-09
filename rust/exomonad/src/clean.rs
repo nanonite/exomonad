@@ -24,6 +24,9 @@ pub(crate) struct CleanArgs {
     /// Also delete the managed branch from the configured remote.
     #[arg(long)]
     pub(crate) delete_remote_branch: bool,
+    /// Optional operator context recorded in the cleanup receipt.
+    #[arg(long, value_name = "REASON")]
+    pub(crate) reason: Option<String>,
     /// Explicitly allow cleanup when no pull request owns the managed branch.
     #[arg(long = "allow-no-pr")]
     pub(crate) allow_no_pr: bool,
@@ -39,6 +42,7 @@ impl CleanArgs {
             sweep: self.sweep,
             apply: self.apply,
             delete_remote_branch: self.delete_remote_branch,
+            reason: self.reason.clone(),
             allow_no_pr: self.allow_no_pr,
             discard_dirty: self.discard_dirty,
         };
@@ -95,6 +99,7 @@ pub(crate) fn continue_cleanup_request() -> CleanupRequest {
         sweep: true,
         apply: false,
         delete_remote_branch: false,
+        reason: None,
         allow_no_pr: false,
         discard_dirty: false,
     }
@@ -333,6 +338,7 @@ mod tests {
             started_at: 1,
             finished_at: 2,
             dry_run,
+            operator_reason: None,
             entries: vec![
                 CleanupReceiptEntry {
                     candidate_id: "would-id".to_string(),
@@ -396,6 +402,7 @@ mod tests {
                 sweep: false,
                 apply: false,
                 delete_remote_branch: false,
+                reason: None,
                 allow_no_pr: false,
                 discard_dirty: false,
             }
@@ -412,6 +419,7 @@ mod tests {
                 sweep: true,
                 apply: true,
                 delete_remote_branch: false,
+                reason: None,
                 allow_no_pr: false,
                 discard_dirty: false,
             }
@@ -428,12 +436,18 @@ mod tests {
             "--apply",
             "--allow-no-pr",
             "--discard-dirty",
+            "--reason",
+            "operator confirmed abandonment",
         ])
         .unwrap();
         let request = args.request().unwrap();
         assert!(request.allow_no_pr);
         assert!(request.discard_dirty);
         assert!(request.apply);
+        assert_eq!(
+            request.reason.as_deref(),
+            Some("operator confirmed abandonment")
+        );
 
         let args = parse(&[
             "exomonad",
@@ -511,6 +525,7 @@ mod tests {
                 sweep: false,
                 apply: false,
                 delete_remote_branch: false,
+                reason: None,
                 allow_no_pr: false,
                 discard_dirty: false,
             };
@@ -524,6 +539,7 @@ mod tests {
             sweep: false,
             apply: false,
             delete_remote_branch: false,
+            reason: None,
             allow_no_pr: false,
             discard_dirty: false,
         };

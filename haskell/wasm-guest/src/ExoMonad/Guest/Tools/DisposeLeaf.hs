@@ -69,7 +69,7 @@ disposeLeafCore args =
         Left err -> pure $ Left err
         Right _ -> pure $ Right $ object ["success" .= True, "agent" .= dlaName args, "issue_id" .= issueId, "force" .= dlaForce args]
     Nothing
-      | dlaForce args -> cleanupOrphanCore (CleanupOrphanArgs (dlaName args) False False False)
+      | dlaForce args -> cleanupOrphanCore (CleanupOrphanArgs (dlaName args) Nothing False False False)
       | otherwise -> pure $ Left "Could not infer a Chainlink issue id from the leaf name. Pass force=true only for a genuine orphan."
 
 inferIssueId :: Text -> Maybe Int

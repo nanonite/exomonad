@@ -421,6 +421,7 @@ mod tests {
             started_at: 0,
             finished_at: 0,
             dry_run: false,
+            operator_reason: None,
             entries: vec![receipt_entry(
                 &candidate,
                 CleanupReceiptStatus::InProgress,

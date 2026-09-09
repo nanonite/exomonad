@@ -145,6 +145,7 @@ impl VerifiedCleanupService {
             project_dir: self.project_dir.clone(),
             repository,
             repository_error,
+            operator_reason: request.reason.clone(),
             candidates,
             fetched_target,
         })

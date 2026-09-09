@@ -1762,7 +1762,8 @@ data DisposeOrphanRequest
     disposeOrphanRequestDryRun :: Hs.Bool,
     disposeOrphanRequestSweep :: Hs.Bool,
     disposeOrphanRequestAllowNoPr :: Hs.Bool,
-    disposeOrphanRequestDiscardDirty :: Hs.Bool
+    disposeOrphanRequestDiscardDirty :: Hs.Bool,
+    disposeOrphanRequestReason :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -1782,42 +1783,51 @@ instance (HsProtobuf.Message DisposeOrphanRequest) where
         disposeOrphanRequestDryRun,
         disposeOrphanRequestSweep,
         disposeOrphanRequestAllowNoPr,
-        disposeOrphanRequestDiscardDirty
+        disposeOrphanRequestDiscardDirty,
+        disposeOrphanRequestReason
       } =
       Hs.mappend
         ( Hs.mappend
             ( Hs.mappend
                 ( Hs.mappend
                     ( Hs.mappend
-                        ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 1)
-                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                disposeOrphanRequestAgentSlug
+                        ( Hs.mappend
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 1)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    disposeOrphanRequestAgentSlug
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 2)
+                                disposeOrphanRequestVerifyPrState
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 2)
-                            disposeOrphanRequestVerifyPrState
+                            (HsProtobuf.FieldNumber 3)
+                            disposeOrphanRequestDryRun
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 3)
-                        disposeOrphanRequestDryRun
+                        (HsProtobuf.FieldNumber 4)
+                        disposeOrphanRequestSweep
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 4)
-                    disposeOrphanRequestSweep
+                    (HsProtobuf.FieldNumber 5)
+                    disposeOrphanRequestAllowNoPr
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 5)
-                disposeOrphanRequestAllowNoPr
+                (HsProtobuf.FieldNumber 6)
+                disposeOrphanRequestDiscardDirty
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 6)
-            disposeOrphanRequestDiscardDirty
+            (HsProtobuf.FieldNumber 7)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                disposeOrphanRequestReason
+            )
         )
   decodeMessage _ =
     Hs.pure DisposeOrphanRequest
@@ -1842,6 +1852,12 @@ instance (HsProtobuf.Message DisposeOrphanRequest) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 6)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -1878,11 +1894,17 @@ instance (HsProtobuf.Message DisposeOrphanRequest) where
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "discard_dirty")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "reason")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB DisposeOrphanRequest) where
-  toJSONPB (DisposeOrphanRequest f1 f2 f3 f4 f5 f6) =
+  toJSONPB (DisposeOrphanRequest f1 f2 f3 f4 f5 f6 f7) =
     HsJSONPB.object
       [ "agent_slug"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -1890,9 +1912,10 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanRequest) where
         "dry_run" .= f3,
         "sweep" .= f4,
         "allow_no_pr" .= f5,
-        "discard_dirty" .= f6
+        "discard_dirty" .= f6,
+        "reason" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
       ]
-  toEncodingPB (DisposeOrphanRequest f1 f2 f3 f4 f5 f6) =
+  toEncodingPB (DisposeOrphanRequest f1 f2 f3 f4 f5 f6 f7) =
     HsJSONPB.pairs
       [ "agent_slug"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -1900,7 +1923,8 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanRequest) where
         "dry_run" .= f3,
         "sweep" .= f4,
         "allow_no_pr" .= f5,
-        "discard_dirty" .= f6
+        "discard_dirty" .= f6,
+        "reason" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
       ]
 
 instance (HsJSONPB.FromJSONPB DisposeOrphanRequest) where
@@ -1917,6 +1941,9 @@ instance (HsJSONPB.FromJSONPB DisposeOrphanRequest) where
             <*> obj .: "sweep"
             <*> obj .: "allow_no_pr"
             <*> obj .: "discard_dirty"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "reason")
+                )
       )
 
 instance (HsJSONPB.ToJSON DisposeOrphanRequest) where
@@ -1941,7 +1968,8 @@ data DisposeOrphanResponse
     disposeOrphanResponseDiscardedPorcelain :: (Hs.Vector Hs.Text),
     disposeOrphanResponseDiscardedTrackedPaths :: (Hs.Vector Hs.Text),
     disposeOrphanResponseDiscardedUntrackedPaths :: (Hs.Vector Hs.Text),
-    disposeOrphanResponseDiscardedChangesTruncated :: Hs.Bool
+    disposeOrphanResponseDiscardedChangesTruncated :: Hs.Bool,
+    disposeOrphanResponseOperatorReason :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -1969,7 +1997,8 @@ instance (HsProtobuf.Message DisposeOrphanResponse) where
         disposeOrphanResponseDiscardedPorcelain,
         disposeOrphanResponseDiscardedTrackedPaths,
         disposeOrphanResponseDiscardedUntrackedPaths,
-        disposeOrphanResponseDiscardedChangesTruncated
+        disposeOrphanResponseDiscardedChangesTruncated,
+        disposeOrphanResponseOperatorReason
       } =
       Hs.mappend
         ( Hs.mappend
@@ -1984,107 +2013,115 @@ instance (HsProtobuf.Message DisposeOrphanResponse) where
                                             ( Hs.mappend
                                                 ( Hs.mappend
                                                     ( Hs.mappend
-                                                        ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 1)
-                                                            disposeOrphanResponseRemovedWorktree
+                                                        ( Hs.mappend
+                                                            ( HsProtobuf.encodeMessageField
+                                                                (HsProtobuf.FieldNumber 1)
+                                                                disposeOrphanResponseRemovedWorktree
+                                                            )
+                                                            ( HsProtobuf.encodeMessageField
+                                                                (HsProtobuf.FieldNumber 2)
+                                                                disposeOrphanResponseRemovedAgentDir
+                                                            )
                                                         )
                                                         ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 2)
-                                                            disposeOrphanResponseRemovedAgentDir
+                                                            (HsProtobuf.FieldNumber 3)
+                                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                                disposeOrphanResponseMessage
+                                                            )
                                                         )
                                                     )
                                                     ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 3)
+                                                        (HsProtobuf.FieldNumber 4)
                                                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                            disposeOrphanResponseMessage
+                                                            disposeOrphanResponsePrState
                                                         )
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 4)
-                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                        disposeOrphanResponsePrState
-                                                    )
+                                                    (HsProtobuf.FieldNumber 5)
+                                                    disposeOrphanResponsePrNumber
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 5)
-                                                disposeOrphanResponsePrNumber
+                                                (HsProtobuf.FieldNumber 6)
+                                                disposeOrphanResponseVerified
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 6)
-                                            disposeOrphanResponseVerified
+                                            (HsProtobuf.FieldNumber 7)
+                                            disposeOrphanResponseDryRun
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 7)
-                                        disposeOrphanResponseDryRun
+                                        (HsProtobuf.FieldNumber 8)
+                                        ( ( Hs.coerce
+                                              @(Hs.Vector Hs.Text)
+                                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                          )
+                                            disposeOrphanResponseCleanedAgents
+                                        )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 8)
+                                    (HsProtobuf.FieldNumber 9)
                                     ( ( Hs.coerce
                                           @(Hs.Vector Hs.Text)
                                           @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                                       )
-                                        disposeOrphanResponseCleanedAgents
+                                        disposeOrphanResponseSkippedAgents
                                     )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 9)
+                                (HsProtobuf.FieldNumber 10)
                                 ( ( Hs.coerce
                                       @(Hs.Vector Hs.Text)
                                       @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                                   )
-                                    disposeOrphanResponseSkippedAgents
+                                    disposeOrphanResponseErrors
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 10)
+                            (HsProtobuf.FieldNumber 11)
                             ( ( Hs.coerce
                                   @(Hs.Vector Hs.Text)
                                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                               )
-                                disposeOrphanResponseErrors
+                                disposeOrphanResponseDiscardedPorcelain
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 11)
+                        (HsProtobuf.FieldNumber 12)
                         ( ( Hs.coerce
                               @(Hs.Vector Hs.Text)
                               @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                           )
-                            disposeOrphanResponseDiscardedPorcelain
+                            disposeOrphanResponseDiscardedTrackedPaths
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 12)
+                    (HsProtobuf.FieldNumber 13)
                     ( ( Hs.coerce
                           @(Hs.Vector Hs.Text)
                           @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                       )
-                        disposeOrphanResponseDiscardedTrackedPaths
+                        disposeOrphanResponseDiscardedUntrackedPaths
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 13)
-                ( ( Hs.coerce
-                      @(Hs.Vector Hs.Text)
-                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                  )
-                    disposeOrphanResponseDiscardedUntrackedPaths
-                )
+                (HsProtobuf.FieldNumber 14)
+                disposeOrphanResponseDiscardedChangesTruncated
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 14)
-            disposeOrphanResponseDiscardedChangesTruncated
+            (HsProtobuf.FieldNumber 15)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                disposeOrphanResponseOperatorReason
+            )
         )
   decodeMessage _ =
     Hs.pure DisposeOrphanResponse
@@ -2172,6 +2209,12 @@ instance (HsProtobuf.Message DisposeOrphanResponse) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 14)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 15)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -2256,6 +2299,12 @@ instance (HsProtobuf.Message DisposeOrphanResponse) where
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "discarded_changes_truncated")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 15)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "operator_reason")
+        []
         ""
     ]
 
@@ -2276,6 +2325,7 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
         f12
         f13
         f14
+        f15
       ) =
       HsJSONPB.object
         [ "removed_worktree" .= f1,
@@ -2329,7 +2379,9 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
                  )
                    f13
                ),
-          "discarded_changes_truncated" .= f14
+          "discarded_changes_truncated" .= f14,
+          "operator_reason"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15)
         ]
   toEncodingPB
     ( DisposeOrphanResponse
@@ -2347,6 +2399,7 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
         f12
         f13
         f14
+        f15
       ) =
       HsJSONPB.pairs
         [ "removed_worktree" .= f1,
@@ -2400,7 +2453,9 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
                  )
                    f13
                ),
-          "discarded_changes_truncated" .= f14
+          "discarded_changes_truncated" .= f14,
+          "operator_reason"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15)
         ]
 
 instance (HsJSONPB.FromJSONPB DisposeOrphanResponse) where
@@ -2457,6 +2512,9 @@ instance (HsJSONPB.FromJSONPB DisposeOrphanResponse) where
                     (obj .: "discarded_untracked_paths")
                 )
             <*> obj .: "discarded_changes_truncated"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "operator_reason")
+                )
       )
 
 instance (HsJSONPB.ToJSON DisposeOrphanResponse) where

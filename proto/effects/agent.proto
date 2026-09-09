@@ -170,6 +170,8 @@ message DisposeOrphanRequest {
   bool allow_no_pr = 5;
   // Explicitly authorize discarding the named worktree's dirty changes.
   bool discard_dirty = 6;
+  // Optional operator context copied into the durable cleanup receipt.
+  string reason = 7;
 }
 
 message DisposeOrphanResponse {
@@ -198,6 +200,8 @@ message DisposeOrphanResponse {
   repeated string discarded_untracked_paths = 13;
   // True when the bounded dirty manifest was truncated.
   bool discarded_changes_truncated = 14;
+  // Operator context recorded for this cleanup operation.
+  string operator_reason = 15;
 }
 
 // ============================================================================
