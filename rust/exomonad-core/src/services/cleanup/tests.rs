@@ -10,7 +10,7 @@ use crate::services::agent_resolver::AgentIdentityRecord;
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::mutex_registry::MutexRegistry;
 use crate::services::repo::RepositoryIdentity;
-use crate::services::tmux_ipc::WindowId;
+use crate::services::tmux_ipc::{TmuxIpc, WindowId};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -177,7 +177,7 @@ async fn terminal_invocation_with_stale_routing_requires_configured_tmux_session
         &agent_dir,
         AgentType::Codex,
         InvocationTrigger::Spawn,
-        RoutingInfo::window(WindowId::parse("@42").unwrap()),
+        RoutingInfo::window(WindowId::parse("@999999999").unwrap()),
         None,
         None,
     )
@@ -202,6 +202,37 @@ async fn terminal_invocation_with_stale_routing_requires_configured_tmux_session
     );
 
     assert_eq!(service.liveness(&agent_dir).await, CleanupLiveness::Unknown);
+
+    let configured_session = format!("cleanup-stale-{}", invocation.invocation_id);
+    TmuxIpc::new_session(&configured_session, temp.path())
+        .await
+        .unwrap();
+    let configured_service = VerifiedCleanupService::new(
+        temp.path(),
+        Arc::new(AgentResolver::load(temp.path().to_path_buf()).await),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        Some(configured_session.clone()),
+    );
+
+    let liveness = configured_service.liveness(&agent_dir).await;
+    TmuxIpc::kill_session(&configured_session).await.unwrap();
+
+    assert_eq!(liveness, CleanupLiveness::Dead);
+}
+
+#[test]
+fn services_propagate_configured_tmux_session_to_cleanup_service() {
+    let mut services = crate::services::Services::test();
+    services.tmux_session = Some("configured-cleanup-session".to_string());
+
+    let cleanup_service = services.cleanup_service();
+
+    assert_eq!(
+        cleanup_service.tmux_session.as_deref(),
+        Some("configured-cleanup-session")
+    );
 }
 
 #[test]
