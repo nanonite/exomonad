@@ -121,6 +121,7 @@ mod tests {
             Arc::new(GitWorktreeService::new(project.path().to_path_buf())),
             None,
             Arc::new(MutexRegistry::new()),
+            None,
         );
 
         let receipt = execute(&service, CleanupRequest::default())

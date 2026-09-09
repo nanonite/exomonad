@@ -1662,6 +1662,7 @@ Run `exomonad recompile` first to build it.",
         event_queue: event_queue.clone(),
         mutex_registry,
         git_wt,
+        tmux_session: Some(config.tmux_session.clone()),
         opencode_worker_model: config.opencode.worker_model.clone(),
         ci_status_map: ci_status_map.clone(),
         watcher_runtime_state: watcher_runtime_state.clone(),
@@ -2105,6 +2106,7 @@ mod tests {
             )),
             None,
             Arc::new(exomonad_core::services::MutexRegistry::new()),
+            None,
         );
         let router = Router::new()
             .route(

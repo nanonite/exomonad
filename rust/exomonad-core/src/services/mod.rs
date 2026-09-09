@@ -215,6 +215,8 @@ pub struct Services {
     pub event_queue: Arc<EventQueue>,
     pub mutex_registry: Arc<MutexRegistry>,
     pub git_wt: Arc<GitWorktreeService>,
+    /// Resolved tmux session used by server-side cleanup liveness checks.
+    pub tmux_session: Option<String>,
     /// Model for spawned OpenCode workers (passed to `opencode run --model`).
     /// `None` means let opencode pick.
     pub opencode_worker_model: Option<String>,
@@ -349,6 +351,7 @@ impl Services {
             event_queue: Arc::new(EventQueue::new()),
             mutex_registry: Arc::new(MutexRegistry::new()),
             git_wt: Arc::new(GitWorktreeService::new(project_dir)),
+            tmux_session: None,
             opencode_worker_model: None,
             ci_status_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             watcher_runtime_state: Arc::new(WatcherRuntimeState::new()),
@@ -375,6 +378,7 @@ impl Services {
             event_queue: Arc::new(EventQueue::new()),
             mutex_registry: Arc::new(MutexRegistry::new()),
             git_wt: Arc::new(GitWorktreeService::new(PathBuf::from("."))),
+            tmux_session: None,
             opencode_worker_model: None,
             ci_status_map: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             watcher_runtime_state: Arc::new(WatcherRuntimeState::new()),

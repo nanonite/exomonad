@@ -1,12 +1,16 @@
 use super::service::VerifiedCleanupService;
 use super::support::*;
 use super::types::*;
-use crate::domain::{BirthBranch, Slug};
-use crate::services::agent_control::{AgentResolver, AgentType, Topology};
+use crate::domain::{BirthBranch, RoutingInfo, Slug};
+use crate::services::agent_control::{
+    finish_invocation, start_invocation, AgentResolver, AgentType, InvocationStatus,
+    InvocationTrigger, Topology,
+};
 use crate::services::agent_resolver::AgentIdentityRecord;
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::mutex_registry::MutexRegistry;
 use crate::services::repo::RepositoryIdentity;
+use crate::services::tmux_ipc::WindowId;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -163,6 +167,43 @@ fn routing_target_absence_is_dead_but_probe_errors_are_unknown() {
     );
 }
 
+#[tokio::test]
+async fn terminal_invocation_with_stale_routing_requires_configured_tmux_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+
+    let invocation = start_invocation(
+        &agent_dir,
+        AgentType::Codex,
+        InvocationTrigger::Spawn,
+        RoutingInfo::window(WindowId::parse("@42").unwrap()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    finish_invocation(
+        &agent_dir,
+        &invocation.invocation_id,
+        InvocationStatus::Exited,
+        Some(0),
+    )
+    .await
+    .unwrap();
+
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        Arc::new(AgentResolver::load(temp.path().to_path_buf()).await),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        None,
+    );
+
+    assert_eq!(service.liveness(&agent_dir).await, CleanupLiveness::Unknown);
+}
+
 #[test]
 fn remote_branch_head_must_match_the_pull_request_head() {
     let identity = identity(Topology::WorktreePerAgent);
@@ -262,6 +303,7 @@ async fn dry_run_does_not_remove_shared_agent_directory() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     let receipt = service.run(&CleanupRequest::default()).await.unwrap();
     assert!(receipt.dry_run);
@@ -291,6 +333,7 @@ async fn apply_is_idempotent_for_shared_agent_directory() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     let request = CleanupRequest {
         apply: true,
@@ -332,6 +375,7 @@ async fn apply_resumes_an_interrupted_resolver_only_cleanup() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     let request = CleanupRequest {
         apply: true,
@@ -380,6 +424,7 @@ async fn receipt_persistence_failure_stops_before_resolver_deregistration() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     service.fail_receipt_persist_on_call(3);
     let request = CleanupRequest {
@@ -418,6 +463,7 @@ async fn receipt_persistence_failure_after_deregistration_is_recovered() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     service.fail_receipt_persist_on_call(5);
     let request = CleanupRequest {
@@ -458,6 +504,7 @@ async fn interrupted_cleanup_can_resume_by_slug_after_candidate_identity_changes
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     let request = CleanupRequest {
         target: Some(record.slug.to_string()),
@@ -501,6 +548,7 @@ async fn resolver_identity_reuse_does_not_authorize_an_old_receipt() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     let request = CleanupRequest {
         target: Some(old_record.agent_name.to_string()),
@@ -548,6 +596,7 @@ async fn resolver_only_cleanup_requires_an_in_progress_receipt() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
 
     let plan = service.plan(&CleanupRequest::default()).await.unwrap();
@@ -587,6 +636,7 @@ async fn sweep_reports_malformed_identity_and_identityless_worktree() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     let plan = service.plan(&CleanupRequest::default()).await.unwrap();
     assert_eq!(plan.candidates.len(), 2);
@@ -651,6 +701,7 @@ async fn real_worktree_is_discovered_from_authoritative_resolver_identity() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         None,
         Arc::new(MutexRegistry::new()),
+        None,
     );
     let plan = service.plan(&CleanupRequest::default()).await.unwrap();
     let candidate = plan
@@ -994,6 +1045,7 @@ async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
         Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
         Some(crate::services::forgejo::ForgejoClient::new(&server.uri(), "token").unwrap()),
         Arc::new(MutexRegistry::new()),
+        None,
     );
     let pull_request = CleanupPullRequest {
         number: 1,

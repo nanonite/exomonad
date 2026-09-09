@@ -26,6 +26,7 @@ pub struct VerifiedCleanupService {
     pub(super) git_worktree: Arc<GitWorktreeService>,
     pub(super) forgejo: Option<Arc<ForgejoClient>>,
     pub(super) mutex: Arc<MutexRegistry>,
+    pub(super) tmux_session: Option<String>,
     #[cfg(test)]
     pub(super) receipt_persist_calls: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -39,6 +40,7 @@ impl VerifiedCleanupService {
         git_worktree: Arc<GitWorktreeService>,
         forgejo: Option<Arc<ForgejoClient>>,
         mutex: Arc<MutexRegistry>,
+        tmux_session: Option<String>,
     ) -> Self {
         let requested_dir = project_dir.into();
         let project_dir = std::fs::canonicalize(&requested_dir).unwrap_or(requested_dir);
@@ -48,6 +50,7 @@ impl VerifiedCleanupService {
             git_worktree,
             forgejo,
             mutex,
+            tmux_session,
             #[cfg(test)]
             receipt_persist_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -62,6 +65,7 @@ impl VerifiedCleanupService {
             services.git_wt.clone(),
             services.forgejo_client.clone(),
             services.mutex_registry.clone(),
+            services.tmux_session.clone(),
         )
     }
 

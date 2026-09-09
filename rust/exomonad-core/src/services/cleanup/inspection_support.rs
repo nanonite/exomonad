@@ -75,13 +75,13 @@ impl VerifiedCleanupService {
         if !routing.has_delivery_target() {
             return CleanupLiveness::Dead;
         }
-        let Ok(session) = std::env::var("EXOMONAD_TMUX_SESSION") else {
+        let Some(session) = self.tmux_session.as_deref() else {
             return CleanupLiveness::Unknown;
         };
         if session.trim().is_empty() {
             return CleanupLiveness::Unknown;
         }
-        let tmux = TmuxIpc::new(&session);
+        let tmux = TmuxIpc::new(session);
         match classify_routing_target(routing_target_alive(&routing, &tmux).await) {
             CleanupLiveness::Dead => return CleanupLiveness::Dead,
             CleanupLiveness::Unknown => return CleanupLiveness::Unknown,
