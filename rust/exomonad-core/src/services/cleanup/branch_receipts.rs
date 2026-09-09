@@ -13,7 +13,12 @@ impl VerifiedCleanupService {
         local: bool,
     ) -> Option<CleanupReceiptEntry> {
         let Some(branch) = receipt.entries[index].branch.as_mut() else {
-            return Some(self.failed_branch(candidate, "branch evidence is unavailable"));
+            return Some(self.failed_branch(
+                candidate,
+                receipt,
+                index,
+                "branch evidence is unavailable",
+            ));
         };
         branch_action_mut(branch, local).status = CleanupBranchActionStatus::DeletePending;
         branch_action_mut(branch, local).reason = None;
@@ -34,13 +39,23 @@ impl VerifiedCleanupService {
         reason: Option<String>,
     ) -> Option<CleanupReceiptEntry> {
         let Some(branch) = receipt.entries[index].branch.as_mut() else {
-            return Some(self.failed_branch(candidate, "branch evidence is unavailable"));
+            return Some(self.failed_branch(
+                candidate,
+                receipt,
+                index,
+                "branch evidence is unavailable",
+            ));
         };
         let action = branch_action_mut(branch, local);
         action.status = status.clone();
         action.reason = reason;
         let Some(name) = completed_action_name(local, &status) else {
-            return Some(self.failed_branch(candidate, "invalid branch action state"));
+            return Some(self.failed_branch(
+                candidate,
+                receipt,
+                index,
+                "invalid branch action state",
+            ));
         };
         receipt.entries[index]
             .actions
@@ -63,6 +78,8 @@ impl VerifiedCleanupService {
             .map(|error| {
                 self.failed_branch(
                     candidate,
+                    receipt,
+                    index,
                     format!("{PROGRESS_PERSISTENCE_FAILURE}: {error}"),
                 )
             })
@@ -143,14 +160,18 @@ impl VerifiedCleanupService {
     pub(super) fn failed_branch(
         &self,
         candidate: &CleanupCandidate,
+        receipt: &CleanupReceipt,
+        index: usize,
         reason: impl Into<String>,
     ) -> CleanupReceiptEntry {
-        receipt_entry(
+        let mut entry = receipt_entry(
             candidate,
             CleanupReceiptStatus::Failed,
-            Vec::new(),
+            receipt.entries[index].actions.clone(),
             Some(reason.into()),
-        )
+        );
+        entry.branch = receipt.entries[index].branch.clone();
+        entry
     }
 }
 

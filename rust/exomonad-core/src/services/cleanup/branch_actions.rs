@@ -108,7 +108,7 @@ impl VerifiedCleanupService {
         let prepared = self
             .prepare_local_branch_deletion(candidate, expected)
             .await;
-        self.complete_local_action(candidate, receipt, index, prepared)
+        self.complete_local_action(candidate, receipt, index, expected, prepared)
             .await
     }
 
@@ -117,6 +117,7 @@ impl VerifiedCleanupService {
         candidate: &CleanupCandidate,
         receipt: &mut CleanupReceipt,
         index: usize,
+        expected: &str,
         prepared: Result<LocalBranchDeletion>,
     ) -> Option<CleanupReceiptEntry> {
         let branch = match prepared {
@@ -130,7 +131,7 @@ impl VerifiedCleanupService {
                 return Some(self.refuse_branch(candidate, receipt, index, true, error.to_string()))
             }
         };
-        let result = delete_local_branch(&self.project_dir, &branch.branch).await;
+        let result = delete_local_branch(&self.project_dir, &branch.branch, expected).await;
         self.finish_delete_result(candidate, receipt, index, true, result)
             .await
     }

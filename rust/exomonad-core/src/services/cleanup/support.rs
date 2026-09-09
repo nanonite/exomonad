@@ -214,10 +214,16 @@ pub(super) async fn merge_commit_reachable(
     }
 }
 
-pub(super) async fn delete_local_branch(project_dir: &Path, branch: &str) -> Result<()> {
+pub(super) async fn delete_local_branch(
+    project_dir: &Path,
+    branch: &str,
+    expected_sha: &str,
+) -> Result<()> {
     validate_branch_arg(branch, "managed local branch")?;
+    validate_commit_arg(expected_sha).context("validate expected local branch head")?;
+    let ref_name = format!("refs/heads/{branch}");
     let output = git_command(project_dir)
-        .args(["branch", "-D", "--", branch])
+        .args(["update-ref", "-d", &ref_name, expected_sha])
         .output()
         .await
         .context("delete managed local branch")?;

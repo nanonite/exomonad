@@ -819,7 +819,28 @@ async fn local_branch_deletion_removes_only_the_validated_branch() {
     run_git(temp.path(), &["commit", "-qm", "initial"]);
     run_git(temp.path(), &["branch", "-M", "main"]);
     run_git(temp.path(), &["branch", "main.stale"]);
-    delete_local_branch(temp.path(), "main.stale")
+    let expected = local_branch_state(temp.path(), "main.stale")
+        .await
+        .unwrap()
+        .unwrap();
+    run_git(temp.path(), &["checkout", "-q", "main.stale"]);
+    tokio::fs::write(temp.path().join("README"), "advanced\n")
+        .await
+        .unwrap();
+    run_git(temp.path(), &["add", "README"]);
+    run_git(temp.path(), &["commit", "-qm", "advance"]);
+    let advanced = local_branch_state(temp.path(), "main.stale")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(delete_local_branch(temp.path(), "main.stale", &expected)
+        .await
+        .is_err());
+    assert_eq!(
+        local_branch_state(temp.path(), "main.stale").await.unwrap(),
+        Some(advanced.clone())
+    );
+    delete_local_branch(temp.path(), "main.stale", &advanced)
         .await
         .unwrap();
     assert_eq!(

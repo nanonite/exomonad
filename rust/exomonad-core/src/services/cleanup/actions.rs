@@ -97,7 +97,12 @@ impl VerifiedCleanupService {
             return entry;
         }
         if let Err(error) = self.resolver.deregister(&expected.agent_name).await {
-            return failed(candidate, format!("deregister identity: {error}"));
+            return failed(
+                candidate,
+                receipt,
+                index,
+                format!("deregister identity: {error}"),
+            );
         }
         actions.retain(|action| action != DEREGISTER_PENDING);
         actions.push("deregister_identity".to_string());
@@ -126,10 +131,20 @@ impl VerifiedCleanupService {
             match tokio::task::spawn_blocking(move || git_worktree.remove_workspace(&path)).await {
                 Ok(Ok(())) => actions.push("remove_worktree".to_string()),
                 Ok(Err(error)) => {
-                    return Some(failed(candidate, format!("remove worktree: {error}")))
+                    return Some(failed(
+                        candidate,
+                        receipt,
+                        index,
+                        format!("remove worktree: {error}"),
+                    ))
                 }
                 Err(error) => {
-                    return Some(failed(candidate, format!("remove worktree task: {error}")));
+                    return Some(failed(
+                        candidate,
+                        receipt,
+                        index,
+                        format!("remove worktree task: {error}"),
+                    ));
                 }
             }
         } else {
@@ -154,6 +169,8 @@ impl VerifiedCleanupService {
             Err(error) => {
                 return Some(failed(
                     candidate,
+                    receipt,
+                    index,
                     format!("remove agent directory: {error}"),
                 ));
             }
@@ -170,7 +187,12 @@ impl VerifiedCleanupService {
         actions: &mut Vec<String>,
     ) -> Option<CleanupReceiptEntry> {
         let Ok(agent_name) = AgentName::try_from_str(&candidate.agent_name) else {
-            return Some(failed(candidate, "agent name became invalid"));
+            return Some(failed(
+                candidate,
+                receipt,
+                index,
+                "agent name became invalid",
+            ));
         };
         if !actions.iter().any(|action| action == DEREGISTER_PENDING) {
             actions.push(DEREGISTER_PENDING.to_string());
@@ -182,7 +204,12 @@ impl VerifiedCleanupService {
             return Some(entry);
         }
         if let Err(error) = self.resolver.deregister(&agent_name).await {
-            return Some(failed(candidate, format!("deregister identity: {error}")));
+            return Some(failed(
+                candidate,
+                receipt,
+                index,
+                format!("deregister identity: {error}"),
+            ));
         }
         actions.retain(|action| action != DEREGISTER_PENDING);
         actions.push("deregister_identity".to_string());
@@ -203,6 +230,8 @@ impl VerifiedCleanupService {
             .map(|error| {
                 failed(
                     candidate,
+                    receipt,
+                    index,
                     format!("{PROGRESS_PERSISTENCE_FAILURE}: {error}"),
                 )
             })
@@ -222,13 +251,20 @@ fn refused(candidate: &CleanupCandidate, reason: impl Into<String>) -> CleanupRe
     )
 }
 
-fn failed(candidate: &CleanupCandidate, reason: impl Into<String>) -> CleanupReceiptEntry {
-    receipt_entry(
+fn failed(
+    candidate: &CleanupCandidate,
+    receipt: &CleanupReceipt,
+    index: usize,
+    reason: impl Into<String>,
+) -> CleanupReceiptEntry {
+    let mut entry = receipt_entry(
         candidate,
         CleanupReceiptStatus::Failed,
-        Vec::new(),
+        receipt.entries[index].actions.clone(),
         Some(reason.into()),
-    )
+    );
+    entry.branch = receipt.entries[index].branch.clone();
+    entry
 }
 
 fn receipt_entry_identity_is_coherent(
@@ -236,4 +272,70 @@ fn receipt_entry_identity_is_coherent(
     identity: &AgentIdentityRecord,
 ) -> bool {
     entry.agent_name == identity.agent_name.as_str() && entry.agent_slug == identity.slug.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate() -> CleanupCandidate {
+        CleanupCandidate {
+            id: "candidate".to_string(),
+            managed: true,
+            resolver_only: false,
+            recovery_receipt: false,
+            agent_name: "stale-codex".to_string(),
+            issue: None,
+            agent_dir: "agent".into(),
+            worktree_path: None,
+            local_branch: Some("main.stale".to_string()),
+            local_head_sha: Some("a".repeat(40)),
+            remote_branch: None,
+            remote_head_sha: None,
+            pull_request: None,
+            liveness: CleanupLiveness::Dead,
+            dirty: Some(false),
+            protected: false,
+            identity_drift: false,
+            identity_error: None,
+            head_matches_pull_request: None,
+            remote_head_matches_pull_request: None,
+            identity: None,
+            branch: None,
+            delete_remote_branch: false,
+            decision: CleanupDecision::Cleanable,
+        }
+    }
+
+    #[test]
+    fn failure_after_branch_action_preserves_receipt_progress() {
+        let candidate = candidate();
+        let mut branch = CleanupBranchEvidence {
+            branch: Some("main.stale".to_string()),
+            local_head_sha: candidate.local_head_sha.clone(),
+            ..CleanupBranchEvidence::default()
+        };
+        branch.local.status = CleanupBranchActionStatus::Deleted;
+        let mut receipt = CleanupReceipt {
+            schema_version: CLEANUP_RECEIPT_SCHEMA_VERSION,
+            operation_id: "operation".to_string(),
+            plan_id: "plan".to_string(),
+            started_at: 0,
+            finished_at: 0,
+            dry_run: false,
+            entries: vec![receipt_entry(
+                &candidate,
+                CleanupReceiptStatus::InProgress,
+                vec!["delete_local_branch".to_string()],
+                None,
+            )],
+        };
+        receipt.entries[0].branch = Some(branch.clone());
+
+        let entry = failed(&candidate, &receipt, 0, "remove agent directory failed");
+
+        assert_eq!(entry.actions, vec!["delete_local_branch"]);
+        assert_eq!(entry.branch, Some(branch));
+        assert_eq!(entry.status, CleanupReceiptStatus::Failed);
+    }
 }
