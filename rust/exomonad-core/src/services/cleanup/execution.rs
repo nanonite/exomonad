@@ -73,7 +73,10 @@ impl VerifiedCleanupService {
 }
 
 fn in_progress_actions(entry: &CleanupReceiptEntry) -> Vec<String> {
-    if matches!(&entry.status, CleanupReceiptStatus::InProgress) {
+    if matches!(
+        &entry.status,
+        CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Failed
+    ) {
         entry.actions.clone()
     } else {
         Vec::new()

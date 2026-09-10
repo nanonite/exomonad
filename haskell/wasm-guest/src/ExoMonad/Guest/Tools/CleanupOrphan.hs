@@ -38,7 +38,7 @@ data CleanupOrphanArgs = CleanupOrphanArgs
     coaAllowNoPr :: Bool,
     coaDiscardDirty :: Bool,
     coaPreserveUniqueCommits :: Bool,
-    coaDeleteRemoteBranch :: Bool
+    coaDeleteRemoteBranch :: Maybe Bool
   }
   deriving (Generic, Show)
 
@@ -51,7 +51,7 @@ instance FromJSON CleanupOrphanArgs where
       <*> v .:? "allow_no_pr" .!= False
       <*> v .:? "discard_dirty" .!= False
       <*> v .:? "preserve_unique_commits" .!= False
-      <*> v .:? "delete_remote_branch" .!= False
+      <*> v .:? "delete_remote_branch"
 
 instance ToJSON CleanupOrphanArgs where
   toJSON args =
@@ -62,7 +62,7 @@ instance ToJSON CleanupOrphanArgs where
         "allow_no_pr" .= coaAllowNoPr args,
         "discard_dirty" .= coaDiscardDirty args,
         "preserve_unique_commits" .= coaPreserveUniqueCommits args,
-        "delete_remote_branch" .= coaDeleteRemoteBranch args
+        "delete_remote_branch" .= maybe False id (coaDeleteRemoteBranch args)
       ]
 
 cleanupOrphanDescription :: Text
@@ -94,7 +94,7 @@ cleanupOrphanCore args
                 PA.disposeOrphanRequestAllowNoPr = coaAllowNoPr args,
                 PA.disposeOrphanRequestDiscardDirty = coaDiscardDirty args,
                 PA.disposeOrphanRequestPreserveUniqueCommits = coaPreserveUniqueCommits args,
-                PA.disposeOrphanRequestDeleteRemoteBranch = coaDeleteRemoteBranch args
+                PA.disposeOrphanRequestDeleteRemoteBranch = maybe False id (coaDeleteRemoteBranch args)
               }
       result <- suspendEffect @Agent.AgentDisposeOrphan req
       pure $ case result of
@@ -107,7 +107,7 @@ cleanupOrphanOutput args resp =
     [ "success" .= True,
       "agent" .= coaName args,
       "dry_run" .= coaDryRun args,
-      "delete_remote_branch" .= coaDeleteRemoteBranch args,
+      "delete_remote_branch" .= maybe False id (coaDeleteRemoteBranch args),
       "operator_reason" .= lazyText (PA.disposeOrphanResponseOperatorReason resp),
       "preserved_unique_commits" .= PA.disposeOrphanResponsePreservedUniqueCommits resp,
       "verified" .= PA.disposeOrphanResponseVerified resp,
@@ -122,7 +122,11 @@ cleanupOrphanOutput args resp =
       "discarded_porcelain" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedPorcelain resp)),
       "discarded_tracked_paths" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedTrackedPaths resp)),
       "discarded_untracked_paths" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedUntrackedPaths resp)),
-      "discarded_changes_truncated" .= PA.disposeOrphanResponseDiscardedChangesTruncated resp
+      "discarded_changes_truncated" .= PA.disposeOrphanResponseDiscardedChangesTruncated resp,
+      "verified_remote_name" .= lazyText (PA.disposeOrphanResponseVerifiedRemoteName resp),
+      "verified_remote_ref" .= lazyText (PA.disposeOrphanResponseVerifiedRemoteRef resp),
+      "verified_remote_head_sha" .= lazyText (PA.disposeOrphanResponseVerifiedRemoteHeadSha resp),
+      "remote_deletion_outcome" .= lazyText (PA.disposeOrphanResponseRemoteDeletionOutcome resp)
     ]
 
 lazyText :: TL.Text -> Text

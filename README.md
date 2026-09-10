@@ -243,8 +243,10 @@ both local and explicitly requested remote actions are preview-only.
 Remote deletion is irreversible, requires a named target, and is rejected for
 sweeps; it is never implied by --apply, --allow-no-pr, --discard-dirty, or
 local branch deletion. No-PR cleanup requires both --allow-no-pr and
---delete-remote-branch, while dirty no-PR cleanup additionally requires
---discard-dirty.
+--delete-remote-branch only when remote deletion is requested; no-PR cleanup
+without remote deletion requires only --allow-no-pr. Dirty no-PR cleanup
+additionally requires --discard-dirty, and remote deletion still requires its
+own explicit confirmation.
 
 Afterwards, the run is measurable rather than merely reviewable. The controller's own decisions — gates opened and answered, slices parked and why, merge decisions, RLM judgment retries — land in the same append-only ledger as agent and PR activity:
 

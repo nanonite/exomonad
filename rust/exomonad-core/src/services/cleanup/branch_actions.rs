@@ -12,7 +12,7 @@ impl VerifiedCleanupService {
         receipt: &mut CleanupReceipt,
         index: usize,
     ) -> Option<CleanupReceiptEntry> {
-        if remote_deletion_was_proven(receipt, index) {
+        if !candidate.delete_remote_branch {
             return None;
         }
         if matches!(
@@ -22,13 +22,15 @@ impl VerifiedCleanupService {
                 .map(|branch| &branch.remote.status),
             Some(CleanupBranchActionStatus::Deleted)
         ) {
-            return Some(self.refuse_branch(
-                candidate,
-                receipt,
-                index,
-                false,
-                "cleanup receipt marks remote deletion complete without exact remote, ref, and SHA evidence",
-            ));
+            return match self
+                .verify_prior_remote_deletion(candidate, receipt, index)
+                .await
+            {
+                Ok(()) => None,
+                Err(error) => {
+                    Some(self.refuse_branch(candidate, receipt, index, false, error.to_string()))
+                }
+            };
         }
         if !remote_action_requested(candidate, receipt, index) {
             return None;
@@ -102,6 +104,15 @@ impl VerifiedCleanupService {
                 ))
             }
         };
+        if let Err(error) = self.revalidate_liveness_and_worktree(candidate).await {
+            return Some(self.refuse_branch(
+                candidate,
+                receipt,
+                index,
+                false,
+                format!("state changed before remote deletion: {error}"),
+            ));
+        }
         let result = delete_remote_branch_with_lease(
             &self.project_dir,
             &branch.repository.remote_name,
@@ -111,6 +122,95 @@ impl VerifiedCleanupService {
         .await;
         self.finish_delete_result(candidate, receipt, index, false, result)
             .await
+    }
+
+    async fn verify_prior_remote_deletion(
+        &self,
+        candidate: &CleanupCandidate,
+        receipt: &CleanupReceipt,
+        index: usize,
+    ) -> Result<()> {
+        let entry = &receipt.entries[index];
+        let evidence = entry
+            .branch
+            .as_ref()
+            .context("cleanup receipt is missing remote deletion evidence")?;
+        if !entry
+            .actions
+            .iter()
+            .any(|action| action == "delete_remote_branch")
+        {
+            anyhow::bail!("cleanup receipt is missing remote deletion intent");
+        }
+        let remote_name = evidence
+            .remote_name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .context("cleanup receipt is missing the verified remote name")?;
+        let remote_branch = evidence
+            .remote_branch
+            .as_deref()
+            .or(evidence.branch.as_deref())
+            .filter(|value| !value.is_empty())
+            .context("cleanup receipt is missing the verified remote ref")?;
+        let expected_sha = evidence
+            .remote_head_sha
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .context("cleanup receipt is missing the verified remote head SHA")?;
+        let identity = candidate
+            .identity
+            .as_ref()
+            .context("managed identity is unavailable while verifying prior deletion")?;
+        if entry.identity_snapshot.as_ref() != Some(identity)
+            || entry.agent_name != candidate.agent_name
+            || entry.agent_slug != identity.slug.as_str()
+        {
+            anyhow::bail!("cleanup receipt identity differs from the current candidate");
+        }
+        let candidate_branch = candidate
+            .branch
+            .as_ref()
+            .context("current candidate is missing branch evidence")?;
+        if candidate_branch.remote_name.as_deref() != Some(remote_name) {
+            anyhow::bail!("cleanup receipt remote differs from the current candidate");
+        }
+        let candidate_branch_name = candidate_branch
+            .branch
+            .as_deref()
+            .or(candidate.local_branch.as_deref());
+        if candidate_branch_name != Some(remote_branch) {
+            anyhow::bail!("cleanup receipt ref differs from the current candidate");
+        }
+        if candidate_branch
+            .remote_branch
+            .as_deref()
+            .is_some_and(|branch| branch != remote_branch)
+        {
+            anyhow::bail!("cleanup receipt remote ref differs from current branch evidence");
+        }
+        if candidate
+            .pull_request
+            .as_ref()
+            .and_then(|pull_request| pull_request.head_sha.as_deref())
+            .is_some_and(|head| head != expected_sha)
+        {
+            anyhow::bail!(
+                "cleanup receipt expected SHA differs from current pull-request evidence"
+            );
+        }
+        let current = self.revalidate_branch(candidate).await?;
+        if current.repository.remote_name != remote_name || current.branch != remote_branch {
+            anyhow::bail!("configured remote or ref changed since prior deletion");
+        }
+        if let Some(observed) =
+            remote_branch_state(&self.project_dir, remote_name, remote_branch).await?
+        {
+            anyhow::bail!(
+                "remote branch was recreated or moved after prior deletion (observed {observed})"
+            );
+        }
+        Ok(())
     }
 
     pub(super) async fn execute_local_branch_action(
@@ -217,21 +317,6 @@ fn remote_action_requested(
         )
 }
 
-fn remote_deletion_was_proven(receipt: &CleanupReceipt, index: usize) -> bool {
-    let entry = &receipt.entries[index];
-    let Some(branch) = entry.branch.as_ref() else {
-        return false;
-    };
-    branch.remote.status == CleanupBranchActionStatus::Deleted
-        && entry
-            .actions
-            .iter()
-            .any(|action| action == "delete_remote_branch")
-        && branch.remote_name.is_some()
-        && branch.remote_branch.is_some()
-        && branch.remote_head_sha.is_some()
-}
-
 fn local_action_requested(receipt: &CleanupReceipt, index: usize) -> bool {
     branch_action_is_pending_or_planned(
         receipt.entries[index]
@@ -239,4 +324,57 @@ fn local_action_requested(receipt: &CleanupReceipt, index: usize) -> bool {
             .as_ref()
             .map(|branch| &branch.local.status),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn recovered_provenance_uses_the_authoritative_pull_request_head() {
+        let candidate = CleanupCandidate {
+            id: "recovered".to_string(),
+            managed: true,
+            resolver_only: false,
+            recovery_receipt: true,
+            agent_name: "recovered".to_string(),
+            issue: None,
+            agent_dir: PathBuf::from(".exo/agents/recovered"),
+            worktree_path: None,
+            local_branch: Some("main.recovered".to_string()),
+            local_head_sha: Some("local-sha".to_string()),
+            remote_branch: Some("main.recovered".to_string()),
+            remote_head_sha: None,
+            pull_request: Some(CleanupPullRequest {
+                number: 43,
+                head_ref: "main.recovered".to_string(),
+                base_ref: "main".to_string(),
+                state: "closed".to_string(),
+                merged: true,
+                head_sha: Some("recovered-pr-head".to_string()),
+                merge_commit_sha: Some("recovered-merge".to_string()),
+            }),
+            liveness: CleanupLiveness::Dead,
+            dirty: Some(false),
+            dirty_evidence: None,
+            protected: false,
+            identity_drift: false,
+            identity_error: None,
+            head_matches_pull_request: Some(true),
+            remote_head_matches_pull_request: Some(true),
+            identity: None,
+            branch: None,
+            delete_remote_branch: true,
+            allow_no_pr: false,
+            discard_dirty: false,
+            preserve_unique_commits: false,
+            decision: CleanupDecision::Cleanable,
+        };
+
+        assert_eq!(
+            remote_expected_sha(&candidate).unwrap(),
+            "recovered-pr-head"
+        );
+    }
 }

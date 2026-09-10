@@ -2010,7 +2010,11 @@ data DisposeOrphanResponse
     disposeOrphanResponseDiscardedUntrackedPaths :: (Hs.Vector Hs.Text),
     disposeOrphanResponseDiscardedChangesTruncated :: Hs.Bool,
     disposeOrphanResponseOperatorReason :: Hs.Text,
-    disposeOrphanResponsePreservedUniqueCommits :: Hs.Bool
+    disposeOrphanResponsePreservedUniqueCommits :: Hs.Bool,
+    disposeOrphanResponseVerifiedRemoteName :: Hs.Text,
+    disposeOrphanResponseVerifiedRemoteRef :: Hs.Text,
+    disposeOrphanResponseVerifiedRemoteHeadSha :: Hs.Text,
+    disposeOrphanResponseRemoteDeletionOutcome :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -2040,7 +2044,11 @@ instance (HsProtobuf.Message DisposeOrphanResponse) where
         disposeOrphanResponseDiscardedUntrackedPaths,
         disposeOrphanResponseDiscardedChangesTruncated,
         disposeOrphanResponseOperatorReason,
-        disposeOrphanResponsePreservedUniqueCommits
+        disposeOrphanResponsePreservedUniqueCommits,
+        disposeOrphanResponseVerifiedRemoteName,
+        disposeOrphanResponseVerifiedRemoteRef,
+        disposeOrphanResponseVerifiedRemoteHeadSha,
+        disposeOrphanResponseRemoteDeletionOutcome
       } =
       Hs.mappend
         ( Hs.mappend
@@ -2057,119 +2065,157 @@ instance (HsProtobuf.Message DisposeOrphanResponse) where
                                                     ( Hs.mappend
                                                         ( Hs.mappend
                                                             ( Hs.mappend
-                                                                ( HsProtobuf.encodeMessageField
-                                                                    (HsProtobuf.FieldNumber 1)
-                                                                    disposeOrphanResponseRemovedWorktree
+                                                                ( Hs.mappend
+                                                                    ( Hs.mappend
+                                                                        ( Hs.mappend
+                                                                            ( Hs.mappend
+                                                                                ( HsProtobuf.encodeMessageField
+                                                                                    (HsProtobuf.FieldNumber 1)
+                                                                                    disposeOrphanResponseRemovedWorktree
+                                                                                )
+                                                                                ( HsProtobuf.encodeMessageField
+                                                                                    (HsProtobuf.FieldNumber 2)
+                                                                                    disposeOrphanResponseRemovedAgentDir
+                                                                                )
+                                                                            )
+                                                                            ( HsProtobuf.encodeMessageField
+                                                                                (HsProtobuf.FieldNumber 3)
+                                                                                ( ( Hs.coerce
+                                                                                      @Hs.Text
+                                                                                      @(HsProtobuf.String Hs.Text)
+                                                                                  )
+                                                                                    disposeOrphanResponseMessage
+                                                                                )
+                                                                            )
+                                                                        )
+                                                                        ( HsProtobuf.encodeMessageField
+                                                                            (HsProtobuf.FieldNumber 4)
+                                                                            ( ( Hs.coerce
+                                                                                  @Hs.Text
+                                                                                  @(HsProtobuf.String Hs.Text)
+                                                                              )
+                                                                                disposeOrphanResponsePrState
+                                                                            )
+                                                                        )
+                                                                    )
+                                                                    ( HsProtobuf.encodeMessageField
+                                                                        (HsProtobuf.FieldNumber 5)
+                                                                        disposeOrphanResponsePrNumber
+                                                                    )
                                                                 )
                                                                 ( HsProtobuf.encodeMessageField
-                                                                    (HsProtobuf.FieldNumber 2)
-                                                                    disposeOrphanResponseRemovedAgentDir
+                                                                    (HsProtobuf.FieldNumber 6)
+                                                                    disposeOrphanResponseVerified
                                                                 )
                                                             )
                                                             ( HsProtobuf.encodeMessageField
-                                                                (HsProtobuf.FieldNumber 3)
-                                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                                    disposeOrphanResponseMessage
-                                                                )
+                                                                (HsProtobuf.FieldNumber 7)
+                                                                disposeOrphanResponseDryRun
                                                             )
                                                         )
                                                         ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 4)
-                                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                                disposeOrphanResponsePrState
+                                                            (HsProtobuf.FieldNumber 8)
+                                                            ( ( Hs.coerce
+                                                                  @(Hs.Vector Hs.Text)
+                                                                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                              )
+                                                                disposeOrphanResponseCleanedAgents
                                                             )
                                                         )
                                                     )
                                                     ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 5)
-                                                        disposeOrphanResponsePrNumber
+                                                        (HsProtobuf.FieldNumber 9)
+                                                        ( ( Hs.coerce
+                                                              @(Hs.Vector Hs.Text)
+                                                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                          )
+                                                            disposeOrphanResponseSkippedAgents
+                                                        )
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 6)
-                                                    disposeOrphanResponseVerified
+                                                    (HsProtobuf.FieldNumber 10)
+                                                    ( ( Hs.coerce
+                                                          @(Hs.Vector Hs.Text)
+                                                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                      )
+                                                        disposeOrphanResponseErrors
+                                                    )
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 7)
-                                                disposeOrphanResponseDryRun
+                                                (HsProtobuf.FieldNumber 11)
+                                                ( ( Hs.coerce
+                                                      @(Hs.Vector Hs.Text)
+                                                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                  )
+                                                    disposeOrphanResponseDiscardedPorcelain
+                                                )
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 8)
+                                            (HsProtobuf.FieldNumber 12)
                                             ( ( Hs.coerce
                                                   @(Hs.Vector Hs.Text)
                                                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                                               )
-                                                disposeOrphanResponseCleanedAgents
+                                                disposeOrphanResponseDiscardedTrackedPaths
                                             )
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 9)
+                                        (HsProtobuf.FieldNumber 13)
                                         ( ( Hs.coerce
                                               @(Hs.Vector Hs.Text)
                                               @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                                           )
-                                            disposeOrphanResponseSkippedAgents
+                                            disposeOrphanResponseDiscardedUntrackedPaths
                                         )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 10)
-                                    ( ( Hs.coerce
-                                          @(Hs.Vector Hs.Text)
-                                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                                      )
-                                        disposeOrphanResponseErrors
-                                    )
+                                    (HsProtobuf.FieldNumber 14)
+                                    disposeOrphanResponseDiscardedChangesTruncated
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 11)
-                                ( ( Hs.coerce
-                                      @(Hs.Vector Hs.Text)
-                                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                                  )
-                                    disposeOrphanResponseDiscardedPorcelain
+                                (HsProtobuf.FieldNumber 15)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    disposeOrphanResponseOperatorReason
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 12)
-                            ( ( Hs.coerce
-                                  @(Hs.Vector Hs.Text)
-                                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                              )
-                                disposeOrphanResponseDiscardedTrackedPaths
-                            )
+                            (HsProtobuf.FieldNumber 16)
+                            disposeOrphanResponsePreservedUniqueCommits
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 13)
-                        ( ( Hs.coerce
-                              @(Hs.Vector Hs.Text)
-                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                          )
-                            disposeOrphanResponseDiscardedUntrackedPaths
+                        (HsProtobuf.FieldNumber 17)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            disposeOrphanResponseVerifiedRemoteName
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 14)
-                    disposeOrphanResponseDiscardedChangesTruncated
+                    (HsProtobuf.FieldNumber 18)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        disposeOrphanResponseVerifiedRemoteRef
+                    )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 15)
+                (HsProtobuf.FieldNumber 19)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    disposeOrphanResponseOperatorReason
+                    disposeOrphanResponseVerifiedRemoteHeadSha
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 16)
-            disposeOrphanResponsePreservedUniqueCommits
+            (HsProtobuf.FieldNumber 20)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                disposeOrphanResponseRemoteDeletionOutcome
+            )
         )
   decodeMessage _ =
     Hs.pure DisposeOrphanResponse
@@ -2266,6 +2312,30 @@ instance (HsProtobuf.Message DisposeOrphanResponse) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 16)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 17)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 18)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 19)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 20)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -2362,6 +2432,30 @@ instance (HsProtobuf.Message DisposeOrphanResponse) where
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "preserved_unique_commits")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 17)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "verified_remote_name")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 18)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "verified_remote_ref")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 19)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "verified_remote_head_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 20)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "remote_deletion_outcome")
+        []
         ""
     ]
 
@@ -2384,6 +2478,10 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
         f14
         f15
         f16
+        f17
+        f18
+        f19
+        f20
       ) =
       HsJSONPB.object
         [ "removed_worktree" .= f1,
@@ -2440,7 +2538,15 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
           "discarded_changes_truncated" .= f14,
           "operator_reason"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15),
-          "preserved_unique_commits" .= f16
+          "preserved_unique_commits" .= f16,
+          "verified_remote_name"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f17),
+          "verified_remote_ref"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f18),
+          "verified_remote_head_sha"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f19),
+          "remote_deletion_outcome"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f20)
         ]
   toEncodingPB
     ( DisposeOrphanResponse
@@ -2460,6 +2566,10 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
         f14
         f15
         f16
+        f17
+        f18
+        f19
+        f20
       ) =
       HsJSONPB.pairs
         [ "removed_worktree" .= f1,
@@ -2516,7 +2626,15 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanResponse) where
           "discarded_changes_truncated" .= f14,
           "operator_reason"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f15),
-          "preserved_unique_commits" .= f16
+          "preserved_unique_commits" .= f16,
+          "verified_remote_name"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f17),
+          "verified_remote_ref"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f18),
+          "verified_remote_head_sha"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f19),
+          "remote_deletion_outcome"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f20)
         ]
 
 instance (HsJSONPB.FromJSONPB DisposeOrphanResponse) where
@@ -2577,6 +2695,18 @@ instance (HsJSONPB.FromJSONPB DisposeOrphanResponse) where
                     (obj .: "operator_reason")
                 )
             <*> obj .: "preserved_unique_commits"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "verified_remote_name")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "verified_remote_ref")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "verified_remote_head_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "remote_deletion_outcome")
+                )
       )
 
 instance (HsJSONPB.ToJSON DisposeOrphanResponse) where

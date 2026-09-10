@@ -39,7 +39,7 @@ data CleanupLeafArgs = CleanupLeafArgs
     claAllowNoPr :: Bool,
     claDiscardDirty :: Bool,
     claPreserveUniqueCommits :: Bool,
-    claDeleteRemoteBranch :: Bool
+    claDeleteRemoteBranch :: Maybe Bool
   }
   deriving (Generic, Show)
 
@@ -53,7 +53,7 @@ instance FromJSON CleanupLeafArgs where
       <*> v .:? "allow_no_pr" .!= False
       <*> v .:? "discard_dirty" .!= False
       <*> v .:? "preserve_unique_commits" .!= False
-      <*> v .:? "delete_remote_branch" .!= False
+      <*> v .:? "delete_remote_branch"
 
 instance ToJSON CleanupLeafArgs where
   toJSON args =
@@ -65,7 +65,7 @@ instance ToJSON CleanupLeafArgs where
         "allow_no_pr" .= claAllowNoPr args,
         "discard_dirty" .= claDiscardDirty args,
         "preserve_unique_commits" .= claPreserveUniqueCommits args,
-        "delete_remote_branch" .= claDeleteRemoteBranch args
+        "delete_remote_branch" .= maybe False id (claDeleteRemoteBranch args)
       ]
 
 cleanupLeafDescription :: Text
@@ -88,7 +88,7 @@ cleanupLeafSchema =
 cleanupLeafCore :: CleanupLeafArgs -> Eff Effects (Either Text Aeson.Value)
 cleanupLeafCore args
   | not (claSweep args) && maybe True (T.null . T.strip) (claName args) = pure $ Left "name is required unless sweep=true"
-  | (claAllowNoPr args || claDiscardDirty args || claPreserveUniqueCommits args || claDeleteRemoteBranch args) && claSweep args = pure $ Left "cleanup overrides require a named target"
+  | (claAllowNoPr args || claDiscardDirty args || claPreserveUniqueCommits args || maybe False id (claDeleteRemoteBranch args)) && claSweep args = pure $ Left "cleanup overrides require a named target"
   | otherwise = do
       let req =
             PA.DisposeOrphanRequest
@@ -100,7 +100,7 @@ cleanupLeafCore args
                 PA.disposeOrphanRequestAllowNoPr = claAllowNoPr args,
                 PA.disposeOrphanRequestDiscardDirty = claDiscardDirty args,
                 PA.disposeOrphanRequestPreserveUniqueCommits = claPreserveUniqueCommits args,
-                PA.disposeOrphanRequestDeleteRemoteBranch = claDeleteRemoteBranch args
+                PA.disposeOrphanRequestDeleteRemoteBranch = maybe False id (claDeleteRemoteBranch args)
               }
       result <- suspendEffect @Agent.AgentDisposeOrphan req
       pure $ case result of
@@ -113,7 +113,7 @@ cleanupLeafOutput args resp =
     [ "success" .= True,
       "agent" .= claName args,
       "dry_run" .= claDryRun args,
-      "delete_remote_branch" .= claDeleteRemoteBranch args,
+      "delete_remote_branch" .= maybe False id (claDeleteRemoteBranch args),
       "operator_reason" .= lazyText (PA.disposeOrphanResponseOperatorReason resp),
       "preserved_unique_commits" .= PA.disposeOrphanResponsePreservedUniqueCommits resp,
       "sweep" .= claSweep args,
@@ -131,7 +131,11 @@ cleanupLeafOutput args resp =
       "discarded_porcelain" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedPorcelain resp)),
       "discarded_tracked_paths" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedTrackedPaths resp)),
       "discarded_untracked_paths" .= map lazyText (V.toList (PA.disposeOrphanResponseDiscardedUntrackedPaths resp)),
-      "discarded_changes_truncated" .= PA.disposeOrphanResponseDiscardedChangesTruncated resp
+      "discarded_changes_truncated" .= PA.disposeOrphanResponseDiscardedChangesTruncated resp,
+      "verified_remote_name" .= lazyText (PA.disposeOrphanResponseVerifiedRemoteName resp),
+      "verified_remote_ref" .= lazyText (PA.disposeOrphanResponseVerifiedRemoteRef resp),
+      "verified_remote_head_sha" .= lazyText (PA.disposeOrphanResponseVerifiedRemoteHeadSha resp),
+      "remote_deletion_outcome" .= lazyText (PA.disposeOrphanResponseRemoteDeletionOutcome resp)
     ]
 
 lazyText :: TL.Text -> Text

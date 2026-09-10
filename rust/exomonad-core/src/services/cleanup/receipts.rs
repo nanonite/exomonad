@@ -17,7 +17,12 @@ impl VerifiedCleanupService {
             .into_iter()
             .filter(|receipt| !receipt.dry_run)
             .flat_map(|receipt| receipt.entries)
-            .filter(|entry| matches!(&entry.status, CleanupReceiptStatus::InProgress))
+            .filter(|entry| {
+                matches!(
+                    &entry.status,
+                    CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Failed
+                )
+            })
             .filter(receipt_snapshot_is_coherent)
             .filter_map(|entry| entry.identity_snapshot)
             .collect())
@@ -49,8 +54,10 @@ impl VerifiedCleanupService {
             .filter(|receipt| {
                 !receipt.dry_run
                     && receipt.entries.iter().any(|entry| {
-                        matches!(&entry.status, CleanupReceiptStatus::InProgress)
-                            && receipt_entry_matches(entry, plan, target)
+                        matches!(
+                            &entry.status,
+                            CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Failed
+                        ) && receipt_entry_matches(entry, plan, target)
                     })
             })
             .collect::<Vec<_>>();
@@ -96,8 +103,10 @@ impl VerifiedCleanupService {
 
     async fn reconcile_deregistered_entries(&self, receipt: &mut CleanupReceipt) -> Result<()> {
         for entry in &mut receipt.entries {
-            if !matches!(&entry.status, CleanupReceiptStatus::InProgress)
-                || !has_deregister_intent(entry)
+            if !matches!(
+                &entry.status,
+                CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Failed
+            ) || !has_deregister_intent(entry)
             {
                 continue;
             }
@@ -213,7 +222,9 @@ fn resume_receipt(plan: &CleanupPlan, previous: CleanupReceipt) -> CleanupReceip
                     receipt_entry_matches_candidate(entry, candidate)
                         && matches!(
                             &entry.status,
-                            CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Cleaned
+                            CleanupReceiptStatus::InProgress
+                                | CleanupReceiptStatus::Failed
+                                | CleanupReceiptStatus::Cleaned
                         )
                 })
                 .map(|(index, entry)| {
@@ -243,7 +254,9 @@ fn resume_receipt(plan: &CleanupPlan, previous: CleanupReceipt) -> CleanupReceip
                 (!matched.contains(&index)
                     && matches!(
                         &entry.status,
-                        CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Cleaned
+                        CleanupReceiptStatus::InProgress
+                            | CleanupReceiptStatus::Failed
+                            | CleanupReceiptStatus::Cleaned
                     ))
                 .then_some(entry)
             }),

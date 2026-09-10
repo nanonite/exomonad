@@ -146,6 +146,15 @@ def test_cleanup_remote_branch_deletion_defaults_to_false() -> None:
     ]
 
 
+def test_cleanup_remote_branch_flag_is_optional_in_mcp_schemas() -> None:
+    schemas = _load_schemas()
+
+    for tool_name in ("cleanup_orphan", "cleanup_leaf"):
+        required = schemas[tool_name].get("required", [])
+        assert isinstance(required, list)
+        assert "delete_remote_branch" not in required
+
+
 def test_effect_result_decodes_the_server_envelope() -> None:
     """Effects expose a typed envelope while leaving tool-specific results opaque."""
     transport = RecordingTransport()

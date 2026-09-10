@@ -208,6 +208,14 @@ message DisposeOrphanResponse {
   string operator_reason = 15;
   // True when the local branch was intentionally preserved for unique commits.
   bool preserved_unique_commits = 16;
+  // Configured remote used for the verified cleanup branch action.
+  string verified_remote_name = 17;
+  // Fully qualified remote branch ref observed by verified cleanup.
+  string verified_remote_ref = 18;
+  // Exact remote head SHA used as the deletion lease expectation.
+  string verified_remote_head_sha = 19;
+  // Remote action outcome, such as not_requested, would_delete, or deleted.
+  string remote_deletion_outcome = 20;
 }
 
 // ============================================================================

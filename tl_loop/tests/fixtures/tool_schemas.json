@@ -1236,8 +1236,7 @@
           "dry_run",
           "allow_no_pr",
           "discard_dirty",
-          "preserve_unique_commits",
-          "delete_remote_branch"
+          "preserve_unique_commits"
         ],
         "type": "object"
       },
@@ -1285,8 +1284,7 @@
           "sweep",
           "allow_no_pr",
           "discard_dirty",
-          "preserve_unique_commits",
-          "delete_remote_branch"
+          "preserve_unique_commits"
         ],
         "type": "object"
       },

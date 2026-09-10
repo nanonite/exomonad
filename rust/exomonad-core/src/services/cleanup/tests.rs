@@ -1306,6 +1306,250 @@ async fn dirty_no_pr_cleanup_recovers_after_receipt_failure() {
 }
 
 #[tokio::test]
+async fn remote_deletion_revalidates_worktree_at_mutation_boundary() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let candidate = &plan.candidates[0];
+    assert_eq!(candidate.decision, CleanupDecision::Cleanable);
+    let mut receipt = in_progress_receipt(&plan, 1);
+
+    tokio::fs::write(
+        fixture.worktree.join("late-change.txt"),
+        "changed after planning",
+    )
+    .await
+    .unwrap();
+    let entry = service
+        .execute_remote_branch_action(candidate, &mut receipt, 0)
+        .await
+        .expect("late worktree mutation must refuse remote deletion");
+
+    assert_eq!(entry.status, CleanupReceiptStatus::Refused);
+    assert!(entry
+        .reason
+        .as_deref()
+        .is_some_and(|reason| { reason.contains("dirty worktree changed since planning") }));
+    assert!(remote_branch_state(
+        fixture.services.project_dir.as_path(),
+        "origin",
+        "main.stale"
+    )
+    .await
+    .unwrap()
+    .is_some());
+}
+
+#[tokio::test]
+async fn remote_deletion_revalidates_liveness_at_mutation_boundary() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let candidate = &plan.candidates[0];
+    let mut receipt = in_progress_receipt(&plan, 1);
+    start_invocation(
+        &fixture.agent_dir,
+        AgentType::Codex,
+        InvocationTrigger::Spawn,
+        RoutingInfo::window(WindowId::parse("@999999999").unwrap()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let entry = service
+        .execute_remote_branch_action(candidate, &mut receipt, 0)
+        .await
+        .expect("late liveness change must refuse remote deletion");
+
+    assert_eq!(entry.status, CleanupReceiptStatus::Refused);
+    assert!(entry
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("no longer provably dead")));
+    assert!(remote_branch_state(
+        fixture.services.project_dir.as_path(),
+        "origin",
+        "main.stale"
+    )
+    .await
+    .unwrap()
+    .is_some());
+}
+
+#[tokio::test]
+async fn service_remote_deletion_refuses_a_head_race_at_the_exact_lease() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let candidate = &plan.candidates[0];
+    let mut receipt = in_progress_receipt(&plan, 1);
+    let remote_repo = fixture._temp.path().join("owner/repo.git");
+    let hook = fixture.services.project_dir.join(".git/hooks/pre-push");
+    let hook_contents = format!(
+        "#!/bin/sh\ngit --git-dir='{}' update-ref refs/heads/main.stale refs/heads/main\nexit 0\n",
+        remote_repo.display()
+    );
+    tokio::fs::write(&hook, hook_contents).await.unwrap();
+    tokio::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+        .await
+        .unwrap();
+
+    let entry = service
+        .execute_remote_branch_action(candidate, &mut receipt, 0)
+        .await
+        .expect("remote head movement must refuse the exact lease");
+
+    assert_eq!(entry.status, CleanupReceiptStatus::Refused);
+    assert!(entry
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("expected head")));
+    let moved_head = local_branch_state(fixture.services.project_dir.as_path(), "main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        remote_branch_state(
+            fixture.services.project_dir.as_path(),
+            "origin",
+            "main.stale"
+        )
+        .await
+        .unwrap(),
+        Some(moved_head)
+    );
+}
+
+#[tokio::test]
+async fn remote_success_resumes_from_a_failed_downstream_receipt() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+
+    service.fail_receipt_persist_on_call(6);
+    assert!(service.run(&request).await.is_err());
+    service.fail_receipt_persist_on_call(0);
+    assert!(remote_branch_state(
+        fixture.services.project_dir.as_path(),
+        "origin",
+        "main.stale"
+    )
+    .await
+    .unwrap()
+    .is_none());
+
+    let plan = service.plan(&request).await.unwrap();
+    let mut failed = service
+        .resume_or_create_receipt(&plan, request.target.as_deref(), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        failed.entries[0].branch.as_ref().unwrap().remote.status,
+        CleanupBranchActionStatus::Deleted
+    );
+    failed.entries[0].status = CleanupReceiptStatus::Failed;
+    failed.entries[0].reason = Some("downstream cleanup failed after remote deletion".to_string());
+    service.persist_receipt(&failed).await.unwrap();
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"delete_remote_branch".to_string()));
+    assert!(!fixture.worktree.exists());
+    assert!(!fixture.agent_dir.exists());
+    assert!(fixture
+        .services
+        .agent_resolver
+        .get(&fixture.record.agent_name)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn recreated_remote_branch_invalidates_prior_deletion_proof() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+
+    service.fail_receipt_persist_on_call(6);
+    assert!(service.run(&request).await.is_err());
+    service.fail_receipt_persist_on_call(0);
+    let plan = service.plan(&request).await.unwrap();
+    let mut failed = service
+        .resume_or_create_receipt(&plan, request.target.as_deref(), 1)
+        .await
+        .unwrap();
+    failed.entries[0].status = CleanupReceiptStatus::Failed;
+    failed.entries[0].reason = Some("downstream cleanup failed after remote deletion".to_string());
+    service.persist_receipt(&failed).await.unwrap();
+    run_git(
+        fixture.services.project_dir.as_path(),
+        &["push", "-q", "origin", "main.stale"],
+    );
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Refused);
+    assert!(receipt.entries[0].reason.as_deref().is_some_and(|reason| {
+        reason.contains("recreated or moved") || reason.contains("remote branch")
+    }));
+    assert!(fixture.agent_dir.exists());
+    assert!(remote_branch_state(
+        fixture.services.project_dir.as_path(),
+        "origin",
+        "main.stale"
+    )
+    .await
+    .unwrap()
+    .is_some());
+}
+
+#[tokio::test]
 async fn no_pr_remote_cleanup_uses_verified_remote_head_and_preserves_unique_commits() {
     let fixture = real_cleanup_fixture().await;
     let service = fixture.services.cleanup_service();

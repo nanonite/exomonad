@@ -2,6 +2,7 @@ use super::service::VerifiedCleanupService;
 use super::support::*;
 use super::types::*;
 use crate::services::agent_resolver::AgentIdentityRecord;
+use anyhow::{bail, Context};
 use tokio::fs;
 
 impl VerifiedCleanupService {
@@ -60,6 +61,45 @@ impl VerifiedCleanupService {
         };
         serde_json::from_str(&contents)
             .map_err(|_| refused(candidate, "identity changed or is malformed"))
+    }
+
+    pub(super) async fn revalidate_liveness_and_worktree(
+        &self,
+        candidate: &CleanupCandidate,
+    ) -> anyhow::Result<()> {
+        let expected = candidate
+            .identity
+            .as_ref()
+            .context("managed identity is unavailable")?;
+        let current = match self.load_current_identity(candidate).await {
+            Ok(identity) => identity,
+            Err(entry) => bail!(
+                "{}",
+                entry
+                    .reason
+                    .unwrap_or_else(|| "managed identity could not be revalidated".to_string())
+            ),
+        };
+        if let Some(entry) = self
+            .validate_identity_and_liveness(candidate, expected, &current)
+            .await
+        {
+            bail!(
+                "{}",
+                entry
+                    .reason
+                    .unwrap_or_else(|| "agent liveness could not be revalidated".to_string())
+            );
+        }
+        if let Some(entry) = self.validate_worktree(candidate, expected).await {
+            bail!(
+                "{}",
+                entry
+                    .reason
+                    .unwrap_or_else(|| "worktree could not be revalidated".to_string())
+            );
+        }
+        Ok(())
     }
 
     async fn validate_identity_and_liveness(

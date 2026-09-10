@@ -46,11 +46,12 @@ use tokio::{fs, process::Command};
 use tracing::{info, warn};
 
 use crate::services::{
-    capture_memory, CleanupReceipt, CleanupReceiptEntry, CleanupReceiptStatus,
-    CleanupRequest as VerifiedCleanupRequest, HasAgentResolver, HasClaudeSessionRegistry,
-    HasCleanupService, HasEventLog, HasForgejoClient, HasForgejoReviewerClient, HasGitHubClient,
-    HasGitWorktreeService, HasInboxStore, HasProjectDir, HasSessionMemory, HasSupervisorRegistry,
-    HasTeamRegistry, HasWatcherRuntimeState, MemoryCapture, MemoryKind,
+    capture_memory, CleanupBranchActionStatus, CleanupReceipt, CleanupReceiptEntry,
+    CleanupReceiptStatus, CleanupRequest as VerifiedCleanupRequest, HasAgentResolver,
+    HasClaudeSessionRegistry, HasCleanupService, HasEventLog, HasForgejoClient,
+    HasForgejoReviewerClient, HasGitHubClient, HasGitWorktreeService, HasInboxStore, HasProjectDir,
+    HasSessionMemory, HasSupervisorRegistry, HasTeamRegistry, HasWatcherRuntimeState,
+    MemoryCapture, MemoryKind,
 };
 
 /// Agent effect handler.
@@ -623,6 +624,12 @@ fn cleanup_receipt_response(receipt: &CleanupReceipt) -> DisposeOrphanResponse {
         }
         append_cleanup_entry(&mut response, entry, receipt.dry_run);
     }
+    let (remote_name, remote_ref, remote_head_sha, remote_outcome) =
+        cleanup_remote_details(receipt);
+    response.verified_remote_name = remote_name;
+    response.verified_remote_ref = remote_ref;
+    response.verified_remote_head_sha = remote_head_sha;
+    response.remote_deletion_outcome = remote_outcome;
     response.verified = response.errors.is_empty();
     response.message = format!(
         "Verified cleanup complete: cleaned={}, skipped={}, dry_run={}",
@@ -651,6 +658,67 @@ fn empty_cleanup_response(dry_run: bool) -> DisposeOrphanResponse {
         discarded_changes_truncated: false,
         operator_reason: String::new(),
         preserved_unique_commits: false,
+        verified_remote_name: String::new(),
+        verified_remote_ref: String::new(),
+        verified_remote_head_sha: String::new(),
+        remote_deletion_outcome: String::new(),
+    }
+}
+
+fn cleanup_remote_details(receipt: &CleanupReceipt) -> (String, String, String, String) {
+    let mut details = None;
+    for entry in &receipt.entries {
+        let Some(branch) = entry.branch.as_ref() else {
+            continue;
+        };
+        let Some(remote_name) = branch
+            .remote_name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let remote_ref = branch
+            .remote_branch
+            .as_deref()
+            .or(branch.branch.as_deref())
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("refs/heads/{value}"))
+            .unwrap_or_default();
+        let remote_head_sha = branch.remote_head_sha.clone().unwrap_or_default();
+        let outcome = cleanup_remote_outcome(&branch.remote.status).to_string();
+        if let Some((_, _, _, previous_outcome)) = &mut details {
+            if previous_outcome != &outcome {
+                *previous_outcome = "mixed".to_string();
+            }
+        } else {
+            details = Some((
+                remote_name.to_string(),
+                remote_ref,
+                remote_head_sha,
+                outcome,
+            ));
+        }
+    }
+    details.unwrap_or_else(|| {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            "unknown".to_string(),
+        )
+    })
+}
+
+fn cleanup_remote_outcome(status: &CleanupBranchActionStatus) -> &'static str {
+    match status {
+        CleanupBranchActionStatus::NotRequested => "not_requested",
+        CleanupBranchActionStatus::WouldDelete => "would_delete",
+        CleanupBranchActionStatus::DeletePending => "delete_pending",
+        CleanupBranchActionStatus::Deleted => "deleted",
+        CleanupBranchActionStatus::AlreadyAbsent => "already_absent",
+        CleanupBranchActionStatus::Skipped => "skipped",
+        CleanupBranchActionStatus::Refused => "refused",
     }
 }
 
@@ -4702,6 +4770,55 @@ mod tests {
         assert!(response.dry_run);
         assert_eq!(response.operator_reason, "operator confirmed abandonment");
         assert!(response.preserved_unique_commits);
+    }
+
+    #[test]
+    fn cleanup_response_reports_verified_remote_evidence_and_outcome() {
+        let receipt = CleanupReceipt {
+            schema_version: 1,
+            operation_id: "operation".to_string(),
+            plan_id: "plan".to_string(),
+            started_at: 1,
+            finished_at: 2,
+            dry_run: false,
+            operator_reason: None,
+            preserve_unique_commits: false,
+            entries: vec![CleanupReceiptEntry {
+                candidate_id: "candidate".to_string(),
+                agent_name: "leaf-codex".to_string(),
+                agent_slug: "feature-codex".to_string(),
+                identity_snapshot: None,
+                pull_request: None,
+                branch: Some(crate::services::CleanupBranchEvidence {
+                    branch: Some("main.feature-codex".to_string()),
+                    local_head_sha: Some("local-sha".to_string()),
+                    remote_name: Some("origin".to_string()),
+                    remote_branch: Some("main.feature-codex".to_string()),
+                    remote_head_sha: Some("remote-sha".to_string()),
+                    target_branch: Some("main".to_string()),
+                    target_head_sha: Some("target-sha".to_string()),
+                    merge_commit_reachable: None,
+                    local: crate::services::CleanupBranchAction::default(),
+                    remote: crate::services::CleanupBranchAction {
+                        status: CleanupBranchActionStatus::Deleted,
+                        reason: None,
+                    },
+                }),
+                status: CleanupReceiptStatus::Cleaned,
+                actions: vec!["delete_remote_branch".to_string()],
+                reason: None,
+                dirty_evidence: None,
+            }],
+        };
+
+        let response = cleanup_receipt_response(&receipt);
+        assert_eq!(response.verified_remote_name, "origin");
+        assert_eq!(
+            response.verified_remote_ref,
+            "refs/heads/main.feature-codex"
+        );
+        assert_eq!(response.verified_remote_head_sha, "remote-sha");
+        assert_eq!(response.remote_deletion_outcome, "deleted");
     }
 
     fn restart_test_pr() -> ForgejoPullRequest {
