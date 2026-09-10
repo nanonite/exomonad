@@ -10,6 +10,8 @@ use std::io::Write;
 use std::sync::atomic::Ordering;
 use tokio::fs;
 
+const RESUMED_CLEANUP_ACTION: &str = "resumed_cleanup";
+
 impl VerifiedCleanupService {
     pub(super) async fn in_progress_identity_snapshots(&self) -> Result<Vec<AgentIdentityRecord>> {
         let receipts = self.read_receipts().await?;
@@ -248,7 +250,13 @@ fn resume_receipt(plan: &CleanupPlan, previous: CleanupReceipt) -> CleanupReceip
                     matched.insert(index);
                     entry
                 });
-            previous_entry.cloned().unwrap_or_else(|| {
+            let was_resumed = previous_entry.is_some_and(|entry| {
+                matches!(
+                    &entry.status,
+                    CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Failed
+                )
+            });
+            let mut entry = previous_entry.cloned().unwrap_or_else(|| {
                 let status = if candidate.decision.is_cleanable() {
                     CleanupReceiptStatus::InProgress
                 } else {
@@ -260,7 +268,16 @@ fn resume_receipt(plan: &CleanupPlan, previous: CleanupReceipt) -> CleanupReceip
                     Vec::new(),
                     candidate.decision.reason().map(ToOwned::to_owned),
                 )
-            })
+            });
+            if was_resumed
+                && !entry
+                    .actions
+                    .iter()
+                    .any(|action| action == RESUMED_CLEANUP_ACTION)
+            {
+                entry.actions.push(RESUMED_CLEANUP_ACTION.to_string());
+            }
+            entry
         })
         .collect::<Vec<_>>();
     entries.extend(

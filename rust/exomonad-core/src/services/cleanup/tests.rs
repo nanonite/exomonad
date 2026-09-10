@@ -172,6 +172,45 @@ fn cleanup_overrides_require_named_apply_for_dirty_discard() {
     assert!(request.validate().is_ok());
 }
 
+#[tokio::test]
+async fn dry_run_refuses_remote_deletion_without_branch_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        Arc::new(AgentResolver::load(temp.path().to_path_buf()).await),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        None,
+    );
+    let request = CleanupRequest {
+        target: Some(record.agent_name.to_string()),
+        sweep: false,
+        delete_remote_branch: true,
+        ..CleanupRequest::default()
+    };
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Refused);
+    assert_eq!(
+        receipt.entries[0].reason.as_deref(),
+        Some("remote deletion requested but verified branch evidence is unavailable")
+    );
+    assert!(agent_dir.exists());
+}
+
 #[test]
 fn no_pr_override_only_bypasses_missing_pr_observation() {
     let identity = identity(Topology::WorktreePerAgent);
@@ -1950,6 +1989,89 @@ async fn remote_success_resumes_from_a_failed_downstream_receipt() {
         .get(&fixture.record.agent_name)
         .await
         .is_none());
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"resumed_cleanup".to_string()));
+}
+
+#[tokio::test]
+async fn retry_preserve_unique_commits_normalizes_historical_local_deletion() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let initial_request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        preserve_unique_commits: false,
+        ..CleanupRequest::default()
+    };
+    let initial_plan = service.plan(&initial_request).await.unwrap();
+    assert_eq!(
+        initial_plan.candidates[0]
+            .branch
+            .as_ref()
+            .unwrap()
+            .local
+            .status,
+        CleanupBranchActionStatus::WouldDelete
+    );
+    let mut failed = in_progress_receipt(&initial_plan, 1);
+    failed.operation_id = "preserve-retry".to_string();
+    failed.entries[0].status = CleanupReceiptStatus::Failed;
+    failed.entries[0].reason = Some("simulated cleanup interruption".to_string());
+    service.persist_receipt(&failed).await.unwrap();
+
+    let retry_request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        preserve_unique_commits: true,
+        ..CleanupRequest::default()
+    };
+    let retry_plan = service.plan(&retry_request).await.unwrap();
+    assert_eq!(
+        retry_plan.candidates[0]
+            .branch
+            .as_ref()
+            .unwrap()
+            .local
+            .status,
+        CleanupBranchActionStatus::Skipped
+    );
+    let receipt = service.run(&retry_request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"resumed_cleanup".to_string()));
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"preserve_unique_commits".to_string()));
+    let persisted: CleanupReceipt = serde_json::from_slice(
+        &tokio::fs::read(
+            service
+                .receipt_dir()
+                .join(format!("{}.json", receipt.operation_id)),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(persisted.entries[0]
+        .actions
+        .contains(&"resumed_cleanup".to_string()));
+    assert!(!receipt.entries[0]
+        .actions
+        .contains(&"delete_local_branch".to_string()));
+    assert!(
+        local_branch_state(fixture.services.project_dir.as_path(), "main.stale")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]

@@ -159,7 +159,7 @@ fn decision_for(
     observations: DecisionObservations<'_>,
     context: InspectionContext<'_>,
 ) -> CleanupDecision {
-    candidate_decision_for_recovery(
+    let decision = candidate_decision_for_recovery(
         DecisionContext {
             identity: observations.observed.identity.as_ref(),
             identity_error: observations.local.identity_error.as_deref(),
@@ -182,7 +182,19 @@ fn decision_for(
             discard_dirty: context.discard_dirty,
         },
         observations.observed.recovered_provenance.is_some(),
-    )
+    );
+    let branch_evidence_available = observations.local.local_branch.is_some()
+        || observations
+            .pull_request
+            .request
+            .as_ref()
+            .is_some_and(|pull_request| !pull_request.head_ref.is_empty());
+    if context.delete_remote_branch && decision.is_cleanable() && !branch_evidence_available {
+        return CleanupDecision::refusal(
+            "remote deletion requested but verified branch evidence is unavailable",
+        );
+    }
+    decision
 }
 
 fn branch_evidence(

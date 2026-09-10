@@ -283,6 +283,11 @@ when recovery is planned and immediately before mutation; a matching window or
 an unavailable session keeps the candidate from being cleaned. Recovered
 cleanup records every evidence source in its plan and durable receipt and uses
 the same liveness, branch, and exact-lease checks as ordinary cleanup.
+Remote deletion without complete verified branch evidence is an explicit
+refusal in both dry-run and apply receipts. Resumed receipts retain a
+`resumed_cleanup` audit action, and retry options re-normalize local branch
+actions so a later `preserve_unique_commits` request cannot delete the last
+local ref.
 
 Inbox and exact-pane tmux delivery are guidance channels. Injection success,
 process exit, and local push events do not advance watcher state; publication,

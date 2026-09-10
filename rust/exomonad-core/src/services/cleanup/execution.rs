@@ -33,6 +33,7 @@ impl VerifiedCleanupService {
             in_progress.identity_snapshot =
                 historical_identity.or_else(|| candidate.identity.clone());
             in_progress.branch = historical_branch.or_else(|| candidate.branch.clone());
+            normalize_local_opt_in(&mut in_progress, candidate);
             normalize_remote_opt_in(&mut in_progress, candidate);
             receipt.entries[index] = in_progress;
             self.persist_receipt(receipt).await?;
@@ -110,5 +111,31 @@ fn normalize_remote_opt_in(entry: &mut CleanupReceiptEntry, candidate: &CleanupC
     ) {
         branch.remote.status = CleanupBranchActionStatus::Skipped;
         branch.remote.reason = Some("remote deletion requires explicit opt-in".to_string());
+    }
+}
+
+fn normalize_local_opt_in(entry: &mut CleanupReceiptEntry, candidate: &CleanupCandidate) {
+    let Some(branch) = entry.branch.as_mut() else {
+        return;
+    };
+    if candidate.preserve_unique_commits {
+        if matches!(
+            branch.local.status,
+            CleanupBranchActionStatus::WouldDelete | CleanupBranchActionStatus::DeletePending
+        ) {
+            branch.local = candidate.branch.as_ref().map_or_else(
+                || CleanupBranchAction {
+                    status: CleanupBranchActionStatus::Skipped,
+                    reason: Some(
+                        "unique commits preserved by explicit operator request".to_string(),
+                    ),
+                },
+                |planned| planned.local.clone(),
+            );
+        }
+    } else if matches!(branch.local.status, CleanupBranchActionStatus::Skipped) {
+        if let Some(planned) = candidate.branch.as_ref() {
+            branch.local = planned.local.clone();
+        }
     }
 }

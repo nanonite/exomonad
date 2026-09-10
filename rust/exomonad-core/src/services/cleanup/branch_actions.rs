@@ -33,7 +33,13 @@ impl VerifiedCleanupService {
             };
         }
         if !remote_action_requested(candidate, receipt, index) {
-            return None;
+            return Some(self.refuse_branch(
+                candidate,
+                receipt,
+                index,
+                false,
+                "remote deletion requested but verified remote branch evidence is unavailable",
+            ));
         }
         let expected = match remote_expected_sha(candidate) {
             Ok(expected) => expected,
@@ -329,7 +335,81 @@ fn local_action_requested(receipt: &CleanupReceipt, index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::agent_resolver::AgentResolver;
+    use crate::services::git_worktree::GitWorktreeService;
+    use crate::services::mutex_registry::MutexRegistry;
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn requested_remote_deletion_without_branch_evidence_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = VerifiedCleanupService::new(
+            temp.path(),
+            Arc::new(AgentResolver::load(temp.path().to_path_buf()).await),
+            Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+            None,
+            Arc::new(MutexRegistry::new()),
+            None,
+        );
+        let candidate = CleanupCandidate {
+            id: "missing-remote-evidence".to_string(),
+            managed: true,
+            resolver_only: false,
+            recovery_receipt: false,
+            recovered_provenance: None,
+            agent_name: "missing-remote-evidence".to_string(),
+            issue: None,
+            agent_dir: temp.path().join(".exo/agents/missing-remote-evidence"),
+            worktree_path: Some(temp.path().join(".exo/worktrees/missing-remote-evidence")),
+            local_branch: None,
+            local_head_sha: None,
+            remote_branch: None,
+            remote_head_sha: None,
+            pull_request: None,
+            liveness: CleanupLiveness::Dead,
+            dirty: Some(false),
+            dirty_evidence: None,
+            protected: false,
+            identity_drift: false,
+            identity_error: None,
+            head_matches_pull_request: None,
+            remote_head_matches_pull_request: None,
+            identity: None,
+            branch: None,
+            delete_remote_branch: true,
+            allow_no_pr: true,
+            discard_dirty: false,
+            preserve_unique_commits: false,
+            decision: CleanupDecision::Cleanable,
+        };
+        let mut receipt = CleanupReceipt {
+            schema_version: CLEANUP_RECEIPT_SCHEMA_VERSION,
+            operation_id: "missing-remote-evidence".to_string(),
+            plan_id: "missing-remote-evidence".to_string(),
+            started_at: 0,
+            finished_at: 0,
+            dry_run: false,
+            operator_reason: None,
+            preserve_unique_commits: false,
+            entries: vec![receipt_entry(
+                &candidate,
+                CleanupReceiptStatus::InProgress,
+                Vec::new(),
+                None,
+            )],
+        };
+
+        let entry = service
+            .execute_remote_branch_action(&candidate, &mut receipt, 0)
+            .await
+            .expect("requested remote deletion must return a refusal");
+        assert_eq!(entry.status, CleanupReceiptStatus::Refused);
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some("remote deletion requested but verified remote branch evidence is unavailable")
+        );
+    }
 
     #[test]
     fn recovered_provenance_uses_the_authoritative_pull_request_head() {

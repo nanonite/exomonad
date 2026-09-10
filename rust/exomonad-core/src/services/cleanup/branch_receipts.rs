@@ -138,15 +138,17 @@ impl VerifiedCleanupService {
         local: bool,
         reason: impl Into<String>,
     ) -> CleanupReceiptEntry {
+        let refusal_reason = reason.into();
         if let Some(branch) = receipt.entries[index].branch.as_mut() {
             let action = branch_action_mut(branch, local);
             action.status = CleanupBranchActionStatus::Refused;
-            action.reason = Some(reason.into());
+            action.reason = Some(refusal_reason.clone());
         }
         let branch = receipt.entries[index].branch.clone();
         let reason = branch
             .as_ref()
-            .and_then(|evidence| branch_action(evidence, local).reason.clone());
+            .and_then(|evidence| branch_action(evidence, local).reason.clone())
+            .or(Some(refusal_reason));
         let mut entry = receipt_entry(
             candidate,
             CleanupReceiptStatus::Refused,
