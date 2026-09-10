@@ -32,6 +32,9 @@ pub struct CleanupRequest {
     /// Explicitly authorize disposal of an observed dirty worktree.
     #[serde(default)]
     pub discard_dirty: bool,
+    /// Keep the managed local branch reachable so unique abandoned commits are preserved.
+    #[serde(default)]
+    pub preserve_unique_commits: bool,
 }
 
 const fn default_sweep() -> bool {
@@ -48,6 +51,7 @@ impl Default for CleanupRequest {
             reason: None,
             allow_no_pr: false,
             discard_dirty: false,
+            preserve_unique_commits: false,
         }
     }
 }
@@ -62,6 +66,7 @@ impl CleanupRequest {
             reason: None,
             allow_no_pr: false,
             discard_dirty: false,
+            preserve_unique_commits: false,
         }
     }
 
@@ -259,6 +264,9 @@ pub struct CleanupCandidate {
     pub allow_no_pr: bool,
     #[serde(default)]
     pub discard_dirty: bool,
+    /// Keep the local branch reachable when cleanup would otherwise delete it.
+    #[serde(default)]
+    pub preserve_unique_commits: bool,
     pub decision: CleanupDecision,
 }
 
@@ -272,6 +280,9 @@ pub struct CleanupPlan {
     pub repository_error: Option<String>,
     #[serde(default)]
     pub operator_reason: Option<String>,
+    /// Whether the cleanup was requested to preserve unique local commits.
+    #[serde(default)]
+    pub preserve_unique_commits: bool,
     pub candidates: Vec<CleanupCandidate>,
     #[serde(default)]
     pub fetched_target: Option<CleanupTargetBranch>,
@@ -326,5 +337,8 @@ pub struct CleanupReceipt {
     pub dry_run: bool,
     #[serde(default)]
     pub operator_reason: Option<String>,
+    /// Whether unique local commits were explicitly preserved for this operation.
+    #[serde(default)]
+    pub preserve_unique_commits: bool,
     pub entries: Vec<CleanupReceiptEntry>,
 }

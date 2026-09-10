@@ -145,12 +145,20 @@ fn worktree_exists(candidate: &CleanupCandidate) -> bool {
 }
 
 fn remote_expected_sha(candidate: &CleanupCandidate) -> Result<&str> {
-    candidate
+    let pull_request_head = candidate
         .pull_request
         .as_ref()
         .and_then(|pull_request| pull_request.head_sha.as_deref())
-        .filter(|sha| !sha.is_empty())
-        .context("remote deletion requires an authoritative pull-request head SHA")
+        .filter(|sha| !sha.is_empty());
+    let no_pr_remote_head = (candidate.allow_no_pr && candidate.pull_request.is_none())
+        .then_some(candidate.remote_head_sha.as_deref())
+        .flatten()
+        .filter(|sha| !sha.is_empty());
+    pull_request_head
+        .or(no_pr_remote_head)
+        .context(
+            "remote deletion requires an authoritative pull-request head SHA or verified no-PR remote head",
+        )
 }
 
 fn remote_action_requested(

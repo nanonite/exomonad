@@ -124,6 +124,9 @@ dirty targets without the separate discard confirmation, are reported and
 left in place. This tool
 shares the existing resource-disposal implementation with `cleanup_orphan`;
 it does not force cleanup, close PRs, or replace the automatic reconciler.
+Without the explicit `preserve_unique_commits=true` option, abandoned
+unreferenced commits may later be garbage-collected; preserving them keeps the
+local branch reachable and does not preserve remote history.
 
 ## Chainlink Coordination
 

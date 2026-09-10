@@ -62,6 +62,15 @@ impl VerifiedCleanupService {
         Ok(receipts.pop())
     }
 
+    pub(super) async fn target_was_cleaned(&self, target: &str) -> Result<bool> {
+        Ok(self.read_receipts().await?.iter().any(|receipt| {
+            receipt.entries.iter().any(|entry| {
+                matches!(entry.status, CleanupReceiptStatus::Cleaned)
+                    && (entry.agent_name == target || entry.agent_slug == target)
+            })
+        }))
+    }
+
     async fn read_receipts(&self) -> Result<Vec<CleanupReceipt>> {
         let mut directory = match fs::read_dir(self.receipt_dir()).await {
             Ok(directory) => directory,
@@ -247,6 +256,7 @@ fn resume_receipt(plan: &CleanupPlan, previous: CleanupReceipt) -> CleanupReceip
         finished_at: 0,
         dry_run: false,
         operator_reason: plan.operator_reason.clone().or(previous_reason),
+        preserve_unique_commits: plan.preserve_unique_commits,
         entries,
     }
 }

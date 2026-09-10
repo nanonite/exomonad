@@ -21,6 +21,9 @@ impl VerifiedCleanupService {
         if candidate.discard_dirty && candidate.dirty == Some(true) {
             authorization_actions.push("record_dirty_evidence".to_string());
         }
+        if candidate.preserve_unique_commits {
+            authorization_actions.push("preserve_unique_commits".to_string());
+        }
         authorization_actions.sort();
         authorization_actions.dedup();
         if let Some(entry) = self
@@ -401,6 +404,7 @@ mod tests {
             delete_remote_branch: false,
             allow_no_pr: false,
             discard_dirty: false,
+            preserve_unique_commits: false,
             decision: CleanupDecision::Cleanable,
         }
     }
@@ -422,6 +426,7 @@ mod tests {
             finished_at: 0,
             dry_run: false,
             operator_reason: None,
+            preserve_unique_commits: false,
             entries: vec![receipt_entry(
                 &candidate,
                 CleanupReceiptStatus::InProgress,

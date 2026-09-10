@@ -134,6 +134,7 @@ impl VerifiedCleanupService {
                 delete_remote_branch: request.delete_remote_branch,
                 allow_no_pr: request.allow_no_pr,
                 discard_dirty: request.discard_dirty,
+                preserve_unique_commits: request.preserve_unique_commits,
             };
             candidates.push(self.inspect_candidate(resource, context).await);
         }
@@ -146,6 +147,7 @@ impl VerifiedCleanupService {
             repository,
             repository_error,
             operator_reason: request.reason.clone(),
+            preserve_unique_commits: request.preserve_unique_commits,
             candidates,
             fetched_target,
         })

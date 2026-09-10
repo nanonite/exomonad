@@ -674,6 +674,7 @@ class EffectClient:
         dry_run: bool,
         allow_no_pr: bool = False,
         discard_dirty: bool = False,
+        preserve_unique_commits: bool = False,
         reason: str | None = None,
     ) -> ToolResult:
         return self._call(
@@ -683,6 +684,7 @@ class EffectClient:
                 "dry_run": dry_run,
                 "allow_no_pr": allow_no_pr,
                 "discard_dirty": discard_dirty,
+                "preserve_unique_commits": preserve_unique_commits,
                 **({"reason": reason} if reason is not None else {}),
             },
         )
@@ -695,6 +697,7 @@ class EffectClient:
         name: str | None = None,
         allow_no_pr: bool = False,
         discard_dirty: bool = False,
+        preserve_unique_commits: bool = False,
         reason: str | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {
@@ -702,6 +705,7 @@ class EffectClient:
             "sweep": sweep,
             "allow_no_pr": allow_no_pr,
             "discard_dirty": discard_dirty,
+            "preserve_unique_commits": preserve_unique_commits,
         }
         _put(arguments, "name", name)
         _put(arguments, "reason", reason);

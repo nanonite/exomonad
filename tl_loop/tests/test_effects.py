@@ -68,6 +68,7 @@ def test_cleanup_overrides_are_forwarded() -> None:
         dry_run=False,
         allow_no_pr=True,
         discard_dirty=True,
+        preserve_unique_commits=True,
         reason="abandoned test target",
     )
     client.cleanup_leaf(
@@ -76,6 +77,7 @@ def test_cleanup_overrides_are_forwarded() -> None:
         sweep=False,
         allow_no_pr=True,
         discard_dirty=True,
+        preserve_unique_commits=True,
         reason="abandoned test target",
     )
 
@@ -87,6 +89,7 @@ def test_cleanup_overrides_are_forwarded() -> None:
                 "dry_run": False,
                 "allow_no_pr": True,
                 "discard_dirty": True,
+                "preserve_unique_commits": True,
                 "reason": "abandoned test target",
             },
         ),
@@ -98,6 +101,7 @@ def test_cleanup_overrides_are_forwarded() -> None:
                 "sweep": False,
                 "allow_no_pr": True,
                 "discard_dirty": True,
+                "preserve_unique_commits": True,
                 "reason": "abandoned test target",
             },
         ),

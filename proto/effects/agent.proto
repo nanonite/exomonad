@@ -172,6 +172,8 @@ message DisposeOrphanRequest {
   bool discard_dirty = 6;
   // Optional operator context copied into the durable cleanup receipt.
   string reason = 7;
+  // Keep the managed local branch reachable to preserve unique abandoned commits.
+  bool preserve_unique_commits = 8;
 }
 
 message DisposeOrphanResponse {
@@ -202,6 +204,8 @@ message DisposeOrphanResponse {
   bool discarded_changes_truncated = 14;
   // Operator context recorded for this cleanup operation.
   string operator_reason = 15;
+  // True when the local branch was intentionally preserved for unique commits.
+  bool preserved_unique_commits = 16;
 }
 
 // ============================================================================

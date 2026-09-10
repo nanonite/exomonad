@@ -37,8 +37,8 @@ The guest exports MCP tools that agents can call. These are defined in `ExoMonad
 
 ### Cleanup Tools
 
-- **`cleanup_orphan`**: Safety-checked cleanup for a named orphan agent. The host verifies dead tmux state, exactly one matching PR, and a merged or closed-unmerged PR before disposal. Use `dry_run=true` to inspect without disposal. `allow_no_pr=true` explicitly authorizes an abandoned target without a PR; `discard_dirty=true` separately authorizes discarding a named dirty worktree and requires apply.
-- **`cleanup_leaf`**: On-demand safety-checked cleanup for a named orphan or a `sweep=true` set. The host verifies dead tmux state, exactly one matching PR, and a merged or closed-unmerged PR before using the shared disposal path. Use `dry_run=true` to inspect; `allow_no_pr=true` and `discard_dirty=true` are separate explicit overrides, and dirty discard requires apply.
+- **`cleanup_orphan`**: Safety-checked cleanup for a named orphan agent. The host verifies dead tmux state, exactly one matching PR, and a merged or closed-unmerged PR before disposal. Use `dry_run=true` to inspect without disposal. `allow_no_pr=true` explicitly authorizes an abandoned target without a PR; `discard_dirty=true` separately authorizes discarding a named dirty worktree and requires apply. Without `preserve_unique_commits=true`, abandoned unreferenced commits may later be garbage-collected; preserving them keeps the local branch reachable.
+- **`cleanup_leaf`**: On-demand safety-checked cleanup for a named orphan or a `sweep=true` set. The host verifies dead tmux state, exactly one matching PR, and a merged or closed-unmerged PR before using the shared disposal path. Use `dry_run=true` to inspect; `allow_no_pr=true` and `discard_dirty=true` are separate explicit overrides, and dirty discard requires apply. Set `preserve_unique_commits=true` explicitly when unique abandoned commits must remain reachable; otherwise they may later be garbage-collected.
 
 ### Task Tools (`ExoMonad.Guest.Tools.Tasks`)
 

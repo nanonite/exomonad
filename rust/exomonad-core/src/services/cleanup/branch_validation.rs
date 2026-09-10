@@ -29,7 +29,9 @@ impl VerifiedCleanupService {
         let pull_request = self
             .validate_pull_request(candidate, branch, &repository)
             .await?;
-        validate_merge_reachability(&self.project_dir, &pull_request, &target).await?;
+        if let Some(pull_request) = &pull_request {
+            validate_merge_reachability(&self.project_dir, pull_request, &target).await?;
+        }
         let local_head = self.validate_current_branch(branch, &repository).await?;
         Ok(RevalidatedBranch {
             repository,
@@ -74,23 +76,25 @@ impl VerifiedCleanupService {
         candidate: &CleanupCandidate,
         branch: &str,
         repository: &RepositoryIdentity,
-    ) -> Result<CleanupPullRequest> {
+    ) -> Result<Option<CleanupPullRequest>> {
         let (pull_request, error) = self
             .pull_request_state(Some(branch), true, Some(repository), None)
             .await;
-        let pull_request = match (pull_request, error) {
-            (Some(pull_request), None) => pull_request,
+        match (pull_request, error) {
+            (Some(pull_request), None) => {
+                let expected = candidate
+                    .pull_request
+                    .as_ref()
+                    .context("pull request appeared after the verified no-PR observation")?;
+                if pull_request != *expected {
+                    bail!("authoritative pull-request evidence changed since planning");
+                }
+                Ok(Some(pull_request))
+            }
+            (None, None) if candidate.allow_no_pr && candidate.pull_request.is_none() => Ok(None),
             (None, Some(error)) => bail!("authoritative pull request lookup failed: {error}"),
-            _ => bail!("authoritative pull request disappeared"),
-        };
-        let expected = candidate
-            .pull_request
-            .as_ref()
-            .context("pull-request evidence is unavailable")?;
-        if pull_request != *expected {
-            bail!("authoritative pull-request evidence changed since planning");
+            _ => bail!("authoritative pull-request evidence disappeared"),
         }
-        Ok(pull_request)
     }
 
     async fn validate_current_branch(

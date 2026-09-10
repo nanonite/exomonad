@@ -587,6 +587,7 @@ fn dirty_worktree_message(entries: &[String]) -> String {
 fn cleanup_receipt_response(receipt: &CleanupReceipt) -> DisposeOrphanResponse {
     let mut response = empty_cleanup_response(receipt.dry_run);
     response.operator_reason = receipt.operator_reason.clone().unwrap_or_default();
+    response.preserved_unique_commits = receipt.preserve_unique_commits;
     for entry in &receipt.entries {
         response.pr_number = response.pr_number.max(
             entry
@@ -649,6 +650,7 @@ fn empty_cleanup_response(dry_run: bool) -> DisposeOrphanResponse {
         discarded_untracked_paths: Vec::new(),
         discarded_changes_truncated: false,
         operator_reason: String::new(),
+        preserved_unique_commits: false,
     }
 }
 
@@ -2832,6 +2834,7 @@ impl<
             reason: (!req.reason.trim().is_empty()).then(|| req.reason.clone()),
             allow_no_pr: req.allow_no_pr,
             discard_dirty: req.discard_dirty,
+            preserve_unique_commits: req.preserve_unique_commits,
         };
         let receipt = self
             .ctx
@@ -4676,6 +4679,7 @@ mod tests {
             finished_at: 2,
             dry_run: true,
             operator_reason: Some("operator confirmed abandonment".to_string()),
+            preserve_unique_commits: true,
             entries: vec![CleanupReceiptEntry {
                 candidate_id: "candidate".to_string(),
                 agent_name: "leaf-codex".to_string(),
@@ -4697,6 +4701,7 @@ mod tests {
         assert!(!response.removed_agent_dir);
         assert!(response.dry_run);
         assert_eq!(response.operator_reason, "operator confirmed abandonment");
+        assert!(response.preserved_unique_commits);
     }
 
     fn restart_test_pr() -> ForgejoPullRequest {

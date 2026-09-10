@@ -1,7 +1,7 @@
 use super::service::VerifiedCleanupService;
 use super::support::*;
 use super::types::*;
-use crate::domain::{BirthBranch, RoutingInfo, Slug};
+use crate::domain::{AgentName, BirthBranch, ClaudeSessionUuid, RoutingInfo, Slug, TeamName};
 use crate::services::agent_control::{
     finish_invocation, start_invocation, AgentResolver, AgentType, InvocationStatus,
     InvocationTrigger, Topology,
@@ -10,7 +10,10 @@ use crate::services::agent_resolver::AgentIdentityRecord;
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::mutex_registry::MutexRegistry;
 use crate::services::repo::RepositoryIdentity;
+use crate::services::supervisor_registry::SupervisorInfo;
 use crate::services::tmux_ipc::{TmuxIpc, WindowId};
+use crate::services::{ForgejoClient, Services};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -107,6 +110,7 @@ fn target_validation_rejects_paths_and_ambiguous_requests() {
         reason: None,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
     }
     .validate()
     .is_err());
@@ -118,6 +122,7 @@ fn target_validation_rejects_paths_and_ambiguous_requests() {
         reason: None,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
     }
     .validate()
     .is_err());
@@ -461,6 +466,7 @@ fn duplicate_local_branches_are_refused() {
         delete_remote_branch: false,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
     };
     let mut candidates = vec![make_candidate("a"), make_candidate("b")];
     refuse_duplicate_branches(&mut candidates);
@@ -529,10 +535,16 @@ async fn apply_is_idempotent_for_shared_agent_directory() {
         reason: None,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
         ..CleanupRequest::default()
     };
     let receipt = service.run(&request).await.unwrap();
-    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert_eq!(
+        receipt.entries[0].status,
+        CleanupReceiptStatus::Cleaned,
+        "receipt entry: {:?}",
+        receipt.entries[0]
+    );
     assert!(!agent_dir.exists());
     let receipt_path = service
         .receipt_dir()
@@ -574,6 +586,7 @@ async fn apply_resumes_an_interrupted_resolver_only_cleanup() {
         reason: None,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
         ..CleanupRequest::default()
     };
     let plan = service.plan(&request).await.unwrap();
@@ -708,6 +721,7 @@ async fn interrupted_cleanup_can_resume_by_slug_after_candidate_identity_changes
         reason: None,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
     };
     let plan = service.plan(&request).await.unwrap();
     let mut interrupted = in_progress_receipt(&plan, 1);
@@ -755,6 +769,7 @@ async fn resolver_identity_reuse_does_not_authorize_an_old_receipt() {
         reason: None,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
     };
     let plan = service.plan(&request).await.unwrap();
     let mut interrupted = in_progress_receipt(&plan, 1);
@@ -1017,6 +1032,321 @@ async fn fetched_target_and_squash_merge_reachability_use_the_configured_remote(
     assert!(merge_commit_reachable(temp.path(), &merge, &target)
         .await
         .unwrap());
+}
+
+struct RealCleanupFixture {
+    _temp: tempfile::TempDir,
+    _forgejo: MockServer,
+    services: Services,
+    record: AgentIdentityRecord,
+    agent_dir: PathBuf,
+    worktree: PathBuf,
+}
+
+async fn real_cleanup_fixture() -> RealCleanupFixture {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let remote = temp.path().join("owner/repo.git");
+    tokio::fs::create_dir_all(&project).await.unwrap();
+    tokio::fs::create_dir_all(&remote).await.unwrap();
+    run_git(&remote, &["init", "--bare", "-q"]);
+    tokio::fs::write(remote.join("git-daemon-export-ok"), "")
+        .await
+        .unwrap();
+    run_git(&project, &["init", "-q"]);
+    run_git(&project, &["config", "user.email", "cleanup@example.test"]);
+    run_git(&project, &["config", "user.name", "Cleanup Test"]);
+    tokio::fs::write(project.join("README"), "initial\n")
+        .await
+        .unwrap();
+    run_git(&project, &["add", "README"]);
+    run_git(&project, &["commit", "-qm", "initial"]);
+    run_git(&project, &["branch", "-M", "main"]);
+    run_git(&project, &["branch", "main.stale"]);
+    run_git(&project, &["checkout", "-q", "main.stale"]);
+    tokio::fs::write(project.join("README"), "abandoned commit\n")
+        .await
+        .unwrap();
+    run_git(&project, &["commit", "-qam", "abandoned unique commit"]);
+    run_git(&project, &["checkout", "-q", "main"]);
+    run_git(
+        &project,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    run_git(&project, &["push", "-q", "origin", "main", "main.stale"]);
+    run_git(&project, &["remote", "set-head", "origin", "main"]);
+
+    let ssh_command = temp.path().join("local-ssh");
+    let ssh_script = format!(
+        "#!/bin/sh\ncase \"${{2:-}}\" in\n  git-upload-pack*) exec git-upload-pack '{}' ;;\n  git-receive-pack*) exec git-receive-pack '{}' ;;\n  *) exit 1 ;;\nesac\n",
+        remote.display(),
+        remote.display()
+    );
+    tokio::fs::write(&ssh_command, ssh_script).await.unwrap();
+    tokio::fs::set_permissions(&ssh_command, std::fs::Permissions::from_mode(0o755))
+        .await
+        .unwrap();
+    run_git(
+        &project,
+        &["config", "core.sshCommand", ssh_command.to_str().unwrap()],
+    );
+    let remote_url = "git@forgejo.test:owner/repo.git";
+    run_git(&project, &["remote", "set-url", "origin", remote_url]);
+
+    tokio::fs::create_dir_all(project.join(".exo/worktrees"))
+        .await
+        .unwrap();
+    run_git(
+        &project,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            ".exo/worktrees/stale-codex",
+            "main.stale",
+        ],
+    );
+    let worktree = project.join(".exo/worktrees/stale-codex");
+    tokio::fs::write(worktree.join("README"), "dirty\n")
+        .await
+        .unwrap();
+    tokio::fs::write(worktree.join("abandoned.txt"), "untracked\n")
+        .await
+        .unwrap();
+
+    let agent_dir = project.join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::WorktreePerAgent);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+
+    let forgejo_server = MockServer::start().await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/api/v1/repos/owner/repo/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<String>::new()))
+        .mount(&forgejo_server)
+        .await;
+    let mut services = Services::test();
+    services.project_dir = project.clone();
+    services.forgejo_client =
+        Some(ForgejoClient::new(&forgejo_server.uri(), "test-token").unwrap());
+    services.agent_resolver = Arc::new(AgentResolver::load(project.clone()).await);
+    services.git_wt = Arc::new(GitWorktreeService::new(project));
+    services
+        .claude_session_registry
+        .register(
+            record.agent_name.as_str(),
+            ClaudeSessionUuid::try_from_str("uuid-123").unwrap(),
+        )
+        .await;
+    services
+        .supervisor_registry
+        .register(
+            &[record.birth_branch.to_string()],
+            SupervisorInfo {
+                supervisor: AgentName::try_from_str("root").unwrap(),
+                team: TeamName::try_from_str("cleanup-team").unwrap(),
+            },
+        )
+        .await;
+    RealCleanupFixture {
+        _temp: temp,
+        _forgejo: forgejo_server,
+        services,
+        record,
+        agent_dir,
+        worktree,
+    }
+}
+
+#[tokio::test]
+async fn dirty_no_pr_cleanup_removes_resources_registries_and_is_idempotent() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: false,
+        reason: Some("confirmed abandoned dirty work".to_string()),
+        allow_no_pr: true,
+        discard_dirty: true,
+        preserve_unique_commits: false,
+    };
+
+    let plan = service.plan(&request).await.unwrap();
+    let candidate = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.id == fixture.record.agent_name.as_str())
+        .unwrap();
+    assert_eq!(candidate.decision, CleanupDecision::Cleanable);
+    assert_eq!(candidate.dirty, Some(true));
+    assert!(candidate
+        .dirty_evidence
+        .as_ref()
+        .unwrap()
+        .tracked_paths
+        .contains(&"README".to_string()));
+    assert!(candidate
+        .dirty_evidence
+        .as_ref()
+        .unwrap()
+        .untracked_paths
+        .contains(&"abandoned.txt".to_string()));
+    assert_eq!(
+        candidate.branch.as_ref().unwrap().local.status,
+        CleanupBranchActionStatus::WouldDelete
+    );
+
+    let receipt = service.run(&request).await.unwrap();
+    let entry = &receipt.entries[0];
+    assert_eq!(
+        entry.status,
+        CleanupReceiptStatus::Cleaned,
+        "cleanup entry: {entry:?}"
+    );
+    assert!(entry.actions.contains(&"allow_no_pr_override".to_string()));
+    assert!(entry.actions.contains(&"record_dirty_evidence".to_string()));
+    assert!(entry.actions.contains(&"discard_dirty_changes".to_string()));
+    assert!(entry.actions.contains(&"remove_worktree".to_string()));
+    assert!(entry
+        .actions
+        .contains(&"remove_agent_directory".to_string()));
+    assert!(entry
+        .actions
+        .contains(&"remove_ephemeral_registrations".to_string()));
+    assert!(!fixture.worktree.exists());
+    assert!(!fixture.agent_dir.exists());
+    assert!(
+        local_branch_state(fixture.services.project_dir.as_path(), "main.stale")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(remote_branch_state(
+        fixture.services.project_dir.as_path(),
+        "origin",
+        "main.stale"
+    )
+    .await
+    .unwrap()
+    .is_some());
+    assert!(fixture
+        .services
+        .agent_resolver
+        .get(&fixture.record.agent_name)
+        .await
+        .is_none());
+    assert!(fixture
+        .services
+        .claude_session_registry
+        .get(fixture.record.agent_name.as_str())
+        .await
+        .is_none());
+    assert!(fixture
+        .services
+        .supervisor_registry
+        .lookup(fixture.record.birth_branch.as_str())
+        .await
+        .is_none());
+
+    let second = service.run(&request).await.unwrap();
+    assert!(second.entries.is_empty());
+}
+
+#[tokio::test]
+async fn dirty_no_pr_cleanup_recovers_after_receipt_failure() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+
+    service.fail_receipt_persist_on_call(4);
+    assert!(service.run(&request).await.is_err());
+    service.fail_receipt_persist_on_call(0);
+    let receipt = service.run(&request).await.unwrap();
+
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(!fixture.worktree.exists());
+    assert!(!fixture.agent_dir.exists());
+    assert!(fixture
+        .services
+        .agent_resolver
+        .get(&fixture.record.agent_name)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn no_pr_remote_cleanup_uses_verified_remote_head_and_preserves_unique_commits() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let preserved_head = local_branch_state(fixture.services.project_dir.as_path(), "main.stale")
+        .await
+        .unwrap()
+        .unwrap();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: true,
+        reason: Some("preserved unique abandoned commits".to_string()),
+        allow_no_pr: true,
+        discard_dirty: true,
+        preserve_unique_commits: true,
+    };
+
+    let plan = service.plan(&request).await.unwrap();
+    let candidate = plan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.id == fixture.record.agent_name.as_str())
+        .unwrap();
+    assert_eq!(candidate.decision, CleanupDecision::Cleanable);
+    assert_eq!(
+        candidate.branch.as_ref().unwrap().local.status,
+        CleanupBranchActionStatus::Skipped
+    );
+    assert_eq!(
+        candidate.branch.as_ref().unwrap().remote.status,
+        CleanupBranchActionStatus::WouldDelete
+    );
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"preserve_unique_commits".to_string()));
+    assert!(!fixture.worktree.exists());
+    assert!(!fixture.agent_dir.exists());
+    assert_eq!(
+        local_branch_state(fixture.services.project_dir.as_path(), "main.stale")
+            .await
+            .unwrap(),
+        Some(preserved_head)
+    );
+    assert!(remote_branch_state(
+        fixture.services.project_dir.as_path(),
+        "origin",
+        "main.stale"
+    )
+    .await
+    .unwrap()
+    .is_none());
 }
 
 #[tokio::test]
@@ -1297,6 +1627,7 @@ async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
         delete_remote_branch: false,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
         decision: CleanupDecision::Cleanable,
     };
     let linked = temp.path().join("linked-stale");
@@ -1313,6 +1644,7 @@ async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
         finished_at: 0,
         dry_run: false,
         operator_reason: None,
+        preserve_unique_commits: false,
         entries: vec![receipt_entry(
             &candidate,
             CleanupReceiptStatus::InProgress,

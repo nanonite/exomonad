@@ -33,6 +33,10 @@ pub(crate) struct CleanArgs {
     /// Confirm that dirty worktree changes may be discarded.
     #[arg(long = "discard-dirty")]
     pub(crate) discard_dirty: bool,
+    /// Keep unique commits reachable by preserving the local branch.
+    /// Without this flag, abandoned unreferenced commits may later be garbage-collected.
+    #[arg(long = "preserve-unique-commits")]
+    pub(crate) preserve_unique_commits: bool,
 }
 
 impl CleanArgs {
@@ -45,6 +49,7 @@ impl CleanArgs {
             reason: self.reason.clone(),
             allow_no_pr: self.allow_no_pr,
             discard_dirty: self.discard_dirty,
+            preserve_unique_commits: self.preserve_unique_commits,
         };
         request
             .validate()
@@ -102,6 +107,7 @@ pub(crate) fn continue_cleanup_request() -> CleanupRequest {
         reason: None,
         allow_no_pr: false,
         discard_dirty: false,
+        preserve_unique_commits: false,
     }
 }
 
@@ -136,6 +142,14 @@ pub(crate) fn render_receipt(receipt: &CleanupReceipt) -> String {
         format!("Cleanup plan: {}", receipt.plan_id),
         format!("Mode: {mode}"),
     ];
+    if receipt.preserve_unique_commits {
+        lines.push("Unique commits: preserved by explicit request".to_string());
+    } else {
+        lines.push(
+            "Warning: abandoned unreferenced commits may later be garbage-collected; use --preserve-unique-commits to keep them reachable."
+                .to_string(),
+        );
+    }
     append_receipt_entries(&mut lines, receipt);
     lines.join("\n")
 }
@@ -339,6 +353,7 @@ mod tests {
             finished_at: 2,
             dry_run,
             operator_reason: None,
+            preserve_unique_commits: false,
             entries: vec![
                 CleanupReceiptEntry {
                     candidate_id: "would-id".to_string(),
@@ -405,6 +420,7 @@ mod tests {
                 reason: None,
                 allow_no_pr: false,
                 discard_dirty: false,
+                preserve_unique_commits: false,
             }
         );
     }
@@ -422,6 +438,7 @@ mod tests {
                 reason: None,
                 allow_no_pr: false,
                 discard_dirty: false,
+                preserve_unique_commits: false,
             }
         );
     }
@@ -528,6 +545,7 @@ mod tests {
                 reason: None,
                 allow_no_pr: false,
                 discard_dirty: false,
+                preserve_unique_commits: false,
             };
             assert!(
                 args.request().is_err(),
@@ -542,6 +560,7 @@ mod tests {
             reason: None,
             allow_no_pr: false,
             discard_dirty: false,
+            preserve_unique_commits: false,
         };
         assert!(args.request().is_err());
     }
@@ -551,6 +570,7 @@ mod tests {
         let preview = render_receipt(&receipt(true));
         assert!(preview.contains("Mode: dry-run (no resources were deleted)"));
         assert!(preview.contains("Would clean: would-clean"));
+        assert!(preview.contains("garbage-collected"));
         assert!(!preview.contains("Cleaned:"));
         assert!(preview.contains("Refused: refused — agent is still live"));
         assert!(preview.contains("Skipped: skipped — worktree is dirty"));
@@ -559,6 +579,12 @@ mod tests {
         let applied = render_receipt(&receipt(false));
         assert!(applied.contains("Mode: apply"));
         assert!(applied.contains("Cleaned: cleaned"));
+
+        let mut preserved = receipt(false);
+        preserved.preserve_unique_commits = true;
+        let preserved_rendered = render_receipt(&preserved);
+        assert!(preserved_rendered.contains("Unique commits: preserved by explicit request"));
+        assert!(!preserved_rendered.contains("garbage-collected"));
     }
 
     #[test]

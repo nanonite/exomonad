@@ -37,7 +37,8 @@ data CleanupLeafArgs = CleanupLeafArgs
     claDryRun :: Bool,
     claSweep :: Bool,
     claAllowNoPr :: Bool,
-    claDiscardDirty :: Bool
+    claDiscardDirty :: Bool,
+    claPreserveUniqueCommits :: Bool
   }
   deriving (Generic, Show)
 
@@ -50,6 +51,7 @@ instance FromJSON CleanupLeafArgs where
       <*> v .:? "sweep" .!= False
       <*> v .:? "allow_no_pr" .!= False
       <*> v .:? "discard_dirty" .!= False
+      <*> v .:? "preserve_unique_commits" .!= False
 
 instance ToJSON CleanupLeafArgs where
   toJSON args =
@@ -59,7 +61,8 @@ instance ToJSON CleanupLeafArgs where
         "dry_run" .= claDryRun args,
         "sweep" .= claSweep args,
         "allow_no_pr" .= claAllowNoPr args,
-        "discard_dirty" .= claDiscardDirty args
+        "discard_dirty" .= claDiscardDirty args,
+        "preserve_unique_commits" .= claPreserveUniqueCommits args
       ]
 
 cleanupLeafDescription :: Text
@@ -74,7 +77,8 @@ cleanupLeafSchema =
       ("dry_run", "Verify and report without disposing resources. Defaults to false."),
       ("sweep", "Verify and clean every orphan worktree. Defaults to false."),
       ("allow_no_pr", "Explicitly authorize cleanup when no pull request owns the managed branch; requires a named target."),
-      ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires a named target and apply.")
+      ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires a named target and apply."),
+      ("preserve_unique_commits", "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected.")
     ]
 
 cleanupLeafCore :: CleanupLeafArgs -> Eff Effects (Either Text Aeson.Value)
@@ -90,7 +94,8 @@ cleanupLeafCore args
                 PA.disposeOrphanRequestDryRun = claDryRun args,
                 PA.disposeOrphanRequestSweep = claSweep args,
                 PA.disposeOrphanRequestAllowNoPr = claAllowNoPr args,
-                PA.disposeOrphanRequestDiscardDirty = claDiscardDirty args
+                PA.disposeOrphanRequestDiscardDirty = claDiscardDirty args,
+                PA.disposeOrphanRequestPreserveUniqueCommits = claPreserveUniqueCommits args
               }
       result <- suspendEffect @Agent.AgentDisposeOrphan req
       pure $ case result of
@@ -104,6 +109,7 @@ cleanupLeafOutput args resp =
       "agent" .= claName args,
       "dry_run" .= claDryRun args,
       "operator_reason" .= lazyText (PA.disposeOrphanResponseOperatorReason resp),
+      "preserved_unique_commits" .= PA.disposeOrphanResponsePreservedUniqueCommits resp,
       "sweep" .= claSweep args,
       "allow_no_pr" .= claAllowNoPr args,
       "discard_dirty" .= claDiscardDirty args,

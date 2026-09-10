@@ -36,7 +36,8 @@ data CleanupOrphanArgs = CleanupOrphanArgs
     coaReason :: Maybe Text,
     coaDryRun :: Bool,
     coaAllowNoPr :: Bool,
-    coaDiscardDirty :: Bool
+    coaDiscardDirty :: Bool,
+    coaPreserveUniqueCommits :: Bool
   }
   deriving (Generic, Show)
 
@@ -48,6 +49,7 @@ instance FromJSON CleanupOrphanArgs where
       <*> v .:? "dry_run" .!= False
       <*> v .:? "allow_no_pr" .!= False
       <*> v .:? "discard_dirty" .!= False
+      <*> v .:? "preserve_unique_commits" .!= False
 
 instance ToJSON CleanupOrphanArgs where
   toJSON args =
@@ -56,7 +58,8 @@ instance ToJSON CleanupOrphanArgs where
         "reason" .= coaReason args,
         "dry_run" .= coaDryRun args,
         "allow_no_pr" .= coaAllowNoPr args,
-        "discard_dirty" .= coaDiscardDirty args
+        "discard_dirty" .= coaDiscardDirty args,
+        "preserve_unique_commits" .= coaPreserveUniqueCommits args
       ]
 
 cleanupOrphanDescription :: Text
@@ -69,7 +72,8 @@ cleanupOrphanSchema =
       ("reason", "Optional operator context recorded in the cleanup receipt."),
       ("dry_run", "When true, report what would be removed without removing it. Defaults to false."),
       ("allow_no_pr", "Explicitly authorize cleanup when no pull request owns the managed branch."),
-      ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires apply.")
+      ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires apply."),
+      ("preserve_unique_commits", "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected.")
     ]
 
 cleanupOrphanCore :: CleanupOrphanArgs -> Eff Effects (Either Text Aeson.Value)
@@ -84,7 +88,8 @@ cleanupOrphanCore args
                 PA.disposeOrphanRequestDryRun = coaDryRun args,
                 PA.disposeOrphanRequestSweep = False,
                 PA.disposeOrphanRequestAllowNoPr = coaAllowNoPr args,
-                PA.disposeOrphanRequestDiscardDirty = coaDiscardDirty args
+                PA.disposeOrphanRequestDiscardDirty = coaDiscardDirty args,
+                PA.disposeOrphanRequestPreserveUniqueCommits = coaPreserveUniqueCommits args
               }
       result <- suspendEffect @Agent.AgentDisposeOrphan req
       pure $ case result of
@@ -98,6 +103,7 @@ cleanupOrphanOutput args resp =
       "agent" .= coaName args,
       "dry_run" .= coaDryRun args,
       "operator_reason" .= lazyText (PA.disposeOrphanResponseOperatorReason resp),
+      "preserved_unique_commits" .= PA.disposeOrphanResponsePreservedUniqueCommits resp,
       "verified" .= PA.disposeOrphanResponseVerified resp,
       "pr_state" .= lazyText (PA.disposeOrphanResponsePrState resp),
       "pr_number" .= PA.disposeOrphanResponsePrNumber resp,

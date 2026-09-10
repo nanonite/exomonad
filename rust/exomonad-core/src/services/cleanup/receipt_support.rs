@@ -35,6 +35,7 @@ pub(super) fn dry_run_receipt(plan: &CleanupPlan) -> CleanupReceipt {
         finished_at: unix_timestamp(),
         dry_run: true,
         operator_reason: plan.operator_reason.clone(),
+        preserve_unique_commits: plan.preserve_unique_commits,
         entries: plan.candidates.iter().map(dry_run_entry).collect(),
     }
 }
@@ -43,6 +44,9 @@ fn dry_run_entry(candidate: &CleanupCandidate) -> CleanupReceiptEntry {
     let actions = if candidate.decision.is_cleanable() {
         let mut actions = Vec::new();
         append_branch_preview(&mut actions, candidate.branch.as_ref());
+        if candidate.preserve_unique_commits {
+            actions.push("preserve_unique_commits".to_string());
+        }
         if candidate.allow_no_pr && candidate.pull_request.is_none() {
             actions.push("allow_no_pr_override".to_string());
         }
@@ -94,6 +98,7 @@ pub(super) fn in_progress_receipt(plan: &CleanupPlan, started_at: u64) -> Cleanu
         finished_at: 0,
         dry_run: false,
         operator_reason: plan.operator_reason.clone(),
+        preserve_unique_commits: plan.preserve_unique_commits,
         entries: plan
             .candidates
             .iter()

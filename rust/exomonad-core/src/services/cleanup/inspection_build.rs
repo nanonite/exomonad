@@ -31,6 +31,7 @@ pub(super) struct CandidateFacts {
     delete_remote_branch: bool,
     allow_no_pr: bool,
     discard_dirty: bool,
+    preserve_unique_commits: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -43,6 +44,7 @@ pub(super) struct InspectionContext<'a> {
     pub(super) delete_remote_branch: bool,
     pub(super) allow_no_pr: bool,
     pub(super) discard_dirty: bool,
+    pub(super) preserve_unique_commits: bool,
 }
 
 struct DecisionObservations<'a> {
@@ -112,6 +114,7 @@ impl CandidateFacts {
             delete_remote_branch: context.delete_remote_branch,
             allow_no_pr: context.allow_no_pr,
             discard_dirty: context.discard_dirty,
+            preserve_unique_commits: context.preserve_unique_commits,
         }
     }
 
@@ -143,6 +146,7 @@ impl CandidateFacts {
             dirty_evidence: self.dirty_evidence,
             allow_no_pr: self.allow_no_pr,
             discard_dirty: self.discard_dirty,
+            preserve_unique_commits: self.preserve_unique_commits,
             decision: self.decision,
         }
     }
@@ -188,7 +192,12 @@ fn branch_evidence(
             .as_ref()
             .map(|pull_request| pull_request.head_ref.clone())
     })?;
-    let local_action = if local.local_branch.is_some() {
+    let local_action = if context.preserve_unique_commits {
+        CleanupBranchAction {
+            status: CleanupBranchActionStatus::Skipped,
+            reason: Some("unique commits preserved by explicit operator request".to_string()),
+        }
+    } else if local.local_branch.is_some() {
         CleanupBranchAction {
             status: CleanupBranchActionStatus::WouldDelete,
             reason: None,

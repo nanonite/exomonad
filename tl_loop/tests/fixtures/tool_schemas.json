@@ -1221,13 +1221,18 @@
           "discard_dirty": {
             "description": "Explicitly authorize discarding dirty changes for this named agent; requires apply.",
             "type": "boolean"
+          },
+          "preserve_unique_commits": {
+            "description": "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected.",
+            "type": "boolean"
           }
         },
         "required": [
           "name",
           "dry_run",
           "allow_no_pr",
-          "discard_dirty"
+          "discard_dirty",
+          "preserve_unique_commits"
         ],
         "type": "object"
       },
@@ -1260,13 +1265,18 @@
           "discard_dirty": {
             "description": "Explicitly authorize discarding dirty changes for this named agent; requires a named target and apply.",
             "type": "boolean"
+          },
+          "preserve_unique_commits": {
+            "description": "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected.",
+            "type": "boolean"
           }
         },
         "required": [
           "dry_run",
           "sweep",
           "allow_no_pr",
-          "discard_dirty"
+          "discard_dirty",
+          "preserve_unique_commits"
         ],
         "type": "object"
       },

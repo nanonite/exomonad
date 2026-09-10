@@ -96,6 +96,7 @@ impl VerifiedCleanupService {
                 && !recovery_identities.iter().any(|identity| {
                     target == identity.agent_name.as_str() || target == identity.slug.as_str()
                 })
+                && !self.target_was_cleaned(target).await?
             {
                 bail!("managed cleanup target {:?} was not found", target);
             }
