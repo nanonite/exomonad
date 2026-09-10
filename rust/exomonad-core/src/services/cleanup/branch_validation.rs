@@ -33,7 +33,9 @@ impl VerifiedCleanupService {
         let pull_request = self
             .validate_pull_request(candidate, branch, &repository)
             .await?;
-        if let Some(pull_request) = &pull_request {
+        if let Some(pull_request) = pull_request.as_ref().filter(|pull_request| {
+            pull_request.merged || !pull_request.state.eq_ignore_ascii_case("closed")
+        }) {
             validate_merge_reachability(&self.project_dir, pull_request, &target).await?;
         }
         let local_head = self.validate_current_branch(branch, &repository).await?;

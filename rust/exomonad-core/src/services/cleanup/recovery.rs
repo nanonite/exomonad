@@ -1,16 +1,56 @@
 use super::discovery::DiscoveredResource;
 use super::service::VerifiedCleanupService;
 use super::support::*;
-use super::types::{CleanupBranchActionStatus, CleanupRecoveredProvenance};
+use super::types::{CleanupBranchActionStatus, CleanupLiveness, CleanupRecoveredProvenance};
 use crate::domain::{AgentName, BirthBranch, BranchName, Slug};
 use crate::services::agent_control::{AgentIdentity, AgentType, Topology};
 use crate::services::agent_resolver::AgentIdentityRecord;
 use crate::services::immutable_ledger::LedgerRecord;
 use crate::services::pr_registry::{read_published_heads, PublicationProvenance, PublishedHead};
+use crate::services::tmux_ipc::TmuxIpc;
 use anyhow::Context;
 use tokio::fs;
 
 impl VerifiedCleanupService {
+    pub(super) async fn recovered_liveness(
+        &self,
+        identity: &AgentIdentityRecord,
+    ) -> CleanupLiveness {
+        let Some(session) = self.tmux_session.as_deref() else {
+            return CleanupLiveness::Unknown;
+        };
+        if session.trim().is_empty() {
+            return CleanupLiveness::Unknown;
+        }
+        let windows = match TmuxIpc::new(session).list_windows().await {
+            Ok(windows) => windows,
+            Err(_) => return CleanupLiveness::Unknown,
+        };
+        if windows.iter().any(|window| {
+            window.window_name == identity.display_name
+                || window.window_name == identity.agent_name.as_str()
+        }) {
+            CleanupLiveness::Live
+        } else {
+            CleanupLiveness::Dead
+        }
+    }
+
+    pub(super) async fn revalidate_recovered_liveness(
+        &self,
+        identity: &AgentIdentityRecord,
+    ) -> anyhow::Result<()> {
+        match self.recovered_liveness(identity).await {
+            CleanupLiveness::Dead => Ok(()),
+            CleanupLiveness::Live => {
+                anyhow::bail!("recovered agent has a live tmux window")
+            }
+            CleanupLiveness::Unknown => {
+                anyhow::bail!("recovered agent liveness is unknown")
+            }
+        }
+    }
+
     pub(super) async fn recover_residual_resource(
         &self,
         path: &std::path::Path,
@@ -105,10 +145,16 @@ impl VerifiedCleanupService {
         let [pull_request] = pull_requests.as_slice() else {
             return None;
         };
-        if !pull_request.merged
+        let closed_unmerged =
+            !pull_request.merged && pull_request.state.eq_ignore_ascii_case("closed");
+        if (!pull_request.merged && !closed_unmerged)
             || pull_request.head_ref.as_str() != branch
             || pull_request.base_ref.as_str() != publication.base_branch
             || pull_request.head_sha.as_deref() != Some(publication.head_sha.as_str())
+            || pr_metadata_value(&pull_request.body, "Authoring-Agent").as_deref()
+                != Some(id.as_str())
+            || pr_metadata_value(&pull_request.body, "Birth-Branch").as_deref()
+                != Some(branch.as_str())
         {
             return None;
         }
@@ -150,12 +196,15 @@ impl VerifiedCleanupService {
             pull_request_sources: vec![
                 "ledger:pr.published".to_string(),
                 "published-heads.json".to_string(),
-                "Forgejo unique merged pull request".to_string(),
+                "Forgejo unique merged or closed-unmerged pull request".to_string(),
+                "Forgejo PR body: Authoring-Agent".to_string(),
+                "Forgejo PR body: Birth-Branch".to_string(),
             ],
             liveness_sources: vec![
                 "ledger:agent.invocation.finished".to_string(),
                 "resolver identity absent".to_string(),
                 "agent directory absent".to_string(),
+                "configured tmux session window inventory".to_string(),
             ],
         };
         if receipt_proves_remote_deletion {
@@ -194,6 +243,7 @@ impl VerifiedCleanupService {
         {
             anyhow::bail!("recovered identity no longer matches its candidate");
         }
+        self.revalidate_recovered_liveness(identity).await?;
         if self.resolver.get(&identity.agent_name).await.is_some() {
             anyhow::bail!("resolver identity appeared for recovered cleanup target");
         }
@@ -237,6 +287,14 @@ impl VerifiedCleanupService {
         }
         Ok(())
     }
+}
+
+fn pr_metadata_value(body: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn residual_contents_are_safe(path: &std::path::Path) -> anyhow::Result<bool> {

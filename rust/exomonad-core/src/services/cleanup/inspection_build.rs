@@ -159,27 +159,30 @@ fn decision_for(
     observations: DecisionObservations<'_>,
     context: InspectionContext<'_>,
 ) -> CleanupDecision {
-    candidate_decision(DecisionContext {
-        identity: observations.observed.identity.as_ref(),
-        identity_error: observations.local.identity_error.as_deref(),
-        liveness: observations.liveness,
-        dirty: observations.observed.worktree.dirty,
-        protected: observations.protected,
-        identity_drift: observations.observed.worktree.identity_drift,
-        repository: context.repository,
-        repository_error: context.repository_error,
-        remote_error: observations.remote.error.as_deref(),
-        pull_request: observations.pull_request.request.as_ref(),
-        pr_error: observations.pull_request.error.as_deref(),
-        head_matches_pull_request: observations.pull_request.head_matches,
-        remote_head_matches_pull_request: observations.pull_request.remote_head_matches,
-        merge_commit_reachable: observations.pull_request.merge_commit_reachable.clone(),
-        target_error: context.target_error,
-        resolver_only: observations.observed.resolver_only,
-        recovery_receipt: observations.observed.recovery_receipt,
-        allow_no_pr: context.allow_no_pr,
-        discard_dirty: context.discard_dirty,
-    })
+    candidate_decision_for_recovery(
+        DecisionContext {
+            identity: observations.observed.identity.as_ref(),
+            identity_error: observations.local.identity_error.as_deref(),
+            liveness: observations.liveness,
+            dirty: observations.observed.worktree.dirty,
+            protected: observations.protected,
+            identity_drift: observations.observed.worktree.identity_drift,
+            repository: context.repository,
+            repository_error: context.repository_error,
+            remote_error: observations.remote.error.as_deref(),
+            pull_request: observations.pull_request.request.as_ref(),
+            pr_error: observations.pull_request.error.as_deref(),
+            head_matches_pull_request: observations.pull_request.head_matches,
+            remote_head_matches_pull_request: observations.pull_request.remote_head_matches,
+            merge_commit_reachable: observations.pull_request.merge_commit_reachable.clone(),
+            target_error: context.target_error,
+            resolver_only: observations.observed.resolver_only,
+            recovery_receipt: observations.observed.recovery_receipt,
+            allow_no_pr: context.allow_no_pr,
+            discard_dirty: context.discard_dirty,
+        },
+        observations.observed.recovered_provenance.is_some(),
+    )
 }
 
 fn branch_evidence(

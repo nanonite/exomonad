@@ -238,7 +238,9 @@ head SHA, and reachability of its merge commit from a freshly fetched
 configured target branch are verified. Remote deletion is never implied by
 --apply: --delete-remote-branch is a separate opt-in and uses an exact
 expected-head force-with-lease. Current, protected, base, dirty, live,
-ambiguous, open, and closed-unmerged branches are preserved. Without --apply,
+ambiguous and open branches are preserved; recovered closed-unmerged branches
+are eligible only with the verified provenance and authoring metadata described
+in the core cleanup documentation. Without --apply,
 both local and explicitly requested remote actions are preview-only.
 Remote deletion is irreversible, requires a named target, and is rejected for
 sweeps; it is never implied by --apply, --allow-no-pr, --discard-dirty, or

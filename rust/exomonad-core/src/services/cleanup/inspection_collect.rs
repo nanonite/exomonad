@@ -49,6 +49,7 @@ impl VerifiedCleanupService {
                 observed.recovery_receipt,
                 &observed.agent_dir,
                 observed.worktree.worktree_path.as_ref(),
+                observed.identity.as_ref(),
                 observed.recovered_provenance.is_some(),
             )
             .await;
@@ -166,13 +167,19 @@ impl VerifiedCleanupService {
         recovery_receipt: bool,
         agent_dir: &Path,
         worktree_path: Option<&PathBuf>,
+        identity: Option<&AgentIdentityRecord>,
         recovered_provenance: bool,
     ) -> CleanupLiveness {
-        if recovered_provenance
-            || (resolver_only
-                && recovery_receipt
-                && !agent_dir.exists()
-                && worktree_path.is_none_or(|path| !path.exists()))
+        if recovered_provenance {
+            let Some(identity) = identity else {
+                return CleanupLiveness::Unknown;
+            };
+            return self.recovered_liveness(identity).await;
+        }
+        if resolver_only
+            && recovery_receipt
+            && !agent_dir.exists()
+            && worktree_path.is_none_or(|path| !path.exists())
         {
             CleanupLiveness::Dead
         } else {

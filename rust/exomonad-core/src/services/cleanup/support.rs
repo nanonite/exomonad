@@ -1,5 +1,8 @@
+#[cfg(test)]
+pub(super) use super::decision::candidate_decision;
 pub(super) use super::decision::{
-    candidate_decision, classify_routing_target, refuse_duplicate_branches, DecisionContext,
+    candidate_decision_for_recovery, classify_routing_target, refuse_duplicate_branches,
+    DecisionContext,
 };
 pub(super) use super::receipt_support::{
     dry_run_receipt, in_progress_receipt, receipt_entry, unix_timestamp,

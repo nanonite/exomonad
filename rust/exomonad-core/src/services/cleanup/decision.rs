@@ -27,7 +27,15 @@ pub(super) struct DecisionContext<'a> {
     pub(super) discard_dirty: bool,
 }
 
+#[cfg(test)]
 pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecision {
+    candidate_decision_for_recovery(context, false)
+}
+
+pub(super) fn candidate_decision_for_recovery(
+    context: DecisionContext<'_>,
+    recovered_provenance: bool,
+) -> CleanupDecision {
     if let Some(decision) = reject_identity(&context) {
         return decision;
     }
@@ -40,7 +48,7 @@ pub(super) fn candidate_decision(context: DecisionContext<'_>) -> CleanupDecisio
     if context.resolver_only {
         return CleanupDecision::Cleanable;
     }
-    pull_request_decision(&context)
+    pull_request_decision(&context, recovered_provenance)
 }
 
 fn reject_identity(context: &DecisionContext<'_>) -> Option<CleanupDecision> {
@@ -93,7 +101,10 @@ fn reject_candidate_state(context: &DecisionContext<'_>) -> Option<CleanupDecisi
     None
 }
 
-fn pull_request_decision(context: &DecisionContext<'_>) -> CleanupDecision {
+fn pull_request_decision(
+    context: &DecisionContext<'_>,
+    recovered_provenance: bool,
+) -> CleanupDecision {
     let Some(identity) = context.identity else {
         return CleanupDecision::refusal("managed identity is missing or malformed");
     };
@@ -124,7 +135,7 @@ fn pull_request_decision(context: &DecisionContext<'_>) -> CleanupDecision {
     let Some(repository) = context.repository else {
         return CleanupDecision::refusal("repository identity is unavailable");
     };
-    pull_request_safety_decision(context, identity, repository, pr)
+    pull_request_safety_decision(context, identity, repository, pr, recovered_provenance)
 }
 
 fn pull_request_safety_decision(
@@ -132,8 +143,10 @@ fn pull_request_safety_decision(
     identity: &crate::services::agent_resolver::AgentIdentityRecord,
     repository: &RepositoryIdentity,
     pr: &CleanupPullRequest,
+    recovered_provenance: bool,
 ) -> CleanupDecision {
-    if !pr.merged {
+    let closed_unmerged = !pr.merged && pr.state.eq_ignore_ascii_case("closed");
+    if !(pr.merged || recovered_provenance && closed_unmerged) {
         return CleanupDecision::refusal(format!(
             "pull request #{} is {} and not merged",
             pr.number,
@@ -157,6 +170,9 @@ fn pull_request_safety_decision(
         return CleanupDecision::refusal(format!(
             "configured target branch is unavailable: {error}"
         ));
+    }
+    if closed_unmerged {
+        return reject_head_mismatch(context).unwrap_or(CleanupDecision::Cleanable);
     }
     match &context.merge_commit_reachable {
         Some(Ok(true)) => {}

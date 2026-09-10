@@ -214,18 +214,6 @@ impl<
             }
         }
 
-        if agent_config_dir.exists() {
-            if let Err(e) = fs::remove_dir_all(&agent_config_dir).await {
-                warn!(
-                    path = %agent_config_dir.display(),
-                    error = %e,
-                    "Failed to remove per-agent config dir (non-fatal)"
-                );
-            } else {
-                info!(path = %agent_config_dir.display(), "Removed per-agent config dir");
-            }
-        }
-
         // Remove git worktree if it exists.
         // spawn_subtree/spawn_leaf_subtree use bare slug as dir name,
         // spawn_agent uses internal_name ({id}-{type}).
@@ -247,20 +235,28 @@ impl<
                     // Successfully removed workspace
                 }
                 Ok(Err(e)) => {
-                    warn!(
-                        path = %worktree_path.display(),
-                        error = %e,
-                        "Failed to remove git worktree (non-fatal)"
-                    );
+                    return Err(anyhow::anyhow!(
+                        "failed to remove git worktree {}: {e}",
+                        worktree_path.display()
+                    ));
                 }
                 Err(join_err) => {
-                    warn!(
-                        path = %worktree_path.display(),
-                        error = %join_err,
-                        "Blocking task for git worktree removal panicked or was cancelled (non-fatal)"
-                    );
+                    return Err(anyhow::anyhow!(
+                        "git worktree removal task failed for {}: {join_err}",
+                        worktree_path.display()
+                    ));
                 }
             }
+        }
+
+        if agent_config_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&agent_config_dir).await {
+                return Err(anyhow::anyhow!(
+                    "failed to remove per-agent config dir {}: {e}",
+                    agent_config_dir.display()
+                ));
+            }
+            info!(path = %agent_config_dir.display(), "Removed per-agent config dir");
         }
 
         // Deregister identity from resolver
@@ -458,5 +454,71 @@ impl<
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AgentName, BirthBranch, Slug};
+    use crate::services::agent_control::{AgentType, Topology};
+    use crate::services::agent_resolver::{AgentIdentityRecord, AgentResolver};
+    use crate::services::git_worktree::GitWorktreeService;
+    use crate::services::Services;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cleanup_agent_retains_identity_when_worktree_removal_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().to_path_buf();
+        let mut services = Services::test();
+        services.project_dir = project.clone();
+        let resolver = Arc::new(AgentResolver::load(project.clone()).await);
+        services.agent_resolver = resolver.clone();
+        services.git_wt = Arc::new(GitWorktreeService::new(project.clone()));
+        let service = AgentControlService::new(Arc::new(services));
+        let agent_name = AgentName::try_from_str("stale-codex").unwrap();
+        let record = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::try_from_str("stale").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.stale").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: ".exo/worktrees/stale".into(),
+            display_name: "🤖 stale-codex".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: false,
+            slice_id: None,
+        };
+        resolver.register(record).await.unwrap();
+
+        let worktree = project.join(".exo/worktrees/stale");
+        tokio::fs::create_dir_all(&worktree).await.unwrap();
+        tokio::fs::write(worktree.join("residual"), "must remain")
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let error = service
+            .cleanup_agent(agent_name.as_str())
+            .await
+            .expect_err("failed worktree removal must stop teardown");
+        assert!(error.to_string().contains("failed to remove git worktree"));
+        assert!(tokio::fs::symlink_metadata(&worktree).await.is_ok());
+        assert!(resolver.get(&agent_name).await.is_some());
+        assert!(
+            tokio::fs::symlink_metadata(project.join(".exo/agents/stale-codex/identity.json"))
+                .await
+                .is_ok()
+        );
+
+        tokio::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
     }
 }

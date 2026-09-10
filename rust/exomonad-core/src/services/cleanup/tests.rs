@@ -320,6 +320,51 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
 }
 
 #[test]
+fn recovered_closed_unmerged_pr_requires_recovered_provenance() {
+    let identity = identity(Topology::WorktreePerAgent);
+    let repo = RepositoryIdentity {
+        owner: crate::domain::GithubOwner::try_from_str("owner").unwrap(),
+        repo: crate::domain::GithubRepo::try_from_str("repo").unwrap(),
+        base_branch: "main".to_string(),
+        forge_host: "forgejo.test".to_string(),
+        remote_url: "https://forgejo.test/owner/repo.git".to_string(),
+        remote_name: "origin".to_string(),
+    };
+    let pr = CleanupPullRequest {
+        number: 7,
+        head_ref: identity.birth_branch.to_string(),
+        base_ref: "main".to_string(),
+        state: "closed".to_string(),
+        merged: false,
+        head_sha: Some("head".to_string()),
+        merge_commit_sha: None,
+    };
+    let context = DecisionContext {
+        identity: Some(&identity),
+        identity_error: None,
+        resolver_only: false,
+        liveness: &CleanupLiveness::Dead,
+        dirty: Some(false),
+        protected: false,
+        identity_drift: false,
+        repository: Some(&repo),
+        repository_error: None,
+        remote_error: None,
+        pull_request: Some(&pr),
+        pr_error: None,
+        head_matches_pull_request: Some(true),
+        remote_head_matches_pull_request: Some(true),
+        recovery_receipt: false,
+        allow_no_pr: false,
+        discard_dirty: false,
+        merge_commit_reachable: None,
+        target_error: None,
+    };
+    assert!(candidate_decision_for_recovery(context.clone(), true).is_cleanable());
+    assert!(!candidate_decision(context).is_cleanable());
+}
+
+#[test]
 fn routing_target_absence_is_dead_but_probe_errors_are_unknown() {
     assert_eq!(classify_routing_target(Ok(false)), CleanupLiveness::Dead);
     assert_eq!(
@@ -381,6 +426,60 @@ async fn terminal_invocation_with_stale_routing_requires_configured_tmux_session
     TmuxIpc::kill_session(&configured_session).await.unwrap();
 
     assert_eq!(liveness, CleanupLiveness::Dead);
+}
+
+#[tokio::test]
+async fn recovered_liveness_requires_current_server_tmux_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = identity(Topology::WorktreePerAgent);
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        None,
+    );
+    assert_eq!(
+        service.recovered_liveness(&identity).await,
+        CleanupLiveness::Unknown
+    );
+
+    let session = format!("cleanup-recovered-liveness-{}", std::process::id());
+    let _ = TmuxIpc::kill_session(&session).await;
+    TmuxIpc::new_session(&session, temp.path()).await.unwrap();
+    let configured = VerifiedCleanupService::new(
+        temp.path(),
+        resolver,
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        Some(session.clone()),
+    );
+    assert_eq!(
+        configured.recovered_liveness(&identity).await,
+        CleanupLiveness::Dead
+    );
+
+    TmuxIpc::new(&session)
+        .new_window(
+            identity.display_name.as_str(),
+            temp.path(),
+            "sh",
+            "sleep 30",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        configured.recovered_liveness(&identity).await,
+        CleanupLiveness::Live
+    );
+    assert!(configured
+        .revalidate_recovered_liveness(&identity)
+        .await
+        .is_err());
+    TmuxIpc::kill_session(&session).await.unwrap();
 }
 
 #[test]
@@ -1188,6 +1287,10 @@ async fn recovered_merged_pr_residual_uses_verified_provenance_end_to_end() {
     let mut fixture = real_cleanup_fixture().await;
     let project = fixture.services.project_dir.clone();
     let branch = fixture.record.birth_branch.to_string();
+    let tmux_session = format!("cleanup-recovery-{}", std::process::id());
+    let _ = TmuxIpc::kill_session(&tmux_session).await;
+    TmuxIpc::new_session(&tmux_session, &project).await.unwrap();
+    fixture.services.tmux_session = Some(tmux_session.clone());
     let branch_sha = local_branch_state(&project, &branch)
         .await
         .unwrap()
@@ -1308,6 +1411,76 @@ async fn recovered_merged_pr_residual_uses_verified_provenance_end_to_end() {
         delete_remote_branch: true,
         ..CleanupRequest::default()
     };
+    let missing_metadata_plan = service.plan(&request).await.unwrap();
+    assert!(!missing_metadata_plan.candidates[0].decision.is_cleanable());
+
+    fixture._forgejo.reset().await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/api/v1/repos/owner/repo/pulls"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "number": 43,
+                "title": "Recovered merged branch",
+                "body": format!(
+                    "Authoring-Agent: {}\nBirth-Branch: {branch}\n",
+                    fixture.record.agent_name
+                ),
+                "state": "closed",
+                "merged": false,
+                "merge_commit_sha": null,
+                "html_url": "http://forgejo.test/owner/repo/pulls/43",
+                "head": {"ref": branch, "sha": branch_sha},
+                "base": {"ref": "main", "sha": "base-sha"}
+            }])),
+        )
+        .mount(&fixture._forgejo)
+        .await;
+    let closed_unmerged_plan = service.plan(&request).await.unwrap();
+    assert_eq!(
+        closed_unmerged_plan.candidates[0].decision,
+        CleanupDecision::Cleanable
+    );
+    assert_eq!(
+        closed_unmerged_plan.candidates[0]
+            .pull_request
+            .as_ref()
+            .map(|pull_request| pull_request.merged),
+        Some(false)
+    );
+    let revalidated_closed_unmerged = service
+        .revalidate_branch(&closed_unmerged_plan.candidates[0])
+        .await
+        .unwrap();
+    assert_eq!(
+        revalidated_closed_unmerged.branch,
+        closed_unmerged_plan.candidates[0]
+            .branch
+            .as_ref()
+            .and_then(|branch| branch.branch.clone())
+            .unwrap()
+    );
+
+    fixture._forgejo.reset().await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/api/v1/repos/owner/repo/pulls"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "number": 43,
+                "title": "Recovered merged branch",
+                "body": format!(
+                    "Authoring-Agent: {}\nBirth-Branch: {branch}\n",
+                    fixture.record.agent_name
+                ),
+                "state": "closed",
+                "merged": true,
+                "merge_commit_sha": merge_sha,
+                "html_url": "http://forgejo.test/owner/repo/pulls/43",
+                "head": {"ref": branch, "sha": branch_sha},
+                "base": {"ref": "main", "sha": merge_sha}
+            }])),
+        )
+        .mount(&fixture._forgejo)
+        .await;
     let plan = service.plan(&request).await.unwrap();
     let candidate = &plan.candidates[0];
     assert_eq!(candidate.decision, CleanupDecision::Cleanable);
@@ -1327,6 +1500,37 @@ async fn recovered_merged_pr_residual_uses_verified_provenance_end_to_end() {
         .recovered_provenance
         .as_ref()
         .is_some_and(|evidence| evidence.identity_sources.len() >= 3));
+
+    let mut liveness_race = service
+        .resume_or_create_receipt(&plan, request.target.as_deref(), 1)
+        .await
+        .unwrap();
+    let live_window = TmuxIpc::new(&tmux_session)
+        .new_window(
+            candidate.identity.as_ref().unwrap().display_name.as_str(),
+            &project,
+            "sh",
+            "sleep 30",
+        )
+        .await
+        .unwrap();
+    let race_entry = service
+        .execute_remote_branch_action(candidate, &mut liveness_race, 0)
+        .await
+        .expect("live recovered target must refuse before remote mutation");
+    assert_eq!(race_entry.status, CleanupReceiptStatus::Refused);
+    assert!(race_entry
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("live") || reason.contains("liveness")));
+    assert!(remote_branch_state(&project, "origin", &branch)
+        .await
+        .unwrap()
+        .is_some());
+    TmuxIpc::new(&tmux_session)
+        .kill_window(&live_window)
+        .await
+        .unwrap();
 
     let mut interrupted = service
         .resume_or_create_receipt(&plan, request.target.as_deref(), 1)
@@ -1368,6 +1572,7 @@ async fn recovered_merged_pr_residual_uses_verified_provenance_end_to_end() {
         .is_none());
     let second = service.apply(&request).await.unwrap();
     assert!(second.entries.is_empty());
+    TmuxIpc::kill_session(&tmux_session).await.unwrap();
 }
 
 #[tokio::test]
