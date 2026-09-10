@@ -264,6 +264,8 @@ fn candidate_decision_requires_merged_pr_and_matching_base() {
         merged: true,
         head_sha: Some("head".to_string()),
         merge_commit_sha: Some("merge".to_string()),
+        authoring_agent: None,
+        birth_branch: None,
     };
     assert_eq!(
         candidate_decision(DecisionContext {
@@ -338,6 +340,8 @@ fn recovered_closed_unmerged_pr_requires_recovered_provenance() {
         merged: false,
         head_sha: Some("head".to_string()),
         merge_commit_sha: None,
+        authoring_agent: None,
+        birth_branch: None,
     };
     let context = DecisionContext {
         identity: Some(&identity),
@@ -526,6 +530,8 @@ fn remote_branch_head_must_match_the_pull_request_head() {
         merged: true,
         head_sha: Some("pr-head".to_string()),
         merge_commit_sha: Some("merge".to_string()),
+        authoring_agent: None,
+        birth_branch: None,
     };
     assert!(!candidate_decision(DecisionContext {
         identity: Some(&identity),
@@ -1501,6 +1507,54 @@ async fn recovered_merged_pr_residual_uses_verified_provenance_end_to_end() {
         .as_ref()
         .is_some_and(|evidence| evidence.identity_sources.len() >= 3));
 
+    fixture._forgejo.reset().await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/api/v1/repos/owner/repo/pulls"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "number": 43,
+                "title": "Recovered merged branch",
+                "body": "Authoring-Agent: changed-codex\nBirth-Branch: changed-branch\n",
+                "state": "closed",
+                "merged": true,
+                "merge_commit_sha": merge_sha,
+                "html_url": "http://forgejo.test/owner/repo/pulls/43",
+                "head": {"ref": branch, "sha": branch_sha},
+                "base": {"ref": "main", "sha": merge_sha}
+            }])),
+        )
+        .mount(&fixture._forgejo)
+        .await;
+    let metadata_error = match service.revalidate_branch(candidate).await {
+        Ok(_) => panic!("changed Forgejo authoring metadata must refuse mutation"),
+        Err(error) => error,
+    };
+    assert!(metadata_error
+        .to_string()
+        .contains("authoritative pull-request evidence changed since planning"));
+
+    fixture._forgejo.reset().await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/api/v1/repos/owner/repo/pulls"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "number": 43,
+                "title": "Recovered merged branch",
+                "body": format!(
+                    "Authoring-Agent: {}\nBirth-Branch: {branch}\n",
+                    fixture.record.agent_name
+                ),
+                "state": "closed",
+                "merged": true,
+                "merge_commit_sha": merge_sha,
+                "html_url": "http://forgejo.test/owner/repo/pulls/43",
+                "head": {"ref": branch, "sha": branch_sha},
+                "base": {"ref": "main", "sha": merge_sha}
+            }])),
+        )
+        .mount(&fixture._forgejo)
+        .await;
+
     let mut liveness_race = service
         .resume_or_create_receipt(&plan, request.target.as_deref(), 1)
         .await
@@ -2273,6 +2327,8 @@ async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
         merged: true,
         head_sha: Some(branch_sha.clone()),
         merge_commit_sha: Some(merge_sha.clone()),
+        authoring_agent: None,
+        birth_branch: None,
     };
     let candidate = CleanupCandidate {
         id: "stale-codex".to_string(),

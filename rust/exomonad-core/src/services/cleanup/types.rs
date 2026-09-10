@@ -154,6 +154,10 @@ pub struct CleanupPullRequest {
     pub merged: bool,
     pub head_sha: Option<String>,
     pub merge_commit_sha: Option<String>,
+    #[serde(default)]
+    pub authoring_agent: Option<String>,
+    #[serde(default)]
+    pub birth_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -243,8 +247,18 @@ impl From<ForgejoPullRequest> for CleanupPullRequest {
             merged: pr.merged,
             head_sha: pr.head_sha,
             merge_commit_sha: pr.merge_commit_sha,
+            authoring_agent: pr_metadata_value(&pr.body, "Authoring-Agent"),
+            birth_branch: pr_metadata_value(&pr.body, "Birth-Branch"),
         }
     }
+}
+
+pub(super) fn pr_metadata_value(body: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

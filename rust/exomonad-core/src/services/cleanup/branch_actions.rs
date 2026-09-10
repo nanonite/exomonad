@@ -355,6 +355,8 @@ mod tests {
                 merged: true,
                 head_sha: Some("recovered-pr-head".to_string()),
                 merge_commit_sha: Some("recovered-merge".to_string()),
+                authoring_agent: None,
+                birth_branch: None,
             }),
             liveness: CleanupLiveness::Dead,
             dirty: Some(false),

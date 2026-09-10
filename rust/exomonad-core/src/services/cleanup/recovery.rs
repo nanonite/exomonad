@@ -1,7 +1,9 @@
 use super::discovery::DiscoveredResource;
 use super::service::VerifiedCleanupService;
 use super::support::*;
-use super::types::{CleanupBranchActionStatus, CleanupLiveness, CleanupRecoveredProvenance};
+use super::types::{
+    pr_metadata_value, CleanupBranchActionStatus, CleanupLiveness, CleanupRecoveredProvenance,
+};
 use crate::domain::{AgentName, BirthBranch, BranchName, Slug};
 use crate::services::agent_control::{AgentIdentity, AgentType, Topology};
 use crate::services::agent_resolver::AgentIdentityRecord;
@@ -287,14 +289,6 @@ impl VerifiedCleanupService {
         }
         Ok(())
     }
-}
-
-fn pr_metadata_value(body: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}:");
-    body.lines()
-        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::trim))
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
 }
 
 async fn residual_contents_are_safe(path: &std::path::Path) -> anyhow::Result<bool> {
