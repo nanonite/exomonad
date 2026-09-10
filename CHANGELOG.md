@@ -223,6 +223,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Extend opt-in remote branch deletion across verified cleanup overrides (#1082)
 - Add audited discard-dirty cleanup for abandoned managed worktrees (#1079)
 - Add an audited cleanup override for abandoned work without a pull request (#1078)
 - Prove stale-resource cleanup end to end (#1073)
