@@ -24,6 +24,9 @@ impl VerifiedCleanupService {
         if candidate.preserve_unique_commits {
             authorization_actions.push("preserve_unique_commits".to_string());
         }
+        if candidate.delete_remote_branch {
+            authorization_actions.push("delete_remote_branch_override".to_string());
+        }
         authorization_actions.sort();
         authorization_actions.dedup();
         if let Some(entry) = self
@@ -165,6 +168,9 @@ impl VerifiedCleanupService {
                     actions.push("remove_worktree".to_string());
                     if candidate.discard_dirty && candidate.dirty == Some(true) {
                         actions.push("discard_dirty_changes".to_string());
+                    }
+                    if candidate.delete_remote_branch {
+                        actions.push("delete_remote_branch_override".to_string());
                     }
                 }
                 Ok(Err(error)) => {

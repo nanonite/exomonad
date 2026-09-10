@@ -21,7 +21,7 @@ pub(crate) struct CleanArgs {
     /// Confirm resource removal. Without this flag the command is a dry run.
     #[arg(long)]
     pub(crate) apply: bool,
-    /// Also delete the managed branch from the configured remote.
+    /// Independently request irreversible, lease-protected deletion of the managed remote branch.
     #[arg(long)]
     pub(crate) delete_remote_branch: bool,
     /// Optional operator context recorded in the cleanup receipt.
@@ -488,10 +488,23 @@ mod tests {
 
     #[test]
     fn remote_branch_deletion_is_explicit_and_dry_run_by_default() {
-        let args = parse(&["exomonad", "clean", "--sweep", "--delete-remote-branch"]).unwrap();
+        let args = parse(&[
+            "exomonad",
+            "clean",
+            "--name",
+            "leaf",
+            "--delete-remote-branch",
+        ])
+        .unwrap();
         let request = args.request().unwrap();
         assert!(request.delete_remote_branch);
         assert!(!request.apply);
+        assert!(
+            parse(&["exomonad", "clean", "--sweep", "--delete-remote-branch"])
+                .unwrap()
+                .request()
+                .is_err()
+        );
         assert!(
             !parse(&["exomonad", "clean", "--sweep", "--apply"])
                 .unwrap()

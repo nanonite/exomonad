@@ -2830,7 +2830,7 @@ impl<
             target,
             sweep: req.sweep,
             apply: !req.dry_run,
-            delete_remote_branch: false,
+            delete_remote_branch: req.delete_remote_branch,
             reason: (!req.reason.trim().is_empty()).then(|| req.reason.clone()),
             allow_no_pr: req.allow_no_pr,
             discard_dirty: req.discard_dirty,

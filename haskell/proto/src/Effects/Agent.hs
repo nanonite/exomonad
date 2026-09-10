@@ -1764,7 +1764,8 @@ data DisposeOrphanRequest
     disposeOrphanRequestAllowNoPr :: Hs.Bool,
     disposeOrphanRequestDiscardDirty :: Hs.Bool,
     disposeOrphanRequestReason :: Hs.Text,
-    disposeOrphanRequestPreserveUniqueCommits :: Hs.Bool
+    disposeOrphanRequestPreserveUniqueCommits :: Hs.Bool,
+    disposeOrphanRequestDeleteRemoteBranch :: Hs.Bool
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -1786,7 +1787,8 @@ instance (HsProtobuf.Message DisposeOrphanRequest) where
         disposeOrphanRequestAllowNoPr,
         disposeOrphanRequestDiscardDirty,
         disposeOrphanRequestReason,
-        disposeOrphanRequestPreserveUniqueCommits
+        disposeOrphanRequestPreserveUniqueCommits,
+        disposeOrphanRequestDeleteRemoteBranch
       } =
       Hs.mappend
         ( Hs.mappend
@@ -1795,47 +1797,53 @@ instance (HsProtobuf.Message DisposeOrphanRequest) where
                     ( Hs.mappend
                         ( Hs.mappend
                             ( Hs.mappend
-                                ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 1)
-                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        disposeOrphanRequestAgentSlug
+                                ( Hs.mappend
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 1)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            disposeOrphanRequestAgentSlug
+                                        )
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 2)
+                                        disposeOrphanRequestVerifyPrState
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 2)
-                                    disposeOrphanRequestVerifyPrState
+                                    (HsProtobuf.FieldNumber 3)
+                                    disposeOrphanRequestDryRun
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 3)
-                                disposeOrphanRequestDryRun
+                                (HsProtobuf.FieldNumber 4)
+                                disposeOrphanRequestSweep
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 4)
-                            disposeOrphanRequestSweep
+                            (HsProtobuf.FieldNumber 5)
+                            disposeOrphanRequestAllowNoPr
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 5)
-                        disposeOrphanRequestAllowNoPr
+                        (HsProtobuf.FieldNumber 6)
+                        disposeOrphanRequestDiscardDirty
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 6)
-                    disposeOrphanRequestDiscardDirty
+                    (HsProtobuf.FieldNumber 7)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        disposeOrphanRequestReason
+                    )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 7)
-                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    disposeOrphanRequestReason
-                )
+                (HsProtobuf.FieldNumber 8)
+                disposeOrphanRequestPreserveUniqueCommits
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 8)
-            disposeOrphanRequestPreserveUniqueCommits
+            (HsProtobuf.FieldNumber 9)
+            disposeOrphanRequestDeleteRemoteBranch
         )
   decodeMessage _ =
     Hs.pure DisposeOrphanRequest
@@ -1869,6 +1877,9 @@ instance (HsProtobuf.Message DisposeOrphanRequest) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 8)
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 9)
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -1917,11 +1928,17 @@ instance (HsProtobuf.Message DisposeOrphanRequest) where
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "preserve_unique_commits")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "delete_remote_branch")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB DisposeOrphanRequest) where
-  toJSONPB (DisposeOrphanRequest f1 f2 f3 f4 f5 f6 f7 f8) =
+  toJSONPB (DisposeOrphanRequest f1 f2 f3 f4 f5 f6 f7 f8 f9) =
     HsJSONPB.object
       [ "agent_slug"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -1931,9 +1948,10 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanRequest) where
         "allow_no_pr" .= f5,
         "discard_dirty" .= f6,
         "reason" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
-        "preserve_unique_commits" .= f8
+        "preserve_unique_commits" .= f8,
+        "delete_remote_branch" .= f9
       ]
-  toEncodingPB (DisposeOrphanRequest f1 f2 f3 f4 f5 f6 f7 f8) =
+  toEncodingPB (DisposeOrphanRequest f1 f2 f3 f4 f5 f6 f7 f8 f9) =
     HsJSONPB.pairs
       [ "agent_slug"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -1943,7 +1961,8 @@ instance (HsJSONPB.ToJSONPB DisposeOrphanRequest) where
         "allow_no_pr" .= f5,
         "discard_dirty" .= f6,
         "reason" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
-        "preserve_unique_commits" .= f8
+        "preserve_unique_commits" .= f8,
+        "delete_remote_branch" .= f9
       ]
 
 instance (HsJSONPB.FromJSONPB DisposeOrphanRequest) where
@@ -1964,6 +1983,7 @@ instance (HsJSONPB.FromJSONPB DisposeOrphanRequest) where
                     (obj .: "reason")
                 )
             <*> obj .: "preserve_unique_commits"
+            <*> obj .: "delete_remote_branch"
       )
 
 instance (HsJSONPB.ToJSON DisposeOrphanRequest) where

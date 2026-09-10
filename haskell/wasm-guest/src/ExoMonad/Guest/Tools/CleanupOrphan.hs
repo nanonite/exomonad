@@ -37,7 +37,8 @@ data CleanupOrphanArgs = CleanupOrphanArgs
     coaDryRun :: Bool,
     coaAllowNoPr :: Bool,
     coaDiscardDirty :: Bool,
-    coaPreserveUniqueCommits :: Bool
+    coaPreserveUniqueCommits :: Bool,
+    coaDeleteRemoteBranch :: Bool
   }
   deriving (Generic, Show)
 
@@ -50,6 +51,7 @@ instance FromJSON CleanupOrphanArgs where
       <*> v .:? "allow_no_pr" .!= False
       <*> v .:? "discard_dirty" .!= False
       <*> v .:? "preserve_unique_commits" .!= False
+      <*> v .:? "delete_remote_branch" .!= False
 
 instance ToJSON CleanupOrphanArgs where
   toJSON args =
@@ -59,11 +61,12 @@ instance ToJSON CleanupOrphanArgs where
         "dry_run" .= coaDryRun args,
         "allow_no_pr" .= coaAllowNoPr args,
         "discard_dirty" .= coaDiscardDirty args,
-        "preserve_unique_commits" .= coaPreserveUniqueCommits args
+        "preserve_unique_commits" .= coaPreserveUniqueCommits args,
+        "delete_remote_branch" .= coaDeleteRemoteBranch args
       ]
 
 cleanupOrphanDescription :: Text
-cleanupOrphanDescription = "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Supply reason for auditable operator context."
+cleanupOrphanDescription = "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Set delete_remote_branch=true separately for irreversible lease-protected remote deletion. Supply reason for auditable operator context."
 
 cleanupOrphanSchema :: Aeson.Object
 cleanupOrphanSchema =
@@ -73,7 +76,8 @@ cleanupOrphanSchema =
       ("dry_run", "When true, report what would be removed without removing it. Defaults to false."),
       ("allow_no_pr", "Explicitly authorize cleanup when no pull request owns the managed branch."),
       ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires apply."),
-      ("preserve_unique_commits", "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected.")
+      ("preserve_unique_commits", "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected."),
+      ("delete_remote_branch", "Independently authorize irreversible lease-protected deletion of the exact managed remote branch; never implied by other options.")
     ]
 
 cleanupOrphanCore :: CleanupOrphanArgs -> Eff Effects (Either Text Aeson.Value)
@@ -89,7 +93,8 @@ cleanupOrphanCore args
                 PA.disposeOrphanRequestSweep = False,
                 PA.disposeOrphanRequestAllowNoPr = coaAllowNoPr args,
                 PA.disposeOrphanRequestDiscardDirty = coaDiscardDirty args,
-                PA.disposeOrphanRequestPreserveUniqueCommits = coaPreserveUniqueCommits args
+                PA.disposeOrphanRequestPreserveUniqueCommits = coaPreserveUniqueCommits args,
+                PA.disposeOrphanRequestDeleteRemoteBranch = coaDeleteRemoteBranch args
               }
       result <- suspendEffect @Agent.AgentDisposeOrphan req
       pure $ case result of
@@ -102,6 +107,7 @@ cleanupOrphanOutput args resp =
     [ "success" .= True,
       "agent" .= coaName args,
       "dry_run" .= coaDryRun args,
+      "delete_remote_branch" .= coaDeleteRemoteBranch args,
       "operator_reason" .= lazyText (PA.disposeOrphanResponseOperatorReason resp),
       "preserved_unique_commits" .= PA.disposeOrphanResponsePreservedUniqueCommits resp,
       "verified" .= PA.disposeOrphanResponseVerified resp,

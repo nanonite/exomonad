@@ -38,7 +38,8 @@ data CleanupLeafArgs = CleanupLeafArgs
     claSweep :: Bool,
     claAllowNoPr :: Bool,
     claDiscardDirty :: Bool,
-    claPreserveUniqueCommits :: Bool
+    claPreserveUniqueCommits :: Bool,
+    claDeleteRemoteBranch :: Bool
   }
   deriving (Generic, Show)
 
@@ -52,6 +53,7 @@ instance FromJSON CleanupLeafArgs where
       <*> v .:? "allow_no_pr" .!= False
       <*> v .:? "discard_dirty" .!= False
       <*> v .:? "preserve_unique_commits" .!= False
+      <*> v .:? "delete_remote_branch" .!= False
 
 instance ToJSON CleanupLeafArgs where
   toJSON args =
@@ -62,12 +64,13 @@ instance ToJSON CleanupLeafArgs where
         "sweep" .= claSweep args,
         "allow_no_pr" .= claAllowNoPr args,
         "discard_dirty" .= claDiscardDirty args,
-        "preserve_unique_commits" .= claPreserveUniqueCommits args
+        "preserve_unique_commits" .= claPreserveUniqueCommits args,
+        "delete_remote_branch" .= claDeleteRemoteBranch args
       ]
 
 cleanupLeafDescription :: Text
 cleanupLeafDescription =
-  "Safely dispose an orphan leaf after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Supply reason for auditable operator context."
+  "Safely dispose an orphan leaf after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Set delete_remote_branch=true separately for irreversible lease-protected remote deletion. Supply reason for auditable operator context."
 
 cleanupLeafSchema :: Aeson.Object
 cleanupLeafSchema =
@@ -78,13 +81,14 @@ cleanupLeafSchema =
       ("sweep", "Verify and clean every orphan worktree. Defaults to false."),
       ("allow_no_pr", "Explicitly authorize cleanup when no pull request owns the managed branch; requires a named target."),
       ("discard_dirty", "Explicitly authorize discarding dirty changes for this named agent; requires a named target and apply."),
-      ("preserve_unique_commits", "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected.")
+      ("preserve_unique_commits", "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected."),
+      ("delete_remote_branch", "Independently authorize irreversible lease-protected deletion of the exact managed remote branch; never implied by other options.")
     ]
 
 cleanupLeafCore :: CleanupLeafArgs -> Eff Effects (Either Text Aeson.Value)
 cleanupLeafCore args
   | not (claSweep args) && maybe True (T.null . T.strip) (claName args) = pure $ Left "name is required unless sweep=true"
-  | (claAllowNoPr args || claDiscardDirty args) && claSweep args = pure $ Left "cleanup overrides require a named target"
+  | (claAllowNoPr args || claDiscardDirty args || claPreserveUniqueCommits args || claDeleteRemoteBranch args) && claSweep args = pure $ Left "cleanup overrides require a named target"
   | otherwise = do
       let req =
             PA.DisposeOrphanRequest
@@ -95,7 +99,8 @@ cleanupLeafCore args
                 PA.disposeOrphanRequestSweep = claSweep args,
                 PA.disposeOrphanRequestAllowNoPr = claAllowNoPr args,
                 PA.disposeOrphanRequestDiscardDirty = claDiscardDirty args,
-                PA.disposeOrphanRequestPreserveUniqueCommits = claPreserveUniqueCommits args
+                PA.disposeOrphanRequestPreserveUniqueCommits = claPreserveUniqueCommits args,
+                PA.disposeOrphanRequestDeleteRemoteBranch = claDeleteRemoteBranch args
               }
       result <- suspendEffect @Agent.AgentDisposeOrphan req
       pure $ case result of
@@ -108,6 +113,7 @@ cleanupLeafOutput args resp =
     [ "success" .= True,
       "agent" .= claName args,
       "dry_run" .= claDryRun args,
+      "delete_remote_branch" .= claDeleteRemoteBranch args,
       "operator_reason" .= lazyText (PA.disposeOrphanResponseOperatorReason resp),
       "preserved_unique_commits" .= PA.disposeOrphanResponsePreservedUniqueCommits resp,
       "sweep" .= claSweep args,

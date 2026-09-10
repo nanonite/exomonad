@@ -203,6 +203,10 @@ curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Credential: $EXOMONAD
 curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Credential: $EXOMONAD_CONTROL_TOKEN" \
      -H "Content-Type: application/json" -X POST http://localhost/control/cleanup \
      --data '{"sweep":true,"apply":false}'
+# Preview a named remote-deletion request; apply only after reviewing its receipt.
+curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Credential: $EXOMONAD_CONTROL_TOKEN" \
+     -H "Content-Type: application/json" -X POST http://localhost/control/cleanup \
+     --data '{"target":"<managed-agent-name-or-slug>","sweep":false,"apply":false,"allow_no_pr":true,"delete_remote_branch":true}'
 ```
 
 The `/control` surface adds a schema-versioned read model over run state
@@ -221,7 +225,10 @@ supplied:
     exomonad clean --name <managed-agent-name-or-slug>  # inspect one candidate
     exomonad clean --sweep                              # inspect all candidates
     exomonad clean --sweep --apply                      # apply the reviewed sweep
-    exomonad clean --sweep --apply --delete-remote-branch  # opt in to leased remote deletion
+    exomonad clean --name <managed-agent-name-or-slug> --delete-remote-branch  # preview leased remote deletion
+    exomonad clean --name <managed-agent-name-or-slug> --apply --delete-remote-branch  # apply after review
+    exomonad clean --name <managed-agent-name-or-slug> --apply --allow-no-pr --delete-remote-branch  # named no-PR cleanup
+    exomonad clean --name <managed-agent-name-or-slug> --apply --allow-no-pr --discard-dirty --delete-remote-branch  # named dirty no-PR cleanup
 
 The command requires EXOMONAD_CONTROL_TOKEN and a running project server.
 exomonad init --continue may report a dry-run cleanup candidate count and the
@@ -233,6 +240,11 @@ configured target branch are verified. Remote deletion is never implied by
 expected-head force-with-lease. Current, protected, base, dirty, live,
 ambiguous, open, and closed-unmerged branches are preserved. Without --apply,
 both local and explicitly requested remote actions are preview-only.
+Remote deletion is irreversible, requires a named target, and is rejected for
+sweeps; it is never implied by --apply, --allow-no-pr, --discard-dirty, or
+local branch deletion. No-PR cleanup requires both --allow-no-pr and
+--delete-remote-branch, while dirty no-PR cleanup additionally requires
+--discard-dirty.
 
 Afterwards, the run is measurable rather than merely reviewable. The controller's own decisions — gates opened and answered, slices parked and why, merge decisions, RLM judgment retries — land in the same append-only ledger as agent and PR activity:
 

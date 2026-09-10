@@ -12,6 +12,24 @@ impl VerifiedCleanupService {
         receipt: &mut CleanupReceipt,
         index: usize,
     ) -> Option<CleanupReceiptEntry> {
+        if remote_deletion_was_proven(receipt, index) {
+            return None;
+        }
+        if matches!(
+            receipt.entries[index]
+                .branch
+                .as_ref()
+                .map(|branch| &branch.remote.status),
+            Some(CleanupBranchActionStatus::Deleted)
+        ) {
+            return Some(self.refuse_branch(
+                candidate,
+                receipt,
+                index,
+                false,
+                "cleanup receipt marks remote deletion complete without exact remote, ref, and SHA evidence",
+            ));
+        }
         if !remote_action_requested(candidate, receipt, index) {
             return None;
         }
@@ -27,6 +45,21 @@ impl VerifiedCleanupService {
                 ))
             }
         };
+        if matches!(
+            receipt.entries[index]
+                .branch
+                .as_ref()
+                .map(|branch| &branch.remote.status),
+            Some(CleanupBranchActionStatus::AlreadyAbsent)
+        ) {
+            return Some(self.refuse_branch(
+                candidate,
+                receipt,
+                index,
+                false,
+                "remote branch is absent and no durable receipt proves a prior deletion at the verified SHA",
+            ));
+        }
         if let Some(entry) = self
             .set_branch_pending(candidate, receipt, index, false)
             .await
@@ -51,9 +84,13 @@ impl VerifiedCleanupService {
         let branch = match prepared {
             Ok(RemoteBranchDeletion::Present(branch)) => branch,
             Ok(RemoteBranchDeletion::AlreadyAbsent) => {
-                return self
-                    .finish_absent_branch(candidate, receipt, index, false)
-                    .await
+                return Some(self.refuse_branch(
+                    candidate,
+                    receipt,
+                    index,
+                    false,
+                    "remote branch disappeared before its exact lease could be exercised",
+                ))
             }
             Err(error) => {
                 return Some(self.refuse_branch(
@@ -167,12 +204,32 @@ fn remote_action_requested(
     index: usize,
 ) -> bool {
     candidate.delete_remote_branch
-        && branch_action_is_pending_or_planned(
+        && matches!(
             receipt.entries[index]
                 .branch
                 .as_ref()
                 .map(|branch| &branch.remote.status),
+            Some(
+                CleanupBranchActionStatus::WouldDelete
+                    | CleanupBranchActionStatus::DeletePending
+                    | CleanupBranchActionStatus::AlreadyAbsent
+            )
         )
+}
+
+fn remote_deletion_was_proven(receipt: &CleanupReceipt, index: usize) -> bool {
+    let entry = &receipt.entries[index];
+    let Some(branch) = entry.branch.as_ref() else {
+        return false;
+    };
+    branch.remote.status == CleanupBranchActionStatus::Deleted
+        && entry
+            .actions
+            .iter()
+            .any(|action| action == "delete_remote_branch")
+        && branch.remote_name.is_some()
+        && branch.remote_branch.is_some()
+        && branch.remote_head_sha.is_some()
 }
 
 fn local_action_requested(receipt: &CleanupReceipt, index: usize) -> bool {

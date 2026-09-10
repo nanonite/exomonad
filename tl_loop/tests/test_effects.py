@@ -69,6 +69,7 @@ def test_cleanup_overrides_are_forwarded() -> None:
         allow_no_pr=True,
         discard_dirty=True,
         preserve_unique_commits=True,
+        delete_remote_branch=True,
         reason="abandoned test target",
     )
     client.cleanup_leaf(
@@ -78,6 +79,7 @@ def test_cleanup_overrides_are_forwarded() -> None:
         allow_no_pr=True,
         discard_dirty=True,
         preserve_unique_commits=True,
+        delete_remote_branch=True,
         reason="abandoned test target",
     )
 
@@ -90,6 +92,7 @@ def test_cleanup_overrides_are_forwarded() -> None:
                 "allow_no_pr": True,
                 "discard_dirty": True,
                 "preserve_unique_commits": True,
+                "delete_remote_branch": True,
                 "reason": "abandoned test target",
             },
         ),
@@ -102,10 +105,46 @@ def test_cleanup_overrides_are_forwarded() -> None:
                 "allow_no_pr": True,
                 "discard_dirty": True,
                 "preserve_unique_commits": True,
+                "delete_remote_branch": True,
                 "reason": "abandoned test target",
             },
         ),
     ]
+
+
+def test_cleanup_remote_branch_deletion_defaults_to_false() -> None:
+    transport = RecordingTransport()
+    client = EffectClient(transport)
+
+    client.cleanup_orphan(name="abandoned", dry_run=True)
+    client.cleanup_leaf(name="abandoned", dry_run=True, sweep=False)
+
+    assert transport.calls == [
+        (
+            "cleanup_orphan",
+            {
+                "name": "abandoned",
+                "dry_run": True,
+                "allow_no_pr": False,
+                "discard_dirty": False,
+                "preserve_unique_commits": False,
+                "delete_remote_branch": False,
+            },
+        ),
+        (
+            "cleanup_leaf",
+            {
+                "name": "abandoned",
+                "dry_run": True,
+                "sweep": False,
+                "allow_no_pr": False,
+                "discard_dirty": False,
+                "preserve_unique_commits": False,
+                "delete_remote_branch": False,
+            },
+        ),
+    ]
+
 
 def test_effect_result_decodes_the_server_envelope() -> None:
     """Effects expose a typed envelope while leaving tool-specific results opaque."""

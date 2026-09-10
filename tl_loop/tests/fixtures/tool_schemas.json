@@ -1199,7 +1199,7 @@
       "name": "close_issue_and_cleanup"
     },
     {
-      "description": "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Supply reason for auditable operator context.",
+      "description": "Safely dispose an orphan agent after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Set delete_remote_branch=true separately for irreversible lease-protected remote deletion. Supply reason for auditable operator context.",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -1225,6 +1225,10 @@
           "preserve_unique_commits": {
             "description": "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected.",
             "type": "boolean"
+          },
+          "delete_remote_branch": {
+            "description": "Independently authorize irreversible lease-protected deletion of the exact managed remote branch; never implied by other options.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1232,14 +1236,15 @@
           "dry_run",
           "allow_no_pr",
           "discard_dirty",
-          "preserve_unique_commits"
+          "preserve_unique_commits",
+          "delete_remote_branch"
         ],
         "type": "object"
       },
       "name": "cleanup_orphan"
     },
     {
-      "description": "Safely dispose an orphan leaf after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Supply reason for auditable operator context.",
+      "description": "Safely dispose an orphan leaf after verifying its tmux window is dead and managed identity is coherent. Use allow_no_pr=true for abandoned work without a PR and discard_dirty=true to explicitly discard a named dirty worktree; these overrides require an exact target, and dirty discard requires apply. Set delete_remote_branch=true separately for irreversible lease-protected remote deletion. Supply reason for auditable operator context.",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -1269,6 +1274,10 @@
           "preserve_unique_commits": {
             "description": "Keep unique abandoned commits reachable by preserving the local branch. Without this option they may later be garbage-collected.",
             "type": "boolean"
+          },
+          "delete_remote_branch": {
+            "description": "Independently authorize irreversible lease-protected deletion of the exact managed remote branch; never implied by other options.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1276,7 +1285,8 @@
           "sweep",
           "allow_no_pr",
           "discard_dirty",
-          "preserve_unique_commits"
+          "preserve_unique_commits",
+          "delete_remote_branch"
         ],
         "type": "object"
       },

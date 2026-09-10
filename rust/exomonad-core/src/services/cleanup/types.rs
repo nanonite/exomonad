@@ -77,7 +77,12 @@ impl CleanupRequest {
         if !self.sweep && self.target.is_none() {
             bail!("cleanup requires a named target or sweep=true");
         }
-        if (self.allow_no_pr || self.discard_dirty) && self.sweep {
+        if (self.allow_no_pr
+            || self.discard_dirty
+            || self.preserve_unique_commits
+            || self.delete_remote_branch)
+            && self.sweep
+        {
             bail!("cleanup overrides require a named target");
         }
         if self.discard_dirty && !self.apply {

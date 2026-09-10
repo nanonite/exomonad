@@ -174,6 +174,8 @@ message DisposeOrphanRequest {
   string reason = 7;
   // Keep the managed local branch reachable to preserve unique abandoned commits.
   bool preserve_unique_commits = 8;
+  // Independently authorize lease-protected deletion of the managed remote branch.
+  bool delete_remote_branch = 9;
 }
 
 message DisposeOrphanResponse {

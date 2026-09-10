@@ -53,6 +53,9 @@ fn dry_run_entry(candidate: &CleanupCandidate) -> CleanupReceiptEntry {
         if candidate.discard_dirty && candidate.dirty == Some(true) {
             actions.push("record_dirty_evidence".to_string());
         }
+        if candidate.delete_remote_branch {
+            actions.push("delete_remote_branch_override".to_string());
+        }
         if candidate.worktree_path.is_some() && !candidate.resolver_only {
             actions.push("remove_worktree".to_string());
         }

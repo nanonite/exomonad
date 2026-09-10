@@ -71,6 +71,7 @@ fn cleanup_defaults_to_a_non_mutating_sweep() {
     let request = CleanupRequest::default();
     assert!(request.sweep);
     assert!(!request.apply);
+    assert!(!request.delete_remote_branch);
 }
 
 #[test]
@@ -152,6 +153,19 @@ fn cleanup_overrides_require_named_apply_for_dirty_discard() {
     let request = CleanupRequest {
         apply: true,
         ..request
+    };
+    assert!(request.validate().is_ok());
+
+    let request = CleanupRequest {
+        delete_remote_branch: true,
+        ..CleanupRequest::default()
+    };
+    assert!(request.validate().is_err());
+    let request = CleanupRequest {
+        target: Some("abandoned-codex".to_string()),
+        sweep: false,
+        delete_remote_branch: true,
+        ..CleanupRequest::default()
     };
     assert!(request.validate().is_ok());
 }
@@ -1331,6 +1345,9 @@ async fn no_pr_remote_cleanup_uses_verified_remote_head_and_preserves_unique_com
     assert!(receipt.entries[0]
         .actions
         .contains(&"preserve_unique_commits".to_string()));
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"delete_remote_branch_override".to_string()));
     assert!(!fixture.worktree.exists());
     assert!(!fixture.agent_dir.exists());
     assert_eq!(
@@ -1398,6 +1415,38 @@ async fn remote_branch_deletion_uses_an_exact_expected_head_lease() {
             .unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn remote_deletion_refuses_an_absent_branch_without_a_prior_receipt() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    run_git(
+        fixture.services.project_dir.as_path(),
+        &["push", "-q", "origin", "--delete", "main.stale"],
+    );
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Refused);
+    assert!(receipt.entries[0]
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("remote deletion")));
+    assert_eq!(
+        receipt.entries[0].branch.as_ref().unwrap().remote.status,
+        CleanupBranchActionStatus::Refused
+    );
+    assert!(fixture.worktree.exists());
+    assert!(fixture.agent_dir.exists());
 }
 
 #[tokio::test]

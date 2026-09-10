@@ -124,6 +124,10 @@ dirty targets without the separate discard confirmation, are reported and
 left in place. This tool
 shares the existing resource-disposal implementation with `cleanup_orphan`;
 it does not force cleanup, close PRs, or replace the automatic reconciler.
+`delete_remote_branch=true` is a separate irreversible opt-in: it requires an
+exact named target and removes only the verified configured remote ref with an
+expected-head lease; it is never implied by apply or any other override and is
+not valid for sweeps.
 Without the explicit `preserve_unique_commits=true` option, abandoned
 unreferenced commits may later be garbage-collected; preserving them keeps the
 local branch reachable and does not preserve remote history.

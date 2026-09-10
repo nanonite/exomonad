@@ -675,6 +675,7 @@ class EffectClient:
         allow_no_pr: bool = False,
         discard_dirty: bool = False,
         preserve_unique_commits: bool = False,
+        delete_remote_branch: bool = False,
         reason: str | None = None,
     ) -> ToolResult:
         return self._call(
@@ -685,6 +686,7 @@ class EffectClient:
                 "allow_no_pr": allow_no_pr,
                 "discard_dirty": discard_dirty,
                 "preserve_unique_commits": preserve_unique_commits,
+                "delete_remote_branch": delete_remote_branch,
                 **({"reason": reason} if reason is not None else {}),
             },
         )
@@ -698,6 +700,7 @@ class EffectClient:
         allow_no_pr: bool = False,
         discard_dirty: bool = False,
         preserve_unique_commits: bool = False,
+        delete_remote_branch: bool = False,
         reason: str | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {
@@ -706,6 +709,7 @@ class EffectClient:
             "allow_no_pr": allow_no_pr,
             "discard_dirty": discard_dirty,
             "preserve_unique_commits": preserve_unique_commits,
+            "delete_remote_branch": delete_remote_branch,
         }
         _put(arguments, "name", name)
         _put(arguments, "reason", reason);
