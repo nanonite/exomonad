@@ -222,6 +222,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Extend opt-in remote branch deletion across verified cleanup overrides (#1082)
 - cleanup_leaf/cleanup_orphan MCP tools still call the legacy cleanup_merged_agents path, not VerifiedCleanupService (#1077)
 - Cleanup liveness tie-break requires ambient tmux session instead of querying the server (#1076)
 - Delete verified stale branches with merge and lease safeguards (#1072)
