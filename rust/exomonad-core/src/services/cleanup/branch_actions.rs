@@ -338,6 +338,7 @@ mod tests {
             managed: true,
             resolver_only: false,
             recovery_receipt: true,
+            recovered_provenance: None,
             agent_name: "recovered".to_string(),
             issue: None,
             agent_dir: PathBuf::from(".exo/agents/recovered"),

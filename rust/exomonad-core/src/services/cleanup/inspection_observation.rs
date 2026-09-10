@@ -1,6 +1,6 @@
 use super::service::VerifiedCleanupService;
 use super::support::*;
-use super::types::CleanupDirtyEvidence;
+use super::types::{CleanupDirtyEvidence, CleanupRecoveredProvenance};
 use crate::services::agent_control::Topology;
 use crate::services::agent_resolver::AgentIdentityRecord;
 use std::path::PathBuf;
@@ -21,6 +21,7 @@ impl VerifiedCleanupService {
         discovered_worktree: Option<PathBuf>,
         identity: Option<&AgentIdentityRecord>,
         identity_error: Option<&str>,
+        recovered_provenance: Option<&CleanupRecoveredProvenance>,
     ) -> WorktreeObservation {
         let resolved_working_dir = identity
             .map(|identity| resolve_path(&self.project_dir, &identity.working_dir))
@@ -36,8 +37,12 @@ impl VerifiedCleanupService {
             identity,
             &mut identity_drift,
         );
-        let observed_branch = if let Some(worktree) = &worktree_path {
-            workspace_branch(worktree).await.ok().flatten()
+        let observed_branch = if recovered_provenance.is_none() {
+            if let Some(worktree) = &worktree_path {
+                workspace_branch(worktree).await.ok().flatten()
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -50,6 +55,7 @@ impl VerifiedCleanupService {
             .observe_existing_worktree(
                 &worktree_path,
                 identity.map(|identity| identity.birth_branch.as_str()),
+                recovered_provenance.is_some(),
             )
             .await;
         identity_drift |= worktree_drift;
@@ -88,12 +94,22 @@ impl VerifiedCleanupService {
         &self,
         worktree_path: &Option<PathBuf>,
         expected_branch: Option<&str>,
+        recovered: bool,
     ) -> (Option<bool>, Option<CleanupDirtyEvidence>, bool) {
         let Some(worktree) = worktree_path else {
             return (Some(false), None, false);
         };
         if !worktree.exists() {
             return (Some(false), None, false);
+        }
+        if recovered {
+            let canonical = fs::canonicalize(worktree).await.ok();
+            let root = workspace_git_root(worktree).await.ok().flatten();
+            return (
+                Some(false),
+                None,
+                canonical.zip(root).is_some_and(|(path, root)| path == root),
+            );
         }
         let Ok(canonical_worktree) = fs::canonicalize(worktree).await else {
             return (None, None, true);

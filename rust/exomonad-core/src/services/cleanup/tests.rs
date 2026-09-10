@@ -7,8 +7,10 @@ use crate::services::agent_control::{
     InvocationTrigger, Topology,
 };
 use crate::services::agent_resolver::AgentIdentityRecord;
+use crate::services::event_log::EventLog;
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::mutex_registry::MutexRegistry;
+use crate::services::pr_registry::{publish_verified_head, PublicationProvenance, PublishedHead};
 use crate::services::repo::RepositoryIdentity;
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::services::tmux_ipc::{TmuxIpc, WindowId};
@@ -457,6 +459,7 @@ fn duplicate_local_branches_are_refused() {
         managed: true,
         resolver_only: false,
         recovery_receipt: false,
+        recovered_provenance: None,
         agent_name: id.to_string(),
         issue: None,
         agent_dir: PathBuf::from(".exo/agents").join(id),
@@ -1181,6 +1184,193 @@ async fn real_cleanup_fixture() -> RealCleanupFixture {
 }
 
 #[tokio::test]
+async fn recovered_merged_pr_residual_uses_verified_provenance_end_to_end() {
+    let mut fixture = real_cleanup_fixture().await;
+    let project = fixture.services.project_dir.clone();
+    let branch = fixture.record.birth_branch.to_string();
+    let branch_sha = local_branch_state(&project, &branch)
+        .await
+        .unwrap()
+        .unwrap();
+    run_git(
+        &project,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            fixture.worktree.to_str().unwrap(),
+        ],
+    );
+    run_git(&project, &["worktree", "prune", "--expire", "now"]);
+    tokio::fs::create_dir_all(fixture.worktree.join(".exo/runtime"))
+        .await
+        .unwrap();
+    tokio::fs::remove_dir_all(&fixture.agent_dir).await.unwrap();
+    fixture
+        .services
+        .agent_resolver
+        .deregister(&fixture.record.agent_name)
+        .await
+        .unwrap();
+    run_git(
+        &project,
+        &["merge", "--no-ff", "-qm", "merge recovered PR", &branch],
+    );
+    run_git(&project, &["push", "-q", "origin", "main"]);
+    let merge_sha = local_branch_state(&project, "main").await.unwrap().unwrap();
+
+    fixture._forgejo.reset().await;
+    Mock::given(matchers::method("GET"))
+        .and(matchers::path("/api/v1/repos/owner/repo/pulls"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "number": 43,
+                "title": "Recovered merged branch",
+                "body": "",
+                "state": "closed",
+                "merged": true,
+                "merge_commit_sha": merge_sha,
+                "html_url": "http://forgejo.test/owner/repo/pulls/43",
+                "head": {"ref": branch, "sha": branch_sha},
+                "base": {"ref": "main", "sha": merge_sha}
+            }])),
+        )
+        .mount(&fixture._forgejo)
+        .await;
+
+    let event_log = EventLog::open(project.join(".exo/events")).unwrap();
+    event_log
+        .append(
+            "agent.spawned",
+            "root",
+            &serde_json::json!({
+                "child_agent": "stale-codex",
+                "agent_type": "codex",
+                "branch": branch,
+                "topology": "worktreeperagent"
+            }),
+        )
+        .unwrap();
+    event_log
+        .append(
+            "pr.published",
+            "stale-codex",
+            &serde_json::json!({
+                "agent_id": "stale-codex",
+                "pr_number": 43,
+                "head_branch": branch,
+                "base_branch": "main",
+                "head_sha": branch_sha
+            }),
+        )
+        .unwrap();
+    event_log
+        .append(
+            "agent.invocation.finished",
+            "stale-codex",
+            &serde_json::json!({
+                "invocation_id": "inv-43",
+                "slice_id": "slice-43",
+                "outcome": "finished",
+                "status": "exited",
+                "branch": branch,
+                "head_sha": branch_sha,
+                "pr_number": 43
+            }),
+        )
+        .unwrap();
+    publish_verified_head(
+        &project,
+        PublishedHead {
+            pr_number: 43,
+            head_branch: branch.clone(),
+            base_branch: "main".to_string(),
+            head_sha: branch_sha.clone(),
+            author_agent: Some("stale-codex".to_string()),
+            author_role: Some("dev".to_string()),
+            provenance: PublicationProvenance::LedgerOwned,
+            slice_id: Some("slice-43".to_string()),
+            invocation_id: Some("inv-43".to_string()),
+            invocation_trigger: Some("spawn".to_string()),
+            invocation_runtime: Some("codex".to_string()),
+            invocation_succession: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    fixture.services.event_log = Some(Arc::new(event_log));
+
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        delete_remote_branch: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let candidate = &plan.candidates[0];
+    assert_eq!(candidate.decision, CleanupDecision::Cleanable);
+    assert_eq!(candidate.local_branch.as_deref(), Some(branch.as_str()));
+    assert_eq!(
+        candidate.pull_request.as_ref().map(|pr| pr.number),
+        Some(43)
+    );
+    assert_eq!(
+        candidate
+            .branch
+            .as_ref()
+            .and_then(|branch| branch.branch.as_deref()),
+        Some(branch.as_str())
+    );
+    assert!(candidate
+        .recovered_provenance
+        .as_ref()
+        .is_some_and(|evidence| evidence.identity_sources.len() >= 3));
+
+    let mut interrupted = service
+        .resume_or_create_receipt(&plan, request.target.as_deref(), 1)
+        .await
+        .unwrap();
+    assert!(service
+        .execute_remote_branch_action(candidate, &mut interrupted, 0)
+        .await
+        .is_none());
+    interrupted.entries[0].status = CleanupReceiptStatus::Failed;
+    interrupted.entries[0].reason = Some("simulated downstream cleanup failure".to_string());
+    service.persist_receipt(&interrupted).await.unwrap();
+    tokio::fs::remove_dir_all(&fixture.worktree).await.unwrap();
+    let recovered_resources = service.discover_resources(&request).await.unwrap();
+    assert!(recovered_resources.iter().any(|resource| {
+        resource.id == fixture.record.agent_name.as_str()
+            && resource.recovered_provenance.is_some()
+            && resource.worktree_path.as_ref() == Some(&fixture.worktree)
+    }));
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(receipt.entries[0].recovered_provenance.is_some());
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"worktree_already_absent".to_string()));
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"delete_remote_branch".to_string()));
+    assert!(!fixture.worktree.exists());
+    assert!(!fixture.agent_dir.exists());
+    assert!(local_branch_state(&project, &branch)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(remote_branch_state(&project, "origin", &branch)
+        .await
+        .unwrap()
+        .is_none());
+    let second = service.apply(&request).await.unwrap();
+    assert!(second.entries.is_empty());
+}
+
+#[tokio::test]
 async fn dirty_no_pr_cleanup_removes_resources_registries_and_is_idempotent() {
     let fixture = real_cleanup_fixture().await;
     let service = fixture.services.cleanup_service();
@@ -1884,6 +2074,7 @@ async fn service_preserves_branch_checked_out_in_a_linked_worktree() {
         managed: true,
         resolver_only: false,
         recovery_receipt: false,
+        recovered_provenance: None,
         agent_name: record.agent_name.to_string(),
         issue: None,
         agent_dir,

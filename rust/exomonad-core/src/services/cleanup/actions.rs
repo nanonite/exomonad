@@ -161,33 +161,57 @@ impl VerifiedCleanupService {
         };
         let worktree_present = path_exists(worktree).await;
         if worktree_present {
-            let git_worktree = self.git_worktree.clone();
-            let path = worktree.clone();
-            match tokio::task::spawn_blocking(move || git_worktree.remove_workspace(&path)).await {
-                Ok(Ok(())) => {
-                    actions.push("remove_worktree".to_string());
-                    if candidate.discard_dirty && candidate.dirty == Some(true) {
-                        actions.push("discard_dirty_changes".to_string());
-                    }
-                    if candidate.delete_remote_branch {
-                        actions.push("delete_remote_branch_override".to_string());
-                    }
-                }
-                Ok(Err(error)) => {
+            if candidate.recovered_provenance.is_some() {
+                if let Err(error) = self.revalidate_recovered_residual(candidate).await {
                     return Some(failed(
                         candidate,
                         receipt,
                         index,
-                        format!("remove worktree: {error}"),
-                    ))
-                }
-                Err(error) => {
-                    return Some(failed(
-                        candidate,
-                        receipt,
-                        index,
-                        format!("remove worktree task: {error}"),
+                        format!("revalidate recovered residual: {error}"),
                     ));
+                }
+                match fs::remove_dir_all(worktree).await {
+                    Ok(()) => actions.push("remove_recovered_residual".to_string()),
+                    Err(error) => {
+                        return Some(failed(
+                            candidate,
+                            receipt,
+                            index,
+                            format!("remove recovered residual: {error}"),
+                        ));
+                    }
+                }
+            } else {
+                let git_worktree = self.git_worktree.clone();
+                let path = worktree.clone();
+                match tokio::task::spawn_blocking(move || git_worktree.remove_workspace(&path))
+                    .await
+                {
+                    Ok(Ok(())) => {
+                        actions.push("remove_worktree".to_string());
+                        if candidate.discard_dirty && candidate.dirty == Some(true) {
+                            actions.push("discard_dirty_changes".to_string());
+                        }
+                        if candidate.delete_remote_branch {
+                            actions.push("delete_remote_branch_override".to_string());
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        return Some(failed(
+                            candidate,
+                            receipt,
+                            index,
+                            format!("remove worktree: {error}"),
+                        ))
+                    }
+                    Err(error) => {
+                        return Some(failed(
+                            candidate,
+                            receipt,
+                            index,
+                            format!("remove worktree task: {error}"),
+                        ));
+                    }
                 }
             }
         } else {
@@ -388,6 +412,7 @@ mod tests {
             managed: true,
             resolver_only: false,
             recovery_receipt: false,
+            recovered_provenance: None,
             agent_name: "stale-codex".to_string(),
             issue: None,
             agent_dir: "agent".into(),

@@ -196,6 +196,19 @@ pub struct CleanupDirtyEvidence {
     pub head_sha: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Evidence sources that justify cleanup-only provenance recovery.
+pub struct CleanupRecoveredProvenance {
+    #[serde(default)]
+    pub identity_sources: Vec<String>,
+    #[serde(default)]
+    pub branch_sources: Vec<String>,
+    #[serde(default)]
+    pub pull_request_sources: Vec<String>,
+    #[serde(default)]
+    pub liveness_sources: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CleanupBranchEvidence {
     #[serde(default)]
@@ -242,6 +255,8 @@ pub struct CleanupCandidate {
     pub resolver_only: bool,
     #[serde(default)]
     pub recovery_receipt: bool,
+    #[serde(default)]
+    pub recovered_provenance: Option<CleanupRecoveredProvenance>,
     pub agent_name: String,
     pub issue: Option<String>,
     pub agent_dir: PathBuf,
@@ -320,6 +335,8 @@ pub struct CleanupReceiptEntry {
     pub agent_slug: String,
     #[serde(default)]
     pub identity_snapshot: Option<AgentIdentityRecord>,
+    #[serde(default)]
+    pub recovered_provenance: Option<CleanupRecoveredProvenance>,
     #[serde(default)]
     pub pull_request: Option<CleanupPullRequest>,
     #[serde(default)]

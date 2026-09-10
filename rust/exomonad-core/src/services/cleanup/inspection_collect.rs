@@ -16,6 +16,7 @@ pub(super) struct ObservedResource {
     pub(super) identity_error: Option<String>,
     pub(super) resolver_only: bool,
     pub(super) recovery_receipt: bool,
+    pub(super) recovered_provenance: Option<CleanupRecoveredProvenance>,
     pub(super) worktree: WorktreeObservation,
     pub(super) issue: Option<String>,
 }
@@ -48,6 +49,7 @@ impl VerifiedCleanupService {
                 observed.recovery_receipt,
                 &observed.agent_dir,
                 observed.worktree.worktree_path.as_ref(),
+                observed.recovered_provenance.is_some(),
             )
             .await;
         CandidateFacts::from_observations(observed, local, remote, pull_request, liveness, context)
@@ -84,6 +86,7 @@ impl VerifiedCleanupService {
             identity_error,
             resolver_only,
             recovery_receipt,
+            recovered_provenance,
         } = resource;
         let worktree = self
             .observe_worktree(
@@ -91,6 +94,7 @@ impl VerifiedCleanupService {
                 worktree_path,
                 identity.as_ref(),
                 identity_error.as_deref(),
+                recovered_provenance.as_ref(),
             )
             .await;
         let issue = read_active_issue(&agent_dir).await;
@@ -101,6 +105,7 @@ impl VerifiedCleanupService {
             identity_error,
             resolver_only,
             recovery_receipt,
+            recovered_provenance,
             worktree,
             issue,
         }
@@ -161,11 +166,13 @@ impl VerifiedCleanupService {
         recovery_receipt: bool,
         agent_dir: &Path,
         worktree_path: Option<&PathBuf>,
+        recovered_provenance: bool,
     ) -> CleanupLiveness {
-        if resolver_only
-            && recovery_receipt
-            && !agent_dir.exists()
-            && worktree_path.is_none_or(|path| !path.exists())
+        if recovered_provenance
+            || (resolver_only
+                && recovery_receipt
+                && !agent_dir.exists()
+                && worktree_path.is_none_or(|path| !path.exists()))
         {
             CleanupLiveness::Dead
         } else {

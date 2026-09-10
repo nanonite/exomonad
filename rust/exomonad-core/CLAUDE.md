@@ -267,6 +267,19 @@ The existing issue → agent identity → worktree → branch/PR ownership remai
 unchanged. Invocation ID/runtime/trigger fields are optional context attached
 to the publication, never a second owner model.
 
+### Verified cleanup provenance recovery
+
+Cleanup may recover a missing agent identity only for a plain, unregistered
+directory directly below .exo/worktrees that contains only nested .exo runtime
+state. The append-only ledger, published-head registry, local and
+configured-remote refs, and exactly one matching merged PR must agree on the
+agent, branch, base, and head SHA; a finished invocation record must also bind
+the publication. Recovery is cleanup-only evidence and never re-registers the
+resolver identity. A real Git worktree, dirty residual contents, missing or
+conflicting evidence, a protected branch, or an ambiguous PR remains refused.
+Recovered cleanup records every evidence source in its plan and durable receipt
+and uses the same liveness, branch, and exact-lease checks as ordinary cleanup.
+
 Inbox and exact-pane tmux delivery are guidance channels. Injection success,
 process exit, and local push events do not advance watcher state; publication,
 Forgejo review verdicts, and CI observations remain the state-machine inputs.

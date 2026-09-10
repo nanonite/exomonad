@@ -28,6 +28,23 @@ impl VerifiedCleanupService {
             .collect())
     }
 
+    pub(super) async fn recoverable_receipt_entries(&self) -> Result<Vec<CleanupReceiptEntry>> {
+        let receipts = self.read_receipts().await?;
+        Ok(receipts
+            .into_iter()
+            .filter(|receipt| !receipt.dry_run)
+            .flat_map(|receipt| receipt.entries)
+            .filter(|entry| {
+                matches!(
+                    &entry.status,
+                    CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Failed
+                )
+            })
+            .filter(receipt_snapshot_is_coherent)
+            .filter(|entry| entry.recovered_provenance.is_some())
+            .collect())
+    }
+
     pub(super) async fn resume_or_create_receipt(
         &self,
         plan: &CleanupPlan,

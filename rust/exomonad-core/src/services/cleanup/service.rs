@@ -3,6 +3,7 @@ use super::support::*;
 use super::types::*;
 use crate::services::agent_control::Topology;
 use crate::services::agent_resolver::AgentResolver;
+use crate::services::event_log::EventLog;
 use crate::services::forgejo::ForgejoClient;
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::mutex_registry::MutexRegistry;
@@ -32,6 +33,7 @@ pub struct VerifiedCleanupService {
     pub(super) team_registry: Arc<TeamRegistry>,
     pub(super) supervisor_registry: Arc<SupervisorRegistry>,
     pub(super) claude_session_registry: Arc<ClaudeSessionRegistry>,
+    pub(super) event_log: Option<Arc<EventLog>>,
     #[cfg(test)]
     pub(super) receipt_persist_calls: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -59,6 +61,7 @@ impl VerifiedCleanupService {
             team_registry: Arc::new(TeamRegistry::new()),
             supervisor_registry: Arc::new(SupervisorRegistry::new()),
             claude_session_registry: Arc::new(ClaudeSessionRegistry::new()),
+            event_log: None,
             #[cfg(test)]
             receipt_persist_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -78,6 +81,7 @@ impl VerifiedCleanupService {
         cleanup.team_registry = services.team_registry.clone();
         cleanup.supervisor_registry = services.supervisor_registry.clone();
         cleanup.claude_session_registry = services.claude_session_registry.clone();
+        cleanup.event_log = services.event_log.clone();
         cleanup
     }
 

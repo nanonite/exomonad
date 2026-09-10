@@ -4102,6 +4102,7 @@ mod tests {
                 agent_name: "leaf".to_string(),
                 agent_slug: "leaf-slug".to_string(),
                 identity_snapshot: None,
+                recovered_provenance: None,
                 pull_request: None,
                 branch: None,
                 status: exomonad_core::services::CleanupReceiptStatus::WouldClean,

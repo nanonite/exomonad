@@ -16,6 +16,7 @@ pub(super) struct DiscoveredResource {
     pub(super) identity_error: Option<String>,
     pub(super) resolver_only: bool,
     pub(super) recovery_receipt: bool,
+    pub(super) recovered_provenance: Option<CleanupRecoveredProvenance>,
 }
 
 impl VerifiedCleanupService {
@@ -27,6 +28,7 @@ impl VerifiedCleanupService {
         let mut resources = Vec::new();
         let resolver_records = self.resolver.all().await;
         let recovery_identities = self.in_progress_identity_snapshots().await?;
+        let recovery_entries = self.recoverable_receipt_entries().await?;
         let agent_entries = match fs::read_dir(&agents_dir).await {
             Ok(entries) => Some(entries),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -55,6 +57,7 @@ impl VerifiedCleanupService {
                     identity_error,
                     resolver_only: false,
                     recovery_receipt: false,
+                    recovered_provenance: None,
                 });
             }
         }
@@ -73,10 +76,17 @@ impl VerifiedCleanupService {
                 if !file_type.is_dir() || file_type.is_symlink() {
                     continue;
                 }
-                self.attach_worktree_resource(&mut resources, entry.path(), &resolver_records)
-                    .await;
+                self.attach_worktree_resource(
+                    &mut resources,
+                    entry.path(),
+                    &resolver_records,
+                    &recovery_entries,
+                )
+                .await;
             }
         }
+
+        self.append_recovered_receipt_resources(&mut resources, &recovery_entries);
 
         self.append_resolver_only_resources(
             &mut resources,
@@ -103,6 +113,38 @@ impl VerifiedCleanupService {
         }
         resources.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(resources)
+    }
+
+    fn append_recovered_receipt_resources(
+        &self,
+        resources: &mut Vec<DiscoveredResource>,
+        recovery_entries: &[CleanupReceiptEntry],
+    ) {
+        for entry in recovery_entries {
+            let Some(identity) = &entry.identity_snapshot else {
+                continue;
+            };
+            if resources.iter().any(|resource| {
+                resource.id == identity.agent_name.as_str()
+                    || resource.identity.as_ref() == Some(identity)
+            }) {
+                continue;
+            }
+            resources.push(DiscoveredResource {
+                id: identity.agent_name.to_string(),
+                agent_dir: self
+                    .project_dir
+                    .join(".exo/agents")
+                    .join(identity.agent_name.as_str()),
+                worktree_path: (identity.topology == Topology::WorktreePerAgent)
+                    .then(|| resolve_path(&self.project_dir, &identity.working_dir)),
+                identity: Some(identity.clone()),
+                identity_error: None,
+                resolver_only: false,
+                recovery_receipt: true,
+                recovered_provenance: entry.recovered_provenance.clone(),
+            });
+        }
     }
 
     async fn authoritative_identity(
@@ -153,6 +195,7 @@ impl VerifiedCleanupService {
         resources: &mut Vec<DiscoveredResource>,
         path: PathBuf,
         resolver_records: &[AgentIdentityRecord],
+        recovery_entries: &[CleanupReceiptEntry],
     ) {
         let worktree_name = path
             .file_name()
@@ -194,6 +237,15 @@ impl VerifiedCleanupService {
                     && resolve_path(&self.project_dir, &identity.working_dir) == path
             })
             .cloned();
+        if matching_identity.is_none() {
+            if let Some(recovered) = self
+                .recover_residual_resource(&path, resolver_records, recovery_entries)
+                .await
+            {
+                resources.push(recovered);
+                return;
+            }
+        }
         resources.push(DiscoveredResource {
             id: id.to_string(),
             agent_dir: matching_identity
@@ -209,6 +261,7 @@ impl VerifiedCleanupService {
             identity_error: Some("worktree is not backed by a verified identity".to_string()),
             resolver_only: false,
             recovery_receipt: false,
+            recovered_provenance: None,
         });
     }
 
@@ -250,6 +303,7 @@ impl VerifiedCleanupService {
                 recovery_receipt: recovery_identities
                     .iter()
                     .any(|historical| historical == identity),
+                recovered_provenance: None,
             });
         }
     }

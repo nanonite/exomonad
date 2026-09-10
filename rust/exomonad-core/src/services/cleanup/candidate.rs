@@ -20,6 +20,14 @@ impl VerifiedCleanupService {
                 .execute_resolver_only(candidate, receipt, index, expected)
                 .await;
         }
+        if candidate.recovered_provenance.is_some() {
+            if let Err(error) = self.revalidate_recovered_residual(candidate).await {
+                return refused(candidate, error.to_string());
+            }
+            return self
+                .execute_destructive_actions(candidate, receipt, index)
+                .await;
+        }
         let current = match self.load_current_identity(candidate).await {
             Ok(identity) => identity,
             Err(entry) => return entry,
@@ -67,6 +75,9 @@ impl VerifiedCleanupService {
         &self,
         candidate: &CleanupCandidate,
     ) -> anyhow::Result<()> {
+        if candidate.recovered_provenance.is_some() {
+            return self.revalidate_recovered_residual(candidate).await;
+        }
         let expected = candidate
             .identity
             .as_ref()

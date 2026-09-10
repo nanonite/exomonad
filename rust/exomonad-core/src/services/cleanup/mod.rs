@@ -15,6 +15,7 @@ mod inspection_observation;
 mod inspection_support;
 mod receipt_support;
 mod receipts;
+mod recovery;
 mod service;
 mod support;
 #[cfg(test)]
@@ -25,6 +26,7 @@ pub use self::service::VerifiedCleanupService;
 pub use self::types::{
     CleanupBranchAction, CleanupBranchActionStatus, CleanupBranchEvidence, CleanupCandidate,
     CleanupDecision, CleanupDirtyEvidence, CleanupLiveness, CleanupPlan, CleanupPullRequest,
-    CleanupReceipt, CleanupReceiptEntry, CleanupReceiptStatus, CleanupRequest, CleanupTargetBranch,
-    CLEANUP_PLAN_SCHEMA_VERSION, CLEANUP_RECEIPT_SCHEMA_VERSION,
+    CleanupReceipt, CleanupReceiptEntry, CleanupReceiptStatus, CleanupRecoveredProvenance,
+    CleanupRequest, CleanupTargetBranch, CLEANUP_PLAN_SCHEMA_VERSION,
+    CLEANUP_RECEIPT_SCHEMA_VERSION,
 };

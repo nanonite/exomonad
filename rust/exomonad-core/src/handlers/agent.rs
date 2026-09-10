@@ -4753,6 +4753,7 @@ mod tests {
                 agent_name: "leaf-codex".to_string(),
                 agent_slug: "feature-codex".to_string(),
                 identity_snapshot: None,
+                recovered_provenance: None,
                 pull_request: None,
                 branch: None,
                 status: CleanupReceiptStatus::WouldClean,
@@ -4788,6 +4789,7 @@ mod tests {
                 agent_name: "leaf-codex".to_string(),
                 agent_slug: "feature-codex".to_string(),
                 identity_snapshot: None,
+                recovered_provenance: None,
                 pull_request: None,
                 branch: Some(crate::services::CleanupBranchEvidence {
                     branch: Some("main.feature-codex".to_string()),

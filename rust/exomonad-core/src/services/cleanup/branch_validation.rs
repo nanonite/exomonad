@@ -18,7 +18,11 @@ impl VerifiedCleanupService {
         let evidence = branch_evidence(candidate)?;
         let branch = branch_name(candidate, evidence)?;
         let identity = managed_identity(candidate)?;
-        self.validate_resolver_identity(identity).await?;
+        if candidate.recovered_provenance.is_some() {
+            self.revalidate_recovered_residual(candidate).await?;
+        } else {
+            self.validate_resolver_identity(identity).await?;
+        }
         let repository = self.validate_repository(evidence).await?;
         let target = fetch_target_branch(
             &self.project_dir,
