@@ -13,7 +13,12 @@ impl VerifiedCleanupService {
         index: usize,
     ) -> CleanupReceiptEntry {
         let Some(expected) = candidate.identity.as_ref() else {
-            return refused(candidate, "managed identity is missing or malformed");
+            return refused_with_progress(
+                candidate,
+                receipt,
+                index,
+                "managed identity is missing or malformed",
+            );
         };
         if candidate.resolver_only {
             return self
@@ -22,7 +27,7 @@ impl VerifiedCleanupService {
         }
         if candidate.recovered_provenance.is_some() {
             if let Err(error) = self.revalidate_recovered_residual(candidate).await {
-                return refused(candidate, error.to_string());
+                return refused_with_progress(candidate, receipt, index, error.to_string());
             }
             return self
                 .execute_destructive_actions(candidate, receipt, index)
@@ -30,16 +35,43 @@ impl VerifiedCleanupService {
         }
         let current = match self.load_current_identity(candidate).await {
             Ok(identity) => identity,
-            Err(entry) => return entry,
+            Err(entry) => {
+                return if matches!(entry.status, CleanupReceiptStatus::Refused) {
+                    refused_with_progress(
+                        candidate,
+                        receipt,
+                        index,
+                        entry
+                            .reason
+                            .unwrap_or_else(|| "cleanup was refused".to_string()),
+                    )
+                } else {
+                    entry
+                }
+            }
         };
         if let Some(entry) = self
             .validate_identity_and_liveness(candidate, expected, &current)
             .await
         {
-            return entry;
+            return refused_with_progress(
+                candidate,
+                receipt,
+                index,
+                entry
+                    .reason
+                    .unwrap_or_else(|| "cleanup was refused".to_string()),
+            );
         }
         if let Some(entry) = self.validate_worktree(candidate, expected).await {
-            return entry;
+            return refused_with_progress(
+                candidate,
+                receipt,
+                index,
+                entry
+                    .reason
+                    .unwrap_or_else(|| "cleanup was refused".to_string()),
+            );
         }
         self.execute_destructive_actions(candidate, receipt, index)
             .await

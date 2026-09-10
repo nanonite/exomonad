@@ -211,6 +211,41 @@ async fn dry_run_refuses_remote_deletion_without_branch_evidence() {
     assert!(agent_dir.exists());
 }
 
+#[tokio::test]
+async fn dry_run_refuses_absent_remote_branch_without_deletion_receipt() {
+    let fixture = real_cleanup_fixture().await;
+    run_git(fixture.worktree.as_path(), &["restore", "README"]);
+    tokio::fs::remove_file(fixture.worktree.join("abandoned.txt"))
+        .await
+        .unwrap();
+    run_git(
+        fixture.services.project_dir.as_path(),
+        &["push", "-q", "origin", "--delete", "main.stale"],
+    );
+
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        delete_remote_branch: true,
+        allow_no_pr: true,
+        ..CleanupRequest::default()
+    };
+
+    let receipt = service.run(&request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Refused);
+    assert_eq!(
+        receipt.entries[0].reason.as_deref(),
+        Some("remote deletion requested but remote branch is absent and no durable receipt proves a prior deletion at the verified SHA")
+    );
+    assert_eq!(
+        receipt.entries[0].branch.as_ref().unwrap().remote.status,
+        CleanupBranchActionStatus::Refused
+    );
+    assert!(fixture.worktree.exists());
+    assert!(fixture.agent_dir.exists());
+}
+
 #[test]
 fn no_pr_override_only_bypasses_missing_pr_observation() {
     let identity = identity(Topology::WorktreePerAgent);
@@ -1838,6 +1873,40 @@ async fn remote_deletion_revalidates_worktree_at_mutation_boundary() {
 }
 
 #[tokio::test]
+async fn mutation_refusal_preserves_resumed_cleanup_audit_marker() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let candidate = &plan.candidates[0];
+    let mut receipt = in_progress_receipt(&plan, 1);
+    receipt.entries[0]
+        .actions
+        .push("resumed_cleanup".to_string());
+    tokio::fs::write(fixture.worktree.join("late-change.txt"), "late\n")
+        .await
+        .unwrap();
+
+    let entry = service.execute_candidate(candidate, &mut receipt, 0).await;
+
+    assert_eq!(entry.status, CleanupReceiptStatus::Refused);
+    assert!(entry.actions.contains(&"resumed_cleanup".to_string()));
+    assert!(entry
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("dirty worktree changed since planning")));
+    assert!(fixture.worktree.exists());
+    assert!(fixture.agent_dir.exists());
+}
+
+#[tokio::test]
 async fn remote_deletion_revalidates_liveness_at_mutation_boundary() {
     let fixture = real_cleanup_fixture().await;
     let service = fixture.services.cleanup_service();
@@ -2072,6 +2141,64 @@ async fn retry_preserve_unique_commits_normalizes_historical_local_deletion() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn refused_retry_preserves_resumed_cleanup_audit_marker() {
+    let fixture = real_cleanup_fixture().await;
+    let service = fixture.services.cleanup_service();
+    let initial_request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        ..CleanupRequest::default()
+    };
+    let initial_plan = service.plan(&initial_request).await.unwrap();
+    let mut failed = in_progress_receipt(&initial_plan, 1);
+    failed.operation_id = "refused-retry".to_string();
+    failed.entries[0].status = CleanupReceiptStatus::Failed;
+    failed.entries[0].reason = Some("simulated cleanup interruption".to_string());
+    service.persist_receipt(&failed).await.unwrap();
+
+    let retry_request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        allow_no_pr: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&retry_request).await.unwrap();
+    assert_eq!(
+        plan.candidates[0].decision,
+        CleanupDecision::Refused {
+            reason: "worktree is dirty; discard_dirty authorization is required".to_string(),
+        }
+    );
+
+    let receipt = service.run(&retry_request).await.unwrap();
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Refused);
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"resumed_cleanup".to_string()));
+    assert!(fixture.worktree.exists());
+    assert!(fixture.agent_dir.exists());
+
+    let persisted: CleanupReceipt = serde_json::from_slice(
+        &tokio::fs::read(
+            service
+                .receipt_dir()
+                .join(format!("{}.json", receipt.operation_id)),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted.entries[0].status, CleanupReceiptStatus::Refused);
+    assert!(persisted.entries[0]
+        .actions
+        .contains(&"resumed_cleanup".to_string()));
 }
 
 #[tokio::test]

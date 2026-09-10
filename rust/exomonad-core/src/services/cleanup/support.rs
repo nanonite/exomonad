@@ -18,6 +18,39 @@ use tokio::process::Command;
 pub(super) const DEREGISTER_PENDING: &str = "deregister_identity_pending";
 pub(super) const PROGRESS_PERSISTENCE_FAILURE: &str = "persist cleanup progress";
 
+pub(super) fn refused_with_progress(
+    candidate: &CleanupCandidate,
+    receipt: &CleanupReceipt,
+    index: usize,
+    reason: impl Into<String>,
+) -> CleanupReceiptEntry {
+    let previous = &receipt.entries[index];
+    let mut entry = receipt_entry(
+        candidate,
+        CleanupReceiptStatus::Refused,
+        previous.actions.clone(),
+        Some(reason.into()),
+    );
+    entry.identity_snapshot = previous
+        .identity_snapshot
+        .clone()
+        .or_else(|| candidate.identity.clone());
+    entry.recovered_provenance = previous
+        .recovered_provenance
+        .clone()
+        .or_else(|| candidate.recovered_provenance.clone());
+    entry.pull_request = previous
+        .pull_request
+        .clone()
+        .or_else(|| candidate.pull_request.clone());
+    entry.branch = previous.branch.clone().or_else(|| candidate.branch.clone());
+    entry.dirty_evidence = previous
+        .dirty_evidence
+        .clone()
+        .or_else(|| candidate.dirty_evidence.clone());
+    entry
+}
+
 pub(super) fn requested_target_matches(
     target: Option<&str>,
     entry_name: &str,

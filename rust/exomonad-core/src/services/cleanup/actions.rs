@@ -87,8 +87,10 @@ impl VerifiedCleanupService {
         expected: &AgentIdentityRecord,
     ) -> CleanupReceiptEntry {
         if !candidate.recovery_receipt {
-            return refused(
+            return refused_with_progress(
                 candidate,
+                receipt,
+                index,
                 "resolver-only cleanup lacks a matching in-progress receipt",
             );
         }
@@ -98,16 +100,28 @@ impl VerifiedCleanupService {
                 .as_ref()
                 .is_some_and(|path| path_exists_sync(path))
         {
-            return refused(candidate, "managed resource reappeared since planning");
+            return refused_with_progress(
+                candidate,
+                receipt,
+                index,
+                "managed resource reappeared since planning",
+            );
         }
         if self.resolver.get(&expected.agent_name).await.as_ref() != Some(expected) {
-            return refused(candidate, "resolver identity changed since planning");
+            return refused_with_progress(
+                candidate,
+                receipt,
+                index,
+                "resolver identity changed since planning",
+            );
         }
         if receipt.entries[index].identity_snapshot.as_ref() != Some(expected)
             || !receipt_entry_identity_is_coherent(&receipt.entries[index], expected)
         {
-            return refused(
+            return refused_with_progress(
                 candidate,
+                receipt,
+                index,
                 "cleanup receipt identity differs from the resolver",
             );
         }
@@ -368,15 +382,6 @@ impl VerifiedCleanupService {
 
 async fn path_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).await.is_ok()
-}
-
-fn refused(candidate: &CleanupCandidate, reason: impl Into<String>) -> CleanupReceiptEntry {
-    receipt_entry(
-        candidate,
-        CleanupReceiptStatus::Refused,
-        Vec::new(),
-        Some(reason.into()),
-    )
 }
 
 fn failed(

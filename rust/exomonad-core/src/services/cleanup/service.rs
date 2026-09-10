@@ -142,6 +142,10 @@ impl VerifiedCleanupService {
             };
             candidates.push(self.inspect_candidate(resource, context).await);
         }
+        for candidate in &mut candidates {
+            self.refuse_unproven_absent_remote(candidate, request.delete_remote_branch)
+                .await?;
+        }
         refuse_duplicate_branches(&mut candidates);
         Ok(CleanupPlan {
             schema_version: CLEANUP_PLAN_SCHEMA_VERSION,
@@ -155,6 +159,34 @@ impl VerifiedCleanupService {
             candidates,
             fetched_target,
         })
+    }
+
+    async fn refuse_unproven_absent_remote(
+        &self,
+        candidate: &mut CleanupCandidate,
+        requested: bool,
+    ) -> Result<()> {
+        let remote_is_absent = candidate.branch.as_ref().is_some_and(|branch| {
+            matches!(
+                branch.remote.status,
+                CleanupBranchActionStatus::AlreadyAbsent
+            )
+        });
+        if !requested
+            || !candidate.decision.is_cleanable()
+            || !remote_is_absent
+            || self.has_prior_remote_deletion_proof(candidate).await?
+        {
+            return Ok(());
+        }
+        let reason =
+            "remote deletion requested but remote branch is absent and no durable receipt proves a prior deletion at the verified SHA";
+        candidate.decision = CleanupDecision::refusal(reason);
+        if let Some(branch) = candidate.branch.as_mut() {
+            branch.remote.status = CleanupBranchActionStatus::Refused;
+            branch.remote.reason = Some(reason.to_string());
+        }
+        Ok(())
     }
 
     pub async fn run(&self, request: &CleanupRequest) -> Result<CleanupReceipt> {

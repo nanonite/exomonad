@@ -65,7 +65,7 @@ impl VerifiedCleanupService {
                 receipt,
                 index,
                 false,
-                "remote branch is absent and no durable receipt proves a prior deletion at the verified SHA",
+                "remote deletion requested but remote branch is absent and no durable receipt proves a prior deletion at the verified SHA",
             ));
         }
         if let Some(entry) = self

@@ -11,11 +11,11 @@ impl VerifiedCleanupService {
     ) -> Result<()> {
         for (index, candidate) in plan.candidates.iter().enumerate() {
             if !candidate.decision.is_cleanable() {
-                receipt.entries[index] = receipt_entry(
+                receipt.entries[index] = refused_with_progress(
                     candidate,
-                    CleanupReceiptStatus::Refused,
-                    Vec::new(),
-                    candidate.decision.reason().map(ToOwned::to_owned),
+                    receipt,
+                    index,
+                    candidate.decision.reason().unwrap_or("cleanup was refused"),
                 );
                 continue;
             }

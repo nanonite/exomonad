@@ -13,6 +13,45 @@ use tokio::fs;
 const RESUMED_CLEANUP_ACTION: &str = "resumed_cleanup";
 
 impl VerifiedCleanupService {
+    pub(super) async fn has_prior_remote_deletion_proof(
+        &self,
+        candidate: &CleanupCandidate,
+    ) -> Result<bool> {
+        let Some(branch) = candidate.branch.as_ref() else {
+            return Ok(false);
+        };
+        let Some(remote_name) = branch
+            .remote_name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(false);
+        };
+        let Some(remote_branch) = branch
+            .branch
+            .as_deref()
+            .or(candidate.local_branch.as_deref())
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(false);
+        };
+        Ok(self
+            .read_receipts()
+            .await?
+            .iter()
+            .filter(|receipt| !receipt.dry_run)
+            .any(|receipt| {
+                receipt.entries.iter().any(|entry| {
+                    receipt_entry_proves_remote_deletion(
+                        entry,
+                        candidate,
+                        remote_name,
+                        remote_branch,
+                    )
+                })
+            }))
+    }
+
     pub(super) async fn in_progress_identity_snapshots(&self) -> Result<Vec<AgentIdentityRecord>> {
         let receipts = self.read_receipts().await?;
         Ok(receipts
@@ -338,4 +377,36 @@ fn receipt_snapshot_is_coherent(entry: &CleanupReceiptEntry) -> bool {
         entry.agent_name == snapshot.agent_name.as_str()
             && entry.agent_slug == snapshot.slug.as_str()
     })
+}
+
+fn receipt_entry_proves_remote_deletion(
+    entry: &CleanupReceiptEntry,
+    candidate: &CleanupCandidate,
+    remote_name: &str,
+    remote_branch: &str,
+) -> bool {
+    let Some(evidence) = entry.branch.as_ref() else {
+        return false;
+    };
+    let evidence_branch = evidence
+        .remote_branch
+        .as_deref()
+        .or(evidence.branch.as_deref());
+    matches!(evidence.remote.status, CleanupBranchActionStatus::Deleted)
+        && entry
+            .actions
+            .iter()
+            .any(|action| action == "delete_remote_branch")
+        && receipt_entry_matches_candidate(entry, candidate)
+        && evidence.remote_name.as_deref() == Some(remote_name)
+        && evidence_branch == Some(remote_branch)
+        && evidence
+            .remote_head_sha
+            .as_deref()
+            .is_some_and(|sha| !sha.is_empty())
+        && candidate
+            .pull_request
+            .as_ref()
+            .and_then(|pull_request| pull_request.head_sha.as_deref())
+            .is_none_or(|head| evidence.remote_head_sha.as_deref() == Some(head))
 }
