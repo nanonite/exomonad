@@ -37,7 +37,10 @@ class PreflightReport:
 
 
 def run_preflight(
-    project_root: str | Path, *, allow_missing_plan: bool = False
+    project_root: str | Path,
+    *,
+    allow_missing_plan: bool = False,
+    expected_plan_hex: str | None = None,
 ) -> PreflightReport:
     """Validate controller files, policy coverage, and the structured plan."""
     root = Path(project_root).expanduser().resolve()
@@ -47,6 +50,7 @@ def run_preflight(
     review_path = exo / "review-policy.toml"
     capability_path = exo / "harness_capability.toml"
     plan_path = root / PLAN_PATH
+    expected_plan = _decode_expected_plan(expected_plan_hex)
 
     fingerprint = fingerprint_report(root)
     if fingerprint["status"] in {"stale", "invalid"}:
@@ -67,9 +71,11 @@ def run_preflight(
         policy = load_policy(policy_path)
         load_review_policy(review_path)
         if plan_path.is_file():
-            _validate_plan(plan_path)
+            _validate_plan(plan_path, expected_plan)
         elif not allow_missing_plan:
             raise PreflightError(f"missing required TL file: {plan_path}")
+        elif expected_plan is not None:
+            raise PreflightError(f"expected plan bytes but {plan_path} is missing")
         if not capability_path.is_file():
             raise PreflightError(
                 f"missing required TL file: {capability_path}\n\n"
@@ -112,9 +118,23 @@ def _require_files(paths: tuple[Path, ...]) -> None:
         raise PreflightError(f"missing required TL file(s): {names}")
 
 
-def _validate_plan(path: Path) -> None:
+def _decode_expected_plan(expected_plan_hex: str | None) -> bytes | None:
+    if expected_plan_hex is None:
+        return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        return bytes.fromhex(expected_plan_hex)
+    except ValueError as error:
+        raise PreflightError("expected plan identity is not valid hexadecimal") from error
+
+
+def _validate_plan(path: Path, expected_plan: bytes | None = None) -> None:
+    try:
+        plan_bytes = path.read_bytes()
+        if expected_plan is not None and plan_bytes != expected_plan:
+            raise PreflightError(f"{path}: plan changed during preflight validation")
+        value = json.loads(plan_bytes.decode("utf-8"))
+    except PreflightError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PreflightError(f"{path}: invalid plan: {error}") from error
     try:

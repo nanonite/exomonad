@@ -92,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_preflight(
                 args.project_root,
                 allow_missing_plan=args.allow_missing_plan,
+                expected_plan_hex=args.expected_plan_hex,
             )
             print(
                 "TL preflight passed: config.toml, harness_policy.toml, review-policy.toml, harness_capability.toml"
@@ -242,6 +243,7 @@ def _parser() -> argparse.ArgumentParser:
     preflight = subcommands.add_parser("preflight", help="validate required TL controller files")
     _add_project_options(preflight)
     preflight.add_argument("--allow-missing-plan", action="store_true")
+    preflight.add_argument("--expected-plan-hex")
     preflight.set_defaults(command="preflight")
 
     return parser
@@ -281,9 +283,9 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         plan_document: dict[str, object] = {"run_id": args.run_id}
         plan = None
     else:
-        plan_document = _load_plan(plan_path, args.wait_for_plan)
+        plan_document, accepted_plan_bytes = _load_plan(plan_path, args.wait_for_plan)
         plan = _plan_from_document(plan_document)
-        _record_plan_snapshot(project_root, plan_path)
+        _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
     run_id = _run_id(plan_document, args.run_id)
     ledger_run_id = _authoritative_ledger_run_id(project_root)
     session_mode = _read_session_mode(project_root)
@@ -357,7 +359,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         source.close(timeout=1.0)
 
 
-def _load_plan(path: Path, wait_for_plan: bool) -> dict[str, object]:
+def _load_plan(path: Path, wait_for_plan: bool) -> tuple[dict[str, object], bytes]:
     if wait_for_plan:
         announced = False
         while not path.exists():
@@ -376,19 +378,23 @@ def _load_plan(path: Path, wait_for_plan: bool) -> dict[str, object]:
             f"plan is missing at {path}; write a JSON WorkPlan or start with --wait-for-plan"
         )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        plan_bytes = path.read_bytes()
+        value = json.loads(plan_bytes.decode("utf-8"))
     except json.JSONDecodeError as error:
         raise LauncherError(f"plan {path} is not valid JSON: {error}") from error
     try:
-        return validate_plan_document(value)
+        return validate_plan_document(value), plan_bytes
     except PlanValidationError as error:
         raise LauncherError(f"plan {path} is invalid: {error}") from error
 
 
-def _record_plan_snapshot(project_root: Path, plan_path: Path) -> None:
+def _record_plan_snapshot(
+    project_root: Path, plan_path: Path, plan_bytes: bytes | None = None
+) -> None:
     """Persist the exact accepted plan bytes before the controller owns them."""
     snapshot_path = project_root / ".exo" / "tl-loop" / "plan.snapshot"
-    plan_bytes = plan_path.read_bytes()
+    if plan_bytes is None:
+        plan_bytes = plan_path.read_bytes()
     if snapshot_path.exists():
         if snapshot_path.read_bytes() != plan_bytes:
             raise LauncherError(
@@ -406,7 +412,8 @@ def _redispatch(args: argparse.Namespace) -> None:
         raise LauncherError("redispatch requires --confirm; no attempt was started")
     project_root = args.project_root.expanduser().resolve()
     plan_path = _resolve_under_project(project_root, args.plan)
-    plan = _plan_from_document(_load_plan(plan_path, wait_for_plan=False))
+    plan_document, _ = _load_plan(plan_path, wait_for_plan=False)
+    plan = _plan_from_document(plan_document)
     state_root = project_root / ".exo" / "tl-loop"
     store = RunStore(args.run_id, state_root)
     state = store.load()

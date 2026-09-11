@@ -511,7 +511,10 @@ fn ensure_start_allowed(project_dir: &Path) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 enum StartPlanDecision {
     Continue,
-    NewRun { archive_terminal: bool },
+    NewRun {
+        archive_terminal: bool,
+        validated_plan: Option<Vec<u8>>,
+    },
 }
 
 fn requested_plan_bytes(project_dir: &Path) -> Result<Option<Vec<u8>>> {
@@ -537,15 +540,15 @@ fn resolve_start_plan(project_dir: &Path) -> Result<StartPlanDecision> {
     // Plan identity is intentionally byte-for-byte. The snapshot preserves the
     // exact authored document so formatting-only edits are still explicit drift.
     let identical = requested.is_some() && requested == snapshot;
+    let new_run = |archive_terminal| StartPlanDecision::NewRun {
+        archive_terminal,
+        validated_plan: requested.clone(),
+    };
 
     match checkpoint {
-        StartupCheckpoint::Missing => Ok(StartPlanDecision::NewRun {
-            archive_terminal: false,
-        }),
+        StartupCheckpoint::Missing => Ok(new_run(false)),
         StartupCheckpoint::TerminalOrParked { .. } if identical => Ok(StartPlanDecision::Continue),
-        StartupCheckpoint::TerminalOrParked { .. } => Ok(StartPlanDecision::NewRun {
-            archive_terminal: true,
-        }),
+        StartupCheckpoint::TerminalOrParked { .. } => Ok(new_run(true)),
         StartupCheckpoint::Nonterminal { phase: _ } if identical => Ok(StartPlanDecision::Continue),
         StartupCheckpoint::Nonterminal { phase } => {
             let identity = if snapshot.is_some() {
@@ -567,11 +570,14 @@ fn prepare_start_plan(project_dir: &Path) -> Result<StartPlanDecision> {
 fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<SessionMode> {
     match decision {
         StartPlanDecision::Continue => Ok(SessionMode::Continue),
-        StartPlanDecision::NewRun { archive_terminal } => {
+        StartPlanDecision::NewRun {
+            archive_terminal,
+            validated_plan,
+        } => {
             if archive_terminal {
                 archive_root_tl_run(project_dir)?;
             }
-            if let Some(requested) = requested_plan_bytes(project_dir)? {
+            if let Some(requested) = validated_plan {
                 write_plan_snapshot(&plan_snapshot_path(project_dir), &requested)?;
             } else if let Err(error) = std::fs::remove_file(plan_snapshot_path(project_dir)) {
                 if error.kind() != std::io::ErrorKind::NotFound {
@@ -579,6 +585,15 @@ fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<S
                 }
             }
             Ok(SessionMode::Start)
+        }
+    }
+}
+
+impl StartPlanDecision {
+    fn validated_plan(&self) -> Option<&[u8]> {
+        match self {
+            Self::Continue => None,
+            Self::NewRun { validated_plan, .. } => validated_plan.as_deref(),
         }
     }
 }
@@ -1624,7 +1639,12 @@ fn check_tl_loop_python(cwd: &Path) -> Result<String> {
     Ok(interpreter)
 }
 
-fn run_tl_loop_preflight(cwd: &Path, package_root: &Path, allow_missing_plan: bool) -> Result<()> {
+fn run_tl_loop_preflight(
+    cwd: &Path,
+    package_root: &Path,
+    allow_missing_plan: bool,
+    expected_plan: Option<&[u8]>,
+) -> Result<()> {
     let interpreter = check_tl_loop_python(cwd)?;
     let mut command = std::process::Command::new(interpreter);
     command.args([
@@ -1638,6 +1658,10 @@ fn run_tl_loop_preflight(cwd: &Path, package_root: &Path, allow_missing_plan: bo
     if allow_missing_plan {
         command.arg("--allow-missing-plan");
     }
+    let expected_plan_hex = expected_plan.map(hex_encode);
+    if let Some(plan_hex) = expected_plan_hex.as_deref() {
+        command.args(["--expected-plan-hex", plan_hex]);
+    }
     let status = command
         .status()
         .context("failed to run TL controller preflight")?;
@@ -1645,6 +1669,16 @@ fn run_tl_loop_preflight(cwd: &Path, package_root: &Path, allow_missing_plan: bo
         anyhow::bail!("TL controller preflight failed with {status}");
     }
     Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn validate_publication_registry_schema(cwd: &Path) -> Result<()> {
@@ -2653,9 +2687,10 @@ pub async fn run(
     ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
     if let Some(decision) = start_plan_decision {
+        let expected_plan = decision.validated_plan().map(ToOwned::to_owned);
         mode = apply_start_plan_after_validation(&cwd, decision, || {
             if skip_preflight {
-                if requested_plan_bytes(&cwd)?.is_some() {
+                if expected_plan.is_some() {
                     anyhow::bail!(
                         "--skip-preflight cannot be used with --start when plan.json exists; the requested plan must be validated before replacing runtime state"
                     );
@@ -2663,7 +2698,7 @@ pub async fn run(
                 warn!("Skipping TL controller preflight for --start without a plan");
                 return Ok(());
             }
-            run_tl_loop_preflight(&cwd, &tl_loop_root, true)
+            run_tl_loop_preflight(&cwd, &tl_loop_root, true, expected_plan.as_deref())
         })?;
     } else {
         if mode == SessionMode::Continue {
@@ -2677,7 +2712,7 @@ pub async fn run(
         if skip_preflight {
             warn!("Skipping TL controller preflight by explicit request");
         } else {
-            run_tl_loop_preflight(&cwd, &tl_loop_root, false)?;
+            run_tl_loop_preflight(&cwd, &tl_loop_root, false, None)?;
         }
     }
 
@@ -4613,6 +4648,29 @@ mod tests {
     }
 
     #[test]
+    fn start_plan_apply_uses_validated_bytes_without_rereading_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let validated = br#"{"plan":{"leaves":[{"name":"validated"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        std::fs::write(&plan, validated).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+
+        let decision = prepare_start_plan(dir.path()).unwrap();
+        std::fs::write(&plan, b"unvalidated bytes").unwrap();
+        apply_start_plan(dir.path(), decision).unwrap();
+
+        assert!(!root.exists());
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            validated
+        );
+    }
+
+    #[test]
     fn start_without_plan_clears_snapshot_for_wait_for_plan() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".exo/tl-loop/root");
@@ -4658,7 +4716,8 @@ mod tests {
         assert_eq!(
             prepare_start_plan(dir.path()).unwrap(),
             StartPlanDecision::NewRun {
-                archive_terminal: true
+                archive_terminal: true,
+                validated_plan: Some(reformatted.to_vec()),
             }
         );
     }
@@ -4917,6 +4976,10 @@ mod tests {
         );
         assert_eq!(
             tl_window_recovery_action(true, true, false),
+            TlWindowRecoveryAction::RemoveAndRelaunch
+        );
+        assert_eq!(
+            tl_window_recovery_action(true, false, false),
             TlWindowRecoveryAction::RemoveAndRelaunch
         );
     }

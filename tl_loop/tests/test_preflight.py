@@ -129,7 +129,27 @@ def test_wait_for_plan_snapshot_preserves_accepted_bytes(tmp_path: Path) -> None
     )
     with pytest.raises(tl_main.LauncherError, match="immutable session snapshot"):
         tl_main._record_plan_snapshot(project, plan)
-    assert snapshot.read_bytes() == accepted
+
+
+def test_preflight_rejects_plan_bytes_that_changed_after_capture(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    plan = project / ".exo" / "tl-loop" / "plan.json"
+    accepted = plan.read_bytes()
+    plan.write_bytes(b'{"plan":{"workers":[{"name":"changed"}]}}')
+
+    with pytest.raises(PreflightError, match="changed during preflight validation"):
+        run_preflight(project, expected_plan_hex=accepted.hex())
+
+
+def test_snapshot_uses_captured_plan_bytes_without_rereading_source(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    plan = project / ".exo" / "tl-loop" / "plan.json"
+    accepted = plan.read_bytes()
+    plan.write_bytes(b'{"plan":{"workers":[{"name":"changed"}]}}')
+
+    tl_main._record_plan_snapshot(project, plan, accepted)
+
+    assert (project / ".exo" / "tl-loop" / "plan.snapshot").read_bytes() == accepted
 
 
 def test_exit_reason_is_diagnostic_only(tmp_path: Path) -> None:
