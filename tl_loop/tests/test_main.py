@@ -139,6 +139,7 @@ def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(launcher, "EffectClient", lambda *a, **kw: object())
     monkeypatch.setattr(launcher, "LedgerReader", lambda *a, **kw: object())
     monkeypatch.setattr(launcher, "_load_plan", lambda path, wait: {"plan": {}})
+    monkeypatch.setattr(launcher, "_record_plan_snapshot", lambda root, plan: None)
     monkeypatch.setattr(launcher, "_plan_from_document", lambda document: object())
     monkeypatch.setattr(launcher, "_run_id", lambda document, configured: "root")
     monkeypatch.setattr(launcher, "_authoritative_ledger_run_id", lambda root: None)

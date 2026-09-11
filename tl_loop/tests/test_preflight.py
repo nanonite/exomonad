@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
+import tl_loop.preflight as preflight_module
 from tl_loop import __main__ as tl_main
 from tl_loop.preflight import PreflightError, capability_example, run_preflight
-import tl_loop.preflight as preflight_module
 from tl_loop.select.policy import load_policy
 from tl_loop.state.store import RunStore
 
@@ -102,6 +102,34 @@ def test_missing_and_invalid_plan_fail_preflight(tmp_path: Path) -> None:
     plan.write_text("{\"plan\": {\"unknown\": true}}", encoding="utf-8")
     with pytest.raises(PreflightError, match="invalid plan"):
         run_preflight(project)
+
+
+def test_allow_missing_plan_supports_wait_for_plan_startup(tmp_path: Path) -> None:
+    project = _project(tmp_path, capability="standard")
+    (project / ".exo" / "tl-loop" / "plan.json").unlink()
+
+    report = run_preflight(project, allow_missing_plan=True)
+
+    assert project / ".exo" / "tl-loop" / "plan.json" not in report.files
+
+
+def test_wait_for_plan_snapshot_preserves_accepted_bytes(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    plan = project / ".exo" / "tl-loop" / "plan.json"
+    accepted = b'{"plan":{"workers":[],"leaves":[],"sub_tls":[]}}\n'
+    plan.write_bytes(accepted)
+
+    tl_main._record_plan_snapshot(project, plan)
+
+    snapshot = project / ".exo" / "tl-loop" / "plan.snapshot"
+    assert snapshot.read_bytes() == accepted
+    plan.write_text(
+        '{\n  "plan": {"workers": [], "leaves": [], "sub_tls": []}\n}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(tl_main.LauncherError, match="immutable session snapshot"):
+        tl_main._record_plan_snapshot(project, plan)
+    assert snapshot.read_bytes() == accepted
 
 
 def test_exit_reason_is_diagnostic_only(tmp_path: Path) -> None:

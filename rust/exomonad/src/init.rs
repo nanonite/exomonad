@@ -534,6 +534,8 @@ fn resolve_start_plan(project_dir: &Path) -> Result<StartPlanDecision> {
             Err(error).with_context(|| format!("failed to read {}", snapshot_path.display()))?
         }
     };
+    // Plan identity is intentionally byte-for-byte. The snapshot preserves the
+    // exact authored document so formatting-only edits are still explicit drift.
     let identical = requested.is_some() && requested == snapshot;
 
     match checkpoint {
@@ -558,8 +560,12 @@ fn resolve_start_plan(project_dir: &Path) -> Result<StartPlanDecision> {
     }
 }
 
-fn prepare_start_plan(project_dir: &Path) -> Result<SessionMode> {
-    match resolve_start_plan(project_dir)? {
+fn prepare_start_plan(project_dir: &Path) -> Result<StartPlanDecision> {
+    resolve_start_plan(project_dir)
+}
+
+fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<SessionMode> {
+    match decision {
         StartPlanDecision::Continue => Ok(SessionMode::Continue),
         StartPlanDecision::NewRun { archive_terminal } => {
             if archive_terminal {
@@ -567,10 +573,26 @@ fn prepare_start_plan(project_dir: &Path) -> Result<SessionMode> {
             }
             if let Some(requested) = requested_plan_bytes(project_dir)? {
                 write_plan_snapshot(&plan_snapshot_path(project_dir), &requested)?;
+            } else if let Err(error) = std::fs::remove_file(plan_snapshot_path(project_dir)) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error).context("failed to clear stale TL plan snapshot");
+                }
             }
             Ok(SessionMode::Start)
         }
     }
+}
+
+fn apply_start_plan_after_validation<F>(
+    project_dir: &Path,
+    decision: StartPlanDecision,
+    validate: F,
+) -> Result<SessionMode>
+where
+    F: FnOnce() -> Result<()>,
+{
+    validate()?;
+    apply_start_plan(project_dir, decision)
 }
 
 fn report_legacy_session(project_dir: &Path, mode: SessionMode) {
@@ -1602,17 +1624,21 @@ fn check_tl_loop_python(cwd: &Path) -> Result<String> {
     Ok(interpreter)
 }
 
-fn run_tl_loop_preflight(cwd: &Path, package_root: &Path) -> Result<()> {
+fn run_tl_loop_preflight(cwd: &Path, package_root: &Path, allow_missing_plan: bool) -> Result<()> {
     let interpreter = check_tl_loop_python(cwd)?;
-    let status = std::process::Command::new(interpreter)
-        .args([
-            package_root
-                .to_str()
-                .context("TL archive path is not UTF-8")?,
-            "preflight",
-            "--project-root",
-        ])
-        .arg(cwd)
+    let mut command = std::process::Command::new(interpreter);
+    command.args([
+        package_root
+            .to_str()
+            .context("TL archive path is not UTF-8")?,
+        "preflight",
+        "--project-root",
+    ]);
+    command.arg(cwd);
+    if allow_missing_plan {
+        command.arg("--allow-missing-plan");
+    }
+    let status = command
         .status()
         .context("failed to run TL controller preflight")?;
     if !status.success() {
@@ -1916,7 +1942,7 @@ fn read_startup_checkpoint(project_dir: &Path) -> Result<StartupCheckpoint> {
                 .map(|error| (slice_id.clone(), error.to_string()))
         })
         .collect::<Vec<_>>();
-    if matches!(phase, "tl_done" | "tl_failed") || !pending_gates.is_empty() {
+    if matches!(phase, "tl_done" | "tl_failed") {
         return Ok(StartupCheckpoint::TerminalOrParked {
             phase: phase.to_string(),
             pending_gates,
@@ -2169,7 +2195,10 @@ async fn reconcile_existing_session(
         None => false,
     };
     let root_needs_resume = root_tl_needs_resume(project_dir)?;
-    if !should_recover_tl_window(restart_tl, tl_alive, root_needs_resume) {
+    if matches!(
+        tl_window_recovery_action(restart_tl, tl_alive, root_needs_resume),
+        TlWindowRecoveryAction::Keep
+    ) {
         return Ok(());
     }
 
@@ -2585,10 +2614,12 @@ pub async fn run(
             "--confirm-recreate, --force-recreate, and --recreate-dry-run require --recreate"
         );
     }
-    if mode == SessionMode::Start {
+    let start_plan_decision = if mode == SessionMode::Start {
         write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
-        mode = prepare_start_plan(&cwd)?;
-    }
+        Some(prepare_start_plan(&cwd)?)
+    } else {
+        None
+    };
     let recreate_plan = if recreate {
         prepare_recreate(
             &cwd,
@@ -2621,18 +2652,33 @@ pub async fn run(
     std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, &runtime_paths);
     ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
-    if mode == SessionMode::Continue {
-        validate_or_record_plan_snapshot(&cwd, mode)?;
+    if let Some(decision) = start_plan_decision {
+        mode = apply_start_plan_after_validation(&cwd, decision, || {
+            if skip_preflight {
+                if requested_plan_bytes(&cwd)?.is_some() {
+                    anyhow::bail!(
+                        "--skip-preflight cannot be used with --start when plan.json exists; the requested plan must be validated before replacing runtime state"
+                    );
+                }
+                warn!("Skipping TL controller preflight for --start without a plan");
+                return Ok(());
+            }
+            run_tl_loop_preflight(&cwd, &tl_loop_root, true)
+        })?;
     } else {
-        if mode == SessionMode::Recreate {
-            write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
+        if mode == SessionMode::Continue {
+            validate_or_record_plan_snapshot(&cwd, mode)?;
+        } else {
+            if mode == SessionMode::Recreate {
+                write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
+            }
+            validate_or_record_plan_snapshot(&cwd, mode)?;
         }
-        validate_or_record_plan_snapshot(&cwd, mode)?;
-    }
-    if skip_preflight {
-        warn!("Skipping TL controller preflight by explicit request");
-    } else {
-        run_tl_loop_preflight(&cwd, &tl_loop_root)?;
+        if skip_preflight {
+            warn!("Skipping TL controller preflight by explicit request");
+        } else {
+            run_tl_loop_preflight(&cwd, &tl_loop_root, false)?;
+        }
     }
 
     if !import_legacy.is_empty() {
@@ -3673,8 +3719,21 @@ fn should_attach_existing_session(recreate: bool, session_alive: bool) -> bool {
     session_alive && !recreate
 }
 
-fn should_recover_tl_window(force_restart: bool, tl_alive: bool, root_needs_resume: bool) -> bool {
-    force_restart || (!tl_alive && root_needs_resume)
+#[derive(Debug, PartialEq, Eq)]
+enum TlWindowRecoveryAction {
+    Keep,
+    RemoveAndRelaunch,
+}
+
+fn tl_window_recovery_action(
+    force_restart: bool,
+    tl_alive: bool,
+    root_needs_resume: bool,
+) -> TlWindowRecoveryAction {
+    if force_restart || (!tl_alive && root_needs_resume) {
+        return TlWindowRecoveryAction::RemoveAndRelaunch;
+    }
+    TlWindowRecoveryAction::Keep
 }
 
 /// Refresh orphan timeout baselines for agents that predate this `exomonad init` session.
@@ -4455,7 +4514,7 @@ mod tests {
             StartPlanDecision::Continue
         );
         assert_eq!(
-            prepare_start_plan(dir.path()).unwrap(),
+            apply_start_plan(dir.path(), prepare_start_plan(dir.path()).unwrap()).unwrap(),
             SessionMode::Continue
         );
         assert!(root.exists());
@@ -4477,7 +4536,10 @@ mod tests {
         std::fs::write(&plan, requested).unwrap();
         std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
 
-        assert_eq!(prepare_start_plan(dir.path()).unwrap(), SessionMode::Start);
+        assert_eq!(
+            apply_start_plan(dir.path(), prepare_start_plan(dir.path()).unwrap()).unwrap(),
+            SessionMode::Start
+        );
         assert!(!root.exists());
         assert_eq!(
             std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
@@ -4518,6 +4580,86 @@ mod tests {
         assert_eq!(
             std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
             original
+        );
+    }
+
+    #[test]
+    fn start_plan_validation_failure_preserves_terminal_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        std::fs::write(&plan, b"{not-json").unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+
+        let decision = prepare_start_plan(dir.path()).unwrap();
+        let error = apply_start_plan_after_validation(dir.path(), decision, || {
+            anyhow::bail!("invalid requested WorkPlan")
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid requested WorkPlan"));
+        assert!(root.exists());
+        assert_eq!(
+            std::fs::read(root.join("run.json")).unwrap(),
+            br#"{"fsm":{"phase":"tl_done"}}"#
+        );
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn start_without_plan_clears_snapshot_for_wait_for_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let requested = br#"{"plan":{"leaves":[{"name":"waited"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+
+        let decision = prepare_start_plan(dir.path()).unwrap();
+        assert_eq!(
+            apply_start_plan(dir.path(), decision).unwrap(),
+            SessionMode::Start
+        );
+        assert!(!root.exists());
+        assert!(!plan_snapshot_path(dir.path()).exists());
+
+        std::fs::write(&plan, requested).unwrap();
+        validate_or_record_plan_snapshot(dir.path(), SessionMode::Continue).unwrap();
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            requested
+        );
+        validate_or_record_plan_snapshot(dir.path(), SessionMode::Continue).unwrap();
+    }
+
+    #[test]
+    fn start_plan_identity_treats_formatting_changes_as_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let snapshot = br#"{"plan":{"leaves":[]}}"#;
+        let reformatted = br#"{
+  "plan": {"leaves": []}
+}
+"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        std::fs::write(&plan, reformatted).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), snapshot).unwrap();
+
+        assert_eq!(
+            prepare_start_plan(dir.path()).unwrap(),
+            StartPlanDecision::NewRun {
+                archive_terminal: true
+            }
         );
     }
 
@@ -4761,10 +4903,22 @@ mod tests {
 
     #[test]
     fn init_restarts_tl_for_new_plan_with_live_or_dead_window() {
-        assert!(should_recover_tl_window(true, true, false));
-        assert!(should_recover_tl_window(true, false, false));
-        assert!(should_recover_tl_window(false, false, true));
-        assert!(!should_recover_tl_window(false, true, false));
+        assert_eq!(
+            tl_window_recovery_action(false, false, true),
+            TlWindowRecoveryAction::RemoveAndRelaunch
+        );
+        assert_eq!(
+            tl_window_recovery_action(false, true, false),
+            TlWindowRecoveryAction::Keep
+        );
+        assert_eq!(
+            tl_window_recovery_action(false, false, false),
+            TlWindowRecoveryAction::Keep
+        );
+        assert_eq!(
+            tl_window_recovery_action(true, true, false),
+            TlWindowRecoveryAction::RemoveAndRelaunch
+        );
     }
 
     #[test]
@@ -4840,6 +4994,37 @@ mod tests {
                 phase: "tl_waiting".to_string()
             }
         );
+    }
+
+    #[test]
+    fn startup_checkpoint_pending_gates_do_not_park_active_phases() {
+        let phases = [
+            "tl_planning",
+            "tl_dispatching",
+            "tl_waiting",
+            "tl_merging",
+            "tl_all_merged",
+            "tl_pr_filed",
+        ];
+        for phase in phases {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join(".exo/tl-loop/root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("run.json"),
+                format!(
+                    r#"{{"fsm":{{"phase":"{phase}"}},"gates":[{{"name":"operator-review","status":"pending"}}]}}"#
+                ),
+            )
+            .unwrap();
+
+            assert_eq!(
+                read_startup_checkpoint(dir.path()).unwrap(),
+                StartupCheckpoint::Nonterminal {
+                    phase: phase.to_string()
+                }
+            );
+        }
     }
 
     #[test]

@@ -36,7 +36,9 @@ class PreflightReport:
     files: tuple[Path, ...]
 
 
-def run_preflight(project_root: str | Path) -> PreflightReport:
+def run_preflight(
+    project_root: str | Path, *, allow_missing_plan: bool = False
+) -> PreflightReport:
     """Validate controller files, policy coverage, and the structured plan."""
     root = Path(project_root).expanduser().resolve()
     exo = root / ".exo"
@@ -54,14 +56,20 @@ def run_preflight(project_root: str | Path) -> PreflightReport:
             "--recreate does not update runtime artifacts"
         )
 
-    _require_files((config_path, policy_path, review_path, plan_path))
+    required = (config_path, policy_path, review_path)
+    if not allow_missing_plan:
+        required += (plan_path,)
+    _require_files(required)
     try:
         with config_path.open("rb") as stream:
             config = tomllib.load(stream)
         _validate_config(config, config_path)
         policy = load_policy(policy_path)
         load_review_policy(review_path)
-        _validate_plan(plan_path)
+        if plan_path.is_file():
+            _validate_plan(plan_path)
+        elif not allow_missing_plan:
+            raise PreflightError(f"missing required TL file: {plan_path}")
         if not capability_path.is_file():
             raise PreflightError(
                 f"missing required TL file: {capability_path}\n\n"
@@ -71,7 +79,12 @@ def run_preflight(project_root: str | Path) -> PreflightReport:
     except (OSError, ValueError, tomllib.TOMLDecodeError, PlanValidationError) as error:
         raise PreflightError(str(error)) from error
     return PreflightReport(
-        root, (config_path, policy_path, review_path, capability_path, plan_path)
+        root,
+        tuple(
+            path
+            for path in (config_path, policy_path, review_path, capability_path, plan_path)
+            if path.is_file()
+        ),
     )
 
 
