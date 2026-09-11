@@ -873,6 +873,21 @@ def run_tl_loop(
     store = RunStore(run_id, Path(root_dir))
     existing_state = store.load() if store.path.exists() else None
     if existing_state is not None and _is_terminal_phase(_phase_from_state(existing_state)):
+        if plan is not None:
+            persisted_manifest = existing_state.plan_manifest
+            if persisted_manifest is None:
+                raise TLLoopError(
+                    "terminal checkpoint has no immutable plan manifest; "
+                    "cannot verify the supplied plan before returning terminal state"
+                )
+            supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
+            candidate = _manifest_for_plan(supplied_plan, run_id, selected)
+            if candidate.digest != persisted_manifest.digest:
+                raise TLLoopError(
+                    "terminal checkpoint plan digest "
+                    f"{persisted_manifest.digest} differs from supplied plan digest "
+                    f"{candidate.digest}; archive the completed run before starting a new plan"
+                )
         if existing_state.reducer_version != REDUCER_VERSION:
             raise TLLoopError(
                 f"checkpoint reducer_version {existing_state.reducer_version} is incompatible "

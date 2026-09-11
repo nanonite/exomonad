@@ -476,6 +476,50 @@ def test_continuation_rejects_changed_external_plan(tmp_path) -> None:
         )
 
 
+def test_terminal_checkpoint_rejects_supplied_plan_drift_before_fast_path(tmp_path) -> None:
+    original = _plan()
+    manifest = build_plan_manifest(original, scope_id="terminal-drift")
+    create(
+        "terminal-drift",
+        {
+            "fsm": {"phase": "tl_done", "waiting": []},
+            "plan_manifest": manifest.to_document(),
+        },
+        root_dir=tmp_path,
+    )
+
+    class EmptySource:
+        def get(self, timeout=None):
+            raise queue.Empty
+
+        def acknowledge(self, event):
+            return event.run_seq
+
+    class NoopTransport:
+        def call_tool(self, role, name, tool_name, arguments):
+            return {"success": True, "result": {}}
+
+    changed = {
+        "workers": original["workers"],
+        "leaves": [{"name": "leaf-a", "task": "changed task", "boundary": ["src"]}],
+        "sub_tls": original["sub_tls"],
+    }
+    with pytest.raises(
+        driver.TLLoopError,
+        match="terminal checkpoint plan digest.*supplied plan digest",
+    ):
+        run_tl_loop(
+            "terminal-drift",
+            changed,
+            EmptySource(),
+            ReadOnlyEffectClient(EffectClient(NoopTransport(), role="tl", name="root")),
+            config=TLLoopConfig(active=False, max_events=1, root_dir=tmp_path),
+            root_dir=tmp_path,
+        )
+
+    assert RunStore("terminal-drift", tmp_path).load().plan_manifest == manifest
+
+
 def test_recursive_running_fsm_preserves_dispatch_and_lane_payloads() -> None:
     child = ChildRecord(
         "stage-a",
