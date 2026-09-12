@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -92,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_preflight(
                 args.project_root,
                 allow_missing_plan=args.allow_missing_plan,
-                expected_plan_hex=args.expected_plan_hex,
+                expected_plan_digest=args.expected_plan_digest,
             )
             print(
                 "TL preflight passed: config.toml, harness_policy.toml, review-policy.toml, harness_capability.toml"
@@ -157,6 +158,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--poll-interval", type=_positive_float, default=0.25)
     run.add_argument("--wait-for-plan", action="store_true")
+    run.add_argument("--expected-plan-digest")
     run.add_argument("--verbose", action="store_true")
     run.set_defaults(command="run")
 
@@ -243,7 +245,7 @@ def _parser() -> argparse.ArgumentParser:
     preflight = subcommands.add_parser("preflight", help="validate required TL controller files")
     _add_project_options(preflight)
     preflight.add_argument("--allow-missing-plan", action="store_true")
-    preflight.add_argument("--expected-plan-hex")
+    preflight.add_argument("--expected-plan-digest")
     preflight.set_defaults(command="preflight")
 
     return parser
@@ -274,6 +276,8 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     state_root = project_root / ".exo" / "tl-loop"
     checkpoint = RunStore(args.run_id, state_root)
     existing = checkpoint.load() if checkpoint.path.exists() else None
+    session_mode = _read_session_mode(project_root)
+    expected_plan_digest = getattr(args, "expected_plan_digest", None)
     if (
         existing is not None
         and existing.plan_manifest is not None
@@ -282,13 +286,21 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     ):
         plan_document: dict[str, object] = {"run_id": args.run_id}
         plan = None
+    elif expected_plan_digest is not None and session_mode == "start":
+        plan_document, accepted_plan_bytes = _load_snapshot_plan(
+            project_root, expected_plan_digest
+        )
+        plan = _plan_from_document(plan_document)
     else:
         plan_document, accepted_plan_bytes = _load_plan(plan_path, args.wait_for_plan)
         plan = _plan_from_document(plan_document)
+        if expected_plan_digest is not None:
+            observed_digest = hashlib.sha256(accepted_plan_bytes).hexdigest()
+            if observed_digest != expected_plan_digest:
+                raise LauncherError(f"plan {plan_path} changed after validation")
         _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
     run_id = _run_id(plan_document, args.run_id)
     ledger_run_id = _authoritative_ledger_run_id(project_root)
-    session_mode = _read_session_mode(project_root)
     reader = LedgerReader(
         project_root / ".exo" / "ledger" / "segments",
         run_id=run_id,
@@ -359,6 +371,17 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         source.close(timeout=1.0)
 
 
+def _parse_plan_bytes(path: Path, plan_bytes: bytes) -> tuple[dict[str, object], bytes]:
+    try:
+        value = json.loads(plan_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise LauncherError(f"plan {path} is not valid JSON: {error}") from error
+    try:
+        return validate_plan_document(value), plan_bytes
+    except PlanValidationError as error:
+        raise LauncherError(f"plan {path} is invalid: {error}") from error
+
+
 def _load_plan(path: Path, wait_for_plan: bool) -> tuple[dict[str, object], bytes]:
     if wait_for_plan:
         announced = False
@@ -379,13 +402,20 @@ def _load_plan(path: Path, wait_for_plan: bool) -> tuple[dict[str, object], byte
         )
     try:
         plan_bytes = path.read_bytes()
-        value = json.loads(plan_bytes.decode("utf-8"))
-    except json.JSONDecodeError as error:
-        raise LauncherError(f"plan {path} is not valid JSON: {error}") from error
+    except OSError as error:
+        raise LauncherError(f"plan {path} could not be read: {error}") from error
+    return _parse_plan_bytes(path, plan_bytes)
+
+
+def _load_snapshot_plan(project_root: Path, expected_digest: str) -> tuple[dict[str, object], bytes]:
+    path = project_root / ".exo" / "tl-loop" / "plan.snapshot"
     try:
-        return validate_plan_document(value), plan_bytes
-    except PlanValidationError as error:
-        raise LauncherError(f"plan {path} is invalid: {error}") from error
+        plan_bytes = path.read_bytes()
+    except OSError as error:
+        raise LauncherError(f"plan snapshot {path} could not be read: {error}") from error
+    if hashlib.sha256(plan_bytes).hexdigest() != expected_digest:
+        raise LauncherError(f"plan snapshot {path} changed after validation")
+    return _parse_plan_bytes(path, plan_bytes)
 
 
 def _record_plan_snapshot(

@@ -17,6 +17,7 @@ use exomonad_core::services::{
     AgentType, ForgejoClient, GitWorktreeService,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -510,7 +511,9 @@ fn ensure_start_allowed(project_dir: &Path) -> Result<()> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum StartPlanDecision {
-    Continue,
+    Continue {
+        validated_plan: Vec<u8>,
+    },
     NewRun {
         archive_terminal: bool,
         validated_plan: Option<Vec<u8>>,
@@ -547,9 +550,21 @@ fn resolve_start_plan(project_dir: &Path) -> Result<StartPlanDecision> {
 
     match checkpoint {
         StartupCheckpoint::Missing => Ok(new_run(false)),
-        StartupCheckpoint::TerminalOrParked { .. } if identical => Ok(StartPlanDecision::Continue),
+        StartupCheckpoint::TerminalOrParked { .. } if identical => {
+            Ok(StartPlanDecision::Continue {
+                validated_plan: requested
+                    .clone()
+                    .context("identical start plan has no captured bytes")?,
+            })
+        }
         StartupCheckpoint::TerminalOrParked { .. } => Ok(new_run(true)),
-        StartupCheckpoint::Nonterminal { phase: _ } if identical => Ok(StartPlanDecision::Continue),
+        StartupCheckpoint::Nonterminal { phase: _ } if identical => {
+            Ok(StartPlanDecision::Continue {
+                validated_plan: requested
+                    .clone()
+                    .context("identical start plan has no captured bytes")?,
+            })
+        }
         StartupCheckpoint::Nonterminal { phase } => {
             let identity = if snapshot.is_some() {
                 "the requested plan differs from its persisted session snapshot"
@@ -567,21 +582,68 @@ fn prepare_start_plan(project_dir: &Path) -> Result<StartPlanDecision> {
     resolve_start_plan(project_dir)
 }
 
+fn ensure_plan_matches(project_dir: &Path, expected: &[u8]) -> Result<()> {
+    let actual = requested_plan_bytes(project_dir)?.with_context(|| {
+        format!(
+            "refusing start transition: {} disappeared after validation",
+            project_dir.join(".exo/tl-loop/plan.json").display()
+        )
+    })?;
+    if actual != expected {
+        anyhow::bail!(
+            "refusing start transition: plan.json changed after validation; no runtime state was replaced"
+        );
+    }
+    Ok(())
+}
+
+fn read_plan_snapshot_bytes(project_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let path = plan_snapshot_path(project_dir);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn apply_plan_snapshot(project_dir: &Path, plan: Option<&[u8]>) -> Result<()> {
+    if let Some(plan) = plan {
+        return write_plan_snapshot(&plan_snapshot_path(project_dir), plan);
+    }
+    if let Err(error) = std::fs::remove_file(plan_snapshot_path(project_dir)) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error).context("failed to clear stale TL plan snapshot");
+        }
+    }
+    Ok(())
+}
+
+fn restore_plan_snapshot(project_dir: &Path, previous: Option<&[u8]>) -> Result<()> {
+    apply_plan_snapshot(project_dir, previous)
+}
+
 fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<SessionMode> {
     match decision {
-        StartPlanDecision::Continue => Ok(SessionMode::Continue),
+        StartPlanDecision::Continue { validated_plan } => {
+            ensure_plan_matches(project_dir, &validated_plan)?;
+            Ok(SessionMode::Continue)
+        }
         StartPlanDecision::NewRun {
             archive_terminal,
             validated_plan,
         } => {
+            let previous_snapshot = read_plan_snapshot_bytes(project_dir)?;
+            apply_plan_snapshot(project_dir, validated_plan.as_deref())?;
             if archive_terminal {
-                archive_root_tl_run(project_dir)?;
-            }
-            if let Some(requested) = validated_plan {
-                write_plan_snapshot(&plan_snapshot_path(project_dir), &requested)?;
-            } else if let Err(error) = std::fs::remove_file(plan_snapshot_path(project_dir)) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    return Err(error).context("failed to clear stale TL plan snapshot");
+                if let Err(error) = archive_root_tl_run(project_dir) {
+                    if let Err(rollback_error) =
+                        restore_plan_snapshot(project_dir, previous_snapshot.as_deref())
+                    {
+                        return Err(anyhow::anyhow!(
+                            "failed to archive prior TL run: {error}; snapshot rollback also failed: {rollback_error}"
+                        ));
+                    }
+                    return Err(error);
                 }
             }
             Ok(SessionMode::Start)
@@ -592,7 +654,7 @@ fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<S
 impl StartPlanDecision {
     fn validated_plan(&self) -> Option<&[u8]> {
         match self {
-            Self::Continue => None,
+            Self::Continue { validated_plan } => Some(validated_plan),
             Self::NewRun { validated_plan, .. } => validated_plan.as_deref(),
         }
     }
@@ -1643,7 +1705,7 @@ fn run_tl_loop_preflight(
     cwd: &Path,
     package_root: &Path,
     allow_missing_plan: bool,
-    expected_plan: Option<&[u8]>,
+    expected_plan_digest: Option<&str>,
 ) -> Result<()> {
     let interpreter = check_tl_loop_python(cwd)?;
     let mut command = std::process::Command::new(interpreter);
@@ -1658,9 +1720,8 @@ fn run_tl_loop_preflight(
     if allow_missing_plan {
         command.arg("--allow-missing-plan");
     }
-    let expected_plan_hex = expected_plan.map(hex_encode);
-    if let Some(plan_hex) = expected_plan_hex.as_deref() {
-        command.args(["--expected-plan-hex", plan_hex]);
+    if let Some(plan_digest) = expected_plan_digest {
+        command.args(["--expected-plan-digest", plan_digest]);
     }
     let status = command
         .status()
@@ -1671,14 +1732,8 @@ fn run_tl_loop_preflight(
     Ok(())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
+fn plan_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn validate_publication_registry_schema(cwd: &Path) -> Result<()> {
@@ -1847,7 +1902,16 @@ impl From<&Config> for TlLoopTimeouts {
     }
 }
 
-fn tl_loop_command(cwd: &Path, package_root: &Path, timeouts: &TlLoopTimeouts) -> String {
+fn plan_snapshot_digest(project_dir: &Path) -> Result<Option<String>> {
+    Ok(read_plan_snapshot_bytes(project_dir)?.map(|bytes| plan_digest(&bytes)))
+}
+
+fn tl_loop_command(
+    cwd: &Path,
+    package_root: &Path,
+    timeouts: &TlLoopTimeouts,
+    expected_plan_digest: Option<&str>,
+) -> String {
     let package = shell_escape::escape(package_root.display().to_string().into());
     let project = shell_escape::escape(cwd.display().to_string().into());
     let plan = shell_escape::escape(
@@ -1856,8 +1920,16 @@ fn tl_loop_command(cwd: &Path, package_root: &Path, timeouts: &TlLoopTimeouts) -
             .to_string()
             .into(),
     );
+    let expected_plan_arg = expected_plan_digest
+        .map(|digest| {
+            format!(
+                " --expected-plan-digest {}",
+                shell_escape::escape(digest.into())
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan \
+        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan{expected_plan_arg} \
            --transport-timeout {} --active-tail-timeout {} --task-timeout {}",
         shell_escape::escape(tl_loop_python(cwd).into()),
         timeouts.transport,
@@ -2143,7 +2215,12 @@ async fn launch_tl_recovery(
             "TL",
             project_dir,
             shell,
-            &tl_loop_command(project_dir, tl_loop_root, &TlLoopTimeouts::from(config)),
+            &tl_loop_command(
+                project_dir,
+                tl_loop_root,
+                &TlLoopTimeouts::from(config),
+                plan_snapshot_digest(project_dir)?.as_deref(),
+            ),
         )
         .await?;
     ipc.set_window_remain_on_exit(&tl_window, true).await?;
@@ -2687,10 +2764,10 @@ pub async fn run(
     ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
     if let Some(decision) = start_plan_decision {
-        let expected_plan = decision.validated_plan().map(ToOwned::to_owned);
+        let expected_plan_digest = decision.validated_plan().map(plan_digest);
         mode = apply_start_plan_after_validation(&cwd, decision, || {
             if skip_preflight {
-                if expected_plan.is_some() {
+                if expected_plan_digest.is_some() {
                     anyhow::bail!(
                         "--skip-preflight cannot be used with --start when plan.json exists; the requested plan must be validated before replacing runtime state"
                     );
@@ -2698,7 +2775,7 @@ pub async fn run(
                 warn!("Skipping TL controller preflight for --start without a plan");
                 return Ok(());
             }
-            run_tl_loop_preflight(&cwd, &tl_loop_root, true, expected_plan.as_deref())
+            run_tl_loop_preflight(&cwd, &tl_loop_root, true, expected_plan_digest.as_deref())
         })?;
     } else {
         if mode == SessionMode::Continue {
@@ -3369,7 +3446,16 @@ pub async fn run(
     // The human-facing TL window runs one coordinator: the Python controller.
     // Root harness settings and root_command are intentionally ignored.
     let tl_cwd = cwd.clone();
-    let base_command = tl_loop_command(&cwd, &tl_loop_root, &TlLoopTimeouts::from(&config));
+    let expected_plan_digest = match mode {
+        SessionMode::Start | SessionMode::Continue => plan_snapshot_digest(&cwd)?,
+        SessionMode::Recreate => None,
+    };
+    let base_command = tl_loop_command(
+        &cwd,
+        &tl_loop_root,
+        &TlLoopTimeouts::from(&config),
+        expected_plan_digest.as_deref(),
+    );
 
     let tl_command = match config.shell_command {
         Some(ref sc) => format!("{} -c \"{}\"", sc, base_command.replace('"', "\\\"")),
@@ -4546,7 +4632,9 @@ mod tests {
 
         assert_eq!(
             resolve_start_plan(dir.path()).unwrap(),
-            StartPlanDecision::Continue
+            StartPlanDecision::Continue {
+                validated_plan: snapshot.to_vec()
+            }
         );
         assert_eq!(
             apply_start_plan(dir.path(), prepare_start_plan(dir.path()).unwrap()).unwrap(),
@@ -4667,6 +4755,58 @@ mod tests {
         assert_eq!(
             std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
             validated
+        );
+    }
+
+    #[test]
+    fn start_plan_snapshot_failure_preserves_terminal_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let requested = br#"{"plan":{"leaves":[{"name":"new"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        std::fs::write(&plan, requested).unwrap();
+        std::fs::create_dir_all(dir.path().join(".exo/tl-loop/plan.tmp")).unwrap();
+
+        let decision = prepare_start_plan(dir.path()).unwrap();
+        assert!(apply_start_plan(dir.path(), decision).is_err());
+
+        assert!(root.exists());
+        let archives = std::fs::read_dir(dir.path().join(".exo/tl-loop"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("root.invalid-")
+            })
+            .count();
+        assert_eq!(archives, 0);
+    }
+
+    #[test]
+    fn continue_plan_apply_rejects_drift_after_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let snapshot = br#"{"plan":{"leaves":[]}}"#;
+        let changed = br#"{"plan":{"leaves":[{"name":"changed"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        std::fs::write(&plan, snapshot).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), snapshot).unwrap();
+
+        let decision = prepare_start_plan(dir.path()).unwrap();
+        std::fs::write(&plan, changed).unwrap();
+        let error = apply_start_plan(dir.path(), decision).unwrap_err();
+
+        assert!(error.to_string().contains("changed after validation"));
+        assert!(root.exists());
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            snapshot
         );
     }
 
@@ -5677,11 +5817,18 @@ mod tests {
             active_tail: 60.0,
             task: 90.0,
         };
-        let command = tl_loop_command(Path::new("/tmp/repo"), Path::new("/tmp/exo"), &timeouts);
+        let command = tl_loop_command(
+            Path::new("/tmp/repo"),
+            Path::new("/tmp/exo"),
+            &timeouts,
+            Some("0123456789abcdef"),
+        );
         assert!(command.contains("EXOMONAD_ROLE=tl"));
         assert!(!command.contains("PYTHONPATH="));
         assert!(command.contains("python3 /tmp/exo run"));
         assert!(command.contains("--wait-for-plan"));
+        assert!(command.contains("--expected-plan-digest 0123456789abcdef"));
+        assert!(!command.contains("--expected-plan-hex"));
         assert!(command.contains("--transport-timeout 45.5"));
         assert!(command.contains("--active-tail-timeout 60"));
         assert!(command.contains("--task-timeout 90"));

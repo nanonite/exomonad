@@ -52,6 +52,7 @@ http-body-util = { workspace = true }
 futures-util = { workspace = true }
 nix = { workspace = true }
 shell-escape = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 assert_cmd = "2.0"

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -138,7 +139,7 @@ def test_preflight_rejects_plan_bytes_that_changed_after_capture(tmp_path: Path)
     plan.write_bytes(b'{"plan":{"workers":[{"name":"changed"}]}}')
 
     with pytest.raises(PreflightError, match="changed during preflight validation"):
-        run_preflight(project, expected_plan_hex=accepted.hex())
+        run_preflight(project, expected_plan_digest=hashlib.sha256(accepted).hexdigest())
 
 
 def test_snapshot_uses_captured_plan_bytes_without_rereading_source(tmp_path: Path) -> None:
@@ -150,6 +151,24 @@ def test_snapshot_uses_captured_plan_bytes_without_rereading_source(tmp_path: Pa
     tl_main._record_plan_snapshot(project, plan, accepted)
 
     assert (project / ".exo" / "tl-loop" / "plan.snapshot").read_bytes() == accepted
+
+
+def test_snapshot_loader_binds_startup_to_immutable_snapshot(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    plan = project / ".exo" / "tl-loop" / "plan.json"
+    accepted = plan.read_bytes()
+    snapshot = project / ".exo" / "tl-loop" / "plan.snapshot"
+    snapshot.write_bytes(accepted)
+    plan.write_bytes(b'{"plan":{"workers":[{"name":"changed"}]}}')
+
+    document, captured = tl_main._load_snapshot_plan(
+        project, hashlib.sha256(accepted).hexdigest()
+    )
+
+    assert document["plan"]["workers"] == []
+    assert captured == accepted
+    with pytest.raises(tl_main.LauncherError, match="changed after validation"):
+        tl_main._load_snapshot_plan(project, hashlib.sha256(plan.read_bytes()).hexdigest())
 
 
 def test_exit_reason_is_diagnostic_only(tmp_path: Path) -> None:
