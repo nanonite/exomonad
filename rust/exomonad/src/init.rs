@@ -645,6 +645,26 @@ fn write_plan_digest_file(path: &Path, digest: &str) -> Result<()> {
     Ok(())
 }
 
+const PLAN_TRANSITION_PHASE_PREPARED: &str = "prepared";
+const PLAN_TRANSITION_PHASE_ARCHIVED: &str = "archived";
+const PLAN_TRANSITION_PHASE_ROLLED_BACK: &str = "rolled_back";
+
+fn acquire_plan_transition_lock(
+    project_dir: &Path,
+) -> Result<claude_teams_bridge::file_lock::FileLock> {
+    let lock_target = project_dir.join(".exo/tl-loop/init-reconcile");
+    if let Some(parent) = lock_target.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create plan transition lock directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    claude_teams_bridge::file_lock::FileLock::acquire(&lock_target, Duration::from_secs(3600))
+        .context("failed to acquire project plan transition lock")
+}
+
 fn plan_transition_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".exo/tl-loop/plan-transition.json")
 }
@@ -696,7 +716,10 @@ fn read_plan_transition(project_dir: &Path) -> Result<Option<(String, Option<Str
         .and_then(Value::as_str)
         .context("plan transition journal has no phase")?
         .to_owned();
-    if phase != "prepared" && phase != "archived" {
+    if phase != PLAN_TRANSITION_PHASE_PREPARED
+        && phase != PLAN_TRANSITION_PHASE_ARCHIVED
+        && phase != PLAN_TRANSITION_PHASE_ROLLED_BACK
+    {
         anyhow::bail!("unsupported plan transition phase {phase}");
     }
     let archive_name = value
@@ -720,13 +743,31 @@ fn remove_if_present(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn clear_plan_transition(project_dir: &Path) -> Result<()> {
-    remove_if_present(&plan_transition_path(project_dir))?;
-    remove_if_present(&plan_transition_previous_snapshot_path(project_dir))?;
-    remove_if_present(&plan_transition_previous_digest_path(project_dir))
+fn maybe_fail_transition(failure: &mut Option<&str>, step: &str) -> Result<()> {
+    if failure.is_some_and(|expected| expected == step) {
+        *failure = None;
+        anyhow::bail!("injected plan transition failure at {step}");
+    }
+    Ok(())
 }
 
-fn begin_plan_transition(
+fn clear_plan_transition_locked(project_dir: &Path, failure: &mut Option<&str>) -> Result<()> {
+    maybe_fail_transition(failure, "backup-snapshot-delete")?;
+    remove_if_present(&plan_transition_previous_snapshot_path(project_dir))?;
+    maybe_fail_transition(failure, "backup-digest-delete")?;
+    remove_if_present(&plan_transition_previous_digest_path(project_dir))?;
+    maybe_fail_transition(failure, "journal-delete")?;
+    remove_if_present(&plan_transition_path(project_dir))
+}
+
+#[cfg(test)]
+fn clear_plan_transition(project_dir: &Path) -> Result<()> {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let mut failure = None;
+    clear_plan_transition_locked(project_dir, &mut failure)
+}
+
+fn begin_plan_transition_locked(
     project_dir: &Path,
     previous_snapshot: Option<&[u8]>,
     previous_digest: Option<&str>,
@@ -744,19 +785,40 @@ fn begin_plan_transition(
         }
         None => remove_if_present(&plan_transition_previous_digest_path(project_dir))?,
     }
-    write_plan_transition(project_dir, "prepared", archive)
+    write_plan_transition(project_dir, PLAN_TRANSITION_PHASE_PREPARED, archive)
 }
 
-fn recover_plan_transition(project_dir: &Path) -> Result<()> {
+#[cfg(test)]
+fn begin_plan_transition(
+    project_dir: &Path,
+    previous_snapshot: Option<&[u8]>,
+    previous_digest: Option<&str>,
+    archive: Option<&Path>,
+) -> Result<()> {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    begin_plan_transition_locked(project_dir, previous_snapshot, previous_digest, archive)
+}
+
+fn recover_plan_transition_locked(project_dir: &Path, failure: &mut Option<&str>) -> Result<()> {
     let Some((phase, archive_name)) = read_plan_transition(project_dir)? else {
         return Ok(());
     };
-    if phase == "archived" {
-        return clear_plan_transition(project_dir);
+    if phase == PLAN_TRANSITION_PHASE_ARCHIVED || phase == PLAN_TRANSITION_PHASE_ROLLED_BACK {
+        return clear_plan_transition_locked(project_dir, failure);
     }
-    if let Some(archive_name) = archive_name {
+    if phase != PLAN_TRANSITION_PHASE_PREPARED {
+        anyhow::bail!("unsupported plan transition phase {phase}");
+    }
+    let archive = archive_name.map(|name| project_dir.join(".exo/tl-loop").join(name));
+    if let Some(archive) = archive.as_deref() {
         let root = project_dir.join(".exo/tl-loop/root");
-        let archive = project_dir.join(".exo/tl-loop").join(archive_name);
+        if root.exists() && archive.exists() {
+            anyhow::bail!(
+                "cannot recover plan transition: both TL root {} and archive {} exist",
+                root.display(),
+                archive.display()
+            );
+        }
         if !root.exists() {
             if !archive.exists() {
                 anyhow::bail!(
@@ -764,7 +826,7 @@ fn recover_plan_transition(project_dir: &Path) -> Result<()> {
                     archive.display()
                 );
             }
-            std::fs::rename(&archive, &root).with_context(|| {
+            std::fs::rename(archive, &root).with_context(|| {
                 format!("failed to restore archived TL root {}", archive.display())
             })?;
         }
@@ -773,6 +835,11 @@ fn recover_plan_transition(project_dir: &Path) -> Result<()> {
     if previous_snapshot.is_file() {
         let bytes = std::fs::read(&previous_snapshot)?;
         write_plan_snapshot(&plan_snapshot_path(project_dir), &bytes)?;
+    } else if previous_snapshot.exists() {
+        anyhow::bail!(
+            "cannot recover plan transition: snapshot backup {} is not a file",
+            previous_snapshot.display()
+        );
     } else {
         remove_if_present(&plan_snapshot_path(project_dir))?;
     }
@@ -780,14 +847,35 @@ fn recover_plan_transition(project_dir: &Path) -> Result<()> {
     if previous_digest.is_file() {
         let digest = std::fs::read_to_string(&previous_digest)?;
         write_plan_snapshot_digest(project_dir, digest.trim())?;
+    } else if previous_digest.exists() {
+        anyhow::bail!(
+            "cannot recover plan transition: digest backup {} is not a file",
+            previous_digest.display()
+        );
     } else {
         remove_plan_snapshot_digest(project_dir)?;
     }
-    clear_plan_transition(project_dir)
+    write_plan_transition(
+        project_dir,
+        PLAN_TRANSITION_PHASE_ROLLED_BACK,
+        archive.as_deref(),
+    )?;
+    clear_plan_transition_locked(project_dir, failure)
 }
 
-fn rollback_plan_transition(project_dir: &Path, error: anyhow::Error) -> anyhow::Error {
-    match recover_plan_transition(project_dir) {
+#[cfg(test)]
+fn recover_plan_transition(project_dir: &Path) -> Result<()> {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let mut failure = None;
+    recover_plan_transition_locked(project_dir, &mut failure)
+}
+
+fn rollback_plan_transition_locked(
+    project_dir: &Path,
+    error: anyhow::Error,
+    failure: &mut Option<&str>,
+) -> anyhow::Error {
+    match recover_plan_transition_locked(project_dir, failure) {
         Ok(()) => error,
         Err(rollback_error) => {
             anyhow::anyhow!("{error}; transition rollback also failed: {rollback_error}")
@@ -804,14 +892,17 @@ fn remove_plan_snapshot_digest(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn apply_plan_snapshot(
+fn apply_plan_snapshot_locked(
     project_dir: &Path,
     plan: Option<&[u8]>,
     digest: Option<&str>,
+    failure: &mut Option<&str>,
 ) -> Result<()> {
     if let Some(plan) = plan {
+        maybe_fail_transition(failure, "snapshot-write")?;
         write_plan_snapshot(&plan_snapshot_path(project_dir), plan)?;
         if let Some(digest) = digest {
+            maybe_fail_transition(failure, "digest-write")?;
             write_plan_snapshot_digest(project_dir, digest)?;
         } else {
             remove_plan_snapshot_digest(project_dir)?;
@@ -825,6 +916,17 @@ fn apply_plan_snapshot(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn apply_plan_snapshot(
+    project_dir: &Path,
+    plan: Option<&[u8]>,
+    digest: Option<&str>,
+) -> Result<()> {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let mut failure = None;
+    apply_plan_snapshot_locked(project_dir, plan, digest, &mut failure)
 }
 
 fn ensure_snapshot_matches(project_dir: &Path, expected: &[u8]) -> Result<()> {
@@ -850,7 +952,26 @@ fn ensure_snapshot_matches(project_dir: &Path, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<SessionMode> {
+fn ensure_snapshot_digest_matches(project_dir: &Path, expected: &str) -> Result<()> {
+    let snapshot = read_plan_snapshot_bytes(project_dir)?.with_context(|| {
+        format!(
+            "refusing controller recovery: {} is missing",
+            plan_snapshot_path(project_dir).display()
+        )
+    })?;
+    if plan_digest(&snapshot) != expected {
+        anyhow::bail!(
+            "refusing controller recovery: plan.snapshot no longer matches the captured plan identity"
+        );
+    }
+    Ok(())
+}
+
+fn apply_start_plan_locked(
+    project_dir: &Path,
+    decision: StartPlanDecision,
+    failure: &mut Option<&str>,
+) -> Result<SessionMode> {
     match decision {
         StartPlanDecision::Continue { validated_plan } => {
             ensure_plan_matches(project_dir, &validated_plan)?;
@@ -869,31 +990,57 @@ fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<S
             } else {
                 None
             };
-            begin_plan_transition(
+            begin_plan_transition_locked(
                 project_dir,
                 previous_snapshot.as_deref(),
                 previous_digest.as_deref(),
                 archive.as_deref(),
             )?;
-            if let Err(error) = apply_plan_snapshot(
+            if let Err(error) = apply_plan_snapshot_locked(
                 project_dir,
                 validated_plan.as_deref(),
                 validated_digest.as_deref(),
+                failure,
             ) {
-                return Err(rollback_plan_transition(project_dir, error));
+                return Err(rollback_plan_transition_locked(project_dir, error, failure));
             }
             if let Some(archive) = archive.as_deref() {
+                if let Err(error) = maybe_fail_transition(failure, "archive") {
+                    return Err(rollback_plan_transition_locked(project_dir, error, failure));
+                }
                 if let Err(error) = archive_root_tl_run_to(project_dir, archive) {
-                    return Err(rollback_plan_transition(project_dir, error));
+                    return Err(rollback_plan_transition_locked(project_dir, error, failure));
                 }
             }
-            if let Err(error) = write_plan_transition(project_dir, "archived", archive.as_deref()) {
-                return Err(rollback_plan_transition(project_dir, error));
+            if let Err(error) = write_plan_transition(
+                project_dir,
+                PLAN_TRANSITION_PHASE_ARCHIVED,
+                archive.as_deref(),
+            ) {
+                return Err(rollback_plan_transition_locked(project_dir, error, failure));
             }
-            clear_plan_transition(project_dir)?;
+            clear_plan_transition_locked(project_dir, failure)?;
             Ok(SessionMode::Start)
         }
     }
+}
+
+#[cfg(test)]
+fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<SessionMode> {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let mut failure = None;
+    apply_start_plan_locked(project_dir, decision, &mut failure)
+}
+
+#[cfg(test)]
+fn apply_start_plan_with_failure(
+    project_dir: &Path,
+    decision: StartPlanDecision,
+    failure: &'static str,
+) -> Result<SessionMode> {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let mut failure = Some(failure);
+    apply_start_plan_locked(project_dir, decision, &mut failure)
 }
 
 impl StartPlanDecision {
@@ -905,6 +1052,7 @@ impl StartPlanDecision {
     }
 }
 
+#[cfg(test)]
 fn apply_start_plan_after_validation<F>(
     project_dir: &Path,
     decision: StartPlanDecision,
@@ -913,8 +1061,24 @@ fn apply_start_plan_after_validation<F>(
 where
     F: FnOnce() -> Result<()>,
 {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let mut failure = None;
     validate()?;
-    apply_start_plan(project_dir, decision)
+    apply_start_plan_locked(project_dir, decision, &mut failure)
+}
+
+fn apply_start_plan_after_validation_locked<F>(
+    project_dir: &Path,
+    decision: StartPlanDecision,
+    validate: F,
+    _lock: &claude_teams_bridge::file_lock::FileLock,
+    failure: &mut Option<&str>,
+) -> Result<SessionMode>
+where
+    F: FnOnce() -> Result<()>,
+{
+    validate()?;
+    apply_start_plan_locked(project_dir, decision, failure)
 }
 
 fn report_legacy_session(project_dir: &Path, mode: SessionMode) {
@@ -947,7 +1111,7 @@ fn write_plan_snapshot(snapshot_path: &Path, bytes: &[u8]) -> Result<()> {
 /// Preserve the original plan bytes so continue can fail closed on drift.
 /// The snapshot is separate from plan.json and is never used as a replacement
 /// plan, which keeps the authoritative plan untouched.
-fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()> {
+fn validate_or_record_plan_snapshot_locked(cwd: &Path, mode: SessionMode) -> Result<()> {
     let plan_path = cwd.join(".exo/tl-loop/plan.json");
     let snapshot_path = plan_snapshot_path(cwd);
     let plan_exists = plan_path.is_file();
@@ -1001,6 +1165,44 @@ fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()>
         info!(path = %snapshot_path.display(), "Recorded initial TL plan snapshot");
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()> {
+    let _lock = acquire_plan_transition_lock(cwd)?;
+    validate_or_record_plan_snapshot_locked(cwd, mode)
+}
+
+fn capture_validated_plan_digest(cwd: &Path) -> Result<Option<String>> {
+    let plan = requested_plan_bytes(cwd)?;
+    let snapshot = read_plan_snapshot_bytes(cwd)?;
+    match (plan, snapshot) {
+        (None, None) => Ok(None),
+        (Some(plan), Some(snapshot)) if plan == snapshot => {
+            let expected = plan_digest(&snapshot);
+            let persisted = read_plan_snapshot_digest(cwd)?.with_context(|| {
+                format!(
+                    "missing persisted plan identity for {}",
+                    plan_snapshot_path(cwd).display()
+                )
+            })?;
+            if persisted != expected {
+                anyhow::bail!(
+                    "persisted plan identity does not match plan.json and plan.snapshot"
+                );
+            }
+            Ok(Some(persisted))
+        }
+        (None, Some(_)) => anyhow::bail!(
+            "cannot use persisted plan identity: plan.json is missing while its session snapshot exists"
+        ),
+        (Some(_), None) => anyhow::bail!(
+            "cannot use persisted plan identity: plan.snapshot is missing while plan.json exists"
+        ),
+        (Some(_), Some(_)) => {
+            anyhow::bail!("persisted plan identity cannot be captured because plan bytes differ")
+        }
+    }
 }
 
 fn publication_matches_agent(
@@ -2460,7 +2662,11 @@ async fn launch_tl_recovery(
     shell: &str,
     tl_loop_root: &Path,
     config: &Config,
+    controller_plan_digest: Option<&str>,
 ) -> Result<()> {
+    if let Some(expected_digest) = controller_plan_digest {
+        ensure_snapshot_digest_matches(project_dir, expected_digest)?;
+    }
     let controller_epoch = prepare_controller_spawn(project_dir)?;
     let tl_window = ipc
         .new_window(
@@ -2471,7 +2677,7 @@ async fn launch_tl_recovery(
                 project_dir,
                 tl_loop_root,
                 &TlLoopTimeouts::from(config),
-                read_plan_snapshot_digest(project_dir)?.as_deref(),
+                controller_plan_digest,
             ),
         )
         .await?;
@@ -2488,24 +2694,13 @@ async fn launch_tl_recovery(
 /// project so two processes never race between inspecting session health
 /// and creating repair windows. The lock target need not exist; `FileLock`
 /// only ever touches the sibling `.lock` path.
-async fn acquire_init_reconciliation_lock(
+async fn acquire_plan_transition_lock_async(
     project_dir: &Path,
 ) -> Result<claude_teams_bridge::file_lock::FileLock> {
-    let lock_target = project_dir.join(".exo/tl-loop/init-reconcile");
-    if let Some(parent) = lock_target.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create init reconciliation lock directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    tokio::task::spawn_blocking(move || {
-        claude_teams_bridge::file_lock::FileLock::acquire(&lock_target, Duration::from_secs(30))
-    })
-    .await
-    .context("init reconciliation lock task panicked")?
-    .context("failed to acquire init reconciliation lock — another `exomonad init` may be running")
+    let project_dir = project_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_plan_transition_lock(&project_dir))
+        .await
+        .context("plan transition lock task panicked")?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2518,12 +2713,11 @@ async fn reconcile_existing_session(
     tl_loop_root: &Path,
     verbose: bool,
     restart_tl: bool,
+    controller_plan_digest: Option<&str>,
 ) -> Result<()> {
     // Held for the whole inspect-then-create sequence below so a second
     // concurrent `init` cannot observe the same dead window and race to
     // create a duplicate repair window.
-    let _reconcile_lock = acquire_init_reconciliation_lock(project_dir).await?;
-
     let windows = ipc.list_windows().await?;
     let server_window = windows.iter().find(|window| window.window_name == "Server");
     let server_healthy = server_socket_is_healthy(project_dir).await;
@@ -2574,7 +2768,15 @@ async fn reconcile_existing_session(
         ipc.kill_window(&window.window_id).await?;
     }
 
-    launch_tl_recovery(ipc, project_dir, shell, tl_loop_root, config).await
+    launch_tl_recovery(
+        ipc,
+        project_dir,
+        shell,
+        tl_loop_root,
+        config,
+        controller_plan_digest,
+    )
+    .await
 }
 
 fn controller_exit_path(project_dir: &Path) -> PathBuf {
@@ -2974,7 +3176,9 @@ pub async fn run(
     // inbox, capability, plan, or orchestration side effect.
     let mut config = Config::discover()?;
     validate_runtime_compatibility(&cwd)?;
-    recover_plan_transition(&cwd)?;
+    let project_plan_lock = acquire_plan_transition_lock_async(&cwd).await?;
+    let mut no_transition_failure = None;
+    recover_plan_transition_locked(&cwd, &mut no_transition_failure)?;
     let mut mode = mode;
     let recreate = mode.is_recreate();
     report_legacy_session(&cwd, mode);
@@ -3024,33 +3228,44 @@ pub async fn run(
     let mut controller_plan_digest = None;
     if let Some(decision) = start_plan_decision {
         let expected_plan_digest = decision.validated_plan().map(plan_digest);
-        mode = apply_start_plan_after_validation(&cwd, decision, || {
-            if skip_preflight {
-                if expected_plan_digest.is_some() {
-                    anyhow::bail!(
+        mode = apply_start_plan_after_validation_locked(
+            &cwd,
+            decision,
+            || {
+                if skip_preflight {
+                    if expected_plan_digest.is_some() {
+                        anyhow::bail!(
                         "--skip-preflight cannot be used with --start when plan.json exists; the requested plan must be validated before replacing runtime state"
                     );
+                    }
+                    warn!("Skipping TL controller preflight for --start without a plan");
+                    return Ok(());
                 }
-                warn!("Skipping TL controller preflight for --start without a plan");
-                return Ok(());
-            }
-            run_tl_loop_preflight(&cwd, &tl_loop_root, true, expected_plan_digest.as_deref())
-        })?;
+                run_tl_loop_preflight(&cwd, &tl_loop_root, true, expected_plan_digest.as_deref())
+            },
+            &project_plan_lock,
+            &mut no_transition_failure,
+        )?;
         controller_plan_digest = expected_plan_digest;
     } else {
         if mode == SessionMode::Continue {
-            validate_or_record_plan_snapshot(&cwd, mode)?;
-            controller_plan_digest = read_plan_snapshot_digest(&cwd)?;
+            validate_or_record_plan_snapshot_locked(&cwd, mode)?;
+            controller_plan_digest = capture_validated_plan_digest(&cwd)?;
         } else {
             if mode == SessionMode::Recreate {
                 write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
             }
-            validate_or_record_plan_snapshot(&cwd, mode)?;
+            validate_or_record_plan_snapshot_locked(&cwd, mode)?;
         }
         if skip_preflight {
             warn!("Skipping TL controller preflight by explicit request");
         } else {
-            run_tl_loop_preflight(&cwd, &tl_loop_root, false, None)?;
+            run_tl_loop_preflight(
+                &cwd,
+                &tl_loop_root,
+                false,
+                controller_plan_digest.as_deref(),
+            )?;
         }
     }
 
@@ -3247,6 +3462,7 @@ pub async fn run(
             &tl_loop_root,
             verbose,
             mode == SessionMode::Start,
+            controller_plan_digest.as_deref(),
         )
         .await?;
         if mode == SessionMode::Continue {
@@ -3254,6 +3470,7 @@ pub async fn run(
         }
         report_orphaned_agent_windows(&session, &cwd).await;
         info!(session = %session, "Attaching to existing session");
+        drop(project_plan_lock);
         return TmuxIpc::attach_session(&session).await;
     }
 
@@ -3727,6 +3944,7 @@ pub async fn run(
         ipc.set_window_remain_on_exit(&tl_window, false).await?;
     }
     startup?;
+    drop(project_plan_lock);
 
     // 5. Spawn companion agents
     let companions_to_spawn: Vec<&crate::config::CompanionConfig> =
@@ -4876,6 +5094,24 @@ mod tests {
             .contains("plan.json is missing while its persisted session snapshot exists"));
     }
 
+    fn terminal_transition_fixture() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#.to_vec();
+        let requested = br#"{"plan":{"leaves":[{"name":"new"}]}}"#.to_vec();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        std::fs::write(&plan, &requested).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), &original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(&original)),
+        )
+        .unwrap();
+        (dir, original, requested)
+    }
+
     #[test]
     fn start_with_identical_terminal_plan_uses_continue_and_preserves_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -5174,6 +5410,67 @@ mod tests {
     }
 
     #[test]
+    fn transition_failure_points_preserve_committed_state() {
+        for failure in ["snapshot-write", "digest-write", "archive"] {
+            let (dir, original, requested) = terminal_transition_fixture();
+            let decision = StartPlanDecision::NewRun {
+                archive_terminal: true,
+                validated_plan: Some(requested.clone()),
+            };
+
+            let error = apply_start_plan_with_failure(dir.path(), decision, failure).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("injected plan transition failure"));
+            assert!(dir.path().join(".exo/tl-loop/root").exists());
+            assert_eq!(
+                std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+                original
+            );
+            assert_eq!(
+                std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+                format!("{}\n", plan_digest(&original))
+            );
+            assert!(!plan_transition_path(dir.path()).exists());
+        }
+
+        for failure in [
+            "backup-snapshot-delete",
+            "backup-digest-delete",
+            "journal-delete",
+        ] {
+            let (dir, _original, requested) = terminal_transition_fixture();
+            let decision = StartPlanDecision::NewRun {
+                archive_terminal: true,
+                validated_plan: Some(requested.clone()),
+            };
+
+            let error = apply_start_plan_with_failure(dir.path(), decision, failure).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("injected plan transition failure"));
+            assert!(!dir.path().join(".exo/tl-loop/root").exists());
+            assert_eq!(
+                std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+                requested
+            );
+            assert_eq!(
+                std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+                format!("{}\n", plan_digest(&requested))
+            );
+            assert!(plan_transition_path(dir.path()).exists());
+
+            recover_plan_transition(dir.path()).unwrap();
+
+            assert!(!plan_transition_path(dir.path()).exists());
+            assert!(!plan_transition_previous_snapshot_path(dir.path()).exists());
+            assert!(!plan_transition_previous_digest_path(dir.path()).exists());
+        }
+    }
+
+    #[test]
     fn start_without_plan_clears_snapshot_for_wait_for_plan() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".exo/tl-loop/root");
@@ -5294,7 +5591,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().to_path_buf();
 
-        let first = acquire_init_reconciliation_lock(&project_dir)
+        let first = acquire_plan_transition_lock_async(&project_dir)
             .await
             .expect("first init should acquire the reconciliation lock");
 
@@ -5306,7 +5603,7 @@ mod tests {
         let contender_dir = project_dir.clone();
         let contender = tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let lock = acquire_init_reconciliation_lock(&contender_dir)
+            let lock = acquire_plan_transition_lock_async(&contender_dir)
                 .await
                 .expect("second init should eventually acquire the lock");
             (started.elapsed(), lock)
@@ -6195,6 +6492,43 @@ mod tests {
         assert!(command.contains("--transport-timeout 45.5"));
         assert!(command.contains("--active-tail-timeout 60"));
         assert!(command.contains("--task-timeout 90"));
+    }
+
+    #[test]
+    fn recovery_command_keeps_captured_digest_after_snapshot_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let substituted = br#"{"plan":{"leaves":[{"name":"substituted"}]}}"#;
+        std::fs::create_dir_all(dir.path().join(".exo/tl-loop")).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(original)),
+        )
+        .unwrap();
+
+        let timeouts = TlLoopTimeouts {
+            transport: 1.0,
+            active_tail: 2.0,
+            task: 3.0,
+        };
+        let expected = plan_digest(original);
+        std::fs::write(plan_snapshot_path(dir.path()), substituted).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(substituted)),
+        )
+        .unwrap();
+
+        let command = tl_loop_command(
+            dir.path(),
+            Path::new("/tmp/exo"),
+            &timeouts,
+            Some(&expected),
+        );
+
+        assert!(command.contains(&format!("--expected-plan-digest {expected}")));
+        assert!(!command.contains(&plan_digest(substituted)));
     }
 
     #[test]

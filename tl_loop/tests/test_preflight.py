@@ -180,6 +180,23 @@ def test_snapshot_loader_binds_startup_to_immutable_snapshot(tmp_path: Path) -> 
         tl_main._load_snapshot_plan(project, hashlib.sha256(plan.read_bytes()).hexdigest())
 
 
+def test_wait_for_plan_validates_spawn_routes_before_snapshot(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    plan = project / ".exo" / "tl-loop" / "plan.json"
+    invalid = (
+        b'{"plan":{"workers":[{"name":"bad","task":"bad",'
+        b'"agent_type":"unsupported/runtime"}],'
+        b'"leaves":[],"sub_tls":[]}}'
+    )
+    plan.write_bytes(invalid)
+
+    with pytest.raises(PreflightError, match="invalid TL spawn routes"):
+        tl_main._validate_captured_plan(project, invalid)
+
+    assert not (project / ".exo" / "tl-loop" / "plan.snapshot").exists()
+    assert not (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").exists()
+
+
 def test_exit_reason_is_diagnostic_only(tmp_path: Path) -> None:
     store = RunStore("root", tmp_path / ".exo" / "tl-loop")
     store.record_exit_reason("capability file is missing")

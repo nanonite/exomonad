@@ -283,6 +283,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         and existing.plan_manifest is not None
         and not plan_path.exists()
         and not args.wait_for_plan
+        and expected_plan_digest is None
     ):
         plan_document: dict[str, object] = {"run_id": args.run_id}
         plan = None
@@ -298,6 +299,8 @@ def _run(args: argparse.Namespace) -> TLRunResult:
             observed_digest = hashlib.sha256(accepted_plan_bytes).hexdigest()
             if observed_digest != expected_plan_digest:
                 raise LauncherError(f"plan {plan_path} changed after validation")
+        if args.wait_for_plan:
+            _validate_captured_plan(project_root, accepted_plan_bytes)
         _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
     run_id = _run_id(plan_document, args.run_id)
     ledger_run_id = _authoritative_ledger_run_id(project_root)
@@ -405,6 +408,15 @@ def _load_plan(path: Path, wait_for_plan: bool) -> tuple[dict[str, object], byte
     except OSError as error:
         raise LauncherError(f"plan {path} could not be read: {error}") from error
     return _parse_plan_bytes(path, plan_bytes)
+
+
+def _validate_captured_plan(project_root: Path, plan_bytes: bytes) -> None:
+    """Run the complete preflight pipeline against the bytes about to be recorded."""
+    run_preflight(
+        project_root,
+        allow_missing_plan=False,
+        expected_plan_digest=hashlib.sha256(plan_bytes).hexdigest(),
+    )
 
 
 def _load_snapshot_plan(project_root: Path, expected_digest: str) -> tuple[dict[str, object], bytes]:
