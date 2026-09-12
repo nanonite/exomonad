@@ -5593,35 +5593,77 @@ mod tests {
 
         let first = acquire_plan_transition_lock_async(&project_dir)
             .await
-            .expect("first init should acquire the reconciliation lock");
+            .expect("first init should acquire the plan transition lock");
 
         let lock_path = project_dir.join(".exo/tl-loop/init-reconcile.lock");
         assert!(lock_path.exists(), "lock file should be published");
 
-        // A second concurrent init contends for the same lock while the
-        // first is still running its reconciliation.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let contender_dir = project_dir.clone();
         let contender = tokio::spawn(async move {
-            let started = std::time::Instant::now();
+            started_tx.send(()).unwrap();
             let lock = acquire_plan_transition_lock_async(&contender_dir)
                 .await
                 .expect("second init should eventually acquire the lock");
-            (started.elapsed(), lock)
+            lock
         });
 
-        // Give the contender time to start blocking on the held lock before
-        // releasing it, then confirm it only proceeds after release.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        started_rx.await.unwrap();
         drop(first);
 
-        let (waited, second_lock) = contender.await.unwrap();
-        assert!(
-            waited >= std::time::Duration::from_millis(150),
-            "second init should have blocked until the first lock was released, waited {waited:?}"
-        );
+        let second_lock = contender.await.unwrap();
         assert!(lock_path.exists(), "second init should now hold the lock");
         drop(second_lock);
         assert!(!lock_path.exists(), "lock should be released on drop");
+    }
+
+    #[test]
+    fn concurrent_start_does_not_recover_a_live_prepared_transition() {
+        let (dir, original, requested) = terminal_transition_fixture();
+        let first = acquire_plan_transition_lock(dir.path()).unwrap();
+        let archive = root_archive_path_at(dir.path(), 123).unwrap().unwrap();
+        begin_plan_transition_locked(
+            dir.path(),
+            Some(&original),
+            Some(&plan_digest(&original)),
+            Some(&archive),
+        )
+        .unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let contender_dir = dir.path().to_path_buf();
+        let contender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _lock = acquire_plan_transition_lock(&contender_dir).unwrap();
+            let mut failure = None;
+            recover_plan_transition_locked(&contender_dir, &mut failure).unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        assert_eq!(
+            read_plan_transition(dir.path()).unwrap().unwrap().0,
+            PLAN_TRANSITION_PHASE_PREPARED
+        );
+        let mut failure = None;
+        apply_plan_snapshot_locked(
+            dir.path(),
+            Some(&requested),
+            Some(&plan_digest(&requested)),
+            &mut failure,
+        )
+        .unwrap();
+        archive_root_tl_run_to(dir.path(), &archive).unwrap();
+        write_plan_transition(dir.path(), PLAN_TRANSITION_PHASE_ARCHIVED, Some(&archive)).unwrap();
+        clear_plan_transition_locked(dir.path(), &mut failure).unwrap();
+        drop(first);
+        contender.join().unwrap();
+
+        assert!(!dir.path().join(".exo/tl-loop/root").exists());
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            requested
+        );
+        assert!(!plan_transition_path(dir.path()).exists());
     }
 
     #[test]
