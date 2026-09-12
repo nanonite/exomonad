@@ -151,6 +151,15 @@ def test_snapshot_uses_captured_plan_bytes_without_rereading_source(tmp_path: Pa
     tl_main._record_plan_snapshot(project, plan, accepted)
 
     assert (project / ".exo" / "tl-loop" / "plan.snapshot").read_bytes() == accepted
+    assert (
+        (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").read_text(encoding="ascii").strip()
+        == hashlib.sha256(accepted).hexdigest()
+    )
+    (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").write_text(
+        "0" * 64 + "\n", encoding="ascii"
+    )
+    with pytest.raises(tl_main.LauncherError, match="snapshot identity"):
+        tl_main._record_plan_snapshot(project, plan, accepted)
 
 
 def test_snapshot_loader_binds_startup_to_immutable_snapshot(tmp_path: Path) -> None:

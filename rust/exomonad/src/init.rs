@@ -606,10 +606,219 @@ fn read_plan_snapshot_bytes(project_dir: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn apply_plan_snapshot(project_dir: &Path, plan: Option<&[u8]>) -> Result<()> {
-    if let Some(plan) = plan {
-        return write_plan_snapshot(&plan_snapshot_path(project_dir), plan);
+fn plan_snapshot_digest_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".exo/tl-loop/plan.snapshot.sha256")
+}
+
+fn read_plan_snapshot_digest(project_dir: &Path) -> Result<Option<String>> {
+    let path = plan_snapshot_digest_path(project_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(value) => {
+            let digest = value.trim().to_owned();
+            if digest.is_empty() {
+                anyhow::bail!("persisted TL plan digest is empty: {}", path.display());
+            }
+            Ok(Some(digest))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+fn write_plan_snapshot_digest(project_dir: &Path, digest: &str) -> Result<()> {
+    write_plan_digest_file(&plan_snapshot_digest_path(project_dir), digest)
+}
+
+fn write_plan_digest_file(path: &Path, digest: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("plan snapshot digest has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .context("plan snapshot digest path is not UTF-8")?
+    ));
+    std::fs::write(&temporary, format!("{digest}\n"))?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+fn plan_transition_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".exo/tl-loop/plan-transition.json")
+}
+
+fn plan_transition_previous_snapshot_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".exo/tl-loop/plan-transition.previous.snapshot")
+}
+
+fn plan_transition_previous_digest_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".exo/tl-loop/plan-transition.previous.sha256")
+}
+
+fn write_plan_transition(project_dir: &Path, phase: &str, archive: Option<&Path>) -> Result<()> {
+    let archive_name = archive
+        .map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .context("plan transition archive path is not UTF-8")
+        })
+        .transpose()?;
+    let payload = serde_json::json!({
+        "phase": phase,
+        "archive_name": archive_name,
+    });
+    let path = plan_transition_path(project_dir);
+    let parent = path
+        .parent()
+        .context("plan transition has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_vec(&payload)?)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+fn read_plan_transition(project_dir: &Path) -> Result<Option<(String, Option<String>)>> {
+    let path = plan_transition_path(project_dir);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()))
+        }
+    };
+    let value: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("invalid plan transition journal {}", path.display()))?;
+    let phase = value
+        .get("phase")
+        .and_then(Value::as_str)
+        .context("plan transition journal has no phase")?
+        .to_owned();
+    if phase != "prepared" && phase != "archived" {
+        anyhow::bail!("unsupported plan transition phase {phase}");
+    }
+    let archive_name = value
+        .get("archive_name")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if archive_name.as_deref().is_some_and(|name| {
+        name == "." || name == ".." || name.contains('/') || name.contains('\\')
+    }) {
+        anyhow::bail!("plan transition journal contains an invalid archive name");
+    }
+    Ok(Some((phase, archive_name)))
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error).with_context(|| format!("failed to remove {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn clear_plan_transition(project_dir: &Path) -> Result<()> {
+    remove_if_present(&plan_transition_path(project_dir))?;
+    remove_if_present(&plan_transition_previous_snapshot_path(project_dir))?;
+    remove_if_present(&plan_transition_previous_digest_path(project_dir))
+}
+
+fn begin_plan_transition(
+    project_dir: &Path,
+    previous_snapshot: Option<&[u8]>,
+    previous_digest: Option<&str>,
+    archive: Option<&Path>,
+) -> Result<()> {
+    match previous_snapshot {
+        Some(bytes) => {
+            write_plan_snapshot(&plan_transition_previous_snapshot_path(project_dir), bytes)?
+        }
+        None => remove_if_present(&plan_transition_previous_snapshot_path(project_dir))?,
+    }
+    match previous_digest {
+        Some(digest) => {
+            write_plan_digest_file(&plan_transition_previous_digest_path(project_dir), digest)?
+        }
+        None => remove_if_present(&plan_transition_previous_digest_path(project_dir))?,
+    }
+    write_plan_transition(project_dir, "prepared", archive)
+}
+
+fn recover_plan_transition(project_dir: &Path) -> Result<()> {
+    let Some((phase, archive_name)) = read_plan_transition(project_dir)? else {
+        return Ok(());
+    };
+    if phase == "archived" {
+        return clear_plan_transition(project_dir);
+    }
+    if let Some(archive_name) = archive_name {
+        let root = project_dir.join(".exo/tl-loop/root");
+        let archive = project_dir.join(".exo/tl-loop").join(archive_name);
+        if !root.exists() {
+            if !archive.exists() {
+                anyhow::bail!(
+                    "cannot recover plan transition: archived TL root {} is missing",
+                    archive.display()
+                );
+            }
+            std::fs::rename(&archive, &root).with_context(|| {
+                format!("failed to restore archived TL root {}", archive.display())
+            })?;
+        }
+    }
+    let previous_snapshot = plan_transition_previous_snapshot_path(project_dir);
+    if previous_snapshot.is_file() {
+        let bytes = std::fs::read(&previous_snapshot)?;
+        write_plan_snapshot(&plan_snapshot_path(project_dir), &bytes)?;
+    } else {
+        remove_if_present(&plan_snapshot_path(project_dir))?;
+    }
+    let previous_digest = plan_transition_previous_digest_path(project_dir);
+    if previous_digest.is_file() {
+        let digest = std::fs::read_to_string(&previous_digest)?;
+        write_plan_snapshot_digest(project_dir, digest.trim())?;
+    } else {
+        remove_plan_snapshot_digest(project_dir)?;
+    }
+    clear_plan_transition(project_dir)
+}
+
+fn rollback_plan_transition(project_dir: &Path, error: anyhow::Error) -> anyhow::Error {
+    match recover_plan_transition(project_dir) {
+        Ok(()) => error,
+        Err(rollback_error) => {
+            anyhow::anyhow!("{error}; transition rollback also failed: {rollback_error}")
+        }
+    }
+}
+
+fn remove_plan_snapshot_digest(project_dir: &Path) -> Result<()> {
+    if let Err(error) = std::fs::remove_file(plan_snapshot_digest_path(project_dir)) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error).context("failed to clear stale TL plan digest");
+        }
+    }
+    Ok(())
+}
+
+fn apply_plan_snapshot(
+    project_dir: &Path,
+    plan: Option<&[u8]>,
+    digest: Option<&str>,
+) -> Result<()> {
+    if let Some(plan) = plan {
+        write_plan_snapshot(&plan_snapshot_path(project_dir), plan)?;
+        if let Some(digest) = digest {
+            write_plan_snapshot_digest(project_dir, digest)?;
+        } else {
+            remove_plan_snapshot_digest(project_dir)?;
+        }
+        return Ok(());
+    }
+    remove_plan_snapshot_digest(project_dir)?;
     if let Err(error) = std::fs::remove_file(plan_snapshot_path(project_dir)) {
         if error.kind() != std::io::ErrorKind::NotFound {
             return Err(error).context("failed to clear stale TL plan snapshot");
@@ -618,14 +827,34 @@ fn apply_plan_snapshot(project_dir: &Path, plan: Option<&[u8]>) -> Result<()> {
     Ok(())
 }
 
-fn restore_plan_snapshot(project_dir: &Path, previous: Option<&[u8]>) -> Result<()> {
-    apply_plan_snapshot(project_dir, previous)
+fn ensure_snapshot_matches(project_dir: &Path, expected: &[u8]) -> Result<()> {
+    let actual = read_plan_snapshot_bytes(project_dir)?.with_context(|| {
+        format!(
+            "refusing start transition: {} disappeared after validation",
+            plan_snapshot_path(project_dir).display()
+        )
+    })?;
+    if actual != expected {
+        anyhow::bail!(
+            "refusing start transition: plan.snapshot changed after validation; no runtime state was replaced"
+        );
+    }
+    let expected_digest = plan_digest(expected);
+    match read_plan_snapshot_digest(project_dir)? {
+        Some(actual_digest) if actual_digest != expected_digest => anyhow::bail!(
+            "refusing start transition: persisted plan identity changed after validation; no runtime state was replaced"
+        ),
+        Some(_) => {}
+        None => write_plan_snapshot_digest(project_dir, &expected_digest)?,
+    }
+    Ok(())
 }
 
 fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<SessionMode> {
     match decision {
         StartPlanDecision::Continue { validated_plan } => {
             ensure_plan_matches(project_dir, &validated_plan)?;
+            ensure_snapshot_matches(project_dir, &validated_plan)?;
             Ok(SessionMode::Continue)
         }
         StartPlanDecision::NewRun {
@@ -633,19 +862,35 @@ fn apply_start_plan(project_dir: &Path, decision: StartPlanDecision) -> Result<S
             validated_plan,
         } => {
             let previous_snapshot = read_plan_snapshot_bytes(project_dir)?;
-            apply_plan_snapshot(project_dir, validated_plan.as_deref())?;
-            if archive_terminal {
-                if let Err(error) = archive_root_tl_run(project_dir) {
-                    if let Err(rollback_error) =
-                        restore_plan_snapshot(project_dir, previous_snapshot.as_deref())
-                    {
-                        return Err(anyhow::anyhow!(
-                            "failed to archive prior TL run: {error}; snapshot rollback also failed: {rollback_error}"
-                        ));
-                    }
-                    return Err(error);
+            let previous_digest = read_plan_snapshot_digest(project_dir)?;
+            let validated_digest = validated_plan.as_deref().map(plan_digest);
+            let archive = if archive_terminal {
+                root_archive_path_at(project_dir, current_time_millis())?
+            } else {
+                None
+            };
+            begin_plan_transition(
+                project_dir,
+                previous_snapshot.as_deref(),
+                previous_digest.as_deref(),
+                archive.as_deref(),
+            )?;
+            if let Err(error) = apply_plan_snapshot(
+                project_dir,
+                validated_plan.as_deref(),
+                validated_digest.as_deref(),
+            ) {
+                return Err(rollback_plan_transition(project_dir, error));
+            }
+            if let Some(archive) = archive.as_deref() {
+                if let Err(error) = archive_root_tl_run_to(project_dir, archive) {
+                    return Err(rollback_plan_transition(project_dir, error));
                 }
             }
+            if let Err(error) = write_plan_transition(project_dir, "archived", archive.as_deref()) {
+                return Err(rollback_plan_transition(project_dir, error));
+            }
+            clear_plan_transition(project_dir)?;
             Ok(SessionMode::Start)
         }
     }
@@ -710,6 +955,7 @@ fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()>
 
     if mode == SessionMode::Continue {
         if !plan_exists && !snapshot_exists {
+            remove_plan_snapshot_digest(cwd)?;
             return Ok(());
         }
         if !plan_exists {
@@ -721,6 +967,7 @@ fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()>
             .with_context(|| format!("failed to read {}", plan_path.display()))?;
         if !snapshot_exists {
             write_plan_snapshot(&snapshot_path, &current)?;
+            write_plan_snapshot_digest(cwd, &plan_digest(&current))?;
             info!(
                 path = %snapshot_path.display(),
                 "Adopted legacy plan bytes as the initial TL plan snapshot"
@@ -735,6 +982,14 @@ fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()>
                 plan_path.display()
             );
         }
+        let expected_digest = plan_digest(&original);
+        match read_plan_snapshot_digest(cwd)? {
+            Some(actual_digest) if actual_digest != expected_digest => anyhow::bail!(
+                "cannot continue: persisted plan identity differs from its snapshot; use --recreate --confirm-recreate to reconcile it"
+            ),
+            Some(_) => {}
+            None => write_plan_snapshot_digest(cwd, &expected_digest)?,
+        }
         return Ok(());
     }
 
@@ -742,6 +997,7 @@ fn validate_or_record_plan_snapshot(cwd: &Path, mode: SessionMode) -> Result<()>
         let original = std::fs::read(&plan_path)
             .with_context(|| format!("failed to read {}", plan_path.display()))?;
         write_plan_snapshot(&snapshot_path, &original)?;
+        write_plan_snapshot_digest(cwd, &plan_digest(&original))?;
         info!(path = %snapshot_path.display(), "Recorded initial TL plan snapshot");
     }
     Ok(())
@@ -1902,10 +2158,6 @@ impl From<&Config> for TlLoopTimeouts {
     }
 }
 
-fn plan_snapshot_digest(project_dir: &Path) -> Result<Option<String>> {
-    Ok(read_plan_snapshot_bytes(project_dir)?.map(|bytes| plan_digest(&bytes)))
-}
-
 fn tl_loop_command(
     cwd: &Path,
     package_root: &Path,
@@ -2219,7 +2471,7 @@ async fn launch_tl_recovery(
                 project_dir,
                 tl_loop_root,
                 &TlLoopTimeouts::from(config),
-                plan_snapshot_digest(project_dir)?.as_deref(),
+                read_plan_snapshot_digest(project_dir)?.as_deref(),
             ),
         )
         .await?;
@@ -2443,16 +2695,10 @@ fn archive_root_tl_run(project_dir: &Path) -> Result<Option<PathBuf>> {
     archive_root_tl_run_at(project_dir, current_time_millis())
 }
 
-fn archive_root_tl_run_at(project_dir: &Path, timestamp_ms: u128) -> Result<Option<PathBuf>> {
+fn root_archive_path_at(project_dir: &Path, timestamp_ms: u128) -> Result<Option<PathBuf>> {
     let root_dir = project_dir.join(".exo/tl-loop/root");
     if !root_dir.exists() {
         return Ok(None);
-    }
-    if !root_dir.is_dir() {
-        anyhow::bail!(
-            "cannot recreate TL run: expected {} to be a directory",
-            root_dir.display()
-        );
     }
     let parent = root_dir
         .parent()
@@ -2472,35 +2718,46 @@ fn archive_root_tl_run_at(project_dir: &Path, timestamp_ms: u128) -> Result<Opti
                 .context("too many TL root checkpoint archive collisions")?;
             continue;
         }
-        match std::fs::rename(&root_dir, &archive) {
-            Ok(()) => {
-                info!(
-                    source = %root_dir.display(),
-                    archive = %archive.display(),
-                    "Archived prior TL root checkpoint for a new run"
-                );
-                return Ok(Some(archive));
-            }
-            Err(error)
-                if archive.exists()
-                    || matches!(
-                        error.kind(),
-                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
-                    ) =>
-            {
-                suffix = suffix
-                    .checked_add(1)
-                    .context("too many TL root checkpoint archive collisions")?;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to archive prior TL root checkpoint {}",
-                        root_dir.display()
-                    )
-                });
-            }
+        return Ok(Some(archive));
+    }
+}
+
+fn archive_root_tl_run_at(project_dir: &Path, timestamp_ms: u128) -> Result<Option<PathBuf>> {
+    let Some(archive) = root_archive_path_at(project_dir, timestamp_ms)? else {
+        return Ok(None);
+    };
+    archive_root_tl_run_to(project_dir, &archive)?;
+    Ok(Some(archive))
+}
+
+fn archive_root_tl_run_to(project_dir: &Path, archive: &Path) -> Result<()> {
+    let root_dir = project_dir.join(".exo/tl-loop/root");
+    if !root_dir.is_dir() {
+        anyhow::bail!(
+            "cannot recreate TL run: expected {} to be a directory",
+            root_dir.display()
+        );
+    }
+    match std::fs::rename(&root_dir, archive) {
+        Ok(()) => {
+            info!(
+                source = %root_dir.display(),
+                archive = %archive.display(),
+                "Archived prior TL root checkpoint for a new run"
+            );
+            Ok(())
         }
+        Err(error) if archive.exists() => anyhow::bail!(
+            "failed to archive prior TL root checkpoint {}: archive {} already exists ({error})",
+            root_dir.display(),
+            archive.display()
+        ),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to archive prior TL root checkpoint {}",
+                root_dir.display()
+            )
+        }),
     }
 }
 
@@ -2717,6 +2974,7 @@ pub async fn run(
     // inbox, capability, plan, or orchestration side effect.
     let mut config = Config::discover()?;
     validate_runtime_compatibility(&cwd)?;
+    recover_plan_transition(&cwd)?;
     let mut mode = mode;
     let recreate = mode.is_recreate();
     report_legacy_session(&cwd, mode);
@@ -2763,6 +3021,7 @@ pub async fn run(
     std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, &runtime_paths);
     ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
+    let mut controller_plan_digest = None;
     if let Some(decision) = start_plan_decision {
         let expected_plan_digest = decision.validated_plan().map(plan_digest);
         mode = apply_start_plan_after_validation(&cwd, decision, || {
@@ -2777,9 +3036,11 @@ pub async fn run(
             }
             run_tl_loop_preflight(&cwd, &tl_loop_root, true, expected_plan_digest.as_deref())
         })?;
+        controller_plan_digest = expected_plan_digest;
     } else {
         if mode == SessionMode::Continue {
             validate_or_record_plan_snapshot(&cwd, mode)?;
+            controller_plan_digest = read_plan_snapshot_digest(&cwd)?;
         } else {
             if mode == SessionMode::Recreate {
                 write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
@@ -3446,15 +3707,11 @@ pub async fn run(
     // The human-facing TL window runs one coordinator: the Python controller.
     // Root harness settings and root_command are intentionally ignored.
     let tl_cwd = cwd.clone();
-    let expected_plan_digest = match mode {
-        SessionMode::Start | SessionMode::Continue => plan_snapshot_digest(&cwd)?,
-        SessionMode::Recreate => None,
-    };
     let base_command = tl_loop_command(
         &cwd,
         &tl_loop_root,
         &TlLoopTimeouts::from(&config),
-        expected_plan_digest.as_deref(),
+        controller_plan_digest.as_deref(),
     );
 
     let tl_command = match config.shell_command {
@@ -4645,6 +4902,10 @@ mod tests {
             std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
             snapshot
         );
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            plan_digest(snapshot) + "\n"
+        );
     }
 
     #[test]
@@ -4667,6 +4928,10 @@ mod tests {
         assert_eq!(
             std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
             requested
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            plan_digest(requested) + "\n"
         );
         let archives = std::fs::read_dir(dir.path().join(".exo/tl-loop"))
             .unwrap()
@@ -4808,6 +5073,104 @@ mod tests {
             std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
             snapshot
         );
+    }
+
+    #[test]
+    fn continue_plan_apply_rejects_snapshot_drift_after_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let snapshot = br#"{"plan":{"leaves":[]}}"#;
+        let changed = br#"{"plan":{"leaves":[{"name":"changed"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        std::fs::write(&plan, snapshot).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), snapshot).unwrap();
+
+        let decision = prepare_start_plan(dir.path()).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), changed).unwrap();
+        let error = apply_start_plan(dir.path(), decision).unwrap_err();
+
+        assert!(error.to_string().contains("plan.snapshot changed"));
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn start_plan_archive_failure_restores_snapshot_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let requested = br#"{"plan":{"leaves":[{"name":"new"}]}}"#;
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::write(&root, "not a checkpoint directory").unwrap();
+        std::fs::write(&plan, requested).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(original)),
+        )
+        .unwrap();
+
+        let decision = StartPlanDecision::NewRun {
+            archive_terminal: true,
+            validated_plan: Some(requested.to_vec()),
+        };
+        assert!(apply_start_plan(dir.path(), decision).is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(&root).unwrap(),
+            "not a checkpoint directory"
+        );
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            format!("{}\n", plan_digest(original))
+        );
+    }
+
+    #[test]
+    fn prepared_plan_transition_recovers_after_archive_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let requested = br#"{"plan":{"leaves":[{"name":"new"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), "old checkpoint").unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(original)),
+        )
+        .unwrap();
+
+        let archive = root_archive_path_at(dir.path(), 123).unwrap().unwrap();
+        begin_plan_transition(
+            dir.path(),
+            Some(original),
+            Some(&plan_digest(original)),
+            Some(&archive),
+        )
+        .unwrap();
+        apply_plan_snapshot(dir.path(), Some(requested), Some(&plan_digest(requested))).unwrap();
+        archive_root_tl_run_to(dir.path(), &archive).unwrap();
+
+        recover_plan_transition(dir.path()).unwrap();
+
+        assert!(root.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("run.json")).unwrap(),
+            "old checkpoint"
+        );
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            original
+        );
+        assert!(!plan_transition_path(dir.path()).exists());
+        assert!(!archive.exists());
     }
 
     #[test]
