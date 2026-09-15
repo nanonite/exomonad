@@ -140,3 +140,47 @@ passed against this same `codex-cli 0.154.0` on 2026-09-15 (host: Ubuntu
 24.04.7, `apparmor` 4.0.1). Re-verify this note (and the e2e run) whenever the
 installed Codex version changes — Codex's config schema has already drifted
 out from under this ADR once.
+
+## Update 2026-09-15 (cont.): Review Adjudication Is Implemented; Root/TL Codex Profile Scope
+
+The Context and Investigation sections above were written when TL/root
+orchestration was still expected to run as an interactive LLM session
+deciding its own merges — the same mental model documented in the now-legacy
+`codex_root_instructions()` PLAN/FORK/IDLE/MERGE/REPEAT text in
+`rust/exomonad/src/init.rs`. Two things have since changed and are worth
+recording here so this ADR doesn't keep citing a stale model:
+
+**`adjudicate_review` is implemented, not aspirational.** CLAUDE.md's Tech
+Lead Praxis section lists `decompose`, `adjudicate_review`, and
+`compose_repair` as narrow model calls; at the time this ADR was written that
+read as forward-looking. It is not — `adjudicate_review`
+(`tl_loop/rlm/adjudicate.py:58-87`) is a real call through the shared RLM
+boundary (`tl_loop/rlm/call.py::rlm`), invoked from the live ledger-event
+handler in `tl_loop/loop/driver.py:10096-10103`, validated against a closed
+schema, and gated by Python-side policy checks
+(`_apply_policy_gates`, `adjudicate.py:210-232`) before a verdict is trusted.
+The repair loop is real too: a `NO_GO` verdict flows through
+`compose_repair(..., dispatch=dispatch_resume)`
+(`driver.py:10449-10459`) into the same-owner `resume_pr` path
+(`driver.py:10437-10447`) — never a new branch or owner — and reviewed-head
+SHA binding (`driver.py:10040-10057`) drops stale verdicts on a head change,
+matching the reviewed-head invariant elsewhere in CLAUDE.md. Exhausting
+`reviewer_max_rounds` parks the slice with `ParkCause.REVIEW_STUCK`
+(`driver.py:10460-10489`) rather than looping — this is a sound, bounded
+state machine as implemented, not just as designed.
+
+**The TL/root Codex sandbox profile in this ADR no longer covers the primary
+orchestrator.** `tl_loop`'s own effect-client calls authenticate as
+`role="tl"`/`role="root"` directly against the Rust runtime
+(`tl_loop/client/effects.py:172`, `tl_loop/loop/recovery_control.py:160`) —
+the Python controller process itself, unsandboxed by Codex, not a spawned
+Codex/Claude agent running its own `git fetch`/merge commands. A "sub-TL" is
+a nested `tl_run` (another Python controller instance,
+`tl_loop/loop/driver.py:11303`), not another LLM session either. So the
+Investigation table's `git fetch`/merge-orchestration row, and the `root`/`tl`
+writable-roots profile in the Decision section, now apply only to
+**Codex-based root/tl companions** (`[[companions]]` with `role = "root"` or
+`"tl"` in `config.toml`) and any remaining manual Codex root/tl spawn path —
+not to the controller's own git/merge operations, which never go through a
+Codex sandbox at all. The `reviewer`, `dev`, and `worker` profiles are
+unaffected by this and remain the primary Codex sandbox surface in practice.
