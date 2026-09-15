@@ -13,7 +13,7 @@ const EXOMONAD_CODEX_HOOKS_END: &str = "# END EXOMONAD CODEX HOOKS";
 const CODEX_HOOK_TIMEOUT_SEC: u64 = 600;
 
 pub const CODEX_CONFIG_TEMPLATE: &str = r#"{model_config}approval_policy = "never"
-default_permissions = "{default_permissions}"
+sandbox_mode = "workspace-write"
 developer_instructions = """
 {instructions}
 """
@@ -49,7 +49,7 @@ async = false
 
 {mcp_servers}
 
-{permissions_profiles}
+{sandbox_workspace_write}
 "#;
 
 pub fn render_codex_config(
@@ -59,6 +59,7 @@ pub fn render_codex_config(
     model: Option<&str>,
     extra_mcp_servers: &HashMap<String, Value>,
     exomonad_binary: &Path,
+    project_root: &Path,
 ) -> String {
     render_codex_config_with_effort(
         agent_name,
@@ -68,6 +69,7 @@ pub fn render_codex_config(
         None,
         extra_mcp_servers,
         exomonad_binary,
+        project_root,
     )
 }
 
@@ -79,6 +81,7 @@ pub fn render_codex_config_with_effort(
     effort: Option<&str>,
     extra_mcp_servers: &HashMap<String, Value>,
     exomonad_binary: &Path,
+    project_root: &Path,
 ) -> String {
     let mut mcp_servers = toml::map::Map::new();
     mcp_servers.insert(
@@ -109,7 +112,6 @@ pub fn render_codex_config_with_effort(
             "{instructions}",
             &escape_multiline_basic_string(instructions),
         )
-        .replace("{default_permissions}", permissions_profile_for_role(role))
         .replace(
             "exomonad hook pre-tool-use --runtime codex",
             &format!("{hook_command_prefix} hook pre-tool-use --runtime codex"),
@@ -124,7 +126,10 @@ pub fn render_codex_config_with_effort(
         )
         .replace("{hook_timeout}", &CODEX_HOOK_TIMEOUT_SEC.to_string())
         .replace("{mcp_servers}", &mcp_servers_to_toml(&mcp_servers))
-        .replace("{permissions_profiles}", &permissions_profiles_toml())
+        .replace(
+            "{sandbox_workspace_write}",
+            &sandbox_workspace_write_toml(role, project_root),
+        )
 }
 
 pub fn codex_user_config_path() -> Option<PathBuf> {
@@ -436,31 +441,10 @@ fn to_io_invalid_data(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
 }
 
-fn permissions_profile_for_role(role: &str) -> &'static str {
+fn writable_roots_for_role(role: &str) -> &'static [&'static str] {
     match role {
-        "root" => "root",
-        "tl" => "tl",
-        "reviewer" => "reviewer",
-        "worker" => "worker",
-        _ => "dev",
-    }
-}
-
-fn permissions_profiles_toml() -> String {
-    let mut root = toml::map::Map::new();
-    let mut permissions = toml::map::Map::new();
-
-    permissions.insert(
-        "root".to_string(),
-        toml::Value::Table(read_mostly_profile(&[".exo", ".git"])),
-    );
-    permissions.insert(
-        "tl".to_string(),
-        toml::Value::Table(read_mostly_profile(&[".exo", ".git"])),
-    );
-    permissions.insert(
-        "reviewer".to_string(),
-        toml::Value::Table(read_mostly_profile(&[
+        "root" | "tl" => &[".exo", ".git"],
+        "reviewer" => &[
             ".exo/events",
             ".exo/tmp",
             "target",
@@ -469,45 +453,53 @@ fn permissions_profiles_toml() -> String {
             "haskell/dist-newstyle",
             ".stack-work",
             ".cache",
-        ])),
-    );
-    permissions.insert(
-        "dev".to_string(),
-        toml::Value::Table(workspace_write_profile()),
-    );
-    permissions.insert(
-        "worker".to_string(),
-        toml::Value::Table(workspace_write_profile()),
-    );
+        ],
+        _ => &["."],
+    }
+}
 
-    root.insert("permissions".to_string(), toml::Value::Table(permissions));
+/// Renders the `[sandbox_workspace_write]` table Codex resolves `sandbox_mode
+/// = "workspace-write"` against (see `codex-rs/config/src/types.rs`,
+/// `SandboxWorkspaceWrite`). `writable_roots` must be absolute paths.
+///
+/// `network_access = false` matches docs/decisions/agent-sandbox-profiles.md:
+/// root/tl may only touch `.exo`/`.git`, reviewers only build/event
+/// directories, dev/worker get the full worktree. Denying network still
+/// requires bwrap to unshare the network namespace and configure a
+/// loopback-only interface; a host whose AppArmor `unprivileged_userns`
+/// transition profile does not grant `capability net_admin` to unprivileged
+/// user namespaces will fail that step (`bwrap: loopback: Failed
+/// RTM_NEWADDR`). That is a host policy gap to fix at the OS level, not a
+/// reason to widen this profile.
+fn sandbox_workspace_write_toml(role: &str, project_root: &Path) -> String {
+    let writable_roots = writable_roots_for_role(role)
+        .iter()
+        .map(|relative| {
+            let absolute = if *relative == "." {
+                project_root.to_path_buf()
+            } else {
+                project_root.join(relative)
+            };
+            toml::Value::String(absolute.display().to_string())
+        })
+        .collect();
+
+    let mut sandbox_workspace_write = toml::map::Map::new();
+    sandbox_workspace_write.insert(
+        "writable_roots".to_string(),
+        toml::Value::Array(writable_roots),
+    );
+    sandbox_workspace_write.insert("network_access".to_string(), toml::Value::Boolean(false));
+
+    let mut root = toml::map::Map::new();
+    root.insert(
+        "sandbox_workspace_write".to_string(),
+        toml::Value::Table(sandbox_workspace_write),
+    );
     toml::to_string_pretty(&toml::Value::Table(root))
-        .expect("Codex permissions profiles should serialize")
+        .expect("Codex sandbox_workspace_write config should serialize")
         .trim()
         .to_string()
-}
-
-fn read_mostly_profile(writable_roots: &[&str]) -> toml::map::Map<String, toml::Value> {
-    let mut profile = toml::map::Map::new();
-    profile.insert(
-        "sandbox_mode".to_string(),
-        toml::Value::String("workspace-write".to_string()),
-    );
-    profile.insert("network_access".to_string(), toml::Value::Boolean(false));
-    profile.insert(
-        "writable_roots".to_string(),
-        toml::Value::Array(
-            writable_roots
-                .iter()
-                .map(|root| toml::Value::String((*root).to_string()))
-                .collect(),
-        ),
-    );
-    profile
-}
-
-fn workspace_write_profile() -> toml::map::Map<String, toml::Value> {
-    read_mostly_profile(&["."])
 }
 
 fn model_config_toml(model: Option<&str>, effort: Option<&str>) -> String {
@@ -622,6 +614,10 @@ mod tests {
         Path::new("/usr/local/bin/exomonad")
     }
 
+    fn test_project_root() -> &'static Path {
+        Path::new("/tmp/exomonad-test-project")
+    }
+
     #[test]
     fn renders_codex_config_with_hooks_and_mcp() {
         let config = render_codex_config(
@@ -631,10 +627,11 @@ mod tests {
             None,
             &HashMap::new(),
             test_exomonad_binary(),
+            test_project_root(),
         );
 
         assert!(config.contains("approval_policy = \"never\""));
-        assert!(config.contains("default_permissions = \"dev\""));
+        assert!(config.contains("sandbox_mode = \"workspace-write\""));
         assert!(config.contains("developer_instructions = \"\"\"\nUse ExoMonad tools.\n\"\"\""));
         assert!(config.contains("[features]\nhooks = true"));
 
@@ -651,24 +648,20 @@ mod tests {
             parsed["hooks"]["Stop"][0]["hooks"][0]["command"].as_str(),
             Some("/usr/local/bin/exomonad hook stop --runtime codex")
         );
-        assert_eq!(parsed["default_permissions"].as_str(), Some("dev"));
+        assert_eq!(parsed["sandbox_mode"].as_str(), Some("workspace-write"));
+        assert!(parsed.get("default_permissions").is_none());
+        assert!(parsed.get("permissions").is_none());
         assert_eq!(
-            parsed["permissions"]["dev"]["writable_roots"]
+            parsed["sandbox_workspace_write"]["writable_roots"]
                 .as_array()
                 .unwrap(),
-            &[toml::Value::String(".".to_string())]
+            &[toml::Value::String(
+                test_project_root().display().to_string()
+            )],
+            "dev role gets the whole worktree writable"
         );
         assert_eq!(
-            parsed["permissions"]["tl"]["writable_roots"]
-                .as_array()
-                .unwrap(),
-            &[
-                toml::Value::String(".exo".to_string()),
-                toml::Value::String(".git".to_string())
-            ]
-        );
-        assert_eq!(
-            parsed["permissions"]["reviewer"]["network_access"].as_bool(),
+            parsed["sandbox_workspace_write"]["network_access"].as_bool(),
             Some(false)
         );
     }
@@ -686,8 +679,15 @@ mod tests {
             }),
         );
 
-        let config =
-            render_codex_config("agent", "tl", "Plan.", None, &extra, test_exomonad_binary());
+        let config = render_codex_config(
+            "agent",
+            "tl",
+            "Plan.",
+            None,
+            &extra,
+            test_exomonad_binary(),
+            test_project_root(),
+        );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
         let docs = &parsed["mcp_servers"]["docs"];
@@ -712,6 +712,7 @@ mod tests {
             Some("gpt-5.2"),
             &HashMap::new(),
             test_exomonad_binary(),
+            test_project_root(),
         );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
@@ -729,6 +730,7 @@ mod tests {
             Some("high"),
             &HashMap::new(),
             test_exomonad_binary(),
+            test_project_root(),
         );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
@@ -745,6 +747,7 @@ mod tests {
             None,
             &HashMap::new(),
             test_exomonad_binary(),
+            test_project_root(),
         );
 
         let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
@@ -752,14 +755,27 @@ mod tests {
     }
 
     #[test]
-    fn maps_roles_to_default_permission_profiles() {
-        for (role, expected) in [
-            ("root", "root"),
-            ("tl", "tl"),
-            ("reviewer", "reviewer"),
-            ("worker", "worker"),
-            ("dev", "dev"),
-            ("custom-dev-role", "dev"),
+    fn maps_roles_to_scoped_writable_roots() {
+        let root = test_project_root();
+        for (role, expected_relative) in [
+            ("root", &[".exo", ".git"][..]),
+            ("tl", &[".exo", ".git"][..]),
+            (
+                "reviewer",
+                &[
+                    ".exo/events",
+                    ".exo/tmp",
+                    "target",
+                    "rust/target",
+                    "dist-newstyle",
+                    "haskell/dist-newstyle",
+                    ".stack-work",
+                    ".cache",
+                ][..],
+            ),
+            ("worker", &["."][..]),
+            ("dev", &["."][..]),
+            ("custom-dev-role", &["."][..]),
         ] {
             let config = render_codex_config(
                 "agent",
@@ -768,12 +784,37 @@ mod tests {
                 None,
                 &HashMap::new(),
                 test_exomonad_binary(),
+                root,
             );
             let parsed: toml::Value = toml::from_str(&config).expect("valid Codex config TOML");
             assert_eq!(
-                parsed["default_permissions"].as_str(),
-                Some(expected),
-                "role {role} should select profile {expected}"
+                parsed["sandbox_mode"].as_str(),
+                Some("workspace-write"),
+                "role {role} should stay in workspace-write, not fall back to a stricter \
+                 default via an unrecognized profile"
+            );
+            let expected: Vec<toml::Value> = expected_relative
+                .iter()
+                .map(|relative| {
+                    let absolute = if *relative == "." {
+                        root.to_path_buf()
+                    } else {
+                        root.join(relative)
+                    };
+                    toml::Value::String(absolute.display().to_string())
+                })
+                .collect();
+            assert_eq!(
+                parsed["sandbox_workspace_write"]["writable_roots"]
+                    .as_array()
+                    .unwrap(),
+                &expected,
+                "role {role} should get its scoped writable roots"
+            );
+            assert_eq!(
+                parsed["sandbox_workspace_write"]["network_access"].as_bool(),
+                Some(false),
+                "role {role} should keep network denied per docs/decisions/agent-sandbox-profiles.md"
             );
         }
     }
@@ -850,6 +891,7 @@ mod tests {
             None,
             &HashMap::new(),
             test_exomonad_binary(),
+            test_project_root(),
         );
         std::fs::write(&worktree_config_path, config).unwrap();
 
@@ -886,6 +928,7 @@ mod tests {
             None,
             &HashMap::new(),
             test_exomonad_binary(),
+            &repo_path,
         );
         std::fs::write(&worktree_config_path, config).unwrap();
         install_codex_hook_trust(&user_config_path, &worktree_config_path).unwrap();
@@ -922,6 +965,7 @@ mod tests {
             None,
             &HashMap::new(),
             test_exomonad_binary(),
+            &repo_path,
         );
         std::fs::write(&worktree_config_path, config).unwrap();
         install_codex_hook_trust(&user_config_path, &worktree_config_path).unwrap();
@@ -980,6 +1024,7 @@ mod tests {
             None,
             &HashMap::new(),
             test_exomonad_binary(),
+            &repo_path,
         );
         std::fs::write(&worktree_config_path, config).unwrap();
         install_codex_hook_trust(&user_config_path, &worktree_config_path).unwrap();
@@ -1015,6 +1060,7 @@ mod tests {
             None,
             &HashMap::new(),
             test_exomonad_binary(),
+            test_project_root(),
         );
         std::fs::write(&worktree_config_path, config).unwrap();
 

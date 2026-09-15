@@ -1761,6 +1761,7 @@ fn write_codex_companion_config(
         Some(&configured_effort),
         &extra_mcp_servers,
         &exomonad_core::find_exomonad_binary(),
+        dir,
     );
     std::fs::write(codex_dir.join("config.toml"), rendered)?;
     Ok(())

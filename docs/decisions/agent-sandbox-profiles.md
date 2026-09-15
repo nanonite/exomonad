@@ -1,6 +1,6 @@
 # Agent Sandbox Profiles
 
-**Status:** Proposed
+**Status:** Accepted (schema migrated 2026-09-15, see Update below)
 
 **Date:** 2026-05-19
 
@@ -87,3 +87,56 @@ This is the structural fix for Codex. The runtime hook parity from #308 remains 
 - Reviewers can submit review records through Forgejo and write build artifacts, but source modification attempts must fail at the sandbox layer and at the PreToolUse hook layer.
 - Dev leaves and workers keep full workspace write because implementation is their job.
 - Network remains disabled in all generated profiles; networked operations should route through approved tools or explicit operator policy.
+
+## Update 2026-09-15: Codex Schema Migration
+
+Codex's April 2026 config refactor (`codex-rs` commit `1f24116` / PR #16962,
+2026-04-07) replaced the flat `sandbox_mode` / `network_access` /
+`writable_roots` keys inside named `[permissions.<name>]` profiles with a
+nested `filesystem` / `network` sub-table shape. `codex_config.rs` was never
+updated to follow that change, so `default_permissions = "<role>"` and every
+`[permissions.<role>]` block above stopped being recognized. Rather than
+erroring, current Codex silently falls back to its own unconfigured default
+and prints a startup warning ("Permissions profile `<role>` does not define
+any recognized filesystem entries for this version of Codex"). Every Codex
+agent in this project was hitting that fallback.
+
+`codex_config.rs` now renders the still-current legacy fields directly instead
+of a named profile:
+
+```toml
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+writable_roots = ["<abs>/.exo", "<abs>/.git"]   # role-scoped, see table below; absolute paths required
+network_access = false
+```
+
+The per-role root mapping is unchanged from the Decision above (`root`/`tl` →
+`.exo`, `.git`; `reviewer` → build/event roots; `dev`/`worker`/custom → the
+whole worktree). `writable_roots` entries are rendered as absolute paths
+because Codex's config now types them as `AbsolutePathBuf`; a relative path
+like `.exo` is silently invalid.
+
+**Host caveat, not a config regression:** `network_access = false` still makes
+Codex's `bwrap` sandbox helper unshare the network namespace and configure a
+loopback-only interface, both when entering `workspace-write` for ordinary
+tool calls and when the interactive TUI/app-server's `exec-server` helper
+preloads `AGENTS.md` at session bootstrap. A host whose AppArmor
+`unprivileged_userns` transition profile does not grant `capability net_admin`
+to unprivileged user namespaces (Ubuntu 24.04+ default hardening, tracked by
+`kernel.apparmor_restrict_unprivileged_userns`) will fail that step with
+`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`. That failure
+is independent of this config — it reproduces with a bare `bwrap --unshare-net
+... /bin/true` — and must be fixed at the host level (grant
+`capability net_admin`/`capability net_raw` in
+`/etc/apparmor.d/local/unprivileged_userns`, or disable
+`kernel.apparmor_restrict_unprivileged_userns`), not by widening this profile.
+
+**Verified against:** `codex-cli 0.154.0` (`@openai/codex` npm package),
+cross-checked against vendored `codex-rs` commit
+`5e3ee5eddfa5333f2e0b011880abf0cbf92bd295` (2026-05-12). `tests/e2e/codex-reviewer-sandbox`
+passed against this same `codex-cli 0.154.0` on 2026-09-15 (host: Ubuntu
+24.04.7, `apparmor` 4.0.1). Re-verify this note (and the e2e run) whenever the
+installed Codex version changes — Codex's config schema has already drifted
+out from under this ADR once.

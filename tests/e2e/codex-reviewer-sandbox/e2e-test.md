@@ -2,7 +2,7 @@
 
 Regression coverage for a Codex reviewer bug: `CODEX_REVIEWER_INSTRUCTIONS` once told
 reviewers to submit their final Forgejo verdict with `curl`/`fj` from their own shell,
-while the Codex reviewer sandbox profile (`codex_config.rs`, `permissions.reviewer`)
+while the Codex reviewer sandbox profile (`codex_config.rs`, `[sandbox_workspace_write]`)
 sets `network_access = false`. Every Codex reviewer was structurally unable to submit
 a review — see `docs/decisions/agent-sandbox-profiles.md` and
 `docs/decisions/codex-integration.md`.
@@ -13,7 +13,7 @@ auto-spawn a real Codex reviewer worktree for it on first sighting — the same 
 path production uses. It then inspects the generated `.codex/config.toml` on disk and
 asserts:
 
-1. `permissions.reviewer.network_access` is `false` (the sandbox setting itself is
+1. `sandbox_workspace_write.network_access` is `false` (the sandbox setting itself is
    correct and intentional — see the ADR).
 2. `developer_instructions` does not tell the reviewer to reach Forgejo via `curl`/`fj`
    from its own shell, since that can never work under (1).

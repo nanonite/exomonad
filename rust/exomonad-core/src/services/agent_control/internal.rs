@@ -1191,6 +1191,7 @@ impl<
             configured_effort,
             extra_mcp_servers,
             &crate::util::find_exomonad_binary(),
+            dir,
         );
         let codex_config_path = codex_dir.join("config.toml");
         fs::write(&codex_config_path, config).await?;

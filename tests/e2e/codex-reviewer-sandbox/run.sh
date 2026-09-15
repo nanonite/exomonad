@@ -5,7 +5,7 @@ set -euo pipefail
 # CODEX_REVIEWER_INSTRUCTIONS told Codex reviewers to submit their final
 # verdict with `curl`/`fj` against Forgejo directly from their own shell,
 # while the Codex reviewer's own sandbox profile (codex_config.rs,
-# `permissions.reviewer`) sets `network_access = false`. Every Codex
+# `[sandbox_workspace_write]`) sets `network_access = false`. Every Codex
 # reviewer was structurally unable to submit a review. See
 # docs/decisions/agent-sandbox-profiles.md and docs/decisions/codex-integration.md.
 #
@@ -156,9 +156,9 @@ with open(path, "rb") as f:
 instructions = config.get("developer_instructions", "")
 lower = instructions.lower()
 
-network_access = config["permissions"]["reviewer"]["network_access"]
+network_access = config["sandbox_workspace_write"]["network_access"]
 if network_access is not False:
-    print(f"expected permissions.reviewer.network_access = false, got {network_access!r}", file=sys.stderr)
+    print(f"expected sandbox_workspace_write.network_access = false, got {network_access!r}", file=sys.stderr)
     raise SystemExit(1)
 
 # The regression: instructions told the reviewer to hit Forgejo directly from
