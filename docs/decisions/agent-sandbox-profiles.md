@@ -86,7 +86,7 @@ This is the structural fix for Codex. The runtime hook parity from #308 remains 
 - Root and TL Codex agents can mutate orchestration state and git metadata, but not source files through ordinary file writes.
 - Reviewers can submit review records through Forgejo and write build artifacts, but source modification attempts must fail at the sandbox layer and at the PreToolUse hook layer.
 - Dev leaves and workers keep full workspace write because implementation is their job.
-- Network remains disabled in all generated profiles; networked operations should route through approved tools or explicit operator policy. **No longer current — see the 2026-09-16 update: `network_access` is now `true` in every generated profile.**
+- Network remains disabled in all generated profiles; networked operations should route through approved tools or explicit operator policy.
 
 ## Update 2026-09-15: Codex Schema Migration
 
@@ -239,3 +239,65 @@ still holds; it was never actually enforced by `network_access = false`
 alone; it also had to be an instruction/policy discipline; and it still is.
 `tests/e2e/codex-reviewer-sandbox` checks this directly regardless of the
 sandbox's own network setting.
+
+## Update 2026-09-16 (cont.): Real Host Fix Found — network_access Reverted to false
+
+The `network_access = true` workaround above was temporary. Chainlink #1087
+found the actual fix, and `network_access` is back to `false`
+(`rust/exomonad-core/src/codex_config.rs`, `sandbox_workspace_write_toml`) —
+the original Decision stands with no compromise.
+
+**The fix.** Rather than editing `/etc/apparmor.d/local/unprivileged_userns`
+(the transition profile `unconfined` processes go through when calling
+`unshare(CLONE_NEWUSER)` — the approach #1085 exhausted without effect),
+attach a dedicated profile directly to the `bwrap` binary itself:
+
+```
+# /etc/apparmor.d/bwrap-userns
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap_userns /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+```
+
+Loaded with `apparmor_parser -r /etc/apparmor.d/bwrap-userns` (no sysctl
+change, no edit to the shipped `unprivileged_userns` profile). Verified
+immediately: bare `bwrap --unshare-net --dev /dev --proc /proc --ro-bind / /
+-- /bin/true` and the same command without `--unshare-net` both now exit 0
+(previously `bwrap: loopback: Failed RTM_NEWADDR` and
+`bwrap: setting up uid map: Permission denied` respectively). Verified end
+to end: a real `codex exec` run with `approval_policy = "never"`,
+`sandbox_mode = "workspace-write"`, `network_access = false`, in a trusted
+project — the exact shape exomonad generates — executed a real shell command
+cleanly with no sandbox errors.
+
+**Why this worked where #1085 didn't.** The `unprivileged_userns`
+restriction, per its own docstring, only applies to processes AppArmor
+considers **unconfined** transitioning into a new user namespace. `bwrap`
+running under a named profile — even one with `flags=(unconfined)`, which
+does not itself restrict any operation — is no longer in the literal
+unconfined domain, so the separate unconfined-specific transition rule
+doesn't apply to it. This sidesteps the restriction instead of trying to
+carve an exception into a profile (`unprivileged_userns`) that, per #1085,
+could not be reloaded on this host through any means tried (correct syntax,
+cache-bypassed reload, full cold reboot). Scoped to exactly `/usr/bin/bwrap`
+by path attachment — it does not touch the system-wide
+`kernel.apparmor_restrict_unprivileged_userns` sysctl or weaken AppArmor for
+any other binary. What runs *inside* the sandbox remains constrained by
+bwrap's own mount/namespace mechanisms regardless, unrelated to this
+AppArmor layer.
+
+**Consequence for #1085's follow-on.** The non-blocking install-time
+preflight check that issue's Phase 2 proposed can now recommend this exact
+profile as the actionable remediation, rather than only detecting and
+warning with no concrete fix to suggest.
+
+**Consequence for #1087.** The full-sandbox-bypass-vs-containerization
+decision that issue posed is moot for this host — the underlying userns
+restriction is fixed, filesystem scoping and network denial both hold with
+no compromise, and no sandbox bypass or containerized-per-role execution is
+needed here. Left open only as a decision record in case a future host
+exhausts *this* fix too.

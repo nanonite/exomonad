@@ -5,19 +5,20 @@ set -euo pipefail
 # CODEX_REVIEWER_INSTRUCTIONS told Codex reviewers to submit their final
 # verdict with `curl`/`fj` against Forgejo directly from their own shell,
 # while the Codex reviewer's own sandbox profile (codex_config.rs,
-# `[sandbox_workspace_write]`) set `network_access = false` at the time. Every
-# Codex reviewer was structurally unable to submit a review. See
+# `[sandbox_workspace_write]`) sets `network_access = false`. Every Codex
+# reviewer was structurally unable to submit a review. See
 # docs/decisions/agent-sandbox-profiles.md and docs/decisions/codex-integration.md.
 #
-# `network_access` is now `true` (chainlink #1086 — denying it turned out to
-# be unfixable on hosts whose AppArmor `unprivileged_userns` profile lacks
-# `capability net_admin`, chainlink #1085), so the sandbox itself no longer
-# blocks a raw curl/fj call. The underlying invariant this test guards still
-# applies regardless: reviewer verdicts must go through the
-# approve_pr/request_changes MCP tools (submitted by the unsandboxed ExoMonad
-# host process under reviewer-identity authorization), never an ad hoc shell
-# call from inside the reviewer's own worktree — see the reviewer-authorship
-# invariant in docs/decisions/agent-sandbox-profiles.md.
+# `network_access = false` briefly flipped to `true` (chainlink #1086) after
+# a host was found where denying it broke bwrap outright
+# (`bwrap: loopback: Failed RTM_NEWADDR`), but chainlink #1087 found the real
+# fix — a dedicated `/etc/apparmor.d/bwrap-userns` profile attached to
+# `/usr/bin/bwrap` itself, rather than editing the `unprivileged_userns`
+# transition profile — so `network_access = false` was restored. The
+# reviewer-authorship invariant this test guards (verdicts go through
+# approve_pr/request_changes, never a raw shell call) held throughout
+# regardless of which way network_access was set; see
+# docs/decisions/agent-sandbox-profiles.md for the full trail.
 #
 # This harness drives the real worktree event watcher (real `exomonad serve`,
 # no mocked spawn logic) against a mock Forgejo API and lets it auto-spawn a
@@ -165,22 +166,18 @@ instructions = config.get("developer_instructions", "")
 lower = instructions.lower()
 
 network_access = config["sandbox_workspace_write"]["network_access"]
-if network_access is not True:
-    print(f"expected sandbox_workspace_write.network_access = true, got {network_access!r}", file=sys.stderr)
+if network_access is not False:
+    print(f"expected sandbox_workspace_write.network_access = false, got {network_access!r}", file=sys.stderr)
     raise SystemExit(1)
 
-# network_access is true (chainlink #1086 — denying it is unfixable on hosts
-# whose AppArmor unprivileged_userns profile lacks capability net_admin, see
-# chainlink #1085), so the sandbox itself no longer blocks a raw curl/fj call.
-# The original regression this test guards against still matters independent
-# of that: reviewer verdicts must go through the approve_pr/request_changes
-# MCP tools (submitted to Forgejo by the unsandboxed ExoMonad host process,
-# with proper reviewer-identity authorization) rather than an ad hoc shell
-# call from inside the reviewer's own worktree, which would bypass the
-# reviewer-authorship invariant regardless of what the sandbox permits.
+# The regression: instructions told the reviewer to hit Forgejo directly from
+# its own (network-disabled) shell. If network access is off, the verdict
+# path must never require it. Check for actual shell invocations, not just
+# the word "curl"/"fj" — instructions may mention them by name to explain
+# why the reviewer must not invoke them directly.
 for banned in ("curl -", "curl http", "fj pr review", "fj pr view", "fj pr files"):
     if banned in lower:
-        print(f"reviewer instructions must not submit verdicts via direct shell network calls ({banned!r}) — use approve_pr/request_changes instead", file=sys.stderr)
+        print(f"reviewer instructions require sandboxed network access ({banned!r}) but network_access=false", file=sys.stderr)
         raise SystemExit(1)
 
 for required in ("approve_pr", "request_changes"):

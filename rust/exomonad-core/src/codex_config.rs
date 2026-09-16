@@ -466,17 +466,25 @@ fn writable_roots_for_role(role: &str) -> &'static [&'static str] {
 /// root/tl may only touch `.exo`/`.git`, reviewers only build/event
 /// directories, dev/worker get the full worktree.
 ///
-/// `network_access = true` (not `false`, despite the ADR's original intent):
-/// denying network makes Codex's bwrap sandbox unshare the network namespace
-/// and configure a loopback-only interface, which requires
-/// `capability net_admin` inside an unprivileged user namespace. On a host
-/// whose AppArmor `unprivileged_userns` transition profile does not grant
-/// that (`bwrap: loopback: Failed RTM_NEWADDR`), this is unfixable from
-/// userspace: chainlink #1085 exhausted a `/etc/apparmor.d/local/
-/// unprivileged_userns` override, a cache-bypassed parser reload, and a full
-/// cold reboot — the kernel-loaded policy never changed. Do not revert this
-/// to `false` without a resolved fix for that class of host; see chainlink
-/// #1086 and the ADR's 2026-09-16 update for the full trail.
+/// `network_access = false` matches docs/decisions/agent-sandbox-profiles.md:
+/// root/tl may only touch `.exo`/`.git`, reviewers only build/event
+/// directories, dev/worker get the full worktree. Denying network makes
+/// Codex's bwrap sandbox unshare the network namespace and configure a
+/// loopback-only interface, which requires `capability net_admin` inside an
+/// unprivileged user namespace. A host whose AppArmor `unprivileged_userns`
+/// transition profile does not grant that will see
+/// `bwrap: loopback: Failed RTM_NEWADDR`; chainlink #1085/#1086 briefly
+/// worked around this by flipping `network_access` to `true`, but that was
+/// reverted once chainlink #1087 found the real fix: attach a dedicated
+/// `/etc/apparmor.d/bwrap-userns` profile to `/usr/bin/bwrap` itself
+/// (`profile bwrap_userns /usr/bin/bwrap flags=(unconfined) { userns, }`)
+/// rather than editing the `unprivileged_userns` transition profile — the
+/// restriction only applies to processes AppArmor treats as unconfined, and
+/// a named profile (even one that behaves like unconfined) sidesteps it
+/// instead of trying to patch it. See the ADR's 2026-09-16 update for the
+/// full trail; this is a host policy gap to document and fix at the OS
+/// level (chainlink #1085's non-blocking preflight-check follow-on can now
+/// recommend this exact profile), not a reason to widen this config.
 fn sandbox_workspace_write_toml(role: &str, project_root: &Path) -> String {
     let writable_roots = writable_roots_for_role(role)
         .iter()
@@ -495,7 +503,7 @@ fn sandbox_workspace_write_toml(role: &str, project_root: &Path) -> String {
         "writable_roots".to_string(),
         toml::Value::Array(writable_roots),
     );
-    sandbox_workspace_write.insert("network_access".to_string(), toml::Value::Boolean(true));
+    sandbox_workspace_write.insert("network_access".to_string(), toml::Value::Boolean(false));
 
     let mut root = toml::map::Map::new();
     root.insert(
@@ -668,10 +676,10 @@ mod tests {
         );
         assert_eq!(
             parsed["sandbox_workspace_write"]["network_access"].as_bool(),
-            Some(true),
-            "network_access is true per chainlink #1086: denying it is unfixable \
-             on hosts whose AppArmor unprivileged_userns profile lacks capability \
-             net_admin (see chainlink #1085)"
+            Some(false),
+            "network_access stays false per docs/decisions/agent-sandbox-profiles.md; \
+             chainlink #1087 found the real host fix (bwrap-userns AppArmor profile) \
+             instead of widening this"
         );
     }
 
@@ -822,9 +830,9 @@ mod tests {
             );
             assert_eq!(
                 parsed["sandbox_workspace_write"]["network_access"].as_bool(),
-                Some(true),
-                "role {role} should have network access; denying it is unfixable on \
-                 AppArmor-restricted hosts (chainlink #1085/#1086)"
+                Some(false),
+                "role {role} should keep network denied per docs/decisions/agent-sandbox-profiles.md; \
+                 chainlink #1087 found the real host fix instead of widening this"
             );
         }
     }
