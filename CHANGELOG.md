@@ -225,6 +225,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Codex bwrap/AppArmor sandbox failure: Phase 1 (AppArmor override) exhausted, falling back to network_access=true / bypass-sandbox (#1085)
 - Add safe operator cleanup for stale ExoMonad resources (#1068)
 - Extend opt-in remote branch deletion across verified cleanup overrides (#1082)
 - Add audited discard-dirty cleanup for abandoned managed worktrees (#1079)
@@ -449,6 +450,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Decide: full Codex sandbox bypass vs. containerized per-role isolation (uid_map/userns restricted on this host) (#1087)
+- Investigate bwrap-userns AppArmor profile as alternative to editing unprivileged_userns (#1088)
 - Extract a shared verified cleanup planner and executor (#1069)
 - Unify publication ownership verification across watcher and handler (#1024)
 - Single watcher-response projection for tl_loop/loop (63 raw readers) (#1025)
