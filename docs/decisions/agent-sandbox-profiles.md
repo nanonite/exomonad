@@ -290,10 +290,16 @@ any other binary. What runs *inside* the sandbox remains constrained by
 bwrap's own mount/namespace mechanisms regardless, unrelated to this
 AppArmor layer.
 
-**Consequence for #1085's follow-on.** The non-blocking install-time
-preflight check that issue's Phase 2 proposed can now recommend this exact
-profile as the actionable remediation, rather than only detecting and
-warning with no concrete fix to suggest.
+**Consequence for #1085's follow-on.** Implemented (chainlink #1089):
+`rust/exomonad-core/src/services/codex_sandbox_probe.rs` runs this exact
+`bwrap --unshare-net ... /bin/true` reproduction as a non-blocking preflight
+in `exomonad new` and `exomonad init`, gated on `Config::uses_codex_anywhere`
+so a Claude/OpenCode-only project never runs it. On
+`UserNamespaceRestricted`, it prints this exact remediation profile as a
+`warn!` — never a hard error, never a nonzero exit. `BwrapNotFound` and
+`Inconclusive` get their own advisory messages. Classification logic is
+unit-tested against synthetic stderr; the real subprocess call has an
+`#[ignore]`d test for manual host verification.
 
 **Consequence for #1087.** The full-sandbox-bypass-vs-containerization
 decision that issue posed is moot for this host — the underlying userns

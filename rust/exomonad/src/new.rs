@@ -158,8 +158,23 @@ gate = \"auto\"
         }
     }
 
+    if config.uses_codex_anywhere() {
+        warn_if_codex_sandbox_unavailable();
+    }
+
     info!("Project initialized. Run `exomonad init` to start a session.");
     Ok(())
+}
+
+/// Advisory only — never blocks or fails project creation/init. Codex is
+/// one of several optional harnesses; a Claude/OpenCode-only project never
+/// runs this at all (gated by `Config::uses_codex_anywhere`). Shared by
+/// `exomonad new` and `exomonad init`.
+pub(crate) fn warn_if_codex_sandbox_unavailable() {
+    let capability = exomonad_core::services::probe_codex_sandbox_capability();
+    if let Some(message) = exomonad_core::services::codex_sandbox_warning(&capability) {
+        warn!("{message}");
+    }
 }
 
 fn config_content() -> String {

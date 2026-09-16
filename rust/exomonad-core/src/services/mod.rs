@@ -7,6 +7,7 @@ pub mod claude_adapter;
 pub mod claude_session_registry;
 pub mod cleanup;
 pub mod codex_adapter;
+pub mod codex_sandbox_probe;
 pub mod command;
 pub mod complexity_classifier;
 pub mod continuation;
@@ -75,6 +76,10 @@ pub use self::cleanup::{
     CLEANUP_RECEIPT_SCHEMA_VERSION,
 };
 pub use self::codex_adapter::CodexAdapter;
+pub use self::codex_sandbox_probe::{
+    applies_to_this_host as codex_sandbox_probe_applies_to_this_host, codex_sandbox_warning,
+    probe_codex_sandbox_capability, CodexSandboxCapability,
+};
 pub use self::event_log::EventLog;
 pub use self::event_queue::EventQueue;
 pub use self::expected_events::{

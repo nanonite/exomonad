@@ -806,6 +806,22 @@ fn sanitize_session_name(name: String) -> String {
     name.replace('.', "_").chars().take(36).collect()
 }
 
+impl Config {
+    /// True if any configured role — root, spawned workers/leaves, the
+    /// reviewer, or a companion — resolves to the Codex harness. Gates the
+    /// Codex sandbox capability preflight: a Claude/OpenCode-only project
+    /// has no reason to run it.
+    pub fn uses_codex_anywhere(&self) -> bool {
+        self.root_agent_type == AgentType::Codex
+            || self.spawn_agent_type == AgentType::Codex
+            || self.reviewer.agent_type == AgentType::Codex
+            || self
+                .companions
+                .iter()
+                .any(|companion| companion.agent_type == Some(AgentType::Codex))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,6 +1238,66 @@ effort_level = "xhigh"
             result.is_err(),
             "Unknown agent_type should fail to deserialize"
         );
+    }
+
+    #[test]
+    fn uses_codex_anywhere_true_by_default_via_spawn_agent_type() {
+        // AgentType's #[default] is Codex, and Config::default() uses it for
+        // spawn_agent_type — the common case (workers/leaves/companions).
+        let config = Config::default();
+        assert!(config.uses_codex_anywhere());
+    }
+
+    #[test]
+    fn uses_codex_anywhere_false_when_no_role_selects_codex() {
+        let mut config = Config::default();
+        config.root_agent_type = AgentType::Claude;
+        config.spawn_agent_type = AgentType::OpenCode;
+        config.reviewer.agent_type = AgentType::Claude;
+        assert!(!config.uses_codex_anywhere());
+    }
+
+    #[test]
+    fn uses_codex_anywhere_true_when_only_reviewer_is_codex() {
+        let mut config = Config::default();
+        config.root_agent_type = AgentType::Claude;
+        config.spawn_agent_type = AgentType::OpenCode;
+        config.reviewer.agent_type = AgentType::Codex;
+        assert!(config.uses_codex_anywhere());
+    }
+
+    #[test]
+    fn uses_codex_anywhere_true_when_only_a_companion_is_codex() {
+        let mut config = Config::default();
+        config.root_agent_type = AgentType::Claude;
+        config.spawn_agent_type = AgentType::OpenCode;
+        config.reviewer.agent_type = AgentType::Claude;
+        config.companions.push(CompanionConfig {
+            name: "sleeptime".to_string(),
+            role: "sleeptime".to_string(),
+            agent_type: Some(AgentType::Codex),
+            command: "claude".to_string(),
+            task: None,
+            model: None,
+        });
+        assert!(config.uses_codex_anywhere());
+    }
+
+    #[test]
+    fn uses_codex_anywhere_ignores_companion_with_no_agent_type() {
+        let mut config = Config::default();
+        config.root_agent_type = AgentType::Claude;
+        config.spawn_agent_type = AgentType::OpenCode;
+        config.reviewer.agent_type = AgentType::Claude;
+        config.companions.push(CompanionConfig {
+            name: "sleeptime".to_string(),
+            role: "sleeptime".to_string(),
+            agent_type: None,
+            command: "claude".to_string(),
+            task: None,
+            model: None,
+        });
+        assert!(!config.uses_codex_anywhere());
     }
 
     #[test]

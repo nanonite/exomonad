@@ -3364,6 +3364,9 @@ pub async fn run(
             "Resolved exomonad init agent configuration"
         );
     }
+    if config.uses_codex_anywhere() {
+        crate::new::warn_if_codex_sandbox_unavailable();
+    }
     record_session_mode(&cwd, mode)?;
 
     if mode == SessionMode::Continue {

@@ -225,6 +225,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add non-blocking Codex sandbox capability preflight to exomonad new/init (#1089)
 - Codex bwrap/AppArmor sandbox failure: Phase 1 (AppArmor override) exhausted, falling back to network_access=true / bypass-sandbox (#1085)
 - Add safe operator cleanup for stale ExoMonad resources (#1068)
 - Extend opt-in remote branch deletion across verified cleanup overrides (#1082)
