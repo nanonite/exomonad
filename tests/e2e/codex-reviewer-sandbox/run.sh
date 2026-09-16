@@ -5,20 +5,28 @@ set -euo pipefail
 # CODEX_REVIEWER_INSTRUCTIONS told Codex reviewers to submit their final
 # verdict with `curl`/`fj` against Forgejo directly from their own shell,
 # while the Codex reviewer's own sandbox profile (codex_config.rs,
-# `[sandbox_workspace_write]`) sets `network_access = false`. Every Codex
-# reviewer was structurally unable to submit a review. See
+# `[sandbox_workspace_write]`) set `network_access = false` at the time. Every
+# Codex reviewer was structurally unable to submit a review. See
 # docs/decisions/agent-sandbox-profiles.md and docs/decisions/codex-integration.md.
+#
+# `network_access` is now `true` (chainlink #1086 — denying it turned out to
+# be unfixable on hosts whose AppArmor `unprivileged_userns` profile lacks
+# `capability net_admin`, chainlink #1085), so the sandbox itself no longer
+# blocks a raw curl/fj call. The underlying invariant this test guards still
+# applies regardless: reviewer verdicts must go through the
+# approve_pr/request_changes MCP tools (submitted by the unsandboxed ExoMonad
+# host process under reviewer-identity authorization), never an ad hoc shell
+# call from inside the reviewer's own worktree — see the reviewer-authorship
+# invariant in docs/decisions/agent-sandbox-profiles.md.
 #
 # This harness drives the real worktree event watcher (real `exomonad serve`,
 # no mocked spawn logic) against a mock Forgejo API and lets it auto-spawn a
 # real Codex reviewer worktree for a freshly observed PR. It then inspects the
 # *actual* generated `.codex/config.toml` on disk and asserts the sandbox
-# profile and the developer instructions are mutually consistent: if the
-# sandbox has no network access, the instructions must not tell the reviewer
-# to reach Forgejo over the network from its own shell. It also asserts the
-# `.exo/server.sock` symlink — whose supposed absence was the stated reason
-# for the curl-based rewrite — is present, proving that justification never
-# held for the normal spawn path.
+# profile and the developer instructions are mutually consistent. It also
+# asserts the `.exo/server.sock` symlink — whose supposed absence was the
+# stated reason for the curl-based rewrite — is present, proving that
+# justification never held for the normal spawn path.
 #
 # This does not require the `codex` binary: it only exercises ExoMonad's own
 # spawn/config-generation code path, not a live Codex process.
@@ -157,18 +165,22 @@ instructions = config.get("developer_instructions", "")
 lower = instructions.lower()
 
 network_access = config["sandbox_workspace_write"]["network_access"]
-if network_access is not False:
-    print(f"expected sandbox_workspace_write.network_access = false, got {network_access!r}", file=sys.stderr)
+if network_access is not True:
+    print(f"expected sandbox_workspace_write.network_access = true, got {network_access!r}", file=sys.stderr)
     raise SystemExit(1)
 
-# The regression: instructions told the reviewer to hit Forgejo directly from
-# its own (network-disabled) shell. If network access is off, the verdict
-# path must never require it. Check for actual shell invocations, not just
-# the word "curl"/"fj" — instructions may mention them by name to explain
-# why the reviewer must not invoke them directly.
+# network_access is true (chainlink #1086 — denying it is unfixable on hosts
+# whose AppArmor unprivileged_userns profile lacks capability net_admin, see
+# chainlink #1085), so the sandbox itself no longer blocks a raw curl/fj call.
+# The original regression this test guards against still matters independent
+# of that: reviewer verdicts must go through the approve_pr/request_changes
+# MCP tools (submitted to Forgejo by the unsandboxed ExoMonad host process,
+# with proper reviewer-identity authorization) rather than an ad hoc shell
+# call from inside the reviewer's own worktree, which would bypass the
+# reviewer-authorship invariant regardless of what the sandbox permits.
 for banned in ("curl -", "curl http", "fj pr review", "fj pr view", "fj pr files"):
     if banned in lower:
-        print(f"reviewer instructions require sandboxed network access ({banned!r}) but network_access=false", file=sys.stderr)
+        print(f"reviewer instructions must not submit verdicts via direct shell network calls ({banned!r}) — use approve_pr/request_changes instead", file=sys.stderr)
         raise SystemExit(1)
 
 for required in ("approve_pr", "request_changes"):

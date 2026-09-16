@@ -86,7 +86,7 @@ This is the structural fix for Codex. The runtime hook parity from #308 remains 
 - Root and TL Codex agents can mutate orchestration state and git metadata, but not source files through ordinary file writes.
 - Reviewers can submit review records through Forgejo and write build artifacts, but source modification attempts must fail at the sandbox layer and at the PreToolUse hook layer.
 - Dev leaves and workers keep full workspace write because implementation is their job.
-- Network remains disabled in all generated profiles; networked operations should route through approved tools or explicit operator policy.
+- Network remains disabled in all generated profiles; networked operations should route through approved tools or explicit operator policy. **No longer current — see the 2026-09-16 update: `network_access` is now `true` in every generated profile.**
 
 ## Update 2026-09-15: Codex Schema Migration
 
@@ -184,3 +184,58 @@ writable-roots profile in the Decision section, now apply only to
 not to the controller's own git/merge operations, which never go through a
 Codex sandbox at all. The `reviewer`, `dev`, and `worker` profiles are
 unaffected by this and remain the primary Codex sandbox surface in practice.
+
+## Update 2026-09-16: network_access Flipped to true — Denial Is Unfixable on This Host Class
+
+`sandbox_workspace_write.network_access` is now `true` for every generated
+Codex profile (`rust/exomonad-core/src/codex_config.rs`,
+`sandbox_workspace_write_toml`). This reverses the network-deny half of the
+original Decision; the filesystem `writable_roots` restrictions are
+unchanged.
+
+**Why.** Denying network makes Codex's bwrap sandbox unshare the network
+namespace and configure a loopback-only interface inside it, which needs
+`capability net_admin` granted to unprivileged user namespaces. Chainlink
+#1085 attempted the documented host-level fix — adding
+`/etc/apparmor.d/local/unprivileged_userns` with `capability net_admin,` and
+`capability net_raw,`, then reloading — on a host whose AppArmor
+`unprivileged_userns` transition profile denies that capability by default
+(Ubuntu 24.04+ hardening, `kernel.apparmor_restrict_unprivileged_userns=1`).
+The attempt was exhausted, not merely inconclusive: the override's syntax and
+include resolution were verified correct
+(`apparmor_parser -p`, no root needed), a cache-bypassed reload
+(`apparmor_parser --skip-read-cache -r`) reported success, and a genuine cold
+reboot (confirmed via `systemd-detect-virt: none` and a changed `boot_id`,
+ruling out a container/VM restart artifact) still left the kernel's loaded
+policy hash
+(`/sys/kernel/security/apparmor/policy/profiles/unprivileged_userns.*/raw_sha256`)
+byte-for-byte identical throughout. The bare repro
+(`bwrap --unshare-net --dev /dev --proc /proc --ro-bind / / -- /bin/true`)
+failed identically at every checkpoint. Working theory (unconfirmed): this
+transition-target profile is established earlier in boot than the normal
+`/etc/apparmor.d/` directory scan apparmor.service performs, based on an
+"already loaded with profiles" skip path found in
+`/lib/apparmor/rc.apparmor.functions`; pinning that down would need
+kernel/initrd-level tracing beyond what's reachable from userspace tooling.
+Full diagnostic trail is in chainlink #1085; the flip itself is chainlink
+#1086.
+
+**What this means going forward.** ExoMonad's Codex harness currently has no
+way to reliably enforce network denial on a host in this class — the
+harness's own sandbox config can request it, but whether it actually holds
+depends on host AppArmor policy exomonad cannot control or verify from
+userspace. Real, robust per-role network isolation would need each role
+instance running inside its own container (Docker or similar) with a network
+namespace under a runtime that already holds the privileges AppArmor is
+denying to unprivileged bwrap on this host class. That is a real
+architecture direction, not a rejected one — it is explicitly tabled rather
+than attempted here, and any future work on it should start from this
+paragraph rather than rediscovering why plain host-level AppArmor overrides
+were not sufficient.
+
+**What did not change.** The reviewer-authorship invariant — verdicts go
+through `approve_pr`/`request_changes`, never a raw shell call to Forgejo —
+still holds; it was never actually enforced by `network_access = false`
+alone; it also had to be an instruction/policy discipline; and it still is.
+`tests/e2e/codex-reviewer-sandbox` checks this directly regardless of the
+sandbox's own network setting.

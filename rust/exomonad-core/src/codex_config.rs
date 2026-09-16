@@ -462,15 +462,21 @@ fn writable_roots_for_role(role: &str) -> &'static [&'static str] {
 /// = "workspace-write"` against (see `codex-rs/config/src/types.rs`,
 /// `SandboxWorkspaceWrite`). `writable_roots` must be absolute paths.
 ///
-/// `network_access = false` matches docs/decisions/agent-sandbox-profiles.md:
+/// `writable_roots` still enforces docs/decisions/agent-sandbox-profiles.md:
 /// root/tl may only touch `.exo`/`.git`, reviewers only build/event
-/// directories, dev/worker get the full worktree. Denying network still
-/// requires bwrap to unshare the network namespace and configure a
-/// loopback-only interface; a host whose AppArmor `unprivileged_userns`
-/// transition profile does not grant `capability net_admin` to unprivileged
-/// user namespaces will fail that step (`bwrap: loopback: Failed
-/// RTM_NEWADDR`). That is a host policy gap to fix at the OS level, not a
-/// reason to widen this profile.
+/// directories, dev/worker get the full worktree.
+///
+/// `network_access = true` (not `false`, despite the ADR's original intent):
+/// denying network makes Codex's bwrap sandbox unshare the network namespace
+/// and configure a loopback-only interface, which requires
+/// `capability net_admin` inside an unprivileged user namespace. On a host
+/// whose AppArmor `unprivileged_userns` transition profile does not grant
+/// that (`bwrap: loopback: Failed RTM_NEWADDR`), this is unfixable from
+/// userspace: chainlink #1085 exhausted a `/etc/apparmor.d/local/
+/// unprivileged_userns` override, a cache-bypassed parser reload, and a full
+/// cold reboot — the kernel-loaded policy never changed. Do not revert this
+/// to `false` without a resolved fix for that class of host; see chainlink
+/// #1086 and the ADR's 2026-09-16 update for the full trail.
 fn sandbox_workspace_write_toml(role: &str, project_root: &Path) -> String {
     let writable_roots = writable_roots_for_role(role)
         .iter()
@@ -489,7 +495,7 @@ fn sandbox_workspace_write_toml(role: &str, project_root: &Path) -> String {
         "writable_roots".to_string(),
         toml::Value::Array(writable_roots),
     );
-    sandbox_workspace_write.insert("network_access".to_string(), toml::Value::Boolean(false));
+    sandbox_workspace_write.insert("network_access".to_string(), toml::Value::Boolean(true));
 
     let mut root = toml::map::Map::new();
     root.insert(
@@ -662,7 +668,10 @@ mod tests {
         );
         assert_eq!(
             parsed["sandbox_workspace_write"]["network_access"].as_bool(),
-            Some(false)
+            Some(true),
+            "network_access is true per chainlink #1086: denying it is unfixable \
+             on hosts whose AppArmor unprivileged_userns profile lacks capability \
+             net_admin (see chainlink #1085)"
         );
     }
 
@@ -813,8 +822,9 @@ mod tests {
             );
             assert_eq!(
                 parsed["sandbox_workspace_write"]["network_access"].as_bool(),
-                Some(false),
-                "role {role} should keep network denied per docs/decisions/agent-sandbox-profiles.md"
+                Some(true),
+                "role {role} should have network access; denying it is unfixable on \
+                 AppArmor-restricted hosts (chainlink #1085/#1086)"
             );
         }
     }
