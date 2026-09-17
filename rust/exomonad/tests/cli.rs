@@ -7,6 +7,9 @@
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
+use sha2::{Digest, Sha256};
+use std::fs;
+use tempfile::tempdir;
 
 fn test_hook_json() -> String {
     r#"{
@@ -194,4 +197,38 @@ fn test_clean_rejects_name_and_sweep_together() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn test_record_plan_snapshot_cli_persists_stdin_identity() {
+    let project = tempdir().expect("create temporary project");
+    let accepted = br#"{"plan":{"leaves":[{"name":"waited"}]}}"#;
+    let digest = format!("{:x}", Sha256::digest(accepted));
+
+    cargo_bin_cmd!("exomonad")
+        .args([
+            "record-plan-snapshot",
+            "--project-root",
+            project.path().to_str().expect("temporary path is UTF-8"),
+            "--expected-digest",
+            &digest,
+        ])
+        .write_stdin(accepted)
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(project.path().join(".exo/tl-loop/plan.snapshot"))
+            .expect("read persisted plan snapshot"),
+        accepted
+    );
+    assert_eq!(
+        fs::read_to_string(project.path().join(".exo/tl-loop/plan.snapshot.sha256"))
+            .expect("read persisted plan digest"),
+        format!("{digest}\n")
+    );
+    assert!(!project
+        .path()
+        .join(".exo/tl-loop/plan-transition.json")
+        .exists());
 }

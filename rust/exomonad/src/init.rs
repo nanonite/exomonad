@@ -649,10 +649,26 @@ const PLAN_TRANSITION_PHASE_PREPARED: &str = "prepared";
 const PLAN_TRANSITION_PHASE_ARCHIVED: &str = "archived";
 const PLAN_TRANSITION_PHASE_ROLLED_BACK: &str = "rolled_back";
 
-fn acquire_plan_transition_lock(
+fn acquire_init_lifecycle_lock(
     project_dir: &Path,
 ) -> Result<claude_teams_bridge::file_lock::FileLock> {
     let lock_target = project_dir.join(".exo/tl-loop/init-reconcile");
+    if let Some(parent) = lock_target.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create init lifecycle lock directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    claude_teams_bridge::file_lock::FileLock::acquire(&lock_target, Duration::from_secs(3600))
+        .context("failed to acquire project init lifecycle lock")
+}
+
+fn acquire_plan_transition_lock(
+    project_dir: &Path,
+) -> Result<claude_teams_bridge::file_lock::FileLock> {
+    let lock_target = project_dir.join(".exo/tl-loop/plan-transition");
     if let Some(parent) = lock_target.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
@@ -2328,10 +2344,18 @@ fn record_plan_snapshot_bytes(
         Some(expected_digest),
         &mut failure,
     ) {
-        return Err(rollback_plan_transition_locked(project_dir, error, &mut failure));
+        return Err(rollback_plan_transition_locked(
+            project_dir,
+            error,
+            &mut failure,
+        ));
     }
     if let Err(error) = write_plan_transition(project_dir, PLAN_TRANSITION_PHASE_ARCHIVED, None) {
-        return Err(rollback_plan_transition_locked(project_dir, error, &mut failure));
+        return Err(rollback_plan_transition_locked(
+            project_dir,
+            error,
+            &mut failure,
+        ));
     }
     clear_plan_transition_locked(project_dir, &mut failure)
 }
@@ -2842,6 +2866,15 @@ async fn launch_tl_recovery(
 /// project so two processes never race between inspecting session health
 /// and creating repair windows. The lock target need not exist; `FileLock`
 /// only ever touches the sibling `.lock` path.
+async fn acquire_init_lifecycle_lock_async(
+    project_dir: &Path,
+) -> Result<claude_teams_bridge::file_lock::FileLock> {
+    let project_dir = project_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire_init_lifecycle_lock(&project_dir))
+        .await
+        .context("init lifecycle lock task panicked")?
+}
+
 async fn acquire_plan_transition_lock_async(
     project_dir: &Path,
 ) -> Result<claude_teams_bridge::file_lock::FileLock> {
@@ -3321,9 +3354,12 @@ pub async fn run(
     // inbox, capability, plan, or orchestration side effect.
     let mut config = Config::discover()?;
     validate_runtime_compatibility(&cwd)?;
-    let project_plan_lock = acquire_plan_transition_lock_async(&cwd).await?;
+    let init_lifecycle_lock = acquire_init_lifecycle_lock_async(&cwd).await?;
     let mut no_transition_failure = None;
-    recover_plan_transition_locked(&cwd, &mut no_transition_failure)?;
+    {
+        let _plan_transition_lock = acquire_plan_transition_lock_async(&cwd).await?;
+        recover_plan_transition_locked(&cwd, &mut no_transition_failure)?;
+    }
     let mut mode = mode;
     let recreate = mode.is_recreate();
     report_legacy_session(&cwd, mode);
@@ -3373,6 +3409,7 @@ pub async fn run(
     let controller_plan_digest;
     if let Some(decision) = start_plan_decision {
         let expected_plan_digest = decision.validated_plan().map(plan_digest);
+        let plan_transition_lock = acquire_plan_transition_lock_async(&cwd).await?;
         mode = apply_start_plan_after_validation_locked(
             &cwd,
             decision,
@@ -3380,15 +3417,15 @@ pub async fn run(
                 if skip_preflight {
                     if expected_plan_digest.is_some() {
                         anyhow::bail!(
-                        "--skip-preflight cannot be used with --start when plan.json exists; the requested plan must be validated before replacing runtime state"
-                    );
+                            "--skip-preflight cannot be used with --start when plan.json exists; the requested plan must be validated before replacing runtime state"
+                        );
                     }
                     warn!("Skipping TL controller preflight for --start without a plan");
                     return Ok(());
                 }
                 run_tl_loop_preflight(&cwd, &tl_loop_root, true, expected_plan_digest.as_deref())
             },
-            &project_plan_lock,
+            &plan_transition_lock,
             &mut no_transition_failure,
         )?;
         controller_plan_digest = expected_plan_digest;
@@ -3396,6 +3433,7 @@ pub async fn run(
         write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
         let recreate_plan = requested_plan_bytes(&cwd)?;
         let expected_plan_digest = recreate_plan.as_deref().map(plan_digest);
+        let plan_transition_lock = acquire_plan_transition_lock_async(&cwd).await?;
         controller_plan_digest = apply_recreate_plan_after_validation_locked(
             &cwd,
             recreate_plan.as_deref(),
@@ -3411,10 +3449,11 @@ pub async fn run(
                 }
                 run_tl_loop_preflight(&cwd, &tl_loop_root, false, expected_plan_digest.as_deref())
             },
-            &project_plan_lock,
+            &plan_transition_lock,
             &mut no_transition_failure,
         )?;
     } else {
+        let _plan_transition_lock = acquire_plan_transition_lock_async(&cwd).await?;
         validate_or_record_plan_snapshot_locked(&cwd, mode)?;
         controller_plan_digest = capture_validated_plan_digest(&cwd)?;
         if skip_preflight {
@@ -3633,7 +3672,7 @@ pub async fn run(
         }
         report_orphaned_agent_windows(&session, &cwd).await;
         info!(session = %session, "Attaching to existing session");
-        drop(project_plan_lock);
+        drop(init_lifecycle_lock);
         return TmuxIpc::attach_session(&session).await;
     }
 
@@ -3835,6 +3874,7 @@ pub async fn run(
             TmuxIpc::kill_session(&session).await?;
         }
 
+        let _plan_transition_lock = acquire_plan_transition_lock_async(&cwd).await?;
         complete_recreate_plan_transition_locked(&cwd, &mut no_transition_failure)?;
     }
 
@@ -4107,7 +4147,7 @@ pub async fn run(
         ipc.set_window_remain_on_exit(&tl_window, false).await?;
     }
     startup?;
-    drop(project_plan_lock);
+    drop(init_lifecycle_lock);
 
     // 5. Spawn companion agents
     let companions_to_spawn: Vec<&crate::config::CompanionConfig> =
@@ -5319,7 +5359,10 @@ mod tests {
 
         record_plan_snapshot_bytes(dir.path(), accepted, &digest).unwrap();
 
-        assert_eq!(std::fs::read(plan_snapshot_path(dir.path())).unwrap(), accepted);
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            accepted
+        );
         assert_eq!(
             std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
             format!("{digest}\n")
@@ -5334,7 +5377,9 @@ mod tests {
 
         let error = record_plan_snapshot_bytes(dir.path(), accepted, "wrong").unwrap_err();
 
-        assert!(error.to_string().contains("does not match expected identity"));
+        assert!(error
+            .to_string()
+            .contains("does not match expected identity"));
         assert!(!plan_snapshot_path(dir.path()).exists());
         assert!(!plan_snapshot_digest_path(dir.path()).exists());
     }
@@ -5971,9 +6016,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().to_path_buf();
 
-        let first = acquire_plan_transition_lock_async(&project_dir)
+        let first = acquire_init_lifecycle_lock_async(&project_dir)
             .await
-            .expect("first init should acquire the plan transition lock");
+            .expect("first init should acquire the lifecycle lock");
 
         let lock_path = project_dir.join(".exo/tl-loop/init-reconcile.lock");
         assert!(lock_path.exists(), "lock file should be published");
@@ -5982,9 +6027,9 @@ mod tests {
         let contender_dir = project_dir.clone();
         let contender = tokio::spawn(async move {
             started_tx.send(()).unwrap();
-            let lock = acquire_plan_transition_lock_async(&contender_dir)
+            let lock = acquire_init_lifecycle_lock_async(&contender_dir)
                 .await
-                .expect("second init should eventually acquire the lock");
+                .expect("second init should eventually acquire the lifecycle lock");
             lock
         });
 
@@ -5995,6 +6040,38 @@ mod tests {
         assert!(lock_path.exists(), "second init should now hold the lock");
         drop(second_lock);
         assert!(!lock_path.exists(), "lock should be released on drop");
+    }
+
+    #[tokio::test]
+    async fn plan_transition_recorder_completes_while_lifecycle_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let lifecycle_lock = acquire_init_lifecycle_lock_async(dir.path())
+            .await
+            .expect("init should acquire the lifecycle lock");
+        let accepted = br#"{"plan":{"leaves":[{"name":"waited"}]}}"#.to_vec();
+        let expected = accepted.clone();
+        let digest = plan_digest(&accepted);
+        let recorder_digest = digest.clone();
+        let project_dir = dir.path().to_path_buf();
+
+        let recorder = tokio::task::spawn_blocking(move || {
+            record_plan_snapshot_bytes(&project_dir, &accepted, &recorder_digest)
+        });
+        tokio::time::timeout(Duration::from_secs(1), recorder)
+            .await
+            .expect("plan transition recorder must not wait for lifecycle startup observation")
+            .expect("plan transition recorder task must complete")
+            .expect("plan transition recorder must persist the accepted plan");
+
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            expected
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            format!("{digest}\n")
+        );
+        drop(lifecycle_lock);
     }
 
     #[test]
