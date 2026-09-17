@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix recreate transition ownership across Rust and Python (#1091)
 - Set network_access=true in Codex sandbox_workspace_write (AppArmor host fix exhausted, see #1085) (#1086)
 - Fix --start to select new or existing plans correctly (#1083)
 - Recover verified cleanup provenance for merged PR worktrees with missing identities (#1080)
