@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{rejection::JsonRejection, DefaultBodyLimit, Extension, FromRef, Path, Query, State},
-    http::Request,
+    http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -96,6 +96,17 @@ pub struct ToolCallRequest {
     pub name: String,
     #[serde(default)]
     pub arguments: serde_json::Value,
+}
+
+/// Request body for provisioning an ordered sub-TL before its first effect.
+#[derive(Debug, serde::Deserialize)]
+struct OrderedSubTLProvisionRequest {
+    agent_name: String,
+    birth_branch: String,
+    parent_branch: String,
+    working_dir: PathBuf,
+    #[serde(default)]
+    slice_id: Option<String>,
 }
 
 /// Query parameters for the `/hook` endpoint.
@@ -545,7 +556,7 @@ async fn agent_identity_middleware(
     let wasm_path = resolve_wasm_path_for_role(&state.wasm_dir, &role, &state.wasm_name)
         .unwrap_or_else(|| state.wasm_path.clone());
 
-    let plugin_result = resolve_plugin(
+    let plugin = match resolve_plugin(
         &state.plugins,
         &state.registry,
         &state.worktree_base,
@@ -553,18 +564,22 @@ async fn agent_identity_middleware(
         &wasm_path,
         Some(&state.agent_resolver),
     )
-    .await;
+    .await
+    {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            error!(agent = %name, role = %role, error = %error, "Agent identity resolution failed");
+            return agent_identity_resolution_failed(&name);
+        }
+    };
 
-    let parent = plugin_result
-        .as_ref()
-        .ok()
-        .and_then(|p| p.effect_context().birth_branch.parent())
+    let parent = plugin
+        .effect_context()
+        .birth_branch
+        .parent()
         .map(|p| p.to_string())
         .unwrap_or_default();
-
-    if let Ok(ref plugin) = plugin_result {
-        request.extensions_mut().insert(plugin.clone());
-    }
+    request.extensions_mut().insert(plugin);
 
     let span = tracing::info_span!(
         "agent_request",
@@ -574,6 +589,141 @@ async fn agent_identity_middleware(
         swarm.run_id = %state.run_id,
     );
     next.run(request).instrument(span).await
+}
+
+fn agent_identity_resolution_failed(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "kind": "agent_identity_unresolved",
+            "agent": name,
+            "message": "agent identity is unavailable; provision the controller before making an agent request"
+        })),
+    )
+        .into_response()
+}
+
+async fn provision_ordered_sub_tl(
+    Path((role, parent_name)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Extension(plugin): Extension<Arc<PluginManager>>,
+    Json(body): Json<OrderedSubTLProvisionRequest>,
+) -> Response {
+    if role != "tl" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "kind": "invalid_ordered_sub_tl_role",
+                "message": "ordered sub-TL provisioning requires the tl role"
+            })),
+        )
+            .into_response();
+    }
+    let child_name = match AgentName::try_from_str(&body.agent_name) {
+        Ok(name) => name,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "kind": "invalid_ordered_sub_tl_identity",
+                    "message": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
+    if body.agent_name == "." || body.agent_name == ".." || body.agent_name.contains(['/', '\\']) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "kind": "invalid_ordered_sub_tl_identity",
+                "message": "ordered sub-TL agent names must be a single path segment"
+            })),
+        )
+            .into_response();
+    }
+    let birth_branch = match BirthBranch::try_from_str(&body.birth_branch) {
+        Ok(branch) => branch,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "kind": "invalid_ordered_sub_tl_identity",
+                    "message": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
+    let parent_branch = match BirthBranch::try_from_str(&body.parent_branch) {
+        Ok(branch) => branch,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "kind": "invalid_ordered_sub_tl_identity",
+                    "message": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
+    let context = plugin.effect_context();
+    let valid_parent = context.agent_name.as_str() == parent_name
+        && context.birth_branch == parent_branch
+        && birth_branch.parent().as_ref() == Some(&parent_branch)
+        && birth_branch.slug() == child_name.as_str()
+        && body
+            .slice_id
+            .as_deref()
+            .is_some_and(|slice_id| !slice_id.trim().is_empty());
+    if !valid_parent {
+        error!(agent = %child_name, parent = %parent_name, "Rejected conflicting ordered sub-TL identity");
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "kind": "ordered_sub_tl_identity_conflict",
+                "agent": child_name.as_str(),
+                "message": "ordered sub-TL identity does not match its authenticated parent"
+            })),
+        )
+            .into_response();
+    }
+
+    let record = exomonad_core::services::AgentIdentityRecord {
+        agent_name: child_name.clone(),
+        slug: exomonad_core::domain::Slug::try_from_str(child_name.as_str())
+            .expect("validated child agent name is non-empty"),
+        agent_type: exomonad_core::services::AgentType::Codex,
+        birth_branch,
+        parent_branch,
+        working_dir: body.working_dir,
+        display_name: format!("🤖 {}", child_name),
+        topology: exomonad_core::services::agent_control::Topology::WorktreePerAgent,
+        model: None,
+        effort: None,
+        ledger_owned: true,
+        slice_id: body.slice_id,
+    };
+    match state.agent_control.provision_ordered_sub_tl(record).await {
+        Ok(()) => Json(serde_json::json!({
+            "provisioned": true,
+            "agent_name": child_name.as_str()
+        }))
+        .into_response(),
+        Err(error) => {
+            error!(agent = %child_name, error = %error, "Ordered sub-TL provisioning failed");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "kind": "ordered_sub_tl_provisioning_failed",
+                    "agent": child_name.as_str(),
+                    "message": "ordered sub-TL identity or workspace conflicts with existing ownership"
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ============================================================================
@@ -1894,6 +2044,7 @@ Run `exomonad recompile` first to build it.",
         inbox_store: inbox_store.clone(),
         session_memory,
         cleanup_service: services.cleanup_service(),
+        agent_control: agent_control.clone(),
     };
 
     let forgejo_ci_state = exomonad_core::services::forgejo_ci::ForgejoCiWebhookState {
@@ -1923,6 +2074,10 @@ Run `exomonad recompile` first to build it.",
     let agent_routes = Router::new()
         .route("/{role}/{name}/tools", get(list_tools))
         .route("/{role}/{name}/tools/call", post(call_tool))
+        .route(
+            "/{role}/{name}/provision-sub-tl",
+            post(provision_ordered_sub_tl),
+        )
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             agent_identity_middleware,
@@ -2065,6 +2220,19 @@ mod tests {
     use super::*;
     use exomonad_core::mcp::tools::MCPCallOutput;
     use exomonad_core::services::InboxMessageRecord;
+
+    #[tokio::test]
+    async fn unresolved_agent_identity_returns_contextual_json() {
+        let response = agent_identity_resolution_failed("missing-child");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["kind"], "agent_identity_unresolved");
+        assert_eq!(document["agent"], "missing-child");
+        assert!(!String::from_utf8_lossy(&body).contains("/home/"));
+    }
 
     #[tokio::test]
     async fn control_root_exposes_only_non_authoritative_actions() {

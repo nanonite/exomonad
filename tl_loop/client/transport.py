@@ -122,6 +122,34 @@ class TransportClient:
             raise DecodeError(f"Tool-call response is not an object: {response!r}")
         return cast(JsonObject, response)
 
+    def provision_ordered_sub_tl(
+        self,
+        parent_name: str,
+        *,
+        agent_name: str,
+        birth_branch: str,
+        parent_branch: str,
+        working_dir: str | Path,
+        slice_id: str,
+    ) -> None:
+        """Provision a live ordered controller before it can emit effects."""
+        path = (
+            f"/agents/{quote('tl', safe='')}/{quote(parent_name, safe='')}"
+            "/provision-sub-tl"
+        )
+        response = self.post_json(
+            path,
+            {
+                "agent_name": agent_name,
+                "birth_branch": birth_branch,
+                "parent_branch": parent_branch,
+                "working_dir": str(working_dir),
+                "slice_id": slice_id,
+            },
+        )
+        if not isinstance(response, dict) or response.get("provisioned") is not True:
+            raise DecodeError(f"Ordered sub-TL provisioning was not confirmed: {response!r}")
+
     def _request(self, method: str, path: str, body: JsonValue | None = None) -> JsonValue:
         encoded_body, headers = _encode_request_body(body)
         self.logger.info(

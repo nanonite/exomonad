@@ -7,9 +7,11 @@
 use crate::domain::{AgentName, BirthBranch, Slug};
 use crate::services::agent_control::{AgentType, InvocationTrigger, Topology};
 use crate::services::event_log::EventLog;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -236,6 +238,72 @@ impl AgentResolver {
             .await
             .insert(record.agent_name.clone(), record);
 
+        Ok(())
+    }
+
+    /// Persist an ordered sub-TL identity without changing an existing owner.
+    ///
+    /// Ordered controllers are provisioned before their first effect. Their
+    /// identity is therefore an ownership claim, rather than ordinary spawn
+    /// metadata that may be replaced by a later invocation. The caller owns
+    /// the lifecycle lock covering this check and the corresponding worktree
+    /// operation.
+    pub async fn ensure_ordered_sub_tl_identity(
+        &self,
+        record: AgentIdentityRecord,
+    ) -> anyhow::Result<()> {
+        let agent_dir = self
+            .project_dir
+            .join(".exo/agents")
+            .join(record.agent_name.as_str());
+        let identity_path = agent_dir.join(IDENTITY_FILENAME);
+
+        if identity_path.exists() {
+            let contents = tokio::fs::read_to_string(&identity_path).await?;
+            let existing: AgentIdentityRecord =
+                serde_json::from_str(&contents).with_context(|| {
+                    format!("failed to parse durable identity for {}", record.agent_name)
+                })?;
+            if existing != record {
+                anyhow::bail!("ordered sub-TL identity conflict for {}", record.agent_name);
+            }
+            self.records
+                .write()
+                .await
+                .insert(record.agent_name.clone(), record);
+            return Ok(());
+        }
+
+        tokio::fs::create_dir_all(&agent_dir).await?;
+        let json = serde_json::to_string_pretty(&record)?;
+        let temporary_path =
+            agent_dir.join(format!(".{IDENTITY_FILENAME}.{}.tmp", uuid::Uuid::new_v4()));
+        let mut temporary_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .await?;
+        temporary_file
+            .write_all(format!("{json}\n").as_bytes())
+            .await?;
+        temporary_file.sync_all().await?;
+        drop(temporary_file);
+        if identity_path.exists() {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            anyhow::bail!(
+                "ordered sub-TL identity appeared concurrently for {}",
+                record.agent_name
+            );
+        }
+        if let Err(error) = tokio::fs::rename(&temporary_path, &identity_path).await {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            return Err(error.into());
+        }
+
+        self.records
+            .write()
+            .await
+            .insert(record.agent_name.clone(), record);
         Ok(())
     }
 

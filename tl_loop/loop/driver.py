@@ -7204,13 +7204,9 @@ def _prepare_sub_tl_stage(
     prepared: list[SubTLTask] = []
     for task in tasks:
         current = state.slices[task.name]
-        branch = derive_child_branch(config.branch, task.name)
-        worktree = str(
-            task.worktree
-            or derive_child_worktree(
-                _effective_worktree(config, store.root_dir, store.run_id), task.name
-            )
-        )
+        child_name = _child_controller_name(task)
+        branch = derive_child_branch(config.branch, child_name)
+        worktree = str(_sub_tl_worktree(config, store.root_dir, store.run_id, task))
         if config.depth >= config.max_depth:
             before_phase = _phase_from_state(state)
             parked = replace(
@@ -7284,7 +7280,7 @@ def _prepare_sub_tl_stage(
                 dispatch_intent_id=internal_intent_id,
                 dispatch_started_at=internal_attempt.started_at,
                 dispatch_last_boundary="sub_tl_started",
-                dispatch_agent_id=task.name,
+                dispatch_agent_id=child_name,
                 dispatch_authoritative_event_seq=authoritative_seq,
                 dispatch_generation=internal_attempt.dispatch_generation,
             )
@@ -7325,13 +7321,8 @@ def _run_sub_tl_batch(
         return _run_live_sub_tl_batch(tasks, config, source, effects, store, budgets)
 
     def run_one(task: SubTLTask) -> tuple[SubTLTask, TLPhase | None, RunState | None]:
-        branch = derive_child_branch(config.branch, task.name)
-        worktree = str(
-            task.worktree
-            or derive_child_worktree(
-                _effective_worktree(config, store.root_dir, store.run_id), task.name
-            )
-        )
+        branch = derive_child_branch(config.branch, _child_controller_name(task))
+        worktree = str(_sub_tl_worktree(config, store.root_dir, store.run_id, task))
         child_store = RunStore(task.name, store.run_dir)
         if child_store.path.exists():
             child_state = child_store.load()
@@ -7498,15 +7489,19 @@ def _run_live_sub_tl(
     budgets: BudgetLedger,
 ) -> None:
     """Own one live child controller process and leave its checkpoint durable."""
-    branch = derive_child_branch(config.branch, task.name)
-    worktree = str(
-        task.worktree
-        or derive_child_worktree(
-            _effective_worktree(config, store.root_dir, store.run_id), task.name
-        )
-    )
-    child_config = _child_config(config, task, source, effects, store, branch, worktree)
+    branch = derive_child_branch(config.branch, _child_controller_name(task))
+    worktree = str(_sub_tl_worktree(config, store.root_dir, store.run_id, task))
     try:
+        if config.project_root is not None:
+            effects.transport.provision_ordered_sub_tl(
+                effects.name,
+                agent_name=_child_controller_name(task),
+                birth_branch=branch,
+                parent_branch=config.branch,
+                working_dir=worktree,
+                slice_id=task.name,
+            )
+        child_config = _child_config(config, task, source, effects, store, branch, worktree)
         tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
     except Exception as error:  # noqa: BLE001 - parent reconciles the durable marker
         RunStore(task.name, store.run_dir).record_exit_reason(str(error))
@@ -7570,17 +7565,12 @@ def _complete_sub_tl_batch(
                 owner_branch = (
                     child_state.owner_branch
                     if child_state is not None and child_state.owner_branch
-                    else derive_child_branch(config.branch, task.name)
+                    else derive_child_branch(config.branch, _child_controller_name(task))
                 )
                 owner_worktree = (
                     child_state.owner_worktree
                     if child_state is not None and child_state.owner_worktree
-                    else str(
-                        derive_child_worktree(
-                            _effective_worktree(config, store.root_dir, store.run_id),
-                            task.name,
-                        )
-                    )
+                    else str(_sub_tl_worktree(config, store.root_dir, store.run_id, task))
                 )
                 current = slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW))
                 current = slice_transition(
@@ -7686,9 +7676,11 @@ def _ensure_aggregate_candidate(
     owner_id = (
         own_candidate.integration_owner_id if own_candidate is not None else None
     ) or f"{store.run_id}:{task.name}:integration"
-    branch = child_state.owner_branch or derive_child_branch(config.branch, task.name)
+    branch = child_state.owner_branch or derive_child_branch(
+        config.branch, _child_controller_name(task)
+    )
     owner_worktree = child_state.owner_worktree or str(
-        derive_child_worktree(_effective_worktree(config, store.root_dir, store.run_id), task.name)
+        _sub_tl_worktree(config, store.root_dir, store.run_id, task)
     )
     fallback_head = _child_head_sha(child_state, branch)
     fallback_patch = _child_patch_digest(child_state)
@@ -8924,7 +8916,7 @@ def _checkpoint_aggregate_merged(
         integration_owner_branch=(
             integration.integration_owner_branch
             or current.branch
-            or derive_child_branch(current.base_ref or "main", task.name)
+            or derive_child_branch(current.base_ref or "main", _child_controller_name(task))
         ),
         integration_owner_worktree=(
             integration.integration_owner_worktree
@@ -11220,10 +11212,27 @@ def derive_child_branch(parent_branch: str, name: str) -> str:
     return f"{parent_branch}.{name}"
 
 
+def _child_controller_name(task: SubTLTask) -> str:
+    """Return the exact route identity used by a live child controller."""
+    return task.agent_id or task.name
+
+
 def derive_child_worktree(parent_worktree: str | Path, name: str) -> Path:
     _require_text(str(parent_worktree), "parent worktree")
     _require_text(name, "child name")
     return Path(parent_worktree) / name
+
+
+def _sub_tl_worktree(
+    config: TLLoopConfig, root_dir: Path, run_id: str, task: SubTLTask
+) -> Path:
+    """Use the server-owned worktree namespace for live controllers."""
+    if task.worktree is not None:
+        return Path(task.worktree)
+    child_name = _child_controller_name(task)
+    if config.project_root is not None and config.depth == 0:
+        return Path(config.project_root).resolve() / ".exo" / "worktrees" / child_name
+    return derive_child_worktree(_effective_worktree(config, root_dir, run_id), child_name)
 
 
 def _effective_worktree(config: TLLoopConfig, root_dir: Path, run_id: str) -> str:
@@ -11474,8 +11483,8 @@ def _initial_slices(
             (f"tl-loop/{task.name}",),
             ("controller",),
             task.agent_type,
-            derive_child_branch(selected.branch, task.name),
-            str(task.worktree or derive_child_worktree(owner_worktree, task.name)),
+            derive_child_branch(selected.branch, _child_controller_name(task)),
+            str(_sub_tl_worktree(selected, state_root, current_run, task)),
             selected.branch,
             config=selected,
             task_timeout_seconds=task.task_timeout_seconds,

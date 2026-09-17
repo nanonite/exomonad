@@ -818,6 +818,8 @@ pub struct AgentControlService<C> {
     pub(crate) ctx: Arc<C>,
     /// Base directory for worktrees (default: .exo/worktrees)
     pub(crate) worktree_base: PathBuf,
+    /// Serializes ordered controller identity and worktree provisioning.
+    pub(crate) ordered_sub_tl_provision_lock: Arc<tokio::sync::Mutex<()>>,
     /// tmux session name for event emission
     pub(crate) tmux_session: Option<String>,
     /// Direct tmux IPC client.
@@ -866,6 +868,7 @@ impl<
         Self {
             ctx,
             worktree_base,
+            ordered_sub_tl_provision_lock: Arc::new(tokio::sync::Mutex::new(())),
             tmux_session: None,
             tmux_ipc: None,
             birth_branch: BirthBranch::try_from_str("unset")

@@ -60,6 +60,126 @@ impl<
             + 'static,
     > AgentControlService<C>
 {
+    /// Provision an ordered sub-TL's durable identity and worktree as one
+    /// serialized lifecycle operation. Existing ownership is reusable only
+    /// when every field matches exactly; no existing workspace is removed.
+    pub async fn provision_ordered_sub_tl(&self, record: AgentIdentityRecord) -> Result<()> {
+        let _guard = self.ordered_sub_tl_provision_lock.lock().await;
+        let agent_name = record.agent_name.clone();
+        if agent_name.as_str() == "root"
+            || agent_name.as_str() == "."
+            || agent_name.as_str() == ".."
+            || agent_name.as_str().contains(['/', '\\'])
+            || record.agent_type != AgentType::Codex
+            || record.topology != Topology::WorktreePerAgent
+            || !record.ledger_owned
+            || record
+                .slice_id
+                .as_deref()
+                .is_none_or(|slice_id| slice_id.trim().is_empty())
+        {
+            return Err(anyhow!("invalid ordered sub-TL identity for {agent_name}"));
+        }
+        if record.birth_branch.parent().as_ref() != Some(&record.parent_branch)
+            || record.birth_branch.slug() != agent_name.as_str()
+        {
+            return Err(anyhow!(
+                "ordered sub-TL identity branch does not belong to {agent_name}"
+            ));
+        }
+
+        let worktree_path = record.working_dir.clone();
+        let default_worktree_base = self.project_dir().join(".exo/worktrees");
+        if !record.working_dir.is_absolute()
+            || (!record.working_dir.starts_with(&self.worktree_base)
+                && !record.working_dir.starts_with(&default_worktree_base))
+            || record
+                .working_dir
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            || record
+                .working_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some(agent_name.as_str())
+        {
+            return Err(anyhow!(
+                "ordered sub-TL identity has an unexpected working directory"
+            ));
+        }
+        let project_dir = self
+            .project_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_dir().to_path_buf());
+        if !worktree_path.starts_with(&project_dir) {
+            return Err(anyhow!(
+                "ordered sub-TL working directory is outside the project"
+            ));
+        }
+
+        let existing_identity = self.agent_resolver().get(&agent_name).await;
+        let branch = BranchName::try_from_str(record.birth_branch.as_str())?;
+        let branch_exists = {
+            let git_wt = self.git_wt().clone();
+            let branch = branch.clone();
+            tokio::task::spawn_blocking(move || git_wt.branch_exists(&branch))
+                .await
+                .context("ordered sub-TL branch inspection failed")??
+        };
+        if existing_identity.is_none() && branch_exists {
+            return Err(anyhow!(
+                "ordered sub-TL branch already exists without matching durable identity"
+            ));
+        }
+
+        if worktree_path.exists() {
+            let git_wt = self.git_wt().clone();
+            let path = worktree_path.clone();
+            let current_branch =
+                tokio::task::spawn_blocking(move || git_wt.get_workspace_bookmark(&path))
+                    .await
+                    .context("ordered sub-TL worktree inspection failed")??;
+            if current_branch.as_deref() != Some(record.birth_branch.as_str()) {
+                return Err(anyhow!("ordered sub-TL worktree has a conflicting branch"));
+            }
+        }
+
+        self.agent_resolver()
+            .ensure_ordered_sub_tl_identity(record.clone())
+            .await?;
+        if worktree_path.exists() {
+            return Ok(());
+        }
+
+        let git_wt = self.git_wt().clone();
+        let path = worktree_path.clone();
+        let branch = branch.clone();
+        let parent = BranchName::try_from_str(record.parent_branch.as_str())?;
+        let result = tokio::task::spawn_blocking(move || {
+            if branch_exists {
+                git_wt.create_workspace_from_existing_branch(&path, &branch)
+            } else {
+                git_wt.create_workspace(&path, &branch, &parent)
+            }
+        })
+        .await
+        .context("ordered sub-TL worktree creation failed")?;
+        result.map_err(|error| anyhow::Error::from(EffectError::from(error)))?;
+
+        let git_wt = self.git_wt().clone();
+        let path = worktree_path;
+        let expected = record.birth_branch.to_string();
+        let actual = tokio::task::spawn_blocking(move || git_wt.get_workspace_bookmark(&path))
+            .await
+            .context("ordered sub-TL worktree verification failed")??;
+        if actual.as_deref() != Some(expected.as_str()) {
+            return Err(anyhow!(
+                "ordered sub-TL worktree branch verification failed"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn runtime_role_context(&self, role: &crate::domain::Role) -> Result<String> {
         let context_path =
             resolve_role_context_path(self.project_dir(), self.wasm_name.as_str(), role.as_str())
@@ -1595,6 +1715,91 @@ mod tests {
         services.project_dir = project_dir;
         services.git_wt = git_wt;
         Arc::new(services)
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_provisioning_is_idempotent_and_rejects_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        services.agent_resolver = resolver;
+        let service = AgentControlService::new(Arc::new(services));
+        let agent_name = AgentName::try_from_str("ordered-child").unwrap();
+        let record = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::try_from_str("ordered-child").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-child").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-child"),
+            display_name: "🤖 ordered-child".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-child".to_string()),
+        };
+
+        service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        assert!(record.working_dir.join(".git").exists());
+
+        let mut restarted = crate::services::Services::test();
+        restarted.project_dir = project_dir.clone();
+        restarted.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        restarted.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        AgentControlService::new(Arc::new(restarted))
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+
+        let conflict = AgentIdentityRecord {
+            birth_branch: BirthBranch::try_from_str("other.ordered-child").unwrap(),
+            parent_branch: BirthBranch::try_from_str("other").unwrap(),
+            ..record
+        };
+        let identity_path = project_dir.join(".exo/agents/ordered-child/identity.json");
+        let identity_before = std::fs::read_to_string(&identity_path).unwrap();
+        let error = service
+            .provision_ordered_sub_tl(conflict)
+            .await
+            .expect_err("a different owner must not be adopted");
+        assert!(error.to_string().contains("conflicting branch"));
+        assert_eq!(
+            std::fs::read_to_string(identity_path).unwrap(),
+            identity_before
+        );
     }
 
     #[test]

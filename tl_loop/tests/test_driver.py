@@ -60,6 +60,7 @@ from tl_loop.loop.driver import (
     _repair_model,
     _route_ci_event,
     _route_review_event,
+    _run_live_sub_tl,
     _run_sub_tl_batch,
     _spawn_invocation_id,
     _supervise_live_sub_tl,
@@ -434,6 +435,38 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
     assert RunStore("beta", root).load().parent_run_id == "parent"
     assert RunStore("alpha", root).load().ledger_run_id == "swarm-uuid"
     assert RunStore("beta", root).load().ledger_run_id == "swarm-uuid"
+
+
+def test_live_ordered_child_is_provisioned_before_controller_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def provision(self: TransportClient, parent_name: str, **kwargs: object) -> None:
+        del self, parent_name, kwargs
+        calls.append("provision")
+
+    def run_child(root_spec: object, config: TLLoopConfig, budgets: object) -> None:
+        del root_spec, config, budgets
+        calls.append("run")
+
+    monkeypatch.setattr(TransportClient, "provision_ordered_sub_tl", provision)
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", run_child)
+    _run_live_sub_tl(
+        SubTLTask("child", WorkPlan(), order=1),
+        TLLoopConfig(
+            active=True,
+            project_root=tmp_path,
+            branch="main",
+            worktree=tmp_path,
+        ),
+        SyntheticQueue([]),
+        EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"), name="parent"),
+        RunStore("parent", tmp_path / "state"),
+        BudgetLedger(tokens=0, wall_seconds=0),
+    )
+
+    assert calls == ["provision", "run"]
 
 
 def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:

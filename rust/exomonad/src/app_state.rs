@@ -24,4 +24,6 @@ pub struct AppState {
     pub inbox_store: Arc<InboxStore>,
     pub session_memory: Arc<SessionMemoryService>,
     pub cleanup_service: VerifiedCleanupService,
+    pub agent_control:
+        Arc<exomonad_core::services::AgentControlService<exomonad_core::services::Services>>,
 }

@@ -2087,13 +2087,21 @@ def check_pr_evidence(
 def run_live_ordered_probe(
     client: TransportClient, root: Path, repo: Path, swarm_id: str
 ) -> None:
+    first_child = "ordered-first-a"
+    second_child = "ordered-first-b"
     effects = EffectClient(client, role="tl", name="root")
     result = run_tl_loop(
         "ordered-server-live",
         WorkPlan(
             sub_tls=(
-                SubTLTask("sub-a", WorkPlan(), order=1),
-                SubTLTask("sub-b", WorkPlan(), order=1),
+                SubTLTask(
+                    first_child,
+                    WorkPlan(
+                        sub_tls=(SubTLTask("nested", WorkPlan(), order=1),)
+                    ),
+                    order=1,
+                ),
+                SubTLTask(second_child, WorkPlan(), order=1),
             )
         ),
         EmptyEventSource(),
@@ -2108,6 +2116,7 @@ def run_live_ordered_probe(
             ledger_run_id=swarm_id,
             branch="main",
             worktree=repo,
+            project_root=repo,
         ),
         root_dir=root / "controller-state",
     )
@@ -2122,12 +2131,35 @@ def run_live_ordered_probe(
             f"live child ownership did not complete: {result.final_state.slices!r}"
         )
     state_root = root / "controller-state"
-    for name in ("sub-a", "sub-b"):
+    for name in (first_child, second_child):
         child = RunStore(name, state_root / "ordered-server-live").load()
         if child.owner_branch != f"main.{name}" or not child.owner_worktree:
             raise HarnessError(
                 f"child owner record is incomplete for {name}: {child!r}"
             )
+        identity = repo / ".exo" / "agents" / name / "identity.json"
+        if not identity.exists():
+            raise HarnessError(f"ordered child identity was not persisted for {name}")
+    nested_identity = repo / ".exo" / "agents" / "nested" / "identity.json"
+    if not nested_identity.exists():
+        raise HarnessError("nested ordered child identity was not persisted")
+    events = []
+    for path in (repo / ".exo").rglob("*.jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(value, Mapping)
+                and value.get("type") == "tl.slice_status_changed"
+                and value.get("agent_id") == first_child
+            ):
+                events.append(value)
+    if not events:
+        raise HarnessError(
+            f"real server did not record a child-owned effect for {first_child}"
+        )
 
 
 def mock_request_count(log_path: Path, *, method: str, suffix: str) -> int:
