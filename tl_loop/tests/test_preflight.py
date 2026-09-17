@@ -239,13 +239,12 @@ def test_recreate_waits_for_plan_when_rust_accepted_no_plan(
         captured["wait_for_plan"] = wait_for_plan
         return {"plan": {"workers": [], "leaves": [], "sub_tls": []}}, accepted
 
+    def reject_python_ownership(*_args: object) -> None:
+        raise AssertionError("plan-less recreate must not own plan identity")
+
     monkeypatch.setattr(tl_main, "_load_plan", load_plan)
-    monkeypatch.setattr(tl_main, "_validate_captured_plan", lambda _root, _bytes: None)
-    monkeypatch.setattr(
-        tl_main,
-        "_record_plan_snapshot",
-        lambda *args: captured.update(recorded=True),
-    )
+    monkeypatch.setattr(tl_main, "_record_plan_snapshot", reject_python_ownership)
+    monkeypatch.setattr(tl_main, "_validate_captured_plan", reject_python_ownership)
     monkeypatch.setattr(tl_main, "LedgerReader", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         tl_main,
@@ -284,7 +283,8 @@ def test_recreate_waits_for_plan_when_rust_accepted_no_plan(
 
     assert captured["path"] == plan
     assert captured["wait_for_plan"] is True
-    assert captured["recorded"] is True
+    assert not (project / ".exo" / "tl-loop" / "plan.snapshot").exists()
+    assert not (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").exists()
 
 
 def test_preflight_rejects_plan_bytes_that_changed_after_capture(tmp_path: Path) -> None:

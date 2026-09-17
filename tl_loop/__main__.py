@@ -287,8 +287,6 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         if expected_plan_digest is None:
             if args.wait_for_plan:
                 plan_document, accepted_plan_bytes = _load_plan(plan_path, wait_for_plan=True)
-                _validate_captured_plan(project_root, accepted_plan_bytes)
-                _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
                 plan = _plan_from_document(plan_document)
             else:
                 plan_document = {"run_id": args.run_id}
