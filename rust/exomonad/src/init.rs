@@ -2325,6 +2325,16 @@ fn record_plan_snapshot_bytes(
     }
 
     let _lock = acquire_plan_transition_lock(project_dir)?;
+    if let Some((phase, archive_name)) = read_plan_transition(project_dir)? {
+        let journal_path = plan_transition_path(project_dir);
+        let archive = archive_name
+            .map(|name| format!(" archive {name}"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "cannot record recreate plan identity while plan transition is in progress at {}: phase {phase}{archive}",
+            journal_path.display(),
+        );
+    }
     let previous_snapshot = read_plan_snapshot_bytes(project_dir)?;
     let previous_digest = read_plan_snapshot_digest(project_dir)?;
     if previous_snapshot.is_some() || previous_digest.is_some() {
@@ -6071,6 +6081,46 @@ mod tests {
             std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
             format!("{digest}\n")
         );
+        drop(lifecycle_lock);
+    }
+
+    #[tokio::test]
+    async fn recreate_journal_rejects_recorder_until_recreate_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
+        let lifecycle_lock = acquire_init_lifecycle_lock_async(dir.path())
+            .await
+            .expect("init should retain the lifecycle lock during recreate");
+
+        assert_eq!(
+            apply_recreate_plan_after_validation(dir.path(), None, || Ok(())).unwrap(),
+            None
+        );
+        assert!(!plan_snapshot_path(dir.path()).exists());
+        let journal_path = plan_transition_path(dir.path());
+        let prepared_journal = std::fs::read(&journal_path).unwrap();
+        let prepared = read_plan_transition(dir.path()).unwrap().unwrap();
+        assert_eq!(prepared.0, PLAN_TRANSITION_PHASE_PREPARED);
+        let archive_name = prepared.1.expect("recreate should record an archive");
+
+        let accepted = br#"{"plan":{"leaves":[{"name":"waited"}]}}"#;
+        let error =
+            record_plan_snapshot_bytes(dir.path(), accepted, &plan_digest(accepted)).unwrap_err();
+        assert!(error.to_string().contains("plan transition is in progress"));
+        assert_eq!(std::fs::read(&journal_path).unwrap(), prepared_journal);
+        assert!(!plan_snapshot_path(dir.path()).exists());
+
+        complete_recreate_plan_transition(dir.path(), None).unwrap();
+        assert!(!root.exists());
+        assert!(dir
+            .path()
+            .join(".exo/tl-loop")
+            .join(archive_name)
+            .join("run.json")
+            .exists());
+        assert!(!journal_path.exists());
         drop(lifecycle_lock);
     }
 
