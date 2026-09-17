@@ -279,10 +279,20 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     session_mode = _read_session_mode(project_root)
     expected_plan_digest = getattr(args, "expected_plan_digest", None)
     if session_mode == "recreate":
-        expected_plan_digest = _recreate_plan_digest(project_root, expected_plan_digest)
+        expected_plan_digest = _recreate_plan_digest(
+            project_root,
+            expected_plan_digest,
+            allow_unvalidated_plan=args.wait_for_plan,
+        )
         if expected_plan_digest is None:
-            plan_document: dict[str, object] = {"run_id": args.run_id}
-            plan = None
+            if args.wait_for_plan:
+                plan_document, accepted_plan_bytes = _load_plan(plan_path, wait_for_plan=True)
+                _validate_captured_plan(project_root, accepted_plan_bytes)
+                _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
+                plan = _plan_from_document(plan_document)
+            else:
+                plan_document = {"run_id": args.run_id}
+                plan = None
         else:
             plan_document, accepted_plan_bytes = _load_recreate_plan(
                 project_root, expected_plan_digest
@@ -441,21 +451,16 @@ def _load_snapshot_plan(project_root: Path, expected_digest: str) -> tuple[dict[
 
 
 def _load_recreate_plan(project_root: Path, expected_digest: str) -> tuple[dict[str, object], bytes]:
-    """Load Rust's recreate snapshot after checking the source-plan pairing."""
-    document, snapshot_bytes = _load_snapshot_plan(project_root, expected_digest)
-    plan_path = project_root / ".exo" / "tl-loop" / "plan.json"
-    try:
-        plan_bytes = plan_path.read_bytes()
-    except OSError as error:
-        raise LauncherError(f"recreate plan {plan_path} could not be read: {error}") from error
-    if plan_bytes != snapshot_bytes:
-        raise LauncherError(
-            f"recreate plan {plan_path} differs from Rust-validated plan snapshot"
-        )
-    return document, snapshot_bytes
+    """Load Rust's accepted recreate bytes without rereading mutable plan.json."""
+    return _load_snapshot_plan(project_root, expected_digest)
 
 
-def _recreate_plan_digest(project_root: Path, expected_digest: str | None) -> str | None:
+def _recreate_plan_digest(
+    project_root: Path,
+    expected_digest: str | None,
+    *,
+    allow_unvalidated_plan: bool = False,
+) -> str | None:
     """Read the plan identity recorded by Rust for a recreate transition."""
     digest_path = project_root / ".exo" / "tl-loop" / "plan.snapshot.sha256"
     try:
@@ -466,7 +471,10 @@ def _recreate_plan_digest(project_root: Path, expected_digest: str | None) -> st
             raise LauncherError(
                 f"recreate plan identity {digest_path} is missing while {snapshot_path} exists"
             )
-        if (project_root / ".exo" / "tl-loop" / "plan.json").is_file():
+        if (
+            (project_root / ".exo" / "tl-loop" / "plan.json").is_file()
+            and not allow_unvalidated_plan
+        ):
             raise LauncherError(
                 "recreate plan identity is missing while plan.json exists; Rust validation did not complete"
             )

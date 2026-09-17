@@ -149,8 +149,13 @@ def test_recreate_plan_digest_comes_from_rust_identity(tmp_path: Path) -> None:
     plan.write_bytes(old)
     assert snapshot.read_bytes() == accepted
     assert digest.read_text(encoding="ascii").strip() == hashlib.sha256(accepted).hexdigest()
-    with pytest.raises(tl_main.LauncherError, match="differs from Rust-validated"):
-        tl_main._load_recreate_plan(project, hashlib.sha256(accepted).hexdigest())
+    document, captured = tl_main._load_recreate_plan(
+        project, hashlib.sha256(accepted).hexdigest()
+    )
+    assert document["plan"]["workers"][0]["name"] == "recreated"
+    assert captured == accepted
+    plan.unlink()
+    assert tl_main._load_recreate_plan(project, hashlib.sha256(accepted).hexdigest())[1] == accepted
 
 
 @pytest.mark.parametrize("pass_expected_digest", [False, True])
@@ -215,6 +220,71 @@ def test_recreate_controller_startup_uses_rust_plan_identity(
         .strip()
         == hashlib.sha256(accepted).hexdigest()
     )
+
+
+def test_recreate_waits_for_plan_when_rust_accepted_no_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    plan = project / ".exo" / "tl-loop" / "plan.json"
+    plan.unlink()
+    (project / ".exo" / "tl-loop" / "session-mode.json").write_text(
+        '{"session_mode":"recreate"}', encoding="utf-8"
+    )
+    accepted = b'{"plan":{"workers":[],"leaves":[],"sub_tls":[]}}\n'
+    captured: dict[str, object] = {}
+
+    def load_plan(path: Path, wait_for_plan: bool) -> tuple[dict[str, object], bytes]:
+        captured["path"] = path
+        captured["wait_for_plan"] = wait_for_plan
+        return {"plan": {"workers": [], "leaves": [], "sub_tls": []}}, accepted
+
+    monkeypatch.setattr(tl_main, "_load_plan", load_plan)
+    monkeypatch.setattr(tl_main, "_validate_captured_plan", lambda _root, _bytes: None)
+    monkeypatch.setattr(
+        tl_main,
+        "_record_plan_snapshot",
+        lambda *args: captured.update(recorded=True),
+    )
+    monkeypatch.setattr(tl_main, "LedgerReader", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        tl_main,
+        "LedgerQueue",
+        lambda *args, **kwargs: type(
+            "Source",
+            (),
+            {
+                "start": lambda self: self,
+                "close": lambda self, timeout: None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(tl_main, "TransportClient", lambda **kwargs: object())
+    monkeypatch.setattr(tl_main, "EffectClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(tl_main, "TLLoopConfig", lambda **kwargs: object())
+    monkeypatch.setattr(tl_main, "load_policy", lambda path: object())
+    monkeypatch.setattr(tl_main, "load_capability", lambda path, policy_path: object())
+    monkeypatch.setattr(tl_main, "load_model_catalog", lambda path: None)
+    monkeypatch.setattr(tl_main, "_authoritative_ledger_run_id", lambda root: None)
+    monkeypatch.setattr(tl_main, "tl_run", lambda *args, **kwargs: object())
+
+    tl_main._run(
+        argparse.Namespace(
+            project_root=project,
+            plan=Path(".exo/tl-loop/plan.json"),
+            wait_for_plan=True,
+            run_id="root",
+            poll_interval=0.25,
+            max_events=256,
+            transport_timeout=45.5,
+            active_tail_timeout=60.0,
+            task_timeout=90.0,
+        )
+    )
+
+    assert captured["path"] == plan
+    assert captured["wait_for_plan"] is True
+    assert captured["recorded"] is True
 
 
 def test_preflight_rejects_plan_bytes_that_changed_after_capture(tmp_path: Path) -> None:
