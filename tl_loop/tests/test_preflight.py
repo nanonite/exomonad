@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -130,6 +131,82 @@ def test_wait_for_plan_snapshot_preserves_accepted_bytes(tmp_path: Path) -> None
     )
     with pytest.raises(tl_main.LauncherError, match="immutable session snapshot"):
         tl_main._record_plan_snapshot(project, plan)
+
+
+def test_recreate_replaces_superseded_plan_snapshot_and_digest(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    plan = project / ".exo" / "tl-loop" / "plan.json"
+    old = plan.read_bytes()
+    accepted = b'{"plan":{"workers":[{"name":"recreated"}],"leaves":[],"sub_tls":[]}}\n'
+    plan.write_bytes(accepted)
+    snapshot = project / ".exo" / "tl-loop" / "plan.snapshot"
+    digest = project / ".exo" / "tl-loop" / "plan.snapshot.sha256"
+    snapshot.write_bytes(old)
+    digest.write_text(hashlib.sha256(old).hexdigest() + "\n", encoding="ascii")
+
+    tl_main._replace_plan_snapshot(project, plan, accepted)
+
+    assert snapshot.read_bytes() == accepted
+    assert digest.read_text(encoding="ascii").strip() == hashlib.sha256(accepted).hexdigest()
+
+
+def test_recreate_controller_startup_adopts_new_plan(tmp_path: Path, monkeypatch) -> None:
+    project = _project(tmp_path)
+    plan = project / ".exo" / "tl-loop" / "plan.json"
+    old = plan.read_bytes()
+    accepted = (
+        b'{"plan":{"workers":[{"name":"recreated","task":"rebuild"}],'
+        b'"leaves":[],"sub_tls":[]}}'
+        + bytes((10,))
+    )
+    plan.write_bytes(accepted)
+    (project / ".exo" / "tl-loop" / "plan.snapshot").write_bytes(old)
+    (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").write_text(
+        hashlib.sha256(old).hexdigest() + chr(10), encoding="ascii"
+    )
+    (project / ".exo" / "tl-loop" / "session-mode.json").write_text(
+        '{"session_mode":"recreate"}', encoding="utf-8"
+    )
+
+    class EmptySource:
+        def start(self) -> "EmptySource":
+            return self
+
+        def close(self, timeout: float) -> None:
+            del timeout
+
+    monkeypatch.setattr(tl_main, "LedgerReader", lambda *args, **kwargs: object())
+    monkeypatch.setattr(tl_main, "LedgerQueue", lambda *args, **kwargs: EmptySource())
+    monkeypatch.setattr(tl_main, "TransportClient", lambda **kwargs: object())
+    monkeypatch.setattr(tl_main, "EffectClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(tl_main, "TLLoopConfig", lambda **kwargs: object())
+    monkeypatch.setattr(tl_main, "load_policy", lambda path: object())
+    monkeypatch.setattr(tl_main, "load_capability", lambda path, policy_path: object())
+    monkeypatch.setattr(tl_main, "load_model_catalog", lambda path: None)
+    monkeypatch.setattr(tl_main, "_authoritative_ledger_run_id", lambda root: None)
+    monkeypatch.setattr(tl_main, "tl_run", lambda *args, **kwargs: object())
+
+    tl_main._run(
+        argparse.Namespace(
+            project_root=project,
+            plan=Path(".exo/tl-loop/plan.json"),
+            wait_for_plan=False,
+            run_id="root",
+            poll_interval=0.25,
+            max_events=256,
+            transport_timeout=45.5,
+            active_tail_timeout=60.0,
+            task_timeout=90.0,
+        )
+    )
+
+    assert (project / ".exo" / "tl-loop" / "plan.snapshot").read_bytes() == accepted
+    assert (
+        (project / ".exo" / "tl-loop" / "plan.snapshot.sha256")
+        .read_text(encoding="ascii")
+        .strip()
+        == hashlib.sha256(accepted).hexdigest()
+    )
 
 
 def test_preflight_rejects_plan_bytes_that_changed_after_capture(tmp_path: Path) -> None:

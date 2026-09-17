@@ -287,7 +287,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     ):
         plan_document: dict[str, object] = {"run_id": args.run_id}
         plan = None
-    elif expected_plan_digest is not None and session_mode == "start":
+    elif expected_plan_digest is not None and session_mode in {"start", "recreate"}:
         plan_document, accepted_plan_bytes = _load_snapshot_plan(
             project_root, expected_plan_digest
         )
@@ -301,7 +301,10 @@ def _run(args: argparse.Namespace) -> TLRunResult:
                 raise LauncherError(f"plan {plan_path} changed after validation")
         if args.wait_for_plan:
             _validate_captured_plan(project_root, accepted_plan_bytes)
-        _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
+        if session_mode == "recreate":
+            _replace_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
+        else:
+            _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
     run_id = _run_id(plan_document, args.run_id)
     ledger_run_id = _authoritative_ledger_run_id(project_root)
     reader = LedgerReader(
@@ -449,6 +452,26 @@ def _record_plan_snapshot(
     temporary.write_bytes(plan_bytes)
     temporary.replace(snapshot_path)
     _record_plan_digest(project_root, plan_bytes)
+
+
+def _replace_plan_snapshot(
+    project_root: Path, plan_path: Path, plan_bytes: bytes | None = None
+) -> None:
+    """Adopt the accepted plan bytes as the identity for a recreated session."""
+    if plan_bytes is None:
+        plan_bytes = plan_path.read_bytes()
+    snapshot_path = project_root / ".exo" / "tl-loop" / "plan.snapshot"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = snapshot_path.with_suffix(".tmp")
+    temporary.write_bytes(plan_bytes)
+    temporary.replace(snapshot_path)
+    digest_path = project_root / ".exo" / "tl-loop" / "plan.snapshot.sha256"
+    digest_path.parent.mkdir(parents=True, exist_ok=True)
+    digest_temporary = digest_path.with_name(digest_path.name + ".tmp")
+    digest_temporary.write_text(
+        hashlib.sha256(plan_bytes).hexdigest() + chr(10), encoding="ascii"
+    )
+    digest_temporary.replace(digest_path)
 
 
 def _record_plan_digest(project_root: Path, plan_bytes: bytes) -> None:

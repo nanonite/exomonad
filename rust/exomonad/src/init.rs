@@ -1081,6 +1081,62 @@ where
     apply_start_plan_locked(project_dir, decision, failure)
 }
 
+fn apply_recreate_plan_after_validation_locked<F>(
+    project_dir: &Path,
+    validated_plan: Option<&[u8]>,
+    validate: F,
+    _lock: &claude_teams_bridge::file_lock::FileLock,
+    failure: &mut Option<&str>,
+) -> Result<Option<String>>
+where
+    F: FnOnce() -> Result<()>,
+{
+    validate()?;
+    if let Some(plan) = validated_plan {
+        ensure_plan_matches(project_dir, plan)?;
+    }
+
+    let previous_snapshot = read_plan_snapshot_bytes(project_dir)?;
+    let previous_digest = read_plan_snapshot_digest(project_dir)?;
+    let validated_digest = validated_plan.map(plan_digest);
+    begin_plan_transition_locked(
+        project_dir,
+        previous_snapshot.as_deref(),
+        previous_digest.as_deref(),
+        None,
+    )?;
+    if let Err(error) = apply_plan_snapshot_locked(
+        project_dir,
+        validated_plan,
+        validated_digest.as_deref(),
+        failure,
+    ) {
+        return Err(rollback_plan_transition_locked(project_dir, error, failure));
+    }
+    if let Err(error) = write_plan_transition(project_dir, PLAN_TRANSITION_PHASE_ARCHIVED, None) {
+        return Err(rollback_plan_transition_locked(project_dir, error, failure));
+    }
+    clear_plan_transition_locked(project_dir, failure)?;
+    Ok(validated_digest)
+}
+
+#[cfg(test)]
+fn apply_recreate_plan_after_validation(
+    project_dir: &Path,
+    validated_plan: Option<&[u8]>,
+    validate: impl FnOnce() -> Result<()>,
+) -> Result<Option<String>> {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let mut failure = None;
+    apply_recreate_plan_after_validation_locked(
+        project_dir,
+        validated_plan,
+        validate,
+        &_lock,
+        &mut failure,
+    )
+}
+
 fn report_legacy_session(project_dir: &Path, mode: SessionMode) {
     if mode != SessionMode::Continue
         || !project_dir.join(".exo/tl-loop/root/run.json").is_file()
@@ -3226,7 +3282,7 @@ pub async fn run(
     std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, &runtime_paths);
     ensure_harness_capability(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
-    let mut controller_plan_digest = None;
+    let controller_plan_digest;
     if let Some(decision) = start_plan_decision {
         let expected_plan_digest = decision.validated_plan().map(plan_digest);
         mode = apply_start_plan_after_validation_locked(
@@ -3248,16 +3304,31 @@ pub async fn run(
             &mut no_transition_failure,
         )?;
         controller_plan_digest = expected_plan_digest;
+    } else if mode == SessionMode::Recreate {
+        write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
+        let recreate_plan = requested_plan_bytes(&cwd)?;
+        let expected_plan_digest = recreate_plan.as_deref().map(plan_digest);
+        controller_plan_digest = apply_recreate_plan_after_validation_locked(
+            &cwd,
+            recreate_plan.as_deref(),
+            || {
+                if skip_preflight {
+                    if expected_plan_digest.is_some() {
+                        anyhow::bail!(
+                            "--skip-preflight cannot be used with --recreate when plan.json exists; the requested plan must be validated before replacing runtime state"
+                        );
+                    }
+                    warn!("Skipping TL controller preflight for --recreate without a plan");
+                    return Ok(());
+                }
+                run_tl_loop_preflight(&cwd, &tl_loop_root, false, expected_plan_digest.as_deref())
+            },
+            &project_plan_lock,
+            &mut no_transition_failure,
+        )?;
     } else {
-        if mode == SessionMode::Continue {
-            validate_or_record_plan_snapshot_locked(&cwd, mode)?;
-            controller_plan_digest = capture_validated_plan_digest(&cwd)?;
-        } else {
-            if mode == SessionMode::Recreate {
-                write_tl_loop_plan(&cwd, config.initial_prompt.as_deref())?;
-            }
-            validate_or_record_plan_snapshot_locked(&cwd, mode)?;
-        }
+        validate_or_record_plan_snapshot_locked(&cwd, mode)?;
+        controller_plan_digest = capture_validated_plan_digest(&cwd)?;
         if skip_preflight {
             warn!("Skipping TL controller preflight by explicit request");
         } else {
@@ -5117,6 +5188,72 @@ mod tests {
     }
 
     #[test]
+    fn recreate_plan_adopts_new_snapshot_and_digest_after_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let requested = br#"{"plan":{"leaves":[{"name":"recreated"}]}}"#;
+        std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+        std::fs::write(&plan, requested).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(original)),
+        )
+        .unwrap();
+
+        let digest = plan_digest(requested);
+        assert_eq!(
+            apply_recreate_plan_after_validation(dir.path(), Some(requested), || Ok(())).unwrap(),
+            Some(digest.clone())
+        );
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            requested
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            format!("{digest}\n")
+        );
+        assert!(!plan_transition_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn recreate_plan_validation_failure_preserves_prior_identity_before_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let requested = br#"{"plan":{"leaves":[{"name":"recreated"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), "old checkpoint").unwrap();
+        std::fs::write(&plan, requested).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(original)),
+        )
+        .unwrap();
+
+        let error = apply_recreate_plan_after_validation(dir.path(), Some(requested), || {
+            anyhow::bail!("invalid requested WorkPlan")
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid requested WorkPlan"));
+        assert!(root.exists());
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            format!("{}\n", plan_digest(original))
+        );
+        assert!(!plan_transition_path(dir.path()).exists());
+    }
+
+    #[test]
     fn start_with_identical_terminal_plan_uses_continue_and_preserves_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".exo/tl-loop/root");
@@ -6514,6 +6651,19 @@ mod tests {
             .expect("init must create the TL window");
 
         assert!(archive < tl_window);
+    }
+
+    #[test]
+    fn recreate_plan_validation_precedes_destructive_teardown() {
+        let source = include_str!("init.rs");
+        let validation = source
+            .find("controller_plan_digest = apply_recreate_plan_after_validation_locked")
+            .expect("recreate must validate and adopt plan identity");
+        let teardown = source
+            .find("destroy_recreate_resources(&cwd")
+            .expect("recreate must have a destructive resource transition");
+
+        assert!(validation < teardown);
     }
 
     #[test]
