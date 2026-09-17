@@ -115,22 +115,23 @@ def test_allow_missing_plan_supports_wait_for_plan_startup(tmp_path: Path) -> No
     assert project / ".exo" / "tl-loop" / "plan.json" not in report.files
 
 
-def test_wait_for_plan_snapshot_preserves_accepted_bytes(tmp_path: Path) -> None:
+def test_wait_for_plan_snapshot_delegates_accepted_bytes_to_rust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     project = _project(tmp_path)
     plan = project / ".exo" / "tl-loop" / "plan.json"
     accepted = b'{"plan":{"workers":[],"leaves":[],"sub_tls":[]}}\n'
     plan.write_bytes(accepted)
+    captured: list[bytes] = []
+    monkeypatch.setattr(
+        tl_main, "_persist_plan_identity", lambda _root, data: captured.append(data)
+    )
 
     tl_main._record_plan_snapshot(project, plan)
 
     snapshot = project / ".exo" / "tl-loop" / "plan.snapshot"
-    assert snapshot.read_bytes() == accepted
-    plan.write_text(
-        '{\n  "plan": {"workers": [], "leaves": [], "sub_tls": []}\n}\n',
-        encoding="utf-8",
-    )
-    with pytest.raises(tl_main.LauncherError, match="immutable session snapshot"):
-        tl_main._record_plan_snapshot(project, plan)
+    assert captured == [accepted]
+    assert not snapshot.exists()
 
 
 def test_recreate_plan_digest_comes_from_rust_identity(tmp_path: Path) -> None:
@@ -247,7 +248,7 @@ def test_recreate_waits_for_plan_when_rust_accepted_no_plan(
         captured["persisted_bytes"] = plan_bytes
 
     monkeypatch.setattr(tl_main, "_load_plan", load_plan)
-    monkeypatch.setattr(tl_main, "_persist_recreate_plan_identity", persist_identity)
+    monkeypatch.setattr(tl_main, "_persist_plan_identity", persist_identity)
     monkeypatch.setattr(tl_main, "_record_plan_snapshot", reject_python_ownership)
     monkeypatch.setattr(tl_main, "_validate_captured_plan", reject_python_ownership)
     monkeypatch.setattr(tl_main, "LedgerReader", lambda *args, **kwargs: object())
@@ -302,24 +303,42 @@ def test_preflight_rejects_plan_bytes_that_changed_after_capture(tmp_path: Path)
         run_preflight(project, expected_plan_digest=hashlib.sha256(accepted).hexdigest())
 
 
-def test_snapshot_uses_captured_plan_bytes_without_rereading_source(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["start", "continue"])
+def test_waiting_controller_rejects_prepared_recreate_without_python_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
     project = _project(tmp_path)
     plan = project / ".exo" / "tl-loop" / "plan.json"
     accepted = plan.read_bytes()
     plan.write_bytes(b'{"plan":{"workers":[{"name":"changed"}]}}')
-
-    tl_main._record_plan_snapshot(project, plan, accepted)
-
-    assert (project / ".exo" / "tl-loop" / "plan.snapshot").read_bytes() == accepted
-    assert (
-        (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").read_text(encoding="ascii").strip()
-        == hashlib.sha256(accepted).hexdigest()
+    journal = project / ".exo" / "tl-loop" / "plan-transition.json"
+    journal.write_text('{"phase":"prepared","archive_name":"old"}', encoding="utf-8")
+    (project / ".exo" / "tl-loop" / "session-mode.json").write_text(
+        json.dumps({"session_mode": mode}), encoding="utf-8"
     )
-    (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").write_text(
-        "0" * 64 + "\n", encoding="ascii"
-    )
-    with pytest.raises(tl_main.LauncherError, match="snapshot identity"):
-        tl_main._record_plan_snapshot(project, plan, accepted)
+    monkeypatch.setenv("EXOMONAD_BINARY", "/test/exomonad")
+    monkeypatch.setattr(tl_main, "_load_plan", lambda _path, _wait: ({"plan": {}}, accepted))
+    monkeypatch.setattr(tl_main, "_validate_captured_plan", lambda _root, _bytes: None)
+
+    def reject_recorder(*args: object, **kwargs: object) -> object:
+        assert args[0][1] == "record-plan-snapshot"
+        assert kwargs["input"] == accepted
+        return type("Result", (), {"returncode": 1, "stderr": b"plan transition is in progress"})()
+
+    monkeypatch.setattr(tl_main.subprocess, "run", reject_recorder)
+
+    with pytest.raises(tl_main.LauncherError, match="plan transition is in progress"):
+        tl_main._run(
+            argparse.Namespace(
+                project_root=project,
+                plan=Path(".exo/tl-loop/plan.json"),
+                wait_for_plan=True,
+                run_id="root",
+            )
+        )
+    assert journal.read_text(encoding="utf-8") == '{"phase":"prepared","archive_name":"old"}'
+    assert not (project / ".exo" / "tl-loop" / "plan.snapshot").exists()
+    assert not (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").exists()
 
 
 def test_snapshot_loader_binds_startup_to_immutable_snapshot(tmp_path: Path) -> None:
@@ -431,6 +450,7 @@ def test_cli_persists_actual_ledger_queue_failure_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _project(tmp_path, capability="standard")
+    monkeypatch.setattr(tl_main, "_persist_plan_identity", lambda _root, _bytes: None)
     policy_path = project / ".exo" / "harness_policy.toml"
     policy_path.write_text(
         policy_path.read_text(encoding="utf-8").replace("token_budget = 1", "token_budget = 10000"),

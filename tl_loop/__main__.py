@@ -288,7 +288,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         if expected_plan_digest is None:
             if args.wait_for_plan:
                 plan_document, accepted_plan_bytes = _load_plan(plan_path, wait_for_plan=True)
-                _persist_recreate_plan_identity(project_root, accepted_plan_bytes)
+                _persist_plan_identity(project_root, accepted_plan_bytes)
                 plan = _plan_from_document(plan_document)
             else:
                 plan_document = {"run_id": args.run_id}
@@ -455,12 +455,12 @@ def _load_recreate_plan(project_root: Path, expected_digest: str) -> tuple[dict[
     return _load_snapshot_plan(project_root, expected_digest)
 
 
-def _persist_recreate_plan_identity(project_root: Path, plan_bytes: bytes) -> None:
-    """Ask Rust to persist operator-supplied recreate bytes as the identity owner."""
+def _persist_plan_identity(project_root: Path, plan_bytes: bytes) -> None:
+    """Ask Rust to record accepted bytes under the plan transition lock."""
     binary = os.environ.get("EXOMONAD_BINARY")
     if not binary:
         raise LauncherError(
-            "EXOMONAD_BINARY is required to persist a waited recreate plan identity"
+            "EXOMONAD_BINARY is required to persist a waited plan identity"
         )
     digest = hashlib.sha256(plan_bytes).hexdigest()
     try:
@@ -478,12 +478,12 @@ def _persist_recreate_plan_identity(project_root: Path, plan_bytes: bytes) -> No
             check=False,
         )
     except OSError as error:
-        message = f"failed to persist recreate plan identity through Rust: {error}"
+        message = f"failed to persist plan identity through Rust: {error}"
         raise LauncherError(message) from error
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         suffix = f": {detail}" if detail else ""
-        raise LauncherError(f"Rust recreate plan identity persistence failed{suffix}")
+        raise LauncherError(f"Rust plan identity persistence failed{suffix}")
 
 
 def _recreate_plan_digest(
@@ -528,40 +528,10 @@ def _recreate_plan_digest(
 def _record_plan_snapshot(
     project_root: Path, plan_path: Path, plan_bytes: bytes | None = None
 ) -> None:
-    """Persist the exact accepted plan bytes before the controller owns them."""
-    snapshot_path = project_root / ".exo" / "tl-loop" / "plan.snapshot"
+    """Record the exact accepted bytes through Rust's journal guarded writer."""
     if plan_bytes is None:
         plan_bytes = plan_path.read_bytes()
-    if snapshot_path.exists():
-        if snapshot_path.read_bytes() != plan_bytes:
-            raise LauncherError(
-                f"plan {plan_path} differs from its immutable session snapshot"
-            )
-        _record_plan_digest(project_root, plan_bytes)
-        return
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = snapshot_path.with_suffix(".tmp")
-    temporary.write_bytes(plan_bytes)
-    temporary.replace(snapshot_path)
-    _record_plan_digest(project_root, plan_bytes)
-
-
-def _record_plan_digest(project_root: Path, plan_bytes: bytes) -> None:
-    """Persist the identity that later controller recovery must present."""
-    digest_path = project_root / ".exo" / "tl-loop" / "plan.snapshot.sha256"
-    digest = hashlib.sha256(plan_bytes).hexdigest()
-    if digest_path.exists():
-        try:
-            recorded = digest_path.read_text(encoding="ascii").strip()
-        except (OSError, UnicodeError) as error:
-            raise LauncherError(f"plan snapshot identity could not be read: {error}") from error
-        if recorded != digest:
-            raise LauncherError("plan snapshot identity differs from its immutable bytes")
-        return
-    digest_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = digest_path.with_name(digest_path.name + ".tmp")
-    temporary.write_text(f"{digest}\n", encoding="ascii")
-    temporary.replace(digest_path)
+    _persist_plan_identity(project_root, plan_bytes)
 
 
 def _redispatch(args: argparse.Namespace) -> None:

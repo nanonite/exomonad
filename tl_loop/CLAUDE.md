@@ -17,6 +17,11 @@ The runtime creates per-run state under `.exo/tl-loop/<run_id>/`. That directory
 is runtime state, not Python source, and must never be used as the package code
 location.
 
+When controller startup captures a plan, it passes the exact bytes to
+`exomonad record-plan-snapshot`. Rust holds the plan transition lock, rejects
+an existing transition journal, and owns snapshot and digest persistence.
+Python does not write either identity file, including after `--wait-for-plan`.
+
 ## RLM judgment boundary
 
 The tl_loop.rlm boundary is for bounded structured judgments only. Its

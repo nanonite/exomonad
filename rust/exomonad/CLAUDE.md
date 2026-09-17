@@ -53,6 +53,9 @@ Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is
 Claude MCP is auto-registered during init. Other harnesses use their standard MCP registration.
 
 Use `--recreate` to delete an existing session and create fresh (e.g., after binary updates).
+The `record-plan-snapshot` stdin command persists plan bytes captured by a
+controller. It holds the plan transition lock, rejects any existing transition
+journal, and repairs a missing digest only for an identical snapshot.
 
 ### Revert Command
 

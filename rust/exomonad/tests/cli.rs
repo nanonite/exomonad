@@ -232,3 +232,32 @@ fn test_record_plan_snapshot_cli_persists_stdin_identity() {
         .join(".exo/tl-loop/plan-transition.json")
         .exists());
 }
+
+#[test]
+fn test_record_plan_snapshot_cli_rejects_prepared_recreate_journal() {
+    let project = tempdir().expect("create temporary project");
+    let state = project.path().join(".exo/tl-loop");
+    fs::create_dir_all(&state).expect("create TL state directory");
+    let journal = state.join("plan-transition.json");
+    let prepared = br#"{"phase":"prepared","archive_name":"root.previous"}"#;
+    fs::write(&journal, prepared).expect("prepare recreate journal");
+    let accepted = br#"{"plan":{"leaves":[{"name":"late"}]}}"#;
+    let digest = format!("{:x}", Sha256::digest(accepted));
+
+    cargo_bin_cmd!("exomonad")
+        .args([
+            "record-plan-snapshot",
+            "--project-root",
+            project.path().to_str().expect("temporary path is UTF-8"),
+            "--expected-digest",
+            &digest,
+        ])
+        .write_stdin(accepted)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("plan transition is in progress"));
+
+    assert_eq!(fs::read(journal).expect("read prepared journal"), prepared);
+    assert!(!state.join("plan.snapshot").exists());
+    assert!(!state.join("plan.snapshot.sha256").exists());
+}

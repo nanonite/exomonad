@@ -2337,13 +2337,18 @@ fn record_plan_snapshot_bytes(
     }
     let previous_snapshot = read_plan_snapshot_bytes(project_dir)?;
     let previous_digest = read_plan_snapshot_digest(project_dir)?;
-    if previous_snapshot.is_some() || previous_digest.is_some() {
-        if previous_snapshot.as_deref() == Some(plan_bytes)
-            && previous_digest.as_deref() == Some(expected_digest)
-        {
-            return Ok(());
+    if let Some(snapshot) = previous_snapshot.as_deref() {
+        if snapshot != plan_bytes {
+            anyhow::bail!("accepted plan differs from its immutable session snapshot");
         }
-        anyhow::bail!("cannot record recreate plan identity over an existing snapshot");
+        return match previous_digest.as_deref() {
+            Some(digest) if digest == expected_digest => Ok(()),
+            Some(_) => anyhow::bail!("plan snapshot identity differs from its immutable bytes"),
+            None => write_plan_snapshot_digest(project_dir, expected_digest),
+        };
+    }
+    if previous_digest.is_some() {
+        anyhow::bail!("cannot record plan identity without its snapshot");
     }
 
     let mut failure = None;
@@ -5378,6 +5383,48 @@ mod tests {
             format!("{digest}\n")
         );
         assert!(!plan_transition_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn recorder_repairs_missing_digest_for_matching_start_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let accepted = br#"{"plan":{"workers":[]}}"#;
+        let digest = plan_digest(accepted);
+        write_plan_snapshot(&plan_snapshot_path(dir.path()), accepted).unwrap();
+
+        record_plan_snapshot_bytes(dir.path(), accepted, &digest).unwrap();
+        record_plan_snapshot_bytes(dir.path(), accepted, &digest).unwrap();
+
+        assert_eq!(read_plan_snapshot_digest(dir.path()).unwrap(), Some(digest));
+        assert!(!plan_transition_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn recorder_rejects_conflicting_start_snapshot_and_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let accepted = br#"{"plan":{"workers":[]}}"#;
+        let changed = br#"{"plan":{"workers":[{"name":"changed"}]}}"#;
+        let digest = plan_digest(accepted);
+        write_plan_snapshot(&plan_snapshot_path(dir.path()), accepted).unwrap();
+        assert!(
+            record_plan_snapshot_bytes(dir.path(), changed, &plan_digest(changed))
+                .unwrap_err()
+                .to_string()
+                .contains("immutable session snapshot")
+        );
+        write_plan_snapshot_digest(dir.path(), "wrong").unwrap();
+        assert!(record_plan_snapshot_bytes(dir.path(), accepted, &digest)
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot identity differs"));
+        assert_eq!(
+            read_plan_snapshot_bytes(dir.path()).unwrap(),
+            Some(accepted.to_vec())
+        );
+        assert_eq!(
+            read_plan_snapshot_digest(dir.path()).unwrap(),
+            Some("wrong".into())
+        );
     }
 
     #[test]
