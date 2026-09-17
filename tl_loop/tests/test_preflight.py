@@ -133,36 +133,41 @@ def test_wait_for_plan_snapshot_preserves_accepted_bytes(tmp_path: Path) -> None
         tl_main._record_plan_snapshot(project, plan)
 
 
-def test_recreate_replaces_superseded_plan_snapshot_and_digest(tmp_path: Path) -> None:
+def test_recreate_plan_digest_comes_from_rust_identity(tmp_path: Path) -> None:
     project = _project(tmp_path)
     plan = project / ".exo" / "tl-loop" / "plan.json"
     old = plan.read_bytes()
-    accepted = b'{"plan":{"workers":[{"name":"recreated"}],"leaves":[],"sub_tls":[]}}\n'
+    accepted = b'{"plan":{"workers":[{"name":"recreated","task":"rebuild"}],"leaves":[],"sub_tls":[]}}\n'
     plan.write_bytes(accepted)
     snapshot = project / ".exo" / "tl-loop" / "plan.snapshot"
     digest = project / ".exo" / "tl-loop" / "plan.snapshot.sha256"
-    snapshot.write_bytes(old)
-    digest.write_text(hashlib.sha256(old).hexdigest() + "\n", encoding="ascii")
+    snapshot.write_bytes(accepted)
+    digest.write_text(hashlib.sha256(accepted).hexdigest() + "\n", encoding="ascii")
 
-    tl_main._replace_plan_snapshot(project, plan, accepted)
+    assert tl_main._recreate_plan_digest(project, None) == hashlib.sha256(accepted).hexdigest()
 
+    plan.write_bytes(old)
     assert snapshot.read_bytes() == accepted
     assert digest.read_text(encoding="ascii").strip() == hashlib.sha256(accepted).hexdigest()
+    with pytest.raises(tl_main.LauncherError, match="differs from Rust-validated"):
+        tl_main._load_recreate_plan(project, hashlib.sha256(accepted).hexdigest())
 
 
-def test_recreate_controller_startup_adopts_new_plan(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("pass_expected_digest", [False, True])
+def test_recreate_controller_startup_uses_rust_plan_identity(
+    tmp_path: Path, monkeypatch, pass_expected_digest: bool
+) -> None:
     project = _project(tmp_path)
     plan = project / ".exo" / "tl-loop" / "plan.json"
-    old = plan.read_bytes()
     accepted = (
         b'{"plan":{"workers":[{"name":"recreated","task":"rebuild"}],'
         b'"leaves":[],"sub_tls":[]}}'
         + bytes((10,))
     )
     plan.write_bytes(accepted)
-    (project / ".exo" / "tl-loop" / "plan.snapshot").write_bytes(old)
+    (project / ".exo" / "tl-loop" / "plan.snapshot").write_bytes(accepted)
     (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").write_text(
-        hashlib.sha256(old).hexdigest() + chr(10), encoding="ascii"
+        hashlib.sha256(accepted).hexdigest() + chr(10), encoding="ascii"
     )
     (project / ".exo" / "tl-loop" / "session-mode.json").write_text(
         '{"session_mode":"recreate"}', encoding="utf-8"
@@ -197,6 +202,9 @@ def test_recreate_controller_startup_adopts_new_plan(tmp_path: Path, monkeypatch
             transport_timeout=45.5,
             active_tail_timeout=60.0,
             task_timeout=90.0,
+            expected_plan_digest=(
+                hashlib.sha256(accepted).hexdigest() if pass_expected_digest else None
+            ),
         )
     )
 

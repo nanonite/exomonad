@@ -1099,11 +1099,12 @@ where
     let previous_snapshot = read_plan_snapshot_bytes(project_dir)?;
     let previous_digest = read_plan_snapshot_digest(project_dir)?;
     let validated_digest = validated_plan.map(plan_digest);
+    let archive = root_archive_path_at(project_dir, current_time_millis())?;
     begin_plan_transition_locked(
         project_dir,
         previous_snapshot.as_deref(),
         previous_digest.as_deref(),
-        None,
+        archive.as_deref(),
     )?;
     if let Err(error) = apply_plan_snapshot_locked(
         project_dir,
@@ -1113,11 +1114,45 @@ where
     ) {
         return Err(rollback_plan_transition_locked(project_dir, error, failure));
     }
-    if let Err(error) = write_plan_transition(project_dir, PLAN_TRANSITION_PHASE_ARCHIVED, None) {
+    Ok(validated_digest)
+}
+
+fn complete_recreate_plan_transition_locked(
+    project_dir: &Path,
+    failure: &mut Option<&str>,
+) -> Result<()> {
+    let Some((phase, archive_name)) = read_plan_transition(project_dir)? else {
+        anyhow::bail!("cannot commit recreate plan: transition journal is missing");
+    };
+    if phase != PLAN_TRANSITION_PHASE_PREPARED {
+        anyhow::bail!("cannot commit recreate plan from transition phase {phase}");
+    }
+    let archive = archive_name.map(|name| project_dir.join(".exo/tl-loop").join(name));
+    if let Some(archive) = archive.as_deref() {
+        if let Err(error) = maybe_fail_transition(failure, "archive")
+            .and_then(|_| archive_root_tl_run_to(project_dir, archive))
+        {
+            return Err(rollback_plan_transition_locked(project_dir, error, failure));
+        }
+    }
+    if let Err(error) = write_plan_transition(
+        project_dir,
+        PLAN_TRANSITION_PHASE_ARCHIVED,
+        archive.as_deref(),
+    ) {
         return Err(rollback_plan_transition_locked(project_dir, error, failure));
     }
-    clear_plan_transition_locked(project_dir, failure)?;
-    Ok(validated_digest)
+    clear_plan_transition_locked(project_dir, failure)
+}
+
+#[cfg(test)]
+fn complete_recreate_plan_transition(
+    project_dir: &Path,
+    failure: Option<&'static str>,
+) -> Result<()> {
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let mut failure = failure;
+    complete_recreate_plan_transition_locked(project_dir, &mut failure)
 }
 
 #[cfg(test)]
@@ -2950,10 +2985,6 @@ fn prepare_controller_spawn(project_dir: &Path) -> Result<String> {
     Ok(controller_epoch)
 }
 
-fn archive_root_tl_run(project_dir: &Path) -> Result<Option<PathBuf>> {
-    archive_root_tl_run_at(project_dir, current_time_millis())
-}
-
 fn root_archive_path_at(project_dir: &Path, timestamp_ms: u128) -> Result<Option<PathBuf>> {
     let root_dir = project_dir.join(".exo/tl-loop/root");
     if !root_dir.exists() {
@@ -2981,6 +3012,7 @@ fn root_archive_path_at(project_dir: &Path, timestamp_ms: u128) -> Result<Option
     }
 }
 
+#[cfg(test)]
 fn archive_root_tl_run_at(project_dir: &Path, timestamp_ms: u128) -> Result<Option<PathBuf>> {
     let Some(archive) = root_archive_path_at(project_dir, timestamp_ms)? else {
         return Ok(None);
@@ -3747,7 +3779,7 @@ pub async fn run(
             TmuxIpc::kill_session(&session).await?;
         }
 
-        archive_root_tl_run(&cwd)?;
+        complete_recreate_plan_transition_locked(&cwd, &mut no_transition_failure)?;
     }
 
     // Create fresh session
@@ -5215,6 +5247,129 @@ mod tests {
             std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
             format!("{digest}\n")
         );
+        assert_eq!(
+            read_plan_transition(dir.path()).unwrap().unwrap(),
+            (PLAN_TRANSITION_PHASE_PREPARED.to_owned(), None)
+        );
+        complete_recreate_plan_transition(dir.path(), None).unwrap();
+        assert!(!plan_transition_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn recreate_plan_failure_before_archive_restores_prior_checkpoint_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let requested = br#"{"plan":{"leaves":[{"name":"recreated"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), "old checkpoint").unwrap();
+        std::fs::write(&plan, requested).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(original)),
+        )
+        .unwrap();
+
+        apply_recreate_plan_after_validation(dir.path(), Some(requested), || Ok(())).unwrap();
+
+        assert_eq!(
+            read_plan_transition(dir.path()).unwrap().unwrap().0,
+            PLAN_TRANSITION_PHASE_PREPARED
+        );
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            requested
+        );
+        recover_plan_transition(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("run.json")).unwrap(),
+            "old checkpoint"
+        );
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            format!("{}\n", plan_digest(original))
+        );
+        assert!(!plan_transition_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn recreate_plan_commit_archives_prior_checkpoint_and_clears_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let requested = br#"{"plan":{"leaves":[{"name":"recreated"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), "old checkpoint").unwrap();
+        std::fs::write(&plan, requested).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(original)),
+        )
+        .unwrap();
+
+        apply_recreate_plan_after_validation(dir.path(), Some(requested), || Ok(())).unwrap();
+        let (_, archive_name) = read_plan_transition(dir.path()).unwrap().unwrap();
+        let archive_name = archive_name.expect("recreate should reserve the old root archive");
+        let archive = dir.path().join(".exo/tl-loop").join(archive_name);
+
+        complete_recreate_plan_transition(dir.path(), None).unwrap();
+
+        assert!(!root.exists());
+        assert_eq!(
+            std::fs::read_to_string(archive.join("run.json")).unwrap(),
+            "old checkpoint"
+        );
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            requested
+        );
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            format!("{}\n", plan_digest(requested))
+        );
+        assert!(!plan_transition_path(dir.path()).exists());
+        assert!(!plan_transition_previous_snapshot_path(dir.path()).exists());
+        assert!(!plan_transition_previous_digest_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn recreate_plan_archive_failure_rolls_back_adopted_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        let plan = dir.path().join(".exo/tl-loop/plan.json");
+        let original = br#"{"plan":{"leaves":[]}}"#;
+        let requested = br#"{"plan":{"leaves":[{"name":"recreated"}]}}"#;
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run.json"), "old checkpoint").unwrap();
+        std::fs::write(&plan, requested).unwrap();
+        std::fs::write(plan_snapshot_path(dir.path()), original).unwrap();
+        std::fs::write(
+            plan_snapshot_digest_path(dir.path()),
+            format!("{}\n", plan_digest(original)),
+        )
+        .unwrap();
+
+        apply_recreate_plan_after_validation(dir.path(), Some(requested), || Ok(())).unwrap();
+        complete_recreate_plan_transition(dir.path(), Some("archive")).unwrap_err();
+
+        assert!(root.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(root.join("run.json")).unwrap(),
+            "old checkpoint"
+        );
+        assert_eq!(
+            std::fs::read(plan_snapshot_path(dir.path())).unwrap(),
+            original
+        );
         assert!(!plan_transition_path(dir.path()).exists());
     }
 
@@ -6644,7 +6799,7 @@ mod tests {
     fn recreate_archives_root_before_creating_tl_window() {
         let source = include_str!("init.rs");
         let archive = source
-            .find("archive_root_tl_run(&cwd)?")
+            .find("complete_recreate_plan_transition_locked(&cwd")
             .expect("recreate must archive the prior root checkpoint");
         let tl_window = source
             .find("ipc.new_window(\"TL\"")
@@ -6786,7 +6941,7 @@ mod tests {
             .find("write_tl_loop_plan(&cwd")
             .expect("init must locate the plan write");
         let recreate = source
-            .find("archive_root_tl_run(&cwd)?")
+            .find("complete_recreate_plan_transition_locked(&cwd")
             .expect("init must locate recreation archive");
 
         assert!(validation < plan);

@@ -278,7 +278,17 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     existing = checkpoint.load() if checkpoint.path.exists() else None
     session_mode = _read_session_mode(project_root)
     expected_plan_digest = getattr(args, "expected_plan_digest", None)
-    if (
+    if session_mode == "recreate":
+        expected_plan_digest = _recreate_plan_digest(project_root, expected_plan_digest)
+        if expected_plan_digest is None:
+            plan_document: dict[str, object] = {"run_id": args.run_id}
+            plan = None
+        else:
+            plan_document, accepted_plan_bytes = _load_recreate_plan(
+                project_root, expected_plan_digest
+            )
+            plan = _plan_from_document(plan_document)
+    elif (
         existing is not None
         and existing.plan_manifest is not None
         and not plan_path.exists()
@@ -287,7 +297,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
     ):
         plan_document: dict[str, object] = {"run_id": args.run_id}
         plan = None
-    elif expected_plan_digest is not None and session_mode in {"start", "recreate"}:
+    elif expected_plan_digest is not None and session_mode == "start":
         plan_document, accepted_plan_bytes = _load_snapshot_plan(
             project_root, expected_plan_digest
         )
@@ -301,10 +311,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
                 raise LauncherError(f"plan {plan_path} changed after validation")
         if args.wait_for_plan:
             _validate_captured_plan(project_root, accepted_plan_bytes)
-        if session_mode == "recreate":
-            _replace_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
-        else:
-            _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
+        _record_plan_snapshot(project_root, plan_path, accepted_plan_bytes)
     run_id = _run_id(plan_document, args.run_id)
     ledger_run_id = _authoritative_ledger_run_id(project_root)
     reader = LedgerReader(
@@ -433,6 +440,52 @@ def _load_snapshot_plan(project_root: Path, expected_digest: str) -> tuple[dict[
     return _parse_plan_bytes(path, plan_bytes)
 
 
+def _load_recreate_plan(project_root: Path, expected_digest: str) -> tuple[dict[str, object], bytes]:
+    """Load Rust's recreate snapshot after checking the source-plan pairing."""
+    document, snapshot_bytes = _load_snapshot_plan(project_root, expected_digest)
+    plan_path = project_root / ".exo" / "tl-loop" / "plan.json"
+    try:
+        plan_bytes = plan_path.read_bytes()
+    except OSError as error:
+        raise LauncherError(f"recreate plan {plan_path} could not be read: {error}") from error
+    if plan_bytes != snapshot_bytes:
+        raise LauncherError(
+            f"recreate plan {plan_path} differs from Rust-validated plan snapshot"
+        )
+    return document, snapshot_bytes
+
+
+def _recreate_plan_digest(project_root: Path, expected_digest: str | None) -> str | None:
+    """Read the plan identity recorded by Rust for a recreate transition."""
+    digest_path = project_root / ".exo" / "tl-loop" / "plan.snapshot.sha256"
+    try:
+        digest = digest_path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        snapshot_path = project_root / ".exo" / "tl-loop" / "plan.snapshot"
+        if snapshot_path.exists():
+            raise LauncherError(
+                f"recreate plan identity {digest_path} is missing while {snapshot_path} exists"
+            )
+        if (project_root / ".exo" / "tl-loop" / "plan.json").is_file():
+            raise LauncherError(
+                "recreate plan identity is missing while plan.json exists; Rust validation did not complete"
+            )
+        if expected_digest is not None:
+            raise LauncherError(f"recreate plan identity {digest_path} is missing")
+        return None
+    except (OSError, UnicodeError) as error:
+        raise LauncherError(
+            f"recreate plan identity {digest_path} could not be read: {error}"
+        ) from error
+    if not digest:
+        raise LauncherError(f"recreate plan identity {digest_path} is empty")
+    if expected_digest is not None and digest != expected_digest:
+        raise LauncherError(
+            f"recreate plan identity {digest_path} differs from Rust-validated identity"
+        )
+    return digest
+
+
 def _record_plan_snapshot(
     project_root: Path, plan_path: Path, plan_bytes: bytes | None = None
 ) -> None:
@@ -452,26 +505,6 @@ def _record_plan_snapshot(
     temporary.write_bytes(plan_bytes)
     temporary.replace(snapshot_path)
     _record_plan_digest(project_root, plan_bytes)
-
-
-def _replace_plan_snapshot(
-    project_root: Path, plan_path: Path, plan_bytes: bytes | None = None
-) -> None:
-    """Adopt the accepted plan bytes as the identity for a recreated session."""
-    if plan_bytes is None:
-        plan_bytes = plan_path.read_bytes()
-    snapshot_path = project_root / ".exo" / "tl-loop" / "plan.snapshot"
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = snapshot_path.with_suffix(".tmp")
-    temporary.write_bytes(plan_bytes)
-    temporary.replace(snapshot_path)
-    digest_path = project_root / ".exo" / "tl-loop" / "plan.snapshot.sha256"
-    digest_path.parent.mkdir(parents=True, exist_ok=True)
-    digest_temporary = digest_path.with_name(digest_path.name + ".tmp")
-    digest_temporary.write_text(
-        hashlib.sha256(plan_bytes).hexdigest() + chr(10), encoding="ascii"
-    )
-    digest_temporary.replace(digest_path)
 
 
 def _record_plan_digest(project_root: Path, plan_bytes: bytes) -> None:
