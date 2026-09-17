@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix plan-less recreate wait ownership (#1093)
 - Fix recreate controller startup after validated plan changes (#1092)
 - Fix recreate transition ownership across Rust and Python (#1091)
 - Set network_access=true in Codex sandbox_workspace_write (AppArmor host fix exhausted, see #1085) (#1086)
