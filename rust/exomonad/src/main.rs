@@ -161,6 +161,16 @@ enum Commands {
         import_legacy_dry_run: bool,
     },
 
+    /// Persist accepted recreate plan bytes supplied on stdin.
+    RecordPlanSnapshot {
+        /// Project whose plan identity is being recorded.
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// SHA-256 digest of the exact bytes supplied on stdin.
+        #[arg(long)]
+        expected_digest: String,
+    },
+
     /// Initialize a new exomonad project in the current directory.
     /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
     New {
@@ -571,6 +581,13 @@ async fn main() -> Result<()> {
                 tracing::error!(error = %e, "exomonad init failed: {:#}", e);
                 return Err(e);
             }
+        }
+
+        Commands::RecordPlanSnapshot {
+            project_root,
+            expected_digest,
+        } => {
+            return init::record_plan_snapshot_from_stdin(&project_root, &expected_digest);
         }
 
         Commands::New {

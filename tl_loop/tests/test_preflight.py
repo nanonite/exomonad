@@ -242,7 +242,12 @@ def test_recreate_waits_for_plan_when_rust_accepted_no_plan(
     def reject_python_ownership(*_args: object) -> None:
         raise AssertionError("plan-less recreate must not own plan identity")
 
+    def persist_identity(project_root: Path, plan_bytes: bytes) -> None:
+        captured["persisted_root"] = project_root
+        captured["persisted_bytes"] = plan_bytes
+
     monkeypatch.setattr(tl_main, "_load_plan", load_plan)
+    monkeypatch.setattr(tl_main, "_persist_recreate_plan_identity", persist_identity)
     monkeypatch.setattr(tl_main, "_record_plan_snapshot", reject_python_ownership)
     monkeypatch.setattr(tl_main, "_validate_captured_plan", reject_python_ownership)
     monkeypatch.setattr(tl_main, "LedgerReader", lambda *args, **kwargs: object())
@@ -283,8 +288,8 @@ def test_recreate_waits_for_plan_when_rust_accepted_no_plan(
 
     assert captured["path"] == plan
     assert captured["wait_for_plan"] is True
-    assert not (project / ".exo" / "tl-loop" / "plan.snapshot").exists()
-    assert not (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").exists()
+    assert captured["persisted_root"] == project
+    assert captured["persisted_bytes"] == accepted
 
 
 def test_preflight_rejects_plan_bytes_that_changed_after_capture(tmp_path: Path) -> None:

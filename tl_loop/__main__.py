@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -287,6 +288,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         if expected_plan_digest is None:
             if args.wait_for_plan:
                 plan_document, accepted_plan_bytes = _load_plan(plan_path, wait_for_plan=True)
+                _persist_recreate_plan_identity(project_root, accepted_plan_bytes)
                 plan = _plan_from_document(plan_document)
             else:
                 plan_document = {"run_id": args.run_id}
@@ -451,6 +453,37 @@ def _load_snapshot_plan(project_root: Path, expected_digest: str) -> tuple[dict[
 def _load_recreate_plan(project_root: Path, expected_digest: str) -> tuple[dict[str, object], bytes]:
     """Load Rust's accepted recreate bytes without rereading mutable plan.json."""
     return _load_snapshot_plan(project_root, expected_digest)
+
+
+def _persist_recreate_plan_identity(project_root: Path, plan_bytes: bytes) -> None:
+    """Ask Rust to persist operator-supplied recreate bytes as the identity owner."""
+    binary = os.environ.get("EXOMONAD_BINARY")
+    if not binary:
+        raise LauncherError(
+            "EXOMONAD_BINARY is required to persist a waited recreate plan identity"
+        )
+    digest = hashlib.sha256(plan_bytes).hexdigest()
+    try:
+        result = subprocess.run(
+            [
+                binary,
+                "record-plan-snapshot",
+                "--project-root",
+                str(project_root),
+                "--expected-digest",
+                digest,
+            ],
+            input=plan_bytes,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        message = f"failed to persist recreate plan identity through Rust: {error}"
+        raise LauncherError(message) from error
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise LauncherError(f"Rust recreate plan identity persistence failed{suffix}")
 
 
 def _recreate_plan_digest(

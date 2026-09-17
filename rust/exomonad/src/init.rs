@@ -2286,6 +2286,56 @@ fn plan_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+pub fn record_plan_snapshot_from_stdin(project_dir: &Path, expected_digest: &str) -> Result<()> {
+    use std::io::Read;
+
+    let mut plan_bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut plan_bytes)
+        .context("failed to read accepted plan bytes")?;
+    record_plan_snapshot_bytes(project_dir, &plan_bytes, expected_digest)
+}
+
+fn record_plan_snapshot_bytes(
+    project_dir: &Path,
+    plan_bytes: &[u8],
+    expected_digest: &str,
+) -> Result<()> {
+    let actual_digest = plan_digest(plan_bytes);
+    if actual_digest != expected_digest {
+        anyhow::bail!(
+            "accepted plan digest {actual_digest} does not match expected identity {expected_digest}"
+        );
+    }
+
+    let _lock = acquire_plan_transition_lock(project_dir)?;
+    let previous_snapshot = read_plan_snapshot_bytes(project_dir)?;
+    let previous_digest = read_plan_snapshot_digest(project_dir)?;
+    if previous_snapshot.is_some() || previous_digest.is_some() {
+        if previous_snapshot.as_deref() == Some(plan_bytes)
+            && previous_digest.as_deref() == Some(expected_digest)
+        {
+            return Ok(());
+        }
+        anyhow::bail!("cannot record recreate plan identity over an existing snapshot");
+    }
+
+    let mut failure = None;
+    begin_plan_transition_locked(project_dir, None, None, None)?;
+    if let Err(error) = apply_plan_snapshot_locked(
+        project_dir,
+        Some(plan_bytes),
+        Some(expected_digest),
+        &mut failure,
+    ) {
+        return Err(rollback_plan_transition_locked(project_dir, error, &mut failure));
+    }
+    if let Err(error) = write_plan_transition(project_dir, PLAN_TRANSITION_PHASE_ARCHIVED, None) {
+        return Err(rollback_plan_transition_locked(project_dir, error, &mut failure));
+    }
+    clear_plan_transition_locked(project_dir, &mut failure)
+}
+
 fn validate_publication_registry_schema(cwd: &Path) -> Result<()> {
     let path = cwd.join(".exo/published-heads.json");
     if !path.is_file() {
@@ -2458,6 +2508,12 @@ fn tl_loop_command(
     timeouts: &TlLoopTimeouts,
     expected_plan_digest: Option<&str>,
 ) -> String {
+    let binary = shell_escape::escape(
+        exomonad_core::find_exomonad_binary()
+            .display()
+            .to_string()
+            .into(),
+    );
     let package = shell_escape::escape(package_root.display().to_string().into());
     let project = shell_escape::escape(cwd.display().to_string().into());
     let plan = shell_escape::escape(
@@ -2475,7 +2531,7 @@ fn tl_loop_command(
         })
         .unwrap_or_default();
     format!(
-        "EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan{expected_plan_arg} \
+        "EXOMONAD_BINARY={binary} EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan{expected_plan_arg} \
            --transport-timeout {} --active-tail-timeout {} --task-timeout {}",
         shell_escape::escape(tl_loop_python(cwd).into()),
         timeouts.transport,
@@ -5256,6 +5312,34 @@ mod tests {
     }
 
     #[test]
+    fn rust_persists_waited_recreate_plan_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let accepted = br#"{"plan":{"leaves":[{"name":"waited"}]}}"#;
+        let digest = plan_digest(accepted);
+
+        record_plan_snapshot_bytes(dir.path(), accepted, &digest).unwrap();
+
+        assert_eq!(std::fs::read(plan_snapshot_path(dir.path())).unwrap(), accepted);
+        assert_eq!(
+            std::fs::read_to_string(plan_snapshot_digest_path(dir.path())).unwrap(),
+            format!("{digest}\n")
+        );
+        assert!(!plan_transition_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn rust_rejects_waited_recreate_plan_with_wrong_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let accepted = br#"{"plan":{"leaves":[{"name":"waited"}]}}"#;
+
+        let error = record_plan_snapshot_bytes(dir.path(), accepted, "wrong").unwrap_err();
+
+        assert!(error.to_string().contains("does not match expected identity"));
+        assert!(!plan_snapshot_path(dir.path()).exists());
+        assert!(!plan_snapshot_digest_path(dir.path()).exists());
+    }
+
+    #[test]
     fn recreate_plan_failure_before_archive_restores_prior_checkpoint_and_identity() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".exo/tl-loop/root");
@@ -6834,6 +6918,7 @@ mod tests {
             &timeouts,
             Some("0123456789abcdef"),
         );
+        assert!(command.contains("EXOMONAD_BINARY="));
         assert!(command.contains("EXOMONAD_ROLE=tl"));
         assert!(!command.contains("PYTHONPATH="));
         assert!(command.contains("python3 /tmp/exo run"));
