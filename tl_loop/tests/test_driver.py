@@ -565,6 +565,119 @@ def test_live_child_owns_scoped_ledger_source_after_fork(
             process.join(timeout=3)
 
 
+def test_live_child_consumes_delayed_publication_after_staying_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    segment = segments / "segment-000000000001.jsonl"
+    segment.write_text("", encoding="utf-8")
+    context = multiprocessing.get_context("fork")
+    observed = context.Queue()
+
+    def fake_tl_run(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del root_spec, budgets
+        child_source = cast(LedgerQueue, config.source)
+        observed.put(("started", child_source.reader.scope_agent_id))
+        spawned = child_source.get(timeout=3)
+        observed.put(("spawned", spawned.event_type))
+        publication = child_source.get(timeout=3)
+        observed.put(("publication", publication.event_type, publication.pr_number))
+        return SimpleNamespace(
+            final_state=SimpleNamespace(
+                fsm=SimpleNamespace(phase=TLPhase.TLDone),
+                recursive_fsm=None,
+            )
+        )
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", fake_tl_run)
+    store = RunStore("parent", tmp_path / "state")
+    task = SubTLTask("child", WorkPlan(), agent_id="child-agent")
+    config = TLLoopConfig(
+        active=True,
+        root_dir=store.root_dir,
+        run_id="parent",
+        ledger_run_id="swarm-uuid",
+        poll_interval=0.01,
+    )
+    process = context.Process(
+        target=_run_live_sub_tl,
+        args=(
+            task,
+            config,
+            segments,
+            EffectClient(TransportClient(socket_path=tmp_path / "unused.sock")),
+            store,
+            BudgetLedger(tokens=0, wall_seconds=0),
+        ),
+    )
+    process.start()
+    try:
+        assert observed.get(timeout=3) == ("started", "child-agent")
+        segment.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "event_id": "spawned-1",
+                    "id": "spawned-1",
+                    "event_time": "2026-08-11T00:00:00Z",
+                    "observed_at": "2026-08-11T00:00:00Z",
+                    "run_seq": 1,
+                    "type": "agent.spawned",
+                    "agent_id": "child-agent",
+                    "parent_agent_id": "parent",
+                    "run_id": "swarm-uuid",
+                    "session_id": "session-1",
+                    "lifecycle_state": "observed",
+                    "data": {
+                        "child_agent": "child-agent",
+                        "agent_type": "codex",
+                        "branch": "main.child",
+                        "intent_id": "child-intent",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        assert observed.get(timeout=3) == ("spawned", "agent.spawned")
+        assert process.is_alive()
+        with segment.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "event_id": "published-2",
+                        "id": "published-2",
+                        "event_time": "2026-08-11T00:00:01Z",
+                        "observed_at": "2026-08-11T00:00:01Z",
+                        "run_seq": 2,
+                        "type": "pr.filed",
+                        "agent_id": "child-agent",
+                        "parent_agent_id": "parent",
+                        "run_id": "swarm-uuid",
+                        "session_id": "session-1",
+                        "lifecycle_state": "observed",
+                        "data": {
+                            "slice_id": "child",
+                            "pr_number": 42,
+                            "head_sha": "head-child",
+                            "head_branch": "main.child",
+                            "base_branch": "main",
+                        },
+                    }
+                )
+                + "\n"
+            )
+        assert observed.get(timeout=3) == ("publication", "pr.filed", 42)
+        process.join(timeout=3)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=3)
+
+
 def test_live_restart_reuses_child_checkpoint_without_reprovisioning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
