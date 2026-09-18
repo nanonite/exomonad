@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix recursive TL event consumption and keep the TL window available during child work (#1098)
 - Fix recreate journal race during plan handoff (#1096)
 - Fix plan-less recreate startup delay (#1095)
 - Persist plan-less recreate identity through Rust (#1094)
