@@ -66,7 +66,7 @@ from tl_loop.fsm.phase import (
     TLPlanning,
     TLWaiting,
 )
-from tl_loop.fsm.post_merge import PostMergePhase
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.post_merge_events import (
     ChangelogCommitted,
     ChangelogPending,
@@ -251,6 +251,7 @@ INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 REPOSITORY_IDENTITY_GATE_NAME = "tl-repository-identity"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
+ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
 MAX_CONVERGENCE_STEPS = 8
 # A per-call fairness cap on _drain_direct_scope_convergence, not a
 # correctness bound: that function raises the moment a step makes no
@@ -699,6 +700,8 @@ class TLLoopConfig:
     review_clock: Callable[[], datetime] | None = None
     enable_reviewer_spawn: bool = False
     dispatch_names: Mapping[str, str] = field(default_factory=dict)
+    ordered_recovery_child: str | None = None
+    ordered_recovery: bool = False
     review_model_choice: object | None = None
     branch: str = "main"
     worktree: str | Path | None = None
@@ -736,6 +739,8 @@ class TLLoopConfig:
         for slice_id, runtime_name in self.dispatch_names.items():
             _require_text(slice_id, "dispatch_names slice id")
             _require_text(runtime_name, "dispatch_names runtime name")
+        if type(self.ordered_recovery) is not bool:
+            raise ValueError("ordered_recovery must be a boolean")
         if self.poll_interval < 0:
             raise ValueError("poll_interval must be non-negative")
         if self.heartbeat is not None and self.project_root is None:
@@ -771,6 +776,7 @@ class TLLoopConfig:
             raise ValueError("plan_revision must be a positive integer")
         _require_text(self.branch, "branch")
         _optional_text(self.agent_id, "agent_id")
+        _optional_text(self.ordered_recovery_child, "ordered_recovery_child")
         _optional_text(self.parent_branch, "parent_branch")
         _optional_text(self.parent_run_id, "parent_run_id")
         _optional_text(self.parent_agent_id, "parent_agent_id")
@@ -889,6 +895,67 @@ def run_tl_loop(
                     f"{persisted_manifest.digest} differs from supplied plan digest "
                     f"{candidate.digest}; archive the completed run before starting a new plan"
                 )
+        if (
+            selected.session_mode == "continue"
+            and isinstance(existing_state.recursive_fsm, RecursiveTLFailed)
+            and existing_state.plan_manifest is not None
+        ):
+            recovery_plan = (
+                plan
+                if isinstance(plan, WorkPlan)
+                else WorkPlan.from_mapping(plan)
+                if plan is not None
+                else _work_plan_from_manifest(existing_state.plan_manifest)
+            )
+            decision = _ordered_terminal_recovery_decision(
+                existing_state,
+                recovery_plan,
+                selected,
+                store,
+            )
+            if decision is not None:
+                if not decision.recoverable:
+                    state = store.set_gate(decision.gate_name)
+                    return TLRunResult(
+                        state,
+                        (),
+                        (),
+                        (),
+                        (),
+                        {
+                            "reducer_version": state.reducer_version,
+                            "cursor": state.events.last_consumed_offset,
+                            "ordered_recovery": decision.reason,
+                            "recovery_gate": decision.gate_name,
+                        },
+                        (),
+                    )
+                existing_state = _reopen_ordered_scope(
+                    existing_state,
+                    recovery_plan,
+                    store,
+                    decision.task_name,
+                )
+                selected = replace(
+                    selected,
+                    ordered_recovery_child=decision.task_name,
+                    branch=existing_state.owner_branch or selected.branch,
+                    worktree=existing_state.owner_worktree or selected.worktree,
+                )
+        if selected.ordered_recovery and isinstance(existing_state.recursive_fsm, RecursiveTLFailed):
+            recovery_plan = (
+                plan
+                if isinstance(plan, WorkPlan)
+                else WorkPlan.from_mapping(plan)
+                if plan is not None
+                else _work_plan_from_manifest(existing_state.plan_manifest)
+            )
+            existing_state = _reopen_ordered_scope(
+                existing_state,
+                recovery_plan,
+                store,
+                None,
+            )
         if existing_state.reducer_version != REDUCER_VERSION:
             raise TLLoopError(
                 f"checkpoint reducer_version {existing_state.reducer_version} is incompatible "
@@ -1489,6 +1556,348 @@ def _is_terminal_phase(phase: object) -> bool:
             RecursiveTLFailed,
             RecursiveTLParked,
         ),
+    )
+
+
+@dataclass(frozen=True)
+class OrderedRecoveryDecision:
+    """Proof result for one terminal ordered-child continuation."""
+
+    task_name: str | None
+    gate_name: str
+    reason: str
+    recoverable: bool
+
+
+def _ordered_recovery_gate_name(task_name: str | None) -> str:
+    """Build the stable operator gate for an ordered continuation proof."""
+    return f"{ORDERED_RECOVERY_GATE_PREFIX}{task_name or 'ambiguous'}"
+
+
+def _ordered_terminal_recovery_decision(
+    state: RunState,
+    plan: WorkPlan,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> OrderedRecoveryDecision | None:
+    """Classify a failed ordered child without guessing ownership or effects."""
+    failed_phase = state.recursive_fsm
+    if not plan.sub_tls or not isinstance(failed_phase, RecursiveTLFailed):
+        return None
+    if not failed_phase.reason.startswith("recursive child"):
+        return None
+    tasks_by_name = {task.name: task for task in plan.sub_tls}
+    stage = next(
+        (stage for stage in plan.ordered_stages if stage.order == state.current_order),
+        None,
+    )
+    if stage is None:
+        return OrderedRecoveryDecision(
+            None,
+            _ordered_recovery_gate_name(None),
+            f"ordered recovery cannot identify current order {state.current_order}",
+            False,
+        )
+    failed = [
+        task_name
+        for task_name in stage.sub_tls
+        if state.slices.get(task_name) is not None
+        and state.slices[task_name].status is SliceStatus.FAILED
+    ]
+    if len(failed) != 1:
+        return OrderedRecoveryDecision(
+            failed[0] if len(failed) == 1 else None,
+            _ordered_recovery_gate_name(failed[0] if len(failed) == 1 else None),
+            "ordered recovery requires exactly one failed child in the current stage",
+            False,
+        )
+    task_name = failed[0]
+    task = tasks_by_name.get(task_name)
+    if task is None:
+        return OrderedRecoveryDecision(
+            task_name,
+            _ordered_recovery_gate_name(task_name),
+            f"ordered recovery plan is missing failed child {task_name!r}",
+            False,
+        )
+    if any(
+        state.slices.get(sibling) is not None
+        and state.slices[sibling].status in {SliceStatus.FAILED, SliceStatus.PARKED}
+        for sibling in stage.sub_tls
+        if sibling != task_name
+    ):
+        return OrderedRecoveryDecision(
+            task_name,
+            _ordered_recovery_gate_name(task_name),
+            "ordered recovery found another failed or parked sibling",
+            False,
+        )
+    child_store = RunStore(task.name, store.run_dir)
+    if not child_store.path.exists():
+        return OrderedRecoveryDecision(
+            task_name,
+            _ordered_recovery_gate_name(task_name),
+            "failed child checkpoint is missing",
+            False,
+        )
+    try:
+        child_state = child_store.load()
+    except (OSError, ValueError) as error:
+        return OrderedRecoveryDecision(
+            task_name,
+            _ordered_recovery_gate_name(task_name),
+            f"failed child checkpoint cannot be verified: {error}",
+            False,
+        )
+    reason = _ordered_child_recovery_reason(state, task, child_state, config, store)
+    if reason is not None:
+        return OrderedRecoveryDecision(
+            task_name,
+            _ordered_recovery_gate_name(task_name),
+            reason,
+            False,
+        )
+    return OrderedRecoveryDecision(
+        task_name,
+        _ordered_recovery_gate_name(task_name),
+        "durable child startup or transport failure is retryable",
+        True,
+    )
+
+
+def _ordered_child_recovery_reason(
+    parent_state: RunState,
+    task: SubTLTask,
+    child_state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> str | None:
+    """Return a fail-closed reason when child continuation proof is incomplete."""
+    child_store = RunStore(task.name, store.run_dir)
+    parent_slice = parent_state.slices.get(task.name)
+    if parent_slice is None:
+        return f"parent checkpoint is missing child slice {task.name!r}"
+    parent_branch = parent_state.owner_branch or config.branch
+    recovery_config = replace(config, branch=parent_branch)
+    branch = derive_child_branch(parent_branch, _child_controller_name(task))
+    worktree = str(_sub_tl_worktree(recovery_config, store.root_dir, store.run_id, task))
+    if parent_slice.branch != branch or parent_slice.worktree != worktree:
+        return "parent child branch or worktree does not match the declared owner"
+    if (
+        not parent_slice.dispatch_intent_id
+        or not parent_slice.dispatch_agent_id
+        or parent_slice.dispatch_authoritative_event_seq is None
+        or parent_slice.dispatch_last_boundary != "sub_tl_started"
+    ):
+        return "accepted ordered-child dispatch intent is not durably reconciled"
+    if parent_slice.pr_number is not None or parent_slice.publication is not None:
+        return "parent child has publication evidence requiring integration reconciliation"
+    if child_state.run_id != task.name:
+        return "child checkpoint run identity does not match the declared child"
+    if not isinstance(child_state.recursive_fsm, RecursiveTLFailed):
+        return "child checkpoint is not an authoritative recursive failure"
+    if child_state.owner_branch != branch or child_state.owner_worktree != worktree:
+        return "child checkpoint owner branch or worktree conflicts with the parent"
+    if child_state.parent_run_id != parent_state.run_id or child_state.parent_branch != parent_branch:
+        return "child checkpoint parent ownership does not match the current controller"
+    if child_state.plan_manifest is None or parent_state.plan_manifest is None:
+        return "matching child plan manifest is missing"
+    node = next(
+        (candidate for candidate in parent_state.plan_manifest.nodes if candidate.name == task.name),
+        None,
+    )
+    expected_child = (
+        parent_state.plan_manifest.child_manifests.get(node.node_id)
+        if node is not None
+        else None
+    )
+    if expected_child is None or child_state.plan_manifest.digest != expected_child.digest:
+        return "child checkpoint plan manifest does not match the parent declaration"
+    diagnostic = RunStore(task.name, store.run_dir).exit_diagnostics()
+    exit_reason = diagnostic.get("reason") if isinstance(diagnostic, Mapping) else None
+    if not isinstance(exit_reason, str) or not exit_reason:
+        return "durable child exit diagnostic is missing"
+    if not _retryable_ordered_exit_reason(exit_reason):
+        return f"child exit is not a retryable startup, transport, or process failure: {exit_reason}"
+    integration = child_state.integration
+    if integration.lifecycle in {
+        IntegrationLifecycle.MERGED,
+        IntegrationLifecycle.INTEGRATION_VALIDATED,
+        IntegrationLifecycle.MERGING,
+    }:
+        return "child integration has completed or in-flight merge evidence"
+    for slice_state in child_state.slices.values():
+        if slice_state.status in {SliceStatus.FAILED, SliceStatus.PARKED, SliceStatus.BLOCKED}:
+            return f"child slice {slice_state.id!r} has an unsafe terminal status"
+        if slice_state.status is SliceStatus.MERGED:
+            return f"child slice {slice_state.id!r} already completed"
+        if slice_state.action is not None and slice_state.action.phase in {
+            ActionPhase.INTENDED,
+            ActionPhase.IN_FLIGHT,
+            ActionPhase.UNKNOWN,
+        }:
+            return f"child slice {slice_state.id!r} has an unresolved action boundary"
+        if slice_state.status in {
+            SliceStatus.SPAWNED,
+            SliceStatus.DISPATCH_UNCONFIRMED,
+            SliceStatus.IN_REVIEW,
+            SliceStatus.REPAIRING,
+        } and (
+            not slice_state.dispatch_intent_id
+            or not slice_state.dispatch_agent_id
+            or slice_state.dispatch_authoritative_event_seq is None
+        ):
+            return f"child slice {slice_state.id!r} lacks accepted dispatch evidence"
+    journal_path = child_store.run_dir / "action-journal.json"
+    try:
+        pending = EffectJournal(task.name, journal_path).pending_entries()
+    except ActionJournalError as error:
+        return f"child action journal cannot be verified: {error}"
+    if pending:
+        return "child action journal contains an unreconciled effect"
+    return None
+
+
+def _retryable_ordered_exit_reason(reason: str) -> bool:
+    """Recognize only transient controller-boundary failures for retry."""
+    lowered = reason.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "identity conflict",
+            "branch already exists",
+            "plan manifest",
+            "depth ceiling",
+            "cancelled explicitly",
+            "publication ownership",
+            "merge",
+            "review",
+        )
+    ):
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "controller exited before authoritative resolution",
+            "controller exited",
+            "transport",
+            "server returned http",
+            "server socket",
+            "server timeout",
+            "connection",
+            "timed out",
+            "broken pipe",
+            "eof",
+            "missing request extension",
+        )
+    )
+
+
+def _reopen_ordered_scope(
+    state: RunState,
+    plan: WorkPlan,
+    store: RunStore,
+    target_name: str | None,
+) -> RunState:
+    """Reopen one proven ordered scope while retaining all durable identities."""
+    if state.plan_manifest is None:
+        raise TLLoopError("ordered recovery checkpoint has no plan manifest")
+    planning = _canonical_planning_from_manifest(state.plan_manifest, state.slices)
+    tasks_by_name = {task.name: task for task in plan.sub_tls}
+    records = [*planning.parallel_children]
+    records.extend(record for _, group in planning.ordered_children for record in group)
+    completed: dict[str, ChildRecord] = {}
+    parallel_pending: list[ChildRecord] = []
+    pending_by_order: dict[int, tuple[ChildRecord, ...]] = {}
+    post_merge: dict[str, PostMergeState] = {}
+    for record in records:
+        current = state.slices.get(record.child_id)
+        if current is None:
+            raise TLLoopError(f"ordered recovery slice {record.child_id!r} is missing")
+        task = tasks_by_name.get(record.child_id)
+        complete = (
+            _ordered_child_complete(task, current)
+            if task is not None
+            else current.status is SliceStatus.MERGED
+        )
+        if complete:
+            completed[record.child_id] = record
+            if record.kind is ChildKind.SUB_TL:
+                post_merge[record.child_id] = PostMergeState(
+                    PostMergePhase.COMPLETE,
+                    {"recovery": "durable-completion"},
+                )
+            elif record.kind is ChildKind.WORKER:
+                post_merge[record.child_id] = PostMergeState(
+                    PostMergePhase.NOT_REQUIRED,
+                    {"worker_result": f"recovered:{record.child_id}"},
+                )
+            else:
+                post_merge[record.child_id] = PostMergeState(
+                    PostMergePhase.NOT_REQUIRED,
+                    {"leaf_result": f"recovered:{record.child_id}"},
+                )
+        elif record.kind is ChildKind.SUB_TL:
+            for order, group in planning.ordered_children:
+                if record in group:
+                    pending_by_order.setdefault(order, ())
+                    pending_by_order[order] = (*pending_by_order[order], record)
+                    break
+        else:
+            parallel_pending.append(record)
+    if parallel_pending:
+        current_order = 0
+    elif pending_by_order:
+        current_order = min(pending_by_order)
+    else:
+        raise TLLoopError("ordered recovery found no pending child to reopen")
+    running = RecursiveTLRunning(
+        current_order=current_order,
+        pending_by_order=pending_by_order,
+        scope_path=planning.scope_path,
+        plan_digest=planning.plan_digest,
+        parallel_pending=tuple(parallel_pending),
+        completed_children=completed,
+        post_merge=post_merge,
+        dispatch_intents={
+            record.child_id: record.dispatch_intent_id
+            for record in records
+            if record.dispatch_intent_id is not None
+        },
+        lane_bindings={
+            record.child_id: record.lane_id for record in records if record.lane_id is not None
+        },
+        evidence={"ordered_recovery_child": target_name or "scope"},
+    )
+    slices = dict(state.slices)
+    if target_name is not None:
+        target = slices[target_name]
+        slices[target_name] = replace(
+            target,
+            status=SliceStatus.SPAWNED,
+            park_cause=None,
+            dispatch_error=None,
+        )
+    sub_tl_states = dict(state.integration.sub_tl_states)
+    if target_name is not None:
+        sub_tl_states[target_name] = IntegrationLifecycle.RUNNING
+    integration = replace(
+        state.integration,
+        sub_tl_states=sub_tl_states,
+        sub_tl_recovery={
+            name: summary
+            for name, summary in state.integration.sub_tl_recovery.items()
+            if name != target_name or target_name is None
+        },
+    )
+    return store.checkpoint(
+        running,
+        slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=max(1, current_order),
+        ordered_stages=state.ordered_stages,
+        integration=integration,
     )
 
 
@@ -7332,12 +7741,22 @@ def _run_sub_tl_batch(
                 TLPhase.TLAllMerged,
                 TLPhase.TLDone,
                 TLPhase.TLPRFiled,
-                TLPhase.TLFailed,
             }:
+                return task, child_phase, child_state
+            if child_phase is TLPhase.TLFailed and config.ordered_recovery_child != task.name:
                 return task, child_phase, child_state
             if _child_recovery_projection(child_state, store.run_id) is not None:
                 return task, child_phase, child_state
-        child_config = _child_config(config, task, source, effects, store, branch, worktree)
+        child_config = _child_config(
+            config,
+            task,
+            source,
+            effects,
+            store,
+            branch,
+            worktree,
+            ordered_recovery=config.ordered_recovery_child == task.name,
+        )
         try:
             child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
         except Exception as error:  # noqa: BLE001 - batch completion persists a durable failure
@@ -7389,10 +7808,12 @@ def _run_live_sub_tl_batch(
                     TLPhase.TLAllMerged,
                     TLPhase.TLDone,
                     TLPhase.TLPRFiled,
-                    TLPhase.TLFailed,
                 }
                 or _child_recovery_projection(child_state, store.run_id) is not None
             ):
+                existing[task.name] = (task, child_phase, child_state)
+                continue
+            if child_phase is TLPhase.TLFailed and config.ordered_recovery_child != task.name:
                 existing[task.name] = (task, child_phase, child_state)
                 continue
         runnable.append(task)
@@ -7524,6 +7945,7 @@ def _run_live_sub_tl(
             branch,
             worktree,
             keep_alive_on_waiting=True,
+            ordered_recovery=config.ordered_recovery_child == task.name,
         )
         result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
         final_state = getattr(result, "final_state", None)
@@ -9497,6 +9919,7 @@ def _child_config(
     worktree: str,
     *,
     keep_alive_on_waiting: bool = False,
+    ordered_recovery: bool = False,
 ) -> TLLoopConfig:
     child_effects = _owner_effect_client(effects, task.agent_id or task.name)
     return replace(
@@ -9514,6 +9937,8 @@ def _child_config(
         working_dir=worktree,
         depth=config.depth + 1,
         dispatch_names={},
+        ordered_recovery_child=None,
+        ordered_recovery=ordered_recovery,
         keep_alive_on_waiting=keep_alive_on_waiting,
     )
 
