@@ -8,7 +8,7 @@ use exomonad_core::services::runtime_manifest::{
     PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
 };
 use exomonad_core::services::{
-    agent_control::InvocationRecord,
+    agent_control::{read_invocation_conservatively, InvocationRecord},
     pr_registry::{
         invocation_succession_reaches_current, read_published_heads,
         remove_published_heads_for_prs, PublishedHead,
@@ -94,9 +94,115 @@ struct ProtectedPr {
     reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderedBranchSpec {
+    branch: String,
+    parent_branch: String,
+    agent_name: String,
+    slice_id: String,
+    identity_worktree: PathBuf,
+    worktree: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrderedIdentityState {
+    Missing,
+    Matching,
+    Mismatched,
+}
+
+impl OrderedIdentityState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Matching => "matching",
+            Self::Mismatched => "mismatched",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderedBranchObservation {
+    branch_exists: bool,
+    agent_dir_exists: bool,
+    identity: OrderedIdentityState,
+    worktree_exists: bool,
+    worktree_branch: Option<String>,
+    attached_worktree: Option<PathBuf>,
+    dirty_worktree: bool,
+    live_invocation: bool,
+    unique_commits: Option<u64>,
+    publications: Vec<u64>,
+    protected_publications: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrderedBranchAction {
+    Remove,
+    Preserve(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderedBranchCleanup {
+    spec: OrderedBranchSpec,
+    observation: OrderedBranchObservation,
+    action: OrderedBranchAction,
+}
+
+impl OrderedBranchCleanup {
+    fn gate(&self) -> Option<&str> {
+        match &self.action {
+            OrderedBranchAction::Remove => None,
+            OrderedBranchAction::Preserve(reason) => Some(reason),
+        }
+    }
+
+    fn render(&self) -> String {
+        let observation = &self.observation;
+        let unique_commits = observation
+            .unique_commits
+            .map_or_else(|| "unknown".to_owned(), |count| count.to_string());
+        let publications = if observation.publications.is_empty() {
+            "none".to_owned()
+        } else {
+            observation
+                .publications
+                .iter()
+                .map(|number| {
+                    if observation.protected_publications.contains(number) {
+                        format!("#{number} [PROTECTED]")
+                    } else {
+                        format!("#{number}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let action = match &self.action {
+            OrderedBranchAction::Remove => "remove".to_owned(),
+            OrderedBranchAction::Preserve(reason) => format!("preserve [GATE: {reason}]"),
+        };
+        format!(
+            "  {} -> {} (parent={}, identity={}, worktree={}, unique_commits={}, publication={})",
+            self.spec.branch,
+            action,
+            self.spec.parent_branch,
+            observation.identity.label(),
+            if observation.worktree_exists {
+                "present"
+            } else {
+                "absent"
+            },
+            unique_commits,
+            publications,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RecreatePlan {
     worktrees: Vec<PathBuf>,
+    ordered_branches: Vec<OrderedBranchCleanup>,
     prs_to_close: Vec<u64>,
     prs_to_remove: Vec<u64>,
     protected: Vec<ProtectedPr>,
@@ -135,6 +241,15 @@ impl RecreatePlan {
                 output.push_str(&format!("\n  #{number}"));
             }
         }
+        output.push_str("\nOrdered controller branches:");
+        if self.ordered_branches.is_empty() {
+            output.push_str("\n  (none)");
+        } else {
+            for branch in &self.ordered_branches {
+                output.push('\n');
+                output.push_str(&branch.render());
+            }
+        }
         output.push_str("\nProtected PRs:");
         if self.protected.is_empty() {
             output.push_str("\n  (none)");
@@ -145,6 +260,343 @@ impl RecreatePlan {
         }
         output
     }
+}
+
+fn ordered_branch_action(
+    spec: OrderedBranchSpec,
+    observation: OrderedBranchObservation,
+) -> Option<OrderedBranchCleanup> {
+    let has_evidence = observation.branch_exists
+        || observation.agent_dir_exists
+        || observation.worktree_exists
+        || !observation.publications.is_empty();
+    if !has_evidence {
+        return None;
+    }
+
+    let preserve = |reason: &str| OrderedBranchCleanup {
+        spec: spec.clone(),
+        observation: observation.clone(),
+        action: OrderedBranchAction::Preserve(reason.to_owned()),
+    };
+    if observation.live_invocation {
+        return Some(preserve("live ordered controller invocation"));
+    }
+    if observation.dirty_worktree {
+        return Some(preserve("dirty ordered controller worktree"));
+    }
+    if observation.identity == OrderedIdentityState::Mismatched {
+        return Some(preserve(
+            "durable identity does not match the same-plan owner",
+        ));
+    }
+    if observation.agent_dir_exists && observation.identity == OrderedIdentityState::Missing {
+        return Some(preserve("agent metadata exists without a durable identity"));
+    }
+    if observation.worktree_exists && observation.identity == OrderedIdentityState::Missing {
+        return Some(preserve(
+            "ordered worktree exists without a durable identity",
+        ));
+    }
+    if observation.worktree_exists && observation.worktree_branch.as_deref() != Some(&spec.branch) {
+        return Some(preserve(
+            "ordered worktree is not checked out on its owned branch",
+        ));
+    }
+    if observation.attached_worktree.is_some() && !observation.worktree_exists {
+        return Some(preserve(
+            "git still records an ordered worktree whose path is missing",
+        ));
+    }
+    if observation.attached_worktree.is_some()
+        && observation.attached_worktree.as_deref() != Some(spec.worktree.as_path())
+    {
+        return Some(preserve(
+            "owned branch is attached to an unexpected worktree",
+        ));
+    }
+    if observation.unique_commits != Some(0) {
+        return Some(preserve(
+            "ordered branch base or unique commits cannot be verified",
+        ));
+    }
+    if !observation.publications.is_empty() {
+        return Some(preserve(
+            "publication evidence still owns the ordered branch",
+        ));
+    }
+
+    Some(OrderedBranchCleanup {
+        spec,
+        observation,
+        action: OrderedBranchAction::Remove,
+    })
+}
+
+fn plan_worktree_path(project_dir: &Path, parent_worktree: &Path, entry: &Value) -> PathBuf {
+    let Some(raw) = entry.get("worktree").and_then(Value::as_str) else {
+        return parent_worktree.to_path_buf();
+    };
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        project_dir.join(path)
+    }
+}
+
+fn collect_ordered_branch_specs(
+    project_dir: &Path,
+    plan: &Value,
+    parent_branch: &str,
+    parent_worktree: &Path,
+    specs: &mut Vec<OrderedBranchSpec>,
+) -> Result<()> {
+    let Some(entries) = plan.get("sub_tls").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .context("ordered sub-TL plan entry must be an object")?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("ordered sub-TL plan entry is missing a name")?;
+        let agent_name = object
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(name);
+        let branch = format!("{parent_branch}.{agent_name}");
+        let worktree = if object.contains_key("worktree") {
+            plan_worktree_path(project_dir, parent_worktree, entry)
+        } else {
+            parent_worktree.join(agent_name)
+        };
+        specs.push(OrderedBranchSpec {
+            branch: branch.clone(),
+            parent_branch: parent_branch.to_owned(),
+            agent_name: agent_name.to_owned(),
+            slice_id: name.to_owned(),
+            identity_worktree: worktree.clone(),
+            worktree: worktree.clone(),
+        });
+        let nested = object.get("plan").cloned().unwrap_or_else(|| {
+            let mut inline = serde_json::Map::new();
+            for key in ["workers", "leaves", "sub_tls"] {
+                if let Some(value) = object.get(key) {
+                    inline.insert(key.to_owned(), value.clone());
+                }
+            }
+            Value::Object(inline)
+        });
+        collect_ordered_branch_specs(project_dir, &nested, &branch, &worktree, specs)?;
+    }
+    Ok(())
+}
+
+fn recreate_root_branch(project_dir: &Path) -> String {
+    let identity = project_dir.join(".exo/agents/root/identity.json");
+    if let Ok(contents) = std::fs::read_to_string(identity) {
+        if let Ok(value) = serde_json::from_str::<Value>(&contents) {
+            if let Some(branch) = value.get("birth_branch").and_then(Value::as_str) {
+                if !branch.is_empty() {
+                    return branch.to_owned();
+                }
+            }
+        }
+    }
+    std::fs::read_to_string(project_dir.join(".exo/agents/root/.birth_branch"))
+        .map(|branch| branch.trim().to_owned())
+        .ok()
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| "main".to_owned())
+}
+
+fn ordered_branch_specs(project_dir: &Path) -> Result<Vec<OrderedBranchSpec>> {
+    let plan = read_plan_snapshot_bytes(project_dir)?.or(requested_plan_bytes(project_dir)?);
+    let Some(bytes) = plan else {
+        return Ok(Vec::new());
+    };
+    let document = serde_json::from_slice::<Value>(&bytes)
+        .context("failed to parse the plan while inspecting ordered branch ownership")?;
+    let plan = document.get("plan").unwrap_or(&document);
+    let root_branch = recreate_root_branch(project_dir);
+    let mut specs = Vec::new();
+    collect_ordered_branch_specs(
+        project_dir,
+        plan,
+        &root_branch,
+        &project_dir.join(".exo/worktrees"),
+        &mut specs,
+    )?;
+    specs.sort_by(|left, right| {
+        right
+            .branch
+            .matches('.')
+            .count()
+            .cmp(&left.branch.matches('.').count())
+            .then_with(|| left.branch.cmp(&right.branch))
+    });
+    Ok(specs)
+}
+
+fn git_branch_exists(project_dir: &Path, branch: &str) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .current_dir(project_dir)
+        .output()
+        .context("failed to inspect ordered branch")?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "failed to inspect ordered branch {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn git_worktree_for_branch(project_dir: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(project_dir)
+        .output()
+        .context("failed to inspect ordered branch worktrees")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to list ordered branch worktrees: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut path = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(value));
+        } else if line.strip_prefix("branch refs/heads/") == Some(branch) {
+            return Ok(path);
+        }
+    }
+    Ok(None)
+}
+
+fn ordered_unique_commits(project_dir: &Path, parent: &str, branch: &str) -> Result<u64> {
+    let revision = format!("{parent}..{branch}");
+    let output = std::process::Command::new("git")
+        .args(["rev-list", "--count", &revision])
+        .current_dir(project_dir)
+        .output()
+        .context("failed to inspect ordered branch commits")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cannot verify ordered branch base {parent} for {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .with_context(|| format!("git returned an invalid commit count for {branch}"))
+}
+
+fn ordered_identity_state(
+    project_dir: &Path,
+    spec: &OrderedBranchSpec,
+) -> Result<OrderedIdentityState> {
+    let path = project_dir
+        .join(".exo/agents")
+        .join(&spec.agent_name)
+        .join("identity.json");
+    if !path.exists() {
+        return Ok(OrderedIdentityState::Missing);
+    }
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Ok(OrderedIdentityState::Mismatched);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+        return Ok(OrderedIdentityState::Mismatched);
+    };
+    let expected = serde_json::json!({
+        "agent_name": spec.agent_name,
+        "slug": spec.agent_name,
+        "agent_type": "codex",
+        "birth_branch": spec.branch,
+        "parent_branch": spec.parent_branch,
+        "working_dir": spec.identity_worktree,
+        "display_name": format!("🤖 {}", spec.agent_name),
+        "topology": "worktree_per_agent",
+        "model": null,
+        "effort": null,
+        "ledger_owned": true,
+        "slice_id": spec.slice_id,
+    });
+    Ok((value == expected)
+        .then_some(OrderedIdentityState::Matching)
+        .unwrap_or(OrderedIdentityState::Mismatched))
+}
+
+async fn inspect_ordered_branch(
+    project_dir: &Path,
+    spec: OrderedBranchSpec,
+    publications: &[PublishedHead],
+    protected: &[ProtectedPr],
+) -> Result<Option<OrderedBranchCleanup>> {
+    let branch_exists = git_branch_exists(project_dir, &spec.branch)?;
+    let agent_dir = project_dir.join(".exo/agents").join(&spec.agent_name);
+    let worktree_exists = spec.worktree.exists();
+    let worktree_branch = if worktree_exists {
+        Some(
+            std::process::Command::new("git")
+                .args(["branch", "--show-current"])
+                .current_dir(&spec.worktree)
+                .output()
+                .context("failed to inspect ordered worktree branch")
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())?,
+        )
+    } else {
+        None
+    };
+    let attached_worktree = git_worktree_for_branch(project_dir, &spec.branch)?;
+    let unique_commits = branch_exists
+        .then(|| ordered_unique_commits(project_dir, &spec.parent_branch, &spec.branch))
+        .transpose()?;
+    let branch_publications = publications
+        .iter()
+        .filter(|publication| publication.head_branch == spec.branch)
+        .map(|publication| publication.pr_number)
+        .collect::<Vec<_>>();
+    let protected_publications = protected
+        .iter()
+        .filter(|publication| branch_publications.contains(&publication.number))
+        .map(|publication| publication.number)
+        .collect::<Vec<_>>();
+    let live_invocation = read_invocation_conservatively(&agent_dir)
+        .await
+        .is_some_and(|invocation| invocation.is_live());
+    let observation = OrderedBranchObservation {
+        branch_exists,
+        agent_dir_exists: agent_dir.exists(),
+        identity: ordered_identity_state(project_dir, &spec)?,
+        worktree_exists,
+        worktree_branch,
+        attached_worktree,
+        dirty_worktree: worktree_exists && worktree_is_dirty(&spec.worktree),
+        live_invocation,
+        unique_commits,
+        publications: branch_publications,
+        protected_publications,
+    };
+    let mut cleanup = ordered_branch_action(spec, observation);
+    if let Some(branch) = cleanup.as_mut() {
+        if !branch.spec.worktree.starts_with(project_dir) {
+            branch.action =
+                OrderedBranchAction::Preserve("ordered worktree is outside the project".to_owned());
+        }
+    }
+    Ok(cleanup)
 }
 
 fn recreate_worktree_paths(project_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -222,7 +674,7 @@ async fn build_recreate_plan(project_dir: &Path, config: &Config) -> Result<Recr
     let mut prs_to_close = Vec::new();
     let mut prs_to_remove = Vec::new();
     let mut protected = Vec::new();
-    for publication in registry {
+    for publication in &registry {
         let number = publication.pr_number;
         prs_to_remove.push(number);
         let Some(client) = client.as_ref() else {
@@ -288,8 +740,23 @@ async fn build_recreate_plan(project_dir: &Path, config: &Config) -> Result<Recr
     prs_to_remove.sort_unstable();
     prs_to_remove.dedup();
     protected.sort_by_key(|item| item.number);
+    let ordered_branches = if project_dir.join(".git").exists() {
+        let specs = ordered_branch_specs(project_dir)?;
+        let mut branches = Vec::new();
+        for spec in specs {
+            if let Some(branch) =
+                inspect_ordered_branch(project_dir, spec, &registry, &protected).await?
+            {
+                branches.push(branch);
+            }
+        }
+        branches
+    } else {
+        Vec::new()
+    };
     Ok(RecreatePlan {
         worktrees,
+        ordered_branches,
         prs_to_close,
         prs_to_remove,
         protected,
@@ -311,6 +778,22 @@ async fn prepare_recreate(
     if dry_run {
         return Ok(None);
     }
+    let ordered_gates = plan
+        .ordered_branches
+        .iter()
+        .filter_map(|branch| {
+            branch
+                .gate()
+                .map(|gate| (branch.spec.branch.as_str(), gate))
+        })
+        .collect::<Vec<_>>();
+    if !ordered_gates.is_empty() {
+        let mut message = String::from("refusing --recreate: ordered branch cleanup is gated:");
+        for (branch, gate) in ordered_gates {
+            message.push_str(&format!("\n  {branch}: {gate}"));
+        }
+        anyhow::bail!(message);
+    }
     if !confirm {
         anyhow::bail!(
             "refusing destructive --recreate without --confirm-recreate; use --recreate-dry-run to inspect the plan"
@@ -329,6 +812,63 @@ async fn destroy_recreate_resources(
     config: &Config,
     plan: &RecreatePlan,
 ) -> Result<()> {
+    let _plan_lock = acquire_plan_transition_lock_async(project_dir).await?;
+    let git_wt = Arc::new(GitWorktreeService::new(project_dir.to_path_buf()));
+    let ordered_worktrees = plan
+        .ordered_branches
+        .iter()
+        .map(|branch| branch.spec.worktree.clone())
+        .collect::<HashSet<_>>();
+    let publications = read_published_heads(project_dir).await?;
+    for branch in &plan.ordered_branches {
+        if let Some(gate) = branch.gate() {
+            anyhow::bail!(
+                "ordered branch cleanup gate for {}: {}",
+                branch.spec.branch,
+                gate
+            );
+        }
+        let Some(current) = inspect_ordered_branch(
+            project_dir,
+            branch.spec.clone(),
+            &publications,
+            &plan.protected,
+        )
+        .await?
+        else {
+            continue;
+        };
+        if let Some(gate) = current.gate() {
+            anyhow::bail!(
+                "ordered branch cleanup gate for {}: {}",
+                current.spec.branch,
+                gate
+            );
+        }
+        if current.observation.worktree_exists {
+            let path = current.spec.worktree.clone();
+            let git_wt = git_wt.clone();
+            tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path))
+                .await
+                .context("ordered worktree disposal task failed")??;
+        }
+        if git_branch_exists(project_dir, &current.spec.branch)? {
+            let branch_name =
+                exomonad_core::domain::BranchName::try_from_str(&current.spec.branch)?;
+            let git_wt = git_wt.clone();
+            tokio::task::spawn_blocking(move || git_wt.delete_bookmark(&branch_name))
+                .await
+                .context("ordered branch disposal task failed")??;
+        }
+        let agent_dir = project_dir
+            .join(".exo/agents")
+            .join(&current.spec.agent_name);
+        if agent_dir.exists() {
+            std::fs::remove_dir_all(&agent_dir)
+                .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
+        }
+    }
+
     let client = recreate_forgejo_client(project_dir, config)?;
     if !plan.prs_to_close.is_empty() {
         let client = client
@@ -347,8 +887,10 @@ async fn destroy_recreate_resources(
         }
     }
 
-    let git_wt = Arc::new(GitWorktreeService::new(project_dir.to_path_buf()));
     for path in &plan.worktrees {
+        if ordered_worktrees.contains(path) {
+            continue;
+        }
         if path
             .parent()
             .is_some_and(|parent| parent.ends_with(".exo/worktrees"))
@@ -6032,6 +6574,7 @@ mod tests {
     fn recreate_plan_names_dirty_worktrees_and_protected_prs() {
         let plan = RecreatePlan {
             worktrees: vec![PathBuf::from(".exo/worktrees/leaf")],
+            ordered_branches: Vec::new(),
             prs_to_close: vec![43],
             prs_to_remove: vec![43],
             protected: vec![ProtectedPr {
@@ -6043,6 +6586,200 @@ mod tests {
         let rendered = plan.render();
         assert!(rendered.contains(".exo/worktrees/leaf [DIRTY]"));
         assert!(rendered.contains("#43 (approved and CI-green)"));
+    }
+
+    fn ordered_test_spec(branch: &str, parent_branch: &str, agent_name: &str) -> OrderedBranchSpec {
+        let worktree = PathBuf::from("/project/.exo/worktrees").join(agent_name);
+        OrderedBranchSpec {
+            branch: branch.to_owned(),
+            parent_branch: parent_branch.to_owned(),
+            agent_name: agent_name.to_owned(),
+            slice_id: agent_name.to_owned(),
+            identity_worktree: worktree.clone(),
+            worktree,
+        }
+    }
+
+    fn ordered_test_observation(
+        identity: OrderedIdentityState,
+        unique_commits: Option<u64>,
+    ) -> OrderedBranchObservation {
+        OrderedBranchObservation {
+            branch_exists: true,
+            agent_dir_exists: false,
+            identity,
+            worktree_exists: false,
+            worktree_branch: None,
+            attached_worktree: None,
+            dirty_worktree: false,
+            live_invocation: false,
+            unique_commits,
+            publications: Vec::new(),
+            protected_publications: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn same_plan_orphan_branch_is_provably_disposable() {
+        let cleanup = ordered_branch_action(
+            ordered_test_spec("main.stage", "main", "stage"),
+            ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
+        )
+        .unwrap();
+
+        assert_eq!(cleanup.action, OrderedBranchAction::Remove);
+        assert!(cleanup.render().contains("main.stage -> remove"));
+        assert!(cleanup.render().contains("identity=missing"));
+        assert!(cleanup.render().contains("unique_commits=0"));
+
+        let mut worktree_observation =
+            ordered_test_observation(OrderedIdentityState::Missing, Some(0));
+        worktree_observation.worktree_exists = true;
+        worktree_observation.worktree_branch = Some("main.stage".to_owned());
+        let worktree_cleanup = ordered_branch_action(
+            ordered_test_spec("main.stage", "main", "stage"),
+            worktree_observation,
+        )
+        .unwrap();
+        assert!(worktree_cleanup
+            .gate()
+            .is_some_and(|gate| gate.contains("without a durable identity")));
+    }
+
+    #[test]
+    fn nested_orphan_branch_uses_its_exact_parent() {
+        let cleanup = ordered_branch_action(
+            ordered_test_spec("main.parent.child", "main.parent", "child"),
+            ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
+        )
+        .unwrap();
+
+        assert_eq!(cleanup.spec.parent_branch, "main.parent");
+        assert_eq!(cleanup.action, OrderedBranchAction::Remove);
+    }
+
+    #[test]
+    fn mismatched_identity_is_a_named_recovery_gate() {
+        let cleanup = ordered_branch_action(
+            ordered_test_spec("main.stage", "main", "stage"),
+            ordered_test_observation(OrderedIdentityState::Mismatched, Some(0)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cleanup.gate(),
+            Some("durable identity does not match the same-plan owner")
+        );
+        assert!(cleanup.render().contains("preserve [GATE:"));
+    }
+
+    #[test]
+    fn unique_commits_and_publications_are_preserved() {
+        let mut unique = ordered_test_observation(OrderedIdentityState::Missing, Some(1));
+        let unique_cleanup = ordered_branch_action(
+            ordered_test_spec("main.stage", "main", "stage"),
+            unique.clone(),
+        )
+        .unwrap();
+        assert!(unique_cleanup
+            .gate()
+            .is_some_and(|gate| gate.contains("unique commits")));
+
+        unique.unique_commits = Some(0);
+        unique.publications = vec![43];
+        unique.protected_publications = vec![43];
+        let published =
+            ordered_branch_action(ordered_test_spec("main.stage", "main", "stage"), unique)
+                .unwrap();
+        assert!(published
+            .gate()
+            .is_some_and(|gate| gate.contains("publication evidence")));
+        assert!(published.render().contains("#43 [PROTECTED]"));
+    }
+
+    #[tokio::test]
+    async fn ordered_branch_cleanup_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(temp.path().join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"]);
+        run_git(&["commit", "-q", "-m", "seed"]);
+        run_git(&["branch", "main.stage"]);
+
+        let spec = OrderedBranchSpec {
+            branch: "main.stage".to_owned(),
+            parent_branch: "main".to_owned(),
+            agent_name: "stage".to_owned(),
+            slice_id: "stage".to_owned(),
+            identity_worktree: temp.path().join(".exo/worktrees/stage"),
+            worktree: temp.path().join(".exo/worktrees/stage"),
+        };
+        let plan = RecreatePlan {
+            worktrees: Vec::new(),
+            ordered_branches: vec![OrderedBranchCleanup {
+                spec,
+                observation: ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
+                action: OrderedBranchAction::Remove,
+            }],
+            prs_to_close: Vec::new(),
+            prs_to_remove: Vec::new(),
+            protected: Vec::new(),
+            dirty_worktrees: Vec::new(),
+        };
+
+        destroy_recreate_resources(temp.path(), &Config::default(), &plan)
+            .await
+            .unwrap();
+        destroy_recreate_resources(temp.path(), &Config::default(), &plan)
+            .await
+            .unwrap();
+        assert!(!git_branch_exists(temp.path(), "main.stage").unwrap());
+    }
+
+    #[tokio::test]
+    async fn recreate_plan_detects_identityless_same_plan_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(temp.path().join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"]);
+        run_git(&["commit", "-q", "-m", "seed"]);
+        run_git(&["branch", "main.stage"]);
+        let plan_path = temp.path().join(".exo/tl-loop/plan.snapshot");
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            plan_path,
+            br#"{"plan":{"sub_tls":[{"name":"stage","order":1,"plan":{}}]}}"#,
+        )
+        .unwrap();
+
+        let plan = build_recreate_plan(temp.path(), &Config::default())
+            .await
+            .unwrap();
+
+        assert_eq!(plan.ordered_branches.len(), 1);
+        assert_eq!(plan.ordered_branches[0].spec.branch, "main.stage");
+        assert_eq!(plan.ordered_branches[0].action, OrderedBranchAction::Remove);
+        assert!(plan.render().contains("main.stage -> remove"));
     }
 
     #[tokio::test]
