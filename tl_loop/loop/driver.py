@@ -29,6 +29,7 @@ from tl_loop.events.identity import (
     envelope_document,
     resolve_event_slice,
 )
+from tl_loop.events.queue import LedgerQueue, start_child_ledger_queue
 from tl_loop.events.reader import FindingKind, LedgerFinding, LedgerReader, LedgerReadError
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import (
@@ -7374,6 +7375,7 @@ def _run_live_sub_tl_batch(
     if "fork" not in multiprocessing.get_all_start_methods():
         raise TLLoopError("live ordered sub-TLs require fork-capable controller isolation")
     context = multiprocessing.get_context("fork")
+    child_source_spec = _child_source_spec(source)
     existing: dict[str, tuple[SubTLTask, TLPhase | None, RunState | None]] = {}
     runnable: list[SubTLTask] = []
     for task in tasks:
@@ -7399,7 +7401,7 @@ def _run_live_sub_tl_batch(
             task,
             context.Process(
                 target=_run_live_sub_tl,
-                args=(task, config, source, effects, store, budgets),
+                args=(task, config, child_source_spec, effects, store, budgets),
                 name=f"tl-sub-{task.name}",
             ),
         )
@@ -7433,7 +7435,7 @@ def _supervise_live_sub_tl(
             cancelled = True
             process.terminate()
             process.join()
-            child_store.record_exit_reason("sub-TL controller cancelled explicitly")
+            _record_child_exit_reason(child_store, "sub-TL controller cancelled explicitly")
             break
         try:
             child_state = child_store.load()
@@ -7470,7 +7472,8 @@ def _supervise_live_sub_tl(
             }
             and not empty_scope
         ):
-            child_store.record_exit_reason(
+            _record_child_exit_reason(
+                child_store,
                 f"sub-TL controller exited before authoritative resolution with code {exitcode}"
             )
             return None
@@ -7483,7 +7486,7 @@ def _supervise_live_sub_tl(
 def _run_live_sub_tl(
     task: SubTLTask,
     config: TLLoopConfig,
-    source: EventQueue,
+    source: EventQueue | str | Path | None,
     effects: EffectClient,
     store: RunStore,
     budgets: BudgetLedger,
@@ -7491,8 +7494,19 @@ def _run_live_sub_tl(
     """Own one live child controller process and leave its checkpoint durable."""
     branch = derive_child_branch(config.branch, _child_controller_name(task))
     worktree = str(_sub_tl_worktree(config, store.root_dir, store.run_id, task))
+    child_store = RunStore(task.name, store.run_dir)
+    owned_source: LedgerQueue | None = None
     try:
-        if config.project_root is not None:
+        child_source = task.source
+        if child_source is None:
+            child_source, owned_source = _child_source(
+                source,
+                task,
+                config,
+                store,
+                child_store,
+            )
+        if config.project_root is not None and not child_store.path.exists():
             effects.transport.provision_ordered_sub_tl(
                 effects.name,
                 agent_name=_child_controller_name(task),
@@ -7501,10 +7515,109 @@ def _run_live_sub_tl(
                 working_dir=worktree,
                 slice_id=task.name,
             )
-        child_config = _child_config(config, task, source, effects, store, branch, worktree)
-        tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
-    except Exception as error:  # noqa: BLE001 - parent reconciles the durable marker
-        RunStore(task.name, store.run_dir).record_exit_reason(str(error))
+        child_config = _child_config(
+            config,
+            task,
+            child_source,
+            effects,
+            store,
+            branch,
+            worktree,
+            keep_alive_on_waiting=True,
+        )
+        result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
+        final_state = getattr(result, "final_state", None)
+        if final_state is not None and not _child_handoff_ready(final_state, store.run_id):
+            reason = "sub-TL controller returned before authoritative resolution"
+            _record_child_exit_reason(child_store, reason)
+            raise TLLoopError(reason)
+    except Exception as error:
+        _record_child_exit_reason(child_store, str(error), error=error)
+        raise
+    finally:
+        if owned_source is not None:
+            owned_source.close(timeout=max(1.0, config.poll_interval * 4))
+
+
+def _child_source_spec(source: EventQueue) -> EventQueue | Path:
+    """Pass ledger metadata across fork while retaining synthetic sources."""
+    candidate: object = source
+    seen: set[int] = set()
+    while id(candidate) not in seen:
+        seen.add(id(candidate))
+        if isinstance(candidate, LedgerQueue):
+            return candidate.reader.segments_dir
+        nested = getattr(candidate, "queue", None)
+        if nested is None or nested is candidate:
+            break
+        candidate = nested
+    return source
+
+
+def _child_source(
+    source: EventQueue | str | Path | None,
+    task: SubTLTask,
+    config: TLLoopConfig,
+    store: RunStore,
+    child_store: RunStore,
+) -> tuple[EventQueue, LedgerQueue | None]:
+    """Build a child-owned source, retaining explicit synthetic sources."""
+    if isinstance(source, (str, Path)):
+        segments_dir = Path(source)
+    elif isinstance(source, LedgerQueue):
+        # Compatibility for direct callers of _run_live_sub_tl. The normal
+        # batch path passes only the immutable path before forking.
+        segments_dir = source.reader.segments_dir
+    elif source is not None:
+        return source, None
+    else:
+        raise TLLoopError(f"live sub-TL {task.name!r} has no event source")
+    ledger_run_id = config.ledger_run_id
+    if ledger_run_id is None:
+        try:
+            ledger_run_id = store.load().ledger_run_id
+        except (OSError, ValueError):
+            ledger_run_id = None
+    child_source = start_child_ledger_queue(
+        segments_dir,
+        child_store.run_dir,
+        ledger_run_id=ledger_run_id,
+        scope_agent_id=_child_controller_name(task),
+        poll_interval=config.poll_interval,
+    )
+    return child_source, child_source
+
+
+def _child_handoff_ready(state: RunState, parent_run_id: str) -> bool:
+    """Accept only terminal or explicitly recoverable child handoffs."""
+    if _child_recovery_projection(state, parent_run_id) is not None:
+        return True
+    if isinstance(
+        getattr(state, "recursive_fsm", None),
+        (RecursiveTLAllMerged, RecursiveTLDone, RecursiveTLPRFiled, RecursiveTLFailed),
+    ):
+        return True
+    return _child_completion_phase(state) in {
+        TLPhase.TLAllMerged,
+        TLPhase.TLDone,
+        TLPhase.TLPRFiled,
+        TLPhase.TLFailed,
+    }
+
+
+def _record_child_exit_reason(
+    child_store: RunStore,
+    reason: str,
+    *,
+    error: BaseException | None = None,
+) -> None:
+    """Keep the first durable child diagnostic intact across supervision."""
+    if getattr(child_store, "exit_diagnostics", lambda: None)() is not None:
+        return
+    if error is None:
+        child_store.record_exit_reason(reason)
+    else:
+        child_store.record_exit_reason(reason, error=error)
 
 
 def _complete_sub_tl_batch(
@@ -9382,6 +9495,8 @@ def _child_config(
     store: RunStore,
     branch: str,
     worktree: str,
+    *,
+    keep_alive_on_waiting: bool = False,
 ) -> TLLoopConfig:
     child_effects = _owner_effect_client(effects, task.agent_id or task.name)
     return replace(
@@ -9399,7 +9514,7 @@ def _child_config(
         working_dir=worktree,
         depth=config.depth + 1,
         dispatch_names={},
-        keep_alive_on_waiting=False,
+        keep_alive_on_waiting=keep_alive_on_waiting,
     )
 
 

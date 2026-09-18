@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import queue
 import threading
 import time
@@ -467,6 +468,132 @@ def test_live_ordered_child_is_provisioned_before_controller_start(
     )
 
     assert calls == ["provision", "run"]
+
+
+def test_live_child_owns_scoped_ledger_source_after_fork(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    segment = segments / "segment-000000000001.jsonl"
+    segment.write_text("", encoding="utf-8")
+    context = multiprocessing.get_context("fork")
+    observed = context.Queue()
+
+    def fake_tl_run(root_spec: object, config: TLLoopConfig, budgets: object) -> object:
+        del root_spec, budgets
+        child_source = cast(LedgerQueue, config.source)
+        observed.put(
+            (
+                "started",
+                str(child_source.reader.run_dir),
+                child_source.reader.ledger_run_id,
+                child_source.reader.scope_agent_id,
+            )
+        )
+        event = child_source.get(timeout=3)
+        observed.put(("event", event.event_type, event.agent_id))
+        return SimpleNamespace(
+            final_state=SimpleNamespace(
+                fsm=SimpleNamespace(phase=TLPhase.TLDone),
+                recursive_fsm=None,
+            )
+        )
+
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", fake_tl_run)
+    store = RunStore("parent", tmp_path / "state")
+    task = SubTLTask("child", WorkPlan(), agent_id="child-agent")
+    config = TLLoopConfig(
+        active=True,
+        root_dir=store.root_dir,
+        run_id="parent",
+        ledger_run_id="swarm-uuid",
+        poll_interval=0.01,
+    )
+    process = context.Process(
+        target=_run_live_sub_tl,
+        args=(
+            task,
+            config,
+            segments,
+            EffectClient(TransportClient(socket_path=tmp_path / "unused.sock")),
+            store,
+            BudgetLedger(tokens=0, wall_seconds=0),
+        ),
+    )
+    process.start()
+    try:
+        started = observed.get(timeout=3)
+        assert started == (
+            "started",
+            str(store.run_dir / "child"),
+            "swarm-uuid",
+            "child-agent",
+        )
+        segment.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "event_id": "spawned-1",
+                    "id": "spawned-1",
+                    "event_time": "2026-08-11T00:00:00Z",
+                    "observed_at": "2026-08-11T00:00:00Z",
+                    "run_seq": 1,
+                    "type": "agent.spawned",
+                    "agent_id": "child-agent",
+                    "parent_agent_id": "parent",
+                    "run_id": "swarm-uuid",
+                    "session_id": "session-1",
+                    "lifecycle_state": "observed",
+                    "data": {
+                        "child_agent": "child-agent",
+                        "agent_type": "codex",
+                        "branch": "main.child",
+                        "intent_id": "child-intent",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        assert observed.get(timeout=3) == ("event", "agent.spawned", "child-agent")
+        process.join(timeout=3)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=3)
+
+
+def test_live_restart_reuses_child_checkpoint_without_reprovisioning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root = tmp_path / "state"
+    parent_store = RunStore("parent", state_root)
+    create("child", {}, root_dir=parent_store.run_dir)
+    calls: list[str] = []
+
+    def provision(self: TransportClient, parent_name: str, **kwargs: object) -> None:
+        del self, parent_name, kwargs
+        calls.append("provision")
+
+    def run_child(root_spec: object, config: TLLoopConfig, budgets: object) -> None:
+        del root_spec, config, budgets
+        calls.append("run")
+
+    monkeypatch.setattr(TransportClient, "provision_ordered_sub_tl", provision)
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", run_child)
+    task = SubTLTask("child", WorkPlan(), source=SyntheticQueue([]), order=1)
+    _run_live_sub_tl(
+        task,
+        TLLoopConfig(active=True, project_root=tmp_path, root_dir=state_root),
+        SyntheticQueue([]),
+        EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"), name="parent"),
+        parent_store,
+        BudgetLedger(tokens=0, wall_seconds=0),
+    )
+
+    assert calls == ["run"]
 
 
 def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:

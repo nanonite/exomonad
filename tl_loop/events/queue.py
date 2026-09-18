@@ -7,6 +7,7 @@ import queue as queue_module
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import TypeAlias
 
 from .envelope import EventEnvelope
@@ -208,6 +209,34 @@ class LedgerQueue:
                     self._findings.append(finding)
 
 
+def start_child_ledger_queue(
+    segments_dir: str | Path,
+    run_dir: str | Path,
+    *,
+    ledger_run_id: str | None,
+    scope_agent_id: str | None,
+    poll_interval: float = 0.25,
+    active_tail_timeout: float = DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS,
+) -> LedgerQueue:
+    """Start a ledger tailer owned by one child controller process.
+
+    The child run directory supplies the durable cursor. Only immutable ledger
+    coordinates cross the process boundary, so no parent queue or reader state
+    is reused by the child.
+    """
+    reader = LedgerReader(
+        segments_dir,
+        run_dir=run_dir,
+        ledger_run_id=ledger_run_id,
+        scope_agent_id=scope_agent_id,
+    )
+    return LedgerQueue(
+        reader,
+        poll_interval=poll_interval,
+        active_tail_timeout=active_tail_timeout,
+    ).start()
+
+
 EventQueue = LedgerQueue
 
 
@@ -216,4 +245,5 @@ __all__ = [
     "EventQueue",
     "LedgerQueue",
     "QueueError",
+    "start_child_ledger_queue",
 ]
