@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tl_loop import __main__ as launcher
 from tl_loop.client.transport import DEFAULT_TIMEOUT_SECONDS, JsonObject
 from tl_loop.events.queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS
-from tl_loop.loop.driver import TLLoopConfig
+from tl_loop.fsm.phase import TLPhase
+from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
+from tl_loop.loop.driver import TLLoopConfig, TLRunResult
 from tl_loop.state.store import RunStore, create
 
 
@@ -32,6 +36,56 @@ class RecordingTransport:
         del role, name
         self.calls.append((tool_name, arguments))
         return {"success": True, "result": None}
+
+
+def _launcher_result(phase: TLPhase, recursive_fsm: object | None = None) -> TLRunResult:
+    state = SimpleNamespace(
+        fsm=SimpleNamespace(phase=phase),
+        events=SimpleNamespace(last_consumed_offset=0),
+        current_order=1,
+        integration=SimpleNamespace(lifecycle=SimpleNamespace(value="running")),
+        gates=(),
+        slices={},
+        recursive_fsm=recursive_fsm,
+    )
+    return TLRunResult(state, (), (), ())
+
+
+def test_main_records_recursive_failure_and_returns_nonzero(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    result = _launcher_result(TLPhase.TLFailed, RecursiveTLFailed("child lost its handoff"))
+    calls: list[str] = []
+    monkeypatch.setattr(launcher, "_run", lambda args: result)
+    monkeypatch.setattr(launcher, "_print_result", lambda value: calls.append("print"))
+
+    assert launcher.main(["run", "--project-root", str(tmp_path)]) == 2
+    assert calls == ["print"]
+    marker = tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json"
+    assert marker.exists()
+    assert json.loads(marker.read_text(encoding="utf-8"))["reason"] == "child lost its handoff"
+
+
+def test_main_uses_stable_legacy_failure_reason(tmp_path: Path, monkeypatch) -> None:
+    result = _launcher_result(TLPhase.TLFailed)
+    monkeypatch.setattr(launcher, "_run", lambda args: result)
+    monkeypatch.setattr(launcher, "_print_result", lambda value: None)
+
+    assert launcher.main(["run", "--project-root", str(tmp_path)]) == 2
+    marker = tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json"
+    assert json.loads(marker.read_text(encoding="utf-8"))["reason"] == (
+        "TL reached the failed terminal phase"
+    )
+
+
+def test_main_keeps_successful_terminal_result_zero(tmp_path: Path, monkeypatch) -> None:
+    result = _launcher_result(TLPhase.TLDone)
+    monkeypatch.setattr(launcher, "_run", lambda args: result)
+    monkeypatch.setattr(launcher, "_print_result", lambda value: None)
+
+    assert launcher.main(["run", "--project-root", str(tmp_path)]) == 0
+    assert not (tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json").exists()
 
 
 @pytest.mark.parametrize("source", ("cli", "control"))

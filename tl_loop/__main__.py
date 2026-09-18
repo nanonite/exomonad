@@ -21,6 +21,7 @@ from tl_loop.events.envelope import EventEnvelope
 from tl_loop.events.queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS, LedgerQueue
 from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.fingerprint import fingerprint_report
+from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.heartbeat import HeartbeatConfig
@@ -53,6 +54,7 @@ DEFAULT_PLAN = Path(".exo/tl-loop/plan.json")
 DEFAULT_TASK_TIMEOUT_SECONDS = 3600.0
 DEFAULT_MAX_EVENTS = 256
 PLAN_REJECTION_REASON_LIMIT = 160
+TL_FAILURE_FALLBACK_REASON = "TL reached the failed terminal phase"
 
 
 class LauncherError(RuntimeError):
@@ -86,6 +88,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "run":
             result = _run(args)
             _print_result(result)
+            failure_reason = _run_failure_reason(result)
+            if failure_reason is not None:
+                error = LauncherError(failure_reason)
+                LOGGER.error("[TL loop] %s", error)
+                _record_run_failure(args, error)
+                return 2
         elif args.command == "status":
             _print_status(args)
         elif args.command == "plan-proposal":
@@ -133,6 +141,18 @@ def _record_run_failure(args: argparse.Namespace, error: Exception) -> None:
         )
     except (OSError, ValueError, TypeError) as record_error:
         LOGGER.error("[TL loop] failed to persist controller exit reason: %s", record_error)
+
+
+def _run_failure_reason(result: TLRunResult) -> str | None:
+    """Return the durable failure reason for a completed run, if any."""
+    state = result.final_state
+    if state.fsm.phase is not TLPhase.TLFailed:
+        return None
+    recursive_phase = getattr(state, "recursive_fsm", None)
+    reason = getattr(recursive_phase, "reason", None)
+    if isinstance(reason, str) and reason:
+        return reason
+    return TL_FAILURE_FALLBACK_REASON
 
 
 def _parser() -> argparse.ArgumentParser:
