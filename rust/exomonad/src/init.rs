@@ -2569,13 +2569,32 @@ fn tl_loop_command(
             )
         })
         .unwrap_or_default();
-    format!(
+    let controller = format!(
         "EXOMONAD_BINARY={binary} EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan{expected_plan_arg} \
            --transport-timeout {} --active-tail-timeout {} --task-timeout {}",
         shell_escape::escape(tl_loop_python(cwd).into()),
         timeouts.transport,
         timeouts.active_tail,
           timeouts.task,
+    );
+    tl_controller_wrapper_command(cwd, &controller)
+}
+
+fn tl_controller_wrapper_command(cwd: &Path, controller: &str) -> String {
+    let exit_marker = shell_escape::escape(controller_exit_path(cwd).display().to_string().into());
+    let output_log = shell_escape::escape(controller_output_path(cwd).display().to_string().into());
+    format!(
+        "{{ {controller}; status=$?; if [ \"$status\" -ne 0 ] || [ -f {exit_marker} ]; then \
+             tmux set-window-option -t \"${{TMUX_PANE}}\" remain-on-exit on 2>/dev/null || true; \
+             printf '\\nTL controller exited unexpectedly (status %s).\\n' \"$status\"; \
+             if [ -f {exit_marker} ]; then \
+                 printf '%s\\n' 'Controller failure marker:' {exit_marker}; \
+                 cat {exit_marker}; \
+             else \
+                 printf '%s %s.\\n' 'Controller failure reason: exit status' \"$status\"; \
+             fi; \
+             printf '%s\\n' 'Controller output log:' {output_log}; \
+         fi; exit \"$status\"; }}"
     )
 }
 
@@ -2977,6 +2996,10 @@ async fn reconcile_existing_session(
 
 fn controller_exit_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".exo/tl-loop/root/controller-exit.json")
+}
+
+fn controller_output_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".exo/tl-loop/root/controller-output.log")
 }
 
 #[cfg(test)]
@@ -4878,6 +4901,7 @@ mod tests {
         assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
     };
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
 
     #[test]
@@ -7102,6 +7126,142 @@ mod tests {
         assert!(command.contains("--transport-timeout 45.5"));
         assert!(command.contains("--active-tail-timeout 60"));
         assert!(command.contains("--task-timeout 90"));
+    }
+
+    #[test]
+    fn tl_loop_command_retains_pane_and_prints_failure_diagnostics() {
+        let timeouts = TlLoopTimeouts {
+            transport: 1.0,
+            active_tail: 2.0,
+            task: 3.0,
+        };
+        let command = tl_loop_command(
+            Path::new("/tmp/repo"),
+            Path::new("/tmp/exo"),
+            &timeouts,
+            None,
+        );
+
+        assert!(command.contains("[ \"$status\" -ne 0 ] || [ -f"));
+        assert!(command.contains("tmux set-window-option"));
+        assert!(command.contains("remain-on-exit on"));
+        assert!(command.contains("Controller failure marker:"));
+        assert!(command.contains("controller-exit.json"));
+        assert!(command.contains("Controller output log:"));
+        assert!(command.contains("controller-output.log"));
+        assert!(Command::new("sh")
+            .args(["-n", "-c", &command])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn unexpected_tl_exit_retains_pane_and_prints_marker_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let tmux_call = dir.path().join("tmux-call");
+        let tmux = bin.join("tmux");
+        std::fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n",
+                shell_escape::escape(tmux_call.display().to_string().into())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let marker = controller_exit_path(dir.path());
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, r#"{"reason":"unexpected test failure"}"#).unwrap();
+        let wrapper =
+            tl_controller_wrapper_command(dir.path(), "printf 'live output\\n'; sh -c 'exit 23'");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = Command::new("env")
+            .args([
+                format!("PATH={path}"),
+                "TMUX_PANE=%0".to_owned(),
+                "sh".to_owned(),
+                "-c".to_owned(),
+                wrapper,
+            ])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pane = String::from_utf8_lossy(&output.stdout);
+        assert!(pane.contains("unexpected test failure"));
+        assert!(pane.contains("controller-output.log"));
+        assert!(std::fs::read_to_string(tmux_call)
+            .unwrap()
+            .contains("remain-on-exit on"));
+    }
+
+    #[test]
+    fn successful_tl_exit_preserves_live_output_without_retaining_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let tmux = bin.join("tmux");
+        let tmux_call = dir.path().join("tmux-call");
+        std::fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > {}\n",
+                shell_escape::escape(tmux_call.display().to_string().into())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let wrapper =
+            tl_controller_wrapper_command(dir.path(), "printf 'live output\\n'; sh -c 'exit 0'");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = Command::new("env")
+            .args([
+                format!("PATH={path}"),
+                "TMUX_PANE=%0".to_owned(),
+                "sh".to_owned(),
+                "-c".to_owned(),
+                wrapper,
+            ])
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        let pane = String::from_utf8_lossy(&output.stdout);
+        assert!(pane.contains("live output"));
+        assert!(!pane.contains("exited unexpectedly"));
+        assert!(!tmux_call.exists());
+    }
+
+    #[test]
+    fn successful_tl_startup_still_releases_pane_retention() {
+        let source = include_str!("init.rs");
+        let startup = source
+            .find("let startup = wait_for_tl_controller_startup(&ipc, &cwd")
+            .expect("init must wait for TL startup");
+        let release = source[startup..]
+            .find("if startup.is_ok() {\n        ipc.set_window_remain_on_exit(&tl_window, false)")
+            .expect("successful startup must release pane retention");
+
+        assert!(release > 0);
     }
 
     #[test]

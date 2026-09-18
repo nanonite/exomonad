@@ -47,6 +47,8 @@ exomonad shutdown                 # Gracefully shut down the running server
 
 `exomonad init` requires `exomonad new` to have been run first to bootstrap the project configuration and WASM plugins. Use `exomonad init --reviewer-max-rounds N` for a validated, session-only reviewer cap override; it takes precedence over `.exo/review-policy.toml` without changing that file.
 
+The TL window wraps the controller command so live output remains in the pane. A normal zero exit keeps the existing startup retention release, while a failed exit or durable controller-exit marker retains the pane and prints the failure marker plus the `controller-output.log` path.
+
 Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is newer (consuming projects only, not source projects with `.exo/roles/`).
 
 
