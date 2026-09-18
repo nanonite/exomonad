@@ -7506,7 +7506,7 @@ def _run_live_sub_tl(
                 store,
                 child_store,
             )
-        if config.project_root is not None and not child_store.path.exists():
+        if config.project_root is not None:
             effects.transport.provision_ordered_sub_tl(
                 effects.name,
                 agent_name=_child_controller_name(task),

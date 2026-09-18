@@ -700,12 +700,14 @@ def test_live_child_consumes_delayed_publication_after_staying_alive(
             process.join(timeout=3)
 
 
-def test_live_restart_reuses_child_checkpoint_without_reprovisioning(
+def test_live_restart_revalidates_child_identity_before_controller_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state_root = tmp_path / "state"
     parent_store = RunStore("parent", state_root)
     create("child", {}, root_dir=parent_store.run_dir)
+    child_store = RunStore("child", parent_store.run_dir)
+    checkpoint_before = child_store.load()
     calls: list[str] = []
 
     def provision(self: TransportClient, parent_name: str, **kwargs: object) -> None:
@@ -728,7 +730,42 @@ def test_live_restart_reuses_child_checkpoint_without_reprovisioning(
         BudgetLedger(tokens=0, wall_seconds=0),
     )
 
-    assert calls == ["run"]
+    assert calls == ["provision", "run"]
+    assert child_store.load() == checkpoint_before
+
+
+def test_live_restart_fails_before_controller_on_identity_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root = tmp_path / "state"
+    parent_store = RunStore("parent", state_root)
+    create("child", {}, root_dir=parent_store.run_dir)
+    calls: list[str] = []
+
+    def provision(self: TransportClient, parent_name: str, **kwargs: object) -> None:
+        del self, parent_name, kwargs
+        calls.append("provision")
+        raise RuntimeError("ordered sub-TL identity conflict")
+
+    def run_child(root_spec: object, config: TLLoopConfig, budgets: object) -> None:
+        del root_spec, config, budgets
+        calls.append("run")
+
+    monkeypatch.setattr(TransportClient, "provision_ordered_sub_tl", provision)
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", run_child)
+    task = SubTLTask("child", WorkPlan(), source=SyntheticQueue([]), order=1)
+
+    with pytest.raises(RuntimeError, match="identity conflict"):
+        _run_live_sub_tl(
+            task,
+            TLLoopConfig(active=True, project_root=tmp_path, root_dir=state_root),
+            SyntheticQueue([]),
+            EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"), name="parent"),
+            parent_store,
+            BudgetLedger(tokens=0, wall_seconds=0),
+        )
+
+    assert calls == ["provision"]
 
 
 def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
