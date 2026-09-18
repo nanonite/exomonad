@@ -173,7 +173,7 @@ def test_recursive_replay_preserves_position_and_ownership_without_duplicate_eff
     slices = first.durable_state["slices"]
     assert isinstance(slices, dict)
     assert {"root-leaf", "stage-a", "stage-b"}.issubset(slices)
-    assert slices["stage-a"]["dispatch_agent_id"] == "stage-a"
+    assert slices["stage-a"]["dispatch_agent_id"] == "stage-a-owner"
     assert slices["stage-a"]["dispatch_intent_id"]
     assert first.durable_state["ordered_stages"] == [
         {"order": 1, "sub_tls": ["stage-a"]},
