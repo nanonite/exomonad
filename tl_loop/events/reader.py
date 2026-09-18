@@ -147,6 +147,7 @@ class LedgerReader:
         self.ledger_run_id = effective_scope
         self.scope_run_id = effective_scope
         self.scope_agent_id = scope_agent_id
+        self._scoped_agent_ids = {scope_agent_id} if scope_agent_id is not None else set()
         self._segment_cache: dict[Path, _SegmentCacheEntry] = {}
         self._terminal_matches: tuple[tuple[str | None, str | None, Mapping[str, object]], ...] = ()
 
@@ -168,6 +169,7 @@ class LedgerReader:
         status = sequence_status(_run_sequences(row.document for row in rows))
         findings: list[LedgerFinding] = []
         projected: list[EventEnvelope] = []
+        projected_rows: list[tuple[LedgerRow, EventEnvelope]] = []
         for row in rows:
             event_type = _raw_event_type(row.document)
             if event_type not in MAPPED_EVENT_TYPES:
@@ -187,6 +189,14 @@ class LedgerReader:
                     )
                 )
                 continue
+            projected_rows.append((row, envelope))
+        projected_rows.sort(
+            key=lambda item: (
+                item[1].run_seq is None,
+                item[1].run_seq if item[1].run_seq is not None else 0,
+            )
+        )
+        for row, envelope in projected_rows:
             if not self._in_scope(envelope):
                 continue
             if envelope.run_seq is None:
@@ -247,14 +257,28 @@ class LedgerReader:
         return False
 
     def _in_scope(self, event: EventEnvelope) -> bool:
-        """Keep one run and its directly owned child events in scope."""
+        """Keep one run and the controller's direct descendant agents in scope."""
         if self.ledger_run_id is not None and event.run_id != self.ledger_run_id:
             return False
-        return not (
-            self.scope_agent_id is not None
-            and event.agent_id not in {self.scope_agent_id}
-            and event.parent_agent_id != self.scope_agent_id
+        if self.scope_agent_id is None:
+            return True
+        if event.run_seq is not None:
+            self._learn_descendant_agents(event)
+        return (
+            event.agent_id in self._scoped_agent_ids
+            or event.parent_agent_id == self.scope_agent_id
         )
+
+    def _learn_descendant_agents(self, event: EventEnvelope) -> None:
+        """Retain only exact direct-child identities proved by ledger evidence."""
+        direct_parent = event.parent_agent_id == self.scope_agent_id
+        if direct_parent and event.agent_id is not None:
+            self._scoped_agent_ids.add(event.agent_id)
+        if event.event_type != "agent.spawned" or event.agent_id != self.scope_agent_id:
+            return
+        child_agent = event.data.get("child_agent")
+        if isinstance(child_agent, str) and child_agent:
+            self._scoped_agent_ids.add(child_agent)
 
     def acknowledge(self, event_or_run_seq: EventEnvelope | int) -> int:
         """Persist a consumed global sequence through the M2.2 writer."""

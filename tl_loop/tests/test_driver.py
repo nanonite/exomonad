@@ -583,6 +583,8 @@ def test_live_child_consumes_delayed_publication_after_staying_alive(
         observed.put(("spawned", spawned.event_type))
         publication = child_source.get(timeout=3)
         observed.put(("publication", publication.event_type, publication.pr_number))
+        completion = child_source.get(timeout=3)
+        observed.put(("completion", completion.event_type, completion.agent_id))
         return SimpleNamespace(
             final_state=SimpleNamespace(
                 fsm=SimpleNamespace(phase=TLPhase.TLDone),
@@ -592,7 +594,7 @@ def test_live_child_consumes_delayed_publication_after_staying_alive(
 
     monkeypatch.setattr("tl_loop.loop.driver.tl_run", fake_tl_run)
     store = RunStore("parent", tmp_path / "state")
-    task = SubTLTask("child", WorkPlan(), agent_id="child-agent")
+    task = SubTLTask("child", WorkPlan(), agent_id="child-controller")
     config = TLLoopConfig(
         active=True,
         root_dir=store.root_dir,
@@ -613,7 +615,7 @@ def test_live_child_consumes_delayed_publication_after_staying_alive(
     )
     process.start()
     try:
-        assert observed.get(timeout=3) == ("started", "child-agent")
+        assert observed.get(timeout=3) == ("started", "child-controller")
         segment.write_text(
             json.dumps(
                 {
@@ -624,13 +626,13 @@ def test_live_child_consumes_delayed_publication_after_staying_alive(
                     "observed_at": "2026-08-11T00:00:00Z",
                     "run_seq": 1,
                     "type": "agent.spawned",
-                    "agent_id": "child-agent",
+                    "agent_id": "child-controller",
                     "parent_agent_id": "parent",
                     "run_id": "swarm-uuid",
                     "session_id": "session-1",
                     "lifecycle_state": "observed",
                     "data": {
-                        "child_agent": "child-agent",
+                        "child_agent": "dev-leaf",
                         "agent_type": "codex",
                         "branch": "main.child",
                         "intent_id": "child-intent",
@@ -653,8 +655,7 @@ def test_live_child_consumes_delayed_publication_after_staying_alive(
                         "observed_at": "2026-08-11T00:00:01Z",
                         "run_seq": 2,
                         "type": "pr.filed",
-                        "agent_id": "child-agent",
-                        "parent_agent_id": "parent",
+                        "agent_id": "dev-leaf",
                         "run_id": "swarm-uuid",
                         "session_id": "session-1",
                         "lifecycle_state": "observed",
@@ -670,6 +671,27 @@ def test_live_child_consumes_delayed_publication_after_staying_alive(
                 + "\n"
             )
         assert observed.get(timeout=3) == ("publication", "pr.filed", 42)
+        with segment.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "event_id": "completed-3",
+                        "id": "completed-3",
+                        "event_time": "2026-08-11T00:00:02Z",
+                        "observed_at": "2026-08-11T00:00:02Z",
+                        "run_seq": 3,
+                        "type": "agent.completed",
+                        "agent_id": "dev-leaf",
+                        "run_id": "swarm-uuid",
+                        "session_id": "session-1",
+                        "lifecycle_state": "completed",
+                        "data": {"slice_id": "child", "status": "success", "pr_number": 42},
+                    }
+                )
+                + "\n"
+            )
+        assert observed.get(timeout=3) == ("completion", "agent.completed", "dev-leaf")
         process.join(timeout=3)
         assert process.exitcode == 0
     finally:

@@ -439,17 +439,119 @@ def test_kill_and_restart_redelivers_only_unacknowledged_events(tmp_path: Path) 
     assert redelivered.run_seq == 102
 
 
-def test_reader_scope_excludes_grandchild_events_from_root(tmp_path: Path) -> None:
-    events = deepcopy(_fixture_events()[:3])
-    for sequence, (event, agent, parent) in enumerate(
-        zip(events, ("root", "child", "grandchild"), (None, "root", "child")), start=1
-    ):
-        event["run_id"] = "scope-run"
-        event["run_seq"] = sequence
-        event["agent_id"] = agent
-        event["parent_agent_id"] = parent
+def test_reader_scopes_direct_children_across_polls_and_excludes_grandchildren(
+    tmp_path: Path,
+) -> None:
+    template = _fixture_events()[0]
+
+    def event(
+        sequence: int,
+        event_type: str,
+        agent_id: str,
+        data: dict[str, object],
+        parent_agent_id: str | None = None,
+    ) -> dict[str, object]:
+        value = deepcopy(template)
+        value.update(
+            {
+                "event_id": f"scope-{sequence}",
+                "id": f"scope-{sequence}",
+                "run_id": "scope-run",
+                "run_seq": sequence,
+                "type": event_type,
+                "agent_id": agent_id,
+                "parent_agent_id": parent_agent_id,
+                "lifecycle_state": "observed",
+                "data": data,
+            }
+        )
+        return value
+
+    controller = event(
+        1,
+        "agent.spawned",
+        "sub-tl-controller",
+        {"child_agent": "dev-leaf", "agent_type": "codex"},
+        parent_agent_id="parent-controller",
+    )
+    child_spawn = event(
+        2,
+        "agent.spawned",
+        "dev-leaf",
+        {"child_agent": "nested-leaf", "agent_type": "codex"},
+        parent_agent_id="sub-tl-controller",
+    )
+    filed = event(
+        3,
+        "pr.filed",
+        "dev-leaf",
+        {"slice_id": "child", "pr_number": 42, "head_sha": "head-child"},
+    )
+    completed = event(
+        4,
+        "agent.completed",
+        "dev-leaf",
+        {"slice_id": "child", "status": "success"},
+    )
+    grandchild_filed = event(
+        5,
+        "pr.filed",
+        "nested-leaf",
+        {"slice_id": "nested", "pr_number": 43, "head_sha": "head-nested"},
+    )
+    grandchild_completed = event(
+        6,
+        "agent.completed",
+        "nested-leaf",
+        {"slice_id": "nested", "status": "success"},
+    )
+    sibling_spawn = event(
+        7,
+        "agent.spawned",
+        "sibling-controller",
+        {"child_agent": "sibling-leaf", "agent_type": "codex"},
+    )
+    sibling_filed = event(
+        8,
+        "pr.filed",
+        "sibling-leaf",
+        {"slice_id": "sibling", "pr_number": 43, "head_sha": "head-sibling"},
+    )
     segments = tmp_path / "segments"
-    _write_segment(segments, 1, events)
+    _write_segment(segments, 1, [controller])
+    reader = LedgerReader(segments, ledger_run_id="scope-run", scope_agent_id="sub-tl-controller")
+
+    first = reader.read_from()
+    assert [(item.event_type, item.agent_id) for item in first.events] == [
+        ("agent.spawned", "sub-tl-controller")
+    ]
+
+    _write_segment(
+        segments,
+        1,
+        [
+            controller,
+            child_spawn,
+            filed,
+            completed,
+            grandchild_filed,
+            grandchild_completed,
+            sibling_spawn,
+            sibling_filed,
+        ],
+    )
+
+    second = reader.read_from(first.events[-1].run_seq)
+    assert [item.run_seq for item in second.events] == [2, 3, 4]
+    assert second.events[1].agent_id == "dev-leaf"
+    assert second.events[1].parent_agent_id is None
+    assert second.events[2].agent_id == "dev-leaf"
+    assert second.events[2].parent_agent_id is None
+    assert not any(
+        item.agent_id == "nested-leaf"
+        and item.event_type in {"pr.filed", "agent.completed"}
+        for item in second.events
+    )
 
 
 def _fixture_events() -> list[dict[str, object]]:
