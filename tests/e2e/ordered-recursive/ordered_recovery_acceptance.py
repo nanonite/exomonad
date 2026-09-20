@@ -111,6 +111,22 @@ def _worktrees_for(repo: Path, branch: str) -> list[str]:
     return worktrees
 
 
+def _kill_tmux_session(repo: Path) -> None:
+    """Tear down the server session created by the fixture, if any."""
+    marker = repo / ".exo" / "e2e-tmux-session"
+    if not marker.is_file():
+        return
+    # start_server writes the session name with a literal "\\n" suffix.
+    session = marker.read_text(encoding="utf-8").strip().removesuffix("\\n").strip()
+    if not session:
+        return
+    subprocess.run(
+        ["tmux", "kill-session", "-t", session],
+        check=False,
+        capture_output=True,
+    )
+
+
 def _identity(repo: Path, agent_name: str) -> dict[str, Any] | None:
     path = repo / ".exo" / "agents" / agent_name / "identity.json"
     if not path.is_file():
@@ -509,6 +525,7 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
         if server is not None:
             real.stop_server(server, repo, "continuation acceptance")
         real.stop_subprocess(mock, "continuation mock API")
+        _kill_tmux_session(repo)
 
 
 def _write_recreate_fixture(repo: Path, session: str) -> None:
