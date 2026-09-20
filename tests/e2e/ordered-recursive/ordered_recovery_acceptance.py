@@ -285,22 +285,33 @@ def _start_production_continuation(
     state_root: Path,
     repo: Path,
     swarm_id: str,
+    *,
+    use_ledger: bool,
 ) -> multiprocessing.Process:
-    """Run the shipped ``run_tl_loop`` continuation in an isolated process group."""
+    """Run the shipped ``run_tl_loop`` continuation in an isolated process group.
+
+    ``use_ledger=False`` uses an empty source, which stops the child after it
+    requests the leaf spawn but before it consumes the authoritative
+    ``agent.spawned`` event -- the durable ``dispatch_unconfirmed`` state a real
+    crash-before-correlation leaves behind. ``use_ledger=True`` reads the real
+    ledger so the restart reconciles that persisted dispatch.
+    """
     context = multiprocessing.get_context("fork")
 
     def entry() -> None:
         os.setsid()
-        # A real ledger-backed source lets the relaunched child consume the
-        # authoritative agent.spawned event for its leaf, exactly like the
-        # shipped embedded controller.
-        reader = LedgerReader(
-            repo / ".exo" / "ledger" / "segments",
-            run_id=parent_run,
-            state_root=state_root,
-            ledger_run_id=swarm_id,
-        )
-        source = LedgerQueue(reader, poll_interval=0.01, active_tail_timeout=5).start()
+        if use_ledger:
+            reader = LedgerReader(
+                repo / ".exo" / "ledger" / "segments",
+                run_id=parent_run,
+                state_root=state_root,
+                ledger_run_id=swarm_id,
+            )
+            source: Any = LedgerQueue(
+                reader, poll_interval=0.01, active_tail_timeout=5
+            ).start()
+        else:
+            source = real.EmptyEventSource()
         effects = EffectClient(
             real.TransportClient(project_root=repo, timeout=5),
             role="tl",
@@ -320,10 +331,16 @@ def _start_production_continuation(
     return process
 
 
-def _wait_for_leaf_dispatch(
+def _wait_for_leaf_dispatch_request(
     child_store: RunStore, deadline: float
 ) -> tuple[Any, Any]:
-    """Wait for the production controller to durably dispatch the resumed leaf."""
+    """Wait for the child to durably request the leaf spawn (unconfirmed).
+
+    This is the crash-before-correlation boundary: the spawn request was
+    accepted by the server, but the controller has not yet consumed the
+    authoritative ``agent.spawned`` event, so the slice is
+    ``dispatch_unconfirmed``.
+    """
     last: Any = None
     while time.monotonic() < deadline:
         try:
@@ -334,15 +351,15 @@ def _wait_for_leaf_dispatch(
         leaf = last.slices.get(LEAF_NAME)
         if (
             leaf is not None
-            and leaf.status is SliceStatus.SPAWNED
+            and leaf.status is SliceStatus.DISPATCH_UNCONFIRMED
             and leaf.dispatch_intent_id
-            and leaf.dispatch_authoritative_event_seq is not None
+            and leaf.dispatch_last_boundary == "spawn_request_accepted"
         ):
             return last, leaf
         time.sleep(0.1)
     detail = f": {last!r}" if last is not None else ""
     raise AcceptanceError(
-        "production continuation did not dispatch the resumed leaf" + detail
+        "production continuation did not durably request the leaf spawn" + detail
     )
 
 
@@ -383,38 +400,70 @@ def _child_leaf_spawns(repo: Path, child_name: str) -> list[dict[str, Any]]:
     ]
 
 
-def _checkpoint_revision(store: RunStore) -> int:
-    try:
-        return store.load().revision
-    except (OSError, ValueError):
-        return -1
+def _leaf_dispatch_requests(repo: Path) -> list[dict[str, Any]]:
+    """Return every controller dispatch request for the leaf slice.
+
+    A repeated continuation that re-dispatched the leaf would add one of these
+    even if the authoritative spawn count somehow stayed at one.
+    """
+    return [
+        event
+        for event in _ledger_events(repo)
+        if event.get("type") in {"tl.spawn_requested", "tl.dispatch_intended"}
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("slice_id") == LEAF_NAME
+    ]
 
 
-def _wait_for_durable_boundary(
-    stores: list[RunStore],
-    before_revisions: list[int],
+def _reconciliation_events(repo: Path, intent_id: str) -> list[dict[str, Any]]:
+    """Return durable owner-found reconciliation events for one leaf intent."""
+    return [
+        event
+        for event in _ledger_events(repo)
+        if event.get("type") == "tl.dispatch_reconciliation_completed"
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("slice_id") == LEAF_NAME
+        and event["data"].get("intent_id") == intent_id
+        and event["data"].get("boundary") == "owner_found"
+    ]
+
+
+def _wait_for_leaf_reconciliation(
+    child_store: RunStore,
+    repo: Path,
+    intent_id: str,
     process: multiprocessing.Process,
     deadline: float,
-) -> tuple[str, bool]:
-    """Wait until a second continuation makes durable progress or exits.
+) -> tuple[Any, Any, bool]:
+    """Wait until the second continuation durably reconciles the leaf dispatch.
 
-    Returns ``(boundary, process_alive_at_boundary)``. The boundary is
-    ``"checkpoint"`` when a run revision advanced, or ``"exit"`` when the
-    controller ended. A caller can therefore never assert idempotency merely
-    because a fixed sleep elapsed before the second controller did anything.
+    The boundary is leaf-specific: the restart must record an owner-found
+    dispatch reconciliation for the persisted intent *and* adopt the leaf back
+    to ``spawned`` under that same intent. Only then is the exactly-once spawn
+    count meaningful. Returns ``(state, leaf, process_alive_at_boundary)``.
     """
+    last: Any = None
     while time.monotonic() < deadline:
-        for store, before in zip(stores, before_revisions):
-            try:
-                state = store.load()
-            except (OSError, ValueError):
-                continue
-            if state.revision > before:
-                return "checkpoint", process.is_alive()
+        try:
+            last = child_store.load()
+        except (OSError, ValueError):
+            last = None
+        leaf = last.slices.get(LEAF_NAME) if last is not None else None
+        adopted = (
+            leaf is not None
+            and leaf.status is SliceStatus.SPAWNED
+            and leaf.dispatch_intent_id == intent_id
+            and leaf.dispatch_authoritative_event_seq is not None
+        )
+        if adopted and _reconciliation_events(repo, intent_id):
+            return last, leaf, process.is_alive()
         if not process.is_alive():
-            return "exit", False
+            break
         time.sleep(0.1)
-    return "timeout", process.is_alive()
+    raise AcceptanceError(
+        "second continuation did not durably reconcile the leaf dispatch"
+        + (f": {last!r}" if last is not None else "")
+    )
 
 
 def run_continuation_scenario(root: Path) -> dict[str, Any]:
@@ -477,14 +526,16 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
         )
         original_intent = parent_store.load().slices[child_name].dispatch_intent_id
 
-        # Run the shipped continuation path. This must reopen the terminal
-        # parent, relaunch the ordered child controller, and let that child
-        # reopen its own scope and dispatch the leaf exactly once.
+        # First shipped continuation: reopen the terminal parent, relaunch the
+        # child, and let the child reopen its own scope and request the leaf
+        # spawn. The empty source stops the child before it consumes the
+        # authoritative agent.spawned event, leaving the durable
+        # dispatch_unconfirmed state a real crash-before-correlation produces.
         first = _start_production_continuation(
-            PARENT_RUN, plan, state_root, repo, swarm_id
+            PARENT_RUN, plan, state_root, repo, swarm_id, use_ledger=False
         )
         processes.append(first)
-        child_state, leaf = _wait_for_leaf_dispatch(
+        child_state, leaf = _wait_for_leaf_dispatch_request(
             child_store, time.monotonic() + 120
         )
         _require(
@@ -505,48 +556,45 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
             parent_after.slices[child_name].dispatch_intent_id == original_intent,
             "production continuation minted a new child dispatch intent",
         )
-        spawn_events = _leaf_spawn_events(repo, leaf.dispatch_intent_id)
+        first_intent = leaf.dispatch_intent_id
+        spawn_events = _leaf_spawn_events(repo, first_intent)
         _require(
             len(spawn_events) == 1,
-            "resumed leaf was not dispatched exactly once: "
+            "resumed leaf was not spawned exactly once: "
             + json.dumps(spawn_events, default=str)[:3000],
         )
         first_spawns = len(spawn_events)
-        leaf_branch = str(spawn_events[0]["data"]["branch"])
-        _require(
-            all(
-                event["data"].get("branch") == leaf_branch for event in spawn_events
-            ),
-            f"resumed leaf spawned on inconsistent branches: {spawn_events!r}",
-        )
 
         real.stop_multiprocessing_process(
             first, "production continuation", process_group=True
         )
         processes.remove(first)
 
-        # Repeated continuation must reconcile the accepted leaf dispatch and
-        # never mint a second one. Observe a durable second-run boundary before
-        # asserting, and count authoritative leaf spawns across every intent so
-        # a fresh intent cannot hide behind the first intent's count.
-        child_store = RunStore(child_name, parent_store.run_dir)
-        observed_stores = [child_store, parent_store]
-        before_revisions = [_checkpoint_revision(store) for store in observed_stores]
+        # Repeated continuation: the leaf is dispatch_unconfirmed. The shipped
+        # restart must durably reconcile the persisted intent and adopt the
+        # existing owner, never mint a new intent or spawn a second leaf. Wait
+        # for the leaf-specific owner-found reconciliation boundary before
+        # counting, and count authoritative spawns across every intent.
+        dispatch_requests_before = _leaf_dispatch_requests(repo)
         second = _start_production_continuation(
-            PARENT_RUN, plan, state_root, repo, swarm_id
+            PARENT_RUN, plan, state_root, repo, swarm_id, use_ledger=True
         )
         processes.append(second)
-        boundary, alive_at_boundary = _wait_for_durable_boundary(
-            observed_stores,
-            before_revisions,
-            second,
-            time.monotonic() + 60,
+        _reconciled_state, reconciled_leaf, alive_at_boundary = (
+            _wait_for_leaf_reconciliation(
+                child_store, repo, first_intent, second, time.monotonic() + 120
+            )
         )
         _require(
-            boundary == "checkpoint" or (boundary == "exit" and second.exitcode == 0),
-            "repeated continuation made no durable progress before the deadline "
-            f"(boundary={boundary}, alive={alive_at_boundary}, "
-            f"exitcode={second.exitcode})",
+            reconciled_leaf.dispatch_intent_id == first_intent,
+            "reconciliation changed the leaf dispatch intent",
+        )
+        dispatch_requests_after = _leaf_dispatch_requests(repo)
+        _require(
+            dispatch_requests_after == dispatch_requests_before,
+            "repeated continuation issued a new leaf dispatch request: "
+            f"before={len(dispatch_requests_before)}, "
+            f"after={len(dispatch_requests_after)}",
         )
         repeated_events = _child_leaf_spawns(repo, child_name)
         _require(
@@ -583,8 +631,9 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
             "child_dispatch_intent_preserved": True,
             "leaf_dispatched_once": first_spawns == 1,
             "repeated_continuation_spawns": repeated_spawns,
-            "repeated_continuation_boundary": boundary,
+            "repeated_continuation_reconciled": True,
             "repeated_continuation_alive_at_boundary": alive_at_boundary,
+            "repeated_continuation_new_dispatch_requests": 0,
             "worktrees": worktrees_after,
         }
     finally:
@@ -720,9 +769,14 @@ def run_recreate_scenario(root: Path, exomonad: Path) -> dict[str, Any]:
         and "ordered_sub_tl" not in log_text,
         f"exomonad init --recreate failed for an unexpected reason: {log_text[-2000:]}",
     )
+    # Match the exact ordered-ownership conflict markers rather than a bare
+    # "409", which can appear incidentally in ports, pids, or addresses.
     _require(
-        "409" not in log_text and "already exists without matching durable identity" not in log_text,
-        "recreate/restart produced an ordered ownership 409",
+        "ordered_sub_tl_identity_conflict" not in log_text
+        and "already exists without matching durable identity" not in log_text
+        and "does not match its authenticated parent" not in log_text
+        and "ordered sub-TL identity" not in log_text,
+        "recreate/restart produced an ordered ownership conflict",
     )
     identity = _identity(repo, "stage-a")
     _require(
