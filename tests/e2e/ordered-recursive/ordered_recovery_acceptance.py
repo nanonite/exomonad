@@ -10,11 +10,11 @@ Scenario 1 -- failed child startup and safe continuation:
   * The child controller is driven through the real crash path
     (``_supervise_live_sub_tl`` over an exited process), which must persist a
     recursive failure checkpoint and a diagnostic bound to that exact revision.
-  * ``_ordered_terminal_recovery_decision`` must classify the failure as
-    retryable, ``_reopen_ordered_scope`` must reopen the parent while preserving
-    the accepted dispatch intent, and re-provisioning the same stage against
-    the real server must stay idempotent: exactly one branch, identity, and
-    worktree, and no new dispatch intent.
+  * The shipped ``run_tl_loop`` continuation path runs in its own process
+    group with ``session_mode="continue"``. It must reopen the terminal parent,
+    relaunch the ordered child controller, and let that child reopen its own
+    scope and dispatch its leaf exactly once. A second continuation must
+    reconcile the accepted leaf dispatch without minting another one.
 
 Scenario 2 -- recreate followed by a same-plan restart:
   * A disposable repository carries an identity-less orphan ordered branch
@@ -23,6 +23,8 @@ Scenario 2 -- recreate followed by a same-plan restart:
     that branch.
   * The same plan restarts through the real embedded controller and provisions
     the stage with no HTTP 409 and no identity-less branch.
+  * The only accepted init failure is the documented non-TTY tmux attach error;
+    any other exit code or failure marker fails the acceptance.
 
 The harness is intentionally narrower than the full ``real_server_transport``
 suite: it is the acceptance the #1100/#1103 review recorded as outstanding.
@@ -33,11 +35,13 @@ suite.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -49,8 +53,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import real_server_transport as real
 
+from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import ServerError
-from tl_loop.fsm.scope import TLFailed, TLRunning
+from tl_loop.events.queue import LedgerQueue
+from tl_loop.events.reader import LedgerReader
+from tl_loop.fsm.scope import TLFailed
 from tl_loop.loop.driver import (
     LeafTask,
     SubTLTask,
@@ -60,11 +67,10 @@ from tl_loop.loop.driver import (
     _ensure_canonical_scope,
     _initial_slices,
     _manifest_for_plan,
-    _ordered_terminal_recovery_decision,
     _release_canonical_scope,
-    _reopen_ordered_scope,
     _sub_tl_worktree,
     _supervise_live_sub_tl,
+    run_tl_loop,
 )
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
@@ -233,10 +239,125 @@ def _seed_failed_ordered_run(
     return parent_store, plan, config, child_name, child_worktree
 
 
+PARENT_RUN = "recovery-parent"
+CHILD_NAME = "stage-a"
+LEAF_NAME = "leaf"
+
+
+def _controller_config(
+    state_root: Path, repo: Path, swarm_id: str, parent_run: str
+) -> TLLoopConfig:
+    return TLLoopConfig(
+        active=True,
+        keep_alive_on_waiting=False,
+        max_parallel_slices=2,
+        max_events=8,
+        poll_interval=0.1,
+        root_dir=state_root,
+        run_id=parent_run,
+        ledger_run_id=swarm_id,
+        branch="main",
+        worktree=repo,
+        project_root=repo,
+        session_mode="continue",
+    )
+
+
+def _start_production_continuation(
+    parent_run: str,
+    plan: WorkPlan,
+    state_root: Path,
+    repo: Path,
+    swarm_id: str,
+) -> multiprocessing.Process:
+    """Run the shipped ``run_tl_loop`` continuation in an isolated process group."""
+    context = multiprocessing.get_context("fork")
+
+    def entry() -> None:
+        os.setsid()
+        # A real ledger-backed source lets the relaunched child consume the
+        # authoritative agent.spawned event for its leaf, exactly like the
+        # shipped embedded controller.
+        reader = LedgerReader(
+            repo / ".exo" / "ledger" / "segments",
+            run_id=parent_run,
+            state_root=state_root,
+            ledger_run_id=swarm_id,
+        )
+        source = LedgerQueue(reader, poll_interval=0.01, active_tail_timeout=5).start()
+        effects = EffectClient(
+            real.TransportClient(project_root=repo, timeout=5),
+            role="tl",
+            name="root",
+        )
+        run_tl_loop(
+            parent_run,
+            plan,
+            source,
+            effects,
+            config=_controller_config(state_root, repo, swarm_id, parent_run),
+            root_dir=state_root,
+        )
+
+    process = context.Process(target=entry, name="ordered-recovery-controller")
+    process.start()
+    return process
+
+
+def _wait_for_leaf_dispatch(
+    child_store: RunStore, deadline: float
+) -> tuple[Any, Any]:
+    """Wait for the production controller to durably dispatch the resumed leaf."""
+    last: Any = None
+    while time.monotonic() < deadline:
+        try:
+            last = child_store.load()
+        except (OSError, ValueError):
+            time.sleep(0.1)
+            continue
+        leaf = last.slices.get(LEAF_NAME)
+        if (
+            leaf is not None
+            and leaf.status is SliceStatus.SPAWNED
+            and leaf.dispatch_intent_id
+            and leaf.dispatch_authoritative_event_seq is not None
+        ):
+            return last, leaf
+        time.sleep(0.1)
+    detail = f": {last!r}" if last is not None else ""
+    raise AcceptanceError(
+        "production continuation did not dispatch the resumed leaf" + detail
+    )
+
+
+def _leaf_spawn_events(repo: Path, intent_id: str) -> list[dict[str, Any]]:
+    """Return only the authoritative spawn events for one leaf intent.
+
+    The server records a second, non-authoritative ``agent.spawned`` event for
+    the same intent from the WASM log path (no ``spawn_type`` or ``branch``).
+    The shipped ordered probes treat the ``leaf_subtree`` event with a branch as
+    the single authoritative spawn, so the exactly-once assertion must too.
+    """
+    return [
+        event
+        for event in _ledger_events(repo)
+        if event.get("type") == "agent.spawned"
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("intent_id") == intent_id
+        and event["data"].get("spawn_type") == "leaf_subtree"
+        and event["data"].get("branch")
+    ]
+
+
+def _leaf_spawn_count(repo: Path, intent_id: str) -> int:
+    return len(_leaf_spawn_events(repo, intent_id))
+
+
 def run_continuation_scenario(root: Path) -> dict[str, Any]:
     repo, remote, _branch = real.create_fixture(root / "continuation")
     mock, forgejo_url = real.start_mock(root / "continuation", PROJECT_ROOT, remote)
     server: subprocess.Popen[str] | None = None
+    processes: list[multiprocessing.Process] = []
     try:
         server, client = real.start_server(
             root / "continuation", repo, forgejo_url, PROJECT_ROOT
@@ -249,13 +370,14 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
         (root_agent_dir / ".birth_branch").write_text("main\n", encoding="utf-8")
         swarm_id = real.server_run_id(repo)
         state_root = repo / ".exo" / "tl-loop"
-        parent_store, plan, config, child_name, child_worktree = _seed_failed_ordered_run(
-            repo, state_root, swarm_id
+        parent_store, plan, _config, child_name, child_worktree = (
+            _seed_failed_ordered_run(repo, state_root, swarm_id)
         )
         child_branch = f"main.{child_name}"
+        child_store = RunStore(child_name, parent_store.run_dir)
 
-        # Provision the stage through the real server before recovery so the
-        # branch, identity, and worktree already exist.
+        # Provision the stage through the real server so the failed startup
+        # happened after the branch, identity, and worktree already existed.
         client.provision_ordered_sub_tl(
             "root",
             agent_name=child_name,
@@ -278,53 +400,77 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
             f"expected one ordered worktree before recovery, got {worktrees_before!r}",
         )
 
-        parent_state = parent_store.load()
-        child_state = RunStore(child_name, parent_store.run_dir).load()
+        child_state = child_store.load()
         _require(
             isinstance(child_state.recursive_fsm, TLFailed),
             "crashed child did not persist a recursive failure checkpoint",
         )
-        diagnostic = RunStore(child_name, parent_store.run_dir).exit_diagnostics()
+        diagnostic = child_store.exit_diagnostics()
         _require(
             isinstance(diagnostic, dict)
             and diagnostic.get("checkpoint_revision") == child_state.revision,
             "child exit diagnostic is not bound to the failure checkpoint",
         )
+        original_intent = parent_store.load().slices[child_name].dispatch_intent_id
 
-        decision = _ordered_terminal_recovery_decision(
-            parent_state, plan, config, parent_store
+        # Run the shipped continuation path. This must reopen the terminal
+        # parent, relaunch the ordered child controller, and let that child
+        # reopen its own scope and dispatch the leaf exactly once.
+        first = _start_production_continuation(
+            PARENT_RUN, plan, state_root, repo, swarm_id
+        )
+        processes.append(first)
+        child_state, leaf = _wait_for_leaf_dispatch(
+            child_store, time.monotonic() + 120
         )
         _require(
-            decision is not None and decision.recoverable is True,
-            f"failed child startup was not classified recoverable: {decision!r}",
-        )
-        original_intent = parent_state.slices[child_name].dispatch_intent_id
-        reopened = _reopen_ordered_scope(
-            parent_store.load(), plan, parent_store, decision.task_name
+            first.is_alive(),
+            f"production continuation exited before leaf dispatch: {first.exitcode}",
         )
         _require(
-            isinstance(reopened.recursive_fsm, TLRunning),
-            "continuation did not reopen the terminal parent scope",
+            child_state.recursive_fsm is not None
+            and not isinstance(child_state.recursive_fsm, TLFailed),
+            "production continuation did not reopen the failed child scope",
+        )
+        parent_after = parent_store.load()
+        _require(
+            parent_after.slices[child_name].status is SliceStatus.SPAWNED,
+            "production continuation did not relaunch the ordered child slice",
         )
         _require(
-            reopened.slices[child_name].status is SliceStatus.SPAWNED,
-            "reopened child slice is not spawned",
+            parent_after.slices[child_name].dispatch_intent_id == original_intent,
+            "production continuation minted a new child dispatch intent",
         )
+        spawn_events = _leaf_spawn_events(repo, leaf.dispatch_intent_id)
         _require(
-            reopened.slices[child_name].dispatch_intent_id == original_intent,
-            "continuation minted a new dispatch intent instead of reusing the accepted one",
+            len(spawn_events) == 1,
+            "resumed leaf was not dispatched exactly once: "
+            + json.dumps(spawn_events, default=str)[:3000],
         )
+        first_spawns = len(spawn_events)
 
-        # Re-provision the reopened stage against the real server: the effect is
-        # idempotent, so no duplicate branch, identity, worktree, or intent.
-        client.provision_ordered_sub_tl(
-            "root",
-            agent_name=child_name,
-            birth_branch=child_branch,
-            parent_branch="main",
-            working_dir=child_worktree,
-            slice_id=child_name,
+        real.stop_multiprocessing_process(
+            first, "production continuation", process_group=True
         )
+        processes.remove(first)
+
+        # Repeated continuation must reconcile the accepted leaf dispatch and
+        # never mint a second one.
+        second = _start_production_continuation(
+            PARENT_RUN, plan, state_root, repo, swarm_id
+        )
+        processes.append(second)
+        time.sleep(20)
+        repeated_spawns = _leaf_spawn_count(repo, leaf.dispatch_intent_id)
+        _require(
+            repeated_spawns == 1,
+            f"repeated continuation duplicated the leaf dispatch: {repeated_spawns}",
+        )
+        real.stop_multiprocessing_process(
+            second, "repeated continuation", process_group=True
+        )
+        processes.remove(second)
+
         worktrees_after = _worktrees_for(repo, child_branch)
         _require(
             worktrees_after == worktrees_before,
@@ -339,23 +485,27 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
             identities == [child_name],
             f"continuation duplicated the ordered identity: {identities!r}",
         )
-        events = _ledger_events(repo)
-        duplicate_spawns = _count(
-            events, "agent.spawned", intent_id=original_intent
-        )
-        _require(
-            duplicate_spawns == 0,
-            f"continuation produced a duplicate spawn effect: {duplicate_spawns}",
-        )
         return {
             "scenario": "failed-child-startup-and-continuation",
             "child": child_name,
-            "recoverable": True,
-            "dispatch_intent_preserved": True,
+            "leaf": LEAF_NAME,
+            "production_path": "run_tl_loop(session_mode=continue)",
+            "child_relaunched": True,
+            "child_dispatch_intent_preserved": True,
+            "leaf_dispatched_once": first_spawns == 1,
+            "repeated_continuation_spawns": repeated_spawns,
             "worktrees": worktrees_after,
-            "duplicate_spawns": duplicate_spawns,
         }
     finally:
+        for process in processes:
+            try:
+                real.stop_multiprocessing_process(
+                    process, "continuation controller", process_group=True
+                )
+            except real.HarnessError:
+                pass
+        diagnostics: list[str] = []
+        real.best_effort_worker_cleanup(repo, LEAF_NAME, diagnostics)
         if server is not None:
             real.stop_server(server, repo, "continuation acceptance")
         real.stop_subprocess(mock, "continuation mock API")
@@ -455,6 +605,29 @@ def run_recreate_scenario(root: Path, exomonad: Path) -> dict[str, Any]:
         )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
 
+    # The only expected failure is the final tmux attach, which cannot succeed
+    # without a TTY. Any other exit code or failure marker means the recreate
+    # or same-plan restart did not actually complete, so the acceptance must
+    # fail loudly rather than accept an unexplained non-zero exit.
+    _require(
+        init.returncode == 1,
+        f"exomonad init --recreate exited {init.returncode}, expected 1 from the "
+        f"documented non-TTY attach failure: {log_text[-2000:]}",
+    )
+    _require(
+        "open terminal failed: not a terminal" in log_text,
+        "exomonad init --recreate did not fail with the documented tmux attach error",
+    )
+    _require(
+        "Attaching to session" in log_text and "Creating session" in log_text,
+        "exomonad init --recreate failed before creating and attaching to the session",
+    )
+    _require(
+        "panicked" not in log_text.lower()
+        and "refusing --recreate" not in log_text
+        and "ordered_sub_tl" not in log_text,
+        f"exomonad init --recreate failed for an unexpected reason: {log_text[-2000:]}",
+    )
     _require(
         "409" not in log_text and "already exists without matching durable identity" not in log_text,
         "recreate/restart produced an ordered ownership 409",
@@ -487,6 +660,7 @@ def run_recreate_scenario(root: Path, exomonad: Path) -> dict[str, Any]:
         "worktrees": worktrees,
         "stage_starts": stage_starts,
         "init_returncode": init.returncode,
+        "init_failure": "tmux attach (non-TTY)",
     }
 
 

@@ -18,6 +18,8 @@ from tl_loop.loop.driver import (
     TLLoopConfig,
     WorkPlan,
     _bind_initial_slices,
+    _candidate_manifest,
+    _child_config,
     _ensure_canonical_scope,
     _initial_slices,
     _manifest_for_plan,
@@ -439,6 +441,45 @@ def test_stale_exit_reason_cannot_reopen_newer_failure(tmp_path: Path) -> None:
     assert decision is not None
     assert decision.recoverable is False
     assert "durable child exit diagnostic" in decision.reason
+
+
+def test_child_config_declares_parent_manifest_for_recovery(tmp_path: Path) -> None:
+    """A production-spawned child persists the parent's declared child manifest.
+
+    Regression for ordered recovery: rebuilding the child manifest from its own
+    run id changes the scope id, so the child checkpoint digest no longer
+    matches the parent's ``child_manifests`` entry and continuation gates every
+    real child as non-recoverable.
+    """
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    task = plan.sub_tls[0]
+    child_worktree = str(
+        _sub_tl_worktree(config, parent_store.root_dir, parent_store.run_id, task)
+    )
+    child_config = _child_config(
+        config,
+        task,
+        EmptyQueue(),
+        None,
+        parent_store,
+        "main.child",
+        child_worktree,
+        ordered_recovery=True,
+    )
+
+    parent_manifest = parent_store.load().plan_manifest
+    node = next(node for node in parent_manifest.nodes if node.name == "child")
+    declared = parent_manifest.child_manifests[node.node_id]
+
+    assert child_config.declared_manifest is not None
+    assert child_config.declared_manifest.digest == declared.digest
+    candidate = _candidate_manifest(task.plan, task.name, child_config)
+    assert candidate.digest == declared.digest
+    # The child checkpoint seeded by the helper carries the declared manifest,
+    # which is exactly what recovery verifies.
+    child_state = RunStore("child", parent_store.run_dir).load()
+    assert child_state.plan_manifest is not None
+    assert child_state.plan_manifest.digest == declared.digest
 
 
 def test_wrong_controller_identity_is_not_recoverable(tmp_path: Path) -> None:

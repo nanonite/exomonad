@@ -712,6 +712,7 @@ class TLLoopConfig:
     depth: int = 0
     max_depth: int = 3
     plan_revision: int = 1
+    declared_manifest: PlanManifest | None = None
 
     def __post_init__(self) -> None:
         if self.project_root is not None:
@@ -888,7 +889,7 @@ def run_tl_loop(
                     "cannot verify the supplied plan before returning terminal state"
                 )
             supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
-            candidate = _manifest_for_plan(supplied_plan, run_id, selected)
+            candidate = _candidate_manifest(supplied_plan, run_id, selected)
             if candidate.digest != persisted_manifest.digest:
                 raise TLLoopError(
                     "terminal checkpoint plan digest "
@@ -996,7 +997,7 @@ def run_tl_loop(
                     "supply an explicit external WorkPlan"
                 )
             supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
-            candidate = _manifest_for_plan(supplied_plan, run_id, selected)
+            candidate = _candidate_manifest(supplied_plan, run_id, selected)
             reconciliation = None
             if selected.active:
                 journal_path = store.run_dir / "action-journal.json"
@@ -1060,7 +1061,7 @@ def run_tl_loop(
             initial_slices = None
         else:
             supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
-            candidate = _manifest_for_plan(supplied_plan, run_id, selected)
+            candidate = _candidate_manifest(supplied_plan, run_id, selected)
             if candidate.digest == persisted_manifest.digest:
                 work_plan = _work_plan_from_manifest(persisted_manifest)
                 manifest = persisted_manifest
@@ -1105,7 +1106,7 @@ def run_tl_loop(
                 "continuation cannot reconstruct a legacy checkpoint without an immutable plan manifest"
             )
         work_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
-        manifest = _manifest_for_plan(work_plan, run_id, selected)
+        manifest = _candidate_manifest(work_plan, run_id, selected)
         if initial_slices is None:
             initial_slices = _initial_slices(work_plan, selected, root_dir, run_id)
         initial_slices = _bind_initial_slices(initial_slices, manifest)
@@ -10056,6 +10057,7 @@ def _child_config(
         ordered_recovery_child=None,
         ordered_recovery=ordered_recovery,
         keep_alive_on_waiting=keep_alive_on_waiting,
+        declared_manifest=_declared_child_manifest(store, task),
     )
 
 
@@ -11970,6 +11972,46 @@ def _manifest_for_plan(
         parent_integration_target=config.parent_branch,
         manifest_revision=config.plan_revision,
     )
+
+
+def _candidate_manifest(
+    plan: WorkPlan,
+    run_id: str,
+    config: TLLoopConfig,
+) -> PlanManifest:
+    """Prefer the parent's immutable child declaration over a rebuilt manifest.
+
+    A live ordered child receives its scope declaration from the parent manifest
+    (``TLLoopConfig.declared_manifest``). Persisting that exact declaration keeps
+    the child checkpoint digest equal to the parent's ``child_manifests`` entry,
+    which is what ordered recovery verifies. Rebuilding it from the child's own
+    run id would change the scope id and break that proof.
+    """
+    if config.declared_manifest is not None:
+        return config.declared_manifest
+    return _manifest_for_plan(plan, run_id, config)
+
+
+def _declared_child_manifest(store: RunStore, task: SubTLTask) -> PlanManifest | None:
+    """Return the parent's immutable declaration for one ordered child scope."""
+    try:
+        state = store.load()
+    except (OSError, ValueError):
+        return None
+    manifest = state.plan_manifest
+    if manifest is None:
+        return None
+    node = next(
+        (
+            candidate
+            for candidate in manifest.nodes
+            if candidate.name == task.name and candidate.kind == "sub_tl"
+        ),
+        None,
+    )
+    if node is None:
+        return None
+    return manifest.child_manifests.get(node.node_id)
 
 
 def _manifest_is_legacy(manifest: PlanManifest) -> bool:
