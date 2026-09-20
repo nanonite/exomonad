@@ -99,6 +99,15 @@ def _require(condition: bool, message: str) -> None:
         raise AcceptanceError(message)
 
 
+def _expect_server_error(call: Any) -> ServerError:
+    """Run a transport call that must fail and return its ServerError."""
+    try:
+        call()
+    except ServerError as error:
+        return error
+    raise AcceptanceError("expected a server error, but the call succeeded")
+
+
 def _worktrees_for(repo: Path, branch: str) -> list[str]:
     output = real.git(repo, "worktree", "list", "--porcelain")
     worktrees: list[str] = []
@@ -360,6 +369,31 @@ def _wait_for_leaf_dispatch_request(
     detail = f": {last!r}" if last is not None else ""
     raise AcceptanceError(
         "production continuation did not durably request the leaf spawn" + detail
+    )
+
+
+def _wait_for_leaf_spawned(
+    child_store: RunStore, deadline: float
+) -> tuple[Any, Any]:
+    """Wait for the child's first effect to be authoritatively confirmed."""
+    last: Any = None
+    while time.monotonic() < deadline:
+        try:
+            last = child_store.load()
+        except (OSError, ValueError):
+            time.sleep(0.1)
+            continue
+        leaf = last.slices.get(LEAF_NAME)
+        if (
+            leaf is not None
+            and leaf.status is SliceStatus.SPAWNED
+            and leaf.dispatch_authoritative_event_seq is not None
+        ):
+            return last, leaf
+        time.sleep(0.1)
+    detail = f": {last!r}" if last is not None else ""
+    raise AcceptanceError(
+        "child's first effect was not authoritatively confirmed" + detail
     )
 
 
@@ -652,6 +686,153 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
         _kill_tmux_session(repo)
 
 
+def run_child_identity_scenario(root: Path) -> dict[str, Any]:
+    """Prove an ordered child's first server effect uses its own identity (#1097).
+
+    Independent of the recovery scenarios: it starts a genuinely new ordered
+    child (no durable identity, branch, or worktree), observes the child's first
+    authoritative effect, and checks that the child route resolves and executes
+    under the child's own ownership context rather than root's.
+    """
+    repo, remote, _branch = real.create_fixture(root / "identity")
+    mock, forgejo_url = real.start_mock(root / "identity", PROJECT_ROOT, remote)
+    server: subprocess.Popen[str] | None = None
+    process: multiprocessing.Process | None = None
+    try:
+        server, client = real.start_server(
+            root / "identity", repo, forgejo_url, PROJECT_ROOT
+        )
+        root_agent_dir = repo / ".exo" / "agents" / "root"
+        root_agent_dir.mkdir(parents=True, exist_ok=True)
+        (root_agent_dir / ".birth_branch").write_text("main\n", encoding="utf-8")
+        swarm_id = real.server_run_id(repo)
+
+        # Criterion 4: an unknown agent route returns an actionable identity
+        # error, not Axum's generic missing-extension 500.
+        unknown = _expect_server_error(
+            lambda: client.call_tool("tl", "no-such-agent", "list_agents", {})
+        )
+        _require(
+            unknown.status == 404 and "agent_identity_unresolved" in unknown.body,
+            f"unknown agent route did not return an actionable error: {unknown!r}",
+        )
+        _require(
+            "Missing request extension" not in unknown.body,
+            "unknown agent route leaked the generic missing-extension error",
+        )
+
+        parent_run = "identity-parent"
+        child_name = "stage-a"
+        state_root = repo / ".exo" / "tl-loop"
+        child_plan = WorkPlan(
+            leaves=(LeafTask("leaf", "implement the ordered child change"),)
+        )
+        plan = WorkPlan(sub_tls=(SubTLTask(child_name, child_plan, order=1),))
+        config = _controller_config(state_root, repo, swarm_id, parent_run)
+        child_branch = f"main.{child_name}"
+        child_worktree = str(
+            _sub_tl_worktree(config, state_root, parent_run, plan.sub_tls[0])
+        )
+
+        # The child is genuinely new: no durable identity, branch, or worktree.
+        _require(_identity(repo, child_name) is None, "child identity pre-existed")
+        _require(
+            real.git(repo, "branch", "--list", child_branch).strip() == "",
+            "child branch pre-existed",
+        )
+        _require(not Path(child_worktree).exists(), "child worktree pre-existed")
+
+        process = _start_production_continuation(
+            parent_run, plan, state_root, repo, swarm_id, use_ledger=True
+        )
+        child_store = RunStore(child_name, state_root / parent_run)
+        _child_state, leaf = _wait_for_leaf_spawned(
+            child_store, time.monotonic() + 120
+        )
+        _require(process.is_alive(), "child controller exited before its first effect")
+
+        identity = _identity(repo, child_name)
+        _require(
+            identity is not None,
+            "child identity was not provisioned before its first effect",
+        )
+        _require(
+            identity.get("birth_branch") == child_branch,
+            f"child identity birth branch is wrong: {identity!r}",
+        )
+        _require(
+            Path(str(identity.get("working_dir", ""))).resolve()
+            == Path(child_worktree).resolve(),
+            f"child identity working dir is wrong: {identity!r}",
+        )
+
+        # Criterion 2: the child's first effect carried the child's ownership
+        # context. A root-context spawn would have produced main.leaf-codex.
+        spawn_events = _leaf_spawn_events(repo, leaf.dispatch_intent_id)
+        _require(
+            len(spawn_events) == 1,
+            f"child first effect was not confirmed exactly once: {spawn_events!r}",
+        )
+        spawn_branch = str(spawn_events[0]["data"]["branch"])
+        _require(
+            spawn_branch.startswith(f"{child_branch}."),
+            f"child effect used the wrong branch context: {spawn_branch!r}",
+        )
+        _require(
+            spawn_events[0].get("agent_id") == child_name,
+            f"child effect was not attributed to the child: {spawn_events[0]!r}",
+        )
+
+        # Explicit child tool call through /agents/tl/<stage>/tools/call.
+        child_call = client.call_tool("tl", child_name, "list_agents", {})
+        _require(
+            child_call.get("success") is True,
+            f"child tool call did not execute under the child identity: {child_call!r}",
+        )
+
+        # Criterion 3: a mismatched identity fails closed with an actionable error.
+        conflict = _expect_server_error(
+            lambda: client.provision_ordered_sub_tl(
+                "root",
+                agent_name=child_name,
+                birth_branch="main.other-stage",
+                parent_branch="main",
+                working_dir=child_worktree,
+                slice_id=child_name,
+            )
+        )
+        _require(
+            conflict.status in {400, 409} and "identity" in conflict.body,
+            f"mismatched child identity did not fail closed: {conflict!r}",
+        )
+
+        return {
+            "scenario": "child-first-effect-uses-own-identity",
+            "child": child_name,
+            "child_branch": child_branch,
+            "child_worktree": child_worktree,
+            "unknown_route_status": unknown.status,
+            "unknown_route_kind": "agent_identity_unresolved",
+            "first_effect_branch": spawn_branch,
+            "child_tool_call_ok": True,
+            "mismatch_status": conflict.status,
+        }
+    finally:
+        if process is not None:
+            try:
+                real.stop_multiprocessing_process(
+                    process, "identity controller", process_group=True
+                )
+            except real.HarnessError:
+                pass
+        diagnostics: list[str] = []
+        real.best_effort_worker_cleanup(repo, LEAF_NAME, diagnostics)
+        if server is not None:
+            real.stop_server(server, repo, "identity acceptance")
+        real.stop_subprocess(mock, "identity mock API")
+        _kill_tmux_session(repo)
+
+
 def _write_recreate_fixture(repo: Path, session: str) -> None:
     (repo / ".exo" / "config.toml").write_text(
         "\n".join(
@@ -827,6 +1008,7 @@ def main() -> int:
         root = Path(temporary)
         evidence: dict[str, Any] = {}
         try:
+            evidence["child_identity"] = run_child_identity_scenario(root)
             evidence["continuation"] = run_continuation_scenario(root)
             evidence["recreate"] = run_recreate_scenario(root, exomonad)
         except (AcceptanceError, real.HarnessError, ServerError, OSError) as error:
@@ -838,6 +1020,7 @@ def main() -> int:
                 check=False,
                 capture_output=True,
             )
+            shutil.rmtree(root / "identity", ignore_errors=True)
             shutil.rmtree(root / "continuation", ignore_errors=True)
         print(json.dumps(evidence, indent=2, sort_keys=True))
         print("ordered recovery real-server acceptance: passed")
