@@ -365,8 +365,56 @@ def _leaf_spawn_events(repo: Path, intent_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def _leaf_spawn_count(repo: Path, intent_id: str) -> int:
-    return len(_leaf_spawn_events(repo, intent_id))
+def _child_leaf_spawns(repo: Path, child_name: str) -> list[dict[str, Any]]:
+    """Return every authoritative leaf spawn requested by one ordered child.
+
+    Counting by the requesting controller rather than by a single intent means a
+    second continuation that minted a fresh intent and spawned another leaf
+    cannot hide behind the first intent's count.
+    """
+    return [
+        event
+        for event in _ledger_events(repo)
+        if event.get("type") == "agent.spawned"
+        and isinstance(event.get("data"), dict)
+        and event["data"].get("spawn_type") == "leaf_subtree"
+        and event["data"].get("branch")
+        and event.get("agent_id") == child_name
+    ]
+
+
+def _checkpoint_revision(store: RunStore) -> int:
+    try:
+        return store.load().revision
+    except (OSError, ValueError):
+        return -1
+
+
+def _wait_for_durable_boundary(
+    stores: list[RunStore],
+    before_revisions: list[int],
+    process: multiprocessing.Process,
+    deadline: float,
+) -> tuple[str, bool]:
+    """Wait until a second continuation makes durable progress or exits.
+
+    Returns ``(boundary, process_alive_at_boundary)``. The boundary is
+    ``"checkpoint"`` when a run revision advanced, or ``"exit"`` when the
+    controller ended. A caller can therefore never assert idempotency merely
+    because a fixed sleep elapsed before the second controller did anything.
+    """
+    while time.monotonic() < deadline:
+        for store, before in zip(stores, before_revisions):
+            try:
+                state = store.load()
+            except (OSError, ValueError):
+                continue
+            if state.revision > before:
+                return "checkpoint", process.is_alive()
+        if not process.is_alive():
+            return "exit", False
+        time.sleep(0.1)
+    return "timeout", process.is_alive()
 
 
 def run_continuation_scenario(root: Path) -> dict[str, Any]:
@@ -464,6 +512,13 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
             + json.dumps(spawn_events, default=str)[:3000],
         )
         first_spawns = len(spawn_events)
+        leaf_branch = str(spawn_events[0]["data"]["branch"])
+        _require(
+            all(
+                event["data"].get("branch") == leaf_branch for event in spawn_events
+            ),
+            f"resumed leaf spawned on inconsistent branches: {spawn_events!r}",
+        )
 
         real.stop_multiprocessing_process(
             first, "production continuation", process_group=True
@@ -471,17 +526,35 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
         processes.remove(first)
 
         # Repeated continuation must reconcile the accepted leaf dispatch and
-        # never mint a second one.
+        # never mint a second one. Observe a durable second-run boundary before
+        # asserting, and count authoritative leaf spawns across every intent so
+        # a fresh intent cannot hide behind the first intent's count.
+        child_store = RunStore(child_name, parent_store.run_dir)
+        observed_stores = [child_store, parent_store]
+        before_revisions = [_checkpoint_revision(store) for store in observed_stores]
         second = _start_production_continuation(
             PARENT_RUN, plan, state_root, repo, swarm_id
         )
         processes.append(second)
-        time.sleep(20)
-        repeated_spawns = _leaf_spawn_count(repo, leaf.dispatch_intent_id)
-        _require(
-            repeated_spawns == 1,
-            f"repeated continuation duplicated the leaf dispatch: {repeated_spawns}",
+        boundary, alive_at_boundary = _wait_for_durable_boundary(
+            observed_stores,
+            before_revisions,
+            second,
+            time.monotonic() + 60,
         )
+        _require(
+            boundary == "checkpoint" or (boundary == "exit" and second.exitcode == 0),
+            "repeated continuation made no durable progress before the deadline "
+            f"(boundary={boundary}, alive={alive_at_boundary}, "
+            f"exitcode={second.exitcode})",
+        )
+        repeated_events = _child_leaf_spawns(repo, child_name)
+        _require(
+            len(repeated_events) == 1,
+            "repeated continuation duplicated the leaf dispatch across intents: "
+            + json.dumps(repeated_events, default=str)[:3000],
+        )
+        repeated_spawns = len(repeated_events)
         real.stop_multiprocessing_process(
             second, "repeated continuation", process_group=True
         )
@@ -510,6 +583,8 @@ def run_continuation_scenario(root: Path) -> dict[str, Any]:
             "child_dispatch_intent_preserved": True,
             "leaf_dispatched_once": first_spawns == 1,
             "repeated_continuation_spawns": repeated_spawns,
+            "repeated_continuation_boundary": boundary,
+            "repeated_continuation_alive_at_boundary": alive_at_boundary,
             "worktrees": worktrees_after,
         }
     finally:
