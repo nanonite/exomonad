@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix ordered TL recovery review findings (#1103)
 - Fix stale replay ownership assertion (#1099)
 - Fix recursive TL event consumption and keep the TL window available during child work (#1098)
 - Fix recreate journal race during plan handoff (#1096)
