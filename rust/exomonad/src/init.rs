@@ -265,6 +265,7 @@ impl RecreatePlan {
 fn ordered_branch_action(
     spec: OrderedBranchSpec,
     observation: OrderedBranchObservation,
+    authorized_publications: &[u64],
 ) -> Option<OrderedBranchCleanup> {
     let has_evidence = observation.branch_exists
         || observation.agent_dir_exists
@@ -289,6 +290,21 @@ fn ordered_branch_action(
         return Some(preserve(
             "durable identity does not match the same-plan owner",
         ));
+    }
+    // Crash residue: a prior disposal removed the branch before the durable
+    // identity. The branch is already gone, so completing the interrupted
+    // cleanup (removing the matching identity) is the only idempotent action.
+    if !observation.branch_exists
+        && observation.identity == OrderedIdentityState::Matching
+        && !observation.worktree_exists
+        && observation.attached_worktree.is_none()
+        && observation.publications.is_empty()
+    {
+        return Some(OrderedBranchCleanup {
+            spec,
+            observation,
+            action: OrderedBranchAction::Remove,
+        });
     }
     if observation.agent_dir_exists && observation.identity == OrderedIdentityState::Missing {
         return Some(preserve("agent metadata exists without a durable identity"));
@@ -320,9 +336,13 @@ fn ordered_branch_action(
             "ordered branch base or unique commits cannot be verified",
         ));
     }
-    if !observation.publications.is_empty() {
+    if observation
+        .publications
+        .iter()
+        .any(|number| !authorized_publications.contains(number))
+    {
         return Some(preserve(
-            "publication evidence still owns the ordered branch",
+            "publication evidence is not scheduled for disposal by this plan",
         ));
     }
 
@@ -543,6 +563,7 @@ async fn inspect_ordered_branch(
     spec: OrderedBranchSpec,
     publications: &[PublishedHead],
     protected: &[ProtectedPr],
+    authorized_publications: &[u64],
 ) -> Result<Option<OrderedBranchCleanup>> {
     let branch_exists = git_branch_exists(project_dir, &spec.branch)?;
     let agent_dir = project_dir.join(".exo/agents").join(&spec.agent_name);
@@ -589,7 +610,7 @@ async fn inspect_ordered_branch(
         publications: branch_publications,
         protected_publications,
     };
-    let mut cleanup = ordered_branch_action(spec, observation);
+    let mut cleanup = ordered_branch_action(spec, observation, authorized_publications);
     if let Some(branch) = cleanup.as_mut() {
         if !branch.spec.worktree.starts_with(project_dir) {
             branch.action =
@@ -653,7 +674,11 @@ fn recreate_forgejo_client(
     }
 }
 
-async fn build_recreate_plan(project_dir: &Path, config: &Config) -> Result<RecreatePlan> {
+async fn build_recreate_plan(
+    project_dir: &Path,
+    config: &Config,
+    force: bool,
+) -> Result<RecreatePlan> {
     let worktrees = recreate_worktree_paths(project_dir)?;
     let dirty_worktrees = worktrees
         .iter()
@@ -740,12 +765,30 @@ async fn build_recreate_plan(project_dir: &Path, config: &Config) -> Result<Recr
     prs_to_remove.sort_unstable();
     prs_to_remove.dedup();
     protected.sort_by_key(|item| item.number);
+    // Authorize every publication the plan disposes of, including merged or
+    // already-closed PRs whose records are removed without a close call.
+    let authorized_publications = if force {
+        prs_to_remove.clone()
+    } else {
+        let protected_numbers = protected.iter().map(|item| item.number).collect::<Vec<_>>();
+        prs_to_remove
+            .iter()
+            .copied()
+            .filter(|number| !protected_numbers.contains(number))
+            .collect::<Vec<_>>()
+    };
     let ordered_branches = if project_dir.join(".git").exists() {
         let specs = ordered_branch_specs(project_dir)?;
         let mut branches = Vec::new();
         for spec in specs {
-            if let Some(branch) =
-                inspect_ordered_branch(project_dir, spec, &registry, &protected).await?
+            if let Some(branch) = inspect_ordered_branch(
+                project_dir,
+                spec,
+                &registry,
+                &protected,
+                &authorized_publications,
+            )
+            .await?
             {
                 branches.push(branch);
             }
@@ -773,7 +816,7 @@ async fn prepare_recreate(
     allow_pending_gate: bool,
 ) -> Result<Option<RecreatePlan>> {
     ensure_recreate_allowed(project_dir, allow_pending_gate)?;
-    let plan = build_recreate_plan(project_dir, config).await?;
+    let plan = build_recreate_plan(project_dir, config, force).await?;
     println!("{}", plan.render());
     if dry_run {
         return Ok(None);
@@ -811,6 +854,7 @@ async fn destroy_recreate_resources(
     project_dir: &Path,
     config: &Config,
     plan: &RecreatePlan,
+    force: bool,
 ) -> Result<()> {
     let _plan_lock = acquire_plan_transition_lock_async(project_dir).await?;
     let git_wt = Arc::new(GitWorktreeService::new(project_dir.to_path_buf()));
@@ -820,6 +864,26 @@ async fn destroy_recreate_resources(
         .map(|branch| branch.spec.worktree.clone())
         .collect::<HashSet<_>>();
     let publications = read_published_heads(project_dir).await?;
+    let protected_numbers = plan
+        .protected
+        .iter()
+        .map(|item| item.number)
+        .collect::<Vec<_>>();
+    // Publications slated for record removal are authorized for branch
+    // cleanup: merged or closed PRs have nothing left to close, while open PRs
+    // are closed below before any local ownership is removed.
+    let authorized_publications = if force {
+        plan.prs_to_remove.clone()
+    } else {
+        plan.prs_to_remove
+            .iter()
+            .copied()
+            .filter(|number| !protected_numbers.contains(number))
+            .collect::<Vec<_>>()
+    };
+    // Phase one revalidates every ordered branch without mutating anything, so
+    // a gate discovered late can never follow already-removed resources.
+    let mut validated: Vec<OrderedBranchCleanup> = Vec::new();
     for branch in &plan.ordered_branches {
         if let Some(gate) = branch.gate() {
             anyhow::bail!(
@@ -833,6 +897,7 @@ async fn destroy_recreate_resources(
             branch.spec.clone(),
             &publications,
             &plan.protected,
+            &authorized_publications,
         )
         .await?
         else {
@@ -845,6 +910,29 @@ async fn destroy_recreate_resources(
                 gate
             );
         }
+        validated.push(current);
+    }
+    // Close published PRs before removing local ownership. If closure fails,
+    // the branch and identity remain so the disposal can be retried safely.
+    let client = recreate_forgejo_client(project_dir, config)?;
+    if !plan.prs_to_close.is_empty() {
+        let client = client
+            .as_ref()
+            .context("cannot close published PRs: no Forgejo client is configured")?;
+        let repo = get_repo_info(project_dir).await?;
+        for number in &plan.prs_to_close {
+            client
+                .close_pull_request(
+                    &repo.owner,
+                    &repo.repo,
+                    exomonad_core::domain::PRNumber::new(*number),
+                )
+                .await
+                .with_context(|| format!("failed to close PR #{number}"))?;
+        }
+    }
+    // Phase two performs disposal only after revalidation and PR closure.
+    for current in &validated {
         if current.observation.worktree_exists {
             let path = current.spec.worktree.clone();
             let git_wt = git_wt.clone();
@@ -866,24 +954,6 @@ async fn destroy_recreate_resources(
         if agent_dir.exists() {
             std::fs::remove_dir_all(&agent_dir)
                 .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
-        }
-    }
-
-    let client = recreate_forgejo_client(project_dir, config)?;
-    if !plan.prs_to_close.is_empty() {
-        let client = client
-            .as_ref()
-            .context("cannot close published PRs: no Forgejo client is configured")?;
-        let repo = get_repo_info(project_dir).await?;
-        for number in &plan.prs_to_close {
-            client
-                .close_pull_request(
-                    &repo.owner,
-                    &repo.repo,
-                    exomonad_core::domain::PRNumber::new(*number),
-                )
-                .await
-                .with_context(|| format!("failed to close PR #{number}"))?;
         }
     }
 
@@ -4421,33 +4491,12 @@ pub async fn run(
         let recreate_plan = recreate_plan
             .as_ref()
             .context("recreate plan was not prepared before destructive transition")?;
-        destroy_recreate_resources(&cwd, &config, recreate_plan).await?;
-        // Kill the running server process before tearing down the session
-        let pid_path = cwd.join(".exo/server.pid");
-        if let Ok(content) = std::fs::read_to_string(&pid_path) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(pid) = parsed.get("pid").and_then(|v| v.as_u64()) {
-                    use nix::sys::signal;
-                    use nix::unistd::Pid;
-                    let pid = Pid::from_raw(pid as i32);
-                    if signal::kill(pid, None).is_ok() {
-                        info!(pid = pid.as_raw(), "Stopping server");
-                        let _ = signal::kill(pid, signal::Signal::SIGTERM);
-                        for _ in 0..10 {
-                            if signal::kill(pid, None).is_err() {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        }
-                    }
-                }
-            }
-        }
-        // Clean up server socket and pid unconditionally — old server is dead or dying.
-        let sock = cwd.join(".exo/server.sock");
-        let _ = std::fs::remove_file(&sock);
-        let _ = std::fs::remove_file(&pid_path);
-        info!("Cleaned up server socket and pid");
+        // Stop the running server and verify termination before any destructive
+        // cleanup so it cannot provision ordered controllers during
+        // revalidation or disposal.
+        stop_server_for_recreate(&cwd).await?;
+
+        destroy_recreate_resources(&cwd, &config, recreate_plan, force_recreate).await?;
 
         if session_alive {
             info!(session = %session, "Deleting session (--recreate)");
@@ -5282,22 +5331,184 @@ const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVER_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVER_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-fn server_pid_is_alive(pid_path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(pid_path) else {
-        return false;
+/// The recorded server pid, preserving the distinction between "no record" and
+/// "record that cannot be trusted".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerPidRecord {
+    /// No pid file exists; there is nothing to stop or verify.
+    Absent,
+    /// A pid file exists but is unreadable, malformed, or carries an unsafe pid.
+    Unreadable,
+    /// A plausible server pid.
+    Pid(i32),
+}
+
+fn read_server_pid_record(pid_path: &Path) -> ServerPidRecord {
+    let content = match std::fs::read_to_string(pid_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ServerPidRecord::Absent
+        }
+        Err(_) => return ServerPidRecord::Unreadable,
     };
-    let Ok(parsed) = serde_json::from_str::<Value>(&content) else {
-        return false;
+    let parsed = match serde_json::from_str::<Value>(&content) {
+        Ok(value) => value,
+        Err(_) => return ServerPidRecord::Unreadable,
     };
-    let Some(pid) = parsed
+    match parsed
         .get("pid")
         .and_then(Value::as_u64)
         .and_then(|pid| i32::try_from(pid).ok())
-    else {
+    {
+        // PID 0 signals the caller's whole process group and PID 1 is init;
+        // neither can be a recorded exomonad server.
+        Some(pid) if pid > 1 => ServerPidRecord::Pid(pid),
+        _ => ServerPidRecord::Unreadable,
+    }
+}
+
+fn server_pid_is_alive(pid_path: &Path) -> bool {
+    match read_server_pid_record(pid_path) {
+        ServerPidRecord::Pid(pid) => !pid_is_dead(pid),
+        ServerPidRecord::Absent => false,
+        // Fail closed: an unusable record may still describe a live server.
+        ServerPidRecord::Unreadable => true,
+    }
+}
+
+fn server_socket_is_live(socket_path: &Path) -> bool {
+    // A local Unix connect completes or fails immediately; a stale socket file
+    // yields ECONNREFUSED, while a live listener accepts the connection.
+    std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
+
+fn process_is_zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit(')').next().map(str::to_owned))
+        .and_then(|rest| rest.split_whitespace().next().map(str::to_owned))
+        .is_some_and(|state| state == "Z")
+}
+
+fn pid_is_dead(pid: i32) -> bool {
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Err(nix::errno::Errno::ESRCH) => true,
+        // A zombie has not been reaped yet but will not run again.
+        Ok(()) => process_is_zombie(pid),
+        Err(_) => false,
+    }
+}
+
+/// Verify that a recorded pid still names an exomonad server process.
+///
+/// A stale pid file can be reused by an unrelated process, and signalling that
+/// process would be destructive. The recorded pid is the `exomonad serve`
+/// process, so require both an `exomonad` argv[0] and the `serve` subcommand
+/// before any signal is sent. Argument text alone is forgeable, so the caller
+/// must also confirm the process works in this workspace.
+fn process_looks_like_exomonad_server(pid: i32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
+    let args = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .filter_map(|arg| std::str::from_utf8(arg).ok())
+        .collect::<Vec<_>>();
+    let names_exomonad = args.iter().any(|arg| {
+        Path::new(arg)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "exomonad")
+    });
+    names_exomonad && args.contains(&"serve")
+}
 
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+/// Confirm a live process works in this recreate workspace.
+///
+/// `/proc/<pid>/cwd` is kernel-resolved, so a server that reused the pid from
+/// another project cannot masquerade as this workspace's server.
+fn pid_cwd_matches_workspace(pid: i32, project_dir: &Path) -> bool {
+    let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+        return false;
+    };
+    let Ok(expected) = project_dir.canonicalize() else {
+        return false;
+    };
+    cwd.canonicalize()
+        .is_ok_and(|resolved| resolved == expected)
+}
+
+/// Verify that the recorded pid is this workspace's exomonad server.
+fn process_matches_server_record(pid: i32, project_dir: &Path) -> bool {
+    process_looks_like_exomonad_server(pid) && pid_cwd_matches_workspace(pid, project_dir)
+}
+
+async fn wait_until_pid_dead(pid: i32, deadline: Instant) -> bool {
+    while Instant::now() < deadline {
+        if pid_is_dead(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    pid_is_dead(pid)
+}
+
+/// Stop any running server and verify termination before destructive cleanup.
+///
+/// `--recreate` may only proceed once the previous server is provably gone: a
+/// live, unidentifiable, or unresponsive server would otherwise race the
+/// cleanup and re-provision the resources being removed.
+async fn stop_server_for_recreate(project_dir: &Path) -> Result<()> {
+    let pid_path = project_dir.join(".exo/server.pid");
+    let socket_path = project_dir.join(".exo/server.sock");
+    match read_server_pid_record(&pid_path) {
+        ServerPidRecord::Unreadable => {
+            anyhow::bail!(
+                "refusing --recreate: the server pid record at {} is unreadable or invalid; \
+                 remove it manually and retry",
+                pid_path.display()
+            );
+        }
+        ServerPidRecord::Pid(pid) => {
+            if pid_is_dead(pid) {
+                // The recorded server is already gone; the record is stale.
+            } else if process_matches_server_record(pid, project_dir) {
+                info!(pid, "Stopping server before --recreate");
+                let target = nix::unistd::Pid::from_raw(pid);
+                let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGTERM);
+                if !wait_until_pid_dead(pid, Instant::now() + Duration::from_secs(2)).await {
+                    let _ = nix::sys::signal::kill(target, nix::sys::signal::Signal::SIGKILL);
+                    if !wait_until_pid_dead(pid, Instant::now() + Duration::from_secs(2)).await {
+                        anyhow::bail!(
+                            "refusing --recreate: server pid {pid} did not terminate; \
+                             stop it manually and retry"
+                        );
+                    }
+                }
+            } else {
+                // The pid was reused by an unrelated process or belongs to a
+                // different workspace; never signal it and refuse cleanup.
+                anyhow::bail!(
+                    "refusing --recreate: recorded server pid {pid} does not belong to \
+                     this workspace; remove {} manually and retry",
+                    pid_path.display()
+                );
+            }
+        }
+        ServerPidRecord::Absent => {}
+    }
+    if server_socket_is_live(&socket_path) {
+        anyhow::bail!(
+            "refusing --recreate: a server is still listening on {}; \
+             stop it manually and retry",
+            socket_path.display()
+        );
+    }
+    remove_server_artifact(&socket_path)?;
+    remove_server_artifact(&pid_path)?;
+    info!("Cleaned up server socket and pid");
+    Ok(())
 }
 
 fn remove_server_artifact(path: &Path) -> Result<()> {
@@ -6624,6 +6835,7 @@ mod tests {
         let cleanup = ordered_branch_action(
             ordered_test_spec("main.stage", "main", "stage"),
             ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
+            &[],
         )
         .unwrap();
 
@@ -6639,6 +6851,7 @@ mod tests {
         let worktree_cleanup = ordered_branch_action(
             ordered_test_spec("main.stage", "main", "stage"),
             worktree_observation,
+            &[],
         )
         .unwrap();
         assert!(worktree_cleanup
@@ -6651,6 +6864,7 @@ mod tests {
         let cleanup = ordered_branch_action(
             ordered_test_spec("main.parent.child", "main.parent", "child"),
             ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
+            &[],
         )
         .unwrap();
 
@@ -6663,6 +6877,7 @@ mod tests {
         let cleanup = ordered_branch_action(
             ordered_test_spec("main.stage", "main", "stage"),
             ordered_test_observation(OrderedIdentityState::Mismatched, Some(0)),
+            &[],
         )
         .unwrap();
 
@@ -6679,6 +6894,7 @@ mod tests {
         let unique_cleanup = ordered_branch_action(
             ordered_test_spec("main.stage", "main", "stage"),
             unique.clone(),
+            &[],
         )
         .unwrap();
         assert!(unique_cleanup
@@ -6688,13 +6904,298 @@ mod tests {
         unique.unique_commits = Some(0);
         unique.publications = vec![43];
         unique.protected_publications = vec![43];
-        let published =
-            ordered_branch_action(ordered_test_spec("main.stage", "main", "stage"), unique)
-                .unwrap();
+        let published = ordered_branch_action(
+            ordered_test_spec("main.stage", "main", "stage"),
+            unique,
+            &[],
+        )
+        .unwrap();
         assert!(published
             .gate()
             .is_some_and(|gate| gate.contains("publication evidence")));
         assert!(published.render().contains("#43 [PROTECTED]"));
+    }
+
+    fn write_matching_ordered_identity(project_dir: &Path, spec: &OrderedBranchSpec) {
+        let dir = project_dir.join(".exo/agents").join(&spec.agent_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let value = serde_json::json!({
+            "agent_name": spec.agent_name,
+            "slug": spec.agent_name,
+            "agent_type": "codex",
+            "birth_branch": spec.branch,
+            "parent_branch": spec.parent_branch,
+            "working_dir": spec.identity_worktree,
+            "display_name": format!("🤖 {}", spec.agent_name),
+            "topology": "worktree_per_agent",
+            "model": null,
+            "effort": null,
+            "ledger_owned": true,
+            "slice_id": spec.slice_id,
+        });
+        std::fs::write(
+            dir.join("identity.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scheduled_publication_disposal_authorizes_branch_removal() {
+        let mut observation = ordered_test_observation(OrderedIdentityState::Missing, Some(0));
+        observation.publications = vec![43];
+        observation.protected_publications = vec![43];
+
+        let cleanup = ordered_branch_action(
+            ordered_test_spec("main.stage", "main", "stage"),
+            observation,
+            &[43],
+        )
+        .unwrap();
+
+        assert_eq!(cleanup.action, OrderedBranchAction::Remove);
+    }
+
+    fn write_published_head(project_dir: &Path, publication: &PublishedHead) {
+        let dir = project_dir.join(".exo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let document = serde_json::json!({
+            "schema_version": 2,
+            "heads": [publication],
+        });
+        std::fs::write(
+            dir.join("published-heads.json"),
+            serde_json::to_string_pretty(&document).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn ordered_repo_spec(project_dir: &Path, branch: &str) -> OrderedBranchSpec {
+        let agent_name = branch.rsplit('.').next().unwrap().to_owned();
+        OrderedBranchSpec {
+            branch: branch.to_owned(),
+            parent_branch: "main".to_owned(),
+            slice_id: agent_name.clone(),
+            identity_worktree: project_dir.join(".exo/worktrees").join(&agent_name),
+            worktree: project_dir.join(".exo/worktrees").join(&agent_name),
+            agent_name,
+        }
+    }
+
+    fn init_ordered_repo() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(temp.path().join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"]);
+        run_git(&["commit", "-q", "-m", "seed"]);
+        run_git(&["branch", "main.stage"]);
+        temp
+    }
+
+    fn ordered_repo_plan(spec: OrderedBranchSpec) -> RecreatePlan {
+        RecreatePlan {
+            worktrees: Vec::new(),
+            ordered_branches: vec![OrderedBranchCleanup {
+                spec,
+                observation: ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
+                action: OrderedBranchAction::Remove,
+            }],
+            prs_to_close: Vec::new(),
+            prs_to_remove: Vec::new(),
+            protected: Vec::new(),
+            dirty_worktrees: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn merged_publication_record_does_not_block_branch_cleanup() {
+        let temp = init_ordered_repo();
+        let spec = ordered_repo_spec(temp.path(), "main.stage");
+        write_published_head(
+            temp.path(),
+            &test_publication("stage", "invocation", "main.stage", "stage"),
+        );
+        let mut plan = ordered_repo_plan(spec);
+        // A merged or already-closed PR has nothing to close, but its record is
+        // still scheduled for removal, so it must not gate branch cleanup.
+        plan.prs_to_remove = vec![43];
+
+        destroy_recreate_resources(temp.path(), &Config::default(), &plan, false)
+            .await
+            .unwrap();
+
+        assert!(!git_branch_exists(temp.path(), "main.stage").unwrap());
+    }
+
+    #[tokio::test]
+    async fn publication_closure_failure_preserves_ordered_branch() {
+        let temp = init_ordered_repo();
+        let spec = ordered_repo_spec(temp.path(), "main.stage");
+        write_published_head(
+            temp.path(),
+            &test_publication("stage", "invocation", "main.stage", "stage"),
+        );
+        let mut plan = ordered_repo_plan(spec);
+        plan.prs_to_close = vec![43];
+        plan.prs_to_remove = vec![43];
+
+        let error = destroy_recreate_resources(temp.path(), &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+
+        // PR closure is attempted before local ownership removal, so any
+        // closure failure (client, repository resolution, or the API call)
+        // leaves the branch in place for a safe retry.
+        let _ = error;
+        assert!(git_branch_exists(temp.path(), "main.stage").unwrap());
+    }
+
+    #[test]
+    fn interrupted_disposal_identity_residue_is_provably_disposable() {
+        let mut observation = ordered_test_observation(OrderedIdentityState::Matching, None);
+        observation.branch_exists = false;
+        observation.agent_dir_exists = true;
+
+        let cleanup = ordered_branch_action(
+            ordered_test_spec("main.stage", "main", "stage"),
+            observation,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(cleanup.action, OrderedBranchAction::Remove);
+    }
+
+    #[tokio::test]
+    async fn interrupted_disposal_is_completed_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(temp.path().join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"]);
+        run_git(&["commit", "-q", "-m", "seed"]);
+        run_git(&["branch", "main.stage"]);
+
+        let spec = OrderedBranchSpec {
+            branch: "main.stage".to_owned(),
+            parent_branch: "main".to_owned(),
+            agent_name: "stage".to_owned(),
+            slice_id: "stage".to_owned(),
+            identity_worktree: temp.path().join(".exo/worktrees/stage"),
+            worktree: temp.path().join(".exo/worktrees/stage"),
+        };
+        write_matching_ordered_identity(temp.path(), &spec);
+        // Simulate a crash after the branch was deleted but before the durable
+        // identity was removed.
+        run_git(&["branch", "-D", "main.stage"]);
+
+        let plan = RecreatePlan {
+            worktrees: Vec::new(),
+            ordered_branches: vec![OrderedBranchCleanup {
+                spec: spec.clone(),
+                observation: ordered_test_observation(OrderedIdentityState::Matching, None),
+                action: OrderedBranchAction::Remove,
+            }],
+            prs_to_close: Vec::new(),
+            prs_to_remove: Vec::new(),
+            protected: Vec::new(),
+            dirty_worktrees: Vec::new(),
+        };
+
+        destroy_recreate_resources(temp.path(), &Config::default(), &plan, false)
+            .await
+            .unwrap();
+
+        let identity = temp.path().join(".exo/agents/stage/identity.json");
+        assert!(!identity.exists());
+    }
+
+    #[tokio::test]
+    async fn gate_in_later_branch_preserves_earlier_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(temp.path().join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"]);
+        run_git(&["commit", "-q", "-m", "seed"]);
+        run_git(&["branch", "main.first"]);
+        run_git(&["branch", "main.second"]);
+        run_git(&["checkout", "-q", "main.second"]);
+        std::fs::write(temp.path().join("unique"), "unique\n").unwrap();
+        run_git(&["add", "unique"]);
+        run_git(&["commit", "-q", "-m", "unique"]);
+        run_git(&["checkout", "-q", "main"]);
+
+        let first = OrderedBranchSpec {
+            branch: "main.first".to_owned(),
+            parent_branch: "main".to_owned(),
+            agent_name: "first".to_owned(),
+            slice_id: "first".to_owned(),
+            identity_worktree: temp.path().join(".exo/worktrees/first"),
+            worktree: temp.path().join(".exo/worktrees/first"),
+        };
+        let second = OrderedBranchSpec {
+            branch: "main.second".to_owned(),
+            parent_branch: "main".to_owned(),
+            agent_name: "second".to_owned(),
+            slice_id: "second".to_owned(),
+            identity_worktree: temp.path().join(".exo/worktrees/second"),
+            worktree: temp.path().join(".exo/worktrees/second"),
+        };
+        let plan = RecreatePlan {
+            worktrees: Vec::new(),
+            ordered_branches: vec![
+                OrderedBranchCleanup {
+                    spec: first,
+                    observation: ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
+                    action: OrderedBranchAction::Remove,
+                },
+                OrderedBranchCleanup {
+                    spec: second,
+                    observation: ordered_test_observation(OrderedIdentityState::Missing, Some(1)),
+                    action: OrderedBranchAction::Remove,
+                },
+            ],
+            prs_to_close: Vec::new(),
+            prs_to_remove: Vec::new(),
+            protected: Vec::new(),
+            dirty_worktrees: Vec::new(),
+        };
+
+        let error = destroy_recreate_resources(temp.path(), &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("main.second"));
+        // Revalidation of the later branch must complete before any mutation.
+        assert!(git_branch_exists(temp.path(), "main.first").unwrap());
     }
 
     #[tokio::test]
@@ -6737,10 +7238,10 @@ mod tests {
             dirty_worktrees: Vec::new(),
         };
 
-        destroy_recreate_resources(temp.path(), &Config::default(), &plan)
+        destroy_recreate_resources(temp.path(), &Config::default(), &plan, false)
             .await
             .unwrap();
-        destroy_recreate_resources(temp.path(), &Config::default(), &plan)
+        destroy_recreate_resources(temp.path(), &Config::default(), &plan, false)
             .await
             .unwrap();
         assert!(!git_branch_exists(temp.path(), "main.stage").unwrap());
@@ -6772,7 +7273,7 @@ mod tests {
         )
         .unwrap();
 
-        let plan = build_recreate_plan(temp.path(), &Config::default())
+        let plan = build_recreate_plan(temp.path(), &Config::default(), false)
             .await
             .unwrap();
 
@@ -7681,6 +8182,180 @@ mod tests {
         prepare_server_socket_for_start(project.path()).unwrap();
 
         assert!(socket_path.exists());
+        assert!(pid_path.exists());
+    }
+
+    #[test]
+    fn read_server_pid_record_distinguishes_absent_from_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("server.pid");
+
+        assert_eq!(read_server_pid_record(&pid_path), ServerPidRecord::Absent);
+        // PID 0 would signal the caller's process group; PID 1 is init.
+        for document in [
+            r#"{"pid":0}"#,
+            r#"{"pid":1}"#,
+            r#"{"pid":4294967295}"#,
+            r#"{"pid":"abc"}"#,
+            r#"{"role":"server"}"#,
+            "not a pid document",
+        ] {
+            std::fs::write(&pid_path, document).unwrap();
+            assert_eq!(
+                read_server_pid_record(&pid_path),
+                ServerPidRecord::Unreadable,
+                "document must be rejected: {document}"
+            );
+        }
+        std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, std::process::id())).unwrap();
+        assert_eq!(
+            read_server_pid_record(&pid_path),
+            ServerPidRecord::Pid(std::process::id() as i32)
+        );
+    }
+
+    #[tokio::test]
+    async fn recreate_removes_stale_server_artifacts() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let socket_path = exo_dir.join("server.sock");
+        let pid_path = exo_dir.join("server.pid");
+        std::fs::write(&socket_path, "stale socket placeholder").unwrap();
+        std::fs::write(&pid_path, r#"{"pid":2147483647}"#).unwrap();
+
+        stop_server_for_recreate(project.path()).await.unwrap();
+
+        assert!(!socket_path.exists());
+        assert!(!pid_path.exists());
+    }
+
+    #[tokio::test]
+    async fn recreate_stops_live_server_pid_before_cleanup() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let pid_path = exo_dir.join("server.pid");
+        // argv and cwd carry the exomonad/serve/workspace identity the shutdown
+        // verification requires, and the shell terminates on SIGTERM.
+        let mut server = std::process::Command::new("sh")
+            .current_dir(project.path())
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .arg("exomonad")
+            .arg("serve")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, server.id())).unwrap();
+
+        stop_server_for_recreate(project.path()).await.unwrap();
+
+        let status = server.wait().unwrap();
+        assert!(
+            !status.success(),
+            "the verified server process must have been signalled"
+        );
+        assert!(!pid_path.exists());
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_cleanup_when_pid_is_reused_by_unrelated_process() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let pid_path = exo_dir.join("server.pid");
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, unrelated.id())).unwrap();
+
+        let error = stop_server_for_recreate(project.path()).await.unwrap_err();
+
+        assert!(error.to_string().contains("refusing --recreate"));
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "an unrelated process that reused the pid must never be signalled"
+        );
+        assert!(pid_path.exists());
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_cleanup_when_server_pid_is_in_another_workspace() {
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let pid_path = exo_dir.join("server.pid");
+        // A real exomonad serve argv, but running in a different workspace.
+        let mut other_server = std::process::Command::new("sh")
+            .current_dir(other.path())
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .arg("exomonad")
+            .arg("serve")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, other_server.id())).unwrap();
+
+        let error = stop_server_for_recreate(project.path()).await.unwrap_err();
+
+        assert!(error.to_string().contains("refusing --recreate"));
+        assert!(
+            other_server.try_wait().unwrap().is_none(),
+            "a server in another workspace must never be signalled"
+        );
+        assert!(pid_path.exists());
+        let _ = other_server.kill();
+        let _ = other_server.wait();
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_cleanup_when_live_socket_has_no_verifiable_pid() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let socket_path = exo_dir.join("server.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        let error = stop_server_for_recreate(project.path()).await.unwrap_err();
+
+        assert!(error.to_string().contains("refusing --recreate"));
+        assert!(
+            socket_path.exists(),
+            "a live server socket must not be removed when termination is unverified"
+        );
+        assert!(!exo_dir.join("server.pid").exists());
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_cleanup_when_pid_record_is_invalid() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let pid_path = exo_dir.join("server.pid");
+        // No listening socket: an invalid record must still stop cleanup.
+        std::fs::write(&pid_path, "not a pid document").unwrap();
+
+        let error = stop_server_for_recreate(project.path()).await.unwrap_err();
+
+        assert!(error.to_string().contains("refusing --recreate"));
+        assert!(pid_path.exists());
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_cleanup_when_pid_record_is_zero() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let pid_path = exo_dir.join("server.pid");
+        std::fs::write(&pid_path, r#"{"pid":0}"#).unwrap();
+
+        let error = stop_server_for_recreate(project.path()).await.unwrap_err();
+
+        assert!(error.to_string().contains("refusing --recreate"));
         assert!(pid_path.exists());
     }
 

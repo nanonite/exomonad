@@ -102,6 +102,17 @@ tl-loop-ordered-server-e2e:
     nix develop --command cargo build -p exomonad
     {{py}} tests/e2e/ordered-recursive/real_server_transport.py
 
+# Run the ordered TL recovery acceptance against a real server in a disposable
+# repository: failed child startup + safe continuation, and --recreate followed
+# by a same-plan restart (chainlink #1100/#1103).
+tl-loop-ordered-recovery-e2e:
+    nix develop --command cargo build -p exomonad
+    {{py}} tests/e2e/ordered-recursive/ordered_recovery_acceptance.py
+
+# Check the ordered recovery acceptance harness without launching a server.
+check-e2e-ordered-recovery:
+    {{py}} -m py_compile tests/e2e/ordered-recursive/ordered_recovery_acceptance.py
+
 # Run only the bounded merge-restart acceptance probes against the real server.
 tl-loop-merge-convergence-e2e:
     nix develop --command cargo build -p exomonad

@@ -535,6 +535,21 @@ class RunStore:
         """Persist a diagnostic-only controller exit reason outside run state."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
         payload = {"reason": reason, "recorded_at": time.time()}
+        try:
+            state = self.load()
+        except (OSError, ValueError):
+            state = None
+        if state is not None:
+            payload["checkpoint_version"] = state.version
+            payload["checkpoint_revision"] = state.revision
+            payload["checkpoint_state_version"] = state.state_version
+            phase = getattr(state, "recursive_fsm", None)
+            failure_reason = getattr(phase, "reason", None)
+            if isinstance(failure_reason, str) and failure_reason:
+                payload["checkpoint_failure_reason"] = failure_reason
+            phase_value = getattr(getattr(state, "fsm", None), "phase", None)
+            if phase_value is not None:
+                payload["checkpoint_phase"] = getattr(phase_value, "value", str(phase_value))
         if error is not None:
             payload["error_chain"] = list(_exception_chain(error))
             context = _exception_context(error)

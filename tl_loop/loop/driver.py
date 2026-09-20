@@ -895,6 +895,7 @@ def run_tl_loop(
                     f"{persisted_manifest.digest} differs from supplied plan digest "
                     f"{candidate.digest}; archive the completed run before starting a new plan"
                 )
+        terminal_recovery_reopened = False
         if (
             selected.session_mode == "continue"
             and isinstance(existing_state.recursive_fsm, RecursiveTLFailed)
@@ -942,6 +943,7 @@ def run_tl_loop(
                     branch=existing_state.owner_branch or selected.branch,
                     worktree=existing_state.owner_worktree or selected.worktree,
                 )
+                terminal_recovery_reopened = True
         if selected.ordered_recovery and isinstance(existing_state.recursive_fsm, RecursiveTLFailed):
             recovery_plan = (
                 plan
@@ -956,29 +958,34 @@ def run_tl_loop(
                 store,
                 None,
             )
-        if existing_state.reducer_version != REDUCER_VERSION:
-            raise TLLoopError(
-                f"checkpoint reducer_version {existing_state.reducer_version} is incompatible "
-                f"with reducer {REDUCER_VERSION}"
+            terminal_recovery_reopened = True
+        # Fall through to the live loop when a recovery reopened this terminal
+        # checkpoint so the recovered child is actually relaunched in this
+        # invocation instead of requiring a second controller call.
+        if not terminal_recovery_reopened:
+            if existing_state.reducer_version != REDUCER_VERSION:
+                raise TLLoopError(
+                    f"checkpoint reducer_version {existing_state.reducer_version} is incompatible "
+                    f"with reducer {REDUCER_VERSION}"
+                )
+            terminal_ledger_id = selected.ledger_run_id or existing_state.ledger_run_id
+            terminal_log: list[EffectIntent] = (
+                EffectJournal(run_id, store.run_dir / "action-journal.json")
+                if terminal_ledger_id is not None
+                else []
             )
-        terminal_ledger_id = selected.ledger_run_id or existing_state.ledger_run_id
-        terminal_log: list[EffectIntent] = (
-            EffectJournal(run_id, store.run_dir / "action-journal.json")
-            if terminal_ledger_id is not None
-            else []
-        )
-        return TLRunResult(
-            existing_state,
-            (),
-            (),
-            (),
-            (),
-            {
-                "reducer_version": existing_state.reducer_version,
-                "cursor": existing_state.events.last_consumed_offset,
-            },
-            _journal_entries(terminal_log),
-        )
+            return TLRunResult(
+                existing_state,
+                (),
+                (),
+                (),
+                (),
+                {
+                    "reducer_version": existing_state.reducer_version,
+                    "cursor": existing_state.events.last_consumed_offset,
+                },
+                _journal_entries(terminal_log),
+            )
     manifest: PlanManifest
     if existing_state is not None and existing_state.plan_manifest is not None:
         persisted_manifest = existing_state.plan_manifest
@@ -1685,11 +1692,17 @@ def _ordered_child_recovery_reason(
         return "parent child branch or worktree does not match the declared owner"
     if (
         not parent_slice.dispatch_intent_id
-        or not parent_slice.dispatch_agent_id
         or parent_slice.dispatch_authoritative_event_seq is None
         or parent_slice.dispatch_last_boundary != "sub_tl_started"
     ):
         return "accepted ordered-child dispatch intent is not durably reconciled"
+    expected_controller = _child_controller_name(task)
+    if parent_slice.dispatch_agent_id != expected_controller:
+        return (
+            "accepted ordered-child dispatch identity "
+            f"{parent_slice.dispatch_agent_id!r} does not match the declared controller "
+            f"{expected_controller!r}"
+        )
     if parent_slice.pr_number is not None or parent_slice.publication is not None:
         return "parent child has publication evidence requiring integration reconciliation"
     if child_state.run_id != task.name:
@@ -1717,6 +1730,9 @@ def _ordered_child_recovery_reason(
     exit_reason = diagnostic.get("reason") if isinstance(diagnostic, Mapping) else None
     if not isinstance(exit_reason, str) or not exit_reason:
         return "durable child exit diagnostic is missing"
+    binding_error = _ordered_exit_diagnostic_binding_error(diagnostic, child_state)
+    if binding_error is not None:
+        return binding_error
     if not _retryable_ordered_exit_reason(exit_reason):
         return f"child exit is not a retryable startup, transport, or process failure: {exit_reason}"
     integration = child_state.integration
@@ -1758,6 +1774,33 @@ def _ordered_child_recovery_reason(
     return None
 
 
+def _ordered_exit_diagnostic_binding_error(
+    diagnostic: Mapping[str, object] | None,
+    child_state: RunState,
+) -> str | None:
+    """Fail closed when a diagnostic marker predates or contradicts the checkpoint.
+
+    ``controller-exit.json`` is written as a diagnostic side file, so it is not
+    itself authoritative. Recovery may only trust it when it was recorded
+    against the exact child checkpoint being considered: a stale marker from an
+    older transient failure must never reopen a newer nonretryable failure.
+    """
+    if not isinstance(diagnostic, Mapping):
+        return "durable child exit diagnostic is missing"
+    bound_revision = diagnostic.get("checkpoint_revision")
+    if type(bound_revision) is not int or bound_revision != child_state.revision:
+        return (
+            "durable child exit diagnostic is not bound to the current child "
+            "checkpoint revision"
+        )
+    if not isinstance(child_state.recursive_fsm, RecursiveTLFailed):
+        return "child checkpoint is not an authoritative recursive failure"
+    bound_reason = diagnostic.get("checkpoint_failure_reason")
+    if not isinstance(bound_reason, str) or bound_reason != child_state.recursive_fsm.reason:
+        return "durable child exit diagnostic does not match the child checkpoint failure reason"
+    return None
+
+
 def _retryable_ordered_exit_reason(reason: str) -> bool:
     """Recognize only transient controller-boundary failures for retry."""
     lowered = reason.lower()
@@ -1765,7 +1808,19 @@ def _retryable_ordered_exit_reason(reason: str) -> bool:
         marker in lowered
         for marker in (
             "identity conflict",
-            "branch already exists",
+            "conflicts with existing ownership",
+            "ownership conflict",
+            "already exists",
+            "already-owned",
+            "without matching durable identity",
+            "identity or workspace",
+            "http 400",
+            "http 401",
+            "http 403",
+            "http 404",
+            "http 409",
+            "status 409",
+            " 409",
             "plan manifest",
             "depth ceiling",
             "cancelled explicitly",
@@ -1781,7 +1836,11 @@ def _retryable_ordered_exit_reason(reason: str) -> bool:
             "controller exited before authoritative resolution",
             "controller exited",
             "transport",
-            "server returned http",
+            "server returned http 429",
+            "server returned http 500",
+            "server returned http 502",
+            "server returned http 503",
+            "server returned http 504",
             "server socket",
             "server timeout",
             "connection",
@@ -7843,6 +7902,38 @@ def _run_live_sub_tl_batch(
     return tuple(outcomes_by_name[task.name] for task in tasks)
 
 
+def _persist_child_startup_failure(child_store: RunStore, reason: str) -> None:
+    """Durably record a live child controller failure before its diagnostic.
+
+    A child that dies before authoritative resolution otherwise leaves a
+    non-terminal checkpoint, which makes the recovery proof impossible because
+    recovery requires an authoritative recursive failure. The failure
+    checkpoint is also the revision the controller-exit diagnostic binds to.
+    """
+    load = getattr(child_store, "load", None)
+    checkpoint = getattr(child_store, "checkpoint", None)
+    if load is None or checkpoint is None:
+        return
+    try:
+        state = load()
+    except (OSError, ValueError):
+        return
+    if _is_terminal_phase(_phase_from_state(state)):
+        return
+    try:
+        checkpoint(
+            _failure_phase(state, reason),
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+        )
+    except (OSError, ValueError, TLLoopError):
+        return
+
+
 def _supervise_live_sub_tl(
     process: multiprocessing.Process,
     child_store: RunStore,
@@ -7893,10 +7984,9 @@ def _supervise_live_sub_tl(
             }
             and not empty_scope
         ):
-            _record_child_exit_reason(
-                child_store,
-                f"sub-TL controller exited before authoritative resolution with code {exitcode}"
-            )
+            reason = f"sub-TL controller exited before authoritative resolution with code {exitcode}"
+            _persist_child_startup_failure(child_store, reason)
+            _record_child_exit_reason(child_store, reason)
             return None
     try:
         return child_store.load()
@@ -7950,10 +8040,9 @@ def _run_live_sub_tl(
         result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
         final_state = getattr(result, "final_state", None)
         if final_state is not None and not _child_handoff_ready(final_state, store.run_id):
-            reason = "sub-TL controller returned before authoritative resolution"
-            _record_child_exit_reason(child_store, reason)
-            raise TLLoopError(reason)
+            raise TLLoopError("sub-TL controller returned before authoritative resolution")
     except Exception as error:
+        _persist_child_startup_failure(child_store, str(error))
         _record_child_exit_reason(child_store, str(error), error=error)
         raise
     finally:
@@ -8027,14 +8116,41 @@ def _child_handoff_ready(state: RunState, parent_run_id: str) -> bool:
     }
 
 
+def _exit_marker_matches_checkpoint(
+    diagnostic: Mapping[str, object] | None,
+    child_store: RunStore,
+) -> bool:
+    """Return whether a diagnostic marker is already bound to the live checkpoint."""
+    if not isinstance(diagnostic, Mapping):
+        return False
+    bound_revision = diagnostic.get("checkpoint_revision")
+    if type(bound_revision) is not int:
+        return False
+    load = getattr(child_store, "load", None)
+    if load is None:
+        return False
+    try:
+        state = load()
+    except (OSError, ValueError):
+        return False
+    return bound_revision == state.revision
+
+
 def _record_child_exit_reason(
     child_store: RunStore,
     reason: str,
     *,
     error: BaseException | None = None,
 ) -> None:
-    """Keep the first durable child diagnostic intact across supervision."""
-    if getattr(child_store, "exit_diagnostics", lambda: None)() is not None:
+    """Keep the diagnostic for the current failure, replacing a stale one.
+
+    A marker is only retained while it is bound to the checkpoint revision it
+    was recorded against. Once a newer failure checkpoint exists, the marker is
+    rewritten so a later ``--continue`` cannot read the older transient reason.
+    """
+    diagnostics = getattr(child_store, "exit_diagnostics", None)
+    existing = diagnostics() if diagnostics is not None else None
+    if _exit_marker_matches_checkpoint(existing, child_store):
         return
     if error is None:
         child_store.record_exit_reason(reason)

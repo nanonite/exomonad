@@ -29,6 +29,16 @@ reuses the existing child checkpoint and dispatch records. A repeated
 `--continue` therefore does not spawn a second child or repeat a confirmed
 effect.
 
+Recovery decides only from durable checkpoint evidence. A live child controller
+that exits before authoritative resolution persists its own recursive failure
+checkpoint, so the crash is resumable instead of leaving a running checkpoint.
+The `controller-exit.json` marker is diagnostic, so `--continue` trusts it only
+when it is bound to the exact child checkpoint revision and failure reason it
+was recorded against; a new failure rewrites the marker. A stale marker from an
+older transient failure therefore cannot reopen a newer nonretryable failure,
+and the recovered child is relaunched in the same invocation instead of
+requiring a second controller call.
+
 The controller keeps `tl_failed` and opens a named
 `tl-ordered-child-recovery-<child>` gate when any proof is missing or
 conflicting. Missing child state, an identity mismatch, an unresolved action
@@ -36,3 +46,27 @@ journal entry, completed merge evidence, or an unsafe child failure must be
 resolved by the operator through the appropriate recovery or recreate path.
 Answering that gate does not authorize the controller to guess ownership or
 discard resources.
+
+## Recreate publication authorization
+
+`--recreate` may remove an ordered-controller branch only when every
+publication it owns is scheduled for disposal by the same plan and, for a
+protected PR, `--force-recreate` was supplied. An unprotected PR that the plan
+closes, and a merged or already-closed PR whose record the plan removes, no
+longer block branch cleanup; `--force-recreate` authorizes the planned disposal
+of a protected one. The running server is stopped before destructive cleanup,
+and cleanup proceeds only once termination is verified. The recorded pid must
+be plausible (PID 0 and PID 1 are rejected), parse as a real record
+(malformed, unreadable, and absent records are distinguished), and still
+resolve to an `exomonad serve` process whose kernel-resolved working directory
+is this workspace before it is signalled, so a reused pid, a process in another
+workspace, and a forgeable argument string are never terminated. An alive pid
+that cannot be verified against this record and workspace makes `--recreate`
+refuse cleanup rather than risk an unrelated process. A server pid that does
+not exit, an invalid or unreadable record, or a socket that still accepts
+connections likewise refuses and leaves all artifacts in place. All
+ordered branches are then revalidated before any worktree, branch, or identity
+is removed, and published PRs are closed before local ownership is removed so a
+closure failure leaves the branch and identity intact for a safe retry. Cleanup
+tolerates a crash between branch deletion and identity removal by completing
+the interrupted disposal on the next run.

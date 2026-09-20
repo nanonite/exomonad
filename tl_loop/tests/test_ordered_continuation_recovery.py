@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,11 +18,14 @@ from tl_loop.loop.driver import (
     TLLoopConfig,
     WorkPlan,
     _bind_initial_slices,
+    _ensure_canonical_scope,
     _initial_slices,
     _manifest_for_plan,
     _ordered_terminal_recovery_decision,
+    _release_canonical_scope,
     _reopen_ordered_scope,
     _sub_tl_worktree,
+    _supervise_live_sub_tl,
     run_tl_loop,
 )
 from tl_loop.ordered import IntegrationLifecycle
@@ -45,6 +49,15 @@ class EmptyQueue:
     def acknowledge(self, event: EventEnvelope) -> int:
         del event
         raise AssertionError("terminal recovery should not acknowledge events")
+
+
+class _ExitedProcess:
+    """Stand-in for a child controller that exited before authoritative resolution."""
+
+    exitcode = 1
+
+    def is_alive(self) -> bool:
+        return False
 
 
 def _failed_ordered_run(
@@ -131,7 +144,8 @@ def _failed_ordered_run(
         root_dir=parent_store.run_dir,
     )
     child_store = RunStore("child", parent_store.run_dir)
-    child_state = child_store.load()
+    child_state = _ensure_canonical_scope(child_store.load(), child_manifest, child_store)
+    child_state = _release_canonical_scope(child_state, child_store)
     if child_status is not SliceStatus.PENDING:
         leaf = replace(
             child_state.slices["leaf"],
@@ -161,14 +175,10 @@ def _failed_ordered_run(
             child_state.budgets,
             child_state.events.last_consumed_offset,
         )
-    child_store.checkpoint(
-        TLFailed("sub-TL controller exited before authoritative resolution"),
-        child_state.slices,
-        child_state.budgets,
-        0,
-        integration=child_state.integration,
-    )
-    child_store.record_exit_reason("sub-TL controller exited before authoritative resolution")
+    # Exercise the live crash path: a child controller that exits before
+    # authoritative resolution must persist a recursive failure checkpoint and
+    # a diagnostic bound to that exact checkpoint.
+    _supervise_live_sub_tl(_ExitedProcess(), child_store, config)
     return parent_store, plan, config
 
 
@@ -277,13 +287,18 @@ def test_continue_recovers_from_manifest_without_reloading_plan(
     effects = ReadOnlyEffectClient(
         EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
     )
+    calls: list[str] = []
 
-    monkeypatch.setattr(driver, "_run_sub_tls", lambda _plan, state, *_args: state)
-    monkeypatch.setattr(
-        driver,
-        "_run_loop",
-        lambda *args: driver.TLRunResult(args[6], (), (), ()),
-    )
+    def record_sub_tls(_plan, state, *_args):
+        calls.append("sub_tls")
+        return state
+
+    def record_loop(*args):
+        calls.append("loop")
+        return driver.TLRunResult(args[6], (), (), ())
+
+    monkeypatch.setattr(driver, "_run_sub_tls", record_sub_tls)
+    monkeypatch.setattr(driver, "_run_loop", record_loop)
     result = run_tl_loop(
         "parent",
         None,
@@ -296,3 +311,154 @@ def test_continue_recovers_from_manifest_without_reloading_plan(
 
     assert isinstance(result.final_state.recursive_fsm, TLRunning)
     assert result.final_state.slices["child"].status is SliceStatus.SPAWNED
+    # A recovered terminal checkpoint must fall through and actually relanch
+    # the child in the same invocation, not return and wait for another call.
+    assert calls == ["sub_tls", "loop"]
+
+
+def test_premature_child_exit_persists_recursive_failure(tmp_path: Path) -> None:
+    parent_store, _plan, _config = _failed_ordered_run(tmp_path)
+
+    child_state = RunStore("child", parent_store.run_dir).load()
+
+    assert isinstance(child_state.recursive_fsm, TLFailed)
+    assert "exited before authoritative resolution" in child_state.recursive_fsm.reason
+    diagnostic = RunStore("child", parent_store.run_dir).exit_diagnostics()
+    assert diagnostic is not None
+    assert diagnostic["checkpoint_revision"] == child_state.revision
+
+
+def test_new_failure_replaces_stale_exit_marker(tmp_path: Path) -> None:
+    parent_store, _plan, _config = _failed_ordered_run(tmp_path)
+    child_store = RunStore("child", parent_store.run_dir)
+    stale = child_store.exit_diagnostics()
+    assert stale is not None
+    child_state = child_store.load()
+    child_store.checkpoint(
+        TLFailed("sub-TL controller completed an unsafe merge"),
+        child_state.slices,
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+        integration=child_state.integration,
+    )
+
+    driver._record_child_exit_reason(
+        child_store, "sub-TL controller completed an unsafe merge"
+    )
+
+    refreshed = child_store.exit_diagnostics()
+    assert refreshed is not None
+    assert refreshed["checkpoint_revision"] != stale["checkpoint_revision"]
+    assert refreshed["checkpoint_failure_reason"] == "sub-TL controller completed an unsafe merge"
+    assert refreshed["reason"] == "sub-TL controller completed an unsafe merge"
+
+
+def test_repeated_continuation_does_not_reopen_twice(tmp_path: Path) -> None:
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+    assert decision is not None and decision.recoverable is True
+
+    reopened = _reopen_ordered_scope(
+        parent_store.load(), plan, parent_store, decision.task_name
+    )
+    # The second continuation observes a running scope, so it can neither
+    # reopen again nor mint a second dispatch intent.
+    assert (
+        _ordered_terminal_recovery_decision(reopened, plan, config, parent_store) is None
+    )
+    assert reopened.slices["child"].dispatch_intent_id == "sub-tl-dispatch"
+
+
+def test_exact_ownership_conflict_is_not_retryable() -> None:
+    conflict = (
+        "ExoMonad server returned HTTP 409: ordered sub-TL identity or workspace "
+        "conflicts with existing ownership"
+    )
+    assert driver._retryable_ordered_exit_reason(conflict) is False
+    assert (
+        driver._retryable_ordered_exit_reason(
+            "ExoMonad server returned HTTP 409: ordered sub-TL branch already exists "
+            "without matching durable identity"
+        )
+        is False
+    )
+    assert (
+        driver._retryable_ordered_exit_reason(
+            "ExoMonad server returned HTTP 503: upstream unavailable"
+        )
+        is True
+    )
+
+
+def test_unbound_stale_exit_marker_cannot_reopen_newer_failure(
+    tmp_path: Path,
+) -> None:
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    child_store = RunStore("child", parent_store.run_dir)
+    # A diagnostic marker that is not bound to the current checkpoint (for
+    # example an older transient exit) must not authorize recovery.
+    child_store.exit_reason_path.write_text(
+        json.dumps(
+            {
+                "reason": "sub-TL controller exited before authoritative resolution",
+                "recorded_at": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert decision is not None
+    assert decision.recoverable is False
+    assert "not bound to the current child checkpoint revision" in decision.reason
+
+
+def test_stale_exit_reason_cannot_reopen_newer_failure(tmp_path: Path) -> None:
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    child_store = RunStore("child", parent_store.run_dir)
+    child_state = child_store.load()
+    # A newer, nonretryable failure checkpoint written after the old transient
+    # diagnostic marker leaves that marker's bound failure reason stale.
+    child_store.checkpoint(
+        TLFailed("sub-TL controller completed an unsafe merge"),
+        child_state.slices,
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+        integration=child_state.integration,
+    )
+
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert decision is not None
+    assert decision.recoverable is False
+    assert "durable child exit diagnostic" in decision.reason
+
+
+def test_wrong_controller_identity_is_not_recoverable(tmp_path: Path) -> None:
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    state = parent_store.load()
+    child = replace(state.slices["child"], dispatch_agent_id="wrong-controller")
+    parent_store.checkpoint(
+        state.recursive_fsm,
+        {"child": child},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert decision is not None
+    assert decision.recoverable is False
+    assert "does not match the declared controller" in decision.reason
