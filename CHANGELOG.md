@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Self-heal a stale reviewer action after an exact-head verdict, without manual run.json repair (#1042)
 - Refactor SliceState into a single slice_transition reducer (mirroring tl_loop/fsm), fixing stale action bookkeeping blocking merge (#1041)
 - Fix reviewer verdict authorization under the shared reviewer account and --continue recovery (#1040)
 - Fix ordered sub-TL controller identity before first server effect (#1097)
