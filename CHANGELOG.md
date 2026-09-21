@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix reviewer verdict authorization under the shared reviewer account and --continue recovery (#1040)
 - Fix ordered sub-TL controller identity before first server effect (#1097)
 - Fix continuation recovery of failed ordered TL checkpoints (#1102)
 - Fix recreate cleanup of ordered child branch ownership (#1101)
