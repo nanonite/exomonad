@@ -510,6 +510,70 @@ def test_archived_nonterminal_child_does_not_claim_recreated_worktree(tmp_path: 
     assert archived_run.read_bytes() == archived_bytes
 
 
+def test_run_id_cannot_use_reserved_archive_prefix(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="reserved recreate-archive prefix"):
+        create(
+            "root.invalid-live-child",
+            {"owner_branch": "main.lookalike", "owner_worktree": str(tmp_path / "shared")},
+            root_dir=tmp_path,
+        )
+
+
+def test_nested_archive_like_child_still_blocks_duplicate_ownership(tmp_path: Path) -> None:
+    tl_root = tmp_path / ".exo" / "tl-loop"
+    shared_worktree = str(tmp_path / ".worktrees" / "shared")
+    create(
+        "root",
+        {"owner_branch": "main", "owner_worktree": str(tmp_path / ".worktrees" / "root")},
+        root_dir=tl_root,
+    )
+    lookalike = tl_root / "root" / "root.invalid-live-child"
+    lookalike.mkdir(parents=True)
+    (lookalike / "run.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision": 1,
+                "run_id": "root.invalid-live-child",
+                "owner_worktree": shared_worktree,
+                "fsm": {"phase": TLPhase.TLRunning.value, "waiting": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorktreeClaimError, match="already claimed"):
+        create(
+            "sibling",
+            {"owner_branch": "main.sibling", "owner_worktree": shared_worktree},
+            root_dir=tl_root / "root",
+        )
+
+
+def test_unrelated_exo_checkpoint_does_not_block_root_creation(tmp_path: Path) -> None:
+    exo = tmp_path / ".exo"
+    tl_root = exo / "tl-loop"
+    root_worktree = str(tmp_path / ".worktrees" / "root")
+    unrelated = exo / "unrelated"
+    unrelated.mkdir(parents=True)
+    (unrelated / "run.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision": 1,
+                "run_id": "unrelated",
+                "owner_worktree": root_worktree,
+                "fsm": {"phase": TLPhase.TLRunning.value, "waiting": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    create("root", {"owner_branch": "main", "owner_worktree": root_worktree}, root_dir=tl_root)
+
+    assert (tl_root / "root" / "run.json").is_file()
+
+
 def test_active_nested_checkpoint_still_blocks_duplicate_ownership(tmp_path: Path) -> None:
     tl_root = tmp_path / ".exo" / "tl-loop"
     shared_worktree = str(tmp_path / ".worktrees" / "shared")

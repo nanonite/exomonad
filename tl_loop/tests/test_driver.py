@@ -444,7 +444,7 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
     assert RunStore("beta", root).load().ledger_run_id == "swarm-uuid"
 
 
-def test_recreate_starts_replacement_ordered_child_despite_archived_claim(
+def test_live_ordered_child_starts_beneath_archived_root_claim(
     tmp_path: Path,
 ) -> None:
     state_root = tmp_path / ".exo" / "tl-loop"

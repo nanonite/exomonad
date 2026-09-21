@@ -970,29 +970,46 @@ def _iter_active_run_checkpoints(root_dir: Path, target: Path) -> Iterator[Path]
     must exclude every checkpoint beneath them while still detecting collisions
     among active root, child, sibling, and nested runs.
     """
-    search_root = root_dir.parent
-    if not search_root.exists():
+    forest_root = _active_forest_root(root_dir)
+    if not forest_root.exists():
         return
     target_checkpoint = target / "run.json"
-    for candidate in search_root.rglob("run.json"):
+    for candidate in forest_root.rglob("run.json"):
         if candidate == target_checkpoint:
             continue
-        if _lives_in_archived_root(candidate, root_dir):
+        if _lives_in_archived_root(candidate, forest_root):
             continue
         yield candidate
 
 
-def _lives_in_archived_root(candidate: Path, root_dir: Path) -> bool:
-    """Return True only for checkpoints inside a top-level ``root.invalid-*`` archive.
+def _active_forest_root(root_dir: Path) -> Path:
+    """Return the top active run directory that contains ``root_dir``.
 
-    The archive directory is a direct child of the TL-loop root, which is
-    either ``root_dir`` itself (root creation) or ``root_dir.parent`` (child
-    creation). Nested directories whose names merely contain ``invalid`` stay in
-    the active forest so collision detection is not weakened.
+    Child checkpoints live directly beneath their parent run directory, so
+    ascending while the current directory carries its own ``run.json`` lands on
+    the TL-loop root, which holds the active ``root`` run (and every archive) as
+    a direct child. Generic single-level layouts resolve to ``root_dir``. This
+    keeps the scan inside the run forest instead of walking a shared parent such
+    as ``.exo``.
     """
-    archive_parents = {root_dir, root_dir.parent}
+    directory = root_dir
+    while (directory / "run.json").is_file():
+        parent = directory.parent
+        if parent == directory:
+            break
+        directory = parent
+    return directory
+
+
+def _lives_in_archived_root(candidate: Path, forest_root: Path) -> bool:
+    """Return True only inside a top-level ``root.invalid-*`` archive.
+
+    Archives are direct children of the TL-loop root (the active forest root).
+    An active run whose *nested* name resembles an archive therefore stays in
+    the forest and still blocks duplicate ownership.
+    """
     return any(
-        ancestor.name.startswith(ARCHIVED_ROOT_PREFIX) and ancestor.parent in archive_parents
+        ancestor.parent == forest_root and ancestor.name.startswith(ARCHIVED_ROOT_PREFIX)
         for ancestor in candidate.parents
     )
 
@@ -1021,6 +1038,10 @@ def _state_path(path: str | Path) -> Path:
 def _validate_run_id(run_id: str) -> None:
     if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
         raise ValueError("run_id must be a non-empty single path component")
+    if run_id.startswith(ARCHIVED_ROOT_PREFIX):
+        raise ValueError(
+            f"run_id must not use the reserved recreate-archive prefix {ARCHIVED_ROOT_PREFIX!r}"
+        )
 
 
 def _identity(document: dict[str, object]) -> dict[str, object]:

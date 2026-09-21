@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import queue
 from dataclasses import replace
 from pathlib import Path
 
@@ -503,3 +504,69 @@ def test_wrong_controller_identity_is_not_recoverable(tmp_path: Path) -> None:
     assert decision is not None
     assert decision.recoverable is False
     assert "does not match the declared controller" in decision.reason
+
+
+class NoEventQueue:
+    """Event source that reports an empty ledger poll."""
+
+    def get(self, timeout: float | None = None) -> EventEnvelope:
+        del timeout
+        raise queue.Empty
+
+    def acknowledge(self, event: EventEnvelope) -> int:
+        del event
+        raise AssertionError("an empty ledger has no event to acknowledge")
+
+
+def test_recreate_starts_replacement_child_after_archiving_nonterminal_checkpoint(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / ".exo" / "tl-loop"
+    root_worktree = str(tmp_path / "worktrees" / "root")
+    plan = WorkPlan(sub_tls=(SubTLTask("stage-a", WorkPlan(), order=1),))
+    config = TLLoopConfig(
+        root_dir=state_root,
+        branch="main",
+        worktree=root_worktree,
+        session_mode="recreate",
+        active=False,
+        keep_alive_on_waiting=False,
+        max_events=8,
+    )
+    child_worktree = str(_sub_tl_worktree(config, state_root, "root", plan.sub_tls[0]))
+
+    # A previous root ran the ordered child to a nonterminal checkpoint before
+    # the confirmed recreate archived the entire root beneath root.invalid-*.
+    archived_child = state_root / "root.invalid-1789772880851" / "stage-a" / "run.json"
+    archived_child.parent.mkdir(parents=True)
+    archived_child.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision": 133,
+                "run_id": "stage-a",
+                "owner_worktree": child_worktree,
+                "fsm": {"phase": "tl_running", "waiting": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    archived_bytes = archived_child.read_bytes()
+
+    effects = ReadOnlyEffectClient(
+        EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
+    )
+    run_tl_loop(
+        "root",
+        plan,
+        NoEventQueue(),
+        effects,
+        config=config,
+        root_dir=state_root,
+        budgets=BudgetLedger(0, 0),
+    )
+
+    assert (state_root / "root" / "run.json").is_file()
+    replacement = RunStore("stage-a", state_root / "root").load()
+    assert replacement.owner_worktree == child_worktree
+    assert archived_child.read_bytes() == archived_bytes
