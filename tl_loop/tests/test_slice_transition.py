@@ -1,4 +1,6 @@
+import ast
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -197,6 +199,57 @@ def test_newer_same_head_review_uses_a_new_review_round() -> None:
     assert superseding.review_rounds == reviewed.review_rounds + 1
     assert superseding.review_evidence is not None
     assert superseding.review_evidence.review_id == 18
+
+
+def test_owned_slice_fields_are_mutated_only_in_slice_transition() -> None:
+    """Production code must not mutate slice_transition-owned fields directly.
+
+    The closed SliceEvent union is the single mutation point for the slice
+    lifecycle fields. A direct ``replace(slice, status=...)``/``action=...``
+    reintroduces exactly the stale-action/verdict divergence the reducer exists
+    to prevent, so this gate fails if one reappears outside the reducer.
+    """
+    package_root = Path(__file__).resolve().parents[1]
+    owned = {
+        "status",
+        "action",
+        "verdict",
+        "reviewed_head",
+        "review_rounds",
+        "ci_state",
+        "reviewer_agent_id",
+        "stall_classification",
+    }
+    violations: list[str] = []
+    for path in package_root.rglob("*.py"):
+        if "__pycache__" in path.parts or "tests" in path.parts:
+            continue
+        if path.name == "slice_transition.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else func.id
+                if isinstance(func, ast.Name)
+                else None
+            )
+            if name != "replace":
+                continue
+            touched = sorted({k.arg for k in node.keywords if k.arg} & owned)
+            if touched:
+                violations.append(
+                    f"{path.relative_to(package_root)}:{node.lineno}: {touched}"
+                )
+
+    assert violations == [], (
+        "slice_transition-owned fields must be mutated only through "
+        "slice_transition: " + "; ".join(violations)
+    )
 
 
 def test_failed_revalidation_is_durable_without_erasing_review_identity() -> None:

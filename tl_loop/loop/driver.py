@@ -1933,8 +1933,7 @@ def _reopen_ordered_scope(
     if target_name is not None:
         target = slices[target_name]
         slices[target_name] = replace(
-            target,
-            status=SliceStatus.SPAWNED,
+            slice_transition(target, SliceStatusChanged(SliceStatus.SPAWNED)),
             park_cause=None,
             dispatch_error=None,
         )
@@ -3475,9 +3474,7 @@ def _adopt_post_merge_slice(
         and current.post_merge.phase is not PostMergePhase.NOT_STARTED
     ):
         return replace(
-            current,
-            status=SliceStatus.MERGED,
-            action=None,
+            slice_transition(current, MergeCompleted(pr_number)),
             dispatch_last_boundary=boundary,
         )
     evidence = dict(merge_evidence or {})
@@ -3522,7 +3519,10 @@ def _adopt_post_merge_slice(
     )
     if parent_branch != persisted_parent_branch:
         raise ValueError("merged PR parent branch does not match persisted publication identity")
-    adopted = replace(current, status=SliceStatus.MERGED, action=None, post_merge=None)
+    adopted = replace(
+        slice_transition(current, MergeCompleted(pr_number)),
+        post_merge=None,
+    )
     adopted = slice_transition(
         adopted,
         PostMergeEventObserved(
@@ -4669,7 +4669,10 @@ def _block_post_merge_recovery(
     reason: str,
 ) -> RunState:
     bounded = reason[:500]
-    blocked = replace(state.slices[slice_id], dispatch_error=bounded, action=None)
+    blocked = replace(
+        slice_transition(state.slices[slice_id], ActionChanged(None)),
+        dispatch_error=bounded,
+    )
     blocked_state = _checkpoint_slice_action(
         store,
         state,
@@ -5169,7 +5172,7 @@ def _adopt_direct_merge_result(
     """Adopt a merge only after a second authoritative merged snapshot."""
     current = state.slices[slice_id]
     if result is not None and result.success is False:
-        cleared = replace(current, action=None)
+        cleared = slice_transition(current, ActionChanged(None))
         return _checkpoint_slice_action(
             store,
             state,
@@ -11780,11 +11783,12 @@ def _apply_child_completion(
     pr_number = event.data.get("pr_number")
     head_sha = event.data.get("head_sha")
     if type(pr_number) is int and pr_number > 0 and isinstance(head_sha, str) and head_sha:
-        updated = replace(
-            slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW)),
-            pr_number=pr_number,
-            reviewed_head=head_sha,
+        updated = slice_transition(
+            current,
+            HeadEvidenceObserved(head_sha, bind_reviewed_head=True),
         )
+        updated = slice_transition(updated, SliceStatusChanged(SliceStatus.IN_REVIEW))
+        updated = replace(updated, pr_number=pr_number)
         return {**slices, slice_id: updated}
     return dict(slices)
 
