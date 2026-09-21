@@ -59,6 +59,7 @@ from tl_loop.fsm.scope import (
 from tl_loop.fsm.scope_events import ScopeRole
 from tl_loop.fsm.scope_projection import phase_tag as canonical_phase_tag
 from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
+from tl_loop.run_ids import ARCHIVED_ROOT_PREFIX, uses_reserved_archive_prefix
 
 from .lock import RunLock
 from .migration import (
@@ -115,7 +116,6 @@ from .serialization import to_jsonable
 from .write import apply
 
 DEFAULT_ROOT = Path(".exo/tl-loop")
-ARCHIVED_ROOT_PREFIX = "root.invalid-"
 RootSpec: TypeAlias = Mapping[str, object]
 SliceInput: TypeAlias = SliceState | Mapping[str, object]
 FSMInput: TypeAlias = (
@@ -1038,7 +1038,7 @@ def _state_path(path: str | Path) -> Path:
 def _validate_run_id(run_id: str) -> None:
     if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
         raise ValueError("run_id must be a non-empty single path component")
-    if run_id.startswith(ARCHIVED_ROOT_PREFIX):
+    if uses_reserved_archive_prefix(run_id):
         raise ValueError(
             f"run_id must not use the reserved recreate-archive prefix {ARCHIVED_ROOT_PREFIX!r}"
         )

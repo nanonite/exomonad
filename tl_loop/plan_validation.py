@@ -8,6 +8,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from tl_loop.plan_clarification import PlanClarification, PlanClarificationError
+from tl_loop.run_ids import ARCHIVED_ROOT_PREFIX, uses_reserved_archive_prefix
 
 _PLAN_KEYS = frozenset({"run_id", "budgets", "plan", "workers", "leaves", "sub_tls"})
 _PROPOSAL_KEYS = frozenset({"plan", "workers", "leaves", "sub_tls", "clarification"})
@@ -156,6 +157,7 @@ def _validate_work_plan(value: Mapping[str, object], path: str) -> None:
                     f"{path}.{kind}[{index}] contains unknown keys: {', '.join(unknown)}"
                 )
             if kind == "sub_tls":
+                _validate_child_name(entry.get("name"), f"{path}.sub_tls[{index}].name")
                 nested = entry.get("plan")
                 if nested is None:
                     nested = {
@@ -238,6 +240,23 @@ def _validate_run_id(value: object) -> None:
         return
     if not isinstance(value, str) or not value or Path(value).name != value:
         raise PlanValidationError("run_id must be a non-empty single path component")
+    if uses_reserved_archive_prefix(value):
+        raise PlanValidationError(
+            f"run_id must not use the reserved recreate-archive prefix {ARCHIVED_ROOT_PREFIX!r}"
+        )
+
+
+def _validate_child_name(value: object, path: str) -> None:
+    """Reject recursive sub-TL names reserved for recreate archives.
+
+    A sub-TL name becomes its run directory, so it must obey the same reserved
+    prefix rule as a top-level run id and fail during plan validation rather
+    than when the child RunStore is constructed.
+    """
+    if uses_reserved_archive_prefix(value):
+        raise PlanValidationError(
+            f"{path} must not use the reserved recreate-archive prefix {ARCHIVED_ROOT_PREFIX!r}"
+        )
 
 
 def _validate_budgets(value: object) -> None:

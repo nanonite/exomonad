@@ -16,18 +16,23 @@ Scenario 1 -- failed child startup and safe continuation:
     scope and dispatch its leaf exactly once. A second continuation must
     reconcile the accepted leaf dispatch without minting another one.
 
-Scenario 2 -- recreate followed by a same-plan restart:
-  * A disposable repository carries an identity-less orphan ordered branch
-    (branch present, no identity, no worktree) -- the Beast #1100 shape.
-  * The real ``exomonad init --recreate --confirm-recreate`` binary must remove
-    that branch.
-  * The same plan restarts through the real embedded controller and provisions
-    the stage with no HTTP 409 and no identity-less branch.
-  * The only accepted init failure is the documented non-TTY tmux attach error;
-    any other exit code or failure marker fails the acceptance.
+  Scenario 2 -- recreate followed by a same-plan restart:
+    * A disposable repository carries an identity-less orphan ordered branch
+      (branch present, no identity, no worktree) -- the Beast #1100 shape.
+    * The same repository also carries a root checkpoint with a nonterminal
+      ordered child that records the child worktree -- the Beast #1104 shape.
+    * The real ``exomonad init --recreate --confirm-recreate`` binary must remove
+      that branch and archive the whole root beneath ``root.invalid-*``.
+    * The archive bytes must be unchanged, and the same plan must restart through
+      the real embedded controller to provision the stage and start the
+      replacement ordered child instead of failing with ``WorktreeClaimError``
+      against the archived checkpoint.
+    * The only accepted init failure is the documented non-TTY tmux attach error;
+      any other exit code or failure marker fails the acceptance.
+
 
 The harness is intentionally narrower than the full ``real_server_transport``
-suite: it is the acceptance the #1100/#1103 review recorded as outstanding.
+suite: it is the acceptance the #1100/#1103/#1104 reviews recorded as outstanding.
 Full live leaf respawn is covered by ``tl_loop/tests`` and the ordered server
 suite.
 """
@@ -902,6 +907,11 @@ def run_recreate_scenario(root: Path, exomonad: Path) -> dict[str, Any]:
         _identity(repo, "stage-a") is None,
         "orphan stage branch unexpectedly already had an identity",
     )
+    # The #1104 shape: the previous root checkpoint carries a nonterminal
+    # ordered child that records the child worktree. --recreate must archive it
+    # beneath root.invalid-* without modifying the archive bytes, and the fresh
+    # child must still be able to claim that worktree.
+    archived_bytes = _seed_recreate_archived_child(repo)
 
     log_path = root / "recreate" / "init.log"
     with log_path.open("w", encoding="utf-8") as log:
@@ -938,7 +948,7 @@ def run_recreate_scenario(root: Path, exomonad: Path) -> dict[str, Any]:
     )
     _require(
         "open terminal failed: not a terminal" in log_text,
-        "exomonad init --recreate did not fail with the documented tmux attach error",
+        "recreate-then-same-plan-restart did not fail with the documented tmux attach error",
     )
     _require(
         "Attaching to session" in log_text and "Creating session" in log_text,
@@ -980,15 +990,69 @@ def run_recreate_scenario(root: Path, exomonad: Path) -> dict[str, Any]:
         stage_starts == 1,
         f"same-plan restart did not start exactly one stage: {stage_starts}",
     )
+    tl_root = repo / ".exo" / "tl-loop"
+    archives = sorted(tl_root.glob("root.invalid-*"))
+    _require(len(archives) == 1, f"expected one recreate archive, found {archives!r}")
+    archived_child = archives[0] / "stage-a" / "run.json"
+    _require(
+        archived_child.read_bytes() == archived_bytes,
+        "recreate modified the archived nonterminal child checkpoint",
+    )
+    _require(
+        (tl_root / "root" / "stage-a" / "run.json").is_file(),
+        f"recreate did not start the replacement ordered child: {log_text[-2000:]}",
+    )
     return {
         "scenario": "recreate-then-same-plan-restart",
         "orphan_branch_removed": True,
         "identity": identity,
         "worktrees": worktrees,
         "stage_starts": stage_starts,
+        "archive": str(archives[0]),
+        "archive_preserved": True,
+        "replacement_started": True,
         "init_returncode": init.returncode,
         "init_failure": "tmux attach (non-TTY)",
     }
+
+
+def _seed_recreate_archived_child(repo: Path) -> bytes:
+    """Seed the #1104 shape: a nonterminal ordered child checkpoint under root.
+
+    The caller then runs a real ``exomonad init --recreate``: the Rust binary
+    must archive ``.exo/tl-loop/root`` beneath ``root.invalid-*`` and the restart
+    must reuse the child worktree without raising ``WorktreeClaimError``.
+    """
+    tl_root = repo / ".exo" / "tl-loop"
+    root_run = tl_root / "root" / "run.json"
+    root_run.parent.mkdir(parents=True, exist_ok=True)
+    root_run.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision": 1,
+                "run_id": "root",
+                "owner_worktree": str(repo),
+                "fsm": {"phase": "tl_failed", "waiting": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    child_run = tl_root / "root" / "stage-a" / "run.json"
+    child_run.parent.mkdir(parents=True, exist_ok=True)
+    child_run.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision": 133,
+                "run_id": "stage-a",
+                "owner_worktree": str(repo / ".exo" / "worktrees" / "stage-a"),
+                "fsm": {"phase": "tl_running", "waiting": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return child_run.read_bytes()
 
 
 def _find_exomonad() -> Path:

@@ -42,6 +42,32 @@ def test_proposals_cannot_change_run_identity_or_budget() -> None:
             validate_plan_proposal({**forbidden, "plan": {"leaves": []}})
 
 
+def test_reserved_archive_prefix_is_rejected_for_run_id_and_sub_tl_names() -> None:
+    with pytest.raises(PlanValidationError, match="reserved recreate-archive prefix"):
+        validate_plan_document({"run_id": "root.invalid-live", "plan": {"leaves": []}})
+
+    nested = {
+        "plan": {
+            "sub_tls": [{"name": "root.invalid-live", "order": 1, "plan": {"leaves": []}}]
+        }
+    }
+    with pytest.raises(PlanValidationError, match="reserved recreate-archive prefix"):
+        validate_plan_proposal(nested)
+
+
+def test_similarly_named_ids_without_the_reserved_prefix_are_accepted() -> None:
+    document = {
+        "run_id": "root.invalidness",
+        "plan": {
+            "sub_tls": [{"name": "root-invalid-child", "order": 1, "plan": {"leaves": []}}]
+        },
+    }
+
+    validated = validate_plan_document(document)
+
+    assert validated["plan"]["sub_tls"][0]["name"] == "root-invalid-child"  # type: ignore[index]
+
+
 def test_overlapping_owned_paths_are_rejected() -> None:
     proposal = {
         "plan": {
