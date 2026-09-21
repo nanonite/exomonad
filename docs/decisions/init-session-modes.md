@@ -88,6 +88,10 @@ re-proposing and re-parking. While the gate is `pending` the action waits
 (`repeated_action_rejected`) and is never clobbered back to `pending`; an
 `approved` gate authorizes one retry, and if that retry repeats the action the
 gate is re-armed as a fresh `pending` occurrence that needs a new decision.
+Answering a gate advances the run's convergence epoch (`state_version`), so a
+live controller's in-memory livelock guard re-evaluates the released action
+instead of re-detecting it as a repeat and re-parking it before the effect
+runs.
 
 Operator resolution: inspect the parked slice's `park_audit` and its
 `reconciliation` evidence (or the run-level gate), clear the underlying

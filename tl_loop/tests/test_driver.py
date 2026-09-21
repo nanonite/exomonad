@@ -2865,6 +2865,104 @@ def test_derivation_holds_action_behind_repeated_action_gate(tmp_path: Path) -> 
     assert derive_next_action(state) == decision
 
 
+def test_gate_answer_advances_the_convergence_epoch(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    tracker = ConvergenceTracker()
+    state = store.load()
+    first = tracker.reduce(state)
+    assert isinstance(first.decision, ExternalIntent)
+    with pytest.raises(ConvergenceInvariantError):
+        tracker.reduce(state)
+
+    gate_name = repeated_action_gate_name(derive_next_action(state))
+    store.set_gate(gate_name, GateStatus.PENDING)
+    before_version = store.load().state_version
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+
+    assert approved.state_version == before_version + 1
+    # The same tracker sees a new epoch, so the released action is not a repeat.
+    allowed = tracker.reduce(approved)
+    assert allowed.decision == first.decision
+
+
+def test_approved_run_gate_retries_in_live_controller(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+    tracker = ConvergenceTracker()
+    config = TLLoopConfig(active=True)
+
+    # Cycle 1: incomplete compare evidence clears the action without merging,
+    # so the tracker now remembers (target, state_version, action).
+    _apply_convergence(
+        store.load(),
+        tracker,
+        store,
+        config,
+        EffectClient(
+            IntegrationTransport(
+                snapshots=[
+                    {
+                        "merged": False,
+                        "head_sha": "head-a",
+                        "base_sha": "base-a",
+                        "ci_status": "success",
+                    }
+                ]
+            )
+        ),
+        journal,
+    )
+    decision = derive_next_action(store.load())
+    assert isinstance(decision, ExternalIntent) and decision.operation == "merge"
+    gate_name = repeated_action_gate_name(decision)
+    store.set_gate(gate_name, GateStatus.PENDING)
+
+    # Cycle 2: the pending gate holds the action, so the same tracker is never
+    # asked to repeat it (no raise, no re-park).
+    held = _apply_convergence(
+        store.load(), tracker, store, config, EffectClient(RecordingTransport()), journal
+    )
+    assert derive_next_action(held) == Quiescent("await_repeated_action_gate")
+
+    before_version = held.state_version
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    assert approved.state_version == before_version + 1
+
+    # Cycle 3: with the SAME tracker, the released action executes once the
+    # merge evidence is complete, instead of being re-detected and re-parked.
+    resumed_transport = IntegrationTransport(
+        snapshots=[
+            {
+                "merged": False,
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "merged": True,
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+                "pr_state": "closed",
+            },
+        ],
+        merge_response={"success": True, "result": {"merged": True}},
+    )
+    resumed = _apply_convergence(
+        approved, tracker, store, config, EffectClient(resumed_transport), journal
+    )
+
+    assert resumed.slices["leaf-a"].status is SliceStatus.MERGED
+    assert any(name == "merge_pr" for name, _ in resumed_transport.calls)
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.APPROVED for gate in resumed.gates
+    )
+
+
 def test_quiescent_convergence_is_not_parked(tmp_path: Path) -> None:
     store = _review_store(tmp_path)
     transport = RecordingTransport()

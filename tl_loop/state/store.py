@@ -667,6 +667,16 @@ class RunStore:
             for gate in gates:
                 if isinstance(gate, dict) and gate.get("name") == name:
                     gate["status"] = status.value
+                    # An operator decision is a durable semantic transition, so
+                    # advance the convergence epoch exactly like an internal
+                    # transition does. Without this, a live controller's
+                    # in-memory ConvergenceTracker still holds the released
+                    # action's (target, state_version, action) key and would
+                    # re-detect a repeat instead of retrying once.
+                    current = document.get("state_version", 0)
+                    document["state_version"] = (
+                        current if type(current) is int else 0
+                    ) + 1
                     return document
             raise ValueError(f"gate {name!r} does not exist")
 
