@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TypeAlias
@@ -12,6 +11,7 @@ from tl_loop.loop.reconcile import (
     InternalTransition,
     MergeDecision,
     Quiescent,
+    action_key,
     derive_next_action,
 )
 from tl_loop.state.schema import RunState, SliceState
@@ -85,7 +85,7 @@ class ConvergenceTracker:
         run_id = state.run_id if isinstance(state, RunState) else state.id
         version = getattr(state, "state_version", 0)
         target = _target(decision, run_id)
-        action_key = _action_key(decision)
+        key_hash = action_key(decision)
         events: list[ConvergenceEvent] = []
         if isinstance(decision, Quiescent):
             prior = self._wait_reasons.get(target)
@@ -103,12 +103,12 @@ class ConvergenceTracker:
                 )
             return ConvergenceResult(state, decision, tuple(events))
 
-        key = (target, version, action_key)
+        key = (target, version, key_hash)
         if key in self._seen:
             invariant = "repeated_state_version_action"
-            events.extend(self._invariant_event(run_id, target, version, invariant, action_key))
+            events.extend(self._invariant_event(run_id, target, version, invariant, key_hash))
             raise ConvergenceInvariantError(
-                invariant, action_key, tuple(events), target=target
+                invariant, key_hash, tuple(events), target=target
             )
         self._seen.add(key)
         if isinstance(decision, ExternalIntent):
@@ -119,7 +119,7 @@ class ConvergenceTracker:
                     target,
                     version,
                     action=decision.operation,
-                    action_key=action_key,
+                    action_key=key_hash,
                     arguments=dumps_json(
                         dict(decision.arguments),
                         sort_keys=True,
@@ -156,7 +156,7 @@ class ConvergenceTracker:
             intent.target_id,
             getattr(state, "state_version", 0),
             action=intent.operation,
-            action_key=_action_key(intent),
+            action_key=action_key(intent),
         )
 
     def action_outcome(
@@ -172,7 +172,7 @@ class ConvergenceTracker:
             raise ValueError("convergence outcome must be unknown or reconciled")
         payload: dict[str, object] = {
             "action": intent.operation,
-            "action_key": _action_key(intent),
+            "action_key": action_key(intent),
             "outcome": outcome,
         }
         if error:
@@ -215,26 +215,6 @@ def _target(decision: MergeDecision, fallback: str) -> str:
     if isinstance(decision, InternalTransition) and decision.target_id is not None:
         return decision.target_id
     return fallback
-
-
-def _action_key(decision: MergeDecision) -> str:
-    if isinstance(decision, ExternalIntent):
-        payload = {
-            "operation": decision.operation,
-            "target": decision.target_id,
-            "arguments": dict(decision.arguments),
-        }
-    elif isinstance(decision, InternalTransition):
-        payload = {
-            "transition": decision.transition,
-            "reason": decision.reason,
-            "target": decision.target_id,
-        }
-    else:
-        payload = {"wait": decision.reason}
-    return hashlib.sha256(
-        dumps_json(payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()[:32]
 
 
 def _event(

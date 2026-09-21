@@ -81,6 +81,14 @@ run-level gate `tl-repeated-action-<action-key>` is opened instead. The park
 audit records the invariant, action key, action label, target, and a
 plain-language reason, and one `tl.repeated_action_parked` event is emitted.
 
+The run-level gate is checked by the same action derivation that produced the
+action, so a later cycle holds the identical action behind it instead of
+re-proposing and re-parking. While the gate is `pending` the action waits
+(`await_repeated_action_gate`); a `rejected` gate keeps it abandoned
+(`repeated_action_rejected`) and is never clobbered back to `pending`; an
+`approved` gate authorizes one retry, and if that retry repeats the action the
+gate is re-armed as a fresh `pending` occurrence that needs a new decision.
+
 Operator resolution: inspect the parked slice's `park_audit` and its
 `reconciliation` evidence (or the run-level gate), clear the underlying
 blocker (for example incomplete merge compare evidence or an unresolved action

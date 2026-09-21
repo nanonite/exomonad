@@ -235,6 +235,7 @@ from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
 from .journal import MUTATING_OPERATIONS, ActionJournalError, EffectJournal, stable_action_key
 from .observation import WatcherObservation
 from .reconcile import (
+    REPEATED_ACTION_GATE_PREFIX,
     ExternalIntent,
     InternalTransition,
     MergeDecision,
@@ -255,7 +256,6 @@ INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 REPOSITORY_IDENTITY_GATE_NAME = "tl-repository-identity"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
-REPEATED_ACTION_GATE_PREFIX = "tl-repeated-action-"
 MAX_CONVERGENCE_STEPS = 8
 # A per-call fairness cap on _drain_direct_scope_convergence, not a
 # correctness bound: that function raises the moment a step makes no
@@ -2826,24 +2826,30 @@ def _park_repeated_action(
         SliceStatus.BLOCKED,
     }:
         gate_name = f"{REPEATED_ACTION_GATE_PREFIX}{error.key}"
-        previous = next((gate for gate in state.gates if gate.name == gate_name), None)
+        existing = next((gate for gate in state.gates if gate.name == gate_name), None)
+        if existing is not None and existing.status is not GateStatus.APPROVED:
+            # Pending or rejected: already parked. Preserve the operator's
+            # answer and do not re-record the same incident.
+            return state
+        # Absent, or an approved retry repeated: open/re-arm one pending
+        # occurrence. Derivation holds the action behind a pending or rejected
+        # gate, so an approved retry that fails again needs a fresh decision.
         state = store.set_gate(gate_name, GateStatus.PENDING)
-        if previous is None or previous.status is not GateStatus.PENDING:
-            _record_controller_event(
-                "controller",
-                "tl.repeated_action_parked",
-                {
-                    "gate_name": gate_name,
-                    "invariant": error.invariant,
-                    "action_key": error.key,
-                    "action": action_label,
-                    "target_id": target_id,
-                    "reason": reason,
-                },
-                config,
-                effects,
-                effects_log,
-            )
+        _record_controller_event(
+            "controller",
+            "tl.repeated_action_parked",
+            {
+                "gate_name": gate_name,
+                "invariant": error.invariant,
+                "action_key": error.key,
+                "action": action_label,
+                "target_id": target_id,
+                "reason": reason,
+            },
+            config,
+            effects,
+            effects_log,
+        )
         return state
     audit = {
         "invariant": error.invariant,

@@ -75,8 +75,12 @@ from tl_loop.loop.escalate import blocked_gate_name
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.reconcile import (
     ExternalIntent,
+    Quiescent,
     ReconciliationResult,
+    action_key,
+    derive_next_action,
     reconcile_merge_observation,
+    repeated_action_gate_name,
 )
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
 from tl_loop.ordered import (
@@ -2763,6 +2767,102 @@ def test_repeated_action_without_slice_target_opens_run_gate(tmp_path: Path) -> 
         and arguments.get("event_type") == "tl.repeated_action_parked"
     ]
     assert len(parked_events) == 1
+
+
+def test_repeated_action_run_gate_is_idempotent_and_respects_answer(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    state = store.load()
+    decision = ExternalIntent(
+        "merge_aggregate", "aggregate-owner", {"pr_number": 7, "head_sha": "head-a"}
+    )
+    error = ConvergenceInvariantError(
+        "repeated_state_version_action", action_key(decision), target="aggregate-owner"
+    )
+    gate_name = repeated_action_gate_name(decision)
+    config = TLLoopConfig(active=True)
+
+    first_transport = RecordingTransport()
+    first = _park_repeated_action(
+        state, error, decision, store, config, EffectClient(first_transport), []
+    )
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.PENDING for gate in first.gates
+    )
+    assert (
+        len(
+            [
+                arguments
+                for name, arguments in first_transport.calls
+                if name == "emit_controller_event"
+                and arguments.get("event_type") == "tl.repeated_action_parked"
+            ]
+        )
+        == 1
+    )
+
+    # A later cycle must not reset a pending gate or re-record the incident.
+    later_transport = RecordingTransport()
+    later = _park_repeated_action(
+        first, error, decision, store, config, EffectClient(later_transport), []
+    )
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.PENDING for gate in later.gates
+    )
+    assert not [
+        arguments
+        for name, arguments in later_transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.repeated_action_parked"
+    ]
+
+    # An operator rejection is preserved, never clobbered back to pending.
+    rejected = store.answer_gate(gate_name, GateStatus.REJECTED)
+    rejected_transport = RecordingTransport()
+    preserved = _park_repeated_action(
+        rejected, error, decision, store, config, EffectClient(rejected_transport), []
+    )
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.REJECTED
+        for gate in preserved.gates
+    )
+
+    # An approved retry that repeats re-arms one fresh pending occurrence.
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    approved_transport = RecordingTransport()
+    rearmed = _park_repeated_action(
+        approved, error, decision, store, config, EffectClient(approved_transport), []
+    )
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.PENDING for gate in rearmed.gates
+    )
+    assert (
+        len(
+            [
+                arguments
+                for name, arguments in approved_transport.calls
+                if name == "emit_controller_event"
+                and arguments.get("event_type") == "tl.repeated_action_parked"
+            ]
+        )
+        == 1
+    )
+
+
+def test_derivation_holds_action_behind_repeated_action_gate(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    state = store.load()
+    decision = derive_next_action(state)
+    assert isinstance(decision, ExternalIntent)
+    gate_name = repeated_action_gate_name(decision)
+
+    state = store.set_gate(gate_name, GateStatus.PENDING)
+    assert derive_next_action(state) == Quiescent("await_repeated_action_gate")
+
+    state = store.answer_gate(gate_name, GateStatus.REJECTED)
+    assert derive_next_action(state) == Quiescent("repeated_action_rejected")
+
+    state = store.answer_gate(gate_name, GateStatus.APPROVED)
+    assert derive_next_action(state) == decision
 
 
 def test_quiescent_convergence_is_not_parked(tmp_path: Path) -> None:

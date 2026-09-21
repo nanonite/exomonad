@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -23,11 +24,14 @@ from tl_loop.state.schema import (
     SliceStatus,
     Verdict,
 )
+from tl_loop.state.serialization import dumps as dumps_json
 from tl_loop.state.slice_transition import (
     HeadEvidenceObserved,
     MergeCompleted,
     slice_transition,
 )
+
+REPEATED_ACTION_GATE_PREFIX = "tl-repeated-action-"
 
 
 @dataclass(frozen=True)
@@ -162,6 +166,36 @@ class Quiescent:
 MergeDecision = InternalTransition | ExternalIntent | Quiescent
 
 
+def action_key(decision: MergeDecision) -> str:
+    """Return the stable identity of one derived action or transition.
+
+    Shared by the convergence livelock detector and the run-level
+    repeated-action gate so both name the same occurrence.
+    """
+    if isinstance(decision, ExternalIntent):
+        payload: dict[str, object] = {
+            "operation": decision.operation,
+            "target": decision.target_id,
+            "arguments": dict(decision.arguments),
+        }
+    elif isinstance(decision, InternalTransition):
+        payload = {
+            "transition": decision.transition,
+            "reason": decision.reason,
+            "target": decision.target_id,
+        }
+    else:
+        payload = {"wait": decision.reason}
+    return hashlib.sha256(
+        dumps_json(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:32]
+
+
+def repeated_action_gate_name(decision: MergeDecision) -> str:
+    """Return the run-level gate name for one repeated action."""
+    return f"{REPEATED_ACTION_GATE_PREFIX}{action_key(decision)}"
+
+
 def derive_next_action(
     persisted_state: SliceState | RunState,
     *,
@@ -176,11 +210,14 @@ def derive_next_action(
     independent of event arrival order.
     """
     if isinstance(persisted_state, RunState):
-        return _derive_run_action(
+        return _apply_repeated_action_gate(
             persisted_state,
-            reviewer_max_rounds=reviewer_max_rounds,
-            review_freshness_window_secs=review_freshness_window_secs,
-            now=now,
+            _derive_run_action(
+                persisted_state,
+                reviewer_max_rounds=reviewer_max_rounds,
+                review_freshness_window_secs=review_freshness_window_secs,
+                now=now,
+            ),
         )
     return _derive_slice_action(
         persisted_state,
@@ -188,6 +225,28 @@ def derive_next_action(
         review_freshness_window_secs=review_freshness_window_secs,
         now=now,
     )
+
+
+def _apply_repeated_action_gate(
+    state: RunState,
+    decision: MergeDecision,
+) -> MergeDecision:
+    """Hold a run-level action behind its repeated-action gate.
+
+    A repeated action that could not be isolated to a parkable slice opens
+    ``tl-repeated-action-<action-key>``. While that gate is pending or
+    rejected the action is not re-proposed (no crash, no spin, and the
+    operator's answer is preserved); an approved gate authorizes one retry.
+    """
+    if isinstance(decision, Quiescent):
+        return decision
+    gate_name = repeated_action_gate_name(decision)
+    gate = next((candidate for candidate in state.gates if candidate.name == gate_name), None)
+    if gate is None or gate.status is GateStatus.APPROVED:
+        return decision
+    if gate.status is GateStatus.REJECTED:
+        return Quiescent("repeated_action_rejected")
+    return Quiescent("await_repeated_action_gate")
 
 
 def _derive_run_action(
