@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix archived TL checkpoints blocking recreated worktrees (#1104)
 - Park a slice with a named gate on a repeated controller action instead of crashing (#1044)
 - Self-heal a stale reviewer action after an exact-head verdict, without manual run.json repair (#1042)
 - Refactor SliceState into a single slice_transition reducer (mirroring tl_loop/fsm), fixing stale action bookkeeping blocking merge (#1041)
