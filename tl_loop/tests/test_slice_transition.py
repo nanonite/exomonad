@@ -23,6 +23,7 @@ from tl_loop.state.slice_transition import (
     ReviewValidated,
     ReviewValidationFailed,
     ReviewVerdictObserved,
+    StaleReviewerActionHealed,
     slice_transition,
 )
 
@@ -199,6 +200,62 @@ def test_newer_same_head_review_uses_a_new_review_round() -> None:
     assert superseding.review_rounds == reviewed.review_rounds + 1
     assert superseding.review_evidence is not None
     assert superseding.review_evidence.review_id == 18
+
+
+def _decided_state(**changes: object) -> SliceState:
+    """The #1042 shape: exact-head verdict plus a stale matching action."""
+    values: dict[str, object] = {
+        "verdict": Verdict.GO,
+        "reviewed_head": "head-a",
+        **changes,
+    }
+    return replace(_state(), **values)
+
+
+def test_stale_reviewer_action_heal_clears_matching_terminal_action() -> None:
+    healed = slice_transition(_decided_state(), StaleReviewerActionHealed("head-a"))
+
+    assert healed.action is None
+    assert healed.verdict is Verdict.GO
+    assert healed.reviewed_head == "head-a"
+    assert healed.reviewer_attempt == {"head-a": 1}
+    assert healed.reviewer_agent_id == "review-invocation"
+
+
+def test_stale_reviewer_action_heal_rejects_live_repair_action() -> None:
+    state = _decided_state(
+        action=replace(_state().action, kind=ActionKind.REPAIR),
+    )
+    with pytest.raises(IllegalSliceTransition):
+        slice_transition(state, StaleReviewerActionHealed("head-a"))
+
+
+def test_stale_reviewer_action_heal_rejects_nonterminal_phase() -> None:
+    state = _decided_state(action=replace(_state().action, phase=ActionPhase.IN_FLIGHT))
+    with pytest.raises(IllegalSliceTransition):
+        slice_transition(state, StaleReviewerActionHealed("head-a"))
+
+
+def test_stale_reviewer_action_heal_rejects_other_head() -> None:
+    state = _decided_state(action=replace(_state().action, head_sha="other-head"))
+    with pytest.raises(IllegalSliceTransition):
+        slice_transition(state, StaleReviewerActionHealed("head-a"))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"verdict": None},
+        {"reviewed_head": None},
+        {"reviewer_attempt": {}},
+    ],
+)
+def test_stale_reviewer_action_heal_rejects_incomplete_proof(
+    changes: dict[str, object],
+) -> None:
+    state = _decided_state(**changes)
+    with pytest.raises(IllegalSliceTransition):
+        slice_transition(state, StaleReviewerActionHealed("head-a"))
 
 
 def test_owned_slice_fields_are_mutated_only_in_slice_transition() -> None:

@@ -47,6 +47,27 @@ resolved by the operator through the appropriate recovery or recreate path.
 Answering that gate does not authorize the controller to guess ownership or
 discard resources.
 
+## Stale reviewer action self-heal
+
+A verdict recorded by older code (or any prior bug) can leave a matching
+`REVIEWER_SPAWN` action behind for the same head, which holds the slice at
+`await_reviewer_spawn_reconciliation` forever even though review and CI are
+green. On every startup/`--continue` and heartbeat reconciliation the
+controller repairs that specific inconsistency automatically: it clears the
+action only when the verdict is set for the exact `reviewed_head`, the action is
+a matching `REVIEWER_SPAWN` in a terminal phase (`confirmed`/`reconciled`), a
+`reviewer_attempt` for that head exists, and no `spawn_reviewer` journal entry
+for the slice is `intended`/`unknown`. The repair goes through the typed
+`slice_transition` reducer and the locked run-state writer, preserves
+`reviewer_attempt` and all review evidence, and is idempotent.
+
+Everything ambiguous keeps its existing safety gate: a live `REPAIR` action, an
+action for a different head, a non-terminal action, a missing
+`reviewer_attempt`, and a pending/unknown journal entry are all left untouched
+at `await_repair_reconciliation`/`await_reviewer_spawn_reconciliation`. An
+operator resolves those through the normal gate path; no manual `run.json`
+editing is ever required or supported.
+
 ## Recreate publication authorization
 
 `--recreate` may remove an ordered-controller branch only when every

@@ -190,6 +190,20 @@ class StallClassificationObserved(SliceEvent):
     classification: str | None
 
 
+@dataclass(frozen=True)
+class StaleReviewerActionHealed(SliceEvent):
+    """Release a matching-head reviewer action once its effect is terminal.
+
+    This is the narrow self-heal for a verdict recorded by older code (or any
+    prior bug) that left a REVIEWER_SPAWN action behind for the same head. The
+    driver must additionally prove the reviewer effect is no longer ambiguous
+    (no pending/unknown journal entry) before emitting it; the transition only
+    enforces the state-side proof so it cannot clear a live dispatch.
+    """
+
+    head_sha: str
+
+
 class IllegalSliceTransition(Exception):
     """Raised when an event has no legal transition for the current slice."""
 
@@ -221,6 +235,9 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
         return replace(state, reviewer_agent_id=event.reviewer_agent_id)
     if isinstance(event, StallClassificationObserved):
         return replace(state, stall_classification=event.classification)
+    if isinstance(event, StaleReviewerActionHealed):
+        _validate_stale_reviewer_action_heal(state, event)
+        return replace(state, action=None)
     if isinstance(event, ReviewVerdictObserved):
         _validate_review_event(state, event)
         findings = dict(state.review_findings)
@@ -525,3 +542,21 @@ def _reviewer_action_matches(action: ActionState | None, head_sha: str) -> bool:
         and action.kind is ActionKind.REVIEWER_SPAWN
         and action.head_sha == head_sha
     )
+
+
+def _validate_stale_reviewer_action_heal(
+    state: SliceState,
+    event: StaleReviewerActionHealed,
+) -> None:
+    """Allow the heal only for an exact-head, terminal, claimed reviewer action."""
+    action = state.action
+    if (
+        state.verdict is None
+        or state.reviewed_head != event.head_sha
+        or action is None
+        or action.kind is not ActionKind.REVIEWER_SPAWN
+        or action.head_sha != event.head_sha
+        or action.phase not in {ActionPhase.CONFIRMED, ActionPhase.RECONCILED}
+        or state.reviewer_attempt.get(event.head_sha, 0) <= 0
+    ):
+        raise IllegalSliceTransition(state, event)

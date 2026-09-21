@@ -213,6 +213,7 @@ from tl_loop.state.slice_transition import (
     CIStatusObserved,
     HeadChanged,
     HeadEvidenceObserved,
+    IllegalSliceTransition,
     MergeCompleted,
     PostMergeEventObserved,
     RepairQueued,
@@ -225,6 +226,7 @@ from tl_loop.state.slice_transition import (
     ReviewValidationFailed,
     ReviewVerdictObserved,
     SliceStatusChanged,
+    StaleReviewerActionHealed,
     StallClassificationObserved,
     slice_transition,
 )
@@ -6042,6 +6044,54 @@ def _reconcile_dispatches(
     return state
 
 
+def _reviewer_effect_pending(
+    slice_id: str,
+    effects_log: list[EffectIntent],
+) -> bool:
+    """Whether a reviewer spawn for this slice has an unresolved journal entry."""
+    if not isinstance(effects_log, EffectJournal):
+        return False
+    return any(
+        entry.get("operation") == "spawn_reviewer"
+        and entry.get("target") == slice_id
+        for entry in effects_log.pending_entries()
+    )
+
+
+def _heal_stale_reviewer_action(
+    current: SliceState,
+    effects_log: list[EffectIntent],
+) -> SliceState | None:
+    """Clear a provably-stale matching-head reviewer action after a verdict.
+
+    A verdict recorded by older code (or any prior bug) can leave a
+    REVIEWER_SPAWN action for the same head, which holds ``_derive_slice_action``
+    at ``await_reviewer_spawn_reconciliation`` forever. Repair only the narrow,
+    provable case: an exact-head verdict, a matching terminal reviewer action, an
+    existing reviewer attempt, and no pending/unknown reviewer journal entry.
+    Ambiguous actions (including every REPAIR action) stay gated, and the general
+    verdict-is-set fast path is untouched.
+    """
+    action = current.action
+    head_sha = current.reviewed_head
+    if (
+        current.verdict is None
+        or head_sha is None
+        or action is None
+        or action.kind is not ActionKind.REVIEWER_SPAWN
+        or action.head_sha != head_sha
+        or action.phase not in {ActionPhase.CONFIRMED, ActionPhase.RECONCILED}
+        or current.reviewer_attempt.get(head_sha, 0) <= 0
+        or _reviewer_effect_pending(current.id, effects_log)
+    ):
+        return None
+    try:
+        healed = slice_transition(current, StaleReviewerActionHealed(head_sha))
+    except IllegalSliceTransition:
+        return None
+    return healed if healed != current else None
+
+
 def _reconcile_nonterminal_slices(
     plan: WorkPlan,
     state: RunState,
@@ -6081,6 +6131,16 @@ def _reconcile_nonterminal_slices(
     conflicts_found = False
     changed = False
     for current in candidates:
+        healed = _heal_stale_reviewer_action(current, effects_log)
+        if healed is not None:
+            current = healed
+            updated[current.id] = healed
+            changed = True
+            LOGGER.info(
+                "[TL loop] healed stale reviewer action target=%s head=%s",
+                current.id,
+                current.reviewed_head,
+            )
         watcher = None
         if current.pr_number is not None and config.ledger_run_id is not None:
             if current.pr_number not in snapshots:

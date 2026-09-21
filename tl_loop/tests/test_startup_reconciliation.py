@@ -22,8 +22,12 @@ from tl_loop.loop.driver import (
     _reconcile_nonterminal_slices,
 )
 from tl_loop.loop.journal import EffectJournal
+from tl_loop.loop.reconcile import Quiescent, _derive_slice_action
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.state.schema import (
+    ActionKind,
+    ActionPhase,
+    ActionState,
     DurableReviewEvidence,
     FSMState,
     GateStatus,
@@ -540,6 +544,147 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     _apply_convergence(repeated, ConvergenceTracker(), store, config, client, journal)
     assert len(client.merge_calls) == 1
     assert len(client.chainlink_issue_close_calls) == 0
+
+
+def _stale_reviewer_action_state(store: RunStore, **changes: object):
+    """The #1042 artifact: exact-head verdict plus a matching terminal action."""
+    state = _review_recovery_state(store)
+    current = state.slices["slice-a"]
+    action = ActionState(
+        ActionKind.REVIEWER_SPAWN,
+        ActionPhase.CONFIRMED,
+        intent_id="reviewer-intent",
+        head_sha="head-a",
+        attempt=1,
+    )
+    # Fresh evidence keeps the general verdict-is-set replay fast path a no-op,
+    # so the only path that can clear the action is the narrow self-heal.
+    evidence = DurableReviewEvidence(
+        review_id=7,
+        pr_number=99,
+        head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+        verdict=Verdict.GO,
+        submitted_at="2026-08-27T00:00:00Z",
+        validated_at="2026-08-27T00:00:00Z",
+    )
+    values: dict[str, object] = {
+        "verdict": Verdict.GO,
+        "verdict_at": "2026-08-27T00:00:00Z",
+        "review_evidence": evidence,
+        "action": action,
+        **changes,
+    }
+    updated = replace(current, **values)
+    return store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+
+def _self_heal_client() -> FakeClient:
+    return FakeClient(
+        review_id=7,
+        review_verdict="APPROVED",
+        review_head_sha="head-a",
+        reviewer_agent_id="review-pr-99-codex",
+        review_state="approved",
+    )
+
+
+def test_stale_reviewer_action_self_heals_and_queues_merge_once(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _stale_reviewer_action_state(store)
+    client = _self_heal_client()
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+
+    healed = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+    healed_slice = healed.slices["slice-a"]
+    assert healed_slice.action is None
+    assert healed_slice.verdict is Verdict.GO
+    assert healed_slice.reviewed_head == "head-a"
+    assert healed_slice.reviewer_attempt == {"head-a": 1}
+    assert healed_slice.reviewer_agent_id == "review-pr-99-codex"
+
+    merged = _apply_convergence(healed, ConvergenceTracker(), store, config, client, journal)
+    assert client.spawn_reviewer_calls == []
+    assert len(client.merge_calls) == 1
+    assert client.merge_calls[0]["expected_head_sha"] == "head-a"
+    assert merged.slices["slice-a"].status is SliceStatus.MERGED
+
+    repeated = _reconcile_nonterminal_slices(
+        _PLAN, store.load(), config, client, store, journal
+    )
+    _apply_convergence(repeated, ConvergenceTracker(), store, config, client, journal)
+    assert len(client.merge_calls) == 1
+    assert client.spawn_reviewer_calls == []
+
+
+def test_stale_reviewer_action_heal_does_not_fire_with_pending_journal(tmp_path) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _stale_reviewer_action_state(store)
+    client = _self_heal_client()
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+    journal.append(
+        EffectIntent(
+            "spawn_reviewer",
+            "slice-a",
+            {"pr_number": 99, "head_sha": "head-a"},
+            True,
+        )
+    )
+
+    result = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    assert result.slices["slice-a"].action is not None
+    decision = _derive_slice_action(result.slices["slice-a"])
+    assert isinstance(decision, Quiescent)
+    assert decision.reason == "await_reviewer_spawn_reconciliation"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"action": ActionState(ActionKind.REPAIR, ActionPhase.CONFIRMED, head_sha="head-a")},
+        {"action": ActionState(ActionKind.REVIEWER_SPAWN, ActionPhase.CONFIRMED, head_sha="other-head")},
+        {"action": ActionState(ActionKind.REVIEWER_SPAWN, ActionPhase.IN_FLIGHT, head_sha="head-a")},
+        {"reviewer_attempt": {}},
+    ],
+)
+def test_stale_reviewer_action_heal_does_not_fire_for_ambiguous_state(
+    tmp_path, changes: dict[str, object]
+) -> None:
+    store, _ = _load_state(tmp_path)
+    state = _stale_reviewer_action_state(store, **changes)
+    client = _self_heal_client()
+    config = TLLoopConfig(
+        active=True,
+        ledger_run_id="run-1",
+        enable_reviewer_spawn=True,
+        chainlink_issue_id=1039,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+
+    result = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    assert result.slices["slice-a"].action is not None
+    decision = _derive_slice_action(result.slices["slice-a"])
+    assert isinstance(decision, Quiescent)
+    assert decision.reason.startswith("await_")
 
 
 def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_path) -> None:
