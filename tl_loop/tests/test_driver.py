@@ -2963,6 +2963,29 @@ def test_approved_run_gate_retries_in_live_controller(tmp_path: Path) -> None:
     )
 
 
+def test_duplicate_gate_approval_does_not_grant_a_second_retry(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    tracker = ConvergenceTracker()
+    state = store.load()
+    first = tracker.reduce(state)
+    assert isinstance(first.decision, ExternalIntent)
+    with pytest.raises(ConvergenceInvariantError):
+        tracker.reduce(state)
+
+    gate_name = repeated_action_gate_name(first.decision)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    # One approval advances the epoch and releases exactly one retry.
+    assert tracker.reduce(approved).decision == first.decision
+
+    duplicate = store.answer_gate(gate_name, GateStatus.APPROVED)
+    assert duplicate.state_version == approved.state_version
+    # The duplicate same-status answer gives no fresh epoch, so the same
+    # tracker still detects the repeat instead of retrying a second time.
+    with pytest.raises(ConvergenceInvariantError):
+        tracker.reduce(duplicate)
+
+
 def test_quiescent_convergence_is_not_parked(tmp_path: Path) -> None:
     store = _review_store(tmp_path)
     transport = RecordingTransport()

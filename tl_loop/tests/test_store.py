@@ -334,6 +334,22 @@ def test_answer_gate_requires_an_existing_gate(tmp_path: Path) -> None:
     assert answered.gates[0].status is GateStatus.APPROVED
 
 
+def test_same_status_gate_answer_does_not_advance_the_epoch(tmp_path: Path) -> None:
+    store = RunStore("run-1", tmp_path)
+    create("run-1", {}, root_dir=tmp_path)
+    store.set_gate("review")
+    before = store.load().state_version
+
+    approved = store.answer_gate("review", GateStatus.APPROVED)
+    assert approved.state_version == before + 1
+    # A duplicate same-status answer must not grant another convergence epoch.
+    assert store.answer_gate("review", GateStatus.APPROVED).state_version == before + 1
+
+    rejected = store.answer_gate("review", GateStatus.REJECTED)
+    assert rejected.state_version == before + 2
+    assert store.answer_gate("review", GateStatus.REJECTED).state_version == before + 2
+
+
 def test_review_policy_snapshot_survives_store_restart(tmp_path: Path) -> None:
     store = RunStore("run-1", tmp_path)
     create("run-1", {}, root_dir=tmp_path)

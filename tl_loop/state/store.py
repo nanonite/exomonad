@@ -666,8 +666,14 @@ class RunStore:
                 raise CorruptCheckpoint("run state gates are not an array")
             for gate in gates:
                 if isinstance(gate, dict) and gate.get("name") == name:
+                    if gate.get("status") == status.value:
+                        # Idempotent re-answer: leave the convergence epoch
+                        # unchanged so a duplicate approval cannot grant the
+                        # same action another fresh tracker key (and thus a
+                        # second retry without a new pending occurrence).
+                        return document
                     gate["status"] = status.value
-                    # An operator decision is a durable semantic transition, so
+                    # A status change is a durable semantic transition, so
                     # advance the convergence epoch exactly like an internal
                     # transition does. Without this, a live controller's
                     # in-memory ConvergenceTracker still holds the released
