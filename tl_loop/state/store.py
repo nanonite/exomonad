@@ -6,7 +6,7 @@ import copy
 import json
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -115,6 +115,7 @@ from .serialization import to_jsonable
 from .write import apply
 
 DEFAULT_ROOT = Path(".exo/tl-loop")
+ARCHIVED_ROOT_PREFIX = "root.invalid-"
 RootSpec: TypeAlias = Mapping[str, object]
 SliceInput: TypeAlias = SliceState | Mapping[str, object]
 FSMInput: TypeAlias = (
@@ -945,12 +946,7 @@ def _assert_worktree_available(initial: Mapping[str, object], target: Path, root
     if not isinstance(owner, str) or not owner:
         return
     normalized_owner = _normalize_worktree(owner)
-    search_root = root_dir.parent
-    if not search_root.exists():
-        return
-    for candidate in search_root.rglob("run.json"):
-        if candidate == target / "run.json":
-            continue
+    for candidate in _iter_active_run_checkpoints(root_dir, target):
         existing = _read_existing_state(candidate)
         if existing is None:
             continue
@@ -963,6 +959,42 @@ def _assert_worktree_available(initial: Mapping[str, object], target: Path, root
             and phase not in {TLPhase.TLDone.value, TLPhase.TLFailed.value}
         ):
             raise WorktreeClaimError(f"worktree {owner!r} is already claimed by {candidate.parent}")
+
+
+def _iter_active_run_checkpoints(root_dir: Path, target: Path) -> Iterator[Path]:
+    """Yield only checkpoints that belong to the active run forest.
+
+    A confirmed recreate archives the whole active root directory beneath the
+    TL-loop root as ``root.invalid-<timestamp>``. Those checkpoints are
+    immutable diagnostic evidence, not live worktree owners, so the claim scan
+    must exclude every checkpoint beneath them while still detecting collisions
+    among active root, child, sibling, and nested runs.
+    """
+    search_root = root_dir.parent
+    if not search_root.exists():
+        return
+    target_checkpoint = target / "run.json"
+    for candidate in search_root.rglob("run.json"):
+        if candidate == target_checkpoint:
+            continue
+        if _lives_in_archived_root(candidate, root_dir):
+            continue
+        yield candidate
+
+
+def _lives_in_archived_root(candidate: Path, root_dir: Path) -> bool:
+    """Return True only for checkpoints inside a top-level ``root.invalid-*`` archive.
+
+    The archive directory is a direct child of the TL-loop root, which is
+    either ``root_dir`` itself (root creation) or ``root_dir.parent`` (child
+    creation). Nested directories whose names merely contain ``invalid`` stay in
+    the active forest so collision detection is not weakened.
+    """
+    archive_parents = {root_dir, root_dir.parent}
+    return any(
+        ancestor.name.startswith(ARCHIVED_ROOT_PREFIX) and ancestor.parent in archive_parents
+        for ancestor in candidate.parents
+    )
 
 
 def _resolve_run_directory(

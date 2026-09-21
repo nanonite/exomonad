@@ -464,3 +464,88 @@ def test_live_run_cannot_claim_an_owned_worktree_twice(tmp_path: Path) -> None:
         create(
             "second", {"owner_branch": "main.second", "owner_worktree": worktree}, root_dir=tmp_path
         )
+
+
+def _set_checkpoint_phase(store: RunStore, phase: TLPhase) -> None:
+    document = json.loads(store.path.read_text(encoding="utf-8"))
+    document["fsm"] = {"phase": phase.value, "waiting": list(document["fsm"]["waiting"])}
+    store.path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def _ordered_child_spec(child_worktree: str) -> dict[str, object]:
+    return {
+        "owner_branch": "main.stage-a",
+        "owner_worktree": child_worktree,
+        "parent_run_id": "root",
+    }
+
+
+def _archived_nonterminal_child(tmp_path: Path) -> tuple[Path, str, Path]:
+    """Reproduce the captured recreate shape: a live child checkpoint under a root.invalid-* archive."""
+    tl_root = tmp_path / ".exo" / "tl-loop"
+    child_worktree = str(tl_root / "worktrees" / "stage-a")
+    root_worktree = str(tmp_path / ".worktrees" / "root")
+    create("root", {"owner_branch": "main", "owner_worktree": root_worktree}, root_dir=tl_root)
+    create("stage-a", _ordered_child_spec(child_worktree), root_dir=tl_root / "root")
+    _set_checkpoint_phase(RunStore("root", tl_root), TLPhase.TLFailed)
+    _set_checkpoint_phase(RunStore("stage-a", tl_root / "root"), TLPhase.TLRunning)
+    archive = tl_root / "root.invalid-1789772880851"
+    (tl_root / "root").rename(archive)
+    return tl_root, child_worktree, archive
+
+
+def test_archived_nonterminal_child_does_not_claim_recreated_worktree(tmp_path: Path) -> None:
+    tl_root, child_worktree, archive = _archived_nonterminal_child(tmp_path)
+    archived_run = archive / "stage-a" / "run.json"
+    archived_bytes = archived_run.read_bytes()
+
+    create(
+        "root",
+        {"owner_branch": "main", "owner_worktree": str(tmp_path / ".worktrees" / "root")},
+        root_dir=tl_root,
+    )
+    create("stage-a", _ordered_child_spec(child_worktree), root_dir=tl_root / "root")
+
+    assert (tl_root / "root" / "stage-a" / "run.json").is_file()
+    assert archived_run.read_bytes() == archived_bytes
+
+
+def test_active_nested_checkpoint_still_blocks_duplicate_ownership(tmp_path: Path) -> None:
+    tl_root = tmp_path / ".exo" / "tl-loop"
+    shared_worktree = str(tmp_path / ".worktrees" / "shared")
+    create(
+        "root",
+        {"owner_branch": "main", "owner_worktree": str(tmp_path / ".worktrees" / "root")},
+        root_dir=tl_root,
+    )
+    create(
+        "first",
+        {"owner_branch": "main.first", "owner_worktree": shared_worktree},
+        root_dir=tl_root / "root",
+    )
+
+    with pytest.raises(WorktreeClaimError, match="already claimed"):
+        create(
+            "second",
+            {"owner_branch": "main.second", "owner_worktree": shared_worktree},
+            root_dir=tl_root / "root",
+        )
+
+
+def test_multiple_root_invalid_archives_are_preserved_and_never_claim(tmp_path: Path) -> None:
+    tl_root = tmp_path / ".exo" / "tl-loop"
+    child_worktree = str(tl_root / "worktrees" / "stage-a")
+    root_worktree = str(tmp_path / ".worktrees" / "root")
+    snapshots: dict[str, bytes] = {}
+    for name in ("root.invalid-1", "root.invalid-2"):
+        create("root", {"owner_branch": "main", "owner_worktree": root_worktree}, root_dir=tl_root)
+        create("stage-a", _ordered_child_spec(child_worktree), root_dir=tl_root / "root")
+        (tl_root / "root").rename(tl_root / name)
+        snapshots[name] = (tl_root / name / "stage-a" / "run.json").read_bytes()
+
+    create("root", {"owner_branch": "main", "owner_worktree": root_worktree}, root_dir=tl_root)
+    create("stage-a", _ordered_child_spec(child_worktree), root_dir=tl_root / "root")
+
+    assert (tl_root / "root" / "stage-a" / "run.json").is_file()
+    for name, expected in snapshots.items():
+        assert (tl_root / name / "stage-a" / "run.json").read_bytes() == expected

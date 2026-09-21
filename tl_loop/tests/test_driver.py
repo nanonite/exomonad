@@ -444,6 +444,59 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
     assert RunStore("beta", root).load().ledger_run_id == "swarm-uuid"
 
 
+def test_recreate_starts_replacement_ordered_child_despite_archived_claim(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / ".exo" / "tl-loop"
+    root_worktree = str(tmp_path / ".worktrees" / "root")
+    child_worktree = str(tmp_path / ".worktrees" / "root" / "stage-a")
+    create(
+        "root",
+        {"owner_branch": "main", "owner_worktree": root_worktree},
+        root_dir=state_root,
+    )
+
+    archived_run = state_root / "root.invalid-1789772880851" / "stage-a" / "run.json"
+    archived_run.parent.mkdir(parents=True)
+    archived_run.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision": 133,
+                "run_id": "stage-a",
+                "owner_worktree": child_worktree,
+                "fsm": {"phase": TLPhase.TLRunning.value, "waiting": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    archived_bytes = archived_run.read_bytes()
+
+    config = TLLoopConfig(
+        active=True,
+        root_dir=state_root,
+        run_id="root",
+        branch="main",
+        worktree=root_worktree,
+    )
+    effects = EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
+    task = SubTLTask("stage-a", WorkPlan(), source=SyntheticQueue([]), order=1)
+    outcomes = _run_sub_tl_batch(
+        (task,),
+        config,
+        SyntheticQueue([]),
+        effects,
+        RunStore("root", state_root),
+        BudgetLedger(tokens=0, wall_seconds=0),
+    )
+
+    assert [phase for _, phase, _ in outcomes] == [TLPhase.TLDone]
+    replacement = RunStore("stage-a", state_root / "root").load()
+    assert replacement.owner_worktree == child_worktree
+    assert (state_root / "root" / "stage-a" / "run.json").is_file()
+    assert archived_run.read_bytes() == archived_bytes
+
+
 def test_live_ordered_child_is_provisioned_before_controller_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
