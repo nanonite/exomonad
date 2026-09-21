@@ -137,6 +137,7 @@ class ParkCause(str, Enum):
     PUBLICATION_OWNERSHIP_UNRESOLVED = "publication_ownership_unresolved"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
     DISPATCH_FAILED = "dispatch_failed"
+    REPEATED_ACTION_NO_PROGRESS = "repeated_action_no_progress"
     CORRUPT_STATE = "corrupt_state"
     DURABLE_WRITE_FAILED = "durable_write_failed"
     TOOL_UNAVAILABLE = "tool_unavailable"
@@ -681,6 +682,10 @@ PARK_AUDIT_KEYS = frozenset(
         "retryable",
         "declared_difficulty",
         "matched_difficulty_rule",
+        "invariant",
+        "action_key",
+        "action",
+        "target_id",
     }
 )
 RECOVERY_KEYS = frozenset(
@@ -1587,7 +1592,18 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
     for key in ("needs_human", "retryable"):
         if key in audit:
             _boolean(audit, key, f"{path}.park_audit", errors)
-    for key in ("harness", "model", "from_harness", "to_harness", "reason", "effort"):
+    for key in (
+        "harness",
+        "model",
+        "from_harness",
+        "to_harness",
+        "reason",
+        "effort",
+        "invariant",
+        "action_key",
+        "action",
+        "target_id",
+    ):
         if key in audit:
             _nullable_string(audit, key, f"{path}.park_audit", errors)
     ledger = audit.get("ledger")

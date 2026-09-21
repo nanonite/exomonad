@@ -237,6 +237,7 @@ from .observation import WatcherObservation
 from .reconcile import (
     ExternalIntent,
     InternalTransition,
+    MergeDecision,
     Quiescent,
     ReconciliationResult,
     _publication_ownership_status,
@@ -254,6 +255,7 @@ INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 REPOSITORY_IDENTITY_GATE_NAME = "tl-repository-identity"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
+REPEATED_ACTION_GATE_PREFIX = "tl-repeated-action-"
 MAX_CONVERGENCE_STEPS = 8
 # A per-call fairness cap on _drain_direct_scope_convergence, not a
 # correctness bound: that function raises the moment a step makes no
@@ -2738,7 +2740,15 @@ def _apply_convergence(
         except ConvergenceInvariantError as error:
             for event in error.events:
                 _record_convergence_event(error.key, event, config, effects, effects_log)
-            raise TLLoopError(str(error)) from error
+            return _park_repeated_action(
+                state,
+                error,
+                tracker.last_decision,
+                store,
+                config,
+                effects,
+                effects_log,
+            )
         if isinstance(result.state, RunState) and result.state.state_version > state.state_version:
             state = store.set_state_version(result.state.state_version)
         for event in result.events:
@@ -2772,6 +2782,117 @@ def _apply_convergence(
             )
         return state
     raise TLLoopError("convergence did not reach a stable action or wait state")
+
+
+def _repeated_action_label(decision: MergeDecision | None) -> str:
+    if isinstance(decision, ExternalIntent):
+        return f"{decision.operation} effect"
+    if isinstance(decision, InternalTransition):
+        return f"{decision.transition} transition"
+    return "controller"
+
+
+def _park_repeated_action(
+    state: RunState,
+    error: ConvergenceInvariantError,
+    decision: MergeDecision | None,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Park the slice whose identical action repeated without durable progress.
+
+    The livelock detector still fires; this converts its exception into the same
+    durable park + named gate every other bounded-failure path uses, instead of
+    taking down the whole controller. A repeated action that cannot be isolated
+    to a non-terminal slice opens a stable run-level gate and returns, so the
+    next cycle can never crash on another repeated action either.
+    """
+    target_id = error.target
+    action_label = _repeated_action_label(decision)
+    reason = (
+        f"controller detected the same {action_label} proposed twice for "
+        f"{target_id or 'the run'} without durable state advancing "
+        f"({error.invariant}, action key {error.key}); the underlying effect is "
+        "not completing -- inspect the slice reconciliation and any open gate "
+        "before resolving"
+    )
+    target = state.slices.get(target_id) if target_id else None
+    if target is None or target.status in {
+        SliceStatus.MERGED,
+        SliceStatus.FAILED,
+        SliceStatus.PARKED,
+        SliceStatus.BLOCKED,
+    }:
+        gate_name = f"{REPEATED_ACTION_GATE_PREFIX}{error.key}"
+        previous = next((gate for gate in state.gates if gate.name == gate_name), None)
+        state = store.set_gate(gate_name, GateStatus.PENDING)
+        if previous is None or previous.status is not GateStatus.PENDING:
+            _record_controller_event(
+                "controller",
+                "tl.repeated_action_parked",
+                {
+                    "gate_name": gate_name,
+                    "invariant": error.invariant,
+                    "action_key": error.key,
+                    "action": action_label,
+                    "target_id": target_id,
+                    "reason": reason,
+                },
+                config,
+                effects,
+                effects_log,
+            )
+        return state
+    audit = {
+        "invariant": error.invariant,
+        "action_key": error.key,
+        "action": action_label,
+        "target_id": target.id,
+        "reason": reason,
+        "head_sha": _persisted_slice_head(target),
+    }
+    if config.active:
+        park(
+            target,
+            ParkCause.REPEATED_ACTION_NO_PROGRESS,
+            store=store,
+            issue_creator=cast(EffectClient, effects),
+            audit=audit,
+        )
+    else:
+        parked = slice_transition(target, SliceStatusChanged(SliceStatus.PARKED))
+        parked = replace(
+            parked,
+            park_cause=ParkCause.REPEATED_ACTION_NO_PROGRESS,
+            park_audit=audit,
+        )
+        store.checkpoint(
+            state.fsm,
+            {**state.slices, target.id: parked},
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+        )
+    parked_state = store.load()
+    _record_controller_event(
+        target.id,
+        "tl.repeated_action_parked",
+        {
+            "invariant": error.invariant,
+            "action_key": error.key,
+            "action": action_label,
+            "target_id": target.id,
+            "reason": reason,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return parked_state
 
 
 def _drain_direct_scope_convergence(

@@ -28,7 +28,7 @@ from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
-from tl_loop.loop.convergence import ConvergenceTracker
+from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
 from tl_loop.loop.driver import (
     DISPATCH_CORRELATED,
     DISPATCH_HISTORICAL_AUDIT,
@@ -38,6 +38,7 @@ from tl_loop.loop.driver import (
     EventDiagnostics,
     LoopCancelled,
     LoopLimitExceeded,
+    REPEATED_ACTION_GATE_PREFIX,
     SubTLTask,
     TLLoopConfig,
     TLLoopError,
@@ -54,6 +55,7 @@ from tl_loop.loop.driver import (
     _initial_slices,
     _merge_result_is_authoritative,
     _ordered_child_complete,
+    _park_repeated_action,
     _phase_after_slice_merge,
     _record_review_event,
     _recover_tool_unavailable,
@@ -2623,6 +2625,204 @@ def test_review_round_exhaustion_parks_gate_and_emits_once(tmp_path: Path) -> No
             ]
         )
         == 1
+    )
+
+
+def _mergeable_review_store(tmp_path: Path) -> RunStore:
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    current = store.load().slices["leaf-a"]
+    store.checkpoint(
+        TLPlanning(),
+        {
+            "leaf-a": replace(
+                current,
+                publication=PublicationBinding(42, "head-a", "main.leaf-a", "main", 1),
+                handoff=HandoffEvidence(
+                    42, "head-a", 1, "inv-1", "leaf-a", "2026-08-12T00:00:00Z"
+                ),
+                reviewer_attempt={"head-a": 1},
+                ci_state={"head-a": "success"},
+            )
+        },
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+    return store
+
+
+class RepeatedActionTransport(RecordingTransport):
+    """Watcher compare evidence is never complete, so the merge intent repeats."""
+
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
+        if tool_name == "chainlink_issue_create":
+            self.calls.append((tool_name, arguments))
+            return {"success": True, "result": {"issue_id": 1011}}
+        if tool_name == "watcher_pr_state":
+            self.calls.append((tool_name, arguments))
+            return {
+                "success": True,
+                "result": {
+                    "merged": False,
+                    "head_sha": "head-a",
+                    "base_sha": "base-a",
+                    # patch_digest/merge_tree_sha omitted: compare evidence incomplete
+                    "ci_status": "success",
+                },
+            }
+        return super().call_tool(role, name, tool_name, arguments)
+
+
+def test_repeated_action_parks_with_gate_instead_of_crashing(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    transport = RepeatedActionTransport()
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+    tracker = ConvergenceTracker()
+    config = TLLoopConfig(active=True)
+
+    first = _apply_convergence(
+        store.load(), tracker, store, config, EffectClient(transport), journal
+    )
+    assert first.slices["leaf-a"].status is SliceStatus.IN_REVIEW
+
+    parked = _apply_convergence(
+        store.load(), tracker, store, config, EffectClient(transport), journal
+    )
+
+    parked_slice = parked.slices["leaf-a"]
+    assert parked_slice.status is SliceStatus.PARKED
+    assert parked_slice.park_cause is ParkCause.REPEATED_ACTION_NO_PROGRESS
+    audit = parked_slice.park_audit
+    assert audit["invariant"] == "repeated_state_version_action"
+    assert audit["action"] == "merge effect"
+    assert audit["target_id"] == "leaf-a"
+    assert "without durable state advancing" in str(audit["reason"])
+    assert any(
+        gate.name == blocked_gate_name("review-run", "leaf-a", 1, "repeated_action_no_progress")
+        and gate.status is GateStatus.PENDING
+        for gate in parked.gates
+    )
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+    parked_events = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.repeated_action_parked"
+    ]
+    assert len(parked_events) == 1
+
+
+def test_parked_repeated_action_survives_restart_idempotently(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    transport = RepeatedActionTransport()
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+    config = TLLoopConfig(active=True)
+    tracker = ConvergenceTracker()
+    _apply_convergence(store.load(), tracker, store, config, EffectClient(transport), journal)
+    parked = _apply_convergence(
+        store.load(), tracker, store, config, EffectClient(transport), journal
+    )
+    assert parked.slices["leaf-a"].status is SliceStatus.PARKED
+    issues_before = [call for call in transport.calls if call[0] == "chainlink_issue_create"]
+
+    resumed = _apply_convergence(
+        store.load(), ConvergenceTracker(), store, config, EffectClient(transport), journal
+    )
+
+    assert resumed.slices["leaf-a"].status is SliceStatus.PARKED
+    assert resumed.slices["leaf-a"].park_cause is ParkCause.REPEATED_ACTION_NO_PROGRESS
+    assert [call for call in transport.calls if call[0] == "chainlink_issue_create"] == issues_before
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+
+
+def test_repeated_action_without_slice_target_opens_run_gate(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    transport = RecordingTransport()
+    error = ConvergenceInvariantError(
+        "repeated_state_version_action", "abc123", target=None
+    )
+
+    result = _park_repeated_action(
+        store.load(), error, None, store, TLLoopConfig(active=True), EffectClient(transport), []
+    )
+
+    gate_name = f"{REPEATED_ACTION_GATE_PREFIX}abc123"
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.PENDING for gate in result.gates
+    )
+    assert result.slices["leaf-a"].status is SliceStatus.IN_REVIEW
+    parked_events = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.repeated_action_parked"
+    ]
+    assert len(parked_events) == 1
+
+
+def test_quiescent_convergence_is_not_parked(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    transport = RecordingTransport()
+
+    result = _apply_convergence(
+        store.load(),
+        ConvergenceTracker(),
+        store,
+        TLLoopConfig(active=True),
+        EffectClient(transport),
+        [],
+    )
+
+    assert result.slices["leaf-a"].status is SliceStatus.IN_REVIEW
+    assert not any(name == "chainlink_issue_create" for name, _ in transport.calls)
+
+
+def test_valid_exact_head_review_still_merges_without_parking(tmp_path: Path) -> None:
+    store = _mergeable_review_store(tmp_path)
+    transport = IntegrationTransport(
+        snapshots=[
+            {
+                "merged": False,
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "merged": True,
+                "head_sha": "head-a",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+                "pr_state": "closed",
+            },
+        ],
+        merge_response={"success": True, "result": {"merged": True}},
+    )
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+
+    result = _apply_convergence(
+        store.load(),
+        ConvergenceTracker(),
+        store,
+        TLLoopConfig(active=True),
+        EffectClient(transport),
+        journal,
+    )
+
+    assert result.slices["leaf-a"].status is SliceStatus.MERGED
+    assert not any(name == "chainlink_issue_create" for name, _ in transport.calls)
+    assert not any(
+        name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.repeated_action_parked"
+        for name, arguments in transport.calls
     )
 
 

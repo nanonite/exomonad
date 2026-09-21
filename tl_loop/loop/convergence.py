@@ -23,9 +23,17 @@ PersistedState: TypeAlias = RunState | SliceState
 class ConvergenceInvariantError(RuntimeError):
     """A state version attempted the same transition or action twice."""
 
-    def __init__(self, invariant: str, key: str, events: tuple[ConvergenceEvent, ...] = ()) -> None:
+    def __init__(
+        self,
+        invariant: str,
+        key: str,
+        events: tuple[ConvergenceEvent, ...] = (),
+        *,
+        target: str | None = None,
+    ) -> None:
         self.invariant = invariant
         self.key = key
+        self.target = target
         self.events = events
         super().__init__(f"{invariant} violated for {key}")
 
@@ -99,7 +107,9 @@ class ConvergenceTracker:
         if key in self._seen:
             invariant = "repeated_state_version_action"
             events.extend(self._invariant_event(run_id, target, version, invariant, action_key))
-            raise ConvergenceInvariantError(invariant, action_key, tuple(events))
+            raise ConvergenceInvariantError(
+                invariant, action_key, tuple(events), target=target
+            )
         self._seen.add(key)
         if isinstance(decision, ExternalIntent):
             events.append(

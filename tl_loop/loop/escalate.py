@@ -32,7 +32,19 @@ _TERMINAL_STATUSES = frozenset(
         SliceStatus.BLOCKED.value,
     }
 )
-_AUDIT_FIELDS = frozenset({"from_harness", "to_harness", "reason", "model", "effort"})
+_AUDIT_FIELDS = frozenset(
+    {
+        "from_harness",
+        "to_harness",
+        "reason",
+        "model",
+        "effort",
+        "invariant",
+        "action_key",
+        "action",
+        "target_id",
+    }
+)
 _BLOCKED_AUDIT_FIELDS = frozenset(
     {
         "attempt",
@@ -53,6 +65,7 @@ _BLOCKED_GATE_CAUSES = frozenset(
         ParkCause.MISSING_HANDOFF,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
         ParkCause.REVIEW_ROUNDS_EXHAUSTED,
+        ParkCause.REPEATED_ACTION_NO_PROGRESS,
     }
 )
 

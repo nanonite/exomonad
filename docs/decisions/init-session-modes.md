@@ -68,6 +68,27 @@ at `await_repair_reconciliation`/`await_reviewer_spawn_reconciliation`. An
 operator resolves those through the normal gate path; no manual `run.json`
 editing is ever required or supported.
 
+## Repeated-action livelock park
+
+The convergence guard still detects a controller proposing the same
+`(target, state_version, action)` twice without durable progress, but that
+detection now parks instead of taking down the controller. The slice named by
+the repeated action is parked with cause `repeated_action_no_progress` and the
+named gate
+`task-blocked:<run>:<slice>:<attempt>:repeated_action_no_progress`; when the
+repeated action cannot be isolated to one non-terminal slice, a stable
+run-level gate `tl-repeated-action-<action-key>` is opened instead. The park
+audit records the invariant, action key, action label, target, and a
+plain-language reason, and one `tl.repeated_action_parked` event is emitted.
+
+Operator resolution: inspect the parked slice's `park_audit` and its
+`reconciliation` evidence (or the run-level gate), clear the underlying
+blocker (for example incomplete merge compare evidence or an unresolved action
+journal entry), then answer the named gate through the existing gate
+command/route. Repeated continuations observe the parked slice and gate
+without re-raising or retrying the effect, and unrelated valid convergence
+still proceeds normally.
+
 ## Recreate publication authorization
 
 `--recreate` may remove an ordered-controller branch only when every
