@@ -1667,6 +1667,12 @@ impl<
             }
             let prior_identity = self.agent_resolver().get(&agent_name).await;
 
+            // Bounded preflight: drop sink-only residue directories left behind
+            // by earlier failed spawns before deciding whether the planned path
+            // is a reusable worktree. Registered, dirty, identified, or
+            // ambiguous directories are never removed.
+            let _ = super::cleanup::cleanup_unregistered_worktree_residue(self.project_dir());
+
             let existing_branch = if !options.standalone_repo && worktree_path.exists() {
                 self.git_wt()
                     .get_workspace_bookmark(&worktree_path)

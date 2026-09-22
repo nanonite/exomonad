@@ -1259,6 +1259,23 @@ async fn deliver_via_uds(
     }
 }
 
+/// Resolve the project directory used for telemetry and sink writes for one agent.
+///
+/// A planned leaf worktree that does not exist yet (for example after a failed
+/// spawn) must never be materialized just to hold sink records. Only a live Git
+/// worktree is used; otherwise sinks fall back to the project-owned directory,
+/// which preserves the evidence without creating a fake reusable worktree.
+fn sink_project_dir(
+    project_dir: &std::path::Path,
+    candidate: std::path::PathBuf,
+) -> std::path::PathBuf {
+    if candidate.is_dir() && candidate.join(".git").exists() {
+        candidate
+    } else {
+        project_dir.to_path_buf()
+    }
+}
+
 /// Deliver via tmux STDIN injection (routing.json lookup + fallback to tmux_target).
 /// Used as primary path for OpenCode agents and as fallback for others.
 async fn deliver_via_tmux(
@@ -1335,7 +1352,7 @@ async fn deliver_via_tmux(
         } else {
             crate::services::resolve_working_dir(agent_key)
         };
-        let effective_pd = project_dir.join(worktree);
+        let effective_pd = sink_project_dir(project_dir, project_dir.join(worktree));
         return enqueue_tmux_delivery(
             agent_key,
             &target,
@@ -1360,7 +1377,7 @@ async fn deliver_via_tmux(
     } else {
         crate::services::resolve_worktree_from_tab(tmux_target)
     };
-    let effective_pd = project_dir.join(worktree);
+    let effective_pd = sink_project_dir(project_dir, project_dir.join(worktree));
     // Resolve the current pane from the display name. Window and pane indexes
     // are session-local and can become stale after a restart; the display name
     // is the stable identity supplied by AgentResolver.
@@ -1860,6 +1877,62 @@ mod tests {
             body.to_string(),
             "%1".to_string(),
         )
+    }
+
+    #[test]
+    fn sink_project_dir_uses_live_git_worktree() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let project = temp.path();
+        let worktree = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../.git/worktrees/leaf-codex\n",
+        )
+        .unwrap();
+
+        assert_eq!(sink_project_dir(project, worktree.clone()), worktree);
+    }
+
+    #[test]
+    fn sink_project_dir_falls_back_without_creating_missing_worktree() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let project = temp.path();
+        let planned = project.join(".exo/worktrees/leaf-codex");
+
+        let resolved = sink_project_dir(project, planned.clone());
+
+        assert_eq!(resolved, project);
+        assert!(
+            !planned.exists(),
+            "sink resolution must not materialize a planned worktree"
+        );
+    }
+
+    #[test]
+    fn sink_project_dir_rejects_residue_without_git_marker() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let project = temp.path();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(&residue).unwrap();
+
+        assert_eq!(sink_project_dir(project, residue.clone()), project);
+    }
+
+    #[test]
+    fn sink_event_log_for_missing_leaf_stays_in_project_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let project = temp.path();
+        let planned = project.join(".exo/worktrees/leaf-codex");
+
+        let sink_dir = sink_project_dir(project, planned.clone());
+        crate::services::EventLog::open(sink_dir.join(".exo/logs")).unwrap();
+
+        assert!(
+            !planned.exists(),
+            "sink write must not create the planned leaf worktree"
+        );
+        assert!(project.join(".exo/logs").exists());
     }
 
     /// Injector that fails its first `fail_times` calls, then succeeds.

@@ -457,6 +457,92 @@ impl<
     }
 }
 
+const WORKTREE_SINK_ARTIFACTS: &[&str] = &[
+    "logs",
+    "events",
+    "sink-health.json",
+    "sink-health.lock",
+    "session.json",
+];
+
+fn exo_contains_only_sink_artifacts(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !WORKTREE_SINK_ARTIFACTS.contains(&name.to_string_lossy().as_ref()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn contains_only_sink_artifacts(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy() != ".exo" {
+            return false;
+        }
+        if !exo_contains_only_sink_artifacts(&entry.path()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn worktree_name_is_identified(project_dir: &Path, name: &str) -> bool {
+    let agents_dir = project_dir.join(".exo/agents");
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return false;
+    };
+    let needle = format!("worktrees/{name}");
+    for entry in entries.flatten() {
+        let identity_path = entry.path().join("identity.json");
+        if let Ok(contents) = std::fs::read_to_string(&identity_path) {
+            if contents.contains(&needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Remove `.exo/worktrees/*` residue directories that are provably disposable.
+///
+/// Only directories that are not live Git worktrees, carry no agent identity,
+/// and contain nothing but known sink artifacts are removed. Registered, dirty,
+/// identified, or ambiguous directories are left untouched. Returns the removed
+/// paths for observability.
+pub(crate) fn cleanup_unregistered_worktree_residue(project_dir: &Path) -> Vec<PathBuf> {
+    let worktrees_dir = project_dir.join(".exo/worktrees");
+    let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || path.join(".git").exists() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy().to_string();
+        if worktree_name_is_identified(project_dir, &name) {
+            continue;
+        }
+        if !contains_only_sink_artifacts(&path) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +553,66 @@ mod tests {
     use crate::services::Services;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+
+    #[test]
+    fn residue_cleanup_removes_sink_only_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
+        std::fs::write(residue.join(".exo/logs/agent.jsonl"), "{}\n").unwrap();
+
+        let removed = cleanup_unregistered_worktree_residue(project);
+
+        assert_eq!(removed, vec![residue.clone()]);
+        assert!(!residue.exists());
+    }
+
+    #[test]
+    fn residue_cleanup_refuses_live_registered_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        let worktree = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(worktree.join(".exo/logs")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../.git/worktrees/leaf-codex\n",
+        )
+        .unwrap();
+
+        assert!(cleanup_unregistered_worktree_residue(project).is_empty());
+        assert!(worktree.exists());
+    }
+
+    #[test]
+    fn residue_cleanup_refuses_identified_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
+        let agent_dir = project.join(".exo/agents/leaf");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("identity.json"),
+            r#"{"working_dir":".exo/worktrees/leaf-codex/"}"#,
+        )
+        .unwrap();
+
+        assert!(cleanup_unregistered_worktree_residue(project).is_empty());
+        assert!(residue.exists());
+    }
+
+    #[test]
+    fn residue_cleanup_refuses_dirty_or_ambiguous_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
+        std::fs::write(residue.join("seed"), "real work\n").unwrap();
+
+        assert!(cleanup_unregistered_worktree_residue(project).is_empty());
+        assert!(residue.exists());
+    }
 
     #[tokio::test]
     async fn cleanup_agent_retains_identity_when_worktree_removal_fails() {
