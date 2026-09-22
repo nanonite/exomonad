@@ -68,18 +68,17 @@ fn expected_leaf_birth(
     Ok(effective_birth.child(agent_name))
 }
 
-/// One typed ownership verifier for every leaf path decision.
+/// Verify an existing leaf worktree path, if one is present.
 ///
-/// Used by existing-path reuse, the live-route return, ordinary attach, and the
-/// BranchExists race retry so all four share exactly the same proof. Failures
-/// carry stable machine codes through [`EffectError`].
-async fn verify_leaf_ownership(
+/// A missing path is a no-op here: the remote-dependent attach checks require
+/// fresh evidence and run only after `ensure_branch_fetched`. Used by the
+/// preflight and the live-route return, where the path must already exist.
+async fn verify_existing_leaf_worktree(
     git_wt: &GitWorktreeService,
     effective_project_dir: &Path,
     worktree_path: &Path,
     branch_name: &BranchName,
     expected_head: Option<&str>,
-    fresh_remote: Option<crate::services::git_worktree::RemoteEvidence>,
     require_existing_worktree: bool,
 ) -> Result<()> {
     if worktree_path.exists() {
@@ -98,6 +97,21 @@ async fn verify_leaf_ownership(
             },
         )));
     }
+    Ok(())
+}
+
+/// Verify that an absent-worktree branch may be attached.
+///
+/// Must be called only after `ensure_branch_fetched` so `fresh_remote` reflects
+/// the current remote. Requires authoritative head evidence; failures carry
+/// stable machine codes through [`EffectError`].
+async fn verify_attachable_branch(
+    git_wt: &GitWorktreeService,
+    effective_project_dir: &Path,
+    branch_name: &BranchName,
+    expected_head: Option<&str>,
+    fresh_remote: crate::services::git_worktree::RemoteEvidence,
+) -> Result<()> {
     use crate::services::git_worktree::RemoteEvidence;
     let branch_exists = git_wt
         .branch_exists(branch_name)
@@ -122,8 +136,7 @@ async fn verify_leaf_ownership(
     // branch. Remote state is only accepted when freshly verified; an expected
     // head is the fallback. Durable identity proves ownership, not a commit.
     let has_expected_head = expected_head.is_some();
-    let remote = fresh_remote.unwrap_or_else(|| git_wt.remote_evidence(branch_name));
-    match remote {
+    match fresh_remote {
         RemoteEvidence::Unavailable => {
             if !has_expected_head {
                 return Err(anyhow!(EffectError::custom(
@@ -1881,13 +1894,12 @@ impl<
             // registered worktrees on the derived branch; an absent path may be
             // attached later only with proven ownership.
             if !options.standalone_repo {
-                verify_leaf_ownership(
+                verify_existing_leaf_worktree(
                     self.git_wt(),
                     effective_project_dir,
                     &worktree_path,
                     &branch_name,
                     expected_head,
-                    None,
                     false,
                 )
                 .await?;
@@ -1910,13 +1922,12 @@ impl<
                 // registered worktree. A stale route whose worktree was deleted
                 // must never return success.
                 if !options.standalone_repo {
-                    verify_leaf_ownership(
+                    verify_existing_leaf_worktree(
                         self.git_wt(),
                         effective_project_dir,
                         &worktree_path,
                         &branch_name,
                         expected_head,
-                        None,
                         true,
                     )
                     .await?;
@@ -1982,14 +1993,12 @@ impl<
                     options.start_point.as_deref(),
                 ) {
                     LeafWorktreeAction::Attach => {
-                        verify_leaf_ownership(
+                        verify_attachable_branch(
                             self.git_wt(),
                             effective_project_dir,
-                            &worktree_path,
                             &branch_name,
                             expected_head,
-                            Some(fresh_remote.clone()),
-                            false,
+                            fresh_remote.clone(),
                         )
                         .await?;
                         self.create_worktree_from_existing_branch_checked(
@@ -2028,14 +2037,12 @@ impl<
                                 if !branch_raced {
                                     return Err(error);
                                 }
-                                verify_leaf_ownership(
+                                verify_attachable_branch(
                                     self.git_wt(),
                                     effective_project_dir,
-                                    &worktree_path,
                                     &branch_name,
                                     expected_head,
-                                    Some(fresh_remote.clone()),
-                                    false,
+                                    fresh_remote.clone(),
                                 )
                                 .await?;
                                 self.create_worktree_from_existing_branch_checked(

@@ -492,26 +492,30 @@ fn exo_contains_only_sink_artifacts(path: &Path) -> bool {
     true
 }
 
-fn contains_symlink(path: &Path, depth: usize) -> bool {
-    if depth == 0 {
-        return false;
-    }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return true;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
+fn contains_symlink(root: &Path) -> bool {
+    // Bounded guard against pathological trees; exceeding it is ambiguous and
+    // therefore treated as "contains a symlink" (refuse the quarantine).
+    const MAX_ENTRIES: usize = 200_000;
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(directory) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
             return true;
         };
-        match entry.file_type() {
-            Ok(kind) if kind.is_symlink() => return true,
-            Ok(kind) if kind.is_dir() => {
-                if contains_symlink(&entry.path(), depth - 1) {
-                    return true;
-                }
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return true;
+            };
+            visited += 1;
+            if visited > MAX_ENTRIES {
+                return true;
             }
-            Ok(_) => {}
-            Err(_) => return true,
+            match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => return true,
+                Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                Ok(_) => {}
+                Err(_) => return true,
+            }
         }
     }
     false
@@ -647,7 +651,7 @@ pub(crate) fn cleanup_unregistered_worktree_residue(
         if worktree_name_is_identified(project_dir, &name) {
             continue;
         }
-        if !contains_only_sink_artifacts(&path) || contains_symlink(&path, 4) {
+        if !contains_only_sink_artifacts(&path) || contains_symlink(&path) {
             continue;
         }
         if std::fs::create_dir_all(&quarantine_root).is_err() {
@@ -758,6 +762,20 @@ mod tests {
             r#"{"working_dir":".exo/worktrees/leaf-codex/"}"#,
         )
         .unwrap();
+
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
+        assert!(residue.exists());
+    }
+
+    #[test]
+    fn residue_cleanup_refuses_deep_nested_symlink() {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        let deep = residue.join(".exo/ledger/segments/a/b/c/d/e");
+        std::fs::create_dir_all(&deep).unwrap();
+        let target = project.join("escape-target");
+        std::fs::write(&target, "evidence\n").unwrap();
+        std::os::unix::fs::symlink(&target, deep.join("link")).unwrap();
 
         assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
         assert!(residue.exists());
