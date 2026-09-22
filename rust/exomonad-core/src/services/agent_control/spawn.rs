@@ -21,6 +21,31 @@ async fn persist_dispatch_intent(
     Ok(())
 }
 
+/// How a leaf worktree should be provisioned once branch state is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeafWorktreeAction {
+    /// The deterministic birth branch already exists: attach to it.
+    Attach,
+    /// No branch yet, but an expected head was supplied: create at that revision.
+    CreateFromRevision,
+    /// No branch and no expected head: create a fresh branch from the base.
+    CreateFromBase,
+}
+
+/// Select attach-versus-create from verified branch state.
+///
+/// Branch existence decides attachment; `start_point` is expected-head evidence
+/// only and must never gate whether an existing branch is reattached.
+fn leaf_worktree_action(branch_exists: bool, start_point: Option<&str>) -> LeafWorktreeAction {
+    if branch_exists {
+        LeafWorktreeAction::Attach
+    } else if start_point.is_some() {
+        LeafWorktreeAction::CreateFromRevision
+    } else {
+        LeafWorktreeAction::CreateFromBase
+    }
+}
+
 fn parse_git_status_paths(stdout: &[u8]) -> Vec<String> {
     let records: Vec<&[u8]> = stdout
         .split(|byte| *byte == 0)
@@ -1786,19 +1811,36 @@ impl<
                     "Reusing verified existing leaf worktree"
                 );
             } else {
+                // Arm cleanup before any fallible resource creation so a partial
+                // or failed worktree never survives the attempt.
+                remove_worktree_on_spawn_failure = true;
                 ensure_branch_fetched(effective_project_dir, &branch_name).await;
-                if let Some(start_point) = options.start_point.as_deref() {
-                    if self.git_wt().branch_exists(&branch_name)? {
+                self.git_wt().prune_worktrees()?;
+                match leaf_worktree_action(
+                    self.git_wt().branch_exists(&branch_name)?,
+                    options.start_point.as_deref(),
+                ) {
+                    LeafWorktreeAction::Attach => {
+                        // The deterministic birth branch already exists. Attach
+                        // to it instead of creating it; start_point is
+                        // expected-head evidence only.
                         if options.expected_agent_name.is_some() {
-                            verify_branch_head(effective_project_dir, &branch_name, start_point)
-                                .await?;
+                            if let Some(expected_sha) = options.start_point.as_deref() {
+                                verify_branch_head(effective_project_dir, &branch_name, expected_sha)
+                                    .await?;
+                            }
                         }
                         self.create_worktree_from_existing_branch_checked(
                             &worktree_path,
                             &branch_name,
                         )
                         .await?;
-                    } else {
+                    }
+                    LeafWorktreeAction::CreateFromRevision => {
+                        let start_point = options
+                            .start_point
+                            .as_deref()
+                            .expect("CreateFromRevision requires a start point");
                         self.create_worktree_from_revision_checked(
                             &worktree_path,
                             &branch_name,
@@ -1806,11 +1848,31 @@ impl<
                         )
                         .await?;
                     }
-                } else {
-                    self.create_worktree_checked(&worktree_path, &branch_name, &current_branch)
-                        .await?;
+                    LeafWorktreeAction::CreateFromBase => {
+                        match self
+                            .create_worktree_checked(&worktree_path, &branch_name, &current_branch)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(error) => {
+                                // TOCTOU: another actor may have created the
+                                // branch between the existence check and
+                                // creation. Re-evaluate ownership and attach at
+                                // most once; otherwise fail closed with the
+                                // original error.
+                                if self.git_wt().branch_exists(&branch_name)? {
+                                    self.create_worktree_from_existing_branch_checked(
+                                        &worktree_path,
+                                        &branch_name,
+                                    )
+                                    .await?;
+                                } else {
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    }
                 }
-                remove_worktree_on_spawn_failure = true;
             }
 
             self.create_socket_symlink(&worktree_path).await;
@@ -2342,6 +2404,39 @@ mod tests {
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, ScrubGitRepositoryEnv,
     };
+
+    #[test]
+    fn leaf_worktree_action_attaches_when_branch_exists_without_start_point() {
+        assert_eq!(
+            leaf_worktree_action(true, None),
+            LeafWorktreeAction::Attach,
+            "an existing deterministic branch must attach even without a start point"
+        );
+    }
+
+    #[test]
+    fn leaf_worktree_action_attaches_when_branch_exists_with_start_point() {
+        assert_eq!(
+            leaf_worktree_action(true, Some("abc123")),
+            LeafWorktreeAction::Attach
+        );
+    }
+
+    #[test]
+    fn leaf_worktree_action_creates_from_revision_without_branch() {
+        assert_eq!(
+            leaf_worktree_action(false, Some("abc123")),
+            LeafWorktreeAction::CreateFromRevision
+        );
+    }
+
+    #[test]
+    fn leaf_worktree_action_creates_from_base_without_branch_or_start_point() {
+        assert_eq!(
+            leaf_worktree_action(false, None),
+            LeafWorktreeAction::CreateFromBase
+        );
+    }
 
     #[test]
     fn test_opencode_dev_instructions_clarify_mcp_tools_are_not_shell_commands() {
