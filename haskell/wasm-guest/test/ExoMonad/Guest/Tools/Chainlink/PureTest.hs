@@ -39,6 +39,15 @@ pureTests =
         parseIssueId "{\"id\":630}" @=? Nothing,
       testCase "parseIssueId: mixed text remains rejected" $
         parseIssueId "created issue 630" @=? Nothing,
+      testCase "parseIssueId: canonical structured issue_id" $
+        parseIssueId "{\"issue_id\":630}" @=? Just 630,
+      -- Effect-boundary contract for ChainlinkIssueCreateOutput
+      testCase "issue create output encodes canonical issue_id" $
+        encode (ChainlinkIssueCreateOutput 630) @?= "{\"issue_id\":630}",
+      testCase "issue create output decodes canonical issue_id" $
+        (cicoIssueId <$> decode "{\"issue_id\":630}") @=? Just 630,
+      testCase "issue create output decodes legacy cicoIssueId" $
+        (cicoIssueId <$> decode "{\"cicoIssueId\":630}") @=? Just 630,
       -- buildCreateArgs
       testCase "buildCreateArgs: title only" $
         buildCreateArgs (ChainlinkIssueCreateArgs "My issue" Nothing Nothing Nothing)

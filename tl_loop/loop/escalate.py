@@ -166,7 +166,7 @@ def park(
     if issue_creator is None:
         raise EscalationError("a needs-human issue creator is required for durable parking")
 
-    issue_id = _create_issue(issue_creator, slice, parsed_cause, parked_audit)
+    issue_id = _create_issue(issue_creator, slice, parsed_cause, parked_audit, gate_name)
     blocked: list[str] = []
     blocked_statuses: dict[str, str] = {}
 
@@ -448,8 +448,19 @@ def _create_issue(
     slice: SliceState,
     cause: ParkCause,
     audit: Mapping[str, object],
+    gate_name: str | None = None,
 ) -> int:
+    # Reuse an issue already created for this durable marker before creating a
+    # new one, so a crash between remote creation and checkpointing cannot
+    # produce a duplicate escalation.
+    marker = _escalation_marker(gate_name)
+    if marker is not None:
+        existing = _find_existing_issue_id(creator, marker)
+        if existing is not None:
+            return existing
     title = f"Escalate slice {slice.id}: {cause.value}"
+    if marker is not None:
+        title = f"{title} {marker}"
     description = (
         f"Slice {slice.id} is parked for human action. "
         f"Cause: {cause.value}. Audit: {dumps_json(audit, sort_keys=True)}"
@@ -482,10 +493,51 @@ def _issue_id(value: object) -> int | None:
     if type(value) is int and value > 0:
         return value
     if isinstance(value, Mapping):
-        for key in ("issue_id", "id", "number"):
+        # `issue_id` is canonical; `cicoIssueId` is the legacy Haskell shape.
+        for key in ("issue_id", "id", "number", "cicoIssueId"):
             candidate = value.get(key)
             if type(candidate) is int and candidate > 0:
                 return candidate
+    return None
+
+
+def _escalation_marker(gate_name: str | None) -> str | None:
+    """Return the durable, human-visible marker embedded in an escalation title."""
+    return f"[{gate_name}]" if gate_name else None
+
+
+def _find_existing_issue_id(creator: object, marker: str) -> int | None:
+    """Find an escalation already created for this durable marker.
+
+    Used after a crash that created the remote issue but lost the checkpoint, so
+    a retry reuses the issue instead of opening a duplicate.
+    """
+    list_issues = getattr(creator, "chainlink_issue_list", None)
+    if list_issues is None:
+        return None
+    try:
+        result = list_issues(labels=("needs-human",))
+    except Exception:  # noqa: BLE001 - lookup is best-effort reconciliation
+        return None
+    if result.success is not True:
+        return None
+    payload = result.result
+    if isinstance(payload, list):
+        issues: list[object] = list(payload)
+    elif isinstance(payload, Mapping):
+        raw = payload.get("issues")
+        issues = list(raw) if isinstance(raw, list) else []
+    else:
+        issues = []
+    for issue in issues:
+        if not isinstance(issue, Mapping):
+            continue
+        title = issue.get("title")
+        if not isinstance(title, str) or marker not in title:
+            continue
+        issue_id = _issue_id(issue)
+        if issue_id is not None:
+            return issue_id
     return None
 
 

@@ -16,6 +16,7 @@ from tl_loop.loop.escalate import (
     IssueCreationError,
     ParkResult,
     _create_issue,
+    _issue_id,
     authorize_harness_switch,
     blocked_gate_name,
     park,
@@ -75,7 +76,7 @@ def test_each_cause_creates_issue_and_blocks_transitive_dependents(
     assert state.slices["child"].park_issue_id == 700
     assert state.slices["grandchild"].status is SliceStatus.BLOCKED
     assert state.slices["grandchild"].blocked_by == "root"
-    assert issues[0][0] == f"Escalate slice root: {cause.value}"
+    assert issues[0][0].startswith(f"Escalate slice root: {cause.value}")
     assert cause.value in issues[0][1]
     assert '"needs-human"' not in issues[0][1]
 
@@ -122,6 +123,97 @@ def test_externally_blocked_parking_is_gate_and_issue_idempotent(tmp_path: Path)
         gate.name == blocked_gate_name("escalate-test", "root", 2, "base_ci_unstable")
         for gate in store.load().gates
     )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"issue_id": 5}, 5),
+        ({"cicoIssueId": 6}, 6),
+        ({"id": 7}, 7),
+        ({"number": 8}, 8),
+        (11, 11),
+        ({"issue_id": 0}, None),
+        ({"issue_id": -1}, None),
+        ({"issue_id": "9"}, None),
+        ({}, None),
+        (None, None),
+    ],
+)
+def test_issue_id_accepts_canonical_and_legacy_shapes(
+    payload: object, expected: int | None
+) -> None:
+    assert _issue_id(payload) == expected
+
+
+def test_create_issue_parses_legacy_cico_issue_id_result() -> None:
+    class LegacyCreator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del title, description, labels, priority
+            return _tool_result({"cicoIssueId": 816})
+
+    assert _create_issue(LegacyCreator(), _slice(), ParkCause.REVIEW_STUCK, {}) == 816
+
+
+def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
+    gate = blocked_gate_name("escalate-test", "root", 2, "review_stuck")
+    marker = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} [{gate}]"
+    created: list[str] = []
+
+    class RecoveringCreator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 999})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del milestone, priority, status
+            assert tuple(labels or ()) == ("needs-human",)
+            return _tool_result({"issues": [{"issue_id": 816, "title": marker}]})
+
+    issue_id = _create_issue(
+        RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, gate
+    )
+
+    assert issue_id == 816
+    assert created == [], "a retry must reuse the issue, not open a duplicate"
+
+
+def test_effect_client_parses_legacy_cico_issue_id_at_the_boundary(tmp_path: Path) -> None:
+    transport = ParkingTransport()
+    transport.chainlink_result = {"cicoIssueId": 816}
+    store = _store(tmp_path)
+    result = park(
+        _slice(),
+        ParkCause.REVIEW_STUCK,
+        store=store,
+        issue_creator=EffectClient(transport),
+    )
+
+    assert isinstance(result, ParkResult)
+    assert result.issue_id == 816
+    assert store.load().slices["root"].park_issue_id == 816
 
 
 def test_failed_issue_creation_does_not_mutate_state(tmp_path: Path) -> None:
@@ -288,6 +380,7 @@ class ParkingTransport:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, JsonObject]] = []
+        self.chainlink_result: dict[str, object] = {"issue_id": 701}
 
     def call_tool(
         self,
@@ -299,7 +392,7 @@ class ParkingTransport:
         del role, name
         self.calls.append((tool_name, arguments))
         if tool_name == "chainlink_issue_create":
-            return {"success": True, "result": {"issue_id": 701}}
+            return {"success": True, "result": self.chainlink_result}
         return {"success": True, "result": None}
 
 

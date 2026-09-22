@@ -382,7 +382,7 @@ data StructuredIssueId = StructuredIssueId
 
 instance FromJSON StructuredIssueId where
   parseJSON = withObject "StructuredIssueId" $ \value ->
-    StructuredIssueId <$> value .: "cicoIssueId"
+    StructuredIssueId <$> (value .: "issue_id" <|> value .: "cicoIssueId")
 
 parseIssueId :: Text -> Maybe Int
 parseIssueId output = parseBareIssueId trimmed <|> parseStructuredIssueId trimmed

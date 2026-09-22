@@ -133,6 +133,7 @@ module ExoMonad.Guest.Tools.Chainlink
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Monad.Freer (Eff)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
@@ -257,9 +258,17 @@ data ChainlinkIssueCreateOutput = ChainlinkIssueCreateOutput
   }
   deriving (Generic, Show)
 
-instance FromJSON ChainlinkIssueCreateOutput
+-- Canonical effect-boundary result carries `issue_id`. The legacy
+-- `cicoIssueId` field remains accepted during the transition so older hosts and
+-- recorded results still parse.
+instance FromJSON ChainlinkIssueCreateOutput where
+  parseJSON = withObject "ChainlinkIssueCreateOutput" $ \value ->
+    ChainlinkIssueCreateOutput
+      <$> (value .: "issue_id" <|> value .: "cicoIssueId")
 
-instance ToJSON ChainlinkIssueCreateOutput
+instance ToJSON ChainlinkIssueCreateOutput where
+  toJSON (ChainlinkIssueCreateOutput issueId) =
+    object ["issue_id" .= issueId]
 
 chainlinkIssueCreateMemoryRequest :: ChainlinkIssueCreateArgs -> ChainlinkIssueCreateOutput -> Memory.MemoryAppendRequest
 chainlinkIssueCreateMemoryRequest args output =
