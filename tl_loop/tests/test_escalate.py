@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import cast
@@ -14,6 +15,7 @@ from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.loop.escalate import (
     HarnessSwitchDecision,
     IssueCreationError,
+    IssueLookupUnavailable,
     ParkResult,
     _create_issue,
     _issue_id,
@@ -163,8 +165,7 @@ def test_create_issue_parses_legacy_cico_issue_id_result() -> None:
 
 
 def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
-    gate = blocked_gate_name("escalate-test", "root", 2, "review_stuck")
-    marker = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} [{gate}]"
+    legacy_title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value}"
     created: list[str] = []
 
     class RecoveringCreator:
@@ -190,14 +191,110 @@ def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
         ) -> ToolResult:
             del milestone, priority, status
             assert tuple(labels or ()) == ("needs-human",)
-            return _tool_result({"issues": [{"issue_id": 816, "title": marker}]})
+            return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
 
-    issue_id = _create_issue(
-        RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, gate
-    )
+    issue_id = _create_issue(RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
 
     assert issue_id == 816
     assert created == [], "a retry must reuse the issue, not open a duplicate"
+
+
+def test_create_issue_reuses_legacy_816_title_without_marker() -> None:
+    slice_id = "issue-811-substitution-model-architecture"
+    legacy_title = (
+        f"Escalate slice {slice_id}: {ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
+    )
+    created: list[str] = []
+
+    class LegacyReuseCreator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 999})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del milestone, priority, status
+            return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
+
+    target = replace(_slice(), id=slice_id, status=SliceStatus.DISPATCH_FAILED)
+    issue_id = _create_issue(
+        LegacyReuseCreator(),
+        target,
+        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        {},
+    )
+
+    assert issue_id == 816
+    assert created == [], "the existing #816 title must be reconciled, not duplicated"
+
+
+def test_create_issue_fails_closed_when_lookup_is_unavailable() -> None:
+    class BrokenLookupCreator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("must not create when reconciliation is unavailable")
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            return _tool_result({"unexpected": []})
+
+    with pytest.raises(IssueLookupUnavailable):
+        _create_issue(BrokenLookupCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
+
+
+def test_park_reuses_durable_intent_for_non_gated_cause(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        marker_title: str | None = None
+
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            Creator.marker_title = title
+            return _tool_result({"issue_id": 555})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            return _tool_result(
+                {"issues": [{"issue_id": 555, "title": Creator.marker_title}]}
+            )
+
+    creator = Creator()
+    first = park(_slice(), ParkCause.REVIEW_STUCK, store=store, issue_creator=creator)
+    second = park(_slice(), ParkCause.REVIEW_STUCK, store=store, issue_creator=creator)
+
+    assert first.issue_id == 555
+    assert second.issue_id == 555
+    assert len(created) == 1, "non-gated causes must also deduplicate"
 
 
 def test_effect_client_parses_legacy_cico_issue_id_at_the_boundary(tmp_path: Path) -> None:

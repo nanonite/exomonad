@@ -8,9 +8,13 @@ parks the slice and blocks its dependents.
 from __future__ import annotations
 
 import copy
+import fcntl
+import json
 import os
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Protocol, cast
 
 from tl_loop.client.effects import EffectClient, ToolResult
@@ -166,7 +170,13 @@ def park(
     if issue_creator is None:
         raise EscalationError("a needs-human issue creator is required for durable parking")
 
-    issue_id = _create_issue(issue_creator, slice, parsed_cause, parked_audit, gate_name)
+    issue_id = _create_issue(
+        issue_creator,
+        slice,
+        parsed_cause,
+        parked_audit,
+        store=store,
+    )
     blocked: list[str] = []
     blocked_statuses: dict[str, str] = {}
 
@@ -443,24 +453,147 @@ def _emit_gate_opened(effects: EffectClient, run_id: str, gate_name: str, cause:
     )
 
 
+class IssueLookupUnavailable(EscalationError):
+    """Existing escalation issues could not be inspected, so creating is unsafe."""
+
+
+def _legacy_escalation_title(slice_id: str, cause: ParkCause) -> str:
+    """The pre-marker title used by issues created before this change (#816)."""
+    return f"Escalate slice {slice_id}: {cause.value}"
+
+
+def _escalation_key(run_id: str, slice_id: str, cause: ParkCause) -> str:
+    """Stable per-run identity for one slice escalation, for every cause."""
+    return f"task-escalation:{run_id}:{slice_id}:{cause.value}"
+
+
+def _escalation_intent_path(store: RunStore, key: str) -> Path:
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in key)
+    return Path(store.run_dir) / "escalations" / f"{safe}.json"
+
+
+@contextmanager
+def _escalation_intent_lock(store: RunStore, key: str):
+    """Serialize reconciliation and creation for one durable escalation key."""
+    path = _escalation_intent_path(store, key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_suffix(".lock"), "w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield path
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _read_intent(path: Path) -> dict[str, object] | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _write_intent(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _list_needs_human_issues(creator: object) -> list[object]:
+    """List open needs-human issues, failing closed when that is not possible."""
+    list_issues = getattr(creator, "chainlink_issue_list", None)
+    if list_issues is None:
+        return []
+    try:
+        result = list_issues(labels=("needs-human",))
+    except Exception as error:
+        raise IssueLookupUnavailable(
+            f"could not list existing needs-human issues: {error}"
+        ) from error
+    if result.success is not True:
+        raise IssueLookupUnavailable(
+            result.error
+            or "chainlink issue list failed; refusing to create a possible duplicate"
+        )
+    payload = result.result
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, Mapping):
+        raw = payload.get("issues")
+        if isinstance(raw, list):
+            return list(raw)
+        # An empty object is an unambiguous "no issues". Any other unrecognized
+        # shape is ambiguous and must stop creation.
+        if not payload:
+            return []
+    raise IssueLookupUnavailable(f"unrecognized issue list response: {payload!r}")
+
+
+def _reconcile_existing_issue(creator: object, legacy_title: str) -> int | None:
+    """Reuse an escalation already created for this exact slice/cause title."""
+    selected = legacy_title.strip()
+    for issue in _list_needs_human_issues(creator):
+        title = issue.get("title") if isinstance(issue, Mapping) else None
+        if not isinstance(title, str) or title.strip() != selected:
+            continue
+        issue_id = _issue_id(issue)
+        if issue_id is not None:
+            return issue_id
+    return None
+
+
 def _create_issue(
     creator: IssueCreator | EffectClient | Callable[[str, str], int],
     slice: SliceState,
     cause: ParkCause,
     audit: Mapping[str, object],
-    gate_name: str | None = None,
+    *,
+    store: RunStore | None = None,
 ) -> int:
-    # Reuse an issue already created for this durable marker before creating a
-    # new one, so a crash between remote creation and checkpointing cannot
-    # produce a duplicate escalation.
-    marker = _escalation_marker(gate_name)
-    if marker is not None:
-        existing = _find_existing_issue_id(creator, marker)
+    title = _legacy_escalation_title(slice.id, cause)
+    if store is not None:
+        key = _escalation_key(store.run_id, slice.id, cause)
+        with _escalation_intent_lock(store, key) as intent_path:
+            return _create_issue_locked(
+                creator, slice, cause, audit, title, intent_path
+            )
+    return _create_issue_locked(creator, slice, cause, audit, title, None)
+
+
+def _create_issue_locked(
+    creator: IssueCreator | EffectClient | Callable[[str, str], int],
+    slice: SliceState,
+    cause: ParkCause,
+    audit: Mapping[str, object],
+    title: str,
+    intent_path: Path | None,
+) -> int:
+    prior_attempt = False
+    if intent_path is not None:
+        intent = _read_intent(intent_path)
+        if intent is not None:
+            prior_attempt = True
+            recorded = _issue_id(intent)
+            if recorded is not None:
+                return recorded
+    # Reconcile only when a prior attempt may have created the issue remotely, or
+    # when the caller has no durable intent store. An unavailable lookup stops
+    # creation instead of risking a duplicate.
+    if prior_attempt or intent_path is None:
+        existing = _reconcile_existing_issue(creator, title)
         if existing is not None:
+            if intent_path is not None:
+                _write_intent(intent_path, {"issue_id": existing, "title": title})
             return existing
-    title = f"Escalate slice {slice.id}: {cause.value}"
-    if marker is not None:
-        title = f"{title} {marker}"
+    if intent_path is not None:
+        _write_intent(intent_path, {"title": title, "state": "requested"})
     description = (
         f"Slice {slice.id} is parked for human action. "
         f"Cause: {cause.value}. Audit: {dumps_json(audit, sort_keys=True)}"
@@ -486,6 +619,8 @@ def _create_issue(
     issue_id = _issue_id(value)
     if issue_id is None:
         raise IssueCreationError(f"chainlink issue result has no positive issue ID: {value!r}")
+    if intent_path is not None:
+        _write_intent(intent_path, {"issue_id": issue_id, "title": title})
     return issue_id
 
 
@@ -498,46 +633,6 @@ def _issue_id(value: object) -> int | None:
             candidate = value.get(key)
             if type(candidate) is int and candidate > 0:
                 return candidate
-    return None
-
-
-def _escalation_marker(gate_name: str | None) -> str | None:
-    """Return the durable, human-visible marker embedded in an escalation title."""
-    return f"[{gate_name}]" if gate_name else None
-
-
-def _find_existing_issue_id(creator: object, marker: str) -> int | None:
-    """Find an escalation already created for this durable marker.
-
-    Used after a crash that created the remote issue but lost the checkpoint, so
-    a retry reuses the issue instead of opening a duplicate.
-    """
-    list_issues = getattr(creator, "chainlink_issue_list", None)
-    if list_issues is None:
-        return None
-    try:
-        result = list_issues(labels=("needs-human",))
-    except Exception:  # noqa: BLE001 - lookup is best-effort reconciliation
-        return None
-    if result.success is not True:
-        return None
-    payload = result.result
-    if isinstance(payload, list):
-        issues: list[object] = list(payload)
-    elif isinstance(payload, Mapping):
-        raw = payload.get("issues")
-        issues = list(raw) if isinstance(raw, list) else []
-    else:
-        issues = []
-    for issue in issues:
-        if not isinstance(issue, Mapping):
-            continue
-        title = issue.get("title")
-        if not isinstance(title, str) or marker not in title:
-            continue
-        issue_id = _issue_id(issue)
-        if issue_id is not None:
-            return issue_id
     return None
 
 
