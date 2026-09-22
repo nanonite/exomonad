@@ -167,7 +167,7 @@ fn push_remote_command(
 /// Read the `exomonad.remote` git config override, if set. Mirrors
 /// `services::repo::configured_remote`, but synchronous — this module
 /// shells out via `std::process::Command`, not tokio.
-fn configured_remote(workspace_path: &Path) -> Option<String> {
+pub(crate) fn configured_remote(workspace_path: &Path) -> Option<String> {
     let output = headless_git_command()
         .args(["config", "--get", "exomonad.remote"])
         .current_dir(workspace_path)
@@ -436,15 +436,43 @@ impl GitWorktreeService {
         let Ok(canonical) = self.canonical_path(path, "candidate worktree") else {
             return Ok(false);
         };
+        let mut registered = false;
         for worktree in self.list_worktrees()? {
             if std::fs::canonicalize(&worktree.path)
                 .map(|candidate| candidate == canonical)
                 .unwrap_or(false)
             {
-                return Ok(true);
+                registered = true;
+                break;
             }
         }
-        Ok(false)
+        if !registered {
+            return Ok(false);
+        }
+        // A registry entry alone is not proof of a live worktree. A directory
+        // that reappears after deletion (for example from a sink write) has no
+        // valid Git linkage and must not be accepted.
+        let project_common = self.common_git_dir(&self.project_dir)?;
+        let candidate_common = match self.common_git_dir(&canonical) {
+            Ok(dir) => dir,
+            Err(_) => return Ok(false),
+        };
+        if project_common != candidate_common {
+            return Ok(false);
+        }
+        // The directory must be the root of a worktree, not merely somewhere
+        // inside one. A residue directory inside the main worktree would
+        // otherwise pass an is-inside-work-tree check.
+        let toplevel = self.git_output(&canonical, &["rev-parse", "--show-toplevel"])?;
+        if !toplevel.status.success() {
+            return Ok(false);
+        }
+        let toplevel_raw = String::from_utf8_lossy(&toplevel.stdout).trim().to_string();
+        let toplevel = match self.canonical_path(Path::new(&toplevel_raw), "worktree toplevel") {
+            Ok(path) => path,
+            Err(_) => return Ok(false),
+        };
+        Ok(toplevel == canonical)
     }
 
     /// Return the registered worktree that currently holds `branch`, if any.
@@ -1278,6 +1306,30 @@ mod tests {
         assert!(EffectError::from(error)
             .to_string()
             .contains("worktree.branch_mismatch"));
+    }
+
+    #[test]
+    fn is_registered_worktree_rejects_residue_at_a_dead_registration() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let worktree_path = temp.path().join("dead-leaf");
+        let branch = BranchName::try_from_str(format!("{default_branch}.dead").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(&worktree_path, &branch, &base)
+            .unwrap();
+        assert!(service.is_registered_worktree(&worktree_path).unwrap());
+
+        std::fs::remove_dir_all(&worktree_path).unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::write(worktree_path.join("residue"), "sink\n").unwrap();
+
+        assert!(
+            !service.is_registered_worktree(&worktree_path).unwrap(),
+            "a reappearing residue directory must not be accepted as live"
+        );
     }
 
     #[test]

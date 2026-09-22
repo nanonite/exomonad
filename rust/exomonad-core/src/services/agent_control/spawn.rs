@@ -68,6 +68,59 @@ fn expected_leaf_birth(
     Ok(effective_birth.child(agent_name))
 }
 
+/// One typed ownership verifier for every leaf path decision.
+///
+/// Used by existing-path reuse, the live-route return, ordinary attach, and the
+/// BranchExists race retry so all four share exactly the same proof. Failures
+/// carry stable machine codes through [`EffectError`].
+async fn verify_leaf_ownership(
+    git_wt: &GitWorktreeService,
+    effective_project_dir: &Path,
+    worktree_path: &Path,
+    branch_name: &BranchName,
+    expected_head: Option<&str>,
+    require_existing_worktree: bool,
+) -> Result<()> {
+    if worktree_path.exists() {
+        git_wt
+            .verify_existing_worktree(worktree_path, branch_name)
+            .map_err(|error| anyhow!(EffectError::from(error)))?;
+        if let Some(head) = expected_head {
+            verify_branch_head(effective_project_dir, branch_name, head).await?;
+        }
+        return Ok(());
+    }
+    if require_existing_worktree {
+        return Err(anyhow!(EffectError::from(
+            crate::services::git_worktree::WorktreeError::PathUnregistered {
+                path: worktree_path.display().to_string(),
+            }
+        )));
+    }
+    if git_wt.branch_exists(branch_name)? {
+        if let Some(owner) = git_wt.registered_worktree_for_branch(branch_name)? {
+            return Err(anyhow!(EffectError::custom(
+                "worktree.branch_ownership_conflict",
+                format!(
+                    "branch {} is already checked out at {}",
+                    branch_name,
+                    owner.display()
+                ),
+            )));
+        }
+        if !git_wt.local_remote_heads_compatible(branch_name)? {
+            return Err(anyhow!(EffectError::custom(
+                "worktree.branch_ownership_conflict",
+                format!("branch {branch_name} diverges from its remote head"),
+            )));
+        }
+        if let Some(head) = expected_head {
+            verify_branch_head(effective_project_dir, branch_name, head).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Removes a worktree created by this spawn attempt if provisioning fails
 /// before the agent is finalized. Dropping the guard on any `?` error path is
 /// what makes cleanup reliable instead of relying on later statements.
@@ -1761,10 +1814,14 @@ impl<
             // Derive the expected deterministic birth branch from durable
             // identity and deterministic naming only. The branch observed on
             // disk must never redefine the expected branch.
+            // Durable identity wins even when its worktree is missing or the
+            // default path already exists; existing_identity_record is only
+            // populated when the recorded worktree still exists.
+            let durable_identity = existing_identity_record
+                .as_ref()
+                .or(prior_identity.as_ref());
             let expected_birth = expected_leaf_birth(
-                existing_identity_record
-                    .as_ref()
-                    .map(|record| &record.birth_branch),
+                durable_identity.map(|record| &record.birth_branch),
                 options.base_branch.as_deref(),
                 &effective_birth,
                 agent_name.as_str(),
@@ -1772,42 +1829,26 @@ impl<
             let branch_name = BranchName::try_from_str(expected_birth.to_string().as_str())
                 .expect("validated string input is non-empty");
 
-            let existing_branch = if !options.standalone_repo && worktree_path.exists() {
-                self.git_wt()
-                    .get_workspace_bookmark(&worktree_path)
-                    .context("failed to inspect existing leaf worktree branch")?
-                    .map(|branch| BirthBranch::try_from_str(&branch))
-                    .transpose()
-                    .context("existing leaf worktree branch was invalid")?
+            let expected_head = if options.expected_agent_name.is_some() {
+                options.start_point.as_deref()
             } else {
                 None
             };
-            if let Some(observed) = existing_branch.as_ref() {
-                if observed.as_str() != expected_birth.as_str() {
-                    return Err(anyhow!(
-                        "[worktree.branch_ownership_conflict] existing leaf worktree {} is on {}, expected {}",
-                        worktree_path.display(),
-                        observed,
-                        expected_birth
-                    ));
-                }
-            }
 
             // Validate ownership before any idempotent return or reuse so a
-            // stale routing record cannot bypass it.
-            if !options.standalone_repo && worktree_path.exists() {
-                self.git_wt()
-                    .verify_existing_worktree(&worktree_path, &branch_name)
-                    .map_err(|error| anyhow!(EffectError::from(error)))
-                    .context(
-                        "refusing to reuse an existing leaf worktree without verified Git ownership",
-                    )?;
-                if options.expected_agent_name.is_some() {
-                    if let Some(expected_sha) = options.start_point.as_deref() {
-                        verify_branch_head(effective_project_dir, &branch_name, expected_sha)
-                            .await?;
-                    }
-                }
+            // stale routing record cannot bypass it. Existing paths must be
+            // registered worktrees on the derived branch; an absent path may be
+            // attached later only with proven ownership.
+            if !options.standalone_repo {
+                verify_leaf_ownership(
+                    self.git_wt(),
+                    effective_project_dir,
+                    &worktree_path,
+                    &branch_name,
+                    expected_head,
+                    false,
+                )
+                .await?;
             }
 
             let child_birth = expected_birth;
@@ -1823,6 +1864,20 @@ impl<
                 None => self.is_tmux_window_alive(&display_name).await,
             };
             if tab_alive {
+                // A live worktree-per-agent route must still own a verified,
+                // registered worktree. A stale route whose worktree was deleted
+                // must never return success.
+                if !options.standalone_repo {
+                    verify_leaf_ownership(
+                        self.git_wt(),
+                        effective_project_dir,
+                        &worktree_path,
+                        &branch_name,
+                        expected_head,
+                        true,
+                    )
+                    .await?;
+                }
                 if options.expected_agent_name.is_some() {
                     self.refresh_agent_activity(&agent_name).await?;
                 }
@@ -1848,17 +1903,17 @@ impl<
 
             let actual_branch_name = branch_name.to_string();
 
-            let mut remove_worktree_on_spawn_failure = false;
+            let mut worktree_rollback: Option<WorktreeRollback> = None;
 
             if options.standalone_repo {
-                remove_worktree_on_spawn_failure = true;
-                let mut rollback =
-                    WorktreeRollback::armed(self.git_wt().clone(), worktree_path.clone());
+                worktree_rollback = Some(WorktreeRollback::armed(
+                    self.git_wt().clone(),
+                    worktree_path.clone(),
+                ));
                 self.init_standalone_repo(&worktree_path).await?;
                 if !options.allowed_dirs.is_empty() {
                     self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
                 }
-                rollback.defuse();
             } else if worktree_path.exists() {
                 if !worktree_path.is_dir() {
                     return Err(anyhow!(
@@ -1873,9 +1928,10 @@ impl<
                     "Reusing verified existing leaf worktree"
                 );
             } else {
-                remove_worktree_on_spawn_failure = true;
-                let mut rollback =
-                    WorktreeRollback::armed(self.git_wt().clone(), worktree_path.clone());
+                worktree_rollback = Some(WorktreeRollback::armed(
+                    self.git_wt().clone(),
+                    worktree_path.clone(),
+                ));
                 ensure_branch_fetched(effective_project_dir, &branch_name).await;
                 self.git_wt().prune_worktrees()?;
                 match leaf_worktree_action(
@@ -1883,31 +1939,15 @@ impl<
                     options.start_point.as_deref(),
                 ) {
                     LeafWorktreeAction::Attach => {
-                        // Ownership predicate: the branch must not be claimed by
-                        // another live worktree and its local and remote heads
-                        // must agree before it is attached.
-                        if let Some(owner) =
-                            self.git_wt().registered_worktree_for_branch(&branch_name)?
-                        {
-                            return Err(anyhow!(
-                                "[worktree.branch_ownership_conflict] branch {} is already checked out at {}",
-                                branch_name,
-                                owner.display()
-                            ));
-                        }
-                        if !self.git_wt().local_remote_heads_compatible(&branch_name)? {
-                            return Err(anyhow!(
-                                "[worktree.branch_ownership_conflict] branch {} diverges from its remote head",
-                                branch_name
-                            ));
-                        }
-                        // start_point is expected-head evidence only.
-                        if options.expected_agent_name.is_some() {
-                            if let Some(expected_sha) = options.start_point.as_deref() {
-                                verify_branch_head(effective_project_dir, &branch_name, expected_sha)
-                                    .await?;
-                            }
-                        }
+                        verify_leaf_ownership(
+                            self.git_wt(),
+                            effective_project_dir,
+                            &worktree_path,
+                            &branch_name,
+                            expected_head,
+                            false,
+                        )
+                        .await?;
                         self.create_worktree_from_existing_branch_checked(
                             &worktree_path,
                             &branch_name,
@@ -1944,6 +1984,15 @@ impl<
                                 if !branch_raced {
                                     return Err(error);
                                 }
+                                verify_leaf_ownership(
+                                    self.git_wt(),
+                                    effective_project_dir,
+                                    &worktree_path,
+                                    &branch_name,
+                                    expected_head,
+                                    false,
+                                )
+                                .await?;
                                 self.create_worktree_from_existing_branch_checked(
                                     &worktree_path,
                                     &branch_name,
@@ -1953,7 +2002,6 @@ impl<
                         }
                     }
                 }
-                rollback.defuse();
             }
 
             self.create_socket_symlink(&worktree_path).await;
@@ -2094,11 +2142,8 @@ impl<
                     if !agent_config_preexisting {
                         let _ = fs::remove_dir_all(&agent_config_dir).await;
                     }
-                    if remove_worktree_on_spawn_failure && worktree_path.exists() {
-                        let git_wt = self.git_wt().clone();
-                        let path = worktree_path.clone();
-                        let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
-                    }
+                    // The WorktreeRollback guard removes a created worktree on
+                    // this error path.
                     return Err(e);
                 }
             };
@@ -2120,11 +2165,7 @@ impl<
                 if !agent_config_preexisting {
                     let _ = fs::remove_dir_all(&agent_config_dir).await;
                 }
-                if remove_worktree_on_spawn_failure && worktree_path.exists() {
-                    let git_wt = self.git_wt().clone();
-                    let path = worktree_path.clone();
-                    let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
-                }
+                // The WorktreeRollback guard removes a created worktree here.
                 return Err(error);
             }
 
@@ -2186,11 +2227,7 @@ impl<
                 if !agent_config_preexisting {
                     let _ = fs::remove_dir_all(&agent_config_dir).await;
                 }
-                if remove_worktree_on_spawn_failure && worktree_path.exists() {
-                    let git_wt = self.git_wt().clone();
-                    let path = worktree_path.clone();
-                    let _ = tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path)).await;
-                }
+                // The WorktreeRollback guard removes a created worktree here.
                 return Err(error);
             }
 
@@ -2230,6 +2267,11 @@ impl<
                 return Err(error);
             }
 
+            // Every post-creation step succeeded, including tmux launch and
+            // identity finalization, so keep the worktree.
+            if let Some(mut guard) = worktree_rollback.take() {
+                guard.defuse();
+            }
             Ok::<SpawnResult, anyhow::Error>(SpawnResult {
                 agent_dir: agent_config_dir,
                 worktree_path: worktree_path.clone(),

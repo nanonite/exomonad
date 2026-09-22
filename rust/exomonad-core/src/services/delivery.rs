@@ -1006,10 +1006,16 @@ async fn spawn_inbox_consumer(agent: String) {
     tokio::spawn(run_inbox_consumer(
         agent,
         |message: InboxMessage| async move {
+            // Injection writes `.exo/tmp` for multiline bodies, so it must use
+            // the verified sink destination rather than a raw planned path.
+            let sink_dir = crate::services::sink_paths::sink_project_dir(
+                &message.project_root,
+                message.project_dir.clone(),
+            );
             tmux_events::inject_input_with_options(
                 &message.target,
                 &message.body,
-                &message.project_dir,
+                &sink_dir,
                 message.injection_options,
             )
             .await
@@ -1047,7 +1053,10 @@ where
             // Resolve the sink destination at the write boundary, not when the
             // message was enqueued: a planned worktree can disappear between
             // the two, and sinks must never recreate it.
-            let sink_dir = sink_project_dir(&message.project_root, message.project_dir.clone());
+            let sink_dir = crate::services::sink_paths::sink_project_dir(
+                &message.project_root,
+                message.project_dir.clone(),
+            );
             if let Ok(log) = crate::services::EventLog::open(sink_dir.join(".exo/logs")) {
                 let _ = log.append("message.delivery", &message.from, &attempt_data);
             }
@@ -1262,23 +1271,6 @@ async fn deliver_via_uds(
     }
 }
 
-/// Resolve the project directory used for telemetry and sink writes for one agent.
-///
-/// A planned leaf worktree that does not exist yet (for example after a failed
-/// spawn) must never be materialized just to hold sink records. Only a live Git
-/// worktree is used; otherwise sinks fall back to the project-owned directory,
-/// which preserves the evidence without creating a fake reusable worktree.
-fn sink_project_dir(
-    project_dir: &std::path::Path,
-    candidate: std::path::PathBuf,
-) -> std::path::PathBuf {
-    let git_wt = crate::services::git_worktree::GitWorktreeService::new(project_dir.to_path_buf());
-    match git_wt.is_registered_worktree(&candidate) {
-        Ok(true) => candidate,
-        _ => project_dir.to_path_buf(),
-    }
-}
-
 /// Deliver via tmux STDIN injection (routing.json lookup + fallback to tmux_target).
 /// Used as primary path for OpenCode agents and as fallback for others.
 async fn deliver_via_tmux(
@@ -1355,7 +1347,8 @@ async fn deliver_via_tmux(
         } else {
             crate::services::resolve_working_dir(agent_key)
         };
-        let effective_pd = sink_project_dir(project_dir, project_dir.join(worktree));
+        let effective_pd =
+            crate::services::sink_paths::sink_project_dir(project_dir, project_dir.join(worktree));
         return enqueue_tmux_delivery(
             agent_key,
             &target,
@@ -1381,7 +1374,8 @@ async fn deliver_via_tmux(
     } else {
         crate::services::resolve_worktree_from_tab(tmux_target)
     };
-    let effective_pd = sink_project_dir(project_dir, project_dir.join(worktree));
+    let effective_pd =
+        crate::services::sink_paths::sink_project_dir(project_dir, project_dir.join(worktree));
     // Resolve the current pane from the display name. Window and pane indexes
     // are session-local and can become stale after a restart; the display name
     // is the stable identity supplied by AgentResolver.
@@ -1928,7 +1922,10 @@ mod tests {
         let base = crate::domain::BranchName::try_from_str(default_branch.as_str()).unwrap();
         git_wt.create_workspace(&worktree, &branch, &base).unwrap();
 
-        assert_eq!(sink_project_dir(&project, worktree.clone()), worktree);
+        assert_eq!(
+            crate::services::sink_paths::sink_project_dir(&project, worktree.clone()),
+            worktree
+        );
     }
 
     #[test]
@@ -1936,7 +1933,7 @@ mod tests {
         let (_temp, project) = init_sink_repo();
         let planned = project.join(".exo/worktrees/leaf-codex");
 
-        let resolved = sink_project_dir(&project, planned.clone());
+        let resolved = crate::services::sink_paths::sink_project_dir(&project, planned.clone());
 
         assert_eq!(resolved, project);
         assert!(
@@ -1951,7 +1948,10 @@ mod tests {
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(&residue).unwrap();
 
-        assert_eq!(sink_project_dir(&project, residue.clone()), project);
+        assert_eq!(
+            crate::services::sink_paths::sink_project_dir(&project, residue.clone()),
+            project
+        );
     }
 
     #[test]
@@ -1959,7 +1959,7 @@ mod tests {
         let (_temp, project) = init_sink_repo();
         let planned = project.join(".exo/worktrees/leaf-codex");
 
-        let sink_dir = sink_project_dir(&project, planned.clone());
+        let sink_dir = crate::services::sink_paths::sink_project_dir(&project, planned.clone());
         crate::services::EventLog::open(sink_dir.join(".exo/logs")).unwrap();
 
         assert!(

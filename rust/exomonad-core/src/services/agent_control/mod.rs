@@ -116,8 +116,10 @@ pub(crate) async fn ensure_branch_pushed(
 /// the branch to exist locally, so we fetch it first.
 pub(crate) async fn ensure_branch_fetched(project_dir: &Path, branch: &BranchName) {
     let branch_str = branch.as_str();
+    let remote = crate::services::git_worktree::configured_remote(project_dir)
+        .unwrap_or_else(|| "origin".to_string());
     let ls_output = match tokio::process::Command::new("git")
-        .args(["ls-remote", "origin", branch_str])
+        .args(["ls-remote", &remote, branch_str])
         .current_dir(project_dir)
         .output()
         .await
@@ -133,9 +135,13 @@ pub(crate) async fn ensure_branch_fetched(project_dir: &Path, branch: &BranchNam
         return;
     }
 
-    info!(branch = %branch_str, "Branch exists on remote, fetching for worktree recovery");
+    // Fetch into the remote-tracking ref so local/remote compatibility can be
+    // compared against the real remote head, and never force-update a divergent
+    // local branch.
+    let tracking_ref = format!("refs/remotes/{remote}/{branch_str}");
+    info!(branch = %branch_str, remote = %remote, "Branch exists on remote, fetching for worktree recovery");
     match tokio::process::Command::new("git")
-        .args(["fetch", "origin", &format!("{}:{}", branch_str, branch_str)])
+        .args(["fetch", &remote, &format!("{branch_str}:{tracking_ref}")])
         .current_dir(project_dir)
         .output()
         .await
@@ -152,6 +158,39 @@ pub(crate) async fn ensure_branch_fetched(project_dir: &Path, branch: &BranchNam
         }
         Err(e) => {
             warn!(branch = %branch_str, error = %e, "git fetch command failed for branch recovery");
+        }
+    }
+
+    // Materialize the local branch from the remote-tracking ref only when it is
+    // absent, so recovery can attach without clobbering an existing local head.
+    let local_ref = format!("refs/heads/{branch_str}");
+    let local_exists = tokio::process::Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &local_ref])
+        .current_dir(project_dir)
+        .output()
+        .await
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !local_exists {
+        match tokio::process::Command::new("git")
+            .args(["branch", branch_str, &tracking_ref])
+            .current_dir(project_dir)
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => {
+                info!(branch = %branch_str, "Created local recovery branch from remote tracking ref");
+            }
+            Ok(o) => {
+                warn!(
+                    branch = %branch_str,
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "failed to create local recovery branch"
+                );
+            }
+            Err(e) => {
+                warn!(branch = %branch_str, error = %e, "git branch command failed for branch recovery");
+            }
         }
     }
 }

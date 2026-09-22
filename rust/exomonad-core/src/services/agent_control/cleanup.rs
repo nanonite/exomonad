@@ -462,6 +462,7 @@ const WORKTREE_SINK_ARTIFACTS: &[&str] = &[
     "events",
     "ledger",
     "analysis",
+    "tmp",
     "sink-health.json",
     "sink-health.lock",
     "session.json",
@@ -498,19 +499,52 @@ fn contains_only_sink_artifacts(path: &Path) -> bool {
 
 fn worktree_name_is_identified(project_dir: &Path, name: &str) -> bool {
     let agents_dir = project_dir.join(".exo/agents");
-    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
-        return false;
+    let entries = match std::fs::read_dir(&agents_dir) {
+        Ok(entries) => entries,
+        // No agent registry means nothing can identify the path; an unreadable
+        // registry is ambiguous and must fail closed.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
     let needle = format!("worktrees/{name}");
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return true,
+        };
         let identity_path = entry.path().join("identity.json");
-        if let Ok(contents) = std::fs::read_to_string(&identity_path) {
-            if contents.contains(&needle) {
-                return true;
+        match std::fs::read_to_string(&identity_path) {
+            Ok(contents) => {
+                if contents.contains(&needle) {
+                    return true;
+                }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // Present-but-unreadable identity is ambiguous; fail closed.
+            Err(_) => return true,
         }
     }
     false
+}
+
+fn append_quarantine_manifest(quarantine_root: &Path, source: &Path, destination: &Path) {
+    use std::io::Write;
+    let manifest = quarantine_root.join("manifest.jsonl");
+    let record = serde_json::json!({
+        "source": source.display().to_string(),
+        "destination": destination.display().to_string(),
+        "quarantined_at_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0),
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&manifest)
+    {
+        let _ = writeln!(file, "{record}");
+    }
 }
 
 fn residue_quarantine_name(name: &str) -> String {
@@ -541,7 +575,11 @@ pub(crate) fn cleanup_unregistered_worktree_residue(
     };
     let quarantine_root = project_dir.join(".exo/worktrees-residue");
     let mut moved = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        // An entry we cannot inspect is ambiguous: leave it untouched.
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -564,6 +602,7 @@ pub(crate) fn cleanup_unregistered_worktree_residue(
         }
         let destination = quarantine_root.join(residue_quarantine_name(&name));
         if std::fs::rename(&path, &destination).is_ok() {
+            append_quarantine_manifest(&quarantine_root, &path, &destination);
             moved.push(path);
         }
     }
@@ -625,11 +664,16 @@ mod tests {
         let quarantined: Vec<_> = std::fs::read_dir(project.join(".exo/worktrees-residue"))
             .unwrap()
             .flatten()
+            .filter(|entry| entry.path().is_dir())
             .collect();
         assert_eq!(quarantined.len(), 1);
         assert!(quarantined[0]
             .path()
             .join(".exo/ledger/segments/segment-0.jsonl")
+            .is_file());
+        // A durable manifest records the preserved evidence.
+        assert!(project
+            .join(".exo/worktrees-residue/manifest.jsonl")
             .is_file());
     }
 

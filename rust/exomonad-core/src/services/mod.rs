@@ -48,6 +48,7 @@ mod session_memory;
 mod session_memory_capture;
 pub mod session_state;
 pub mod sink_health;
+pub mod sink_paths;
 pub mod state_mirror;
 pub mod supervisor_registry;
 pub mod synthetic_members;
