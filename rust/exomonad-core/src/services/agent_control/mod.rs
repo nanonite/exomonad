@@ -114,7 +114,11 @@ pub(crate) async fn ensure_branch_pushed(
 /// This is needed when re-spawning a leaf whose worktree was deleted but
 /// whose branch and PR still exist on the remote. `git worktree add` requires
 /// the branch to exist locally, so we fetch it first.
-pub(crate) async fn ensure_branch_fetched(project_dir: &Path, branch: &BranchName) {
+pub(crate) async fn ensure_branch_fetched(
+    project_dir: &Path,
+    branch: &BranchName,
+) -> crate::services::git_worktree::RemoteEvidence {
+    use crate::services::git_worktree::RemoteEvidence;
     let branch_str = branch.as_str();
     let remote = crate::services::git_worktree::configured_remote(project_dir)
         .unwrap_or_else(|| "origin".to_string());
@@ -126,22 +130,42 @@ pub(crate) async fn ensure_branch_fetched(project_dir: &Path, branch: &BranchNam
     {
         Ok(o) => o,
         Err(e) => {
-            warn!(branch = %branch_str, error = %e, "git ls-remote failed, skipping fetch");
-            return;
+            warn!(branch = %branch_str, error = %e, "git ls-remote failed");
+            return RemoteEvidence::Unavailable;
         }
     };
-
-    if !ls_output.status.success() || String::from_utf8_lossy(&ls_output.stdout).trim().is_empty() {
-        return;
+    if !ls_output.status.success() {
+        warn!(
+            branch = %branch_str,
+            stderr = %String::from_utf8_lossy(&ls_output.stderr).trim(),
+            "git ls-remote failed"
+        );
+        return RemoteEvidence::Unavailable;
     }
+    let expected_ref = format!("refs/heads/{branch_str}");
+    let remote_sha = String::from_utf8_lossy(&ls_output.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let sha = parts.next()?;
+            let reference = parts.next()?;
+            (reference == expected_ref).then(|| sha.to_string())
+        });
+    let Some(remote_sha) = remote_sha else {
+        return RemoteEvidence::Absent;
+    };
 
-    // Fetch into the remote-tracking ref so local/remote compatibility can be
-    // compared against the real remote head, and never force-update a divergent
-    // local branch.
+    // Force-update the remote-tracking ref so a force-push is observed and the
+    // ancestry comparison uses the current remote head, never a stale one.
     let tracking_ref = format!("refs/remotes/{remote}/{branch_str}");
     info!(branch = %branch_str, remote = %remote, "Branch exists on remote, fetching for worktree recovery");
     match tokio::process::Command::new("git")
-        .args(["fetch", &remote, &format!("{branch_str}:{tracking_ref}")])
+        .args([
+            "fetch",
+            "--force",
+            &remote,
+            &format!("{branch_str}:{tracking_ref}"),
+        ])
         .current_dir(project_dir)
         .output()
         .await
@@ -155,9 +179,11 @@ pub(crate) async fn ensure_branch_fetched(project_dir: &Path, branch: &BranchNam
                 stderr = %String::from_utf8_lossy(&o.stderr).trim(),
                 "git fetch failed for branch recovery"
             );
+            return RemoteEvidence::Unavailable;
         }
         Err(e) => {
             warn!(branch = %branch_str, error = %e, "git fetch command failed for branch recovery");
+            return RemoteEvidence::Unavailable;
         }
     }
 
@@ -193,6 +219,8 @@ pub(crate) async fn ensure_branch_fetched(project_dir: &Path, branch: &BranchNam
             }
         }
     }
+
+    RemoteEvidence::AtSha(remote_sha)
 }
 
 /// If no git remote is configured, create a local bare repo and set it as origin.

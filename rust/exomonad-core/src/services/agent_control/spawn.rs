@@ -79,7 +79,7 @@ async fn verify_leaf_ownership(
     worktree_path: &Path,
     branch_name: &BranchName,
     expected_head: Option<&str>,
-    durable_identity: bool,
+    fresh_remote: Option<crate::services::git_worktree::RemoteEvidence>,
     require_existing_worktree: bool,
 ) -> Result<()> {
     if worktree_path.exists() {
@@ -118,10 +118,12 @@ async fn verify_leaf_ownership(
             ),
         )));
     }
-    // Remote evidence is required unless an expected head or durable identity
-    // already authorizes attachment. Availability failures fail closed.
+    // Authoritative head evidence is required before attaching a preserved
+    // branch. Remote state is only accepted when freshly verified; an expected
+    // head is the fallback. Durable identity proves ownership, not a commit.
     let has_expected_head = expected_head.is_some();
-    match git_wt.remote_evidence(branch_name) {
+    let remote = fresh_remote.unwrap_or_else(|| git_wt.remote_evidence(branch_name));
+    match remote {
         RemoteEvidence::Unavailable => {
             if !has_expected_head {
                 return Err(anyhow!(EffectError::custom(
@@ -131,7 +133,7 @@ async fn verify_leaf_ownership(
             }
         }
         RemoteEvidence::Absent => {
-            if !has_expected_head && !durable_identity {
+            if !has_expected_head {
                 return Err(anyhow!(EffectError::custom(
                     "worktree.branch_ownership_conflict",
                     format!("branch {branch_name} has no authoritative head evidence"),
@@ -403,20 +405,24 @@ async fn verify_branch_head(
         .await
         .with_context(|| format!("failed to inspect head of branch {}", branch))?;
     if !output.status.success() {
-        anyhow::bail!(
-            "could not resolve head of resumed branch {}: {}",
-            branch,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Err(anyhow!(EffectError::custom(
+            "worktree.branch_ownership_conflict",
+            format!(
+                "could not resolve head of resumed branch {}: {}",
+                branch,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        )));
     }
     let actual_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if actual_sha != expected_sha {
-        anyhow::bail!(
-            "resumed branch {} points at {}, expected {}",
-            branch,
-            actual_sha,
-            expected_sha
-        );
+        return Err(anyhow!(EffectError::custom(
+            "worktree.branch_ownership_conflict",
+            format!(
+                "resumed branch {} points at {}, expected {}",
+                branch, actual_sha, expected_sha
+            ),
+        )));
     }
     info!(branch = %branch, actual_sha, "Resumed branch head matches PR head SHA");
     Ok(())
@@ -1881,7 +1887,7 @@ impl<
                     &worktree_path,
                     &branch_name,
                     expected_head,
-                    durable_identity.is_some(),
+                    None,
                     false,
                 )
                 .await?;
@@ -1910,7 +1916,7 @@ impl<
                         &worktree_path,
                         &branch_name,
                         expected_head,
-                        durable_identity.is_some(),
+                        None,
                         true,
                     )
                     .await?;
@@ -1969,7 +1975,7 @@ impl<
                     self.git_wt().clone(),
                     worktree_path.clone(),
                 ));
-                ensure_branch_fetched(effective_project_dir, &branch_name).await;
+                let fresh_remote = ensure_branch_fetched(effective_project_dir, &branch_name).await;
                 self.git_wt().prune_worktrees()?;
                 match leaf_worktree_action(
                     self.git_wt().branch_exists(&branch_name)?,
@@ -1982,7 +1988,7 @@ impl<
                             &worktree_path,
                             &branch_name,
                             expected_head,
-                            durable_identity.is_some(),
+                            Some(fresh_remote.clone()),
                             false,
                         )
                         .await?;
@@ -2028,7 +2034,7 @@ impl<
                                     &worktree_path,
                                     &branch_name,
                                     expected_head,
-                                    durable_identity.is_some(),
+                                    Some(fresh_remote.clone()),
                                     false,
                                 )
                                 .await?;

@@ -492,6 +492,31 @@ fn exo_contains_only_sink_artifacts(path: &Path) -> bool {
     true
 }
 
+fn contains_symlink(path: &Path, depth: usize) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return true;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_symlink() => return true,
+            Ok(kind) if kind.is_dir() => {
+                if contains_symlink(&entry.path(), depth - 1) {
+                    return true;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 fn contains_only_sink_artifacts(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
@@ -602,6 +627,13 @@ pub(crate) fn cleanup_unregistered_worktree_residue(
             continue;
         };
         let path = entry.path();
+        // Never follow a symlinked `.exo/worktrees/*` entry.
+        if std::fs::symlink_metadata(&path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
         if !path.is_dir() {
             continue;
         }
@@ -615,7 +647,7 @@ pub(crate) fn cleanup_unregistered_worktree_residue(
         if worktree_name_is_identified(project_dir, &name) {
             continue;
         }
-        if !contains_only_sink_artifacts(&path) {
+        if !contains_only_sink_artifacts(&path) || contains_symlink(&path, 4) {
             continue;
         }
         if std::fs::create_dir_all(&quarantine_root).is_err() {

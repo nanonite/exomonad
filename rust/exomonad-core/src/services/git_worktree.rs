@@ -394,6 +394,16 @@ impl GitWorktreeService {
         expected_branch: &BranchName,
     ) -> Result<VerifiedWorktree, WorktreeError> {
         self.prune_worktrees()?;
+        // A symlink at the planned location must never stand in for the planned
+        // worktree itself, even when it resolves to another registered worktree.
+        if std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(WorktreeError::PathUnregistered {
+                path: path.display().to_string(),
+            });
+        }
         let canonical = self.canonical_path(path, "existing leaf worktree")?;
         let worktrees = self.list_worktrees()?;
 
@@ -470,6 +480,12 @@ impl GitWorktreeService {
     ///
     /// Uses Git's authoritative worktree registry rather than a `.git` marker.
     pub fn is_registered_worktree(&self, path: &Path) -> Result<bool, WorktreeError> {
+        if std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
         let Ok(canonical) = self.canonical_path(path, "candidate worktree") else {
             return Ok(false);
         };
@@ -1379,6 +1395,12 @@ mod tests {
             .unwrap();
         assert!(service.is_registered_worktree(&worktree_path).unwrap());
 
+        // Lock the registration so `git worktree prune` cannot silently drop it;
+        // the show-toplevel proof must be what rejects the residue.
+        run_git(
+            temp.path(),
+            &["worktree", "lock", worktree_path.to_str().unwrap()],
+        );
         std::fs::remove_dir_all(&worktree_path).unwrap();
         std::fs::create_dir_all(&worktree_path).unwrap();
         std::fs::write(worktree_path.join("residue"), "sink\n").unwrap();
@@ -1453,6 +1475,12 @@ mod tests {
             .create_workspace(&worktree_path, &branch, &base)
             .unwrap();
 
+        // Lock the registration so `git worktree prune` cannot silently drop it;
+        // the show-toplevel proof must be what rejects the residue.
+        run_git(
+            temp.path(),
+            &["worktree", "lock", worktree_path.to_str().unwrap()],
+        );
         std::fs::remove_dir_all(&worktree_path).unwrap();
         std::fs::create_dir_all(&worktree_path).unwrap();
         std::fs::write(worktree_path.join("residue"), "sink\n").unwrap();
