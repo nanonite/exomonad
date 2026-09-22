@@ -472,7 +472,18 @@ fn exo_contains_only_sink_artifacts(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        // Symlinks can escape the quarantine or dangle; treat them as ambiguous.
+        if entry
+            .file_type()
+            .map(|kind| kind.is_symlink())
+            .unwrap_or(true)
+        {
+            return false;
+        }
         let name = entry.file_name();
         if !WORKTREE_SINK_ARTIFACTS.contains(&name.to_string_lossy().as_ref()) {
             return false;
@@ -485,7 +496,17 @@ fn contains_only_sink_artifacts(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if entry
+            .file_type()
+            .map(|kind| kind.is_symlink())
+            .unwrap_or(true)
+        {
+            return false;
+        }
         let name = entry.file_name();
         if name.to_string_lossy() != ".exo" {
             return false;

@@ -105,6 +105,17 @@ pub struct VerifiedWorktree {
     pub branch: String,
 }
 
+/// Evidence about a branch's remote-tracking head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEvidence {
+    /// No remote-tracking ref exists for the branch.
+    Absent,
+    /// The remote-tracking ref resolves to this commit.
+    AtSha(String),
+    /// The remote-tracking ref could not be inspected.
+    Unavailable,
+}
+
 /// Service for git worktree operations via git CLI.
 pub struct GitWorktreeService {
     project_dir: PathBuf,
@@ -351,6 +362,25 @@ impl GitWorktreeService {
         self.canonical_path(&absolute, "git common directory")
     }
 
+    /// Prove `canonical` is the root of a linked worktree of this repository.
+    ///
+    /// A stale registration plus a sink-recreated directory can still resolve a
+    /// common git dir by walking upward into the main repository. Requiring
+    /// `rev-parse --show-toplevel` to equal the candidate rejects that residue.
+    fn is_linked_worktree_root(&self, canonical: &Path) -> bool {
+        let Ok(output) = self.git_output(canonical, &["rev-parse", "--show-toplevel"]) else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        match self.canonical_path(Path::new(&raw), "worktree toplevel") {
+            Ok(toplevel) => toplevel == canonical,
+            Err(_) => false,
+        }
+    }
+
     /// Authoritatively verify an existing leaf path before it is reused.
     ///
     /// A directory must never be reused merely because it exists. It has to be
@@ -385,6 +415,13 @@ impl GitWorktreeService {
                 path: canonical.display().to_string(),
                 expected: project_common.display().to_string(),
                 actual: worktree_common.display().to_string(),
+            });
+        }
+        // A stale registration plus a sink-recreated directory must not be
+        // accepted: the candidate has to be the worktree root itself.
+        if !self.is_linked_worktree_root(&canonical) {
+            return Err(WorktreeError::PathUnregistered {
+                path: canonical.display().to_string(),
             });
         }
 
@@ -463,16 +500,7 @@ impl GitWorktreeService {
         // The directory must be the root of a worktree, not merely somewhere
         // inside one. A residue directory inside the main worktree would
         // otherwise pass an is-inside-work-tree check.
-        let toplevel = self.git_output(&canonical, &["rev-parse", "--show-toplevel"])?;
-        if !toplevel.status.success() {
-            return Ok(false);
-        }
-        let toplevel_raw = String::from_utf8_lossy(&toplevel.stdout).trim().to_string();
-        let toplevel = match self.canonical_path(Path::new(&toplevel_raw), "worktree toplevel") {
-            Ok(path) => path,
-            Err(_) => return Ok(false),
-        };
-        Ok(toplevel == canonical)
+        Ok(self.is_linked_worktree_root(&canonical))
     }
 
     /// Return the registered worktree that currently holds `branch`, if any.
@@ -499,12 +527,37 @@ impl GitWorktreeService {
         Ok(None)
     }
 
-    /// Check whether a local branch head matches its remote tracking head.
+    /// Inspect the branch's remote-tracking head.
     ///
-    /// Returns `true` when there is no remote tracking ref to compare. Returns
-    /// `false` when the local and remote heads differ, which means attachment
-    /// would run at an unverified head.
-    pub fn local_remote_heads_compatible(
+    /// Distinguishes an absent ref from a failure to inspect Git, so callers can
+    /// fail closed when remote evidence is required but unavailable.
+    pub fn remote_evidence(&self, branch: &BranchName) -> RemoteEvidence {
+        let remote_name =
+            configured_remote(&self.project_dir).unwrap_or_else(|| "origin".to_string());
+        let remote_ref = format!("refs/remotes/{remote_name}/{}", branch.as_str());
+        match self.git_output(
+            &self.project_dir,
+            &["rev-parse", "--verify", "--quiet", &remote_ref],
+        ) {
+            Ok(output) if output.status.success() => {
+                let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if sha.is_empty() {
+                    RemoteEvidence::Absent
+                } else {
+                    RemoteEvidence::AtSha(sha)
+                }
+            }
+            Ok(_) => RemoteEvidence::Absent,
+            Err(_) => RemoteEvidence::Unavailable,
+        }
+    }
+
+    /// Check whether the local branch head equals or is ahead of its remote head.
+    ///
+    /// Returns `true` when there is no remote-tracking ref, and `false` when the
+    /// local head is behind the remote or the histories diverged. An unavailable
+    /// remote inspection also returns `false` so callers fail closed.
+    pub fn local_head_is_current_or_ahead(
         &self,
         branch: &BranchName,
     ) -> Result<bool, WorktreeError> {
@@ -512,18 +565,22 @@ impl GitWorktreeService {
             &self.project_dir,
             &["rev-parse", &format!("refs/heads/{}", branch.as_str())],
         )?;
-        let remote_name =
-            configured_remote(&self.project_dir).unwrap_or_else(|| "origin".to_string());
-        let remote_ref = format!("refs/remotes/{remote_name}/{}", branch.as_str());
-        let output = self.git_output(
-            &self.project_dir,
-            &["rev-parse", "--verify", "--quiet", &remote_ref],
-        )?;
-        if !output.status.success() {
-            return Ok(true);
+        match self.remote_evidence(branch) {
+            RemoteEvidence::Absent => Ok(true),
+            RemoteEvidence::Unavailable => Ok(false),
+            RemoteEvidence::AtSha(remote) => {
+                if remote == local {
+                    return Ok(true);
+                }
+                // A preserved local branch may carry legitimate unique commits;
+                // accept it when the remote head is an ancestor.
+                let output = self.git_output(
+                    &self.project_dir,
+                    &["merge-base", "--is-ancestor", &remote, &local],
+                )?;
+                Ok(output.status.success())
+            }
         }
-        let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(local == remote)
     }
 
     fn migrate_worktree_identities(
@@ -1367,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn local_remote_heads_compatible_without_remote_is_true() {
+    fn local_head_is_current_or_ahead_without_remote_is_true() {
         let (temp, service) = init_test_repo();
         let default_branch = get_default_branch(temp.path());
         let worktree_path = temp.path().join("local-only-leaf");
@@ -1379,7 +1436,102 @@ mod tests {
             .create_workspace(&worktree_path, &branch, &base)
             .unwrap();
 
-        assert!(service.local_remote_heads_compatible(&branch).unwrap());
+        assert_eq!(service.remote_evidence(&branch), RemoteEvidence::Absent);
+        assert!(service.local_head_is_current_or_ahead(&branch).unwrap());
+    }
+
+    #[test]
+    fn verify_existing_worktree_rejects_residue_at_a_dead_registration() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let worktree_path = temp.path().join("dead-verified-leaf");
+        let branch = BranchName::try_from_str(format!("{default_branch}.dead").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(&worktree_path, &branch, &base)
+            .unwrap();
+
+        std::fs::remove_dir_all(&worktree_path).unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::write(worktree_path.join("residue"), "sink\n").unwrap();
+
+        let error = service
+            .verify_existing_worktree(&worktree_path, &branch)
+            .expect_err("residue at a dead registration must fail verification");
+        assert!(matches!(error, WorktreeError::PathUnregistered { .. }));
+    }
+
+    #[test]
+    fn local_head_is_current_or_ahead_preserves_unique_local_commits() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let remote_dir = temp.path().join("remote.git");
+        run_git(
+            temp.path(),
+            &["init", "--bare", remote_dir.to_str().unwrap()],
+        );
+        run_git(
+            temp.path(),
+            &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        );
+        run_git(temp.path(), &["push", "-u", "origin", &default_branch]);
+        run_git(temp.path(), &["fetch", "origin"]);
+        let branch = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        assert!(matches!(
+            service.remote_evidence(&branch),
+            RemoteEvidence::AtSha(_)
+        ));
+
+        run_git(
+            temp.path(),
+            &["commit", "--allow-empty", "-m", "unique local commit"],
+        );
+
+        assert!(
+            service.local_head_is_current_or_ahead(&branch).unwrap(),
+            "a local branch ahead of its remote head must be preserved"
+        );
+    }
+
+    #[test]
+    fn local_head_is_current_or_ahead_rejects_remote_ahead() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let remote_dir = temp.path().join("remote.git");
+        run_git(
+            temp.path(),
+            &["init", "--bare", remote_dir.to_str().unwrap()],
+        );
+        run_git(
+            temp.path(),
+            &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        );
+        run_git(temp.path(), &["push", "-u", "origin", &default_branch]);
+
+        let other = temp.path().join("other-clone");
+        run_git(
+            temp.path(),
+            &[
+                "clone",
+                remote_dir.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        run_git(&other, &["config", "user.email", "other@example.invalid"]);
+        run_git(&other, &["config", "user.name", "Other"]);
+        run_git(&other, &["commit", "--allow-empty", "-m", "remote ahead"]);
+        run_git(&other, &["push", "origin", &default_branch]);
+        run_git(temp.path(), &["fetch", "origin"]);
+        let branch = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+
+        assert!(
+            !service.local_head_is_current_or_ahead(&branch).unwrap(),
+            "a local branch behind its remote head must fail closed"
+        );
     }
 
     #[test]

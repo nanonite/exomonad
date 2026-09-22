@@ -79,6 +79,7 @@ async fn verify_leaf_ownership(
     worktree_path: &Path,
     branch_name: &BranchName,
     expected_head: Option<&str>,
+    durable_identity: bool,
     require_existing_worktree: bool,
 ) -> Result<()> {
     if worktree_path.exists() {
@@ -94,29 +95,63 @@ async fn verify_leaf_ownership(
         return Err(anyhow!(EffectError::from(
             crate::services::git_worktree::WorktreeError::PathUnregistered {
                 path: worktree_path.display().to_string(),
-            }
+            },
         )));
     }
-    if git_wt.branch_exists(branch_name)? {
-        if let Some(owner) = git_wt.registered_worktree_for_branch(branch_name)? {
-            return Err(anyhow!(EffectError::custom(
-                "worktree.branch_ownership_conflict",
-                format!(
-                    "branch {} is already checked out at {}",
-                    branch_name,
-                    owner.display()
-                ),
-            )));
+    use crate::services::git_worktree::RemoteEvidence;
+    let branch_exists = git_wt
+        .branch_exists(branch_name)
+        .map_err(|error| anyhow!(EffectError::from(error)))?;
+    if !branch_exists {
+        return Ok(());
+    }
+    if let Some(owner) = git_wt
+        .registered_worktree_for_branch(branch_name)
+        .map_err(|error| anyhow!(EffectError::from(error)))?
+    {
+        return Err(anyhow!(EffectError::custom(
+            "worktree.branch_ownership_conflict",
+            format!(
+                "branch {} is already checked out at {}",
+                branch_name,
+                owner.display()
+            ),
+        )));
+    }
+    // Remote evidence is required unless an expected head or durable identity
+    // already authorizes attachment. Availability failures fail closed.
+    let has_expected_head = expected_head.is_some();
+    match git_wt.remote_evidence(branch_name) {
+        RemoteEvidence::Unavailable => {
+            if !has_expected_head {
+                return Err(anyhow!(EffectError::custom(
+                    "worktree.branch_ownership_conflict",
+                    format!("remote evidence for branch {branch_name} is unavailable"),
+                )));
+            }
         }
-        if !git_wt.local_remote_heads_compatible(branch_name)? {
-            return Err(anyhow!(EffectError::custom(
-                "worktree.branch_ownership_conflict",
-                format!("branch {branch_name} diverges from its remote head"),
-            )));
+        RemoteEvidence::Absent => {
+            if !has_expected_head && !durable_identity {
+                return Err(anyhow!(EffectError::custom(
+                    "worktree.branch_ownership_conflict",
+                    format!("branch {branch_name} has no authoritative head evidence"),
+                )));
+            }
         }
-        if let Some(head) = expected_head {
-            verify_branch_head(effective_project_dir, branch_name, head).await?;
+        RemoteEvidence::AtSha(_) => {
+            if !git_wt
+                .local_head_is_current_or_ahead(branch_name)
+                .map_err(|error| anyhow!(EffectError::from(error)))?
+            {
+                return Err(anyhow!(EffectError::custom(
+                    "worktree.branch_ownership_conflict",
+                    format!("branch {branch_name} is behind or diverged from its remote head"),
+                )));
+            }
         }
+    }
+    if let Some(head) = expected_head {
+        verify_branch_head(effective_project_dir, branch_name, head).await?;
     }
     Ok(())
 }
@@ -1846,6 +1881,7 @@ impl<
                     &worktree_path,
                     &branch_name,
                     expected_head,
+                    durable_identity.is_some(),
                     false,
                 )
                 .await?;
@@ -1874,6 +1910,7 @@ impl<
                         &worktree_path,
                         &branch_name,
                         expected_head,
+                        durable_identity.is_some(),
                         true,
                     )
                     .await?;
@@ -1945,6 +1982,7 @@ impl<
                             &worktree_path,
                             &branch_name,
                             expected_head,
+                            durable_identity.is_some(),
                             false,
                         )
                         .await?;
@@ -1990,6 +2028,7 @@ impl<
                                     &worktree_path,
                                     &branch_name,
                                     expected_head,
+                                    durable_identity.is_some(),
                                     false,
                                 )
                                 .await?;
