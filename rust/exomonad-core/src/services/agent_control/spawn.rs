@@ -46,6 +46,65 @@ fn leaf_worktree_action(branch_exists: bool, start_point: Option<&str>) -> LeafW
     }
 }
 
+/// Derive the expected deterministic leaf birth branch.
+///
+/// Durable identity wins; otherwise deterministic naming from an explicit base
+/// branch or the effective birth branch. The branch observed on disk is never an
+/// input here, so a wrong-branch worktree cannot redefine the expectation.
+fn expected_leaf_birth(
+    identity_birth: Option<&BirthBranch>,
+    base_branch: Option<&str>,
+    effective_birth: &BirthBranch,
+    agent_name: &str,
+) -> Result<BirthBranch> {
+    if let Some(birth) = identity_birth {
+        return Ok(birth.clone());
+    }
+    if let Some(base) = base_branch {
+        return BirthBranch::try_from_str(base)
+            .context("replacement base branch was empty")
+            .map(|branch| branch.child(agent_name));
+    }
+    Ok(effective_birth.child(agent_name))
+}
+
+/// Removes a worktree created by this spawn attempt if provisioning fails
+/// before the agent is finalized. Dropping the guard on any `?` error path is
+/// what makes cleanup reliable instead of relying on later statements.
+struct WorktreeRollback {
+    git_wt: Arc<GitWorktreeService>,
+    path: PathBuf,
+    armed: bool,
+}
+
+impl WorktreeRollback {
+    fn armed(git_wt: Arc<GitWorktreeService>, path: PathBuf) -> Self {
+        Self {
+            git_wt,
+            path,
+            armed: true,
+        }
+    }
+
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorktreeRollback {
+    fn drop(&mut self) {
+        if self.armed && self.path.exists() {
+            if let Err(error) = self.git_wt.remove_workspace(&self.path) {
+                warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "Failed to roll back a partially created leaf worktree"
+                );
+            }
+        }
+    }
+}
+
 fn parse_git_status_paths(stdout: &[u8]) -> Vec<String> {
     let records: Vec<&[u8]> = stdout
         .split(|byte| *byte == 0)
@@ -1696,7 +1755,22 @@ impl<
             // by earlier failed spawns before deciding whether the planned path
             // is a reusable worktree. Registered, dirty, identified, or
             // ambiguous directories are never removed.
-            let _ = super::cleanup::cleanup_unregistered_worktree_residue(self.project_dir());
+            let _ =
+                super::cleanup::cleanup_unregistered_worktree_residue(self.project_dir(), self.git_wt());
+
+            // Derive the expected deterministic birth branch from durable
+            // identity and deterministic naming only. The branch observed on
+            // disk must never redefine the expected branch.
+            let expected_birth = expected_leaf_birth(
+                existing_identity_record
+                    .as_ref()
+                    .map(|record| &record.birth_branch),
+                options.base_branch.as_deref(),
+                &effective_birth,
+                agent_name.as_str(),
+            )?;
+            let branch_name = BranchName::try_from_str(expected_birth.to_string().as_str())
+                .expect("validated string input is non-empty");
 
             let existing_branch = if !options.standalone_repo && worktree_path.exists() {
                 self.git_wt()
@@ -1708,17 +1782,35 @@ impl<
             } else {
                 None
             };
-            let child_birth = if let Some(branch) = existing_branch.clone() {
-                branch
-            } else if let Some(record) = existing_identity_record.as_ref() {
-                record.birth_branch.clone()
-            } else if let Some(base_branch) = options.base_branch.as_deref() {
-                BirthBranch::try_from_str(base_branch)
-                    .context("replacement base branch was empty")?
-                    .child(agent_name.as_str())
-            } else {
-                effective_birth.child(agent_name.as_str())
-            };
+            if let Some(observed) = existing_branch.as_ref() {
+                if observed.as_str() != expected_birth.as_str() {
+                    return Err(anyhow!(
+                        "[worktree.branch_ownership_conflict] existing leaf worktree {} is on {}, expected {}",
+                        worktree_path.display(),
+                        observed,
+                        expected_birth
+                    ));
+                }
+            }
+
+            // Validate ownership before any idempotent return or reuse so a
+            // stale routing record cannot bypass it.
+            if !options.standalone_repo && worktree_path.exists() {
+                self.git_wt()
+                    .verify_existing_worktree(&worktree_path, &branch_name)
+                    .map_err(|error| anyhow!(EffectError::from(error)))
+                    .context(
+                        "refusing to reuse an existing leaf worktree without verified Git ownership",
+                    )?;
+                if options.expected_agent_name.is_some() {
+                    if let Some(expected_sha) = options.start_point.as_deref() {
+                        verify_branch_head(effective_project_dir, &branch_name, expected_sha)
+                            .await?;
+                    }
+                }
+            }
+
+            let child_birth = expected_birth;
 
             // Idempotency check: stable routing IDs take precedence over a
             // stale display-name scan when resuming an existing owner.
@@ -1754,34 +1846,19 @@ impl<
             // Push parent branch so child PRs can reference it as base
             ensure_branch_pushed(self.git_wt(), &current_branch, effective_project_dir).await;
 
-            let branch_name = BranchName::try_from_str(child_birth.to_string().as_str())
-                .expect("validated string input is non-empty");
             let actual_branch_name = branch_name.to_string();
-
-            if options.expected_agent_name.is_some() {
-                if let Some(existing_branch) = existing_branch.as_ref() {
-                    if existing_branch.as_str() != branch_name.as_str() {
-                        return Err(anyhow!(
-                            "existing resume worktree is on {}, expected {}",
-                            existing_branch,
-                            branch_name
-                        ));
-                    }
-                    if let Some(expected_sha) = options.start_point.as_deref() {
-                        verify_branch_head(effective_project_dir, &branch_name, expected_sha)
-                            .await?;
-                    }
-                }
-            }
 
             let mut remove_worktree_on_spawn_failure = false;
 
             if options.standalone_repo {
-                self.init_standalone_repo(&worktree_path).await?;
                 remove_worktree_on_spawn_failure = true;
+                let mut rollback =
+                    WorktreeRollback::armed(self.git_wt().clone(), worktree_path.clone());
+                self.init_standalone_repo(&worktree_path).await?;
                 if !options.allowed_dirs.is_empty() {
                     self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
                 }
+                rollback.defuse();
             } else if worktree_path.exists() {
                 if !worktree_path.is_dir() {
                     return Err(anyhow!(
@@ -1789,31 +1866,16 @@ impl<
                         worktree_path.display()
                     ));
                 }
-                // Never reuse a directory merely because it exists. It must be a
-                // live registered git worktree of this repository on the
-                // deterministic birth branch, regardless of whether a start
-                // point was supplied.
-                self.git_wt()
-                    .verify_existing_worktree(&worktree_path, &branch_name)
-                    .map_err(|error| anyhow!(EffectError::from(error)))
-                    .context(
-                        "refusing to reuse an existing leaf worktree without verified Git ownership",
-                    )?;
-                if options.expected_agent_name.is_some() {
-                    if let Some(expected_sha) = options.start_point.as_deref() {
-                        verify_branch_head(effective_project_dir, &branch_name, expected_sha)
-                            .await?;
-                    }
-                }
+                // Ownership was verified before the idempotency check.
                 info!(
                     worktree_path = %worktree_path.display(),
                     branch_name = %branch_name,
                     "Reusing verified existing leaf worktree"
                 );
             } else {
-                // Arm cleanup before any fallible resource creation so a partial
-                // or failed worktree never survives the attempt.
                 remove_worktree_on_spawn_failure = true;
+                let mut rollback =
+                    WorktreeRollback::armed(self.git_wt().clone(), worktree_path.clone());
                 ensure_branch_fetched(effective_project_dir, &branch_name).await;
                 self.git_wt().prune_worktrees()?;
                 match leaf_worktree_action(
@@ -1821,9 +1883,25 @@ impl<
                     options.start_point.as_deref(),
                 ) {
                     LeafWorktreeAction::Attach => {
-                        // The deterministic birth branch already exists. Attach
-                        // to it instead of creating it; start_point is
-                        // expected-head evidence only.
+                        // Ownership predicate: the branch must not be claimed by
+                        // another live worktree and its local and remote heads
+                        // must agree before it is attached.
+                        if let Some(owner) =
+                            self.git_wt().registered_worktree_for_branch(&branch_name)?
+                        {
+                            return Err(anyhow!(
+                                "[worktree.branch_ownership_conflict] branch {} is already checked out at {}",
+                                branch_name,
+                                owner.display()
+                            ));
+                        }
+                        if !self.git_wt().local_remote_heads_compatible(&branch_name)? {
+                            return Err(anyhow!(
+                                "[worktree.branch_ownership_conflict] branch {} diverges from its remote head",
+                                branch_name
+                            ));
+                        }
+                        // start_point is expected-head evidence only.
                         if options.expected_agent_name.is_some() {
                             if let Some(expected_sha) = options.start_point.as_deref() {
                                 verify_branch_head(effective_project_dir, &branch_name, expected_sha)
@@ -1855,24 +1933,27 @@ impl<
                         {
                             Ok(()) => {}
                             Err(error) => {
-                                // TOCTOU: another actor may have created the
-                                // branch between the existence check and
-                                // creation. Re-evaluate ownership and attach at
-                                // most once; otherwise fail closed with the
-                                // original error.
-                                if self.git_wt().branch_exists(&branch_name)? {
-                                    self.create_worktree_from_existing_branch_checked(
-                                        &worktree_path,
-                                        &branch_name,
-                                    )
-                                    .await?;
-                                } else {
+                                // TOCTOU: only a branch-exists failure can be
+                                // recovered by a single attach. Any other error
+                                // fails closed unchanged.
+                                let branch_raced = matches!(
+                                    error.downcast_ref::<EffectError>(),
+                                    Some(EffectError::Custom { code, .. })
+                                        if code == "worktree.branch_exists"
+                                );
+                                if !branch_raced {
                                     return Err(error);
                                 }
+                                self.create_worktree_from_existing_branch_checked(
+                                    &worktree_path,
+                                    &branch_name,
+                                )
+                                .await?;
                             }
                         }
                     }
                 }
+                rollback.defuse();
             }
 
             self.create_socket_symlink(&worktree_path).await;
@@ -2404,6 +2485,35 @@ mod tests {
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, ScrubGitRepositoryEnv,
     };
+
+    #[test]
+    fn expected_leaf_birth_prefers_durable_identity() {
+        let identity = BirthBranch::try_from_str("main.durable").unwrap();
+        let effective = BirthBranch::try_from_str("main").unwrap();
+
+        let expected =
+            expected_leaf_birth(Some(&identity), Some("base"), &effective, "leaf").unwrap();
+
+        assert_eq!(expected.as_str(), "main.durable");
+    }
+
+    #[test]
+    fn expected_leaf_birth_is_deterministic_without_identity() {
+        let effective = BirthBranch::try_from_str("main").unwrap();
+
+        assert_eq!(
+            expected_leaf_birth(None, None, &effective, "leaf")
+                .unwrap()
+                .as_str(),
+            "main.leaf"
+        );
+        assert_eq!(
+            expected_leaf_birth(None, Some("base"), &effective, "leaf")
+                .unwrap()
+                .as_str(),
+            "base.leaf"
+        );
+    }
 
     #[test]
     fn leaf_worktree_action_attaches_when_branch_exists_without_start_point() {

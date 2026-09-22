@@ -460,6 +460,8 @@ impl<
 const WORKTREE_SINK_ARTIFACTS: &[&str] = &[
     "logs",
     "events",
+    "ledger",
+    "analysis",
     "sink-health.json",
     "sink-health.lock",
     "session.json",
@@ -511,21 +513,42 @@ fn worktree_name_is_identified(project_dir: &Path, name: &str) -> bool {
     false
 }
 
-/// Remove `.exo/worktrees/*` residue directories that are provably disposable.
+fn residue_quarantine_name(name: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{name}-{nanos}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Quarantine `.exo/worktrees/*` residue directories that are provably disposable.
 ///
-/// Only directories that are not live Git worktrees, carry no agent identity,
-/// and contain nothing but known sink artifacts are removed. Registered, dirty,
-/// identified, or ambiguous directories are left untouched. Returns the removed
-/// paths for observability.
-pub(crate) fn cleanup_unregistered_worktree_residue(project_dir: &Path) -> Vec<PathBuf> {
+/// Only directories that Git's worktree registry does not know, carry no agent
+/// identity, and contain nothing but known sink artifacts are moved into the
+/// project-owned `.exo/worktrees-residue/` quarantine. Registered, dirty,
+/// identified, or ambiguous directories are left untouched, and every record in
+/// a quarantined directory is preserved rather than deleted. Returns the
+/// original residue paths that were moved.
+pub(crate) fn cleanup_unregistered_worktree_residue(
+    project_dir: &Path,
+    git_wt: &GitWorktreeService,
+) -> Vec<PathBuf> {
     let worktrees_dir = project_dir.join(".exo/worktrees");
     let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
         return Vec::new();
     };
-    let mut removed = Vec::new();
+    let quarantine_root = project_dir.join(".exo/worktrees-residue");
+    let mut moved = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() || path.join(".git").exists() {
+        if !path.is_dir() {
+            continue;
+        }
+        // Git's registry is authoritative: a registered worktree is never
+        // residue. An unreadable registry fails closed by skipping cleanup.
+        if git_wt.is_registered_worktree(&path).unwrap_or(true) {
             continue;
         }
         let name = entry.file_name();
@@ -536,11 +559,15 @@ pub(crate) fn cleanup_unregistered_worktree_residue(project_dir: &Path) -> Vec<P
         if !contains_only_sink_artifacts(&path) {
             continue;
         }
-        if std::fs::remove_dir_all(&path).is_ok() {
-            removed.push(path);
+        if std::fs::create_dir_all(&quarantine_root).is_err() {
+            continue;
+        }
+        let destination = quarantine_root.join(residue_quarantine_name(&name));
+        if std::fs::rename(&path, &destination).is_ok() {
+            moved.push(path);
         }
     }
-    removed
+    moved
 }
 
 #[cfg(test)]
@@ -554,40 +581,77 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
-    #[test]
-    fn residue_cleanup_removes_sink_only_directory() {
+    fn init_residue_repo() -> (tempfile::TempDir, PathBuf, GitWorktreeService) {
         let temp = tempfile::tempdir().unwrap();
-        let project = temp.path();
-        let residue = project.join(".exo/worktrees/leaf-codex");
-        std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
-        std::fs::write(residue.join(".exo/logs/agent.jsonl"), "{}\n").unwrap();
+        let project = temp.path().to_path_buf();
+        exomonad_test_support::init_fixture_git_repository(&project).unwrap();
+        exomonad_test_support::run_fixture_git_command(
+            &project,
+            &["config", "user.email", "residue@example.invalid"],
+        )
+        .unwrap();
+        exomonad_test_support::run_fixture_git_command(
+            &project,
+            &["config", "user.name", "Residue Test"],
+        )
+        .unwrap();
+        exomonad_test_support::run_fixture_git_command(
+            &project,
+            &["commit", "--allow-empty", "-m", "initial"],
+        )
+        .unwrap();
+        let git_wt = GitWorktreeService::new(project.clone());
+        (temp, project, git_wt)
+    }
 
-        let removed = cleanup_unregistered_worktree_residue(project);
-
-        assert_eq!(removed, vec![residue.clone()]);
-        assert!(!residue.exists());
+    fn fixture_branch(project: &Path) -> String {
+        let output =
+            exomonad_test_support::run_fixture_git_command(project, &["branch", "--show-current"])
+                .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     #[test]
-    fn residue_cleanup_refuses_live_registered_worktree() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path();
-        let worktree = project.join(".exo/worktrees/leaf-codex");
-        std::fs::create_dir_all(worktree.join(".exo/logs")).unwrap();
-        std::fs::write(
-            worktree.join(".git"),
-            "gitdir: ../../.git/worktrees/leaf-codex\n",
-        )
-        .unwrap();
+    fn residue_cleanup_quarantines_sink_only_directory() {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/ledger/segments")).unwrap();
+        std::fs::write(residue.join(".exo/ledger/segments/segment-0.jsonl"), "{}\n").unwrap();
 
-        assert!(cleanup_unregistered_worktree_residue(project).is_empty());
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt);
+
+        assert_eq!(moved, vec![residue.clone()]);
+        assert!(!residue.exists());
+        let quarantined: Vec<_> = std::fs::read_dir(project.join(".exo/worktrees-residue"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert!(quarantined[0]
+            .path()
+            .join(".exo/ledger/segments/segment-0.jsonl")
+            .is_file());
+    }
+
+    #[test]
+    fn residue_cleanup_refuses_registered_worktree() {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let default_branch = fixture_branch(&project);
+        let worktree = project.join(".exo/worktrees/leaf-codex");
+        let branch =
+            crate::domain::BranchName::try_from_str(format!("{default_branch}.leaf").as_str())
+                .unwrap();
+        let base = crate::domain::BranchName::try_from_str(default_branch.as_str()).unwrap();
+        git_wt.create_workspace(&worktree, &branch, &base).unwrap();
+        std::fs::create_dir_all(worktree.join(".exo/ledger/segments")).unwrap();
+
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
         assert!(worktree.exists());
     }
 
     #[test]
     fn residue_cleanup_refuses_identified_worktree() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path();
+        let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
         let agent_dir = project.join(".exo/agents/leaf");
@@ -598,19 +662,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(cleanup_unregistered_worktree_residue(project).is_empty());
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
         assert!(residue.exists());
     }
 
     #[test]
     fn residue_cleanup_refuses_dirty_or_ambiguous_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path();
+        let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
         std::fs::write(residue.join("seed"), "real work\n").unwrap();
 
-        assert!(cleanup_unregistered_worktree_residue(project).is_empty());
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
         assert!(residue.exists());
     }
 

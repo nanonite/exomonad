@@ -18,6 +18,9 @@ pub struct InboxMessage {
     pub id: u64,
     pub target: String,
     pub project_dir: PathBuf,
+    /// Project-owned directory used as the fallback sink destination when the
+    /// candidate `project_dir` is not a live worktree at write time.
+    pub project_root: PathBuf,
     pub from: String,
     pub recipient: String,
     pub body: String,
@@ -37,10 +40,12 @@ impl InboxMessage {
         body: String,
         detail: String,
     ) -> Self {
+        let project_root = project_dir.clone();
         Self {
             id: 0,
             target,
             project_dir,
+            project_root,
             from,
             recipient,
             body,
@@ -48,6 +53,11 @@ impl InboxMessage {
             injection_options: InjectionOptions::claude_default(),
             cache_key: None,
         }
+    }
+
+    pub fn with_project_root(mut self, project_root: PathBuf) -> Self {
+        self.project_root = project_root;
+        self
     }
 
     pub fn with_injection_options(mut self, injection_options: InjectionOptions) -> Self {

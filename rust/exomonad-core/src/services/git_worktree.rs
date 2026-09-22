@@ -404,11 +404,20 @@ impl GitWorktreeService {
             if worktree.branch.as_deref() != Some(expected_branch.as_str()) {
                 continue;
             }
-            if let Ok(candidate) = std::fs::canonicalize(&worktree.path) {
-                if candidate != canonical {
+            match std::fs::canonicalize(&worktree.path) {
+                Ok(candidate) if candidate == canonical => {}
+                Ok(candidate) => {
                     return Err(WorktreeError::BranchOwnershipConflict {
                         branch: expected_branch.to_string(),
                         path: candidate.display().to_string(),
+                    });
+                }
+                // A competing registration that cannot be resolved is ambiguous
+                // ownership, so fail closed rather than ignore it.
+                Err(_) => {
+                    return Err(WorktreeError::BranchOwnershipConflict {
+                        branch: expected_branch.to_string(),
+                        path: worktree.path.display().to_string(),
                     });
                 }
             }
@@ -418,6 +427,75 @@ impl GitWorktreeService {
             path: canonical,
             branch: actual_branch,
         })
+    }
+
+    /// Return whether `path` is a live registered worktree of this repository.
+    ///
+    /// Uses Git's authoritative worktree registry rather than a `.git` marker.
+    pub fn is_registered_worktree(&self, path: &Path) -> Result<bool, WorktreeError> {
+        let Ok(canonical) = self.canonical_path(path, "candidate worktree") else {
+            return Ok(false);
+        };
+        for worktree in self.list_worktrees()? {
+            if std::fs::canonicalize(&worktree.path)
+                .map(|candidate| candidate == canonical)
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Return the registered worktree that currently holds `branch`, if any.
+    ///
+    /// A registration that cannot be canonicalized is reported as an ownership
+    /// conflict instead of being ignored.
+    pub fn registered_worktree_for_branch(
+        &self,
+        branch: &BranchName,
+    ) -> Result<Option<PathBuf>, WorktreeError> {
+        self.prune_worktrees()?;
+        for worktree in self.list_worktrees()? {
+            if worktree.branch.as_deref() != Some(branch.as_str()) {
+                continue;
+            }
+            return match std::fs::canonicalize(&worktree.path) {
+                Ok(candidate) => Ok(Some(candidate)),
+                Err(_) => Err(WorktreeError::BranchOwnershipConflict {
+                    branch: branch.to_string(),
+                    path: worktree.path.display().to_string(),
+                }),
+            };
+        }
+        Ok(None)
+    }
+
+    /// Check whether a local branch head matches its remote tracking head.
+    ///
+    /// Returns `true` when there is no remote tracking ref to compare. Returns
+    /// `false` when the local and remote heads differ, which means attachment
+    /// would run at an unverified head.
+    pub fn local_remote_heads_compatible(
+        &self,
+        branch: &BranchName,
+    ) -> Result<bool, WorktreeError> {
+        let local = self.git_path(
+            &self.project_dir,
+            &["rev-parse", &format!("refs/heads/{}", branch.as_str())],
+        )?;
+        let remote_name =
+            configured_remote(&self.project_dir).unwrap_or_else(|| "origin".to_string());
+        let remote_ref = format!("refs/remotes/{remote_name}/{}", branch.as_str());
+        let output = self.git_output(
+            &self.project_dir,
+            &["rev-parse", "--verify", "--quiet", &remote_ref],
+        )?;
+        if !output.status.success() {
+            return Ok(true);
+        }
+        let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(local == remote)
     }
 
     fn migrate_worktree_identities(
@@ -1200,6 +1278,56 @@ mod tests {
         assert!(EffectError::from(error)
             .to_string()
             .contains("worktree.branch_mismatch"));
+    }
+
+    #[test]
+    fn registered_worktree_for_branch_reports_the_owner() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let worktree_path = temp.path().join("owned-leaf");
+        let branch = BranchName::try_from_str(format!("{default_branch}.owned").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(&worktree_path, &branch, &base)
+            .unwrap();
+
+        let owner = service
+            .registered_worktree_for_branch(&branch)
+            .expect("registry lookup must succeed")
+            .expect("the created worktree must own its branch");
+
+        assert_eq!(owner, std::fs::canonicalize(&worktree_path).unwrap());
+    }
+
+    #[test]
+    fn registered_worktree_for_branch_is_none_for_unused_branch() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let branch = BranchName::try_from_str(format!("{default_branch}.unused").as_str())
+            .expect("validated string input is non-empty");
+
+        assert_eq!(
+            service.registered_worktree_for_branch(&branch).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn local_remote_heads_compatible_without_remote_is_true() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let worktree_path = temp.path().join("local-only-leaf");
+        let branch = BranchName::try_from_str(format!("{default_branch}.local-only").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(&worktree_path, &branch, &base)
+            .unwrap();
+
+        assert!(service.local_remote_heads_compatible(&branch).unwrap());
     }
 
     #[test]
