@@ -23,6 +23,22 @@ pub enum WorktreeError {
     PushRejected { message: String },
     #[error("Git error: {message}")]
     GitError { message: String },
+    #[error("Worktree path is not registered with git: {path}")]
+    PathUnregistered { path: String },
+    #[error("Worktree path {path} belongs to a different repository (expected {expected}, found {actual})")]
+    RepositoryMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("Worktree path {path} is on branch {actual:?}, expected {expected}")]
+    BranchMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("Branch {branch} is already owned by worktree {path}")]
+    BranchOwnershipConflict { branch: String, path: String },
 }
 
 impl From<WorktreeError> for EffectError {
@@ -49,8 +65,44 @@ impl From<WorktreeError> for EffectError {
             WorktreeError::GitError { message } => {
                 EffectError::custom("worktree.git_error", message)
             }
+            WorktreeError::PathUnregistered { path } => EffectError::custom(
+                "worktree.path_unregistered",
+                format!("worktree path is not registered with git: {path}"),
+            ),
+            WorktreeError::RepositoryMismatch {
+                path,
+                expected,
+                actual,
+            } => EffectError::custom(
+                "worktree.repository_mismatch",
+                format!(
+                    "worktree path {path} belongs to a different repository \
+                     (expected {expected}, found {actual})"
+                ),
+            ),
+            WorktreeError::BranchMismatch {
+                path,
+                expected,
+                actual,
+            } => EffectError::custom(
+                "worktree.branch_mismatch",
+                format!("worktree path {path} is on branch {actual:?}, expected {expected}"),
+            ),
+            WorktreeError::BranchOwnershipConflict { branch, path } => EffectError::custom(
+                "worktree.branch_ownership_conflict",
+                format!("branch {branch} is already owned by worktree {path}"),
+            ),
         }
     }
+}
+
+/// A live git worktree that has been verified as owned by this repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedWorktree {
+    /// Canonical path of the registered worktree.
+    pub path: PathBuf,
+    /// Branch the worktree is checked out on.
+    pub branch: String,
 }
 
 /// Service for git worktree operations via git CLI.
@@ -272,6 +324,100 @@ impl GitWorktreeService {
             });
         }
         Ok(worktrees)
+    }
+
+    /// Drop stale worktree registrations whose directories no longer exist.
+    pub fn prune_worktrees(&self) -> Result<(), WorktreeError> {
+        let output = self.git_output(&self.project_dir, &["worktree", "prune"])?;
+        if !output.status.success() {
+            return Err(WorktreeError::GitError {
+                message: format!(
+                    "git worktree prune failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn common_git_dir(&self, path: &Path) -> Result<PathBuf, WorktreeError> {
+        let raw = self.git_path(path, &["rev-parse", "--git-common-dir"])?;
+        let candidate = Path::new(&raw);
+        let absolute = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            path.join(candidate)
+        };
+        self.canonical_path(&absolute, "git common directory")
+    }
+
+    /// Authoritatively verify an existing leaf path before it is reused.
+    ///
+    /// A directory must never be reused merely because it exists. It has to be
+    /// a live, registered git worktree of this repository, checked out on the
+    /// deterministic birth branch, and not competing with another registered
+    /// worktree for that branch. Every failure carries a stable machine code
+    /// through [`WorktreeError`] so callers can classify recovery.
+    pub fn verify_existing_worktree(
+        &self,
+        path: &Path,
+        expected_branch: &BranchName,
+    ) -> Result<VerifiedWorktree, WorktreeError> {
+        self.prune_worktrees()?;
+        let canonical = self.canonical_path(path, "existing leaf worktree")?;
+        let worktrees = self.list_worktrees()?;
+
+        let registered = worktrees.iter().find(|worktree| {
+            std::fs::canonicalize(&worktree.path)
+                .map(|candidate| candidate == canonical)
+                .unwrap_or(false)
+        });
+        let Some(registered) = registered else {
+            return Err(WorktreeError::PathUnregistered {
+                path: canonical.display().to_string(),
+            });
+        };
+
+        let project_common = self.common_git_dir(&self.project_dir)?;
+        let worktree_common = self.common_git_dir(&canonical)?;
+        if project_common != worktree_common {
+            return Err(WorktreeError::RepositoryMismatch {
+                path: canonical.display().to_string(),
+                expected: project_common.display().to_string(),
+                actual: worktree_common.display().to_string(),
+            });
+        }
+
+        let actual_branch = match registered.branch.clone() {
+            Some(branch) => branch,
+            None => self.get_workspace_bookmark(&canonical)?.unwrap_or_default(),
+        };
+        if actual_branch != expected_branch.as_str() {
+            return Err(WorktreeError::BranchMismatch {
+                path: canonical.display().to_string(),
+                expected: expected_branch.to_string(),
+                actual: actual_branch,
+            });
+        }
+
+        for worktree in &worktrees {
+            if worktree.branch.as_deref() != Some(expected_branch.as_str()) {
+                continue;
+            }
+            if let Ok(candidate) = std::fs::canonicalize(&worktree.path) {
+                if candidate != canonical {
+                    return Err(WorktreeError::BranchOwnershipConflict {
+                        branch: expected_branch.to_string(),
+                        path: candidate.display().to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(VerifiedWorktree {
+            path: canonical,
+            branch: actual_branch,
+        })
     }
 
     fn migrate_worktree_identities(
@@ -989,6 +1135,91 @@ mod tests {
 
         assert!(worktree_path.exists());
         assert!(worktree_path.join(".git").exists());
+    }
+
+    #[test]
+    fn verify_existing_worktree_accepts_registered_birth_branch() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let worktree_path = temp.path().join("verified-leaf");
+        let branch = BranchName::try_from_str(format!("{default_branch}.leaf").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(&worktree_path, &branch, &base)
+            .unwrap();
+
+        let verified = service
+            .verify_existing_worktree(&worktree_path, &branch)
+            .expect("registered birth-branch worktree must verify");
+
+        assert_eq!(verified.branch, branch.as_str());
+        assert!(verified.path.join(".git").exists());
+    }
+
+    #[test]
+    fn verify_existing_worktree_rejects_unregistered_residue_directory() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let branch = BranchName::try_from_str(format!("{default_branch}.leaf").as_str())
+            .expect("validated string input is non-empty");
+        let residue = temp.path().join("sink-created-residue");
+        std::fs::create_dir_all(&residue).unwrap();
+
+        let error = service
+            .verify_existing_worktree(&residue, &branch)
+            .expect_err("an unregistered directory must never be reused");
+
+        assert!(matches!(error, WorktreeError::PathUnregistered { .. }));
+        assert!(EffectError::from(error)
+            .to_string()
+            .contains("worktree.path_unregistered"));
+    }
+
+    #[test]
+    fn verify_existing_worktree_rejects_wrong_branch() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let worktree_path = temp.path().join("wrong-branch-leaf");
+        let actual = BranchName::try_from_str(format!("{default_branch}.actual").as_str())
+            .expect("validated string input is non-empty");
+        let expected = BranchName::try_from_str(format!("{default_branch}.expected").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(&worktree_path, &actual, &base)
+            .unwrap();
+
+        let error = service
+            .verify_existing_worktree(&worktree_path, &expected)
+            .expect_err("a worktree on the wrong branch must fail closed");
+
+        assert!(matches!(error, WorktreeError::BranchMismatch { .. }));
+        assert!(EffectError::from(error)
+            .to_string()
+            .contains("worktree.branch_mismatch"));
+    }
+
+    #[test]
+    fn ownership_failure_codes_are_stable_machine_codes() {
+        let repository = WorktreeError::RepositoryMismatch {
+            path: "/tmp/leaf".to_string(),
+            expected: "/repo/.git".to_string(),
+            actual: "/other/.git".to_string(),
+        };
+        assert!(EffectError::from(repository)
+            .to_string()
+            .contains("worktree.repository_mismatch"));
+
+        let conflict = WorktreeError::BranchOwnershipConflict {
+            branch: "main.leaf".to_string(),
+            path: "/tmp/other-leaf".to_string(),
+        };
+        assert!(EffectError::from(conflict)
+            .to_string()
+            .contains("worktree.branch_ownership_conflict"));
     }
 
     #[test]

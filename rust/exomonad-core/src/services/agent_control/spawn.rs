@@ -1758,23 +1758,26 @@ impl<
                         worktree_path.display()
                     ));
                 }
-                if options.start_point.is_some() {
-                    let actual_branch = self
-                        .git_wt()
-                        .get_workspace_bookmark(&worktree_path)
-                        .context("failed to inspect existing replacement worktree")?;
-                    if actual_branch.as_deref() != Some(branch_name.as_str()) {
-                        return Err(anyhow!(
-                            "Existing replacement worktree is on {:?}, expected {}",
-                            actual_branch,
-                            branch_name
-                        ));
+                // Never reuse a directory merely because it exists. It must be a
+                // live registered git worktree of this repository on the
+                // deterministic birth branch, regardless of whether a start
+                // point was supplied.
+                self.git_wt()
+                    .verify_existing_worktree(&worktree_path, &branch_name)
+                    .map_err(|error| anyhow!(EffectError::from(error)))
+                    .context(
+                        "refusing to reuse an existing leaf worktree without verified Git ownership",
+                    )?;
+                if options.expected_agent_name.is_some() {
+                    if let Some(expected_sha) = options.start_point.as_deref() {
+                        verify_branch_head(effective_project_dir, &branch_name, expected_sha)
+                            .await?;
                     }
                 }
                 info!(
                     worktree_path = %worktree_path.display(),
                     branch_name = %branch_name,
-                    "Reusing existing leaf worktree"
+                    "Reusing verified existing leaf worktree"
                 );
             } else {
                 ensure_branch_fetched(effective_project_dir, &branch_name).await;
