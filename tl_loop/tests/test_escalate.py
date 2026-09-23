@@ -223,7 +223,16 @@ def test_create_issue_reuses_run_scoped_issue_with_provenance(tmp_path: Path) ->
     )
     _write_intent(
         intent_path,
-        {"title": title, "state": "requested", "pr_number": None, "head_sha": None},
+        {
+            "run_id": store.run_id,
+            "slice_id": "root",
+            "attempt": 1,
+            "cause": ParkCause.REVIEW_STUCK.value,
+            "title": title,
+            "state": "requested",
+            "pr_number": None,
+            "head_sha": None,
+        },
     )
 
     second = _create_issue(
@@ -271,9 +280,24 @@ def test_create_issue_fails_closed_when_lookup_is_unavailable(tmp_path: Path) ->
 
 def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path) -> None:
     slice_id = "issue-811-substitution-model-architecture"
-    record = _record(slice_id)
-    record["attempts"] = 1
-    create("escalate-test", {"slices": {slice_id: record}}, root_dir=tmp_path)
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=1,
+        pr_number=44,
+        publication=PublicationBinding(
+            pr_number=44,
+            head_sha="25ec8d08ca984b56497518dd05a572a116d1f883",
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
+    create(
+        "escalate-test",
+        {"slices": {slice_id: _record(slice_id, caller=target)}},
+        root_dir=tmp_path,
+    )
     store = RunStore("escalate-test", root_dir=tmp_path)
     bind_legacy_escalation(
         store,
@@ -310,19 +334,6 @@ def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path
             del labels, milestone, priority, status
             return _tool_result({"issues": []})
 
-    target = replace(
-        _slice(),
-        id=slice_id,
-        attempts=1,
-        pr_number=44,
-        publication=PublicationBinding(
-            pr_number=44,
-            head_sha="25ec8d08ca984b56497518dd05a572a116d1f883",
-            head_branch="main.stage.issue",
-            base_branch="main.stage",
-            attempt=1,
-        ),
-    )
     result = park(
         target,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
@@ -337,9 +348,24 @@ def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path
 
 def test_legacy_binding_requires_matching_publication(tmp_path: Path) -> None:
     slice_id = "issue-811-substitution-model-architecture"
-    record = _record(slice_id)
-    record["attempts"] = 1
-    create("escalate-test", {"slices": {slice_id: record}}, root_dir=tmp_path)
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=1,
+        pr_number=45,
+        publication=PublicationBinding(
+            pr_number=45,
+            head_sha="25ec8d08ca984b56497518dd05a572a116d1f883",
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
+    create(
+        "escalate-test",
+        {"slices": {slice_id: _record(slice_id, caller=target)}},
+        root_dir=tmp_path,
+    )
     store = RunStore("escalate-test", root_dir=tmp_path)
     # Bound to PR #44; this slice is PR #45, so the binding must not apply.
     bind_legacy_escalation(
@@ -377,19 +403,6 @@ def test_legacy_binding_requires_matching_publication(tmp_path: Path) -> None:
             del labels, milestone, priority, status
             return _tool_result({"issues": []})
 
-    target = replace(
-        _slice(),
-        id=slice_id,
-        attempts=1,
-        pr_number=45,
-        publication=PublicationBinding(
-            pr_number=45,
-            head_sha="25ec8d08ca984b56497518dd05a572a116d1f883",
-            head_branch="main.stage.issue",
-            base_branch="main.stage",
-            attempt=1,
-        ),
-    )
     result = park(
         target,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
@@ -428,9 +441,24 @@ class _NoopIssueCreator:
 def test_legacy_binding_is_scoped_to_attempt(tmp_path: Path) -> None:
     slice_id = "issue-811-substitution-model-architecture"
     head_sha = "25ec8d08ca984b56497518dd05a572a116d1f883"
-    record = _record(slice_id)
-    record["attempts"] = 2
-    create("escalate-test", {"slices": {slice_id: record}}, root_dir=tmp_path)
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=2,
+        pr_number=44,
+        publication=PublicationBinding(
+            pr_number=44,
+            head_sha=head_sha,
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=2,
+        ),
+    )
+    create(
+        "escalate-test",
+        {"slices": {slice_id: _record(slice_id, caller=target)}},
+        root_dir=tmp_path,
+    )
     store = RunStore("escalate-test", root_dir=tmp_path)
     # Binding is for attempt 1; this park is attempt 2.
     bind_legacy_escalation(
@@ -468,19 +496,6 @@ def test_legacy_binding_is_scoped_to_attempt(tmp_path: Path) -> None:
             del labels, milestone, priority, status
             return _tool_result({"issues": []})
 
-    target = replace(
-        _slice(),
-        id=slice_id,
-        attempts=2,
-        pr_number=44,
-        publication=PublicationBinding(
-            pr_number=44,
-            head_sha=head_sha,
-            head_branch="main.stage.issue",
-            base_branch="main.stage",
-            attempt=2,
-        ),
-    )
     result = park(
         target,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
@@ -499,12 +514,23 @@ def test_park_fails_closed_on_unverified_recorded_issue(tmp_path: Path) -> None:
 
     slice_id = "issue-811-substitution-model-architecture"
     head_sha = "25ec8d08ca984b56497518dd05a572a116d1f883"
-    record = _record(slice_id)
-    record["attempts"] = 1
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=1,
+        pr_number=44,
+        publication=PublicationBinding(
+            pr_number=44,
+            head_sha=head_sha,
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
     create(
         "escalate-test",
         {
-            "slices": {slice_id: record},
+            "slices": {slice_id: _record(slice_id, caller=target)},
             "fsm": RecursiveTLFailed(
                 "chainlink issue result has no positive issue ID: {'cicoIssueId': 816}",
                 ("root",),
@@ -522,19 +548,6 @@ def test_park_fails_closed_on_unverified_recorded_issue(tmp_path: Path) -> None:
             del kwargs
             return _tool_result({"issues": []})
 
-    target = replace(
-        _slice(),
-        id=slice_id,
-        attempts=1,
-        pr_number=44,
-        publication=PublicationBinding(
-            pr_number=44,
-            head_sha=head_sha,
-            head_branch="main.stage.issue",
-            base_branch="main.stage",
-            attempt=1,
-        ),
-    )
     with pytest.raises(EscalationError, match="cannot be proven"):
         park(
             target,
@@ -550,12 +563,25 @@ def test_park_fails_closed_on_recorded_issue_from_other_publication(
     from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 
     slice_id = "issue-811-substitution-model-architecture"
-    record = _record(slice_id)
-    record["attempts"] = 1
+    # The recorded issue predates this attempt; the current publication is a
+    # different PR and head, so it must not be adopted.
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=1,
+        pr_number=45,
+        publication=PublicationBinding(
+            pr_number=45,
+            head_sha="different-head-sha",
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
     create(
         "escalate-test",
         {
-            "slices": {slice_id: record},
+            "slices": {slice_id: _record(slice_id, caller=target)},
             "fsm": RecursiveTLFailed(
                 "chainlink issue result has no positive issue ID: {'cicoIssueId': 816}",
                 ("root",),
@@ -573,21 +599,6 @@ def test_park_fails_closed_on_recorded_issue_from_other_publication(
             del kwargs
             return _tool_result({"issues": []})
 
-    # The recorded issue predates this attempt; the current publication is a
-    # different PR and head, so it must not be adopted.
-    target = replace(
-        _slice(),
-        id=slice_id,
-        attempts=1,
-        pr_number=45,
-        publication=PublicationBinding(
-            pr_number=45,
-            head_sha="different-head-sha",
-            head_branch="main.stage.issue",
-            base_branch="main.stage",
-            attempt=1,
-        ),
-    )
     with pytest.raises(EscalationError, match="cannot be proven"):
         park(
             target,
@@ -595,6 +606,93 @@ def test_park_fails_closed_on_recorded_issue_from_other_publication(
             store=store,
             issue_creator=Creator(),
         )
+
+
+def test_create_issue_fails_closed_when_intent_lacks_provenance_keys(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    token = _run_token(store)
+    title = (
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
+    )
+    intent_path = _escalation_intent_path(
+        store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
+    )
+    intent_path.parent.mkdir(parents=True, exist_ok=True)
+    # Identity is present but provenance keys are entirely absent.
+    _write_intent(
+        intent_path,
+        {
+            "run_id": store.run_id,
+            "slice_id": "root",
+            "attempt": 1,
+            "cause": ParkCause.REVIEW_STUCK.value,
+            "issue_id": 900,
+            "title": title,
+            "state": "created",
+        },
+    )
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("missing provenance must fail closed")
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            return _tool_result({"issues": []})
+
+    with pytest.raises(EscalationError, match="does not match the current publication"):
+        _create_issue(
+            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+        )
+
+
+def test_park_refuses_stale_caller_slice(tmp_path: Path) -> None:
+    persisted = replace(
+        _slice(),
+        attempts=1,
+        pr_number=45,
+        publication=PublicationBinding(
+            pr_number=45,
+            head_sha="newer-head",
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
+    create(
+        "escalate-test",
+        {"slices": {"root": _record("root", caller=persisted)}},
+        root_dir=tmp_path,
+    )
+    store = RunStore("escalate-test", root_dir=tmp_path)
+    stale = replace(
+        _slice(),
+        attempts=1,
+        pr_number=44,
+        publication=PublicationBinding(
+            pr_number=44,
+            head_sha="older-head",
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
+
+    with pytest.raises(EscalationError, match="stale or inconsistent"):
+        park(stale, ParkCause.REVIEW_STUCK, store=store, issue_creator=_NoopIssueCreator())
+
+
+def test_intent_paths_do_not_collide_for_lookalike_slice_ids(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    key_slash = _escalation_key(store.run_id, "a/b", 1, ParkCause.REVIEW_STUCK)
+    key_underscore = _escalation_key(store.run_id, "a_b", 1, ParkCause.REVIEW_STUCK)
+
+    assert key_slash != key_underscore
+    assert _escalation_intent_path(store, key_slash) != _escalation_intent_path(
+        store, key_underscore
+    )
 
 
 def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
@@ -652,6 +750,10 @@ def test_create_issue_fails_closed_on_intent_provenance_mismatch(tmp_path: Path)
     _write_intent(
         intent_path,
         {
+            "run_id": store.run_id,
+            "slice_id": "root",
+            "attempt": 1,
+            "cause": ParkCause.REVIEW_STUCK.value,
             "issue_id": 900,
             "title": title,
             "state": "created",
@@ -893,7 +995,7 @@ def _store(tmp_path: Path) -> RunStore:
         "escalate-test",
         {
             "slices": {
-                "root": _record("root"),
+                "root": _record("root", caller=_slice()),
                 "child": _record("child", depends_on=["root"]),
                 "grandchild": _record("grandchild", depends_on=["child"]),
             }
@@ -922,8 +1024,13 @@ def _slice() -> SliceState:
     )
 
 
-def _record(slice_id: str, *, depends_on: list[str] | None = None) -> dict[str, object]:
-    return {
+def _record(
+    slice_id: str,
+    *,
+    depends_on: list[str] | None = None,
+    caller: SliceState | None = None,
+) -> dict[str, object]:
+    record: dict[str, object] = {
         "id": slice_id,
         "status": "pending",
         "paths": [f"src/{slice_id}.py"],
@@ -939,6 +1046,20 @@ def _record(slice_id: str, *, depends_on: list[str] | None = None) -> dict[str, 
         "attempts": 0,
         "verdict": None,
     }
+    if caller is not None:
+        record["attempts"] = caller.attempts
+        record["pr_number"] = caller.pr_number
+        publication = getattr(caller, "publication", None)
+        if publication is not None:
+            record["publication"] = {
+                "pr_number": publication.pr_number,
+                "head_sha": publication.head_sha,
+                "head_branch": publication.head_branch,
+                "base_branch": publication.base_branch,
+                "attempt": publication.attempt,
+                "invocation_id": publication.invocation_id,
+            }
+    return record
 
 
 class RecordingCreator:

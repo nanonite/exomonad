@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -127,6 +128,27 @@ class HarnessSwitchDecision:
     audit: Mapping[str, object]
 
 
+def _slice_publication_head(slice: SliceState) -> str | None:
+    publication = getattr(slice, "publication", None)
+    return getattr(publication, "head_sha", None) if publication is not None else None
+
+
+def _assert_caller_slice_current(persisted: SliceState, caller: SliceState) -> None:
+    """Refuse a caller slice that has advanced past, or diverged from, the checkpoint."""
+    if (
+        persisted.attempts != caller.attempts
+        or persisted.pr_number != caller.pr_number
+        or _slice_publication_head(persisted) != _slice_publication_head(caller)
+    ):
+        raise EscalationError(
+            f"caller slice {caller.id!r} (attempt {caller.attempts}, PR {caller.pr_number}, "
+            f"head {_slice_publication_head(caller)!r}) is stale or inconsistent with the "
+            f"persisted checkpoint (attempt {persisted.attempts}, PR {persisted.pr_number}, "
+            f"head {_slice_publication_head(persisted)!r}); reload the run state before "
+            "escalating"
+        )
+
+
 def park(
     slice: SliceState,
     cause: ParkCause | str,
@@ -156,6 +178,9 @@ def park(
     gate_created = False
     current_state = store.load()
     current_slice = current_state.slices.get(slice.id)
+    if not isinstance(current_slice, SliceState):
+        raise EscalationError(f"slice {slice.id!r} is missing from run state")
+    _assert_caller_slice_current(current_slice, slice)
     raw_attempt = (audit or {}).get("attempt", slice.attempts)
     attempt = (
         raw_attempt
@@ -506,12 +531,34 @@ def _attempt_scoped_title(slice_id: str, cause: ParkCause, attempt: int) -> str:
     return f"{_legacy_escalation_title(slice_id, cause)} (attempt {attempt})"
 
 
+def _escalation_identity(
+    run_id: str, slice_id: str, attempt: int, cause: ParkCause
+) -> dict[str, object]:
+    """The full durable identity of one slice escalation."""
+    return {
+        "run_id": run_id,
+        "slice_id": slice_id,
+        "attempt": attempt,
+        "cause": cause.value,
+    }
+
+
 def _escalation_key(run_id: str, slice_id: str, attempt: int, cause: ParkCause) -> str:
-    """Stable per-run, per-attempt identity for one slice escalation."""
-    return f"task-escalation:{run_id}:{slice_id}:{attempt}:{cause.value}"
+    """Canonical per-run, per-attempt identity for one slice escalation."""
+    return dumps_json(_escalation_identity(run_id, slice_id, attempt, cause), sort_keys=True)
+
+
+def _intent_digest(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 def _escalation_intent_path(store: RunStore, key: str) -> Path:
+    """Collision-resistant intent path hashed from the full canonical identity."""
+    return Path(store.run_dir) / "escalations" / f"intent-{_intent_digest(key)}.json"
+
+
+def _legacy_escalation_intent_path(store: RunStore, key: str) -> Path:
+    """Pre-digest intent path used before the identity hash (for migration)."""
     safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in key)
     return Path(store.run_dir) / "escalations" / f"{safe}.json"
 
@@ -793,16 +840,45 @@ def _find_run_scoped_issue(creator: object, title: str) -> int | None:
     return None
 
 
+def _intent_identity_matches(
+    intent: Mapping[str, object],
+    run_id: str,
+    slice_id: str,
+    attempt: int,
+    cause: ParkCause,
+) -> bool:
+    """Whether a stored intent carries this exact full identity.
+
+    Missing keys never match; only a fully recorded identity is accepted.
+    """
+    return _escalation_identity(run_id, slice_id, attempt, cause) == {
+        "run_id": intent.get("run_id"),
+        "slice_id": intent.get("slice_id"),
+        "attempt": intent.get("attempt"),
+        "cause": intent.get("cause"),
+    }
+
+
 def _intent_provenance_matches(
     intent: Mapping[str, object], pr_number: int | None, head_sha: str | None
 ) -> bool:
-    """Whether a pre-failure intent recorded the current publication identity."""
+    """Whether a pre-failure intent recorded the current publication identity.
+
+    The provenance keys must be present; an absent key is not explicit null
+    provenance, so it fails closed.
+    """
+    if "pr_number" not in intent or "head_sha" not in intent:
+        return False
     return intent.get("pr_number") == pr_number and intent.get("head_sha") == head_sha
 
 
 def _write_escalation_intent(
     path: Path | None,
     *,
+    run_id: str,
+    slice_id: str,
+    attempt: int,
+    cause: ParkCause,
     title: str,
     pr_number: int | None,
     head_sha: str | None,
@@ -812,6 +888,10 @@ def _write_escalation_intent(
     if path is None:
         return
     document: dict[str, object] = {
+        "run_id": run_id,
+        "slice_id": slice_id,
+        "attempt": attempt,
+        "cause": cause.value,
         "title": title,
         "state": state,
         "pr_number": pr_number,
@@ -836,31 +916,36 @@ def _create_issue(
 ) -> int:
     base_title = _attempt_scoped_title(slice.id, cause, attempt)
     if store is not None:
+        run_id = store.run_id
         title = f"{base_title} [run {_run_token(store)}]"
-        key = _escalation_key(store.run_id, slice.id, attempt, cause)
+        key = _escalation_key(run_id, slice.id, attempt, cause)
         with _escalation_intent_lock(store, key) as intent_path:
             return _create_issue_locked(
                 creator,
                 slice,
                 cause,
                 audit,
+                run_id,
                 title,
                 attempt,
                 pr_number,
                 head_sha,
                 legacy_binding_id,
                 intent_path,
+                _legacy_escalation_intent_path(store, key),
             )
     return _create_issue_locked(
         creator,
         slice,
         cause,
         audit,
+        "",
         base_title,
         attempt,
         pr_number,
         head_sha,
         legacy_binding_id,
+        None,
         None,
     )
 
@@ -870,15 +955,40 @@ def _create_issue_locked(
     slice: SliceState,
     cause: ParkCause,
     audit: Mapping[str, object],
+    run_id: str,
     title: str,
     attempt: int,
     pr_number: int | None,
     head_sha: str | None,
     legacy_binding_id: int | None,
     intent_path: Path | None,
+    legacy_intent_path: Path | None,
 ) -> int:
     intent = _read_intent(intent_path) if intent_path is not None else None
+    if intent is None and legacy_intent_path is not None:
+        legacy = _read_intent(legacy_intent_path)
+        if legacy is not None:
+            # Migrate a pre-digest intent only when its full identity and
+            # provenance are proven; otherwise fail closed rather than risk a
+            # duplicate.
+            if _intent_identity_matches(
+                legacy, run_id, slice.id, attempt, cause
+            ) and _intent_provenance_matches(legacy, pr_number, head_sha):
+                _write_intent(intent_path, legacy)
+                intent = legacy
+            else:
+                raise EscalationError(
+                    f"existing escalation intent at {legacy_intent_path} cannot be proven to "
+                    f"belong to run {run_id!r} slice {slice.id!r} attempt {attempt} for "
+                    f"PR {pr_number} head {head_sha!r}; refusing to create a possible "
+                    "duplicate. Verify the recorded issue and rebind it explicitly."
+                )
     if intent is not None:
+        if not _intent_identity_matches(intent, run_id, slice.id, attempt, cause):
+            raise EscalationError(
+                f"escalation intent at {intent_path} does not match run {run_id!r} slice "
+                f"{slice.id!r} attempt {attempt} cause {cause.value!r}; refusing to reuse it"
+            )
         recorded = _issue_id(intent)
         if recorded is not None:
             # A durable pre-failure record is authoritative only when it also
@@ -894,6 +1004,10 @@ def _create_issue_locked(
     if legacy_binding_id is not None:
         _write_escalation_intent(
             intent_path,
+            run_id=run_id,
+            slice_id=slice.id,
+            attempt=attempt,
+            cause=cause,
             title=title,
             pr_number=pr_number,
             head_sha=head_sha,
@@ -911,6 +1025,10 @@ def _create_issue_locked(
             ):
                 _write_escalation_intent(
                     intent_path,
+                    run_id=run_id,
+                    slice_id=slice.id,
+                    attempt=attempt,
+                    cause=cause,
                     title=title,
                     pr_number=pr_number,
                     head_sha=head_sha,
@@ -925,6 +1043,10 @@ def _create_issue_locked(
             )
     _write_escalation_intent(
         intent_path,
+        run_id=run_id,
+        slice_id=slice.id,
+        attempt=attempt,
+        cause=cause,
         title=title,
         pr_number=pr_number,
         head_sha=head_sha,
@@ -958,6 +1080,10 @@ def _create_issue_locked(
         raise IssueCreationError(f"chainlink issue result has no positive issue ID: {value!r}")
     _write_escalation_intent(
         intent_path,
+        run_id=run_id,
+        slice_id=slice.id,
+        attempt=attempt,
+        cause=cause,
         title=title,
         pr_number=pr_number,
         head_sha=head_sha,
