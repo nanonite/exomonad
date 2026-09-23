@@ -5,7 +5,7 @@ from __future__ import annotations
 import fcntl
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -77,7 +77,7 @@ def test_each_cause_creates_issue_and_blocks_transitive_dependents(
         _slice(),
         cause,
         store=store,
-        issue_creator=create_issue,
+        issue_creator=_ListingCallable(create_issue),
         ledger=BudgetLedger(tokens=42, wall_seconds=3),
     )
 
@@ -123,14 +123,14 @@ def test_externally_blocked_parking_is_gate_and_issue_idempotent(tmp_path: Path)
         _slice(),
         ParkCause.BASE_CI_UNSTABLE,
         store=store,
-        issue_creator=create_issue,
+        issue_creator=_ListingCallable(create_issue),
         audit={"attempt": 2, "recovery_action": "repair base CI", "needs_human": True},
     )
     second = park(
         _slice(),
         ParkCause.BASE_CI_UNSTABLE,
         store=store,
-        issue_creator=create_issue,
+        issue_creator=_ListingCallable(create_issue),
         audit={"attempt": 2, "recovery_action": "repair base CI", "needs_human": True},
     )
 
@@ -280,6 +280,66 @@ def test_create_issue_fails_closed_when_lookup_is_unavailable(tmp_path: Path) ->
         _create_issue(
             BrokenLookupCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
         )
+
+
+def test_create_only_creator_cannot_start_durable_escalation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    created: list[str] = []
+
+    def create_only(title: str, description: str) -> int:
+        del description
+        created.append(title)
+        return 900
+
+    with pytest.raises(IssueLookupUnavailable, match="chainlink_issue_list"):
+        park(_slice(), ParkCause.REVIEW_STUCK, store=store, issue_creator=create_only)
+
+    assert created == []
+    assert store.load().slices["root"].status is SliceStatus.PENDING
+
+
+def test_create_only_creator_cannot_retry_requested_intent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    creator = RecordingCreator()
+    assert _create_issue(
+        creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+    ) == 701
+    title = (
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} "
+        f"(attempt 1) [run {_run_token(store)}]"
+    )
+    intent_path = _escalation_intent_path(
+        store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
+    )
+    _write_intent(
+        intent_path,
+        {
+            "run_id": store.run_id,
+            "slice_id": "root",
+            "attempt": 1,
+            "cause": ParkCause.REVIEW_STUCK.value,
+            "title": title,
+            "state": "requested",
+            "pr_number": None,
+            "head_sha": None,
+        },
+    )
+    created: list[str] = []
+
+    def create_only(title: str, description: str) -> int:
+        del description
+        created.append(title)
+        return 901
+
+    with pytest.raises(IssueLookupUnavailable, match="chainlink_issue_list"):
+        _create_issue(
+            create_only, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+        )
+
+    assert created == []
+    assert _create_issue(
+        creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+    ) == 701
 
 
 def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path) -> None:
@@ -1215,7 +1275,12 @@ def test_failed_issue_creation_does_not_mutate_state(tmp_path: Path) -> None:
     store = _store(tmp_path)
 
     with pytest.raises(IssueCreationError, match="positive issue ID"):
-        park(_slice(), ParkCause.RETRIES_EXHAUSTED, store=store, issue_creator=lambda *_: 0)
+        park(
+            _slice(),
+            ParkCause.RETRIES_EXHAUSTED,
+            store=store,
+            issue_creator=_ListingCallable(lambda *_: 0),
+        )
 
     assert store.load().slices["root"].status is SliceStatus.PENDING
 
@@ -1374,6 +1439,7 @@ class RecordingCreator:
 
     labels: tuple[str, ...] | None = None
     priority: str | None = None
+    title: str | None = None
 
     def chainlink_issue_create(
         self,
@@ -1383,10 +1449,30 @@ class RecordingCreator:
         labels: Sequence[str] | None = None,
         priority: str | None = None,
     ) -> ToolResult:
-        del title, description
+        del description
+        self.title = title
         self.labels = tuple(labels) if labels is not None else None
         self.priority = priority
         return _tool_result({"issue_id": 701})
+
+    def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+        assert kwargs["status"] == "all"
+        issues = [{"issue_id": 701, "title": self.title}] if self.title else []
+        return _tool_result({"issues": issues})
+
+
+class _ListingCallable:
+    """Test callable that can reconcile issues after an uncertain create."""
+
+    def __init__(self, create_issue: Callable[[str, str], int]) -> None:
+        self.create_issue = create_issue
+
+    def __call__(self, title: str, description: str) -> int:
+        return self.create_issue(title, description)
+
+    def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+        assert kwargs["status"] == "all"
+        return _tool_result({"issues": []})
 
 
 class ParkingTransport:

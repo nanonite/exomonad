@@ -233,6 +233,13 @@ class FakeClient:
             error=None,
         )
 
+    def chainlink_issue_list(
+        self, *, labels: tuple[str, ...], status: str
+    ) -> ToolResult:
+        assert labels == ("needs-human",)
+        assert status == "all"
+        return ToolResult(raw={"success": True}, success=True, result={"issues": []}, error=None)
+
     def chainlink_issue_close(
         self,
         *,

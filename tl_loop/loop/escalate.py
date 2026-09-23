@@ -92,7 +92,7 @@ def blocked_gate_name(run_id: str, slice_id: str, attempt: int, cause: str) -> s
 
 
 class IssueCreator(Protocol):
-    """The effect capability required to create a needs-human issue."""
+    """Effect capabilities required for durable needs-human issue creation."""
 
     def chainlink_issue_create(
         self,
@@ -103,6 +103,11 @@ class IssueCreator(Protocol):
         priority: str | None = None,
     ) -> ToolResult:
         """Create one issue through the effect boundary."""
+
+    def chainlink_issue_list(
+        self, *, labels: Sequence[str], status: str
+    ) -> ToolResult:
+        """List open and closed issues for retry reconciliation."""
 
 
 @dataclass(frozen=True)
@@ -837,8 +842,11 @@ def _list_needs_human_issues(creator: object) -> list[object]:
     when the issue is closed by an operator before the retry.
     """
     list_issues = getattr(creator, "chainlink_issue_list", None)
-    if list_issues is None:
-        return []
+    if not callable(list_issues):
+        raise IssueLookupUnavailable(
+            "durable escalation requires chainlink_issue_list with status='all' "
+            "to reconcile an issue created before its ID was recorded"
+        )
     try:
         result = list_issues(labels=("needs-human",), status="all")
     except Exception as error:
