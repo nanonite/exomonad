@@ -435,17 +435,27 @@ impl GitWorktreeService {
             });
         }
 
-        let actual_branch = match registered.branch.clone() {
-            Some(branch) => branch,
-            None => self.get_workspace_bookmark(&canonical)?.unwrap_or_default(),
-        };
-        if actual_branch != expected_branch.as_str() {
+        // Resolve the branch from the candidate directory itself, never trust
+        // the registry entry alone: a stale registration can disagree with what
+        // the directory actually has checked out.
+        let resolved_branch = self.get_workspace_bookmark(&canonical)?.unwrap_or_default();
+        if let Some(registered_branch) = registered.branch.as_deref() {
+            if registered_branch != resolved_branch {
+                return Err(WorktreeError::BranchMismatch {
+                    path: canonical.display().to_string(),
+                    expected: resolved_branch.clone(),
+                    actual: registered_branch.to_string(),
+                });
+            }
+        }
+        if resolved_branch != expected_branch.as_str() {
             return Err(WorktreeError::BranchMismatch {
                 path: canonical.display().to_string(),
                 expected: expected_branch.to_string(),
-                actual: actual_branch,
+                actual: resolved_branch,
             });
         }
+        let actual_branch = resolved_branch;
 
         for worktree in &worktrees {
             if worktree.branch.as_deref() != Some(expected_branch.as_str()) {
@@ -1379,6 +1389,35 @@ mod tests {
         assert!(EffectError::from(error)
             .to_string()
             .contains("worktree.branch_mismatch"));
+    }
+
+    #[test]
+    fn verify_existing_worktree_checks_branch_resolved_from_candidate() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let worktree_path = temp.path().join("switched-leaf");
+        let first = BranchName::try_from_str(format!("{default_branch}.first").as_str())
+            .expect("validated string input is non-empty");
+        let second = BranchName::try_from_str(format!("{default_branch}.second").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(&worktree_path, &first, &base)
+            .unwrap();
+
+        // Switch the worktree to another branch.
+        run_git(&worktree_path, &["checkout", "-b", second.as_str()]);
+
+        let error = service
+            .verify_existing_worktree(&worktree_path, &first)
+            .expect_err("the verifier must reject the stale expected branch");
+        assert!(matches!(error, WorktreeError::BranchMismatch { .. }));
+
+        let verified = service
+            .verify_existing_worktree(&worktree_path, &second)
+            .expect("the verifier must accept the branch resolved from the candidate");
+        assert_eq!(verified.branch, second.as_str());
     }
 
     #[test]
