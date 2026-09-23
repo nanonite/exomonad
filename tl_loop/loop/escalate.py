@@ -186,11 +186,19 @@ def park(
     # issue or intent.
     attempt = current_slice.attempts if current_slice.attempts > 0 else 1
     audit_attempt = (audit or {}).get("attempt")
-    if audit_attempt is not None and audit_attempt != attempt:
-        raise EscalationError(
-            f"audit attempt {audit_attempt!r} does not match the persisted slice attempt "
-            f"{attempt} for slice {slice.id!r}; refusing to escalate"
-        )
+    if audit_attempt is not None:
+        # Only a real positive int is accepted; bool and float are rejected
+        # before any issue lookup or creation.
+        if type(audit_attempt) is not int or audit_attempt <= 0:
+            raise EscalationError(
+                f"audit attempt {audit_attempt!r} must be a positive integer for slice "
+                f"{slice.id!r}; refusing to escalate"
+            )
+        if audit_attempt != attempt:
+            raise EscalationError(
+                f"audit attempt {audit_attempt!r} does not match the persisted slice attempt "
+                f"{attempt} for slice {slice.id!r}; refusing to escalate"
+            )
     if parsed_cause in _BLOCKED_GATE_CAUSES:
         gate_name = blocked_gate_name(store.run_id, slice.id, attempt, parsed_cause.value)
         parked_audit = {**dict(parked_audit), "gate_name": gate_name, "attempt": attempt}
@@ -978,25 +986,52 @@ def _create_issue_locked(
     intent_path: Path | None,
     legacy_intent_path: Path | None,
 ) -> int:
-    intent = _read_intent(intent_path) if intent_path is not None else None
-    if intent is None and legacy_intent_path is not None:
-        legacy = _read_intent(legacy_intent_path)
-        if legacy is not None:
-            # Migrate a pre-digest intent only when its full identity and
-            # provenance are proven; otherwise fail closed rather than risk a
-            # duplicate.
-            if _intent_identity_matches(
-                legacy, run_id, slice.id, attempt, cause
-            ) and _intent_provenance_matches(legacy, pr_number, head_sha):
-                _write_intent(intent_path, legacy)
-                intent = legacy
-            else:
-                raise EscalationError(
-                    f"existing escalation intent at {legacy_intent_path} cannot be proven to "
-                    f"belong to run {run_id!r} slice {slice.id!r} attempt {attempt} for "
-                    f"PR {pr_number} head {head_sha!r}; refusing to create a possible "
-                    "duplicate. Verify the recorded issue and rebind it explicitly."
-                )
+    # Inspect both intent formats under the lock. A digest intent must never
+    # cause a pre-digest intent to be skipped, or the mixed-version upgrade
+    # state could duplicate an issue.
+    digest_intent = _read_intent(intent_path) if intent_path is not None else None
+    legacy_intent = (
+        _read_intent(legacy_intent_path) if legacy_intent_path is not None else None
+    )
+    intent = digest_intent
+    if legacy_intent is not None:
+        legacy_proven = _intent_identity_matches(
+            legacy_intent, run_id, slice.id, attempt, cause
+        ) and _intent_provenance_matches(legacy_intent, pr_number, head_sha)
+        if not legacy_proven:
+            raise EscalationError(
+                f"existing pre-upgrade escalation intent at {legacy_intent_path} cannot be "
+                f"proven to belong to run {run_id!r} slice {slice.id!r} attempt {attempt} "
+                f"for PR {pr_number} head {head_sha!r}; refusing to create a possible "
+                "duplicate. Verify the recorded issue and rebind it explicitly."
+            )
+        legacy_recorded = _issue_id(legacy_intent)
+        digest_recorded = _issue_id(digest_intent) if digest_intent is not None else None
+        if (
+            legacy_recorded is not None
+            and digest_recorded is not None
+            and legacy_recorded != digest_recorded
+        ):
+            raise EscalationError(
+                f"conflicting escalation intents at {legacy_intent_path} and {intent_path} "
+                f"record different issues ({legacy_recorded} vs {digest_recorded}); refusing "
+                "to reuse or create an issue"
+            )
+        if digest_intent is not None and not (
+            _intent_identity_matches(
+                digest_intent, run_id, slice.id, attempt, cause
+            )
+            and _intent_provenance_matches(digest_intent, pr_number, head_sha)
+        ):
+            raise EscalationError(
+                f"escalation intent at {intent_path} cannot be proven for run {run_id!r} "
+                f"slice {slice.id!r} attempt {attempt}; refusing to reuse or create an issue"
+            )
+        # Proven consistent: prefer the record that carries an issue id and
+        # migrate it into the digest path.
+        if legacy_recorded is not None or digest_intent is None:
+            _write_intent(intent_path, legacy_intent)
+            intent = legacy_intent
     if intent is not None:
         if not _intent_identity_matches(intent, run_id, slice.id, attempt, cause):
             raise EscalationError(

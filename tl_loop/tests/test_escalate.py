@@ -776,6 +776,115 @@ def test_intent_paths_do_not_collide_for_lookalike_slice_ids(tmp_path: Path) -> 
     )
 
 
+def test_mixed_version_intents_cannot_create_a_duplicate(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    token = _run_token(store)
+    title = (
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2) [run {token}]"
+    )
+    # Pre-389 intent records issue 900 but carries no identity/provenance.
+    legacy_path = _legacy_escalation_intent_path(
+        store, store.run_id, "root", 2, ParkCause.REVIEW_STUCK
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_intent(
+        legacy_path,
+        {
+            "title": title,
+            "state": "requested",
+            "pr_number": None,
+            "head_sha": None,
+            "issue_id": 900,
+        },
+    )
+    # The newer digest intent is only "requested" and records no issue id.
+    digest_path = _escalation_intent_path(
+        store, _escalation_key(store.run_id, "root", 2, ParkCause.REVIEW_STUCK)
+    )
+    _write_intent(
+        digest_path,
+        {
+            "run_id": store.run_id,
+            "slice_id": "root",
+            "attempt": 2,
+            "cause": ParkCause.REVIEW_STUCK.value,
+            "title": title,
+            "state": "requested",
+            "pr_number": None,
+            "head_sha": None,
+        },
+    )
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("a mixed-version state must never create issue 901")
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            # Remote lookup is empty: the old file alone must stop creation.
+            del kwargs
+            return _tool_result({"issues": []})
+
+    with pytest.raises(EscalationError, match="cannot be proven"):
+        _create_issue(
+            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store
+        )
+
+
+@pytest.mark.parametrize("bad_attempt", [True, 1.0, 1, 0, -1, "2"])
+def test_park_rejects_invalid_audit_attempt(tmp_path: Path, bad_attempt: object) -> None:
+    store = _store(tmp_path)
+
+    with pytest.raises(EscalationError):
+        park(
+            _slice(),
+            ParkCause.REVIEW_STUCK,
+            store=store,
+            issue_creator=_NoopIssueCreator(),
+            audit={"attempt": bad_attempt},
+        )
+
+
+def test_park_accepts_matching_integer_audit_attempt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 900})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            return _tool_result({"issues": []})
+
+    result = park(
+        _slice(),
+        ParkCause.REVIEW_STUCK,
+        store=store,
+        issue_creator=Creator(),
+        audit={"attempt": 2},
+    )
+
+    assert isinstance(result, ParkResult)
+    assert result.issue_id == 900
+    assert len(created) == 1
+
+
 def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
     store_a = _store(tmp_path / "a")
     store_b = _store(tmp_path / "b")
