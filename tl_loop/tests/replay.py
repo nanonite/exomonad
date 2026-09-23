@@ -66,6 +66,8 @@ class RecordingTransport:
                 "success": True,
                 "result": {"issue_id": self.issue_id},
             }
+        if tool_name == "chainlink_issue_list":
+            return {"success": True, "result": []}
         if tool_name == "chainlink_issue_close":
             issue_id = arguments.get("issue_id")
             return {

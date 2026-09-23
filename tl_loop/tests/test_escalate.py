@@ -282,6 +282,57 @@ def test_create_issue_fails_closed_when_lookup_is_unavailable(tmp_path: Path) ->
         )
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"issues": None},
+        [None],
+        [{"id": 0, "title": "unusable"}],
+        [{"id": 901}],
+        [{"id": 901, "title": ""}],
+        [{"id": 901, "title": "other"}, {}],
+    ],
+)
+def test_malformed_successful_issue_list_blocks_create(
+    tmp_path: Path, payload: object
+) -> None:
+    store = _store(tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            assert kwargs["status"] == "all"
+            return _tool_result(payload)
+
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            created.append(str(kwargs["title"]))
+            return _tool_result({"issue_id": 902})
+
+    with pytest.raises(IssueLookupUnavailable):
+        _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, store=store)
+
+    assert created == []
+
+
+def test_empty_issue_list_allows_create(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            assert kwargs["status"] == "all"
+            return _tool_result([])
+
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            created.append(str(kwargs["title"]))
+            return _tool_result({"issue_id": 902})
+
+    assert _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, store=store) == 902
+    assert len(created) == 1
+
+
 def test_create_only_creator_cannot_start_durable_escalation(tmp_path: Path) -> None:
     store = _store(tmp_path)
     created: list[str] = []
@@ -1242,9 +1293,12 @@ def test_park_reuses_durable_intent_for_non_gated_cause(tmp_path: Path) -> None:
             status: str | None = None,
         ) -> ToolResult:
             del labels, milestone, priority, status
-            return _tool_result(
-                {"issues": [{"issue_id": 555, "title": Creator.marker_title}]}
+            issues = (
+                [{"issue_id": 555, "title": Creator.marker_title}]
+                if Creator.marker_title is not None
+                else []
             )
+            return _tool_result({"issues": issues})
 
     creator = Creator()
     first = park(_slice(), ParkCause.REVIEW_STUCK, store=store, issue_creator=creator)
@@ -1493,6 +1547,8 @@ class ParkingTransport:
         self.calls.append((tool_name, arguments))
         if tool_name == "chainlink_issue_create":
             return {"success": True, "result": self.chainlink_result}
+        if tool_name == "chainlink_issue_list":
+            return {"success": True, "result": []}
         return {"success": True, "result": None}
 
 

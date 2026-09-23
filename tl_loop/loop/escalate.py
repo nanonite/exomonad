@@ -861,19 +861,22 @@ def _list_needs_human_issues(creator: object) -> list[object]:
             or "chainlink issue list failed; refusing to create a possible duplicate"
         )
     payload = result.result
-    if payload is None:
-        return []
     if isinstance(payload, list):
-        return list(payload)
-    if isinstance(payload, Mapping):
+        issues = payload
+    elif isinstance(payload, Mapping):
         raw = payload.get("issues")
-        if isinstance(raw, list):
-            return list(raw)
-        # An empty object is an unambiguous "no issues". Any other unrecognized
-        # shape is ambiguous and must stop creation.
-        if not payload:
-            return []
-    raise IssueLookupUnavailable(f"unrecognized issue list response: {payload!r}")
+        if not isinstance(raw, list):
+            raise IssueLookupUnavailable(f"unrecognized issue list response: {payload!r}")
+        issues = raw
+    else:
+        raise IssueLookupUnavailable(f"unrecognized issue list response: {payload!r}")
+    for issue in issues:
+        if not isinstance(issue, Mapping) or _issue_id(issue) is None:
+            raise IssueLookupUnavailable(f"malformed issue list entry: {issue!r}")
+        title = issue.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise IssueLookupUnavailable(f"malformed issue list entry: {issue!r}")
+    return list(issues)
 
 
 def _find_run_scoped_issue(creator: object, title: str) -> int | None:
@@ -881,10 +884,8 @@ def _find_run_scoped_issue(creator: object, title: str) -> int | None:
     wanted = title.strip()
     for issue in _list_needs_human_issues(creator):
         issue_id = _issue_id(issue)
-        if issue_id is None:
-            continue
-        issue_title = issue.get("title") if isinstance(issue, Mapping) else None
-        if isinstance(issue_title, str) and issue_title.strip() == wanted:
+        issue_title = issue.get("title")
+        if issue_title.strip() == wanted:
             return issue_id
     return None
 

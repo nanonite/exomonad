@@ -119,6 +119,8 @@ class HeartbeatTransport:
             )
         if tool_name == "chainlink_issue_create":
             return cast(JsonObject, {"success": True, "result": {"issue_id": 7042}})
+        if tool_name == "chainlink_issue_list":
+            return cast(JsonObject, {"success": True, "result": []})
         return cast(JsonObject, {"success": True, "result": {}})
 
 

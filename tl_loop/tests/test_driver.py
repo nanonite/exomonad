@@ -360,6 +360,8 @@ class RecordingTransport:
             }
         if tool_name == "merge_pr":
             return {"success": True, "result": {"merged": True}}
+        if tool_name == "chainlink_issue_list":
+            return {"success": True, "result": []}
         return {"success": True, "result": None}
 
 
