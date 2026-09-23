@@ -507,6 +507,17 @@ def test_park_autobinds_issue_recorded_in_recovery_reason(tmp_path: Path) -> Non
             del labels, milestone, priority, status
             return _tool_result({"issues": []})
 
+        def chainlink_issue_show(self, *, issue_id: int) -> ToolResult:
+            return _tool_result(
+                {
+                    "issue_id": issue_id,
+                    "title": (
+                        f"Escalate slice {slice_id}: "
+                        f"{ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
+                    ),
+                }
+            )
+
     target = replace(
         _slice(),
         id=slice_id,
@@ -541,6 +552,82 @@ def test_park_autobinds_issue_recorded_in_recovery_reason(tmp_path: Path) -> Non
         )
         == 816
     )
+
+
+def test_autobind_refuses_stale_reason_for_another_slice(tmp_path: Path) -> None:
+    from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
+
+    slice_id = "issue-811-substitution-model-architecture"
+    head_sha = "25ec8d08ca984b56497518dd05a572a116d1f883"
+    record = _record(slice_id)
+    record["attempts"] = 1
+    create(
+        "escalate-test",
+        {
+            "slices": {slice_id: record},
+            "fsm": RecursiveTLFailed(
+                "chainlink issue result has no positive issue ID: {'cicoIssueId': 816}",
+                ("root",),
+            ),
+        },
+        root_dir=tmp_path,
+    )
+    store = RunStore("escalate-test", root_dir=tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 999})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            return _tool_result({"issues": []})
+
+        def chainlink_issue_show(self, *, issue_id: int) -> ToolResult:
+            # The recorded issue belongs to a different slice; it must not bind.
+            return _tool_result(
+                {"issue_id": issue_id, "title": "Escalate slice other-slice: stall_detected"}
+            )
+
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=1,
+        pr_number=44,
+        publication=PublicationBinding(
+            pr_number=44,
+            head_sha=head_sha,
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
+    result = park(
+        target,
+        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        store=store,
+        issue_creator=Creator(),
+    )
+
+    assert isinstance(result, ParkResult)
+    assert result.issue_id == 999
+    assert len(created) == 1
 
 
 def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:

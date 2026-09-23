@@ -198,16 +198,23 @@ def park(
             # slice's publication) so the retry reuses it.
             recorded = _recorded_legacy_issue_id(store)
             if recorded is not None:
-                bind_legacy_escalation(
-                    store,
-                    slice_id=slice.id,
-                    cause=parsed_cause,
-                    attempt=attempt,
-                    issue_id=recorded,
-                    pr_number=slice.pr_number,
-                    head_sha=bound_head,
-                )
-                legacy_binding_id = recorded
+                expected_titles = {
+                    _attempt_scoped_title(slice.id, parsed_cause, attempt),
+                    _legacy_escalation_title(slice.id, parsed_cause),
+                }
+                # A stale failure reason must not bind an unrelated issue: the
+                # recorded issue has to identify this exact slice and cause.
+                if _recorded_issue_matches(issue_creator, recorded, expected_titles):
+                    bind_legacy_escalation(
+                        store,
+                        slice_id=slice.id,
+                        cause=parsed_cause,
+                        attempt=attempt,
+                        issue_id=recorded,
+                        pr_number=slice.pr_number,
+                        head_sha=bound_head,
+                    )
+                    legacy_binding_id = recorded
     issue_id = _create_issue(
         issue_creator,
         slice,
@@ -630,6 +637,31 @@ def _recorded_legacy_issue_id(store: RunStore) -> int | None:
     return value if value > 0 else None
 
 
+def _recorded_issue_matches(
+    creator: object, issue_id: int, expected_titles: set[str]
+) -> bool:
+    """Prove a recorded issue id belongs to this slice/cause before binding it.
+
+    Reads the issue through the effect boundary and requires its title to be one
+    of the escalation titles for the current slice and cause. A creator that
+    cannot show the issue, or a title that does not match, refuses to bind.
+    """
+    show = getattr(creator, "chainlink_issue_show", None)
+    if show is None:
+        return False
+    try:
+        result = show(issue_id=issue_id)
+    except Exception:  # noqa: BLE001
+        return False
+    if result.success is not True:
+        return False
+    payload = result.result
+    if not isinstance(payload, Mapping):
+        return False
+    title = payload.get("title")
+    return isinstance(title, str) and title.strip() in expected_titles
+
+
 _RUN_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
@@ -754,10 +786,9 @@ def _list_needs_human_issues(creator: object) -> list[object]:
         return []
     try:
         result = list_issues(labels=("needs-human",), status="all")
-    except TypeError:
-        # Creators that predate the status filter.
-        result = list_issues(labels=("needs-human",))
     except Exception as error:
+        # A creator that cannot filter by status would only see open issues,
+        # which could duplicate an issue closed before the retry. Fail closed.
         raise IssueLookupUnavailable(
             f"could not list existing needs-human issues: {error}"
         ) from error
