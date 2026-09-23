@@ -901,6 +901,11 @@ impl EffectHandler for MockProcessHandler {
                     {
                         r#"{"id":7,"title":"Worker issue","status":"open","priority":"high","labels":["feature"]}"#
                     }
+                    // Legacy Chainlink CLI create output used to exercise the
+                    // WASM tool-result contract.
+                    [create, _title, quiet] if create == "create" && quiet == "-q" => {
+                        r#"{"cicoIssueId":816}"#
+                    }
                     _ => "{}",
                 };
                 Ok(RunResponse {
@@ -1126,6 +1131,32 @@ async fn wasm_reviewer_tools_include_review_commands() {
     assert!(
         !names.contains(&"merge_pr"),
         "Reviewer should not have merge_pr"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_chainlink_issue_create_emits_canonical_issue_id() {
+    let runtime = build_test_runtime().await;
+
+    // The mock process handler returns the legacy CLI shape {"cicoIssueId":816};
+    // the WASM tool must normalize it to the canonical issue_id at the boundary.
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "chainlink_issue_create",
+        json!({"title": "Escalate slice worker-a: retries_exhausted"}),
+    )
+    .await;
+
+    assert_tool_success(&output, "chainlink_issue_create");
+    assert_eq!(
+        output["result"]["issue_id"], 816,
+        "tool result must carry canonical issue_id: {output:#}"
+    );
+    assert!(
+        output["result"].get("cicoIssueId").is_none(),
+        "tool result must not leak the legacy cicoIssueId field: {output:#}"
     );
 }
 

@@ -30,6 +30,7 @@
         "labels": [
           "needs-human"
         ],
+        "status": "all",
         "force": false,
         "include_dead": false,
         "sweep": false

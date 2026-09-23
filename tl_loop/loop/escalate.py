@@ -191,6 +191,23 @@ def park(
             pr_number=slice.pr_number,
             head_sha=bound_head,
         )
+        if legacy_binding_id is None and slice.pr_number is not None and bound_head:
+            # Production recovery path for a run whose escalation was created
+            # before run-identity titles: recover the recorded issue id from the
+            # persisted failure reason and bind it (verified against this
+            # slice's publication) so the retry reuses it.
+            recorded = _recorded_legacy_issue_id(store)
+            if recorded is not None:
+                bind_legacy_escalation(
+                    store,
+                    slice_id=slice.id,
+                    cause=parsed_cause,
+                    attempt=attempt,
+                    issue_id=recorded,
+                    pr_number=slice.pr_number,
+                    head_sha=bound_head,
+                )
+                legacy_binding_id = recorded
     issue_id = _create_issue(
         issue_creator,
         slice,
@@ -585,6 +602,34 @@ def _read_legacy_binding(
     return bound_id
 
 
+_LEGACY_ISSUE_ID_PATTERN = re.compile(
+    r"(?:cicoIssueId|issue_id|['\"]id['\"])\s*['\"]?\s*[:=]\s*['\"]?(\d+)"
+)
+
+
+def _recorded_legacy_issue_id(store: RunStore) -> int | None:
+    """Recover an issue id recorded in this run's failure diagnostics.
+
+    The pre-fix Beast checkpoint persisted
+    `chainlink issue result has no positive issue ID: {'cicoIssueId': 816}` in
+    its recursive failure reason, so the issue created before the crash is
+    durably recoverable. This is deliberately narrow: only a run whose failure
+    reason names a Chainlink-created issue and that has exactly one slice (the
+    slice being recovered) is eligible.
+    """
+    state = store.load()
+    if len(state.slices) != 1:
+        return None
+    reason = getattr(getattr(state, "recursive_fsm", None), "reason", None)
+    if not isinstance(reason, str) or "chainlink issue" not in reason.lower():
+        return None
+    match = _LEGACY_ISSUE_ID_PATTERN.search(reason)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return value if value > 0 else None
+
+
 _RUN_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
@@ -699,11 +744,18 @@ def _write_intent(path: Path, payload: dict[str, object]) -> None:
 
 
 def _list_needs_human_issues(creator: object) -> list[object]:
-    """List open needs-human issues, failing closed when that is not possible."""
+    """List needs-human issues (open and closed), failing closed on uncertainty.
+
+    Closed issues are included so a crash after creation is still reconciled
+    when the issue is closed by an operator before the retry.
+    """
     list_issues = getattr(creator, "chainlink_issue_list", None)
     if list_issues is None:
         return []
     try:
+        result = list_issues(labels=("needs-human",), status="all")
+    except TypeError:
+        # Creators that predate the status filter.
         result = list_issues(labels=("needs-human",))
     except Exception as error:
         raise IssueLookupUnavailable(

@@ -22,6 +22,7 @@ from tl_loop.loop.escalate import (
     _escalation_intent_path,
     _escalation_key,
     _issue_id,
+    _read_legacy_binding,
     authorize_harness_switch,
     bind_legacy_escalation,
     blocked_gate_name,
@@ -200,10 +201,14 @@ def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
             priority: str | None = None,
             status: str | None = None,
         ) -> ToolResult:
-            del milestone, priority, status
+            del milestone, priority
             assert tuple(labels or ()) == ("needs-human",)
-            return _tool_result({"issues": [{"issue_id": 816, "title": scoped_title}]})
+            assert status == "all"
+            return _tool_result(
+                {"issues": [{"issue_id": 816, "title": scoped_title, "status": "closed"}]}
+            )
 
+    # The issue is closed, but reconciliation must still find it.
     issue_id = _create_issue(RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
 
     assert issue_id == 816
@@ -464,6 +469,78 @@ def test_legacy_binding_is_scoped_to_attempt(tmp_path: Path) -> None:
     assert isinstance(result, ParkResult)
     assert result.issue_id == 999
     assert len(created) == 1
+
+
+def test_park_autobinds_issue_recorded_in_recovery_reason(tmp_path: Path) -> None:
+    from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
+
+    slice_id = "issue-811-substitution-model-architecture"
+    head_sha = "25ec8d08ca984b56497518dd05a572a116d1f883"
+    record = _record(slice_id)
+    record["attempts"] = 1
+    create(
+        "escalate-test",
+        {
+            "slices": {slice_id: record},
+            "fsm": RecursiveTLFailed(
+                "chainlink issue result has no positive issue ID: {'cicoIssueId': 816}",
+                ("root",),
+            ),
+        },
+        root_dir=tmp_path,
+    )
+    store = RunStore("escalate-test", root_dir=tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("a recorded legacy issue must be reused")
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            return _tool_result({"issues": []})
+
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=1,
+        pr_number=44,
+        publication=PublicationBinding(
+            pr_number=44,
+            head_sha=head_sha,
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
+    result = park(
+        target,
+        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        store=store,
+        issue_creator=Creator(),
+    )
+
+    assert isinstance(result, ParkResult)
+    assert result.issue_id == 816
+    assert created == []
+    assert (
+        _read_legacy_binding(
+            store,
+            slice_id,
+            ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+            1,
+            pr_number=44,
+            head_sha=head_sha,
+        )
+        == 816
+    )
 
 
 def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
