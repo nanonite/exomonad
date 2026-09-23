@@ -175,52 +175,44 @@ def park(
     if issue_creator is None:
         raise EscalationError("a needs-human issue creator is required for durable parking")
 
-    # A legacy untagged issue (#816) is reused only through a durable binding
-    # that is verified against this slice's publication PR and head.
+    # A legacy untagged issue (#816) is reused only through an operator-verified
+    # durable binding. The failure reason and a slice/cause title cannot prove
+    # which attempt or publication created an issue, so a recorded legacy id is
+    # never auto-bound: it fails closed with the binding instructions.
+    publication = getattr(slice, "publication", None)
+    bound_head = (
+        getattr(publication, "head_sha", None) if publication is not None else None
+    )
+    pr_number = slice.pr_number
     legacy_binding_id: int | None = None
     if store is not None:
-        publication = getattr(slice, "publication", None)
-        bound_head = (
-            getattr(publication, "head_sha", None) if publication is not None else None
-        )
         legacy_binding_id = _read_legacy_binding(
             store,
             slice.id,
             parsed_cause,
             attempt,
-            pr_number=slice.pr_number,
+            pr_number=pr_number,
             head_sha=bound_head,
         )
-        if legacy_binding_id is None and slice.pr_number is not None and bound_head:
-            # Production recovery path for a run whose escalation was created
-            # before run-identity titles: recover the recorded issue id from the
-            # persisted failure reason and bind it (verified against this
-            # slice's publication) so the retry reuses it.
+        if legacy_binding_id is None:
             recorded = _recorded_legacy_issue_id(store)
             if recorded is not None:
-                expected_titles = {
-                    _attempt_scoped_title(slice.id, parsed_cause, attempt),
-                    _legacy_escalation_title(slice.id, parsed_cause),
-                }
-                # A stale failure reason must not bind an unrelated issue: the
-                # recorded issue has to identify this exact slice and cause.
-                if _recorded_issue_matches(issue_creator, recorded, expected_titles):
-                    bind_legacy_escalation(
-                        store,
-                        slice_id=slice.id,
-                        cause=parsed_cause,
-                        attempt=attempt,
-                        issue_id=recorded,
-                        pr_number=slice.pr_number,
-                        head_sha=bound_head,
-                    )
-                    legacy_binding_id = recorded
+                raise EscalationError(
+                    f"run failure reason references Chainlink issue {recorded}, but it cannot "
+                    f"be proven to belong to slice {slice.id!r} attempt {attempt} and "
+                    f"publication PR {pr_number} head {bound_head!r}. Verify the issue for this "
+                    "publication, then bind it before retrying: bind_legacy_escalation(store, "
+                    f"slice_id={slice.id!r}, cause={parsed_cause!r}, attempt={attempt}, "
+                    f"issue_id={recorded}, pr_number=..., head_sha=...)"
+                )
     issue_id = _create_issue(
         issue_creator,
         slice,
         parsed_cause,
         parked_audit,
         attempt=attempt,
+        pr_number=pr_number,
+        head_sha=bound_head,
         store=store,
         legacy_binding_id=legacy_binding_id,
     )
@@ -637,31 +629,6 @@ def _recorded_legacy_issue_id(store: RunStore) -> int | None:
     return value if value > 0 else None
 
 
-def _recorded_issue_matches(
-    creator: object, issue_id: int, expected_titles: set[str]
-) -> bool:
-    """Prove a recorded issue id belongs to this slice/cause before binding it.
-
-    Reads the issue through the effect boundary and requires its title to be one
-    of the escalation titles for the current slice and cause. A creator that
-    cannot show the issue, or a title that does not match, refuses to bind.
-    """
-    show = getattr(creator, "chainlink_issue_show", None)
-    if show is None:
-        return False
-    try:
-        result = show(issue_id=issue_id)
-    except Exception:  # noqa: BLE001
-        return False
-    if result.success is not True:
-        return False
-    payload = result.result
-    if not isinstance(payload, Mapping):
-        return False
-    title = payload.get("title")
-    return isinstance(title, str) and title.strip() in expected_titles
-
-
 _RUN_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 
 
@@ -813,18 +780,8 @@ def _list_needs_human_issues(creator: object) -> list[object]:
     raise IssueLookupUnavailable(f"unrecognized issue list response: {payload!r}")
 
 
-def _reconcile_existing_issue(
-    creator: object,
-    title: str,
-    legacy_binding_id: int | None,
-) -> int | None:
-    """Reuse this run's escalation for the attempt, or a verified legacy issue.
-
-    The run-scoped title carries a durable run token, so another run can never
-    match it. Legacy issues created before run tokens (for example Beast #816)
-    are reused only through a durable, publication-verified binding created by
-    bind_legacy_escalation; an untagged title alone is never sufficient.
-    """
+def _find_run_scoped_issue(creator: object, title: str) -> int | None:
+    """Return the issue whose title is this run's exact escalation title."""
     wanted = title.strip()
     for issue in _list_needs_human_issues(creator):
         issue_id = _issue_id(issue)
@@ -833,7 +790,36 @@ def _reconcile_existing_issue(
         issue_title = issue.get("title") if isinstance(issue, Mapping) else None
         if isinstance(issue_title, str) and issue_title.strip() == wanted:
             return issue_id
-    return legacy_binding_id
+    return None
+
+
+def _intent_provenance_matches(
+    intent: Mapping[str, object], pr_number: int | None, head_sha: str | None
+) -> bool:
+    """Whether a pre-failure intent recorded the current publication identity."""
+    return intent.get("pr_number") == pr_number and intent.get("head_sha") == head_sha
+
+
+def _write_escalation_intent(
+    path: Path | None,
+    *,
+    title: str,
+    pr_number: int | None,
+    head_sha: str | None,
+    issue_id: int | None,
+    state: str,
+) -> None:
+    if path is None:
+        return
+    document: dict[str, object] = {
+        "title": title,
+        "state": state,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+    }
+    if issue_id is not None:
+        document["issue_id"] = issue_id
+    _write_intent(path, document)
 
 
 def _create_issue(
@@ -843,6 +829,8 @@ def _create_issue(
     audit: Mapping[str, object],
     *,
     attempt: int = 1,
+    pr_number: int | None = None,
+    head_sha: str | None = None,
     store: RunStore | None = None,
     legacy_binding_id: int | None = None,
 ) -> int:
@@ -858,6 +846,8 @@ def _create_issue(
                 audit,
                 title,
                 attempt,
+                pr_number,
+                head_sha,
                 legacy_binding_id,
                 intent_path,
             )
@@ -868,6 +858,8 @@ def _create_issue(
         audit,
         base_title,
         attempt,
+        pr_number,
+        head_sha,
         legacy_binding_id,
         None,
     )
@@ -880,26 +872,65 @@ def _create_issue_locked(
     audit: Mapping[str, object],
     title: str,
     attempt: int,
+    pr_number: int | None,
+    head_sha: str | None,
     legacy_binding_id: int | None,
     intent_path: Path | None,
 ) -> int:
-    # A durable intent that already recorded an issue ID is authoritative.
-    if intent_path is not None:
-        intent = _read_intent(intent_path)
-        if intent is not None:
-            recorded = _issue_id(intent)
-            if recorded is not None:
+    intent = _read_intent(intent_path) if intent_path is not None else None
+    if intent is not None:
+        recorded = _issue_id(intent)
+        if recorded is not None:
+            # A durable pre-failure record is authoritative only when it also
+            # proves the same publication identity for this attempt.
+            if _intent_provenance_matches(intent, pr_number, head_sha):
                 return recorded
-    # Always reconcile before creating. This covers a crash after remote
-    # creation and a verified legacy binding. An unavailable lookup stops
-    # creation instead of risking a duplicate.
-    existing = _reconcile_existing_issue(creator, title, legacy_binding_id)
-    if existing is not None:
-        if intent_path is not None:
-            _write_intent(intent_path, {"issue_id": existing, "title": title})
-        return existing
+            raise EscalationError(
+                f"escalation intent for slice {slice.id!r} records issue {recorded} but does "
+                "not match the current publication PR/head; refusing to reuse it without "
+                "operator verification"
+            )
+    # Operator-verified legacy binding (for example Beast #816).
+    if legacy_binding_id is not None:
+        _write_escalation_intent(
+            intent_path,
+            title=title,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            issue_id=legacy_binding_id,
+            state="bound_legacy",
+        )
+        return legacy_binding_id
+    # A run-scoped issue may be reused only when the pre-failure intent proves
+    # the same publication PR/head for this attempt.
     if intent_path is not None:
-        _write_intent(intent_path, {"title": title, "state": "requested"})
+        matched = _find_run_scoped_issue(creator, title)
+        if matched is not None:
+            if intent is not None and _intent_provenance_matches(
+                intent, pr_number, head_sha
+            ):
+                _write_escalation_intent(
+                    intent_path,
+                    title=title,
+                    pr_number=pr_number,
+                    head_sha=head_sha,
+                    issue_id=matched,
+                    state="reconciled",
+                )
+                return matched
+            raise EscalationError(
+                f"found escalation issue {matched} for slice {slice.id!r} but cannot prove it "
+                "belongs to this attempt's publication; refusing to reuse it without operator "
+                "verification"
+            )
+    _write_escalation_intent(
+        intent_path,
+        title=title,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        issue_id=None,
+        state="requested",
+    )
     description = (
         f"Slice {slice.id} is parked for human action. "
         f"Cause: {cause.value}. Audit: {dumps_json(audit, sort_keys=True)}"
@@ -925,8 +956,14 @@ def _create_issue_locked(
     issue_id = _issue_id(value)
     if issue_id is None:
         raise IssueCreationError(f"chainlink issue result has no positive issue ID: {value!r}")
-    if intent_path is not None:
-        _write_intent(intent_path, {"issue_id": issue_id, "title": title})
+    _write_escalation_intent(
+        intent_path,
+        title=title,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        issue_id=issue_id,
+        state="created",
+    )
     return issue_id
 
 

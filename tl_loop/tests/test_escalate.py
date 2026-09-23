@@ -22,7 +22,8 @@ from tl_loop.loop.escalate import (
     _escalation_intent_path,
     _escalation_key,
     _issue_id,
-    _read_legacy_binding,
+    _run_token,
+    _write_intent,
     authorize_harness_switch,
     bind_legacy_escalation,
     blocked_gate_name,
@@ -176,11 +177,11 @@ def test_create_issue_parses_legacy_cico_issue_id_result() -> None:
     assert _create_issue(LegacyCreator(), _slice(), ParkCause.REVIEW_STUCK, {}) == 816
 
 
-def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
-    scoped_title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1)"
+def test_create_issue_reuses_run_scoped_issue_with_provenance(tmp_path: Path) -> None:
+    store = _store(tmp_path)
     created: list[str] = []
 
-    class RecoveringCreator:
+    class Creator:
         def chainlink_issue_create(
             self,
             *,
@@ -191,7 +192,7 @@ def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
         ) -> ToolResult:
             del description, labels, priority
             created.append(title)
-            return _tool_result({"issue_id": 999})
+            return _tool_result({"issue_id": 900})
 
         def chainlink_issue_list(
             self,
@@ -201,18 +202,36 @@ def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
             priority: str | None = None,
             status: str | None = None,
         ) -> ToolResult:
-            del milestone, priority
-            assert tuple(labels or ()) == ("needs-human",)
-            assert status == "all"
-            return _tool_result(
-                {"issues": [{"issue_id": 816, "title": scoped_title, "status": "closed"}]}
-            )
+            del labels, milestone, priority, status
+            issues = [{"issue_id": 900, "title": created[0]}] if created else []
+            return _tool_result({"issues": issues})
 
-    # The issue is closed, but reconciliation must still find it.
-    issue_id = _create_issue(RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
+    creator = Creator()
+    first = _create_issue(
+        creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+    )
+    assert first == 900
 
-    assert issue_id == 816
-    assert created == [], "a retry must reuse the issue, not open a duplicate"
+    # Simulate a crash after remote creation but before the intent recorded the
+    # issue id: only the pre-failure request (with PR/head) survives.
+    token = _run_token(store)
+    title = (
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
+    )
+    intent_path = _escalation_intent_path(
+        store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
+    )
+    _write_intent(
+        intent_path,
+        {"title": title, "state": "requested", "pr_number": None, "head_sha": None},
+    )
+
+    second = _create_issue(
+        creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+    )
+
+    assert second == 900
+    assert len(created) == 1, "a proven run-scoped issue must be reused"
 
 
 def test_create_issue_reuses_bound_legacy_issue() -> None:
@@ -233,7 +252,9 @@ def test_create_issue_reuses_bound_legacy_issue() -> None:
     assert issue_id == 816
 
 
-def test_create_issue_fails_closed_when_lookup_is_unavailable() -> None:
+def test_create_issue_fails_closed_when_lookup_is_unavailable(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
     class BrokenLookupCreator:
         def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
             raise AssertionError("must not create when reconciliation is unavailable")
@@ -243,7 +264,9 @@ def test_create_issue_fails_closed_when_lookup_is_unavailable() -> None:
             return _tool_result({"unexpected": []})
 
     with pytest.raises(IssueLookupUnavailable):
-        _create_issue(BrokenLookupCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
+        _create_issue(
+            BrokenLookupCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+        )
 
 
 def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path) -> None:
@@ -471,7 +494,7 @@ def test_legacy_binding_is_scoped_to_attempt(tmp_path: Path) -> None:
     assert len(created) == 1
 
 
-def test_park_autobinds_issue_recorded_in_recovery_reason(tmp_path: Path) -> None:
+def test_park_fails_closed_on_unverified_recorded_issue(tmp_path: Path) -> None:
     from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 
     slice_id = "issue-811-substitution-model-architecture"
@@ -490,33 +513,14 @@ def test_park_autobinds_issue_recorded_in_recovery_reason(tmp_path: Path) -> Non
         root_dir=tmp_path,
     )
     store = RunStore("escalate-test", root_dir=tmp_path)
-    created: list[str] = []
 
     class Creator:
         def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
-            raise AssertionError("a recorded legacy issue must be reused")
+            raise AssertionError("an unverified recorded issue must not be reused or duplicated")
 
-        def chainlink_issue_list(
-            self,
-            *,
-            labels: Sequence[str] | None = None,
-            milestone: str | None = None,
-            priority: str | None = None,
-            status: str | None = None,
-        ) -> ToolResult:
-            del labels, milestone, priority, status
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
             return _tool_result({"issues": []})
-
-        def chainlink_issue_show(self, *, issue_id: int) -> ToolResult:
-            return _tool_result(
-                {
-                    "issue_id": issue_id,
-                    "title": (
-                        f"Escalate slice {slice_id}: "
-                        f"{ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
-                    ),
-                }
-            )
 
     target = replace(
         _slice(),
@@ -531,34 +535,21 @@ def test_park_autobinds_issue_recorded_in_recovery_reason(tmp_path: Path) -> Non
             attempt=1,
         ),
     )
-    result = park(
-        target,
-        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
-        store=store,
-        issue_creator=Creator(),
-    )
-
-    assert isinstance(result, ParkResult)
-    assert result.issue_id == 816
-    assert created == []
-    assert (
-        _read_legacy_binding(
-            store,
-            slice_id,
+    with pytest.raises(EscalationError, match="cannot be proven"):
+        park(
+            target,
             ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
-            1,
-            pr_number=44,
-            head_sha=head_sha,
+            store=store,
+            issue_creator=Creator(),
         )
-        == 816
-    )
 
 
-def test_autobind_refuses_stale_reason_for_another_slice(tmp_path: Path) -> None:
+def test_park_fails_closed_on_recorded_issue_from_other_publication(
+    tmp_path: Path,
+) -> None:
     from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 
     slice_id = "issue-811-substitution-model-architecture"
-    head_sha = "25ec8d08ca984b56497518dd05a572a116d1f883"
     record = _record(slice_id)
     record["attempts"] = 1
     create(
@@ -573,61 +564,37 @@ def test_autobind_refuses_stale_reason_for_another_slice(tmp_path: Path) -> None
         root_dir=tmp_path,
     )
     store = RunStore("escalate-test", root_dir=tmp_path)
-    created: list[str] = []
 
     class Creator:
-        def chainlink_issue_create(
-            self,
-            *,
-            title: str,
-            description: str | None = None,
-            labels: Sequence[str] | None = None,
-            priority: str | None = None,
-        ) -> ToolResult:
-            del description, labels, priority
-            created.append(title)
-            return _tool_result({"issue_id": 999})
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("a stale recorded issue must not be reused")
 
-        def chainlink_issue_list(
-            self,
-            *,
-            labels: Sequence[str] | None = None,
-            milestone: str | None = None,
-            priority: str | None = None,
-            status: str | None = None,
-        ) -> ToolResult:
-            del labels, milestone, priority, status
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
             return _tool_result({"issues": []})
 
-        def chainlink_issue_show(self, *, issue_id: int) -> ToolResult:
-            # The recorded issue belongs to a different slice; it must not bind.
-            return _tool_result(
-                {"issue_id": issue_id, "title": "Escalate slice other-slice: stall_detected"}
-            )
-
+    # The recorded issue predates this attempt; the current publication is a
+    # different PR and head, so it must not be adopted.
     target = replace(
         _slice(),
         id=slice_id,
         attempts=1,
-        pr_number=44,
+        pr_number=45,
         publication=PublicationBinding(
-            pr_number=44,
-            head_sha=head_sha,
+            pr_number=45,
+            head_sha="different-head-sha",
             head_branch="main.stage.issue",
             base_branch="main.stage",
             attempt=1,
         ),
     )
-    result = park(
-        target,
-        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
-        store=store,
-        issue_creator=Creator(),
-    )
-
-    assert isinstance(result, ParkResult)
-    assert result.issue_id == 999
-    assert len(created) == 1
+    with pytest.raises(EscalationError, match="cannot be proven"):
+        park(
+            target,
+            ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+            store=store,
+            issue_creator=Creator(),
+        )
 
 
 def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
@@ -670,6 +637,48 @@ def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
     assert first == 701
     assert second == 702
     assert len(created) == 2, "a run must not attach to another run's escalation issue"
+
+
+def test_create_issue_fails_closed_on_intent_provenance_mismatch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    token = _run_token(store)
+    title = (
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
+    )
+    intent_path = _escalation_intent_path(
+        store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
+    )
+    intent_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_intent(
+        intent_path,
+        {
+            "issue_id": 900,
+            "title": title,
+            "state": "created",
+            "pr_number": 44,
+            "head_sha": "head-a",
+        },
+    )
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("must not create when intent provenance mismatches")
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            return _tool_result({"issues": []})
+
+    with pytest.raises(EscalationError, match="does not match the current publication"):
+        _create_issue(
+            Creator(),
+            _slice(),
+            ParkCause.REVIEW_STUCK,
+            {},
+            attempt=1,
+            pr_number=45,
+            head_sha="head-b",
+            store=store,
+        )
 
 
 def test_escalation_intent_is_scoped_per_attempt(tmp_path: Path) -> None:
