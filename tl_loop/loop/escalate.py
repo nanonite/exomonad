@@ -187,6 +187,7 @@ def park(
             store,
             slice.id,
             parsed_cause,
+            attempt,
             pr_number=slice.pr_number,
             head_sha=bound_head,
         )
@@ -499,10 +500,12 @@ def _escalation_intent_path(store: RunStore, key: str) -> Path:
     return Path(store.run_dir) / "escalations" / f"{safe}.json"
 
 
-def _legacy_binding_path(store: RunStore, slice_id: str, cause: ParkCause) -> Path:
+def _legacy_binding_path(
+    store: RunStore, slice_id: str, cause: ParkCause, attempt: int
+) -> Path:
     safe = "".join(
         ch if ch.isalnum() or ch in "-_." else "_"
-        for ch in f"{slice_id}:{cause.value}"
+        for ch in f"{slice_id}:{cause.value}:{attempt}"
     )
     return Path(store.run_dir) / "escalations" / f"legacy-{safe}.json"
 
@@ -512,25 +515,34 @@ def bind_legacy_escalation(
     *,
     slice_id: str,
     cause: ParkCause,
+    attempt: int,
     issue_id: int,
-    pr_number: int | None = None,
-    head_sha: str | None = None,
+    pr_number: int,
+    head_sha: str,
 ) -> Path:
     """Bind a pre-run-identity escalation issue (for example Beast #816).
 
-    This is the narrowly verified migration path for legacy untagged issues:
-    an operator or recovery step records the exact issue for a slice and cause,
-    optionally pinning the publication PR number and head SHA that the issue
-    belongs to. Reconciliation never adopts an untagged issue without it.
+    This is the narrowly verified migration path for legacy untagged issues. The
+    caller must supply the exact publication PR number and head SHA that the
+    issue belongs to, plus the attempt it was filed for; reconciliation only
+    reuses the issue when all of those match the slice's publication. An
+    untagged issue is never adopted without a fully verified binding.
     """
     if type(issue_id) is not int or issue_id <= 0:
         raise ValueError("legacy escalation binding requires a positive issue id")
-    path = _legacy_binding_path(store, slice_id, cause)
+    if type(attempt) is not int or attempt <= 0:
+        raise ValueError("legacy escalation binding requires a positive attempt")
+    if type(pr_number) is not int or pr_number <= 0:
+        raise ValueError("legacy escalation binding requires a positive pr_number")
+    if not isinstance(head_sha, str) or not head_sha:
+        raise ValueError("legacy escalation binding requires a non-empty head_sha")
+    path = _legacy_binding_path(store, slice_id, cause, attempt)
     _write_intent(
         path,
         {
             "slice_id": slice_id,
             "cause": cause.value,
+            "attempt": attempt,
             "issue_id": issue_id,
             "pr_number": pr_number,
             "head_sha": head_sha,
@@ -543,27 +555,32 @@ def _read_legacy_binding(
     store: RunStore,
     slice_id: str,
     cause: ParkCause,
+    attempt: int,
     *,
     pr_number: int | None,
     head_sha: str | None,
 ) -> int | None:
-    """Return a verified legacy issue id, or None when there is no valid binding."""
-    path = _legacy_binding_path(store, slice_id, cause)
+    """Return a fully verified legacy issue id, or None when none applies.
+
+    A binding is only usable when the slice still records the same publication
+    PR and head and the binding is scoped to the current attempt.
+    """
+    if pr_number is None or not head_sha:
+        return None
+    path = _legacy_binding_path(store, slice_id, cause, attempt)
     record = _read_intent(path)
     if record is None:
         return None
     bound_id = _issue_id(record)
     if bound_id is None:
         raise EscalationError(f"legacy escalation binding at {path} has no issue id")
-    if record.get("slice_id") != slice_id or record.get("cause") != cause.value:
-        raise EscalationError(
-            f"legacy escalation binding at {path} does not match slice {slice_id!r}"
-        )
-    bound_pr = record.get("pr_number")
-    if bound_pr is not None and bound_pr != pr_number:
+    if (
+        record.get("slice_id") != slice_id
+        or record.get("cause") != cause.value
+        or record.get("attempt") != attempt
+    ):
         return None
-    bound_head = record.get("head_sha")
-    if bound_head is not None and bound_head != head_sha:
+    if record.get("pr_number") != pr_number or record.get("head_sha") != head_sha:
         return None
     return bound_id
 
@@ -590,39 +607,50 @@ def _run_token(store: RunStore) -> str:
 
     The token is embedded in escalation titles so a later run cannot reconcile
     against this run's issues even when the slice, cause, and attempt match. It
-    is published atomically: a temporary file is written in full and hard-linked
-    into place, so the token path is never visible as empty or partial.
+    is published atomically under an exclusive lock: a temporary file is written
+    in full and hard-linked into place, so the token path is never visible empty
+    or partial and a fallback replace cannot clobber another writer's token.
     """
     path = Path(store.run_dir) / "escalations" / "run.token"
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return _read_run_token(path)
-    token = os.urandom(8).hex()
-    temporary = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
-    try:
-        with open(temporary, "w", encoding="utf-8") as handle:
-            handle.write(token)
-            handle.flush()
-            os.fsync(handle.fileno())
+    lock_path = path.with_name(f"{path.name}.lock")
+    with open(lock_path, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         try:
-            os.link(temporary, path)
-        except FileExistsError:
-            # Another writer published first; use its complete token.
-            return _read_run_token(path)
-        except OSError:
-            # Filesystems without hard links: fall back to an atomic replace,
-            # retaining the winner's token if one already exists.
+            # Re-check under the lock: another writer may have published first.
             if path.exists():
                 return _read_run_token(path)
-            os.replace(temporary, path)
-    except OSError as error:
-        raise EscalationError(f"could not publish run token at {path}: {error}") from error
-    finally:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-    return token
+            token = os.urandom(8).hex()
+            temporary = path.with_name(
+                f"{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+            )
+            try:
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    handle.write(token)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(temporary, path)
+                except FileExistsError:
+                    return _read_run_token(path)
+                except OSError:
+                    # Hard links are unavailable. The lock is held, so this
+                    # replace cannot clobber a concurrent writer's token.
+                    os.replace(temporary, path)
+            finally:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+            return token
+        except OSError as error:
+            raise EscalationError(
+                f"could not publish run token at {path}: {error}"
+            ) from error
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager

@@ -28,7 +28,14 @@ from tl_loop.loop.escalate import (
     park,
     switch_harness,
 )
-from tl_loop.state.schema import BudgetLedger, ParkCause, SliceState, SliceStatus, Verdict
+from tl_loop.state.schema import (
+    BudgetLedger,
+    ParkCause,
+    PublicationBinding,
+    SliceState,
+    SliceStatus,
+    Verdict,
+)
 from tl_loop.state.store import RunStore, create
 
 CAUSES = tuple(ParkCause)
@@ -244,8 +251,10 @@ def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path
         store,
         slice_id=slice_id,
         cause=ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        attempt=1,
         issue_id=816,
         pr_number=44,
+        head_sha="25ec8d08ca984b56497518dd05a572a116d1f883",
     )
     created: list[str] = []
 
@@ -273,7 +282,19 @@ def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path
             del labels, milestone, priority, status
             return _tool_result({"issues": []})
 
-    target = replace(_slice(), id=slice_id, attempts=1, pr_number=44)
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=1,
+        pr_number=44,
+        publication=PublicationBinding(
+            pr_number=44,
+            head_sha="25ec8d08ca984b56497518dd05a572a116d1f883",
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
     result = park(
         target,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
@@ -297,8 +318,10 @@ def test_legacy_binding_requires_matching_publication(tmp_path: Path) -> None:
         store,
         slice_id=slice_id,
         cause=ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        attempt=1,
         issue_id=816,
         pr_number=44,
+        head_sha="25ec8d08ca984b56497518dd05a572a116d1f883",
     )
     created: list[str] = []
 
@@ -326,7 +349,19 @@ def test_legacy_binding_requires_matching_publication(tmp_path: Path) -> None:
             del labels, milestone, priority, status
             return _tool_result({"issues": []})
 
-    target = replace(_slice(), id=slice_id, attempts=1, pr_number=45)
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=1,
+        pr_number=45,
+        publication=PublicationBinding(
+            pr_number=45,
+            head_sha="25ec8d08ca984b56497518dd05a572a116d1f883",
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=1,
+        ),
+    )
     result = park(
         target,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
@@ -360,6 +395,75 @@ class _NoopIssueCreator:
     def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
         del kwargs
         return _tool_result({"issues": []})
+
+
+def test_legacy_binding_is_scoped_to_attempt(tmp_path: Path) -> None:
+    slice_id = "issue-811-substitution-model-architecture"
+    head_sha = "25ec8d08ca984b56497518dd05a572a116d1f883"
+    record = _record(slice_id)
+    record["attempts"] = 2
+    create("escalate-test", {"slices": {slice_id: record}}, root_dir=tmp_path)
+    store = RunStore("escalate-test", root_dir=tmp_path)
+    # Binding is for attempt 1; this park is attempt 2.
+    bind_legacy_escalation(
+        store,
+        slice_id=slice_id,
+        cause=ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        attempt=1,
+        issue_id=816,
+        pr_number=44,
+        head_sha=head_sha,
+    )
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 999})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            return _tool_result({"issues": []})
+
+    target = replace(
+        _slice(),
+        id=slice_id,
+        attempts=2,
+        pr_number=44,
+        publication=PublicationBinding(
+            pr_number=44,
+            head_sha=head_sha,
+            head_branch="main.stage.issue",
+            base_branch="main.stage",
+            attempt=2,
+        ),
+    )
+    result = park(
+        target,
+        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        store=store,
+        issue_creator=Creator(),
+        audit={"attempt": 2},
+    )
+
+    assert isinstance(result, ParkResult)
+    assert result.issue_id == 999
+    assert len(created) == 1
 
 
 def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
