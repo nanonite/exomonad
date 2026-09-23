@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix Chainlink escalation result parsing and exactly-once issue creation (#1113)
 - Validate existing leaf worktrees before reuse (#1106)
 - Fix archived TL checkpoints blocking recreated worktrees (#1104)
 - Park a slice with a named gate on a repeated controller action instead of crashing (#1044)
