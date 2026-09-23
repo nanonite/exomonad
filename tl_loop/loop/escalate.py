@@ -155,9 +155,13 @@ def park(
     gate_created = False
     current_state = store.load()
     current_slice = current_state.slices.get(slice.id)
+    raw_attempt = (audit or {}).get("attempt", slice.attempts)
+    attempt = (
+        raw_attempt
+        if type(raw_attempt) is int and raw_attempt > 0
+        else max(slice.attempts, 1)
+    )
     if parsed_cause in _BLOCKED_GATE_CAUSES:
-        raw_attempt = (audit or {}).get("attempt", slice.attempts)
-        attempt = raw_attempt if type(raw_attempt) is int and raw_attempt > 0 else slice.attempts
         gate_name = blocked_gate_name(store.run_id, slice.id, attempt, parsed_cause.value)
         parked_audit = {**dict(parked_audit), "gate_name": gate_name, "attempt": attempt}
         if isinstance(current_slice, SliceState) and (
@@ -175,6 +179,7 @@ def park(
         slice,
         parsed_cause,
         parked_audit,
+        attempt=attempt,
         store=store,
     )
     blocked: list[str] = []
@@ -458,13 +463,18 @@ class IssueLookupUnavailable(EscalationError):
 
 
 def _legacy_escalation_title(slice_id: str, cause: ParkCause) -> str:
-    """The pre-marker title used by issues created before this change (#816)."""
+    """The pre-attempt title used by issues created before this change (#816)."""
     return f"Escalate slice {slice_id}: {cause.value}"
 
 
-def _escalation_key(run_id: str, slice_id: str, cause: ParkCause) -> str:
-    """Stable per-run identity for one slice escalation, for every cause."""
-    return f"task-escalation:{run_id}:{slice_id}:{cause.value}"
+def _attempt_scoped_title(slice_id: str, cause: ParkCause, attempt: int) -> str:
+    """Stable title that scopes one escalation to a single slice attempt."""
+    return f"{_legacy_escalation_title(slice_id, cause)} (attempt {attempt})"
+
+
+def _escalation_key(run_id: str, slice_id: str, attempt: int, cause: ParkCause) -> str:
+    """Stable per-run, per-attempt identity for one slice escalation."""
+    return f"task-escalation:{run_id}:{slice_id}:{attempt}:{cause.value}"
 
 
 def _escalation_intent_path(store: RunStore, key: str) -> Path:
@@ -486,15 +496,28 @@ def _escalation_intent_lock(store: RunStore, key: str):
 
 
 def _read_intent(path: Path) -> dict[str, object] | None:
+    """Return the intent, or None only when the file does not exist.
+
+    A present-but-unusable intent (unreadable, malformed, or not an object) is
+    an error: the caller must not treat it as a fresh attempt.
+    """
     try:
         raw = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as error:
+        raise EscalationError(
+            f"escalation intent is unreadable at {path}: {error}"
+        ) from error
     try:
         value = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
+    except json.JSONDecodeError as error:
+        raise EscalationError(
+            f"escalation intent is malformed at {path}: {error}"
+        ) from error
+    if not isinstance(value, dict):
+        raise EscalationError(f"escalation intent at {path} is not an object")
+    return value
 
 
 def _write_intent(path: Path, payload: dict[str, object]) -> None:
@@ -536,12 +559,20 @@ def _list_needs_human_issues(creator: object) -> list[object]:
     raise IssueLookupUnavailable(f"unrecognized issue list response: {payload!r}")
 
 
-def _reconcile_existing_issue(creator: object, legacy_title: str) -> int | None:
-    """Reuse an escalation already created for this exact slice/cause title."""
-    selected = legacy_title.strip()
+def _reconcile_existing_issue(
+    creator: object, title: str, legacy_title: str, attempt: int
+) -> int | None:
+    """Reuse an escalation already created for this attempt's exact title.
+
+    Legacy issues created before attempt scoping (for example Beast #816) carry
+    only the un-suffixed title, so that form is accepted for attempt 1.
+    """
+    wanted = {title.strip()}
+    if attempt == 1:
+        wanted.add(legacy_title.strip())
     for issue in _list_needs_human_issues(creator):
-        title = issue.get("title") if isinstance(issue, Mapping) else None
-        if not isinstance(title, str) or title.strip() != selected:
+        issue_title = issue.get("title") if isinstance(issue, Mapping) else None
+        if not isinstance(issue_title, str) or issue_title.strip() not in wanted:
             continue
         issue_id = _issue_id(issue)
         if issue_id is not None:
@@ -555,16 +586,20 @@ def _create_issue(
     cause: ParkCause,
     audit: Mapping[str, object],
     *,
+    attempt: int = 1,
     store: RunStore | None = None,
 ) -> int:
-    title = _legacy_escalation_title(slice.id, cause)
+    title = _attempt_scoped_title(slice.id, cause, attempt)
+    legacy_title = _legacy_escalation_title(slice.id, cause)
     if store is not None:
-        key = _escalation_key(store.run_id, slice.id, cause)
+        key = _escalation_key(store.run_id, slice.id, attempt, cause)
         with _escalation_intent_lock(store, key) as intent_path:
             return _create_issue_locked(
-                creator, slice, cause, audit, title, intent_path
+                creator, slice, cause, audit, title, legacy_title, attempt, intent_path
             )
-    return _create_issue_locked(creator, slice, cause, audit, title, None)
+    return _create_issue_locked(
+        creator, slice, cause, audit, title, legacy_title, attempt, None
+    )
 
 
 def _create_issue_locked(
@@ -573,25 +608,25 @@ def _create_issue_locked(
     cause: ParkCause,
     audit: Mapping[str, object],
     title: str,
+    legacy_title: str,
+    attempt: int,
     intent_path: Path | None,
 ) -> int:
-    prior_attempt = False
+    # A durable intent that already recorded an issue ID is authoritative.
     if intent_path is not None:
         intent = _read_intent(intent_path)
         if intent is not None:
-            prior_attempt = True
             recorded = _issue_id(intent)
             if recorded is not None:
                 return recorded
-    # Reconcile only when a prior attempt may have created the issue remotely, or
-    # when the caller has no durable intent store. An unavailable lookup stops
-    # creation instead of risking a duplicate.
-    if prior_attempt or intent_path is None:
-        existing = _reconcile_existing_issue(creator, title)
-        if existing is not None:
-            if intent_path is not None:
-                _write_intent(intent_path, {"issue_id": existing, "title": title})
-            return existing
+    # Always reconcile before creating. This covers both a crash after remote
+    # creation and the existing Beast #816 issue that predates any intent. An
+    # unavailable lookup stops creation instead of risking a duplicate.
+    existing = _reconcile_existing_issue(creator, title, legacy_title, attempt)
+    if existing is not None:
+        if intent_path is not None:
+            _write_intent(intent_path, {"issue_id": existing, "title": title})
+        return existing
     if intent_path is not None:
         _write_intent(intent_path, {"title": title, "state": "requested"})
     description = (

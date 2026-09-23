@@ -13,11 +13,14 @@ import pytest
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.loop.escalate import (
+    EscalationError,
     HarnessSwitchDecision,
     IssueCreationError,
     IssueLookupUnavailable,
     ParkResult,
     _create_issue,
+    _escalation_intent_path,
+    _escalation_key,
     _issue_id,
     authorize_harness_switch,
     blocked_gate_name,
@@ -253,6 +256,117 @@ def test_create_issue_fails_closed_when_lookup_is_unavailable() -> None:
 
     with pytest.raises(IssueLookupUnavailable):
         _create_issue(BrokenLookupCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
+
+
+def test_park_reconciles_existing_816_on_stored_first_attempt(tmp_path: Path) -> None:
+    slice_id = "issue-811-substitution-model-architecture"
+    legacy_title = (
+        f"Escalate slice {slice_id}: {ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
+    )
+    record = _record(slice_id)
+    record["attempts"] = 1
+    create("escalate-test", {"slices": {slice_id: record}}, root_dir=tmp_path)
+    store = RunStore("escalate-test", root_dir=tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 999})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
+
+    target = replace(_slice(), id=slice_id, attempts=1)
+    result = park(
+        target,
+        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        store=store,
+        issue_creator=Creator(),
+    )
+
+    assert isinstance(result, ParkResult)
+    assert result.issue_id == 816
+    assert created == [], "the stored first attempt must reconcile #816 before creating"
+
+
+def test_escalation_intent_is_scoped_per_attempt(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 900 + len(created)})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            issues = [{"issue_id": 900, "title": created[0]}] if created else []
+            return _tool_result({"issues": issues})
+
+    first = _create_issue(
+        Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+    )
+    second = _create_issue(
+        Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store
+    )
+
+    assert first == 901
+    assert second == 902
+    assert first != second
+    assert len(created) == 2, "a later attempt must not reuse the earlier attempt's issue"
+
+
+def test_escalation_fails_closed_on_malformed_intent(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    key = _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
+    intent_path = _escalation_intent_path(store, key)
+    intent_path.parent.mkdir(parents=True, exist_ok=True)
+    intent_path.write_text("{ not valid json", encoding="utf-8")
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("must not create with an unusable intent")
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            return _tool_result({"issues": []})
+
+    with pytest.raises(EscalationError):
+        _create_issue(
+            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
+        )
 
 
 def test_park_reuses_durable_intent_for_non_gated_cause(tmp_path: Path) -> None:
