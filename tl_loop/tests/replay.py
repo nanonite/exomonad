@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -156,6 +157,11 @@ class ReplayResult:
     acknowledged: tuple[int, ...] = ()
 
 
+def _replay_token(stem: str) -> str:
+    """Deterministic, valid 16-hex run token for a replay fixture."""
+    return hashlib.sha256(f"replay-{stem}".encode()).hexdigest()[:16]
+
+
 def replay_fixture(
     fixture: str | Path,
     root_dir: str | Path,
@@ -178,7 +184,7 @@ def replay_fixture(
     token_directory = Path(root_dir) / run_id / "escalations"
     token_directory.mkdir(parents=True, exist_ok=True)
     (token_directory / "run.token").write_text(
-        f"replay-{Path(fixture).stem}", encoding="utf-8"
+        _replay_token(Path(fixture).stem), encoding="utf-8"
     )
     plan = _plan_with_replay_sources(
         _mapping(spec["plan"], "plan"),

@@ -23,6 +23,7 @@ from tl_loop.loop.escalate import (
     _escalation_key,
     _issue_id,
     authorize_harness_switch,
+    bind_legacy_escalation,
     blocked_gate_name,
     park,
     switch_harness,
@@ -168,7 +169,7 @@ def test_create_issue_parses_legacy_cico_issue_id_result() -> None:
 
 
 def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
-    legacy_title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value}"
+    scoped_title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1)"
     created: list[str] = []
 
     class RecoveringCreator:
@@ -194,58 +195,30 @@ def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
         ) -> ToolResult:
             del milestone, priority, status
             assert tuple(labels or ()) == ("needs-human",)
-            return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
+            return _tool_result({"issues": [{"issue_id": 816, "title": scoped_title}]})
 
-    issue_id = _create_issue(
-        RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, allow_legacy=True
-    )
+    issue_id = _create_issue(RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
 
     assert issue_id == 816
     assert created == [], "a retry must reuse the issue, not open a duplicate"
 
 
-def test_create_issue_reuses_legacy_816_title_without_marker() -> None:
-    slice_id = "issue-811-substitution-model-architecture"
-    legacy_title = (
-        f"Escalate slice {slice_id}: {ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
-    )
-    created: list[str] = []
-
-    class LegacyReuseCreator:
+def test_create_issue_reuses_bound_legacy_issue() -> None:
+    class NoopCreator:
         def chainlink_issue_create(
-            self,
-            *,
-            title: str,
-            description: str | None = None,
-            labels: Sequence[str] | None = None,
-            priority: str | None = None,
+            self, **kwargs: object
         ) -> ToolResult:
-            del description, labels, priority
-            created.append(title)
-            return _tool_result({"issue_id": 999})
+            raise AssertionError("a verified legacy binding must be reused")
 
-        def chainlink_issue_list(
-            self,
-            *,
-            labels: Sequence[str] | None = None,
-            milestone: str | None = None,
-            priority: str | None = None,
-            status: str | None = None,
-        ) -> ToolResult:
-            del milestone, priority, status
-            return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            return _tool_result({"issues": []})
 
-    target = replace(_slice(), id=slice_id, status=SliceStatus.DISPATCH_FAILED)
     issue_id = _create_issue(
-        LegacyReuseCreator(),
-        target,
-        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
-        {},
-        allow_legacy=True,
+        NoopCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, legacy_binding_id=816
     )
 
     assert issue_id == 816
-    assert created == [], "the existing #816 title must be reconciled, not duplicated"
 
 
 def test_create_issue_fails_closed_when_lookup_is_unavailable() -> None:
@@ -261,15 +234,19 @@ def test_create_issue_fails_closed_when_lookup_is_unavailable() -> None:
         _create_issue(BrokenLookupCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
 
 
-def test_park_reconciles_existing_816_on_stored_first_attempt(tmp_path: Path) -> None:
+def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path) -> None:
     slice_id = "issue-811-substitution-model-architecture"
-    legacy_title = (
-        f"Escalate slice {slice_id}: {ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
-    )
     record = _record(slice_id)
     record["attempts"] = 1
     create("escalate-test", {"slices": {slice_id: record}}, root_dir=tmp_path)
     store = RunStore("escalate-test", root_dir=tmp_path)
+    bind_legacy_escalation(
+        store,
+        slice_id=slice_id,
+        cause=ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        issue_id=816,
+        pr_number=44,
+    )
     created: list[str] = []
 
     class Creator:
@@ -294,7 +271,7 @@ def test_park_reconciles_existing_816_on_stored_first_attempt(tmp_path: Path) ->
             status: str | None = None,
         ) -> ToolResult:
             del labels, milestone, priority, status
-            return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
+            return _tool_result({"issues": []})
 
     target = replace(_slice(), id=slice_id, attempts=1, pr_number=44)
     result = park(
@@ -306,18 +283,23 @@ def test_park_reconciles_existing_816_on_stored_first_attempt(tmp_path: Path) ->
 
     assert isinstance(result, ParkResult)
     assert result.issue_id == 816
-    assert created == [], "the stored first attempt must reconcile #816 before creating"
+    assert created == [], "a verified legacy binding must be reused without creating"
 
 
-def test_legacy_fallback_requires_publication_evidence(tmp_path: Path) -> None:
+def test_legacy_binding_requires_matching_publication(tmp_path: Path) -> None:
     slice_id = "issue-811-substitution-model-architecture"
-    legacy_title = (
-        f"Escalate slice {slice_id}: {ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
-    )
     record = _record(slice_id)
     record["attempts"] = 1
     create("escalate-test", {"slices": {slice_id: record}}, root_dir=tmp_path)
     store = RunStore("escalate-test", root_dir=tmp_path)
+    # Bound to PR #44; this slice is PR #45, so the binding must not apply.
+    bind_legacy_escalation(
+        store,
+        slice_id=slice_id,
+        cause=ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        issue_id=816,
+        pr_number=44,
+    )
     created: list[str] = []
 
     class Creator:
@@ -342,10 +324,9 @@ def test_legacy_fallback_requires_publication_evidence(tmp_path: Path) -> None:
             status: str | None = None,
         ) -> ToolResult:
             del labels, milestone, priority, status
-            return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
+            return _tool_result({"issues": []})
 
-    # No publication evidence: the un-tagged legacy issue must not be adopted.
-    target = replace(_slice(), id=slice_id, attempts=1)
+    target = replace(_slice(), id=slice_id, attempts=1, pr_number=45)
     result = park(
         target,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
@@ -356,6 +337,29 @@ def test_legacy_fallback_requires_publication_evidence(tmp_path: Path) -> None:
     assert isinstance(result, ParkResult)
     assert result.issue_id == 999
     assert len(created) == 1
+
+
+def test_run_token_is_rejected_when_empty_or_malformed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    token_path = tmp_path / "escalate-test" / "escalations" / "run.token"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+
+    token_path.write_text("", encoding="utf-8")
+    with pytest.raises(EscalationError):
+        _create_issue(_NoopIssueCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, store=store)
+
+    token_path.write_text("not-a-token", encoding="utf-8")
+    with pytest.raises(EscalationError):
+        _create_issue(_NoopIssueCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, store=store)
+
+
+class _NoopIssueCreator:
+    def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+        raise AssertionError("must not create with an unusable run token")
+
+    def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+        del kwargs
+        return _tool_result({"issues": []})
 
 
 def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:

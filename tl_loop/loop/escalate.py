@@ -11,6 +11,7 @@ import copy
 import fcntl
 import json
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -174,11 +175,21 @@ def park(
     if issue_creator is None:
         raise EscalationError("a needs-human issue creator is required for durable parking")
 
-    # The legacy un-tagged title may only be reconciled for a slice that already
-    # carries completed publication work (the Beast #816 migration shape).
-    allow_legacy = (
-        getattr(slice, "publication", None) is not None or slice.pr_number is not None
-    )
+    # A legacy untagged issue (#816) is reused only through a durable binding
+    # that is verified against this slice's publication PR and head.
+    legacy_binding_id: int | None = None
+    if store is not None:
+        publication = getattr(slice, "publication", None)
+        bound_head = (
+            getattr(publication, "head_sha", None) if publication is not None else None
+        )
+        legacy_binding_id = _read_legacy_binding(
+            store,
+            slice.id,
+            parsed_cause,
+            pr_number=slice.pr_number,
+            head_sha=bound_head,
+        )
     issue_id = _create_issue(
         issue_creator,
         slice,
@@ -186,7 +197,7 @@ def park(
         parked_audit,
         attempt=attempt,
         store=store,
-        allow_legacy=allow_legacy,
+        legacy_binding_id=legacy_binding_id,
     )
     blocked: list[str] = []
     blocked_statuses: dict[str, str] = {}
@@ -488,28 +499,129 @@ def _escalation_intent_path(store: RunStore, key: str) -> Path:
     return Path(store.run_dir) / "escalations" / f"{safe}.json"
 
 
+def _legacy_binding_path(store: RunStore, slice_id: str, cause: ParkCause) -> Path:
+    safe = "".join(
+        ch if ch.isalnum() or ch in "-_." else "_"
+        for ch in f"{slice_id}:{cause.value}"
+    )
+    return Path(store.run_dir) / "escalations" / f"legacy-{safe}.json"
+
+
+def bind_legacy_escalation(
+    store: RunStore,
+    *,
+    slice_id: str,
+    cause: ParkCause,
+    issue_id: int,
+    pr_number: int | None = None,
+    head_sha: str | None = None,
+) -> Path:
+    """Bind a pre-run-identity escalation issue (for example Beast #816).
+
+    This is the narrowly verified migration path for legacy untagged issues:
+    an operator or recovery step records the exact issue for a slice and cause,
+    optionally pinning the publication PR number and head SHA that the issue
+    belongs to. Reconciliation never adopts an untagged issue without it.
+    """
+    if type(issue_id) is not int or issue_id <= 0:
+        raise ValueError("legacy escalation binding requires a positive issue id")
+    path = _legacy_binding_path(store, slice_id, cause)
+    _write_intent(
+        path,
+        {
+            "slice_id": slice_id,
+            "cause": cause.value,
+            "issue_id": issue_id,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+        },
+    )
+    return path
+
+
+def _read_legacy_binding(
+    store: RunStore,
+    slice_id: str,
+    cause: ParkCause,
+    *,
+    pr_number: int | None,
+    head_sha: str | None,
+) -> int | None:
+    """Return a verified legacy issue id, or None when there is no valid binding."""
+    path = _legacy_binding_path(store, slice_id, cause)
+    record = _read_intent(path)
+    if record is None:
+        return None
+    bound_id = _issue_id(record)
+    if bound_id is None:
+        raise EscalationError(f"legacy escalation binding at {path} has no issue id")
+    if record.get("slice_id") != slice_id or record.get("cause") != cause.value:
+        raise EscalationError(
+            f"legacy escalation binding at {path} does not match slice {slice_id!r}"
+        )
+    bound_pr = record.get("pr_number")
+    if bound_pr is not None and bound_pr != pr_number:
+        return None
+    bound_head = record.get("head_sha")
+    if bound_head is not None and bound_head != head_sha:
+        return None
+    return bound_id
+
+
+_RUN_TOKEN_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _valid_run_token(token: str) -> bool:
+    return bool(_RUN_TOKEN_PATTERN.match(token))
+
+
+def _read_run_token(path: Path) -> str:
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise EscalationError(f"run token is unreadable at {path}: {error}") from error
+    if not _valid_run_token(token):
+        raise EscalationError(f"run token at {path} is empty or malformed")
+    return token
+
+
 def _run_token(store: RunStore) -> str:
     """Return this run directory's durable identity token, creating it once.
 
     The token is embedded in escalation titles so a later run cannot reconcile
-    against this run's issues even when the slice, cause, and attempt match.
+    against this run's issues even when the slice, cause, and attempt match. It
+    is published atomically: a temporary file is written in full and hard-linked
+    into place, so the token path is never visible as empty or partial.
     """
     path = Path(store.run_dir) / "escalations" / "run.token"
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        try:
-            return path.read_text(encoding="utf-8").strip()
-        except OSError as error:
-            raise EscalationError(
-                f"run token is unreadable at {path}: {error}"
-            ) from error
-    except OSError as error:
-        raise EscalationError(f"could not create run token at {path}: {error}") from error
+    if path.exists():
+        return _read_run_token(path)
     token = os.urandom(8).hex()
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(token)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(token)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            # Another writer published first; use its complete token.
+            return _read_run_token(path)
+        except OSError:
+            # Filesystems without hard links: fall back to an atomic replace,
+            # retaining the winner's token if one already exists.
+            if path.exists():
+                return _read_run_token(path)
+            os.replace(temporary, path)
+    except OSError as error:
+        raise EscalationError(f"could not publish run token at {path}: {error}") from error
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
     return token
 
 
@@ -593,35 +705,24 @@ def _list_needs_human_issues(creator: object) -> list[object]:
 def _reconcile_existing_issue(
     creator: object,
     title: str,
-    legacy_title: str,
-    attempt: int,
-    *,
-    allow_legacy: bool,
+    legacy_binding_id: int | None,
 ) -> int | None:
-    """Reuse this run's escalation for the attempt, plus a narrow legacy case.
+    """Reuse this run's escalation for the attempt, or a verified legacy issue.
 
     The run-scoped title carries a durable run token, so another run can never
     match it. Legacy issues created before run tokens (for example Beast #816)
-    are reused only through an explicitly verified migration path: the caller
-    must opt in and exactly one open issue may carry the un-suffixed title.
+    are reused only through a durable, publication-verified binding created by
+    bind_legacy_escalation; an untagged title alone is never sufficient.
     """
     wanted = title.strip()
-    legacy_matches: list[int] = []
     for issue in _list_needs_human_issues(creator):
-        issue_title = issue.get("title") if isinstance(issue, Mapping) else None
-        if not isinstance(issue_title, str):
-            continue
-        stripped = issue_title.strip()
         issue_id = _issue_id(issue)
         if issue_id is None:
             continue
-        if stripped == wanted:
+        issue_title = issue.get("title") if isinstance(issue, Mapping) else None
+        if isinstance(issue_title, str) and issue_title.strip() == wanted:
             return issue_id
-        if allow_legacy and attempt == 1 and stripped == legacy_title.strip():
-            legacy_matches.append(issue_id)
-    if len(legacy_matches) == 1:
-        return legacy_matches[0]
-    return None
+    return legacy_binding_id
 
 
 def _create_issue(
@@ -632,10 +733,9 @@ def _create_issue(
     *,
     attempt: int = 1,
     store: RunStore | None = None,
-    allow_legacy: bool = False,
+    legacy_binding_id: int | None = None,
 ) -> int:
     base_title = _attempt_scoped_title(slice.id, cause, attempt)
-    legacy_title = _legacy_escalation_title(slice.id, cause)
     if store is not None:
         title = f"{base_title} [run {_run_token(store)}]"
         key = _escalation_key(store.run_id, slice.id, attempt, cause)
@@ -646,9 +746,8 @@ def _create_issue(
                 cause,
                 audit,
                 title,
-                legacy_title,
                 attempt,
-                allow_legacy,
+                legacy_binding_id,
                 intent_path,
             )
     return _create_issue_locked(
@@ -657,9 +756,8 @@ def _create_issue(
         cause,
         audit,
         base_title,
-        legacy_title,
         attempt,
-        allow_legacy,
+        legacy_binding_id,
         None,
     )
 
@@ -670,9 +768,8 @@ def _create_issue_locked(
     cause: ParkCause,
     audit: Mapping[str, object],
     title: str,
-    legacy_title: str,
     attempt: int,
-    allow_legacy: bool,
+    legacy_binding_id: int | None,
     intent_path: Path | None,
 ) -> int:
     # A durable intent that already recorded an issue ID is authoritative.
@@ -682,12 +779,10 @@ def _create_issue_locked(
             recorded = _issue_id(intent)
             if recorded is not None:
                 return recorded
-    # Always reconcile before creating. This covers both a crash after remote
-    # creation and the existing Beast #816 issue that predates any intent. An
-    # unavailable lookup stops creation instead of risking a duplicate.
-    existing = _reconcile_existing_issue(
-        creator, title, legacy_title, attempt, allow_legacy=allow_legacy
-    )
+    # Always reconcile before creating. This covers a crash after remote
+    # creation and a verified legacy binding. An unavailable lookup stops
+    # creation instead of risking a duplicate.
+    existing = _reconcile_existing_issue(creator, title, legacy_binding_id)
     if existing is not None:
         if intent_path is not None:
             _write_intent(intent_path, {"issue_id": existing, "title": title})
@@ -743,6 +838,7 @@ __all__ = [
     "ParkCause",
     "ParkResult",
     "authorize_harness_switch",
+    "bind_legacy_escalation",
     "blocked_gate_name",
     "park",
     "switch_harness",
