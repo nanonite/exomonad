@@ -181,12 +181,16 @@ def park(
     if not isinstance(current_slice, SliceState):
         raise EscalationError(f"slice {slice.id!r} is missing from run state")
     _assert_caller_slice_current(current_slice, slice)
-    raw_attempt = (audit or {}).get("attempt", slice.attempts)
-    attempt = (
-        raw_attempt
-        if type(raw_attempt) is int and raw_attempt > 0
-        else max(slice.attempts, 1)
-    )
+    # The attempt is owned by the persisted checkpoint, never by the audit
+    # payload: an audit attempt from an older attempt must not select an older
+    # issue or intent.
+    attempt = current_slice.attempts if current_slice.attempts > 0 else 1
+    audit_attempt = (audit or {}).get("attempt")
+    if audit_attempt is not None and audit_attempt != attempt:
+        raise EscalationError(
+            f"audit attempt {audit_attempt!r} does not match the persisted slice attempt "
+            f"{attempt} for slice {slice.id!r}; refusing to escalate"
+        )
     if parsed_cause in _BLOCKED_GATE_CAUSES:
         gate_name = blocked_gate_name(store.run_id, slice.id, attempt, parsed_cause.value)
         parked_audit = {**dict(parked_audit), "gate_name": gate_name, "attempt": attempt}
@@ -557,8 +561,18 @@ def _escalation_intent_path(store: RunStore, key: str) -> Path:
     return Path(store.run_dir) / "escalations" / f"intent-{_intent_digest(key)}.json"
 
 
-def _legacy_escalation_intent_path(store: RunStore, key: str) -> Path:
-    """Pre-digest intent path used before the identity hash (for migration)."""
+def _pre_389_escalation_key(
+    run_id: str, slice_id: str, attempt: int, cause: ParkCause
+) -> str:
+    """The exact pre-389 key format, reconstructed from commit f80df647."""
+    return f"task-escalation:{run_id}:{slice_id}:{attempt}:{cause.value}"
+
+
+def _legacy_escalation_intent_path(
+    store: RunStore, run_id: str, slice_id: str, attempt: int, cause: ParkCause
+) -> Path:
+    """Pre-389 sanitized intent path for the same escalation (for migration)."""
+    key = _pre_389_escalation_key(run_id, slice_id, attempt, cause)
     safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in key)
     return Path(store.run_dir) / "escalations" / f"{safe}.json"
 
@@ -932,7 +946,7 @@ def _create_issue(
                 head_sha,
                 legacy_binding_id,
                 intent_path,
-                _legacy_escalation_intent_path(store, key),
+                _legacy_escalation_intent_path(store, run_id, slice.id, attempt, cause),
             )
     return _create_issue_locked(
         creator,

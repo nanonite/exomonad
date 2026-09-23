@@ -22,6 +22,7 @@ from tl_loop.loop.escalate import (
     _escalation_intent_path,
     _escalation_key,
     _issue_id,
+    _legacy_escalation_intent_path,
     _run_token,
     _write_intent,
     authorize_harness_switch,
@@ -682,6 +683,86 @@ def test_park_refuses_stale_caller_slice(tmp_path: Path) -> None:
 
     with pytest.raises(EscalationError, match="stale or inconsistent"):
         park(stale, ParkCause.REVIEW_STUCK, store=store, issue_creator=_NoopIssueCreator())
+
+
+def test_pre_389_intent_is_detected_and_blocks_creation(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    # The actual pre-389 filename and (identity-less) intent format.
+    legacy_path = _legacy_escalation_intent_path(
+        store, store.run_id, "root", 2, ParkCause.REVIEW_STUCK
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_intent(
+        legacy_path,
+        {
+            "title": f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2)",
+            "state": "created",
+            "pr_number": None,
+            "head_sha": None,
+            "issue_id": 900,
+        },
+    )
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("must not create while an old intent is unresolved")
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            # The remote lookup returns nothing; the old file alone must stop us.
+            del kwargs
+            return _tool_result({"issues": []})
+
+    with pytest.raises(EscalationError, match="cannot be proven"):
+        _create_issue(
+            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store
+        )
+
+
+def test_stale_audit_attempt_cannot_select_older_issue(tmp_path: Path) -> None:
+    persisted = replace(_slice(), attempts=2)
+    create(
+        "escalate-test",
+        {"slices": {"root": _record("root", caller=persisted)}},
+        root_dir=tmp_path,
+    )
+    store = RunStore("escalate-test", root_dir=tmp_path)
+    token = _run_token(store)
+    title = (
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
+    )
+    _write_intent(
+        _escalation_intent_path(
+            store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
+        ),
+        {
+            "run_id": store.run_id,
+            "slice_id": "root",
+            "attempt": 1,
+            "cause": ParkCause.REVIEW_STUCK.value,
+            "issue_id": 900,
+            "title": title,
+            "state": "created",
+            "pr_number": None,
+            "head_sha": None,
+        },
+    )
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("a stale audit attempt must not reuse or create")
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            return _tool_result({"issues": [{"issue_id": 900, "title": title}]})
+
+    with pytest.raises(EscalationError, match="does not match the persisted slice attempt"):
+        park(
+            replace(_slice(), attempts=2),
+            ParkCause.REVIEW_STUCK,
+            store=store,
+            issue_creator=Creator(),
+            audit={"attempt": 1},
+        )
 
 
 def test_intent_paths_do_not_collide_for_lookalike_slice_ids(tmp_path: Path) -> None:
