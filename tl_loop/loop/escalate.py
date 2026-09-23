@@ -185,10 +185,11 @@ def park(
     # payload: an audit attempt from an older attempt must not select an older
     # issue or intent.
     attempt = current_slice.attempts if current_slice.attempts > 0 else 1
-    audit_attempt = (audit or {}).get("attempt")
-    if audit_attempt is not None:
-        # Only a real positive int is accepted; bool and float are rejected
+    if audit is not None and "attempt" in audit:
+        # A present attempt (even None) must be a real positive int equal to the
+        # persisted attempt; bool, float, None, and mismatches are rejected
         # before any issue lookup or creation.
+        audit_attempt = audit["attempt"]
         if type(audit_attempt) is not int or audit_attempt <= 0:
             raise EscalationError(
                 f"audit attempt {audit_attempt!r} must be a positive integer for slice "
@@ -767,16 +768,34 @@ def _run_token(store: RunStore) -> str:
 
 
 @contextmanager
-def _escalation_intent_lock(store: RunStore, key: str):
-    """Serialize reconciliation and creation for one durable escalation key."""
-    path = _escalation_intent_path(store, key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix(".lock"), "w", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+def _escalation_locks(
+    store: RunStore, run_id: str, slice_id: str, attempt: int, cause: ParkCause
+):
+    """Serialize one escalation across both the pre-389 and digest lock files.
+
+    A pre-389 invocation holds only the historical lock, so a new invocation
+    must acquire that lock as well. New invocations always take the historical
+    lock first, then the digest lock, giving a consistent order. Both are held
+    across inspection, reconciliation, and remote issue creation.
+    """
+    key = _escalation_key(run_id, slice_id, attempt, cause)
+    digest_path = _escalation_intent_path(store, key)
+    legacy_path = _legacy_escalation_intent_path(store, run_id, slice_id, attempt, cause)
+    digest_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(legacy_path.with_suffix(".lock"), "w", encoding="utf-8") as legacy_handle:
+        fcntl.flock(legacy_handle.fileno(), fcntl.LOCK_EX)
         try:
-            yield path
+            with open(
+                digest_path.with_suffix(".lock"), "w", encoding="utf-8"
+            ) as digest_handle:
+                fcntl.flock(digest_handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield digest_path, legacy_path
+                finally:
+                    fcntl.flock(digest_handle.fileno(), fcntl.LOCK_UN)
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(legacy_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _read_intent(path: Path) -> dict[str, object] | None:
@@ -862,6 +881,12 @@ def _find_run_scoped_issue(creator: object, title: str) -> int | None:
     return None
 
 
+def _intent_title_matches(intent: Mapping[str, object], title: str) -> bool:
+    """Whether a stored intent carries the exact expected escalation title."""
+    stored = intent.get("title")
+    return isinstance(stored, str) and stored == title
+
+
 def _intent_identity_matches(
     intent: Mapping[str, object],
     run_id: str,
@@ -940,8 +965,9 @@ def _create_issue(
     if store is not None:
         run_id = store.run_id
         title = f"{base_title} [run {_run_token(store)}]"
-        key = _escalation_key(run_id, slice.id, attempt, cause)
-        with _escalation_intent_lock(store, key) as intent_path:
+        with _escalation_locks(
+            store, run_id, slice.id, attempt, cause
+        ) as (intent_path, legacy_intent_path):
             return _create_issue_locked(
                 creator,
                 slice,
@@ -954,7 +980,7 @@ def _create_issue(
                 head_sha,
                 legacy_binding_id,
                 intent_path,
-                _legacy_escalation_intent_path(store, run_id, slice.id, attempt, cause),
+                legacy_intent_path,
             )
     return _create_issue_locked(
         creator,
@@ -993,6 +1019,19 @@ def _create_issue_locked(
     legacy_intent = (
         _read_intent(legacy_intent_path) if legacy_intent_path is not None else None
     )
+    # An intent whose title differs from the expected title must never authorize
+    # reuse, reconciliation, migration, or creation.
+    if digest_intent is not None and not _intent_title_matches(digest_intent, title):
+        raise EscalationError(
+            f"escalation intent at {intent_path} has title {digest_intent.get('title')!r}, "
+            f"expected {title!r}; refusing to reuse or create an issue"
+        )
+    if legacy_intent is not None and not _intent_title_matches(legacy_intent, title):
+        raise EscalationError(
+            f"pre-upgrade escalation intent at {legacy_intent_path} has title "
+            f"{legacy_intent.get('title')!r}, expected {title!r}; refusing to reuse or create "
+            "an issue"
+        )
     intent = digest_intent
     if legacy_intent is not None:
         legacy_proven = _intent_identity_matches(

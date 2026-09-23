@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
+import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -687,7 +690,12 @@ def test_park_refuses_stale_caller_slice(tmp_path: Path) -> None:
 
 def test_pre_389_intent_is_detected_and_blocks_creation(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    # The actual pre-389 filename and (identity-less) intent format.
+    token = _run_token(store)
+    title = (
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2) [run {token}]"
+    )
+    # The actual pre-389 filename and (identity-less) intent format. The title
+    # matches so the identity/provenance proof is what fails closed.
     legacy_path = _legacy_escalation_intent_path(
         store, store.run_id, "root", 2, ParkCause.REVIEW_STUCK
     )
@@ -695,7 +703,7 @@ def test_pre_389_intent_is_detected_and_blocks_creation(tmp_path: Path) -> None:
     _write_intent(
         legacy_path,
         {
-            "title": f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2)",
+            "title": title,
             "state": "created",
             "pr_number": None,
             "head_sha": None,
@@ -830,7 +838,7 @@ def test_mixed_version_intents_cannot_create_a_duplicate(tmp_path: Path) -> None
         )
 
 
-@pytest.mark.parametrize("bad_attempt", [True, 1.0, 1, 0, -1, "2"])
+@pytest.mark.parametrize("bad_attempt", [True, 1.0, 1, 0, -1, "2", None])
 def test_park_rejects_invalid_audit_attempt(tmp_path: Path, bad_attempt: object) -> None:
     store = _store(tmp_path)
 
@@ -883,6 +891,115 @@ def test_park_accepts_matching_integer_audit_attempt(tmp_path: Path) -> None:
     assert isinstance(result, ParkResult)
     assert result.issue_id == 900
     assert len(created) == 1
+
+
+def test_intent_with_mismatched_title_fails_closed(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    stale_title = (
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2) [run stale-token]"
+    )
+    intent_path = _escalation_intent_path(
+        store, _escalation_key(store.run_id, "root", 2, ParkCause.REVIEW_STUCK)
+    )
+    intent_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_intent(
+        intent_path,
+        {
+            "run_id": store.run_id,
+            "slice_id": "root",
+            "attempt": 2,
+            "cause": ParkCause.REVIEW_STUCK.value,
+            "issue_id": 900,
+            "title": stale_title,
+            "state": "created",
+            "pr_number": None,
+            "head_sha": None,
+        },
+    )
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            raise AssertionError("a mismatched-title intent must not authorize creation")
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            return _tool_result(
+                {"issues": [{"issue_id": 900, "title": stale_title}]}
+            )
+
+    # The crash window where an old issue exists remotely but the ID was not
+    # written under the current title: the title mismatch fails closed.
+    with pytest.raises(EscalationError, match="title"):
+        _create_issue(
+            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store
+        )
+
+
+def test_concurrent_pre_389_writer_serializes_new_writer(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    cause = ParkCause.REVIEW_STUCK
+    attempt = 2
+    legacy_path = _legacy_escalation_intent_path(
+        store, store.run_id, "root", attempt, cause
+    )
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = legacy_path.with_suffix(".lock")
+    holdings = threading.Event()
+    release = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def pre_389_writer() -> None:
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            holdings.set()
+            release.wait(timeout=10)
+            # A pre-389 writer records the issue without identity or provenance.
+            _write_intent(
+                legacy_path,
+                {
+                    "title": f"Escalate slice root: {cause.value} (attempt {attempt})",
+                    "state": "created",
+                    "pr_number": None,
+                    "head_sha": None,
+                    "issue_id": 900,
+                },
+            )
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    class Creator:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            outcome["created"] = True
+            return _tool_result({"issue_id": 901})
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            return _tool_result({"issues": []})
+
+    def new_writer() -> None:
+        try:
+            _create_issue(Creator(), _slice(), cause, {}, attempt=attempt, store=store)
+            outcome["result"] = "created"
+        except EscalationError as error:
+            outcome["result"] = "failed"
+            outcome["error"] = str(error)
+
+    old_thread = threading.Thread(target=pre_389_writer)
+    old_thread.start()
+    assert holdings.wait(timeout=5)
+
+    new_thread = threading.Thread(target=new_writer)
+    new_thread.start()
+    # The new invocation must block on the historical lock.
+    time.sleep(0.2)
+    assert new_thread.is_alive()
+    assert "result" not in outcome
+
+    release.set()
+    new_thread.join(timeout=10)
+    old_thread.join(timeout=10)
+
+    assert outcome.get("result") == "failed"
+    assert "created" not in outcome, "a concurrent pre-389 writer must not be duplicated"
 
 
 def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
