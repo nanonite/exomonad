@@ -43,7 +43,7 @@
           "needs-human"
         ],
         "priority": "high",
-        "title": "Escalate slice worker-a: retries_exhausted (attempt 1)",
+        "title": "Escalate slice worker-a: retries_exhausted (attempt 1) [run replay-retry-exhausted]",
         "force": false,
         "include_dead": false,
         "sweep": false

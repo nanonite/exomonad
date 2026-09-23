@@ -173,6 +173,13 @@ def replay_fixture(
     """Run one committed event stream and return normalized observable output."""
     spec = _load_fixture(fixture)
     run_id = _string(spec.get("run_id"), "run_id")
+    # Seed a deterministic run token so escalation titles (which embed the
+    # durable run identity) stay stable across replays.
+    token_directory = Path(root_dir) / run_id / "escalations"
+    token_directory.mkdir(parents=True, exist_ok=True)
+    (token_directory / "run.token").write_text(
+        f"replay-{Path(fixture).stem}", encoding="utf-8"
+    )
     plan = _plan_with_replay_sources(
         _mapping(spec["plan"], "plan"),
         spec.get("child_events"),

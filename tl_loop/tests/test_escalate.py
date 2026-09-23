@@ -196,7 +196,9 @@ def test_create_issue_reuses_issue_created_before_checkpoint() -> None:
             assert tuple(labels or ()) == ("needs-human",)
             return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
 
-    issue_id = _create_issue(RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
+    issue_id = _create_issue(
+        RecoveringCreator(), _slice(), ParkCause.REVIEW_STUCK, {}, allow_legacy=True
+    )
 
     assert issue_id == 816
     assert created == [], "a retry must reuse the issue, not open a duplicate"
@@ -239,6 +241,7 @@ def test_create_issue_reuses_legacy_816_title_without_marker() -> None:
         target,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
         {},
+        allow_legacy=True,
     )
 
     assert issue_id == 816
@@ -293,7 +296,7 @@ def test_park_reconciles_existing_816_on_stored_first_attempt(tmp_path: Path) ->
             del labels, milestone, priority, status
             return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
 
-    target = replace(_slice(), id=slice_id, attempts=1)
+    target = replace(_slice(), id=slice_id, attempts=1, pr_number=44)
     result = park(
         target,
         ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
@@ -304,6 +307,97 @@ def test_park_reconciles_existing_816_on_stored_first_attempt(tmp_path: Path) ->
     assert isinstance(result, ParkResult)
     assert result.issue_id == 816
     assert created == [], "the stored first attempt must reconcile #816 before creating"
+
+
+def test_legacy_fallback_requires_publication_evidence(tmp_path: Path) -> None:
+    slice_id = "issue-811-substitution-model-architecture"
+    legacy_title = (
+        f"Escalate slice {slice_id}: {ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
+    )
+    record = _record(slice_id)
+    record["attempts"] = 1
+    create("escalate-test", {"slices": {slice_id: record}}, root_dir=tmp_path)
+    store = RunStore("escalate-test", root_dir=tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 999})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            return _tool_result({"issues": [{"issue_id": 816, "title": legacy_title}]})
+
+    # No publication evidence: the un-tagged legacy issue must not be adopted.
+    target = replace(_slice(), id=slice_id, attempts=1)
+    result = park(
+        target,
+        ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
+        store=store,
+        issue_creator=Creator(),
+    )
+
+    assert isinstance(result, ParkResult)
+    assert result.issue_id == 999
+    assert len(created) == 1
+
+
+def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
+    store_a = _store(tmp_path / "a")
+    store_b = _store(tmp_path / "b")
+    created: list[str] = []
+
+    class Creator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del description, labels, priority
+            created.append(title)
+            return _tool_result({"issue_id": 700 + len(created)})
+
+        def chainlink_issue_list(
+            self,
+            *,
+            labels: Sequence[str] | None = None,
+            milestone: str | None = None,
+            priority: str | None = None,
+            status: str | None = None,
+        ) -> ToolResult:
+            del labels, milestone, priority, status
+            issues = [{"issue_id": 701, "title": created[0]}] if created else []
+            return _tool_result({"issues": issues})
+
+    first = _create_issue(
+        Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store_a
+    )
+    second = _create_issue(
+        Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store_b
+    )
+
+    assert first == 701
+    assert second == 702
+    assert len(created) == 2, "a run must not attach to another run's escalation issue"
 
 
 def test_escalation_intent_is_scoped_per_attempt(tmp_path: Path) -> None:
