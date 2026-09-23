@@ -199,10 +199,92 @@ impl OrderedBranchCleanup {
     }
 }
 
+/// Disposal decision for one issue-owned leaf branch published outside the
+/// ordered sub-TL tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeafBranchCleanup {
+    branch: String,
+    base_branch: String,
+    head_sha: String,
+    pr_number: u64,
+    worktree: Option<PathBuf>,
+    local_head: Option<String>,
+    dirty: bool,
+    live: bool,
+    protected: bool,
+    action: OrderedBranchAction,
+}
+
+impl LeafBranchCleanup {
+    fn gate(&self) -> Option<&str> {
+        match &self.action {
+            OrderedBranchAction::Remove => None,
+            OrderedBranchAction::Preserve(reason) => Some(reason),
+        }
+    }
+
+    fn render(&self) -> String {
+        let action = match &self.action {
+            OrderedBranchAction::Remove => "remove".to_owned(),
+            OrderedBranchAction::Preserve(reason) => format!("preserve [GATE: {reason}]"),
+        };
+        format!(
+            "  {} -> {} (pr=#{}, head={}, local_head={}, worktree={}, dirty={}, protected={})",
+            self.branch,
+            action,
+            self.pr_number,
+            self.head_sha,
+            self.local_head.as_deref().unwrap_or("absent"),
+            self.worktree
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+            self.dirty,
+            self.protected,
+        )
+    }
+}
+
+fn leaf_branch_action(
+    head_sha: &str,
+    local_head: Option<&str>,
+    worktree: Option<&Path>,
+    dirty: bool,
+    live: bool,
+    protected: bool,
+    project_dir: &Path,
+) -> OrderedBranchAction {
+    if live {
+        return OrderedBranchAction::Preserve("live leaf invocation".to_owned());
+    }
+    if protected {
+        return OrderedBranchAction::Preserve("protected publication".to_owned());
+    }
+    if dirty {
+        return OrderedBranchAction::Preserve("dirty leaf worktree".to_owned());
+    }
+    if let Some(path) = worktree {
+        if !path.starts_with(project_dir) {
+            return OrderedBranchAction::Preserve(
+                "leaf worktree is outside the project".to_owned(),
+            );
+        }
+    }
+    // A same-name branch is never proof of ownership: the local head must equal
+    // the recorded publication head before the branch may be disposed.
+    match local_head {
+        Some(head) if head == head_sha => OrderedBranchAction::Remove,
+        Some(_) => OrderedBranchAction::Preserve(
+            "local branch head does not match the recorded publication head".to_owned(),
+        ),
+        None => OrderedBranchAction::Remove,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RecreatePlan {
     worktrees: Vec<PathBuf>,
     ordered_branches: Vec<OrderedBranchCleanup>,
+    leaf_branches: Vec<LeafBranchCleanup>,
     prs_to_close: Vec<u64>,
     prs_to_remove: Vec<u64>,
     protected: Vec<ProtectedPr>,
@@ -246,6 +328,15 @@ impl RecreatePlan {
             output.push_str("\n  (none)");
         } else {
             for branch in &self.ordered_branches {
+                output.push('\n');
+                output.push_str(&branch.render());
+            }
+        }
+        output.push_str("\nIssue-owned leaf branches:");
+        if self.leaf_branches.is_empty() {
+            output.push_str("\n  (none)");
+        } else {
+            for branch in &self.leaf_branches {
                 output.push('\n');
                 output.push_str(&branch.render());
             }
@@ -640,6 +731,138 @@ fn recreate_worktree_paths(project_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn git_ref_sha(project_dir: &Path, reference: &str) -> Result<Option<String>> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(project_dir)
+        .output()
+        .context("failed to resolve git reference")?;
+    if output.status.success() {
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+fn recreate_remote_name(project_dir: &Path) -> String {
+    std::process::Command::new("git")
+        .args(["config", "--get", "exomonad.remote"])
+        .current_dir(project_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "origin".to_owned())
+}
+
+fn remote_branch_sha(project_dir: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "ls-remote",
+            "--heads",
+            remote,
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(project_dir)
+        .output()
+        .with_context(|| format!("failed to inspect remote branch {remote}/{branch}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to inspect remote branch {remote}/{branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_owned))
+}
+
+fn delete_remote_branch_with_lease(
+    project_dir: &Path,
+    remote: &str,
+    branch: &str,
+    expected_sha: &str,
+) -> Result<()> {
+    let lease = format!("--force-with-lease=refs/heads/{branch}:{expected_sha}");
+    let refspec = format!(":refs/heads/{branch}");
+    let output = std::process::Command::new("git")
+        .args(["push", remote, &lease, &refspec])
+        .current_dir(project_dir)
+        .output()
+        .with_context(|| format!("failed to delete remote branch {remote}/{branch}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to delete remote branch {remote}/{branch} with expected head {expected_sha}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+async fn leaf_branch_cleanups(
+    project_dir: &Path,
+    registry: &[PublishedHead],
+    protected: &[ProtectedPr],
+    covered_branches: &HashSet<String>,
+) -> Result<Vec<LeafBranchCleanup>> {
+    let mut cleanups = Vec::new();
+    let mut seen = HashSet::new();
+    for publication in registry {
+        let branch = publication.head_branch.trim();
+        if branch.is_empty() || covered_branches.contains(branch) || !seen.insert(branch.to_owned())
+        {
+            continue;
+        }
+        let local_head = git_ref_sha(project_dir, &format!("refs/heads/{branch}"))?;
+        let worktree = git_worktree_for_branch(project_dir, branch)?.filter(|path| path.is_dir());
+        if local_head.is_none() && worktree.is_none() {
+            continue;
+        }
+        let dirty = worktree
+            .as_ref()
+            .is_some_and(|path| worktree_is_dirty(path));
+        let live = match publication.author_agent.as_deref() {
+            Some(agent) => {
+                let agent_dir = project_dir.join(".exo/agents").join(agent);
+                read_invocation_conservatively(&agent_dir)
+                    .await
+                    .is_some_and(|invocation| invocation.is_live())
+            }
+            None => false,
+        };
+        let is_protected = protected
+            .iter()
+            .any(|item| item.number == publication.pr_number);
+        let action = leaf_branch_action(
+            &publication.head_sha,
+            local_head.as_deref(),
+            worktree.as_deref(),
+            dirty,
+            live,
+            is_protected,
+            project_dir,
+        );
+        cleanups.push(LeafBranchCleanup {
+            branch: branch.to_owned(),
+            base_branch: publication.base_branch.clone(),
+            head_sha: publication.head_sha.clone(),
+            pr_number: publication.pr_number,
+            worktree,
+            local_head,
+            dirty,
+            live,
+            protected: is_protected,
+            action,
+        });
+    }
+    cleanups.sort_by(|left, right| left.branch.cmp(&right.branch));
+    Ok(cleanups)
+}
+
 fn worktree_is_dirty(path: &Path) -> bool {
     std::process::Command::new("git")
         .args([
@@ -777,8 +1000,12 @@ async fn build_recreate_plan(
             .filter(|number| !protected_numbers.contains(number))
             .collect::<Vec<_>>()
     };
-    let ordered_branches = if project_dir.join(".git").exists() {
+    let (ordered_branches, covered_branches) = if project_dir.join(".git").exists() {
         let specs = ordered_branch_specs(project_dir)?;
+        let covered = specs
+            .iter()
+            .map(|spec| spec.branch.clone())
+            .collect::<HashSet<_>>();
         let mut branches = Vec::new();
         for spec in specs {
             if let Some(branch) = inspect_ordered_branch(
@@ -793,13 +1020,21 @@ async fn build_recreate_plan(
                 branches.push(branch);
             }
         }
-        branches
+        (branches, covered)
+    } else {
+        (Vec::new(), HashSet::new())
+    };
+    // Issue-owned leaf branches are enumerated from the publication registry,
+    // never inferred from a branch name alone.
+    let leaf_branches = if project_dir.join(".git").exists() {
+        leaf_branch_cleanups(project_dir, &registry, &protected, &covered_branches).await?
     } else {
         Vec::new()
     };
     Ok(RecreatePlan {
         worktrees,
         ordered_branches,
+        leaf_branches,
         prs_to_close,
         prs_to_remove,
         protected,
@@ -821,7 +1056,7 @@ async fn prepare_recreate(
     if dry_run {
         return Ok(None);
     }
-    let ordered_gates = plan
+    let gates = plan
         .ordered_branches
         .iter()
         .filter_map(|branch| {
@@ -829,10 +1064,15 @@ async fn prepare_recreate(
                 .gate()
                 .map(|gate| (branch.spec.branch.as_str(), gate))
         })
+        .chain(
+            plan.leaf_branches
+                .iter()
+                .filter_map(|branch| branch.gate().map(|gate| (branch.branch.as_str(), gate))),
+        )
         .collect::<Vec<_>>();
-    if !ordered_gates.is_empty() {
-        let mut message = String::from("refusing --recreate: ordered branch cleanup is gated:");
-        for (branch, gate) in ordered_gates {
+    if !gates.is_empty() {
+        let mut message = String::from("refusing --recreate: branch cleanup is gated:");
+        for (branch, gate) in gates {
             message.push_str(&format!("\n  {branch}: {gate}"));
         }
         anyhow::bail!(message);
@@ -983,6 +1223,71 @@ async fn destroy_recreate_resources(
                 std::fs::remove_dir_all(path)
                     .with_context(|| format!("failed to remove {}", path.display()))?;
             }
+        }
+    }
+    // Dispose issue-owned leaf branches enumerated in the plan. Every step is
+    // revalidated immediately before it runs: a changed local or remote head, a
+    // dirty worktree, or a moved worktree stops recreate before anything is
+    // lost. Worktree removal may already have happened above, so each step is
+    // idempotent and an interrupted disposal can be retried.
+    let remote = recreate_remote_name(project_dir);
+    for branch in &plan.leaf_branches {
+        if branch.gate().is_some() {
+            continue;
+        }
+        let current_head = git_ref_sha(project_dir, &format!("refs/heads/{}", branch.branch))?;
+        let worktree =
+            git_worktree_for_branch(project_dir, &branch.branch)?.filter(|path| path.is_dir());
+        if worktree
+            .as_ref()
+            .is_some_and(|path| worktree_is_dirty(path))
+        {
+            anyhow::bail!(
+                "leaf branch {} became dirty during recreate; refusing to dispose it",
+                branch.branch
+            );
+        }
+        if let Some(head) = current_head.as_deref() {
+            if head != branch.head_sha {
+                anyhow::bail!(
+                    "leaf branch {} head changed from {} to {} during recreate; refusing",
+                    branch.branch,
+                    branch.head_sha,
+                    head
+                );
+            }
+        }
+        let remote_sha = remote_branch_sha(project_dir, &remote, &branch.branch)?;
+        if let Some(sha) = remote_sha.as_deref() {
+            if sha != branch.head_sha {
+                anyhow::bail!(
+                    "remote branch {remote}/{} head changed from {} to {} during recreate; refusing",
+                    branch.branch,
+                    branch.head_sha,
+                    sha
+                );
+            }
+        }
+        if let Some(path) = worktree {
+            let git_wt = git_wt.clone();
+            tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path))
+                .await
+                .context("leaf worktree disposal task failed")??;
+        }
+        if current_head.is_some() {
+            let branch_name = exomonad_core::domain::BranchName::try_from_str(&branch.branch)?;
+            let git_wt = git_wt.clone();
+            tokio::task::spawn_blocking(move || git_wt.delete_bookmark(&branch_name))
+                .await
+                .context("leaf branch disposal task failed")??;
+        }
+        if remote_sha.is_some() {
+            delete_remote_branch_with_lease(
+                project_dir,
+                &remote,
+                &branch.branch,
+                &branch.head_sha,
+            )?;
         }
     }
     let numbers = plan.prs_to_remove.iter().copied().collect::<HashSet<_>>();
@@ -6786,6 +7091,7 @@ mod tests {
         let plan = RecreatePlan {
             worktrees: vec![PathBuf::from(".exo/worktrees/leaf")],
             ordered_branches: Vec::new(),
+            leaf_branches: Vec::new(),
             prs_to_close: vec![43],
             prs_to_remove: vec![43],
             protected: vec![ProtectedPr {
@@ -7010,6 +7316,7 @@ mod tests {
                 observation: ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
                 action: OrderedBranchAction::Remove,
             }],
+            leaf_branches: Vec::new(),
             prs_to_close: Vec::new(),
             prs_to_remove: Vec::new(),
             protected: Vec::new(),
@@ -7115,6 +7422,7 @@ mod tests {
                 observation: ordered_test_observation(OrderedIdentityState::Matching, None),
                 action: OrderedBranchAction::Remove,
             }],
+            leaf_branches: Vec::new(),
             prs_to_close: Vec::new(),
             prs_to_remove: Vec::new(),
             protected: Vec::new(),
@@ -7184,6 +7492,7 @@ mod tests {
                     action: OrderedBranchAction::Remove,
                 },
             ],
+            leaf_branches: Vec::new(),
             prs_to_close: Vec::new(),
             prs_to_remove: Vec::new(),
             protected: Vec::new(),
@@ -7232,6 +7541,7 @@ mod tests {
                 observation: ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
                 action: OrderedBranchAction::Remove,
             }],
+            leaf_branches: Vec::new(),
             prs_to_close: Vec::new(),
             prs_to_remove: Vec::new(),
             protected: Vec::new(),
@@ -7281,6 +7591,182 @@ mod tests {
         assert_eq!(plan.ordered_branches[0].spec.branch, "main.stage");
         assert_eq!(plan.ordered_branches[0].action, OrderedBranchAction::Remove);
         assert!(plan.render().contains("main.stage -> remove"));
+    }
+
+    fn test_leaf_publication(branch: &str, head_sha: &str) -> PublishedHead {
+        PublishedHead {
+            pr_number: 44,
+            head_branch: branch.to_owned(),
+            base_branch: "main".to_owned(),
+            head_sha: head_sha.to_owned(),
+            author_agent: Some("leaf".to_owned()),
+            author_role: Some("dev".to_owned()),
+            provenance: exomonad_core::services::pr_registry::PublicationProvenance::LedgerOwned,
+            slice_id: Some("leaf".to_owned()),
+            invocation_id: Some("inv".to_owned()),
+            invocation_trigger: None,
+            invocation_runtime: None,
+            invocation_succession: Vec::new(),
+        }
+    }
+
+    fn setup_leaf_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("work");
+        let remote = temp.path().join("remote.git");
+        std::fs::create_dir_all(&project).unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(
+            temp.path(),
+            &["init", "--bare", "-q", remote.to_str().unwrap()],
+        );
+        run(&project, &["init", "-q", "-b", "main"]);
+        run(&project, &["config", "user.email", "test@example.invalid"]);
+        run(&project, &["config", "user.name", "Test"]);
+        std::fs::write(project.join("seed"), "seed\n").unwrap();
+        run(&project, &["add", "seed"]);
+        run(&project, &["commit", "-q", "-m", "seed"]);
+        run(
+            &project,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run(&project, &["push", "-q", "origin", "main"]);
+        run(&project, &["checkout", "-q", "-b", "main.leaf"]);
+        std::fs::write(project.join("leaf"), "leaf\n").unwrap();
+        run(&project, &["add", "leaf"]);
+        run(&project, &["commit", "-q", "-m", "leaf"]);
+        run(&project, &["push", "-q", "-u", "origin", "main.leaf"]);
+        let head_sha = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "refs/heads/main.leaf"])
+                .current_dir(&project)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        run(&project, &["checkout", "-q", "main"]);
+        let worktree = project.join(".exo/worktrees/leaf");
+        run(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "main.leaf",
+            ],
+        );
+        (temp, project, remote, head_sha)
+    }
+
+    fn leaf_plan(leaves: Vec<LeafBranchCleanup>) -> RecreatePlan {
+        RecreatePlan {
+            worktrees: Vec::new(),
+            ordered_branches: Vec::new(),
+            leaf_branches: leaves,
+            prs_to_close: Vec::new(),
+            prs_to_remove: vec![44],
+            protected: Vec::new(),
+            dirty_worktrees: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn leaf_branch_action_requires_proven_head_ownership() {
+        let project = Path::new("/repo");
+        assert_eq!(
+            leaf_branch_action("head-a", Some("head-a"), None, false, false, false, project),
+            OrderedBranchAction::Remove
+        );
+        for action in [
+            leaf_branch_action("head-a", Some("other"), None, false, false, false, project),
+            leaf_branch_action("head-a", Some("head-a"), None, true, false, false, project),
+            leaf_branch_action("head-a", Some("head-a"), None, false, true, false, project),
+            leaf_branch_action("head-a", Some("head-a"), None, false, false, true, project),
+        ] {
+            assert!(matches!(action, OrderedBranchAction::Preserve(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn recreate_disposes_verified_leaf_branch_locally_and_remotely() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let publication = test_leaf_publication("main.leaf", &head_sha);
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0].action, OrderedBranchAction::Remove);
+        let plan = leaf_plan(leaves);
+
+        destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap();
+
+        assert!(!git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(!project.join(".exo/worktrees/leaf").exists());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_none());
+
+        // Idempotent retry: an interrupted disposal can be re-run safely.
+        destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_changed_remote_leaf_head() {
+        let (temp, project, remote, head_sha) = setup_leaf_fixture();
+        let publication = test_leaf_publication("main.leaf", &head_sha);
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new())
+            .await
+            .unwrap();
+        let plan = leaf_plan(leaves);
+
+        // Advance the remote leaf head from a second clone.
+        let other = temp.path().join("other");
+        let run = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(
+            temp.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        run(&other, &["config", "user.email", "test@example.invalid"]);
+        run(&other, &["config", "user.name", "Test"]);
+        run(&other, &["checkout", "-q", "main.leaf"]);
+        std::fs::write(other.join("more"), "more\n").unwrap();
+        run(&other, &["add", "more"]);
+        run(&other, &["commit", "-q", "-m", "more"]);
+        run(&other, &["push", "-q", "origin", "main.leaf"]);
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("remote branch"), "{error}");
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(project.join(".exo/worktrees/leaf").exists());
     }
 
     #[tokio::test]
