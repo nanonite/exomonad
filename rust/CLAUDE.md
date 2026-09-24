@@ -77,7 +77,7 @@ rust/CLAUDE.md  ← YOU ARE HERE (router)
 | [exomonad](exomonad/CLAUDE.md) | Binary (`exomonad`) | Init, server, MCP proxy, hooks, and cleanup |
 | exomonad-core | Library | Framework, handlers, services, protocol types, UI protocol |
 | exomonad-proto | Library | Proto-generated types (prost) for FFI + effects |
-| claude-teams-bridge | Binary | Claude Teams compatibility bridge |
+| claude-teams-bridge | Library | Claude Teams compatibility bridge |
 | exomonad-test-support | Library (dev-only) | Shared test scaffolding |
 
 ### Feature Flags (exomonad-core)
