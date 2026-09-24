@@ -2301,17 +2301,18 @@ async fn destroy_recreate_resources(
             receipt.completed_at_millis = current_time_millis() as u64;
             record_recreate_receipt(project_dir, receipt.clone()).await?;
         }
-        // Durable identity: revalidate the worktree and, when relying on
-        // reachability, the retained ref immediately before removal.
+        // Durable identity: always run the final ref-absence and reachability
+        // revalidation, then remove the directory only when it exists. The
+        // check must never be skipped just because the directory is gone.
         {
-            let agent_dir = branch
+            ensure_identity_removal_safe(project_dir, branch, &receipt)?;
+            if let Some(agent_dir) = branch
                 .agent
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
                 .map(|agent| project_dir.join(".exo/agents").join(agent))
-                .filter(|agent_dir| agent_dir.exists());
-            if let Some(agent_dir) = agent_dir {
-                ensure_identity_removal_safe(project_dir, branch, &receipt)?;
+                .filter(|agent_dir| agent_dir.exists())
+            {
                 std::fs::remove_dir_all(&agent_dir)
                     .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
                 receipt.actions.push("remove_identity".to_owned());
@@ -2319,6 +2320,21 @@ async fn destroy_recreate_resources(
             receipt.identity_removed = true;
             receipt.completed_at_millis = current_time_millis() as u64;
             record_recreate_receipt(project_dir, receipt.clone()).await?;
+        }
+    }
+    // Publication metadata is removed only once every leaf ref is provably
+    // gone. A ref that reappeared after a leaf's identity step must keep its
+    // record so a retry can reconcile it through the leased/local deletion
+    // steps.
+    for branch in validated_leaves.iter().copied() {
+        let observation = observe_leaf_branch(project_dir, branch)?;
+        if observation.local_head.is_some() || observation.remote_head.is_some() {
+            anyhow::bail!(
+                "refusing to remove publication metadata for {}: leaf refs are still present (local={}, remote={}); reconcile them before retrying",
+                branch.branch,
+                observation.local_head.as_deref().unwrap_or("absent"),
+                observation.remote_head.as_deref().unwrap_or("absent"),
+            );
         }
     }
     let numbers = plan.prs_to_remove.iter().copied().collect::<HashSet<_>>();
@@ -9281,6 +9297,54 @@ mod tests {
         assert!(remote_branch_sha(&project, "origin", "main.leaf")
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_when_identity_absent_and_ref_reappears() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        // Plan while the identity exists so the leaf action is Remove.
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        assert_eq!(plan.leaf_branches.len(), 1);
+        assert_eq!(plan.leaf_branches[0].action, OrderedBranchAction::Remove);
+        let identity = project.join(".exo/agents/leaf");
+        assert!(identity.exists());
+
+        // A concurrent cleanup removes the identity directory and a same-head
+        // leaf ref reappears right after the local deletion step.
+        let hook = project.join(".git/hooks/reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        let script = format!(
+            "#!/bin/sh\nstate=\"$1\"\nwhile read old new ref; do\n  if [ \"$state\" = \"committed\" ] && [ \"$ref\" = \"refs/heads/main.leaf\" ] && [ \"$new\" = \"0000000000000000000000000000000000000000\" ]; then\n    git -C '{project}' update-ref refs/heads/main.leaf {head}\n    rm -rf '{identity}'\n  fi\ndone\n",
+            project = project.display(),
+            head = head_sha,
+            identity = identity.display(),
+        );
+        std::fs::write(&hook, script).unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("still present"), "{error}");
+        // The reappeared ref stays identifiable at the recorded head and the
+        // publication metadata is retained for a retry.
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+        assert_eq!(
+            git_ref_sha(&project, "refs/heads/main.leaf")
+                .unwrap()
+                .as_deref(),
+            Some(head_sha.as_str())
+        );
+        assert!(!identity.exists());
+        let publications = read_published_heads(&project).await.unwrap();
+        assert!(
+            publications
+                .iter()
+                .any(|publication| publication.pr_number == 44),
+            "publication metadata must be retained"
+        );
     }
 
     #[tokio::test]
