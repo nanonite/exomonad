@@ -935,18 +935,8 @@ async fn leaf_branch_cleanups(
             continue;
         }
         let local_head = git_ref_sha(project_dir, &format!("refs/heads/{branch}"))?;
-        let registered_worktree =
-            git_worktree_for_branch(project_dir, branch)?.filter(|path| path.is_dir());
-        let (worktree, worktree_registered) = match registered_worktree {
-            Some(path) => (Some(path), true),
-            // A directory whose git worktree registration is missing is still
-            // leaf-owned; keep it so the generic sweep cannot remove it without
-            // the leaf's dirty check.
-            None => (
-                conventional_leaf_worktree(project_dir, publication.author_agent.as_deref()),
-                false,
-            ),
-        };
+        let (worktree, worktree_unverifiable) =
+            leaf_worktree_state(project_dir, branch, publication.author_agent.as_deref())?;
         // Remote-only or identity-only residue from an interrupted cleanup must
         // still be enumerated so the next recreate can finish it.
         let remote_head = remote_branch_sha(project_dir, &remote, branch)?;
@@ -972,7 +962,7 @@ async fn leaf_branch_cleanups(
             .iter()
             .any(|item| item.number == publication.pr_number);
         let mut preserve_reason = leaf_identity_mismatch(project_dir, publication, branch);
-        if preserve_reason.is_none() && worktree.is_some() && !worktree_registered {
+        if preserve_reason.is_none() && worktree_unverifiable {
             preserve_reason = Some(
                 "leaf worktree is not registered with git; dirty state cannot be verified"
                     .to_owned(),
@@ -1045,6 +1035,26 @@ fn conventional_leaf_worktree(project_dir: &Path, agent: Option<&str>) -> Option
     path.is_dir().then_some(path)
 }
 
+/// Resolve a leaf's worktree from both possible locations: the git-registered
+/// worktree (which may live elsewhere) and the conventional
+/// `.exo/worktrees/<agent>` directory. A registered worktree does not excuse an
+/// extra unregistered conventional directory, and an unregistered directory's
+/// dirty state cannot be verified, so both are reported as unverifiable.
+fn leaf_worktree_state(
+    project_dir: &Path,
+    branch: &str,
+    agent: Option<&str>,
+) -> Result<(Option<PathBuf>, bool)> {
+    let registered = git_worktree_for_branch(project_dir, branch)?.filter(|path| path.is_dir());
+    let conventional = conventional_leaf_worktree(project_dir, agent);
+    let unverifiable = match (&registered, &conventional) {
+        (None, Some(_)) => true,
+        (Some(registered), Some(conventional)) => !same_path(registered, conventional),
+        _ => false,
+    };
+    Ok((registered.or(conventional), unverifiable))
+}
+
 fn leaf_identity_dir(project_dir: &Path, publication: &PublishedHead) -> Option<PathBuf> {
     let agent = publication.author_agent.as_deref()?.trim();
     if agent.is_empty() {
@@ -1074,17 +1084,11 @@ struct LeafObservation {
 
 fn observe_leaf_branch(project_dir: &Path, leaf: &LeafBranchCleanup) -> Result<LeafObservation> {
     let local_head = git_ref_sha(project_dir, &format!("refs/heads/{}", leaf.branch))?;
-    let registered =
-        git_worktree_for_branch(project_dir, &leaf.branch)?.filter(|path| path.is_dir());
-    let (worktree, worktree_registered) = match registered {
-        Some(path) => (Some(path), true),
-        // Never rely on the path captured at planning time: rederive the
-        // conventional leaf directory so one created after planning is gated.
-        None => (
-            conventional_leaf_worktree(project_dir, leaf.agent.as_deref()),
-            false,
-        ),
-    };
+    // Never rely on the path captured at planning time: rederive both the
+    // registered worktree and the conventional leaf directory so one created
+    // after planning is gated.
+    let (worktree, worktree_unverifiable) =
+        leaf_worktree_state(project_dir, &leaf.branch, leaf.agent.as_deref())?;
     let dirty = worktree
         .as_ref()
         .is_some_and(|path| worktree_is_dirty(path));
@@ -1092,7 +1096,7 @@ fn observe_leaf_branch(project_dir: &Path, leaf: &LeafBranchCleanup) -> Result<L
     Ok(LeafObservation {
         local_head,
         remote_head,
-        worktree_unverifiable: worktree.is_some() && !worktree_registered,
+        worktree_unverifiable,
         worktree,
         dirty,
     })
@@ -1171,6 +1175,9 @@ fn head_reachable_from_retained_refs(
     base_branch: &str,
     head_sha: &str,
 ) -> bool {
+    // Use the fully-qualified branch ref. A bare name resolves tags before
+    // heads, so a tag named `main` pointing at the leaf head could otherwise
+    // authorize identity removal while branch `main` does not contain it.
     let reference = format!("refs/heads/{base_branch}");
     if git_ref_sha(project_dir, &reference)
         .ok()
@@ -1180,11 +1187,38 @@ fn head_reachable_from_retained_refs(
         return false;
     }
     std::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", head_sha, base_branch])
+        .args(["merge-base", "--is-ancestor", head_sha, &reference])
         .current_dir(project_dir)
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Revalidate immediately before removing a leaf's durable identity. The
+/// worktree must still be verifiable, and when the cleanup relies on
+/// reachability rather than a verified bundle the recorded head must still be
+/// contained in a retained ref; either check can have gone stale since the
+/// preservation step.
+fn ensure_identity_removal_safe(
+    project_dir: &Path,
+    leaf: &LeafBranchCleanup,
+    receipt: &RecreateCleanupReceiptEntry,
+) -> Result<()> {
+    let observation = observe_leaf_branch(project_dir, leaf)?;
+    ensure_leaf_unchanged(leaf, &observation)?;
+    let refs_present = observation.local_head.is_some() || observation.remote_head.is_some();
+    if refs_present || receipt.preserved_bundle.is_some() {
+        return Ok(());
+    }
+    if head_reachable_from_retained_refs(project_dir, &leaf.base_branch, &leaf.head_sha) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "identity removal for {} is unsafe: head {} is not reachable from retained branch {} and no verified preservation bundle exists",
+        leaf.branch,
+        leaf.head_sha,
+        leaf.base_branch
+    )
 }
 
 /// Parse the prerequisite commit ids from a bundle's text header. The header
@@ -2258,19 +2292,20 @@ async fn destroy_recreate_resources(
             receipt.completed_at_millis = current_time_millis() as u64;
             record_recreate_receipt(project_dir, receipt.clone()).await?;
         }
-        // Durable identity: always reconcile against the observed directory.
+        // Durable identity: revalidate the worktree and, when relying on
+        // reachability, the retained ref immediately before removal.
         {
-            if let Some(agent) = branch
+            let agent_dir = branch
                 .agent
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
-            {
-                let agent_dir = project_dir.join(".exo/agents").join(agent);
-                if agent_dir.exists() {
-                    std::fs::remove_dir_all(&agent_dir)
-                        .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
-                    receipt.actions.push("remove_identity".to_owned());
-                }
+                .map(|agent| project_dir.join(".exo/agents").join(agent))
+                .filter(|agent_dir| agent_dir.exists());
+            if let Some(agent_dir) = agent_dir {
+                ensure_identity_removal_safe(project_dir, branch, &receipt)?;
+                std::fs::remove_dir_all(&agent_dir)
+                    .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
+                receipt.actions.push("remove_identity".to_owned());
             }
             receipt.identity_removed = true;
             receipt.completed_at_millis = current_time_millis() as u64;
@@ -9177,6 +9212,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recreate_gates_identity_only_residue_when_tag_shadows_base() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        // A tag named `main` points at the leaf head while branch main does not.
+        run_git(
+            &project,
+            &["tag", "main", &head_sha],
+            "tag main at leaf head",
+        )
+        .unwrap();
+        remove_leaf_refs(&project).await;
+
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        assert_eq!(plan.leaf_branches.len(), 1);
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("identity-only residue"),
+            "{error}"
+        );
+        assert!(project.join(".exo/agents/leaf").exists());
+    }
+
+    #[tokio::test]
+    async fn identity_removal_revalidation_rejects_unreachable_head() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        run_git(
+            &project,
+            &["tag", "main", &head_sha],
+            "tag main at leaf head",
+        )
+        .unwrap();
+        remove_leaf_refs(&project).await;
+
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        let leaf = &plan.leaf_branches[0];
+        let receipt = RecreateCleanupReceiptEntry::for_leaf(leaf);
+        let error = ensure_identity_removal_safe(&project, leaf, &receipt).unwrap_err();
+        assert!(error.to_string().contains("identity removal"), "{error}");
+        assert!(project.join(".exo/agents/leaf").exists());
+    }
+
+    #[tokio::test]
     async fn recreate_does_not_force_remove_unregistered_leaf_worktree() {
         let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
         let worktree = project.join(".exo/worktrees/leaf");
@@ -9238,6 +9316,56 @@ mod tests {
         assert!(remote_branch_sha(&project, "origin", "main.leaf")
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn recreate_gates_unregistered_conventional_dir_beside_registered_worktree() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let conventional = project.join(".exo/worktrees/leaf");
+        let elsewhere = project.join(".exo/other/leaf");
+        // Move the git worktree registration to a non-conventional path.
+        run_git(
+            &project,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                conventional.to_str().unwrap(),
+            ],
+            "remove conventional worktree",
+        )
+        .unwrap();
+        run_git(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                elsewhere.to_str().unwrap(),
+                "main.leaf",
+            ],
+            "add worktree elsewhere",
+        )
+        .unwrap();
+
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        assert_eq!(plan.leaf_branches.len(), 1);
+        assert!(plan.leaf_branches[0]
+            .worktree
+            .as_deref()
+            .is_some_and(|path| same_path(path, &elsewhere)));
+        // An unregistered conventional directory appears beside the registered
+        // worktree and must not escape validation.
+        std::fs::create_dir_all(&conventional).unwrap();
+        std::fs::write(conventional.join("uncommitted"), "dirty\n").unwrap();
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not registered"), "{error}");
+        assert!(conventional.join("uncommitted").exists());
+        assert!(elsewhere.exists());
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
     }
 
     #[tokio::test]
