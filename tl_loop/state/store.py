@@ -505,6 +505,58 @@ class RunStore:
             except FileNotFoundError:
                 pass
 
+    @property
+    def event_audit_path(self) -> Path:
+        """Return the permanent audit log for refused historical events.
+
+        Audit rows are distinct from the pending event-quarantine queue: they
+        are never replayed, acknowledged, or removed, so a historical event
+        stays queryable for audit across every restart.
+        """
+        return self.run_dir / "event-audit.json"
+
+    def append_audit_event(self, event: Mapping[str, object]) -> None:
+        """Retain one refused historical event permanently for audit."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        entries = [dict(item) for item in self.audited_events()]
+        run_seq = event.get("run_seq")
+        if any(item.get("run_seq") == run_seq for item in entries):
+            return
+        normalized = to_jsonable(event)
+        if not isinstance(normalized, dict):
+            raise QuarantineStorageError(self.event_audit_path, "event must be an object")
+        entries.append(normalized)
+        temporary = self.event_audit_path.with_suffix(".tmp")
+        temporary.write_text(dumps_json(entries, sort_keys=True), encoding="utf-8")
+        temporary.replace(self.event_audit_path)
+
+    def audited_events(self) -> tuple[Mapping[str, object], ...]:
+        """Read permanently retained audit events; never replayed or released."""
+        try:
+            payload = json.loads(self.event_audit_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return ()
+        except OSError as error:
+            raise QuarantineStorageError(
+                self.event_audit_path,
+                "read failed",
+                cause=error,
+            ) from error
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise QuarantineStorageError(
+                self.event_audit_path,
+                "invalid JSON or UTF-8",
+                cause=error,
+            ) from error
+        if not isinstance(payload, list):
+            raise QuarantineStorageError(self.event_audit_path, "root must be a JSON array")
+        if any(not isinstance(item, dict) for item in payload):
+            raise QuarantineStorageError(
+                self.event_audit_path,
+                "every entry must be a JSON object",
+            )
+        return tuple(MappingProxyType(dict(item)) for item in payload)
+
     def record_terminal_summary(self, summary: Mapping[str, object]) -> None:
         """Persist terminal diagnostics independently of the tmux process."""
         self.run_dir.mkdir(parents=True, exist_ok=True)

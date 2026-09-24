@@ -55,6 +55,7 @@ from tl_loop.loop.driver import (
     _initial_slices,
     _merge_result_is_authoritative,
     _ordered_child_complete,
+    _publication_from_watcher,
     _park_repeated_action,
     _phase_after_slice_merge,
     _record_review_event,
@@ -3653,6 +3654,133 @@ def test_pr_filed_refuses_prior_controller_epoch(tmp_path: Path) -> None:
     )
 
     assert bound["leaf-a"].publication is None
+
+
+def test_historical_publication_rejected_before_reduction_across_recreate(
+    tmp_path: Path,
+) -> None:
+    run_id = "recreate-publication-run"
+    agent_id = "tunable-operator-body-opencode"
+    leaf = "tunable-operator-body"
+
+    def pr_filed(seq: int, invocation: str, number: int, head: str) -> EventEnvelope:
+        return project(
+            {
+                "type": "pr.filed",
+                "run_seq": seq,
+                "run_id": run_id,
+                "agent_id": agent_id,
+                "invocation_id": invocation,
+                "lifecycle_state": "observed",
+                "observed_at": "2026-09-22T00:00:00Z",
+                "data": {
+                    "slice_id": leaf,
+                    "pr_number": number,
+                    "head_sha": head,
+                    "head_branch": f"main.{agent_id}",
+                    "base_branch": "main",
+                },
+            }
+        )
+
+    source = SyntheticQueue(
+        [
+            pr_filed(1, "inv-current", 45, "head-45"),
+            # Historical #44 from the predecessor run replays after #45.
+            pr_filed(2, "inv-historical", 44, "head-44"),
+            _event(3, "all_children_done", run_id=run_id),
+        ]
+    )
+    transport = RecordingTransport(
+        spawned_agent_id=agent_id,
+        spawned_invocation_id="inv-current",
+    )
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": leaf,
+                    "task": "implement the change",
+                    "boundary": ["src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "done_criteria": ["covered"],
+                }
+            ]
+        }
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(transport),
+        config=TLLoopConfig(
+            max_workers=0,
+            max_leaves=1,
+            max_events=3,
+            poll_interval=0.001,
+        ),
+        root_dir=tmp_path,
+    )
+
+    # The rejected historical event must not have reached the reducer: #45's
+    # publication, head, and PR number survive and no recovery state appears.
+    final = result.final_state.slices[leaf]
+    assert final.publication is not None
+    assert final.publication.pr_number == 45
+    assert final.publication.head_sha == "head-45"
+    assert final.pr_number == 45
+    assert final.recovery is None
+    assert final.handoff is not None and final.handoff.head_sha == "head-45"
+
+    # The refusal is permanent audit evidence, never pending replay work.
+    store = RunStore(run_id, tmp_path)
+    assert store.quarantined_events() == ()
+    assert any(entry.get("run_seq") == 2 for entry in store.audited_events())
+    # A restart reloads the audit row but never replays or releases it.
+    reloaded = RunStore(run_id, tmp_path)
+    assert reloaded.quarantined_events() == ()
+    assert any(entry.get("run_seq") == 2 for entry in reloaded.audited_events())
+
+
+def test_publication_from_watcher_refuses_invocation_mismatch(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-current",
+    )
+    watcher = {
+        "found": True,
+        "pr_number": 45,
+        "head_sha": "head-45",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "publication_ownership_verified": True,
+        "publication": {
+            "invocation_id": "inv-host",
+            "slice_id": "leaf-a",
+            "author_agent": "leaf-a",
+            "succession_invocation_ids": [],
+        },
+    }
+
+    publication = _publication_from_watcher(current, watcher, "head-45", "leaf-a")
+
+    assert publication is None
+
+    matching = {
+        **watcher,
+        "publication": {
+            "invocation_id": "inv-current",
+            "slice_id": "leaf-a",
+            "author_agent": "leaf-a",
+            "succession_invocation_ids": [],
+        },
+    }
+    publication = _publication_from_watcher(current, matching, "head-45", "leaf-a")
+    assert publication is not None
+    assert publication.invocation_id == "inv-current"
 
 
 def test_worker_self_approval_is_not_gate_evidence(tmp_path: Path) -> None:
