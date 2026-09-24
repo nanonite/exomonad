@@ -935,11 +935,22 @@ async fn leaf_branch_cleanups(
             continue;
         }
         let local_head = git_ref_sha(project_dir, &format!("refs/heads/{branch}"))?;
-        let worktree = git_worktree_for_branch(project_dir, branch)?.filter(|path| path.is_dir());
-        // Remote-only residue from an interrupted cleanup must still be
-        // enumerated so the next recreate can finish it.
+        let registered_worktree =
+            git_worktree_for_branch(project_dir, branch)?.filter(|path| path.is_dir());
+        let (worktree, worktree_registered) = match registered_worktree {
+            Some(path) => (Some(path), true),
+            // A directory whose git worktree registration is missing is still
+            // leaf-owned; keep it so the generic sweep cannot remove it without
+            // the leaf's dirty check.
+            None => (leaf_fallback_worktree(project_dir, publication), false),
+        };
+        // Remote-only or identity-only residue from an interrupted cleanup must
+        // still be enumerated so the next recreate can finish it.
         let remote_head = remote_branch_sha(project_dir, &remote, branch)?;
-        if local_head.is_none() && worktree.is_none() && remote_head.is_none() {
+        let identity_present =
+            leaf_identity_dir(project_dir, publication).is_some_and(|dir| dir.is_dir());
+        if local_head.is_none() && worktree.is_none() && remote_head.is_none() && !identity_present
+        {
             continue;
         }
         let dirty = worktree
@@ -958,6 +969,12 @@ async fn leaf_branch_cleanups(
             .iter()
             .any(|item| item.number == publication.pr_number);
         let mut preserve_reason = leaf_identity_mismatch(project_dir, publication, branch);
+        if preserve_reason.is_none() && worktree.is_some() && !worktree_registered {
+            preserve_reason = Some(
+                "leaf worktree is not registered with git; dirty state cannot be verified"
+                    .to_owned(),
+            );
+        }
         if preserve_reason.is_none() {
             if let Some((client, repo)) = forgejo {
                 preserve_reason = leaf_forgejo_mismatch(client, repo, publication, branch).await?;
@@ -1012,6 +1029,26 @@ fn worktree_is_dirty(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
+/// The conventional worktree directory for an issue-owned leaf, used when the
+/// git worktree registration is missing so the directory is still recognized as
+/// leaf-owned (and thus never force-removed by the generic cleanup sweep).
+fn leaf_fallback_worktree(project_dir: &Path, publication: &PublishedHead) -> Option<PathBuf> {
+    let agent = publication.author_agent.as_deref()?.trim();
+    if agent.is_empty() {
+        return None;
+    }
+    let path = project_dir.join(".exo/worktrees").join(agent);
+    path.is_dir().then_some(path)
+}
+
+fn leaf_identity_dir(project_dir: &Path, publication: &PublishedHead) -> Option<PathBuf> {
+    let agent = publication.author_agent.as_deref()?.trim();
+    if agent.is_empty() {
+        return None;
+    }
+    Some(project_dir.join(".exo/agents").join(agent))
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
@@ -1021,18 +1058,24 @@ fn same_path(left: &Path, right: &Path) -> bool {
 
 /// A fresh observation of one leaf branch taken immediately before a
 /// destructive step. Every present ref must still equal the recorded
-/// publication head; a moved head, a dirty worktree, or an out-of-project
+/// publication head; a moved head, a dirty worktree, or an unverifiable
 /// worktree refuses the disposal.
 struct LeafObservation {
     local_head: Option<String>,
     remote_head: Option<String>,
     worktree: Option<PathBuf>,
+    worktree_unverifiable: bool,
     dirty: bool,
 }
 
 fn observe_leaf_branch(project_dir: &Path, leaf: &LeafBranchCleanup) -> Result<LeafObservation> {
     let local_head = git_ref_sha(project_dir, &format!("refs/heads/{}", leaf.branch))?;
-    let worktree = git_worktree_for_branch(project_dir, &leaf.branch)?.filter(|path| path.is_dir());
+    let registered =
+        git_worktree_for_branch(project_dir, &leaf.branch)?.filter(|path| path.is_dir());
+    let (worktree, worktree_registered) = match registered {
+        Some(path) => (Some(path), true),
+        None => (leaf.worktree.clone().filter(|path| path.is_dir()), false),
+    };
     let dirty = worktree
         .as_ref()
         .is_some_and(|path| worktree_is_dirty(path));
@@ -1040,12 +1083,19 @@ fn observe_leaf_branch(project_dir: &Path, leaf: &LeafBranchCleanup) -> Result<L
     Ok(LeafObservation {
         local_head,
         remote_head,
+        worktree_unverifiable: worktree.is_some() && !worktree_registered,
         worktree,
         dirty,
     })
 }
 
 fn ensure_leaf_unchanged(leaf: &LeafBranchCleanup, observation: &LeafObservation) -> Result<()> {
+    if observation.worktree_unverifiable {
+        anyhow::bail!(
+            "leaf branch {} worktree is not registered with git; refusing to dispose it",
+            leaf.branch
+        );
+    }
     if observation.dirty {
         anyhow::bail!(
             "leaf branch {} became dirty during recreate; refusing to dispose it",
@@ -1139,6 +1189,34 @@ fn verify_preservation_bundle(project_dir: &Path, path: &Path, expected_head: &s
     if !advertised.iter().any(|sha| sha == expected_head) {
         anyhow::bail!(
             "preservation bundle {} does not advertise recorded head {}",
+            path.display(),
+            expected_head
+        );
+    }
+    // `verify` and `list-heads` read only the bundle header, so a truncated
+    // pack can pass both. Actually import the pack to prove the exact head is
+    // restorable; `unbundle` fails on any truncation or corruption.
+    let unbundle = std::process::Command::new("git")
+        .args(["bundle", "unbundle", path.to_string_lossy().as_ref()])
+        .current_dir(project_dir)
+        .output()
+        .with_context(|| format!("failed to import preservation bundle {}", path.display()))?;
+    if !unbundle.status.success() {
+        anyhow::bail!(
+            "preservation bundle {} could not be restored: {}",
+            path.display(),
+            String::from_utf8_lossy(&unbundle.stderr).trim()
+        );
+    }
+    // The imported pack must yield the exact commit object.
+    let present = std::process::Command::new("git")
+        .args(["cat-file", "-e", &format!("{expected_head}^{{commit}}")])
+        .current_dir(project_dir)
+        .output()
+        .with_context(|| format!("failed to inspect restored head {expected_head}"))?;
+    if !present.status.success() {
+        anyhow::bail!(
+            "preservation bundle {} did not restore commit {}",
             path.display(),
             expected_head
         );
@@ -1663,6 +1741,14 @@ async fn destroy_recreate_resources(
         .iter()
         .filter_map(|branch| branch.worktree.clone())
         .collect::<Vec<_>>();
+    // Directory names of issue-owned leaves. A leaf directory whose git
+    // worktree registration is missing is still excluded from the generic
+    // sweep, so its dirty state is checked by the leaf disposal instead.
+    let leaf_slugs = plan
+        .leaf_branches
+        .iter()
+        .filter_map(|branch| branch.agent.clone())
+        .collect::<HashSet<_>>();
     let publications = read_published_heads(project_dir).await?;
     let publication_by_pr = publications
         .iter()
@@ -1859,6 +1945,13 @@ async fn destroy_recreate_resources(
             continue;
         }
         if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|slug| leaf_slugs.contains(slug))
+        {
+            continue;
+        }
+        if path
             .parent()
             .is_some_and(|parent| parent.ends_with(".exo/worktrees"))
         {
@@ -1948,16 +2041,6 @@ async fn destroy_recreate_resources(
                 }
                 None => receipt.preserved_bundle = None,
             }
-            receipt.preservation_checked = true;
-            receipt.completed_at_millis = current_time_millis() as u64;
-            record_recreate_receipt(project_dir, receipt.clone()).await?;
-        } else if !receipt.preservation_checked {
-            // Every ref vanished before preservation was ever recorded, so
-            // recoverability of any unmerged commits cannot be proven.
-            anyhow::bail!(
-                "cannot verify unmerged-commit preservation for {}: no refs remain and no receipted bundle exists",
-                branch.branch
-            );
         } else if let Some(bundle) = receipt.preserved_bundle.clone() {
             let path = PathBuf::from(&bundle);
             if !path.exists() {
@@ -1969,6 +2052,11 @@ async fn destroy_recreate_resources(
             }
             verify_preservation_bundle(project_dir, &path, &branch.head_sha)?;
         }
+        // No refs and no receipted bundle means there is nothing left to
+        // delete; identity-only residue can be completed without a bundle.
+        receipt.preservation_checked = true;
+        receipt.completed_at_millis = current_time_millis() as u64;
+        record_recreate_receipt(project_dir, receipt.clone()).await?;
         // Remote ref: always reconcile against the observed remote. A ref that
         // reappeared after a prior receipt is deleted again under a fresh SHA
         // lease; a changed head fails closed.
@@ -8871,10 +8959,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recreate_refuses_unverifiable_preservation_when_refs_vanish() {
+    async fn recreate_cleans_identity_only_leaf_residue() {
         let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
-        let plan = leaf_fixture_plan(&project, &head_sha).await;
-        // Refs vanish after planning but before preservation was ever recorded.
+        // Planning must still enumerate a leaf whose refs and worktree are gone
+        // but whose durable identity remains, so a crash between branch
+        // deletion and identity removal does not strand it.
         let worktree = project.join(".exo/worktrees/leaf");
         run_git(
             &project,
@@ -8895,16 +8984,57 @@ mod tests {
         )
         .unwrap();
 
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        assert_eq!(
+            plan.leaf_branches.len(),
+            1,
+            "identity residue must be planned"
+        );
+        destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap();
+        assert!(!project.join(".exo/agents/leaf").exists());
+        let receipts = read_recreate_receipts(&project).await.unwrap();
+        let receipt = receipts
+            .iter()
+            .find(|entry| entry.branch == "main.leaf")
+            .expect("identity-only receipt must be persisted");
+        assert!(receipt.actions.contains(&"remove_identity".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn recreate_does_not_force_remove_unregistered_leaf_worktree() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let worktree = project.join(".exo/worktrees/leaf");
+        // Drop the git worktree registration but leave a leaf-owned directory
+        // with uncommitted content behind.
+        run_git(
+            &project,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+            "remove leaf worktree",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("uncommitted"), "dirty\n").unwrap();
+
+        let mut plan = leaf_fixture_plan(&project, &head_sha).await;
+        assert_eq!(plan.leaf_branches.len(), 1);
+        assert!(
+            matches!(
+                plan.leaf_branches[0].action,
+                OrderedBranchAction::Preserve(_)
+            ),
+            "an unregistered leaf worktree must gate rather than be force-removed"
+        );
+        // The generic sweep would otherwise remove this directory.
+        plan.worktrees = vec![worktree.clone()];
+
         let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("cannot verify unmerged-commit preservation"),
-            "{error}"
-        );
-        assert!(project.join(".exo/agents/leaf").exists());
+        assert!(error.to_string().contains("not registered"), "{error}");
+        assert!(worktree.join("uncommitted").exists());
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
     }
 
     #[tokio::test]
@@ -8925,6 +9055,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("does not advertise"), "{error}");
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_truncated_preservation_bundle() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        let bundle = leaf_preservation_path(&project, "main.leaf", &head_sha);
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        run_git(
+            &project,
+            &[
+                "bundle",
+                "create",
+                bundle.to_str().unwrap(),
+                "refs/heads/main.leaf",
+                "^main",
+            ],
+            "create bundle",
+        )
+        .unwrap();
+        // Drop the pack tail: the bundle header still advertises the head and
+        // `bundle verify` still succeeds, so only a real import can catch it.
+        let bytes = std::fs::read(&bundle).unwrap();
+        assert!(bytes.len() > 40);
+        std::fs::write(&bundle, &bytes[..bytes.len() - 20]).unwrap();
+        let verify = std::process::Command::new("git")
+            .args(["bundle", "verify", bundle.to_str().unwrap()])
+            .current_dir(&project)
+            .status()
+            .unwrap();
+        assert!(
+            verify.success(),
+            "test setup: truncated bundle passes verify"
+        );
+        let heads = std::process::Command::new("git")
+            .args(["bundle", "list-heads", bundle.to_str().unwrap()])
+            .current_dir(&project)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&heads.stdout).contains(&head_sha),
+            "test setup: truncated bundle still advertises the head"
+        );
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("could not be restored"),
+            "{error}"
+        );
         assert!(git_branch_exists(&project, "main.leaf").unwrap());
         assert!(remote_branch_sha(&project, "origin", "main.leaf")
             .unwrap()
