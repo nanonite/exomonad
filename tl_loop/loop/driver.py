@@ -2175,6 +2175,9 @@ def _run_loop(
             if slice_state.dispatch_started_at is not None
         }
     )
+    # Move any legacy audit-marked pending rows to permanent audit storage
+    # before replay selection so they are never replayed or released.
+    _migrate_audit_marked_quarantine(store)
     quarantined: list[EventEnvelope] = []
     for document in store.quarantined_events():
         try:
@@ -2613,6 +2616,9 @@ def _run_loop(
                 )
                 if not replaying:
                     diagnostics.acknowledged += 1
+                # The audit record is durable; only now drop a replayed pending
+                # row so a legacy audit row cannot survive in the replay queue.
+                _release_replayed_event(store, event, replaying)
                 state = store.load()
                 continue
         try:
@@ -7123,24 +7129,36 @@ def _publication_from_watcher(
             record_owner,
         )
         return None
+    # The durable record's original publishing invocation is required; never
+    # infer it from the current dispatch when provenance is missing.
     record_invocation_id = _publication_record_text(publication_record, "invocation_id")
-    expected_invocation = current.dispatch_invocation_id
-    allowed_invocations = {
+    if not record_invocation_id:
+        LOGGER.warning(
+            "[TL loop] refusing publication evidence for %s: publication record has "
+            "no durable invocation provenance",
+            current.id,
+        )
+        return None
+    # Succession is directional: the current dispatch or active recovery
+    # invocation must be reachable from the recorded original invocation, not
+    # the other way around.
+    succession = _publication_record_succession(publication_record)
+    active_invocations = [
         value
-        for value in (expected_invocation, _recorded_recovery_invocation(current))
+        for value in (
+            current.dispatch_invocation_id,
+            _recorded_recovery_invocation(current),
+        )
         if value is not None
-    }
-    allowed_invocations.update(_publication_record_succession(publication_record))
-    if (
-        record_invocation_id is not None
-        and expected_invocation is not None
-        and record_invocation_id not in allowed_invocations
+    ]
+    if active_invocations and not any(
+        active == record_invocation_id or active in succession
+        for active in active_invocations
     ):
         LOGGER.warning(
-            "[TL loop] refusing watcher publication evidence for %s: invocation %s "
-            "does not match the current dispatch invocation",
+            "[TL loop] refusing publication evidence for %s: current or recovery "
+            "invocation is not reachable from the recorded publication invocation",
             current.id,
-            record_invocation_id,
         )
         return None
     return PublicationBinding(
@@ -7149,11 +7167,7 @@ def _publication_from_watcher(
         head_branch=head_branch,
         base_branch=base_branch,
         attempt=existing.attempt if existing is not None else current.attempts,
-        invocation_id=(
-            record_invocation_id
-            or (existing.invocation_id if existing is not None else None)
-            or expected_invocation
-        ),
+        invocation_id=record_invocation_id,
     )
 
 
@@ -11940,6 +11954,24 @@ def _quarantine_historical_publication(
             "correlation_reason": reason,
         }
     )
+
+
+def _migrate_audit_marked_quarantine(store: RunStore) -> None:
+    """Move legacy audit-marked pending rows into permanent audit storage.
+
+    Older code wrote historical-refusal records into the replayable pending
+    quarantine queue. A pending row already marked as audit evidence is copied
+    to permanent audit storage and then removed from the queue, so it is never
+    replayed or released and never lost. The audit append happens first; a
+    failed append leaves the pending row intact.
+    """
+    for document in store.quarantined_events():
+        if document.get("correlation") != "publication_history_audit":
+            continue
+        store.append_audit_event(document)
+        run_seq = document.get("run_seq")
+        if isinstance(run_seq, int):
+            store.release_quarantined_event(run_seq)
 
 
 def _recorded_recovery_invocation(current: SliceState) -> str | None:

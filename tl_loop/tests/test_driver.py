@@ -25,7 +25,7 @@ from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
-from tl_loop.fsm.recovery import begin_recovery
+from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
 from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
@@ -54,6 +54,7 @@ from tl_loop.loop.driver import (
     _execute_direct_reviewer_intent,
     _initial_slices,
     _merge_result_is_authoritative,
+    _migrate_audit_marked_quarantine,
     _ordered_child_complete,
     _publication_from_watcher,
     _park_repeated_action,
@@ -3686,9 +3687,12 @@ def test_historical_publication_rejected_before_reduction_across_recreate(
     source = SyntheticQueue(
         [
             pr_filed(1, "inv-current", 45, "head-45"),
-            # Historical #44 from the predecessor run replays after #45.
-            pr_filed(2, "inv-historical", 44, "head-44"),
-            _event(3, "all_children_done", run_id=run_id),
+            # Establish a real active recovery before the historical replay.
+            _blocked_event(2, leaf, run_id),
+            # Historical #44 from the predecessor run replays after #45 and the
+            # active recovery; it must disturb neither.
+            pr_filed(3, "inv-historical", 44, "head-44"),
+            _event(4, "all_children_done", run_id=run_id),
         ]
     )
     transport = RecordingTransport(
@@ -3717,40 +3721,38 @@ def test_historical_publication_rejected_before_reduction_across_recreate(
         config=TLLoopConfig(
             max_workers=0,
             max_leaves=1,
-            max_events=3,
+            max_events=4,
             poll_interval=0.001,
         ),
         root_dir=tmp_path,
     )
 
     # The rejected historical event must not have reached the reducer: #45's
-    # publication, head, and PR number survive and no recovery state appears.
+    # publication, head, handoff, PR number, and the seeded active recovery all
+    # survive.
     final = result.final_state.slices[leaf]
     assert final.publication is not None
     assert final.publication.pr_number == 45
     assert final.publication.head_sha == "head-45"
     assert final.pr_number == 45
-    assert final.recovery is None
+    assert final.recovery is not None
+    assert final.recovery.cause == ParkCause.BASE_CI_UNSTABLE.value
     assert final.handoff is not None and final.handoff.head_sha == "head-45"
 
     # The refusal is permanent audit evidence, never pending replay work.
     store = RunStore(run_id, tmp_path)
     assert store.quarantined_events() == ()
-    assert any(entry.get("run_seq") == 2 for entry in store.audited_events())
+    assert any(entry.get("run_seq") == 3 for entry in store.audited_events())
     # A restart reloads the audit row but never replays or releases it.
     reloaded = RunStore(run_id, tmp_path)
     assert reloaded.quarantined_events() == ()
-    assert any(entry.get("run_seq") == 2 for entry in reloaded.audited_events())
+    assert any(entry.get("run_seq") == 3 for entry in reloaded.audited_events())
 
 
-def test_publication_from_watcher_refuses_invocation_mismatch(tmp_path: Path) -> None:
-    store = _review_store(tmp_path)
-    current = replace(
-        store.load().slices["leaf-a"],
-        dispatch_agent_id="leaf-a",
-        dispatch_invocation_id="inv-current",
-    )
-    watcher = {
+def _watcher_publication(
+    invocation_id: str | None, succession: tuple[str, ...] = ()
+) -> dict[str, object]:
+    return {
         "found": True,
         "pr_number": 45,
         "head_sha": "head-45",
@@ -3758,29 +3760,157 @@ def test_publication_from_watcher_refuses_invocation_mismatch(tmp_path: Path) ->
         "base_branch": "main",
         "publication_ownership_verified": True,
         "publication": {
-            "invocation_id": "inv-host",
+            "invocation_id": invocation_id,
             "slice_id": "leaf-a",
             "author_agent": "leaf-a",
-            "succession_invocation_ids": [],
+            "succession_invocation_ids": list(succession),
         },
     }
 
-    publication = _publication_from_watcher(current, watcher, "head-45", "leaf-a")
 
-    assert publication is None
+def _watcher_current(root: Path, invocation_id: str | None) -> SliceState:
+    store = _review_store(root)
+    return replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id=invocation_id,
+    )
 
-    matching = {
-        **watcher,
-        "publication": {
-            "invocation_id": "inv-current",
-            "slice_id": "leaf-a",
-            "author_agent": "leaf-a",
-            "succession_invocation_ids": [],
-        },
-    }
-    publication = _publication_from_watcher(current, matching, "head-45", "leaf-a")
+
+def test_publication_from_watcher_refuses_invocation_mismatch(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    assert _publication_from_watcher(
+        current, _watcher_publication("inv-host"), "head-45", "leaf-a"
+    ) is None
+    publication = _publication_from_watcher(
+        current, _watcher_publication("inv-current"), "head-45", "leaf-a"
+    )
     assert publication is not None
     assert publication.invocation_id == "inv-current"
+
+
+def test_publication_from_watcher_refuses_missing_invocation_provenance(
+    tmp_path: Path,
+) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    assert _publication_from_watcher(
+        current, _watcher_publication(None), "head-45", "leaf-a"
+    ) is None
+    assert _publication_from_watcher(
+        current, _watcher_publication(""), "head-45", "leaf-a"
+    ) is None
+
+
+def test_publication_from_watcher_refuses_unrelated_succession(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-origin", ("inv-other", "inv-third"))
+    assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
+
+
+def test_publication_from_watcher_binds_succession_in_origin_direction(
+    tmp_path: Path,
+) -> None:
+    # One hop: current invocation is reachable from the recorded origin.
+    one_hop = _watcher_current(tmp_path / "one-hop", "inv-hop1")
+    publication = _publication_from_watcher(
+        one_hop,
+        _watcher_publication("inv-origin", ("inv-hop1",)),
+        "head-45",
+        "leaf-a",
+    )
+    assert publication is not None
+    assert publication.invocation_id == "inv-origin"
+
+    # Multi hop: a later invocation is still reachable from the origin.
+    multi_hop = _watcher_current(tmp_path / "multi-hop", "inv-hop2")
+    publication = _publication_from_watcher(
+        multi_hop,
+        _watcher_publication("inv-origin", ("inv-hop1", "inv-hop2")),
+        "head-45",
+        "leaf-a",
+    )
+    assert publication is not None
+    assert publication.invocation_id == "inv-origin"
+
+    # The origin itself remains valid.
+    origin = _watcher_current(tmp_path / "origin", "inv-origin")
+    publication = _publication_from_watcher(
+        origin, _watcher_publication("inv-origin"), "head-45", "leaf-a"
+    )
+    assert publication is not None
+    assert publication.invocation_id == "inv-origin"
+
+
+def test_publication_from_watcher_binds_active_recovery_invocation(
+    tmp_path: Path,
+) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-stale",
+        recovery=RecoveryState(
+            cause="stall_detected",
+            phase=RecoveryPhase.WAITING_SIGNAL,
+            recovery_round=1,
+            next_action="wait_for_signal",
+            owner_run_id="review-run",
+            entered_at=0.0,
+            slice_attempt=1,
+            owner_agent_id="leaf-a",
+            evidence={"invocation_id": "inv-recovery"},
+        ),
+    )
+    publication = _publication_from_watcher(
+        current,
+        _watcher_publication("inv-origin", ("inv-recovery",)),
+        "head-45",
+        "leaf-a",
+    )
+    assert publication is not None
+    assert publication.invocation_id == "inv-origin"
+
+
+def test_audit_marked_pending_row_migrates_to_permanent_audit(tmp_path: Path) -> None:
+    run_id = "audit-migration-run"
+    store = RunStore(run_id, tmp_path)
+    store.quarantine_event(
+        {
+            "type": "pr.filed",
+            "run_seq": 39829,
+            "run_id": run_id,
+            "agent_id": "leaf-a",
+            "invocation_id": "inv-historical",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-09-22T00:00:00Z",
+            "correlation": "publication_history_audit",
+            "correlation_reason": "invocation mismatch",
+            "data": {"slice_id": "leaf-a", "pr_number": 44, "head_sha": "head-44"},
+        }
+    )
+    # A non-audit pending row must stay replayable.
+    store.quarantine_event(
+        {
+            "type": "pr.filed",
+            "run_seq": 7,
+            "run_id": run_id,
+            "agent_id": "leaf-a",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-09-22T00:00:00Z",
+            "data": {"slice_id": "leaf-a", "pr_number": 45, "head_sha": "head-45"},
+        }
+    )
+    assert len(store.quarantined_events()) == 2
+
+    _migrate_audit_marked_quarantine(store)
+
+    pending = store.quarantined_events()
+    assert [entry.get("run_seq") for entry in pending] == [7]
+    assert any(entry.get("run_seq") == 39829 for entry in store.audited_events())
+    # The audit row survives a reload and never returns to the pending queue.
+    reloaded = RunStore(run_id, tmp_path)
+    assert [entry.get("run_seq") for entry in reloaded.quarantined_events()] == [7]
+    assert any(entry.get("run_seq") == 39829 for entry in reloaded.audited_events())
 
 
 def test_worker_self_approval_is_not_gate_evidence(tmp_path: Path) -> None:

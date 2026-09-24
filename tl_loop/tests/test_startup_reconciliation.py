@@ -90,6 +90,8 @@ class FakeClient:
     head_reachable: bool = True
     publication_ownership_verified: bool = True
     publication_ownership_error: str = ""
+    publication_invocation_id: str | None = None
+    publication_succession: tuple[str, ...] = ()
     review_id: int | None = None
     review_verdict: str | None = None
     review_head_sha: str | None = None
@@ -153,6 +155,13 @@ class FakeClient:
             }
             result["publication_ownership_verified"] = self.publication_ownership_verified
             result["publication_ownership_error"] = self.publication_ownership_error
+            if self.publication_invocation_id is not None:
+                result["publication"] = {
+                    "invocation_id": self.publication_invocation_id,
+                    "slice_id": "slice-a",
+                    "author_agent": "agent-a",
+                    "succession_invocation_ids": list(self.publication_succession),
+                }
             if self.review_id is not None:
                 result["review_id"] = self.review_id
             if self.review_verdict is not None:
@@ -290,7 +299,10 @@ def test_reconciliation_recovers_and_persists_missing_pr_number(tmp_path) -> Non
         state.budgets,
         state.events.last_consumed_offset,
     )
-    client = FakeClient(publication_ownership_verified=True)
+    client = FakeClient(
+        publication_ownership_verified=True,
+        publication_invocation_id="invocation-a",
+    )
     config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
 
     new_state = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
@@ -362,7 +374,11 @@ def test_reconciliation_adopts_authoritative_publication_handoff_after_restart(
         state.budgets,
         state.events.last_consumed_offset,
     )
-    client = FakeClient(publication_ownership_verified=True)
+    client = FakeClient(
+        publication_ownership_verified=True,
+        publication_invocation_id="inv-old",
+        publication_succession=("inv-new",),
+    )
     config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
 
     new_state = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
@@ -377,6 +393,7 @@ def test_reconciliation_adopts_authoritative_publication_handoff_after_restart(
     assert recovered.publication is not None
     assert recovered.publication.head_sha == "head-a"
     assert recovered.publication.head_branch == "main.slice-a"
+    assert recovered.publication.invocation_id == "inv-old"
     assert store.load().slices["slice-a"].handoff == recovered.handoff
 
 
@@ -394,7 +411,10 @@ def test_reconciliation_rebuilds_publication_and_handoff_when_pr_number_was_lost
         state.budgets,
         state.events.last_consumed_offset,
     )
-    client = FakeClient(publication_ownership_verified=True)
+    client = FakeClient(
+        publication_ownership_verified=True,
+        publication_invocation_id="inv-old",
+    )
     config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
 
     recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
