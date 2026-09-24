@@ -1063,6 +1063,15 @@ fn leaf_identity_dir(project_dir: &Path, publication: &PublishedHead) -> Option<
     Some(project_dir.join(".exo/agents").join(agent))
 }
 
+fn existing_leaf_identity_dir(project_dir: &Path, agent: Option<&str>) -> Option<PathBuf> {
+    let agent = agent?.trim();
+    if agent.is_empty() {
+        return None;
+    }
+    let path = project_dir.join(".exo/agents").join(agent);
+    path.is_dir().then_some(path)
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
@@ -1228,6 +1237,33 @@ fn ensure_identity_removal_safe(
         leaf.head_sha,
         leaf.base_branch
     )
+}
+
+/// Re-observe a disposed leaf immediately before its publication record is
+/// dropped. A finished leaf must leave nothing behind: no local or remote ref,
+/// no registered or conventional worktree directory, and no durable identity
+/// directory. Receipt flags are never trusted as proof of absence.
+fn ensure_leaf_fully_disposed(project_dir: &Path, leaf: &LeafBranchCleanup) -> Result<()> {
+    let observation = observe_leaf_branch(project_dir, leaf)?;
+    let identity = existing_leaf_identity_dir(project_dir, leaf.agent.as_deref());
+    if observation.local_head.is_some()
+        || observation.remote_head.is_some()
+        || observation.worktree.is_some()
+        || identity.is_some()
+    {
+        let render = |path: Option<&Path>| {
+            path.map_or_else(|| "absent".to_owned(), |path| path.display().to_string())
+        };
+        anyhow::bail!(
+            "refusing to remove publication metadata for {}: leaf resources are still present (local={}, remote={}, worktree={}, identity={}); reconcile them before retrying",
+            leaf.branch,
+            observation.local_head.as_deref().unwrap_or("absent"),
+            observation.remote_head.as_deref().unwrap_or("absent"),
+            render(observation.worktree.as_deref()),
+            render(identity.as_deref()),
+        );
+    }
+    Ok(())
 }
 
 /// Parse the prerequisite commit ids from a bundle's text header. The header
@@ -2322,20 +2358,12 @@ async fn destroy_recreate_resources(
             record_recreate_receipt(project_dir, receipt.clone()).await?;
         }
     }
-    // Publication metadata is removed only once every leaf ref is provably
-    // gone. A ref that reappeared after a leaf's identity step must keep its
-    // record so a retry can reconcile it through the leased/local deletion
-    // steps.
+    // Publication metadata is removed only once every leaf is provably gone:
+    // no ref, no worktree directory, and no identity directory. A resource
+    // that reappeared after a leaf's identity step must keep its record so a
+    // retry can reconcile it.
     for branch in validated_leaves.iter().copied() {
-        let observation = observe_leaf_branch(project_dir, branch)?;
-        if observation.local_head.is_some() || observation.remote_head.is_some() {
-            anyhow::bail!(
-                "refusing to remove publication metadata for {}: leaf refs are still present (local={}, remote={}); reconcile them before retrying",
-                branch.branch,
-                observation.local_head.as_deref().unwrap_or("absent"),
-                observation.remote_head.as_deref().unwrap_or("absent"),
-            );
-        }
+        ensure_leaf_fully_disposed(project_dir, branch)?;
     }
     let numbers = plan.prs_to_remove.iter().copied().collect::<HashSet<_>>();
     remove_published_heads_for_prs(project_dir, &numbers).await?;
@@ -8310,11 +8338,15 @@ mod tests {
     }
 
     fn write_published_head(project_dir: &Path, publication: &PublishedHead) {
+        write_published_heads(project_dir, std::slice::from_ref(publication));
+    }
+
+    fn write_published_heads(project_dir: &Path, publications: &[PublishedHead]) {
         let dir = project_dir.join(".exo");
         std::fs::create_dir_all(&dir).unwrap();
         let document = serde_json::json!({
             "schema_version": 2,
-            "heads": [publication],
+            "heads": publications,
         });
         std::fs::write(
             dir.join("published-heads.json"),
@@ -8924,6 +8956,9 @@ mod tests {
         assert!(receipt.local_branch_deleted);
         assert!(receipt.identity_removed);
 
+        // A fully disposed leaf drops its publication record.
+        assert!(!published_head_numbers(&project).await.contains(&44));
+
         // Idempotent retry: an interrupted disposal can be re-run safely.
         destroy_recreate_resources(&project, &Config::default(), &plan, false)
             .await
@@ -9117,6 +9152,66 @@ mod tests {
             .await
             .unwrap();
         leaf_plan(leaves)
+    }
+
+    /// Add a second disposable leaf (`main.leaf2`, PR 45) whose later local
+    /// branch deletion can trigger a reappearance for the first leaf after the
+    /// first leaf's identity step has already completed.
+    fn add_second_leaf(project: &Path, head_sha: &str) -> (PublishedHead, PublishedHead) {
+        let leaf2_head = git_ref_sha(project, "refs/heads/main").unwrap().unwrap();
+        run_git(
+            project,
+            &["branch", "main.leaf2"],
+            "create second leaf branch",
+        )
+        .unwrap();
+        write_leaf_identity(
+            project,
+            "leaf2",
+            "main.leaf2",
+            &project.join(".exo/worktrees/leaf2"),
+        );
+        let leaf1 = test_leaf_publication("main.leaf", head_sha);
+        let mut leaf2 = test_leaf_publication("main.leaf2", &leaf2_head);
+        leaf2.pr_number = 45;
+        leaf2.author_agent = Some("leaf2".to_owned());
+        leaf2.slice_id = Some("leaf2".to_owned());
+        write_published_heads(project, &[leaf1.clone(), leaf2.clone()]);
+        (leaf1, leaf2)
+    }
+
+    async fn two_leaf_plan(project: &Path, head_sha: &str) -> RecreatePlan {
+        let (leaf1, leaf2) = add_second_leaf(project, head_sha);
+        let leaves = leaf_branch_cleanups(project, &[leaf1, leaf2], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
+        let mut plan = leaf_plan(leaves);
+        plan.prs_to_remove = vec![44, 45];
+        plan
+    }
+
+    /// Install a reference-transaction hook that runs `action` when the second
+    /// leaf's local branch is deleted, modelling a resource that reappears
+    /// after the first leaf's identity step.
+    fn install_releaf_hook(project: &Path, action: &str) {
+        let hook = project.join(".git/hooks/reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        let script = format!(
+            "#!/bin/sh\nstate=\"$1\"\nwhile read old new ref; do\n  if [ \"$state\" = \"committed\" ] && [ \"$ref\" = \"refs/heads/main.leaf2\" ] && [ \"$new\" = \"0000000000000000000000000000000000000000\" ]; then\n    {action}\n  fi\ndone\n",
+        );
+        std::fs::write(&hook, script).unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+    }
+
+    async fn published_head_numbers(project: &Path) -> Vec<u64> {
+        read_published_heads(project)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|publication| publication.pr_number)
+            .collect()
     }
 
     #[tokio::test]
@@ -9345,6 +9440,66 @@ mod tests {
                 .any(|publication| publication.pr_number == 44),
             "publication metadata must be retained"
         );
+    }
+
+    #[tokio::test]
+    async fn recreate_retains_publication_when_worktree_reappears_after_identity_step() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = two_leaf_plan(&project, &head_sha).await;
+        assert_eq!(plan.leaf_branches.len(), 2);
+        let worktree = project.join(".exo/worktrees/leaf");
+        // During the second leaf's local deletion (after the first leaf's
+        // identity step), an unregistered conventional leaf directory appears.
+        install_releaf_hook(
+            &project,
+            &format!(
+                "mkdir -p '{path}' && printf 'dirty\\n' > '{path}/uncommitted'",
+                path = worktree.display()
+            ),
+        );
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("leaf resources are still present"),
+            "{error}"
+        );
+        assert!(worktree.join("uncommitted").exists());
+        assert!(!git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_none());
+        let publications = published_head_numbers(&project).await;
+        assert!(publications.contains(&44), "{publications:?}");
+        assert!(publications.contains(&45), "{publications:?}");
+    }
+
+    #[tokio::test]
+    async fn recreate_retains_publication_when_identity_dir_reappears_after_identity_step() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = two_leaf_plan(&project, &head_sha).await;
+        assert_eq!(plan.leaf_branches.len(), 2);
+        let identity = project.join(".exo/agents/leaf");
+        // The first leaf's identity directory reappears after its identity step.
+        install_releaf_hook(&project, &format!("mkdir -p '{}'", identity.display()));
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("leaf resources are still present"),
+            "{error}"
+        );
+        assert!(identity.is_dir());
+        assert!(!git_branch_exists(&project, "main.leaf").unwrap());
+        let publications = published_head_numbers(&project).await;
+        assert!(publications.contains(&44), "{publications:?}");
+        assert!(publications.contains(&45), "{publications:?}");
     }
 
     #[tokio::test]
