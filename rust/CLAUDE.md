@@ -1,78 +1,55 @@
-# Claude Code++: Human-Augmented Sessions
+# ExoMonad Rust Workspace
 
-Rust workspace for augmenting human-driven Claude Code sessions with ExoMonad integrations.
+Rust host for ExoMonad's resumable Python TL controller and its agent tools.
 
-**This is NOT a headless orchestration system.** Humans interact with Claude Code directly via TTY; this infrastructure adds superpowers.
+The `tl_loop` Python program owns planning, dispatch, checkpoint recovery, review and CI gates, and merge decisions. It makes bounded model calls for structured judgments. Rust supplies the server, WASM tool runtime, effects, hooks, tmux and worktree operations. A human can observe and steer a run in tmux or through controller gates; the TL is not a persistent Claude Code conversation.
 
 ## Architecture
 
-**100% WASM routing.** All MCP tool logic lives in Haskell WASM; Rust handles I/O only.
+Agent tool definitions and routing live in Haskell WASM. The Python controller decides *when* to call them; Rust hosts the plugin and performs I/O through effect handlers.
 
 ```
-Claude Code (hook or MCP call)
-       ↓
-  exomonad (Rust)
-       ↓
-  PluginManager::call("handle_*", ...)
-       ↓
-  WASM guest (Haskell) ← PURE LOGIC ONLY
-       ↓
-  Yields effects (Git, GitHub, AgentControl, Log, etc.)
-       ↓
-  Rust host functions execute ALL I/O
-       ↓
-  Result marshalled back through WASM
+Python tl_loop controller ── HTTP over .exo/server.sock ──┐
+Agent MCP clients / hooks ── exomonad mcp-stdio / hook ───┤
+                                                     Rust exomonad serve
+                                                            ↓
+                                             Haskell WASM tool routing
+                                                            ↓
+                                       Rust effect handlers perform I/O
+                                                            ↓
+                                 Result returns to caller; Python records
+                                 run transitions in its durable event ledger
 ```
 
 ### Key Components
 
 | Component | Purpose |
 |-----------|---------|
-| **exomonad** | Rust binary with WASM plugin support (hooks + MCP) |
-| **exomonad-core** | Everything: framework, handlers, services, protocol types, UI protocol |
+| **exomonad** | Rust binary: init, server, MCP proxy, hook forwarding, and cleanup |
+| **exomonad-core** | WASM runtime, effect framework, handlers, services, and protocol types |
 | **exomonad-proto** | Proto-generated types (prost) for FFI + effects |
 | **wasm-guest** | Haskell WASM plugin (pure logic, no I/O) |
+| **tl_loop** | Python controller (outside this Rust workspace) for durable orchestration |
 
 ### Deployment
 
-**Local tmux-based orchestration:**
+**Local controller and server:**
 
 ```
-Human in tmux session
-    └── Claude Code (main window, role=tl)
-            ├── MCP server: exomonad mcp-stdio
-            ├── WASM: loaded from .exo/wasm/ at runtime
-            └── spawn_leaf / spawn_worker creates:
-                ├── Window subtree-1 (Claude, worktree off current branch, role=tl)
-                ├── Window leaf-1 (Codex, worktree off current branch, role=dev)
-                ├── Pane worker-a (Codex, in parent dir, ephemeral, role=worker)
-                └── ... (recursive tree of worktrees + workers)
+exomonad init
+├── Server window: exomonad serve (WASM from .exo/wasm/)
+├── TL window: python3 ~/.exo/tl_loop.pyz run (durable controller)
+└── Watcher/dashboard window
+    └── dispatched sub-TLs and leaves: tmux processes and git worktrees
 ```
 
-Each subtree agent (`spawn_subtree`):
-- Runs in isolated git worktree at `.exo/worktrees/{slug}-{type}/`
-- Branch naming: `{parent_branch}.{slug}-{type}` (dot separator, suffixed agent name)
-- Gets `.mcp.json` with `{"type": "stdio", "command": "exomonad", "args": ["mcp-stdio", "--role", "tl", "--agent-id", "..."]}`
-- Claude-only, gets TL role (can spawn workers, depth-capped at 2)
-- Session ID = birth-branch (immutable, deterministic). Root TL = "root".
-- PRs target parent branch, not main — merged via recursive fold
-- Runs in tmux window with `claude 'task'` (positional arg), auto-closes on exit
-
-Each leaf agent (`spawn_leaf` with worktree/standalone isolation):
-- Same worktree isolation as `spawn_subtree` (own branch, own directory)
-- Codex — dev role (no spawn tools)
-- Runs in tmux window, files PR against parent branch
-
-Each worker agent (`spawn_leaf` with inline isolation):
-- Runs in a tmux pane in the parent's directory (no branch, no worktree, ephemeral)
-- Always Codex — lightweight, focused execution
-- Routing config in `.exo/agents/{name}/routing.json`
+`exomonad init` packages the Python controller, starts the Rust server, waits for its socket, then launches the controller. The controller reads a structured plan and persists its run state and event ledger. It calls role-scoped server tools over the Unix socket to provision sub-TLs, spawn leaves and workers, observe PRs, and perform approved transitions. Worktree leaves have a branch and PR; inline workers use a tmux pane in their parent's worktree. Harnesses are selected by policy and configuration, so neither role is tied to one model vendor. Recursive sub-TL branches and PR bases are tracked by the plan and publication state; do not infer ownership from a branch name alone.
 
 ## Documentation Tree
 
 ```
 rust/CLAUDE.md  ← YOU ARE HERE (router)
-├── exomonad/CLAUDE.md  ← MCP + Hook handler via WASM (BINARY)
+├── exomonad/CLAUDE.md  ← Server, CLI, MCP proxy, and hook handler (BINARY)
 │   • Binary: exomonad
 │   • hook subcommand: handles CC hooks via WASM
 │
@@ -84,21 +61,23 @@ rust/CLAUDE.md  ← YOU ARE HERE (router)
 │   • Handlers: GitHandler, GitHubHandler, LogHandler, AgentHandler,
 │     FsHandler, FilePRHandler, CopilotHandler
 │   • Services: GitService, GitHubService, AgentControlService, TmuxIpc, etc.
-│   • External service clients: Anthropic, GitHub, Ollama, OTLP
+│   • External service clients and telemetry
 │   • tmux IPC (via `std::process::Command`, buffer pattern for input injection)
 │
-└── exomonad-proto/  ← Proto-generated types (prost)
-    • FFI boundary types
-    • Effect request/response messages
+├── exomonad-proto/  ← Proto-generated types (prost)
+│   • FFI boundary types and effect request/response messages
+├── claude-teams-bridge/  ← Claude Teams compatibility bridge
+└── exomonad-test-support/  ← Shared Rust test scaffolding
 ```
 
 ## Workspace Members
 
 | Crate | Type | Purpose |
 |-------|------|---------|
-| [exomonad](exomonad/CLAUDE.md) | Binary (`exomonad`) | MCP + Hook handler via WASM |
+| [exomonad](exomonad/CLAUDE.md) | Binary (`exomonad`) | Init, server, MCP proxy, hooks, and cleanup |
 | exomonad-core | Library | Framework, handlers, services, protocol types, UI protocol |
 | exomonad-proto | Library | Proto-generated types (prost) for FFI + effects |
+| claude-teams-bridge | Binary | Claude Teams compatibility bridge |
 | exomonad-test-support | Library (dev-only) | Shared test scaffolding |
 
 ### Feature Flags (exomonad-core)
@@ -124,16 +103,15 @@ nix develop .#wasm -c wasm32-wasi-cabal build --project-file=cabal.project.wasm 
 
 ### Harness selection and effort policy
 
-`exomonad init` selects root, worker, and reviewer harnesses independently with
-`--tl`, `--worker`, and `--reviewer`, or the matching config fields. Supported
-harnesses are Claude, OpenCode, Codex, and Shoal where the
-selected role supports them. Effort precedence is CLI > local config > global
-config > medium default. OpenCode uses effort as a
-model-aware `--variant`, and `--worker-model` applies to OpenCode.
-Shoal accepts the shared setting but logs that it is ignored.
-Codex passes the resolved effort as model_reasoning_effort, including xhigh,
-after model capability validation. Worker model selection applies to OpenCode
-and Codex command generation.
+`exomonad init` launches the Python controller as root TL. The controller
+selects TL, worker, and reviewer harness/model entries from the human-authored
+`.exo/harness_policy.toml` allowlist and capability map, within its budget.
+`exomonad init --worker` and `--reviewer` configure the corresponding spawned
+agent defaults; `--worker-model`, `--worker-effort-level`,
+`--reviewer-model`, and `--reviewer-effort-level` refine those defaults.
+Supported agent harnesses include Claude, OpenCode, Codex, and Shoal where the
+selected role supports them. Codex receives the resolved reasoning effort
+after model capability validation; OpenCode uses a supported model variant.
 
 Coding spawns stay on the configured worker harness. An explicit
 cross-harness coding request requires human approval through
@@ -144,8 +122,11 @@ worktree, branch, and PR.
 
 ### Running
 ```bash
-# MCP server (stdio)
-exomonad mcp-stdio --role root --agent-id root
+# Server (normally started by exomonad init)
+exomonad serve
+
+# Agent-facing stdio MCP proxy to the running server
+exomonad mcp-stdio --role tl --name root
 
 # Handle Claude Code hook
 echo '{"hook_event_name":"PreToolUse",...}' | exomonad hook pre-tool-use
@@ -167,11 +148,11 @@ echo '{"hook_event_name":"PreToolUse",...}' | exomonad hook pre-tool-use
 
 ### Agent Identity
 
-In `mcp-stdio` mode, the agent's identity is passed via command-line flags: `--role {role} --agent-id {name}`. Role determines which WASM tool set. Identity is structural: each agent gets its own `PluginManager` with `EffectContext` (agent name + birth branch) baked in at construction. All effect handlers receive `&EffectContext` — identity is always present, no Option, no task-locals, no panic paths.
+In `mcp-stdio` mode, the agent's identity is passed via `--role {role} --name {name}`. The Python controller uses the corresponding role/name paths on the Unix-socket HTTP API. Role determines the WASM tool set. Each agent gets a `PluginManager` with an `EffectContext` (agent name and birth branch) resolved by the server. Effect handlers receive that context.
 
 Roles are defined in Haskell WASM (`AllRoles.hs`). Adding a role is a Haskell-only change — Rust uses a lazy cache that creates a `PluginManager` per role on first request.
 
-At spawn time, `spawn_leaf`/`spawn_worker` writes per-agent MCP config with the agent's identity flags. Identity is unforgeable and visible in logs.
+At spawn time, managed agents receive per-agent MCP configuration with their role and name. The server resolves the persisted identity before dispatching tools.
 
 ## MCP Tools
 
@@ -179,11 +160,12 @@ All tools are defined in Haskell WASM and executed via host functions.
 
 | Tool | Role | Description |
 |------|------|-------------|
-| `spawn_leaf` | root, tl | Spawn the configured leaf agent (worktree, inline, or standalone isolation) |
-| `file_pr` | tl, dev | Create/update PR for current branch (auto-detects base branch from naming) |
-| `merge_pr` | tl | Merge child PR (gh pr merge + git fetch) |
-| `notify_parent` | all | Send message to parent agent (auto-routed via Teams inbox, UDS, or tmux) |
-| `send_message` | all | Send message to another exomonad-spawned agent (routes via Teams inbox, UDS, or tmux) |
+| `spawn_leaf` / `spawn_worker` | coordinator roles | Start a managed worktree leaf or inline worker |
+| `resume_pr` | coordinator roles | Resume the persisted owner of an existing open PR |
+| `file_pr` | publishing agents | Create or update a PR for the owned branch |
+| `watcher_pr_state` | coordinator roles | Observe PR head, review, and CI evidence |
+| `merge_pr` | coordinator roles | Merge an eligible child PR through the host |
+| `notify_parent` / `send_message` | managed agents | Route status and guidance through the server |
 
 ## Effect System
 
@@ -216,7 +198,7 @@ Proto field helpers in `handlers/mod.rs`: `non_empty(String) → Option<String>`
 | `git.*` | GitHandler | get_branch, get_status, get_recent_commits, get_worktree, has_unpushed_commits, get_remote_url, get_repo_info |
 | `github.*` | GitHubHandler | list_issues, get_issue, create_pr, list_prs, get_pr_for_branch, get_pr_review_comments |
 | `log.*` | LogHandler | info, error, emit_event |
-| `agent.*` | AgentHandler | spawn_subtree, spawn_leaf_subtree, spawn_workers, dispose_orphan |
+| `agent.*` | AgentHandler | spawn_leaf_subtree, spawn_worker, resume_pr, watcher_pr_state, disposal |
 | `fs.*` | FsHandler | read_file, write_file |
 | `file_pr.*` | FilePRHandler | file_pr |
 | `copilot.*` | CopilotHandler | wait_for_copilot_review |
@@ -224,7 +206,7 @@ Proto field helpers in `handlers/mod.rs`: `non_empty(String) → Option<String>`
 | `session.*` | SessionHandler | register_claude_id, register_team, deregister_team |
 | `tasks.*` | TasksHandler | list_tasks, get_task, update_task (shared task list with team auto-resolution) |
 | `events.*` | EventHandler | wait_for_event (internal), notify_event, notify_parent, send_message |
-| `merge_pr.*` | MergePRHandler | merge_pr (gh pr merge + git fetch) |
+| `merge_pr.*` | MergePRHandler | merge_pr with PR/head and review/CI evidence checks |
 | `process.*` | ProcessHandler | run (execute command with args, env, working dir, timeout) |
 | `coordination.*` | CoordinationHandler | acquire_mutex, release_mutex (in-memory mutex for parallel agents) |
 
@@ -237,19 +219,19 @@ Proto field helpers in `handlers/mod.rs`: `non_empty(String) → Option<String>`
 
 ## Configuration
 
-`exomonad init` auto-registers the Claude MCP server. For custom setups, register manually in `.mcp.json`:
+`exomonad init` writes an MCP proxy configuration for managed agents. For a manual Claude Code client, register the proxy in `.mcp.json`:
 ```json
 {
   "mcpServers": {
     "exomonad": {
       "command": "exomonad",
-      "args": ["mcp-stdio", "--role", "tl", "--agent-id", "root"]
+      "args": ["mcp-stdio", "--role", "tl", "--name", "root"]
     }
   }
 }
 ```
 
-`config.toml` is auto-created by `exomonad init` — all fields are optional.
+`exomonad new` creates `.exo/config.toml`; `exomonad init` uses that project configuration and starts the server and controller.
 
 ## Testing
 
@@ -299,12 +281,13 @@ at warn level with the recorded owner PID.
 
 | Decision | Rationale |
 |----------|-----------|
-| 100% WASM routing | All logic in Haskell, Rust handles I/O only |
+| Python controller | Durable run transitions, budgets, and recovery live in `tl_loop` |
+| WASM tool routing | Haskell defines role-scoped tools and yields effects; Rust executes their I/O |
 | Single `yield_effect` host fn | One entry point, all effects dispatched by namespace via EffectRegistry |
 | Protobuf binary encoding | Type-safe FFI boundary, generated types on both sides |
 | `runtime` feature flag | Plugin consumers get lightweight types without heavy deps |
 | High-level effects | `SpawnAgent` not `CreateWorktree + OpenWindow` |
-| Local tmux orchestration | Git worktrees + tmux windows, no Docker containers |
+| Local tmux orchestration | Managed agents use git worktrees and tmux windows or panes; `try-exomonad` also offers a Docker wrapper |
 | CLI-based tmux IPC | `std::process::Command` calls to `tmux` binary |
 | Extism runtime | Mature WASM runtime with host function support |
 | File-based devswarm WASM | Single WASM for all roles, loaded from disk, hot reload in serve mode |
