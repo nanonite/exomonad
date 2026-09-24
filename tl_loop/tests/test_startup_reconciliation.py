@@ -90,7 +90,7 @@ class FakeClient:
     head_reachable: bool = True
     publication_ownership_verified: bool = True
     publication_ownership_error: str = ""
-    publication_invocation_id: str | None = None
+    publication_invocation_id: str | None = "invocation-a"
     publication_succession: tuple[str, ...] = ()
     review_id: int | None = None
     review_verdict: str | None = None

@@ -115,7 +115,7 @@ from tl_loop.state.schema import (
     Verdict,
 )
 from tl_loop.state.serialization import DurableWriteError
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import QuarantineStorageError, RunStore, create
 from tl_loop.state.store import load as load_state
 
 
@@ -3486,6 +3486,52 @@ def test_reconciliation_backfills_handoff_from_host_publication_provenance(
     assert merge_ready.reconciliation["next_action"] == "queue_merge"
 
 
+def test_reconciliation_refused_watcher_does_not_backfill_handoff(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        status=SliceStatus.SPAWNED,
+        pr_number=45,
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-current",
+        publication=None,
+        handoff=None,
+    )
+    result = ReconciliationResult(
+        slice_id="leaf-a",
+        confirmed_stage="review",
+        authoritative_evidence=("published_pr",),
+        missing_evidence=("handoff",),
+        conflicts=(),
+        next_action="await_handoff",
+    )
+    watcher = {
+        "found": True,
+        "pr_number": 45,
+        "head_sha": "head-45",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "review_state": "approved",
+        "ci_status": "success",
+        "publication_ownership_verified": True,
+        # The record invocation is unrelated to the current dispatch, so the
+        # watcher binding is refused.
+        "publication": {
+            "invocation_id": "inv-other",
+            "slice_id": "leaf-a",
+            "author_agent": "leaf-a",
+            "succession_invocation_ids": [],
+        },
+    }
+
+    updated = _apply_reconciliation_observations(current, result, watcher, None)
+
+    # A refused binding must not relabel the current dispatch as handoff
+    # evidence for a stale publication.
+    assert updated.publication is None
+    assert updated.handoff is None
+
+
 def test_pr_filed_binds_host_verified_publication_to_owner(tmp_path: Path) -> None:
     store = _review_store(tmp_path)
     current = replace(
@@ -3911,6 +3957,48 @@ def test_audit_marked_pending_row_migrates_to_permanent_audit(tmp_path: Path) ->
     reloaded = RunStore(run_id, tmp_path)
     assert [entry.get("run_seq") for entry in reloaded.quarantined_events()] == [7]
     assert any(entry.get("run_seq") == 39829 for entry in reloaded.audited_events())
+
+
+def test_append_audit_event_rejects_conflicting_run_seq(tmp_path: Path) -> None:
+    store = RunStore("audit-conflict-run", tmp_path)
+    row = {"type": "pr.filed", "run_seq": 5, "head_sha": "head-a"}
+    store.append_audit_event(row)
+    # Re-appending an identical row is idempotent.
+    store.append_audit_event(row)
+    assert len(store.audited_events()) == 1
+    # A different row reusing the same run_seq is rejected.
+    with pytest.raises(QuarantineStorageError):
+        store.append_audit_event({"type": "pr.filed", "run_seq": 5, "head_sha": "head-b"})
+    assert len(store.audited_events()) == 1
+
+
+def test_audit_migration_retains_conflicting_pending_row(tmp_path: Path) -> None:
+    run_id = "audit-conflict-migration"
+    store = RunStore(run_id, tmp_path)
+    # Permanent audit already holds a row for run_seq 5.
+    store.append_audit_event(
+        {
+            "type": "pr.filed",
+            "run_seq": 5,
+            "head_sha": "head-a",
+            "correlation": "publication_history_audit",
+        }
+    )
+    # A conflicting audit-marked pending row reuses the same run_seq.
+    store.quarantine_event(
+        {
+            "type": "pr.filed",
+            "run_seq": 5,
+            "head_sha": "head-b",
+            "correlation": "publication_history_audit",
+        }
+    )
+
+    _migrate_audit_marked_quarantine(store)
+
+    # The conflicting pending row is retained, not released into a conflict.
+    assert [entry.get("run_seq") for entry in store.quarantined_events()] == [5]
+    assert len(store.audited_events()) == 1
 
 
 def test_worker_self_approval_is_not_gate_evidence(tmp_path: Path) -> None:

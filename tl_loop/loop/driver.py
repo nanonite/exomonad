@@ -231,7 +231,12 @@ from tl_loop.state.slice_transition import (
     StallClassificationObserved,
     slice_transition,
 )
-from tl_loop.state.store import DEFAULT_ROOT, RunStore, create
+from tl_loop.state.store import (
+    DEFAULT_ROOT,
+    QuarantineStorageError,
+    RunStore,
+    create,
+)
 
 from .journal import MUTATING_OPERATIONS, ActionJournalError, EffectJournal, stable_action_key
 from .observation import WatcherObservation
@@ -7019,7 +7024,8 @@ def _apply_reconciliation_observations(
         if invocation_id is None and publication is not None:
             invocation_id = publication.invocation_id
         if (
-            watcher.publication_ownership_verified is True
+            publication is not None
+            and watcher.publication_ownership_verified is True
             and head_sha
             and published_pr_number is not None
             and effective_agent_id
@@ -11968,7 +11974,15 @@ def _migrate_audit_marked_quarantine(store: RunStore) -> None:
     for document in store.quarantined_events():
         if document.get("correlation") != "publication_history_audit":
             continue
-        store.append_audit_event(document)
+        try:
+            store.append_audit_event(document)
+        except QuarantineStorageError as error:
+            # A conflicting permanent row already exists for this run_seq.
+            # Retain the pending row rather than releasing it into a conflict.
+            LOGGER.warning(
+                "[TL loop] retaining conflicting audit-marked pending row: %s", error
+            )
+            continue
         run_seq = document.get("run_seq")
         if isinstance(run_seq, int):
             store.release_quarantined_event(run_seq)

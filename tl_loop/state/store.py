@@ -516,15 +516,27 @@ class RunStore:
         return self.run_dir / "event-audit.json"
 
     def append_audit_event(self, event: Mapping[str, object]) -> None:
-        """Retain one refused historical event permanently for audit."""
+        """Retain one refused historical event permanently for audit.
+
+        Re-appending an identical row is idempotent. A different row that
+        reuses an existing run_seq is rejected so the caller never releases a
+        conflicting pending row and loses it from both records.
+        """
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        entries = [dict(item) for item in self.audited_events()]
-        run_seq = event.get("run_seq")
-        if any(item.get("run_seq") == run_seq for item in entries):
-            return
         normalized = to_jsonable(event)
         if not isinstance(normalized, dict):
             raise QuarantineStorageError(self.event_audit_path, "event must be an object")
+        entries = [dict(item) for item in self.audited_events()]
+        run_seq = normalized.get("run_seq")
+        for existing in entries:
+            if existing.get("run_seq") != run_seq:
+                continue
+            if existing == normalized:
+                return
+            raise QuarantineStorageError(
+                self.event_audit_path,
+                f"conflicting audit row for run_seq {run_seq!r}",
+            )
         entries.append(normalized)
         temporary = self.event_audit_path.with_suffix(".tmp")
         temporary.write_text(dumps_json(entries, sort_keys=True), encoding="utf-8")
