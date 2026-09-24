@@ -13,12 +13,13 @@ use exomonad_core::services::{
         invocation_succession_reaches_current, read_published_heads,
         remove_published_heads_for_prs, PublishedHead,
     },
-    repo::get_repo_info,
+    repo::{get_repo_info, RepoInfo},
     AgentType, ForgejoClient, GitWorktreeService,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -207,8 +208,12 @@ struct LeafBranchCleanup {
     base_branch: String,
     head_sha: String,
     pr_number: u64,
+    agent: Option<String>,
+    remote_name: String,
     worktree: Option<PathBuf>,
     local_head: Option<String>,
+    remote_head: Option<String>,
+    unmerged_commits: Option<u64>,
     dirty: bool,
     live: bool,
     protected: bool,
@@ -225,16 +230,38 @@ impl LeafBranchCleanup {
 
     fn render(&self) -> String {
         let action = match &self.action {
-            OrderedBranchAction::Remove => "remove".to_owned(),
+            OrderedBranchAction::Remove => {
+                let preserve_action = match self.unmerged_commits {
+                    Some(0) => "no unmerged commits".to_owned(),
+                    Some(1) => "preserve 1 unmerged commit".to_owned(),
+                    Some(count) => format!("preserve {count} unmerged commits"),
+                    None => {
+                        "unmerged commit count unknown; preservation will be verified".to_owned()
+                    }
+                };
+                let remote_action = self.remote_head.as_ref().map_or_else(
+                    || "no remote ref".to_owned(),
+                    |sha| {
+                        format!(
+                            "delete {}/{} with lease {sha}",
+                            self.remote_name, self.branch
+                        )
+                    },
+                );
+                format!("remove [{preserve_action}, {remote_action}]")
+            }
             OrderedBranchAction::Preserve(reason) => format!("preserve [GATE: {reason}]"),
         };
         format!(
-            "  {} -> {} (pr=#{}, head={}, local_head={}, worktree={}, dirty={}, protected={})",
+            "  {} -> {} (pr=#{}, head={}, local_head={}, remote={}/{}, remote_head={}, worktree={}, dirty={}, protected={})",
             self.branch,
             action,
             self.pr_number,
             self.head_sha,
             self.local_head.as_deref().unwrap_or("absent"),
+            self.remote_name,
+            self.branch,
+            self.remote_head.as_deref().unwrap_or("absent"),
             self.worktree
                 .as_ref()
                 .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
@@ -244,9 +271,11 @@ impl LeafBranchCleanup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn leaf_branch_action(
     head_sha: &str,
     local_head: Option<&str>,
+    remote_head: Option<&str>,
     worktree: Option<&Path>,
     dirty: bool,
     live: bool,
@@ -269,15 +298,23 @@ fn leaf_branch_action(
             );
         }
     }
-    // A same-name branch is never proof of ownership: the local head must equal
-    // the recorded publication head before the branch may be disposed.
-    match local_head {
-        Some(head) if head == head_sha => OrderedBranchAction::Remove,
-        Some(_) => OrderedBranchAction::Preserve(
-            "local branch head does not match the recorded publication head".to_owned(),
-        ),
-        None => OrderedBranchAction::Remove,
+    // A same-name branch is never proof of ownership: every present ref must
+    // equal the recorded publication head before the branch may be disposed.
+    if let Some(head) = local_head {
+        if head != head_sha {
+            return OrderedBranchAction::Preserve(
+                "local branch head does not match the recorded publication head".to_owned(),
+            );
+        }
     }
+    if let Some(head) = remote_head {
+        if head != head_sha {
+            return OrderedBranchAction::Preserve(
+                "remote branch head does not match the recorded publication head".to_owned(),
+            );
+        }
+    }
+    OrderedBranchAction::Remove
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -803,12 +840,92 @@ fn delete_remote_branch_with_lease(
     Ok(())
 }
 
+fn leaf_identity_mismatch(
+    project_dir: &Path,
+    publication: &PublishedHead,
+    branch: &str,
+) -> Option<String> {
+    let Some(agent) = publication
+        .author_agent
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Some("publication is missing a durable author identity".to_owned());
+    };
+    let path = project_dir
+        .join(".exo/agents")
+        .join(agent)
+        .join("identity.json");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return Some("durable leaf identity is missing".to_owned());
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+        return Some("durable leaf identity is unreadable".to_owned());
+    };
+    if value.get("birth_branch").and_then(Value::as_str) != Some(branch) {
+        return Some("durable leaf identity does not own this branch".to_owned());
+    }
+    // The recorded working directory must be inside this project when present.
+    if let Some(worktree) = value.get("working_dir").and_then(Value::as_str) {
+        let path = PathBuf::from(worktree);
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            project_dir.join(path)
+        };
+        if !absolute.starts_with(project_dir) {
+            return Some("durable leaf identity worktree is outside the project".to_owned());
+        }
+    }
+    None
+}
+
+/// Compare a live PR against the recorded publication. Ownership is verified
+/// regardless of the PR's state: a closed or merged PR still records the exact
+/// head/base it was opened from, so a stale publication can never authorize
+/// cleanup of a different PR.
+fn forgejo_pr_mismatch(
+    pr: &exomonad_core::services::forgejo::ForgejoPullRequest,
+    publication: &PublishedHead,
+    branch: &str,
+) -> Option<String> {
+    if pr.head_ref.as_str() != branch {
+        return Some("Forgejo PR head branch does not match the recorded publication".to_owned());
+    }
+    if pr.base_ref.as_str() != publication.base_branch {
+        return Some("Forgejo PR base branch does not match the recorded publication".to_owned());
+    }
+    match pr.head_sha.as_deref() {
+        Some(sha) if sha == publication.head_sha => None,
+        Some(_) => Some("Forgejo PR head does not match the recorded publication".to_owned()),
+        None => Some("Forgejo PR head is unavailable; ownership cannot be verified".to_owned()),
+    }
+}
+
+async fn leaf_forgejo_mismatch(
+    client: &ForgejoClient,
+    repo: &RepoInfo,
+    publication: &PublishedHead,
+    branch: &str,
+) -> Result<Option<String>> {
+    let pr = client
+        .get_pull_request(
+            &repo.owner,
+            &repo.repo,
+            exomonad_core::domain::PRNumber::new(publication.pr_number),
+        )
+        .await?;
+    Ok(forgejo_pr_mismatch(&pr, publication, branch))
+}
+
 async fn leaf_branch_cleanups(
     project_dir: &Path,
     registry: &[PublishedHead],
     protected: &[ProtectedPr],
     covered_branches: &HashSet<String>,
+    forgejo: Option<(&ForgejoClient, &RepoInfo)>,
 ) -> Result<Vec<LeafBranchCleanup>> {
+    let remote = recreate_remote_name(project_dir);
     let mut cleanups = Vec::new();
     let mut seen = HashSet::new();
     for publication in registry {
@@ -819,7 +936,10 @@ async fn leaf_branch_cleanups(
         }
         let local_head = git_ref_sha(project_dir, &format!("refs/heads/{branch}"))?;
         let worktree = git_worktree_for_branch(project_dir, branch)?.filter(|path| path.is_dir());
-        if local_head.is_none() && worktree.is_none() {
+        // Remote-only residue from an interrupted cleanup must still be
+        // enumerated so the next recreate can finish it.
+        let remote_head = remote_branch_sha(project_dir, &remote, branch)?;
+        if local_head.is_none() && worktree.is_none() && remote_head.is_none() {
             continue;
         }
         let dirty = worktree
@@ -837,22 +957,38 @@ async fn leaf_branch_cleanups(
         let is_protected = protected
             .iter()
             .any(|item| item.number == publication.pr_number);
-        let action = leaf_branch_action(
-            &publication.head_sha,
-            local_head.as_deref(),
-            worktree.as_deref(),
-            dirty,
-            live,
-            is_protected,
-            project_dir,
-        );
+        let mut preserve_reason = leaf_identity_mismatch(project_dir, publication, branch);
+        if preserve_reason.is_none() {
+            if let Some((client, repo)) = forgejo {
+                preserve_reason = leaf_forgejo_mismatch(client, repo, publication, branch).await?;
+            }
+        }
+        let action = match preserve_reason {
+            Some(reason) => OrderedBranchAction::Preserve(reason),
+            None => leaf_branch_action(
+                &publication.head_sha,
+                local_head.as_deref(),
+                remote_head.as_deref(),
+                worktree.as_deref(),
+                dirty,
+                live,
+                is_protected,
+                project_dir,
+            ),
+        };
+        let unmerged_commits =
+            leaf_unique_commits(project_dir, &publication.base_branch, &publication.head_sha).ok();
         cleanups.push(LeafBranchCleanup {
             branch: branch.to_owned(),
             base_branch: publication.base_branch.clone(),
             head_sha: publication.head_sha.clone(),
             pr_number: publication.pr_number,
+            agent: publication.author_agent.clone(),
+            remote_name: remote.clone(),
             worktree,
             local_head,
+            remote_head,
+            unmerged_commits,
             dirty,
             live,
             protected: is_protected,
@@ -876,6 +1012,407 @@ fn worktree_is_dirty(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// A fresh observation of one leaf branch taken immediately before a
+/// destructive step. Every present ref must still equal the recorded
+/// publication head; a moved head, a dirty worktree, or an out-of-project
+/// worktree refuses the disposal.
+struct LeafObservation {
+    local_head: Option<String>,
+    remote_head: Option<String>,
+    worktree: Option<PathBuf>,
+    dirty: bool,
+}
+
+fn observe_leaf_branch(project_dir: &Path, leaf: &LeafBranchCleanup) -> Result<LeafObservation> {
+    let local_head = git_ref_sha(project_dir, &format!("refs/heads/{}", leaf.branch))?;
+    let worktree = git_worktree_for_branch(project_dir, &leaf.branch)?.filter(|path| path.is_dir());
+    let dirty = worktree
+        .as_ref()
+        .is_some_and(|path| worktree_is_dirty(path));
+    let remote_head = remote_branch_sha(project_dir, &leaf.remote_name, &leaf.branch)?;
+    Ok(LeafObservation {
+        local_head,
+        remote_head,
+        worktree,
+        dirty,
+    })
+}
+
+fn ensure_leaf_unchanged(leaf: &LeafBranchCleanup, observation: &LeafObservation) -> Result<()> {
+    if observation.dirty {
+        anyhow::bail!(
+            "leaf branch {} became dirty during recreate; refusing to dispose it",
+            leaf.branch
+        );
+    }
+    if let Some(head) = observation.local_head.as_deref() {
+        if head != leaf.head_sha {
+            anyhow::bail!(
+                "leaf branch {} head changed from {} to {} during recreate; refusing",
+                leaf.branch,
+                leaf.head_sha,
+                head
+            );
+        }
+    }
+    if let Some(sha) = observation.remote_head.as_deref() {
+        if sha != leaf.head_sha {
+            anyhow::bail!(
+                "remote branch {}/{} head changed from {} to {} during recreate; refusing",
+                leaf.remote_name,
+                leaf.branch,
+                leaf.head_sha,
+                sha
+            );
+        }
+    }
+    Ok(())
+}
+
+fn leaf_preservation_path(project_dir: &Path, branch: &str, head_sha: &str) -> PathBuf {
+    let slug = branch.replace('/', "_");
+    let short = &head_sha[..head_sha.len().min(12)];
+    project_dir
+        .join(".exo")
+        .join("recreate-preserved")
+        .join(format!("{slug}-{short}.bundle"))
+}
+
+fn leaf_unique_commits(project_dir: &Path, base_branch: &str, head_sha: &str) -> Result<u64> {
+    let revision = format!("{base_branch}..{head_sha}");
+    let output = std::process::Command::new("git")
+        .args(["rev-list", "--count", &revision])
+        .current_dir(project_dir)
+        .output()
+        .context("failed to inspect leaf branch commits")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cannot verify leaf base {base_branch} for {head_sha}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .with_context(|| format!("git returned an invalid commit count for {head_sha}"))
+}
+
+fn verify_preservation_bundle(project_dir: &Path, path: &Path, expected_head: &str) -> Result<()> {
+    let verify = std::process::Command::new("git")
+        .args(["bundle", "verify", path.to_string_lossy().as_ref()])
+        .current_dir(project_dir)
+        .output()
+        .with_context(|| format!("failed to verify preservation bundle {}", path.display()))?;
+    if !verify.status.success() {
+        anyhow::bail!(
+            "preservation bundle {} did not verify: {}",
+            path.display(),
+            String::from_utf8_lossy(&verify.stderr).trim()
+        );
+    }
+    // `git bundle verify` only proves the prerequisites are present. Prove the
+    // bundle also advertises the exact recorded head, so a bundle for a
+    // different commit can never authorize deleting the last refs to ours.
+    let heads = std::process::Command::new("git")
+        .args(["bundle", "list-heads", path.to_string_lossy().as_ref()])
+        .current_dir(project_dir)
+        .output()
+        .with_context(|| format!("failed to list heads for {}", path.display()))?;
+    if !heads.status.success() {
+        anyhow::bail!(
+            "failed to list heads for preservation bundle {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&heads.stderr).trim()
+        );
+    }
+    let advertised = String::from_utf8_lossy(&heads.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+        .collect::<Vec<_>>();
+    if !advertised.iter().any(|sha| sha == expected_head) {
+        anyhow::bail!(
+            "preservation bundle {} does not advertise recorded head {}",
+            path.display(),
+            expected_head
+        );
+    }
+    Ok(())
+}
+
+fn run_git(project_dir: &Path, args: &[&str], context: &str) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(project_dir)
+        .output()
+        .with_context(|| format!("failed to {context}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{context}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Preserve unmerged commits in a verified bundle before any ref is deleted.
+/// The bundle is idempotent: an interrupted disposal that already produced it
+/// is verified and reused rather than recreated. A temporary ref is used
+/// because `git bundle` only accepts refs, not raw object ids; it is removed
+/// after the bundle verifies so no durable branch or ref is left behind.
+fn preserve_leaf_unmerged_commits(
+    project_dir: &Path,
+    remote_name: &str,
+    base_branch: &str,
+    branch: &str,
+    head_sha: &str,
+) -> Result<Option<PathBuf>> {
+    let path = leaf_preservation_path(project_dir, branch, head_sha);
+    if path.exists() {
+        // Fail closed: a bundle that does not verify against the exact recorded
+        // head must never be trusted to authorize deleting the last refs.
+        verify_preservation_bundle(project_dir, &path, head_sha)?;
+        return Ok(Some(path));
+    }
+    let temp_ref = format!(
+        "refs/exomonad/recreate-preserve/{}",
+        branch.replace('/', "_")
+    );
+    // Stage the exact head object when it is already present locally (including
+    // dangling objects from a deleted branch); otherwise fetch the remote ref
+    // into the temporary preservation ref for remote-only residue.
+    let staged = run_git(
+        project_dir,
+        &["update-ref", &temp_ref, head_sha],
+        "stage leaf commits for preservation",
+    )
+    .is_ok();
+    if !staged {
+        let refspec = format!("+refs/heads/{branch}:{temp_ref}");
+        run_git(
+            project_dir,
+            &["fetch", "--no-tags", remote_name, &refspec],
+            "fetch remote leaf commits for preservation",
+        )?;
+    }
+    let outcome = (|| -> Result<Option<PathBuf>> {
+        if leaf_unique_commits(project_dir, base_branch, &temp_ref)? == 0 {
+            return Ok(None);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let exclusion = format!("^{base_branch}");
+        run_git(
+            project_dir,
+            &[
+                "bundle",
+                "create",
+                path.to_string_lossy().as_ref(),
+                &temp_ref,
+                &exclusion,
+            ],
+            "create leaf preservation bundle",
+        )?;
+        verify_preservation_bundle(project_dir, &path, head_sha)?;
+        Ok(Some(path.clone()))
+    })();
+    let _ = run_git(
+        project_dir,
+        &["update-ref", "-d", &temp_ref],
+        "clear temporary preservation ref",
+    );
+    outcome
+}
+
+const RECREATE_RECEIPT_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RecreateCleanupReceipt {
+    schema_version: u32,
+    #[serde(default)]
+    entries: Vec<RecreateCleanupReceiptEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RecreateCleanupReceiptEntry {
+    branch: String,
+    pr_number: u64,
+    head_sha: String,
+    remote_name: String,
+    /// True once the unmerged-commit preservation decision has been recorded
+    /// for this exact identity. Prevents a retry from re-trusting a stale
+    /// "no bundle needed" conclusion without re-deriving it from current state.
+    #[serde(default)]
+    preservation_checked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preserved_bundle: Option<String>,
+    /// Ordered log of completed disposal steps, so a resumed disposal can prove
+    /// the exact sequence (remote ref before local branch) it executed.
+    #[serde(default)]
+    actions: Vec<String>,
+    remote_deleted: bool,
+    worktree_removed: bool,
+    local_branch_deleted: bool,
+    identity_removed: bool,
+    completed_at_millis: u64,
+}
+
+impl RecreateCleanupReceiptEntry {
+    fn matches_identity(
+        &self,
+        branch: &str,
+        head_sha: &str,
+        pr_number: u64,
+        remote_name: &str,
+    ) -> bool {
+        self.branch == branch
+            && self.head_sha == head_sha
+            && self.pr_number == pr_number
+            && self.remote_name == remote_name
+    }
+
+    fn for_leaf(leaf: &LeafBranchCleanup) -> Self {
+        Self {
+            branch: leaf.branch.clone(),
+            pr_number: leaf.pr_number,
+            head_sha: leaf.head_sha.clone(),
+            remote_name: leaf.remote_name.clone(),
+            preservation_checked: false,
+            preserved_bundle: None,
+            actions: Vec::new(),
+            remote_deleted: false,
+            worktree_removed: false,
+            local_branch_deleted: false,
+            identity_removed: false,
+            completed_at_millis: 0,
+        }
+    }
+}
+
+fn recreate_receipts_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(".exo").join("recreate-receipts.json")
+}
+
+async fn read_recreate_receipts(project_dir: &Path) -> Result<Vec<RecreateCleanupReceiptEntry>> {
+    let path = recreate_receipts_path(project_dir);
+    let contents = match tokio::fs::read_to_string(&path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()))
+        }
+    };
+    let receipt = serde_json::from_str::<RecreateCleanupReceipt>(&contents)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if receipt.schema_version > RECREATE_RECEIPT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "{} uses unsupported recreate receipt schema version {}",
+            path.display(),
+            receipt.schema_version
+        );
+    }
+    Ok(receipt.entries)
+}
+
+async fn write_recreate_receipts(
+    project_dir: &Path,
+    entries: &[RecreateCleanupReceiptEntry],
+) -> Result<()> {
+    let path = recreate_receipts_path(project_dir);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let document = RecreateCleanupReceipt {
+        schema_version: RECREATE_RECEIPT_SCHEMA_VERSION,
+        entries: entries.to_vec(),
+    };
+    let serialized =
+        serde_json::to_vec_pretty(&document).context("failed to serialize recreate receipts")?;
+    let temp = path.with_extension("json.tmp");
+    tokio::fs::write(&temp, &serialized)
+        .await
+        .with_context(|| format!("failed to write {}", temp.display()))?;
+    tokio::fs::rename(&temp, &path)
+        .await
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
+}
+
+async fn record_recreate_receipt(
+    project_dir: &Path,
+    entry: RecreateCleanupReceiptEntry,
+) -> Result<()> {
+    let mut entries = read_recreate_receipts(project_dir).await?;
+    match entries.iter_mut().find(|existing| {
+        existing.matches_identity(
+            &entry.branch,
+            &entry.head_sha,
+            entry.pr_number,
+            &entry.remote_name,
+        )
+    }) {
+        Some(existing) => *existing = entry,
+        None => entries.push(entry),
+    }
+    write_recreate_receipts(project_dir, &entries).await
+}
+
+fn verify_pr_association(
+    pr: &exomonad_core::services::forgejo::ForgejoPullRequest,
+    publication: &PublishedHead,
+) -> Result<()> {
+    if pr.head_ref.as_str() != publication.head_branch {
+        anyhow::bail!(
+            "Forgejo PR #{} head branch '{}' does not match publication '{}'",
+            publication.pr_number,
+            pr.head_ref.as_str(),
+            publication.head_branch
+        );
+    }
+    if pr.base_ref.as_str() != publication.base_branch {
+        anyhow::bail!(
+            "Forgejo PR #{} base branch '{}' does not match publication '{}'",
+            publication.pr_number,
+            pr.base_ref.as_str(),
+            publication.base_branch
+        );
+    }
+    if pr.head_sha.as_deref() != Some(publication.head_sha.as_str()) {
+        anyhow::bail!(
+            "Forgejo PR #{} head '{}' does not match publication '{}'",
+            publication.pr_number,
+            pr.head_sha.as_deref().unwrap_or("absent"),
+            publication.head_sha
+        );
+    }
+    Ok(())
+}
+
+fn project_remote_is_forgejo(project_dir: &Path) -> bool {
+    let remote = recreate_remote_name(project_dir);
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", &remote])
+        .current_dir(project_dir)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            exomonad_core::services::repo::parse_github_url(&url).is_ok()
+        }
+        _ => false,
+    }
+}
+
 fn recreate_forgejo_client(
     project_dir: &Path,
     config: &Config,
@@ -887,7 +1424,13 @@ fn recreate_forgejo_client(
         (Some(url), Some(token)) => Ok(Some(
             ForgejoClient::new(url, token).context("failed to create Forgejo client")?,
         )),
-        (None, None) if ForgejoClient::fj_binary_in_path() => {
+        // The `fj` CLI can only reach a Forgejo-backed remote. When the
+        // configured remote is a local path (as in the local-git tests), no
+        // Forgejo client is available and ownership falls back to the durable
+        // identity plus exact-ref checks.
+        (None, None)
+            if ForgejoClient::fj_binary_in_path() && project_remote_is_forgejo(project_dir) =>
+        {
             Ok(Some(ForgejoClient::new_fj(project_dir.to_path_buf())))
         }
         (None, None) => Ok(None),
@@ -1027,7 +1570,14 @@ async fn build_recreate_plan(
     // Issue-owned leaf branches are enumerated from the publication registry,
     // never inferred from a branch name alone.
     let leaf_branches = if project_dir.join(".git").exists() {
-        leaf_branch_cleanups(project_dir, &registry, &protected, &covered_branches).await?
+        leaf_branch_cleanups(
+            project_dir,
+            &registry,
+            &protected,
+            &covered_branches,
+            client.as_deref().zip(repo.as_ref()),
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -1103,7 +1653,34 @@ async fn destroy_recreate_resources(
         .iter()
         .map(|branch| branch.spec.worktree.clone())
         .collect::<HashSet<_>>();
+    // Leaf worktrees are disposed by the leaf loop below, which removes the
+    // worktree, local branch, and durable identity in a leased, receipted
+    // order. Excluding them from the generic worktree sweep prevents a
+    // worktree that became dirty after planning from being force-removed
+    // before its own revalidation can refuse.
+    let leaf_worktrees = plan
+        .leaf_branches
+        .iter()
+        .filter_map(|branch| branch.worktree.clone())
+        .collect::<Vec<_>>();
     let publications = read_published_heads(project_dir).await?;
+    let publication_by_pr = publications
+        .iter()
+        .map(|publication| (publication.pr_number, publication))
+        .collect::<HashMap<_, _>>();
+    let publication_by_branch = publications
+        .iter()
+        .filter(|publication| !publication.head_branch.trim().is_empty())
+        .map(|publication| {
+            (
+                (
+                    publication.head_branch.as_str(),
+                    publication.head_sha.as_str(),
+                ),
+                publication,
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let protected_numbers = plan
         .protected
         .iter()
@@ -1120,6 +1697,18 @@ async fn destroy_recreate_resources(
             .copied()
             .filter(|number| !protected_numbers.contains(number))
             .collect::<Vec<_>>()
+    };
+    let client = recreate_forgejo_client(project_dir, config)?;
+    // Live Forgejo verification is required whenever a client is available; a
+    // repository-resolution failure must stop cleanup rather than silently
+    // disabling ownership checks.
+    let repo = match client.as_ref() {
+        Some(_) => Some(
+            get_repo_info(project_dir)
+                .await
+                .context("cannot resolve the Forgejo repository for ownership verification")?,
+        ),
+        None => None,
     };
     // Phase one revalidates every ordered branch without mutating anything, so
     // a gate discovered late can never follow already-removed resources.
@@ -1152,15 +1741,80 @@ async fn destroy_recreate_resources(
         }
         validated.push(current);
     }
-    // Close published PRs before removing local ownership. If closure fails,
-    // the branch and identity remain so the disposal can be retried safely.
-    let client = recreate_forgejo_client(project_dir, config)?;
+    // Leaf branches are revalidated before any destructive step: durable
+    // identity, live Forgejo PR association, and the exact local and remote
+    // refs must still match the recorded publication. This runs before the
+    // generic worktree sweep and before PR closure so a late gate can never
+    // follow a removed resource.
+    let mut validated_leaves: Vec<&LeafBranchCleanup> = Vec::new();
+    for branch in &plan.leaf_branches {
+        if let Some(gate) = branch.gate() {
+            anyhow::bail!("leaf branch cleanup gate for {}: {gate}", branch.branch);
+        }
+        let observation = observe_leaf_branch(project_dir, branch)?;
+        ensure_leaf_unchanged(branch, &observation)?;
+        // Ownership evidence is only required while a ref or worktree remains.
+        // Once an interrupted disposal has removed every ref, the remaining
+        // identity/record cleanup is proven by the plan and its receipts.
+        let refs_present = observation.local_head.is_some()
+            || observation.remote_head.is_some()
+            || observation.worktree.is_some();
+        if refs_present {
+            let publication = publication_by_branch
+                .get(&(branch.branch.as_str(), branch.head_sha.as_str()))
+                .with_context(|| {
+                    format!(
+                        "cannot dispose leaf branch {}: no publication record to verify ownership",
+                        branch.branch
+                    )
+                })?;
+            if let Some(reason) = leaf_identity_mismatch(project_dir, publication, &branch.branch) {
+                anyhow::bail!("leaf branch cleanup gate for {}: {reason}", branch.branch);
+            }
+            if let Some((client, repo)) = client.as_deref().zip(repo.as_ref()) {
+                if let Some(reason) =
+                    leaf_forgejo_mismatch(client, repo, publication, &branch.branch).await?
+                {
+                    anyhow::bail!("leaf branch cleanup gate for {}: {reason}", branch.branch);
+                }
+            }
+        }
+        validated_leaves.push(branch);
+    }
+    // Close published PRs before removing local ownership. Each closure
+    // re-verifies that the live Forgejo PR still matches the recorded
+    // publication, so a stale record can never close an unrelated PR. If
+    // closure fails, the branch and identity remain so the disposal can be
+    // retried safely.
     if !plan.prs_to_close.is_empty() {
         let client = client
             .as_ref()
             .context("cannot close published PRs: no Forgejo client is configured")?;
-        let repo = get_repo_info(project_dir).await?;
+        let repo = repo
+            .as_ref()
+            .context("repository identity is required for PR cleanup")?;
         for number in &plan.prs_to_close {
+            // A missing record means a prior disposal already removed it, so
+            // there is nothing left to close; never close without the record
+            // that proves ownership.
+            let Some(publication) = publication_by_pr.get(number) else {
+                warn!(
+                    pr_number = number,
+                    "skipping PR closure: publication record is absent"
+                );
+                continue;
+            };
+            let pr = client
+                .get_pull_request(
+                    &repo.owner,
+                    &repo.repo,
+                    exomonad_core::domain::PRNumber::new(*number),
+                )
+                .await?;
+            verify_pr_association(&pr, publication)?;
+            if pr.merged || pr.state != "open" {
+                continue;
+            }
             client
                 .close_pull_request(
                     &repo.owner,
@@ -1201,6 +1855,9 @@ async fn destroy_recreate_resources(
         if ordered_worktrees.contains(path) {
             continue;
         }
+        if leaf_worktrees.iter().any(|leaf| same_path(leaf, path)) {
+            continue;
+        }
         if path
             .parent()
             .is_some_and(|parent| parent.ends_with(".exo/worktrees"))
@@ -1225,69 +1882,169 @@ async fn destroy_recreate_resources(
             }
         }
     }
-    // Dispose issue-owned leaf branches enumerated in the plan. Every step is
-    // revalidated immediately before it runs: a changed local or remote head, a
-    // dirty worktree, or a moved worktree stops recreate before anything is
-    // lost. Worktree removal may already have happened above, so each step is
-    // idempotent and an interrupted disposal can be retried.
-    let remote = recreate_remote_name(project_dir);
-    for branch in &plan.leaf_branches {
-        if branch.gate().is_some() {
-            continue;
-        }
-        let current_head = git_ref_sha(project_dir, &format!("refs/heads/{}", branch.branch))?;
-        let worktree =
-            git_worktree_for_branch(project_dir, &branch.branch)?.filter(|path| path.is_dir());
-        if worktree
-            .as_ref()
-            .is_some_and(|path| worktree_is_dirty(path))
-        {
-            anyhow::bail!(
-                "leaf branch {} became dirty during recreate; refusing to dispose it",
-                branch.branch
-            );
-        }
-        if let Some(head) = current_head.as_deref() {
-            if head != branch.head_sha {
-                anyhow::bail!(
-                    "leaf branch {} head changed from {} to {} during recreate; refusing",
-                    branch.branch,
-                    branch.head_sha,
-                    head
-                );
-            }
-        }
-        let remote_sha = remote_branch_sha(project_dir, &remote, &branch.branch)?;
-        if let Some(sha) = remote_sha.as_deref() {
-            if sha != branch.head_sha {
-                anyhow::bail!(
-                    "remote branch {remote}/{} head changed from {} to {} during recreate; refusing",
-                    branch.branch,
-                    branch.head_sha,
-                    sha
-                );
-            }
-        }
-        if let Some(path) = worktree {
-            let git_wt = git_wt.clone();
-            tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path))
-                .await
-                .context("leaf worktree disposal task failed")??;
-        }
-        if current_head.is_some() {
-            let branch_name = exomonad_core::domain::BranchName::try_from_str(&branch.branch)?;
-            let git_wt = git_wt.clone();
-            tokio::task::spawn_blocking(move || git_wt.delete_bookmark(&branch_name))
-                .await
-                .context("leaf branch disposal task failed")??;
-        }
-        if remote_sha.is_some() {
-            delete_remote_branch_with_lease(
-                project_dir,
-                &remote,
+    // Dispose issue-owned leaf branches enumerated in the plan. Every leaf is
+    // re-observed immediately before each destructive step, then steps run in a
+    // fixed, recoverable order: preserve unmerged commits in a verified bundle,
+    // delete the exact remote ref with a SHA lease, remove the worktree, delete
+    // the local branch, and remove the durable identity. A durable receipt is
+    // persisted after each step so an interrupted disposal can resume
+    // idempotently without losing evidence.
+    let existing_receipts = read_recreate_receipts(project_dir).await?;
+    for branch in &validated_leaves {
+        let mut receipt = match existing_receipts.iter().find(|entry| {
+            entry.matches_identity(
                 &branch.branch,
                 &branch.head_sha,
-            )?;
+                branch.pr_number,
+                &branch.remote_name,
+            )
+        }) {
+            Some(entry) => entry.clone(),
+            None => {
+                // A receipt for the same branch under a different PR, head, or
+                // remote belongs to another publication. Never borrow its
+                // completed steps: stop with recoverable evidence instead.
+                if let Some(conflict) = existing_receipts
+                    .iter()
+                    .find(|entry| entry.branch == branch.branch)
+                {
+                    anyhow::bail!(
+                        "conflicting recreate receipt for branch {}: recorded pr=#{} head={} remote={} does not match current pr=#{} head={} remote={}",
+                        branch.branch,
+                        conflict.pr_number,
+                        conflict.head_sha,
+                        conflict.remote_name,
+                        branch.pr_number,
+                        branch.head_sha,
+                        branch.remote_name,
+                    );
+                }
+                RecreateCleanupReceiptEntry::for_leaf(branch)
+            }
+        };
+        // Preservation is reconciled against current state, never trusted from
+        // the receipt alone. While a ref still exists it is re-derived and a
+        // bundle is (re)created and verified against the exact recorded head.
+        // Once every ref is gone, any receipted bundle is re-verified from
+        // disk. A missing or mismatched bundle fails closed before any ref is
+        // deleted.
+        let preservation = observe_leaf_branch(project_dir, branch)?;
+        ensure_leaf_unchanged(branch, &preservation)?;
+        let refs_present = preservation.local_head.is_some() || preservation.remote_head.is_some();
+        if refs_present {
+            match preserve_leaf_unmerged_commits(
+                project_dir,
+                &branch.remote_name,
+                &branch.base_branch,
+                &branch.branch,
+                &branch.head_sha,
+            )? {
+                Some(path) => {
+                    let display = path.display().to_string();
+                    if receipt.preserved_bundle.as_deref() != Some(display.as_str()) {
+                        receipt.actions.push("preserve_unmerged_commits".to_owned());
+                    }
+                    receipt.preserved_bundle = Some(display);
+                }
+                None => receipt.preserved_bundle = None,
+            }
+            receipt.preservation_checked = true;
+            receipt.completed_at_millis = current_time_millis() as u64;
+            record_recreate_receipt(project_dir, receipt.clone()).await?;
+        } else if !receipt.preservation_checked {
+            // Every ref vanished before preservation was ever recorded, so
+            // recoverability of any unmerged commits cannot be proven.
+            anyhow::bail!(
+                "cannot verify unmerged-commit preservation for {}: no refs remain and no receipted bundle exists",
+                branch.branch
+            );
+        } else if let Some(bundle) = receipt.preserved_bundle.clone() {
+            let path = PathBuf::from(&bundle);
+            if !path.exists() {
+                anyhow::bail!(
+                    "receipted preservation bundle {} for {} is missing; refusing to delete refs",
+                    path.display(),
+                    branch.branch
+                );
+            }
+            verify_preservation_bundle(project_dir, &path, &branch.head_sha)?;
+        }
+        // Remote ref: always reconcile against the observed remote. A ref that
+        // reappeared after a prior receipt is deleted again under a fresh SHA
+        // lease; a changed head fails closed.
+        {
+            let observation = observe_leaf_branch(project_dir, branch)?;
+            ensure_leaf_unchanged(branch, &observation)?;
+            if let Some(sha) = observation.remote_head.as_deref() {
+                delete_remote_branch_with_lease(
+                    project_dir,
+                    &branch.remote_name,
+                    &branch.branch,
+                    sha,
+                )?;
+                receipt.actions.push("delete_remote_branch".to_owned());
+            } else if !receipt.remote_deleted {
+                receipt
+                    .actions
+                    .push("remote_branch_already_absent".to_owned());
+            }
+            receipt.remote_deleted = true;
+            receipt.completed_at_millis = current_time_millis() as u64;
+            record_recreate_receipt(project_dir, receipt.clone()).await?;
+        }
+        // Worktree: always reconcile against the observed worktree so one that
+        // reappeared after a receipt is removed again.
+        {
+            let observation = observe_leaf_branch(project_dir, branch)?;
+            ensure_leaf_unchanged(branch, &observation)?;
+            if let Some(path) = observation.worktree.clone() {
+                let git_wt = git_wt.clone();
+                tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path))
+                    .await
+                    .context("leaf worktree disposal task failed")??;
+                receipt.actions.push("remove_worktree".to_owned());
+            }
+            receipt.worktree_removed = true;
+            receipt.completed_at_millis = current_time_millis() as u64;
+            record_recreate_receipt(project_dir, receipt.clone()).await?;
+        }
+        // Local branch: always reconcile against the observed local ref.
+        {
+            let observation = observe_leaf_branch(project_dir, branch)?;
+            ensure_leaf_unchanged(branch, &observation)?;
+            if observation.local_head.is_some() {
+                let branch_name = exomonad_core::domain::BranchName::try_from_str(&branch.branch)?;
+                let git_wt = git_wt.clone();
+                tokio::task::spawn_blocking(move || git_wt.delete_bookmark(&branch_name))
+                    .await
+                    .context("leaf branch disposal task failed")??;
+                receipt.actions.push("delete_local_branch".to_owned());
+            } else if !receipt.local_branch_deleted {
+                receipt
+                    .actions
+                    .push("local_branch_already_absent".to_owned());
+            }
+            receipt.local_branch_deleted = true;
+            receipt.completed_at_millis = current_time_millis() as u64;
+            record_recreate_receipt(project_dir, receipt.clone()).await?;
+        }
+        // Durable identity: always reconcile against the observed directory.
+        {
+            if let Some(agent) = branch
+                .agent
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                let agent_dir = project_dir.join(".exo/agents").join(agent);
+                if agent_dir.exists() {
+                    std::fs::remove_dir_all(&agent_dir)
+                        .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
+                    receipt.actions.push("remove_identity".to_owned());
+                }
+            }
+            receipt.identity_removed = true;
+            receipt.completed_at_millis = current_time_millis() as u64;
+            record_recreate_receipt(project_dir, receipt.clone()).await?;
         }
     }
     let numbers = plan.prs_to_remove.iter().copied().collect::<HashSet<_>>();
@@ -7666,7 +8423,25 @@ mod tests {
                 "main.leaf",
             ],
         );
+        write_leaf_identity(&project, "leaf", "main.leaf", &worktree);
+        write_published_head(&project, &test_leaf_publication("main.leaf", &head_sha));
         (temp, project, remote, head_sha)
+    }
+
+    fn write_leaf_identity(project: &Path, agent: &str, branch: &str, worktree: &Path) {
+        let dir = project.join(".exo/agents").join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        let value = serde_json::json!({
+            "agent_name": agent,
+            "slug": agent,
+            "birth_branch": branch,
+            "working_dir": worktree,
+        });
+        std::fs::write(
+            dir.join("identity.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
     }
 
     fn leaf_plan(leaves: Vec<LeafBranchCleanup>) -> RecreatePlan {
@@ -7685,24 +8460,135 @@ mod tests {
     fn leaf_branch_action_requires_proven_head_ownership() {
         let project = Path::new("/repo");
         assert_eq!(
-            leaf_branch_action("head-a", Some("head-a"), None, false, false, false, project),
+            leaf_branch_action(
+                "head-a",
+                Some("head-a"),
+                Some("head-a"),
+                None,
+                false,
+                false,
+                false,
+                project
+            ),
             OrderedBranchAction::Remove
         );
         for action in [
-            leaf_branch_action("head-a", Some("other"), None, false, false, false, project),
-            leaf_branch_action("head-a", Some("head-a"), None, true, false, false, project),
-            leaf_branch_action("head-a", Some("head-a"), None, false, true, false, project),
-            leaf_branch_action("head-a", Some("head-a"), None, false, false, true, project),
+            leaf_branch_action(
+                "head-a",
+                Some("other"),
+                None,
+                None,
+                false,
+                false,
+                false,
+                project,
+            ),
+            leaf_branch_action(
+                "head-a",
+                None,
+                Some("other"),
+                None,
+                false,
+                false,
+                false,
+                project,
+            ),
+            leaf_branch_action(
+                "head-a",
+                Some("head-a"),
+                None,
+                None,
+                true,
+                false,
+                false,
+                project,
+            ),
+            leaf_branch_action(
+                "head-a",
+                Some("head-a"),
+                None,
+                None,
+                false,
+                true,
+                false,
+                project,
+            ),
+            leaf_branch_action(
+                "head-a",
+                Some("head-a"),
+                None,
+                None,
+                false,
+                false,
+                true,
+                project,
+            ),
         ] {
             assert!(matches!(action, OrderedBranchAction::Preserve(_)));
         }
     }
 
     #[tokio::test]
+    async fn recreate_plan_render_shows_remote_lease_and_preservation() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let publication = test_leaf_publication("main.leaf", &head_sha);
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
+        let rendered = leaves[0].render();
+        assert!(
+            rendered.contains(&format!("delete origin/main.leaf with lease {head_sha}")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("preserve 1 unmerged commit"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("remote_head={head_sha}")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn verify_pr_association_rejects_mismatched_publication() {
+        use exomonad_core::domain::{BranchName, PRNumber};
+        use exomonad_core::services::forgejo::ForgejoPullRequest;
+
+        let publication = test_leaf_publication("main.leaf", "head-a");
+        let pr = ForgejoPullRequest {
+            number: PRNumber::new(44),
+            url: String::new(),
+            title: String::new(),
+            body: String::new(),
+            head_ref: BranchName::try_from_str("main.leaf").unwrap(),
+            base_ref: BranchName::try_from_str("main").unwrap(),
+            state: "open".to_owned(),
+            merged: false,
+            head_sha: Some("head-a".to_owned()),
+            base_sha: None,
+            merge_commit_sha: None,
+        };
+        verify_pr_association(&pr, &publication).unwrap();
+
+        let mut mismatched_head = pr.clone();
+        mismatched_head.head_sha = Some("other".to_owned());
+        assert!(verify_pr_association(&mismatched_head, &publication).is_err());
+
+        let mut mismatched_branch = pr.clone();
+        mismatched_branch.head_ref = BranchName::try_from_str("main.other").unwrap();
+        assert!(verify_pr_association(&mismatched_branch, &publication).is_err());
+
+        let mut mismatched_base = pr;
+        mismatched_base.base_ref = BranchName::try_from_str("release").unwrap();
+        assert!(verify_pr_association(&mismatched_base, &publication).is_err());
+    }
+
+    #[tokio::test]
     async fn recreate_disposes_verified_leaf_branch_locally_and_remotely() {
         let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
         let publication = test_leaf_publication("main.leaf", &head_sha);
-        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new())
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
             .await
             .unwrap();
         assert_eq!(leaves.len(), 1);
@@ -7715,9 +8601,38 @@ mod tests {
 
         assert!(!git_branch_exists(&project, "main.leaf").unwrap());
         assert!(!project.join(".exo/worktrees/leaf").exists());
+        assert!(!project.join(".exo/agents/leaf").exists());
         assert!(remote_branch_sha(&project, "origin", "main.leaf")
             .unwrap()
             .is_none());
+
+        // Unmerged commits are preserved in a verified bundle before the refs
+        // are deleted.
+        let bundle = leaf_preservation_path(&project, "main.leaf", &head_sha);
+        assert!(bundle.exists());
+        verify_preservation_bundle(&project, &bundle, &head_sha).unwrap();
+
+        // A durable per-step receipt records the exact order: preserve, remote
+        // ref before local branch, worktree, identity.
+        let receipts = read_recreate_receipts(&project).await.unwrap();
+        let receipt = receipts
+            .iter()
+            .find(|entry| entry.branch == "main.leaf")
+            .expect("leaf receipt must be persisted");
+        assert_eq!(
+            receipt.actions,
+            vec![
+                "preserve_unmerged_commits",
+                "delete_remote_branch",
+                "remove_worktree",
+                "delete_local_branch",
+                "remove_identity",
+            ]
+        );
+        assert!(receipt.remote_deleted);
+        assert!(receipt.worktree_removed);
+        assert!(receipt.local_branch_deleted);
+        assert!(receipt.identity_removed);
 
         // Idempotent retry: an interrupted disposal can be re-run safely.
         destroy_recreate_resources(&project, &Config::default(), &plan, false)
@@ -7726,10 +8641,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recreate_leaf_cleanup_refuses_dirty_worktree_without_generic_sweep() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let publication = test_leaf_publication("main.leaf", &head_sha);
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
+        let worktree = project.join(".exo/worktrees/leaf");
+        let mut plan = leaf_plan(leaves);
+        // The generic sweep would otherwise force-remove this worktree before
+        // the leaf revalidation ran.
+        plan.worktrees = vec![worktree.clone()];
+
+        std::fs::write(worktree.join("uncommitted"), "dirty\n").unwrap();
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("dirty"), "{error}");
+        // The dirty worktree and its uncommitted file survive.
+        assert!(worktree.join("uncommitted").exists());
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn recreate_enumerates_remote_only_leaf_residue() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let publication = test_leaf_publication("main.leaf", &head_sha);
+        // Simulate an interrupted cleanup: the local worktree and branch are
+        // gone, but the remote ref remains.
+        let worktree = project.join(".exo/worktrees/leaf");
+        let run = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(
+            &project,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        run(&project, &["branch", "-D", "main.leaf"]);
+
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(leaves.len(), 1, "remote-only residue must be enumerated");
+        assert_eq!(leaves[0].action, OrderedBranchAction::Remove);
+        assert!(leaves[0].local_head.is_none());
+        assert!(leaves[0].worktree.is_none());
+        assert_eq!(leaves[0].remote_head.as_deref(), Some(head_sha.as_str()));
+    }
+
+    #[tokio::test]
+    async fn recreate_disposes_remote_only_leaf_residue() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let publication = test_leaf_publication("main.leaf", &head_sha);
+        let worktree = project.join(".exo/worktrees/leaf");
+        let run = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run(
+            &project,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        run(&project, &["branch", "-D", "main.leaf"]);
+
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
+        let plan = leaf_plan(leaves);
+        destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap();
+
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_none());
+        let receipts = read_recreate_receipts(&project).await.unwrap();
+        let receipt = receipts
+            .iter()
+            .find(|entry| entry.branch == "main.leaf")
+            .expect("remote-only residue receipt must be persisted");
+        assert!(receipt.actions.contains(&"delete_remote_branch".to_owned()));
+        assert!(receipt
+            .actions
+            .contains(&"local_branch_already_absent".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn recreate_leaf_cleanup_gates_on_missing_durable_identity() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        std::fs::remove_file(project.join(".exo/agents/leaf/identity.json")).unwrap();
+        let publication = test_leaf_publication("main.leaf", &head_sha);
+
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert!(
+            matches!(leaves[0].action, OrderedBranchAction::Preserve(_)),
+            "a missing durable identity must gate destructive cleanup"
+        );
+    }
+
+    #[tokio::test]
     async fn recreate_refuses_changed_remote_leaf_head() {
         let (temp, project, remote, head_sha) = setup_leaf_fixture();
         let publication = test_leaf_publication("main.leaf", &head_sha);
-        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new())
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
             .await
             .unwrap();
         let plan = leaf_plan(leaves);
@@ -7767,6 +8797,271 @@ mod tests {
         assert!(error.to_string().contains("remote branch"), "{error}");
         assert!(git_branch_exists(&project, "main.leaf").unwrap());
         assert!(project.join(".exo/worktrees/leaf").exists());
+    }
+
+    fn leaf_receipt(
+        head_sha: &str,
+        pr_number: u64,
+        remote_name: &str,
+        preserved_bundle: Option<PathBuf>,
+    ) -> RecreateCleanupReceiptEntry {
+        RecreateCleanupReceiptEntry {
+            branch: "main.leaf".to_owned(),
+            pr_number,
+            head_sha: head_sha.to_owned(),
+            remote_name: remote_name.to_owned(),
+            preservation_checked: true,
+            preserved_bundle: preserved_bundle.map(|path| path.display().to_string()),
+            actions: Vec::new(),
+            remote_deleted: false,
+            worktree_removed: false,
+            local_branch_deleted: false,
+            identity_removed: false,
+            completed_at_millis: 0,
+        }
+    }
+
+    async fn leaf_fixture_plan(project: &Path, head_sha: &str) -> RecreatePlan {
+        let publication = test_leaf_publication("main.leaf", head_sha);
+        let leaves = leaf_branch_cleanups(project, &[publication], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
+        leaf_plan(leaves)
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_missing_receipted_bundle() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        // Every ref is already gone, leaving only the receipt as evidence.
+        let worktree = project.join(".exo/worktrees/leaf");
+        run_git(
+            &project,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+            "remove leaf worktree",
+        )
+        .unwrap();
+        run_git(
+            &project,
+            &["branch", "-D", "main.leaf"],
+            "delete leaf branch",
+        )
+        .unwrap();
+        run_git(
+            &project,
+            &["push", "origin", ":refs/heads/main.leaf"],
+            "delete remote leaf ref",
+        )
+        .unwrap();
+        let missing = leaf_preservation_path(&project, "main.leaf", &head_sha);
+        assert!(!missing.exists());
+        write_recreate_receipts(
+            &project,
+            &[leaf_receipt(&head_sha, 44, "origin", Some(missing))],
+        )
+        .await
+        .unwrap();
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
+        // The identity is retained so the cleanup can be retried.
+        assert!(project.join(".exo/agents/leaf").exists());
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_unverifiable_preservation_when_refs_vanish() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        // Refs vanish after planning but before preservation was ever recorded.
+        let worktree = project.join(".exo/worktrees/leaf");
+        run_git(
+            &project,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+            "remove leaf worktree",
+        )
+        .unwrap();
+        run_git(
+            &project,
+            &["branch", "-D", "main.leaf"],
+            "delete leaf branch",
+        )
+        .unwrap();
+        run_git(
+            &project,
+            &["push", "origin", ":refs/heads/main.leaf"],
+            "delete remote leaf ref",
+        )
+        .unwrap();
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot verify unmerged-commit preservation"),
+            "{error}"
+        );
+        assert!(project.join(".exo/agents/leaf").exists());
+    }
+
+    #[tokio::test]
+    async fn recreate_refuses_bundle_without_recorded_head() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        // A bundle that verifies structurally but advertises a different head.
+        let bundle = leaf_preservation_path(&project, "main.leaf", &head_sha);
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        run_git(
+            &project,
+            &["bundle", "create", bundle.to_str().unwrap(), "main"],
+            "create wrong-head bundle",
+        )
+        .unwrap();
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not advertise"), "{error}");
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn recreate_rejects_receipt_from_another_publication() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        // Same branch and head, but a different PR number.
+        write_recreate_receipts(&project, &[leaf_receipt(&head_sha, 999, "origin", None)])
+            .await
+            .unwrap();
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("conflicting recreate receipt"),
+            "{error}"
+        );
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_some());
+        assert!(project.join(".exo/worktrees/leaf").exists());
+
+        // Same branch, head, and PR, but a different remote is also foreign.
+        write_recreate_receipts(&project, &[leaf_receipt(&head_sha, 44, "upstream", None)])
+            .await
+            .unwrap();
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("conflicting recreate receipt"),
+            "{error}"
+        );
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+    }
+
+    #[tokio::test]
+    async fn recreate_reconciles_receipt_with_reappeared_resources() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        // A fully completed prior receipt, but every resource is still present.
+        let mut receipt = leaf_receipt(&head_sha, 44, "origin", None);
+        receipt.remote_deleted = true;
+        receipt.worktree_removed = true;
+        receipt.local_branch_deleted = true;
+        receipt.identity_removed = true;
+        write_recreate_receipts(&project, &[receipt]).await.unwrap();
+
+        destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap();
+
+        assert!(!git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(!project.join(".exo/worktrees/leaf").exists());
+        assert!(!project.join(".exo/agents/leaf").exists());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_none());
+        // Unmerged commits were re-derived and preserved despite the stale
+        // "no bundle" receipt.
+        let bundle = leaf_preservation_path(&project, "main.leaf", &head_sha);
+        assert!(bundle.exists());
+        verify_preservation_bundle(&project, &bundle, &head_sha).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recreate_stops_when_forgejo_repo_lookup_fails() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        let config = Config {
+            forgejo_url: Some("http://forgejo.invalid".to_owned()),
+            forgejo_token: Some("token".to_owned()),
+            ..Config::default()
+        };
+
+        let error = destroy_recreate_resources(&project, &config, &plan, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Forgejo repository"), "{error}");
+        // No mutation happened before verification.
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_some());
+        assert!(project.join(".exo/worktrees/leaf").exists());
+    }
+
+    #[test]
+    fn forgejo_pr_mismatch_verifies_closed_and_merged_prs() {
+        use exomonad_core::domain::{BranchName, PRNumber};
+        use exomonad_core::services::forgejo::ForgejoPullRequest;
+
+        let publication = test_leaf_publication("main.leaf", "head-a");
+        for (state, merged) in [("open", false), ("closed", false), ("closed", true)] {
+            let pr = ForgejoPullRequest {
+                number: PRNumber::new(44),
+                url: String::new(),
+                title: String::new(),
+                body: String::new(),
+                head_ref: BranchName::try_from_str("main.leaf").unwrap(),
+                base_ref: BranchName::try_from_str("main").unwrap(),
+                state: state.to_owned(),
+                merged,
+                head_sha: Some("head-a".to_owned()),
+                base_sha: None,
+                merge_commit_sha: None,
+            };
+            assert_eq!(
+                forgejo_pr_mismatch(&pr, &publication, "main.leaf"),
+                None,
+                "{state}/{merged}"
+            );
+            let mut changed = pr.clone();
+            changed.head_sha = Some("other".to_owned());
+            assert!(
+                forgejo_pr_mismatch(&changed, &publication, "main.leaf").is_some(),
+                "{state}/{merged}"
+            );
+            let mut missing_head = pr;
+            missing_head.head_sha = None;
+            assert!(forgejo_pr_mismatch(&missing_head, &publication, "main.leaf").is_some());
+        }
+    }
+
+    #[test]
+    fn forgejo_client_is_unavailable_for_local_remotes() {
+        let (_temp, project, _remote, _head_sha) = setup_leaf_fixture();
+        assert!(!project_remote_is_forgejo(&project));
+        assert!(recreate_forgejo_client(&project, &Config::default())
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
