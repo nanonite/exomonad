@@ -210,7 +210,12 @@ struct LeafBranchCleanup {
     pr_number: u64,
     agent: Option<String>,
     remote_name: String,
+    /// The registered worktree path captured at planning time. Checked even
+    /// after the branch is deleted, when a surviving worktree may be detached.
     worktree: Option<PathBuf>,
+    /// The durable identity's recorded `working_dir`, captured at planning so
+    /// it can be checked even after the identity directory is removed.
+    identity_worktree: Option<PathBuf>,
     local_head: Option<String>,
     remote_head: Option<String>,
     unmerged_commits: Option<u64>,
@@ -988,6 +993,7 @@ async fn leaf_branch_cleanups(
         };
         let unmerged_commits =
             leaf_unique_commits(project_dir, &publication.base_branch, &publication.head_sha).ok();
+        let identity_worktree = leaf_identity_worktree(project_dir, publication);
         cleanups.push(LeafBranchCleanup {
             branch: branch.to_owned(),
             base_branch: publication.base_branch.clone(),
@@ -996,6 +1002,7 @@ async fn leaf_branch_cleanups(
             agent: publication.author_agent.clone(),
             remote_name: remote.clone(),
             worktree,
+            identity_worktree,
             local_head,
             remote_head,
             unmerged_commits,
@@ -1070,6 +1077,32 @@ fn existing_leaf_identity_dir(project_dir: &Path, agent: Option<&str>) -> Option
     }
     let path = project_dir.join(".exo/agents").join(agent);
     path.is_dir().then_some(path)
+}
+
+/// The durable identity's recorded `working_dir`, resolved to an absolute path.
+/// Captured at planning time so it can be checked even after the identity
+/// directory has been removed.
+fn leaf_identity_worktree(project_dir: &Path, publication: &PublishedHead) -> Option<PathBuf> {
+    let agent = publication.author_agent.as_deref()?.trim();
+    if agent.is_empty() {
+        return None;
+    }
+    let path = project_dir
+        .join(".exo/agents")
+        .join(agent)
+        .join("identity.json");
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let value = serde_json::from_str::<Value>(&contents).ok()?;
+    let worktree = value.get("working_dir").and_then(Value::as_str)?;
+    if worktree.trim().is_empty() {
+        return None;
+    }
+    let recorded = PathBuf::from(worktree);
+    Some(if recorded.is_absolute() {
+        recorded
+    } else {
+        project_dir.join(recorded)
+    })
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1241,14 +1274,40 @@ fn ensure_identity_removal_safe(
 
 /// Re-observe a disposed leaf immediately before its publication record is
 /// dropped. A finished leaf must leave nothing behind: no local or remote ref,
-/// no registered or conventional worktree directory, and no durable identity
-/// directory. Receipt flags are never trusted as proof of absence.
+/// no worktree at any leaf-owned path, and no durable identity directory.
+///
+/// `git_worktree_for_branch` only matches a worktree still attached to the leaf
+/// branch, so a worktree that survives branch deletion as a detached checkout
+/// would otherwise be missed. The planned registered path and the durable
+/// identity's recorded working_dir are therefore checked directly. Receipt
+/// flags are never trusted, and a leaf-owned path outside the project gates
+/// cleanup because it cannot be verified or safely acted on.
 fn ensure_leaf_fully_disposed(project_dir: &Path, leaf: &LeafBranchCleanup) -> Result<()> {
     let observation = observe_leaf_branch(project_dir, leaf)?;
     let identity = existing_leaf_identity_dir(project_dir, leaf.agent.as_deref());
+    let candidates = [
+        ("observed worktree", observation.worktree.clone()),
+        ("planned worktree", leaf.worktree.clone()),
+        ("identity worktree", leaf.identity_worktree.clone()),
+    ];
+    for (label, path) in &candidates {
+        let Some(path) = path else { continue };
+        if !path.starts_with(project_dir) {
+            anyhow::bail!(
+                "refusing to remove publication metadata for {}: {label} {} is outside the project and cannot be verified; reconcile it before retrying",
+                leaf.branch,
+                path.display()
+            );
+        }
+    }
+    let remaining_worktree = candidates
+        .iter()
+        .filter_map(|(_, path)| path.as_deref())
+        .find(|path| path.is_dir())
+        .map(Path::to_path_buf);
     if observation.local_head.is_some()
         || observation.remote_head.is_some()
-        || observation.worktree.is_some()
+        || remaining_worktree.is_some()
         || identity.is_some()
     {
         let render = |path: Option<&Path>| {
@@ -1259,7 +1318,7 @@ fn ensure_leaf_fully_disposed(project_dir: &Path, leaf: &LeafBranchCleanup) -> R
             leaf.branch,
             observation.local_head.as_deref().unwrap_or("absent"),
             observation.remote_head.as_deref().unwrap_or("absent"),
-            render(observation.worktree.as_deref()),
+            render(remaining_worktree.as_deref()),
             render(identity.as_deref()),
         );
     }
@@ -9497,6 +9556,103 @@ mod tests {
         );
         assert!(identity.is_dir());
         assert!(!git_branch_exists(&project, "main.leaf").unwrap());
+        let publications = published_head_numbers(&project).await;
+        assert!(publications.contains(&44), "{publications:?}");
+        assert!(publications.contains(&45), "{publications:?}");
+    }
+
+    #[tokio::test]
+    async fn recreate_retains_publication_when_detached_worktree_reappears_at_planned_path() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        // The first leaf's legitimate worktree lives at a non-conventional path.
+        let conventional = project.join(".exo/worktrees/leaf");
+        let elsewhere = project.join(".exo/other/leaf");
+        run_git(
+            &project,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                conventional.to_str().unwrap(),
+            ],
+            "remove conventional worktree",
+        )
+        .unwrap();
+        run_git(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                elsewhere.to_str().unwrap(),
+                "main.leaf",
+            ],
+            "add worktree at non-conventional path",
+        )
+        .unwrap();
+
+        let plan = two_leaf_plan(&project, &head_sha).await;
+        assert_eq!(plan.leaf_branches.len(), 2);
+        assert!(plan.leaf_branches[0]
+            .worktree
+            .as_deref()
+            .is_some_and(|path| same_path(path, &elsewhere)));
+
+        // After the first leaf's worktree is removed and its branch is deleted,
+        // the path reappears as a detached registered worktree. Branch lookup
+        // cannot find it, so only the planned path check catches it.
+        install_releaf_hook(
+            &project,
+            &format!(
+                "git -C '{project}' worktree add --detach -q '{path}' {head}",
+                project = project.display(),
+                path = elsewhere.display(),
+                head = head_sha,
+            ),
+        );
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("leaf resources are still present"),
+            "{error}"
+        );
+        assert!(elsewhere.is_dir());
+        assert!(!git_branch_exists(&project, "main.leaf").unwrap());
+        let publications = published_head_numbers(&project).await;
+        assert!(publications.contains(&44), "{publications:?}");
+        assert!(publications.contains(&45), "{publications:?}");
+    }
+
+    #[tokio::test]
+    async fn recreate_retains_publication_when_identity_worktree_reappears() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        // Record a non-conventional identity working_dir for the first leaf so
+        // only the planned identity path can catch its reappearance.
+        let recorded = project.join(".exo/identity-home/leaf");
+        write_leaf_identity(&project, "leaf", "main.leaf", &recorded);
+        let plan = two_leaf_plan(&project, &head_sha).await;
+        assert_eq!(plan.leaf_branches.len(), 2);
+        assert!(plan.leaf_branches[0]
+            .identity_worktree
+            .as_deref()
+            .is_some_and(|path| same_path(path, &recorded)));
+
+        install_releaf_hook(&project, &format!("mkdir -p '{}'", recorded.display()));
+
+        let error = destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("leaf resources are still present"),
+            "{error}"
+        );
+        assert!(recorded.is_dir());
         let publications = published_head_numbers(&project).await;
         assert!(publications.contains(&44), "{publications:?}");
         assert!(publications.contains(&45), "{publications:?}");
