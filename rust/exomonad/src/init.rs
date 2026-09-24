@@ -1194,10 +1194,12 @@ fn head_reachable_from_retained_refs(
         .unwrap_or(false)
 }
 
-/// Revalidate immediately before removing a leaf's durable identity. The
+/// Revalidate immediately before removing a leaf's durable identity. Both leaf
+/// refs must be absent: a local or remote branch that reappeared after its
+/// deletion step must never be left behind with the identity removed. The
 /// worktree must still be verifiable, and when the cleanup relies on
 /// reachability rather than a verified bundle the recorded head must still be
-/// contained in a retained ref; either check can have gone stale since the
+/// contained in a retained ref; any of these can have gone stale since the
 /// preservation step.
 fn ensure_identity_removal_safe(
     project_dir: &Path,
@@ -1206,8 +1208,15 @@ fn ensure_identity_removal_safe(
 ) -> Result<()> {
     let observation = observe_leaf_branch(project_dir, leaf)?;
     ensure_leaf_unchanged(leaf, &observation)?;
-    let refs_present = observation.local_head.is_some() || observation.remote_head.is_some();
-    if refs_present || receipt.preserved_bundle.is_some() {
+    if observation.local_head.is_some() || observation.remote_head.is_some() {
+        anyhow::bail!(
+            "refusing to remove identity for {}: leaf refs are still present (local={}, remote={}); reconcile them before retrying",
+            leaf.branch,
+            observation.local_head.as_deref().unwrap_or("absent"),
+            observation.remote_head.as_deref().unwrap_or("absent"),
+        );
+    }
+    if receipt.preserved_bundle.is_some() {
         return Ok(());
     }
     if head_reachable_from_retained_refs(project_dir, &leaf.base_branch, &leaf.head_sha) {
@@ -9252,6 +9261,26 @@ mod tests {
         let error = ensure_identity_removal_safe(&project, leaf, &receipt).unwrap_err();
         assert!(error.to_string().contains("identity removal"), "{error}");
         assert!(project.join(".exo/agents/leaf").exists());
+    }
+
+    #[tokio::test]
+    async fn identity_removal_revalidation_refuses_reappeared_refs() {
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let plan = leaf_fixture_plan(&project, &head_sha).await;
+        let leaf = &plan.leaf_branches[0];
+        // The receipt says both refs were deleted, but they are present again
+        // at the recorded head, as if they reappeared after the deletion step.
+        let mut receipt = RecreateCleanupReceiptEntry::for_leaf(leaf);
+        receipt.remote_deleted = true;
+        receipt.local_branch_deleted = true;
+
+        let error = ensure_identity_removal_safe(&project, leaf, &receipt).unwrap_err();
+        assert!(error.to_string().contains("still present"), "{error}");
+        assert!(project.join(".exo/agents/leaf").exists());
+        assert!(git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(remote_branch_sha(&project, "origin", "main.leaf")
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
