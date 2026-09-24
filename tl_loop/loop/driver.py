@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from fnmatch import fnmatchcase
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol, cast
@@ -2630,6 +2631,8 @@ def _run_loop(
                 fsm_event,
                 event,
                 event_slice_id,
+                controller_epoch=state.controller_epoch,
+                quarantine=partial(_quarantine_historical_publication, store, event),
             )
         previous_state = state
         state = store.checkpoint(next_phase, next_slices, state.budgets, checkpoint_seq)
@@ -11864,28 +11867,112 @@ def _pr_event_target(
     return matches[0] if len(matches) == 1 else None
 
 
+def _quarantine_historical_publication(
+    store: RunStore, event: EventEnvelope, reason: str
+) -> None:
+    """Retain a refused historical publication event for audit; never bind it."""
+    store.quarantine_event(
+        {
+            **envelope_document(event),
+            "correlation": "publication_history_audit",
+            "correlation_reason": reason,
+        }
+    )
+
+
+def _recorded_recovery_invocation(current: SliceState) -> str | None:
+    """The invocation explicitly recorded by an active recovery, if any."""
+    if current.recovery is None:
+        return None
+    value = current.recovery.evidence.get("invocation_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _publication_generation_rejection(
+    current: SliceState,
+    envelope: EventEnvelope,
+    target_id: str,
+    controller_epoch: str | None,
+) -> str | None:
+    """Return why a publication cannot bind to the current dispatch generation.
+
+    A publication must prove the exact publishing invocation that owns the
+    slice, or an invocation explicitly recorded as the current recovery
+    succession. The reused agent name, branch name, swarm run_id, or PR title
+    are never sufficient. Events from a prior controller epoch are historical:
+    they stay queryable for audit and never bind.
+    """
+    event_invocation = envelope.invocation_id
+    expected_invocation = current.dispatch_invocation_id
+    if not event_invocation:
+        return "publication event carries no invocation identity"
+    if not expected_invocation:
+        return "slice has no confirmed dispatch invocation to bind against"
+    if event_invocation != expected_invocation and event_invocation != (
+        _recorded_recovery_invocation(current)
+    ):
+        return (
+            "publication invocation does not match the current dispatch "
+            "invocation or a recorded recovery succession"
+        )
+    event_epoch = envelope.data.get("controller_epoch")
+    if (
+        controller_epoch is not None
+        and isinstance(event_epoch, str)
+        and event_epoch
+        and event_epoch != controller_epoch
+    ):
+        return "publication event belongs to a prior controller epoch"
+    event_generation = envelope.generation
+    if event_generation is not None and event_generation != current.dispatch_generation:
+        return "publication event generation does not match the current dispatch"
+    if envelope.slice_id is not None and envelope.slice_id != target_id:
+        return "publication event slice identity disagrees with the resolved owner"
+    return None
+
+
 def _bind_publication_evidence(
     slices: Mapping[str, SliceState],
     event: PRFiled | PRUpdated,
     envelope: EventEnvelope,
     slice_id: str | None,
+    *,
+    controller_epoch: str | None = None,
+    quarantine: Callable[[str], None] | None = None,
 ) -> dict[str, SliceState]:
-    """Bind host-verified publication metadata to its persisted owner."""
+    """Bind host-verified publication metadata to its persisted owner.
+
+    A publication only binds when the event proves the current dispatch
+    invocation or a recorded recovery succession, plus the exact PR, head SHA,
+    head branch, base branch, and owner. Historical events from a recreated run
+    are refused and quarantined for audit; they are never backfilled with the
+    current run's invocation.
+    """
     target_id = _pr_event_target(slices, event, slice_id)
     current = slices.get(target_id) if target_id is not None else None
-    if target_id is None or current is None:
+
+    def refuse(reason: str, *, historical: bool = False) -> dict[str, SliceState]:
         LOGGER.warning(
-            "[TL loop] ignoring publication event without an unambiguous owner pr=%s",
+            "[TL loop] refusing publication event pr=%s target=%s: %s",
             event.pr_number,
-        )
-        return dict(slices)
-    if current.dispatch_agent_id is None or envelope.agent_id != current.dispatch_agent_id:
-        LOGGER.warning(
-            "[TL loop] ignoring publication event from untrusted owner target=%s agent=%s",
             target_id,
-            envelope.agent_id,
+            reason,
         )
+        # Only generation/historical rejections are quarantined for audit;
+        # ordinary owner or identity mismatches keep their prior behavior.
+        if quarantine is not None and historical:
+            quarantine(reason)
         return dict(slices)
+
+    if target_id is None or current is None:
+        return refuse("no unambiguous owner")
+    if current.dispatch_agent_id is None or envelope.agent_id != current.dispatch_agent_id:
+        return refuse("owner agent identity disagrees with the persisted owner")
+    generation_reason = _publication_generation_rejection(
+        current, envelope, target_id, controller_epoch
+    )
+    if generation_reason is not None:
+        return refuse(generation_reason, historical=True)
     head_branch = envelope.data.get("head_branch")
     base_branch = envelope.data.get("base_branch")
     if (
@@ -11894,21 +11981,19 @@ def _bind_publication_evidence(
         or not isinstance(base_branch, str)
         or not base_branch
     ):
-        LOGGER.warning(
-            "[TL loop] ignoring publication event with incomplete verified identity target=%s",
-            target_id,
-        )
-        return dict(slices)
+        return refuse("incomplete verified head/base identity")
+    if envelope.head_sha is None or envelope.head_sha != event.head_sha:
+        return refuse("event head SHA disagrees with the verified publication")
+    if current.branch is not None and head_branch != current.branch:
+        return refuse("head branch disagrees with the persisted owner branch")
+    if current.base_ref is not None and base_branch != current.base_ref:
+        return refuse("base branch disagrees with the persisted owner base")
     existing = current.publication
     if existing is not None and (
         existing.pr_number != event.pr_number or existing.head_sha != event.head_sha
     ):
-        LOGGER.warning(
-            "[TL loop] refusing publication replacement for target=%s: existing head differs",
-            target_id,
-        )
-        return dict(slices)
-    invocation_id = envelope.invocation_id or current.dispatch_invocation_id
+        return refuse("existing publication head differs")
+    invocation_id = envelope.invocation_id
     publication = PublicationBinding(
         pr_number=event.pr_number,
         head_sha=event.head_sha,

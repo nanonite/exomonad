@@ -260,6 +260,7 @@ class RecordingTransport:
     fail_observability: bool = False
     reject_spawns: bool = False
     spawned_agent_id: str | None = None
+    spawned_invocation_id: str | None = None
     listed_agents: list[JsonObject] = field(default_factory=list)
     next_controller_run_seq: int = 1000
 
@@ -277,7 +278,10 @@ class RecordingTransport:
         if self.reject_spawns and tool_name in {"spawn_worker", "spawn_leaf"}:
             return {"success": False, "error": "tmux launch rejected"}
         if tool_name in {"spawn_worker", "spawn_leaf"} and self.spawned_agent_id:
-            return {"success": True, "result": {"agent_id": self.spawned_agent_id}}
+            result: JsonObject = {"agent_id": self.spawned_agent_id}
+            if self.spawned_invocation_id is not None:
+                result["invocation_id"] = self.spawned_invocation_id
+            return {"success": True, "result": result}
         if tool_name == "list_agents":
             return {"success": True, "result": {"agents": self.listed_agents}}
         if tool_name == "emit_controller_event":
@@ -1853,7 +1857,10 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
             _event(3, "all_children_done", run_id=run_id),
         ]
     )
-    transport = RecordingTransport(spawned_agent_id="tunable-operator-body-opencode")
+    transport = RecordingTransport(
+        spawned_agent_id="tunable-operator-body-opencode",
+        spawned_invocation_id="invocation-a",
+    )
     plan = WorkPlan.from_mapping(
         {
             "leaves": [
@@ -3479,7 +3486,11 @@ def test_reconciliation_backfills_handoff_from_host_publication_provenance(
 
 def test_pr_filed_binds_host_verified_publication_to_owner(tmp_path: Path) -> None:
     store = _review_store(tmp_path)
-    current = replace(store.load().slices["leaf-a"], dispatch_agent_id="leaf-a")
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-1",
+    )
     event = project(
         {
             "type": "pr.filed",
@@ -3508,6 +3519,140 @@ def test_pr_filed_binds_host_verified_publication_to_owner(tmp_path: Path) -> No
     assert publication.head_branch == "main.leaf-a"
     assert publication.base_branch == "main"
     assert publication.invocation_id == "inv-1"
+
+
+def _pr_filed_event(
+    envelope_invocation_id: str | None,
+    pr_number: int,
+    head_sha: str,
+    run_seq: int,
+) -> EventEnvelope:
+    document: dict[str, object] = {
+        "type": "pr.filed",
+        "run_seq": run_seq,
+        "run_id": "review-run",
+        "agent_id": "leaf-a",
+        "lifecycle_state": "observed",
+        "observed_at": "2026-09-22T00:00:00Z",
+        "data": {
+            "slice_id": "leaf-a",
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "head_branch": "main.leaf-a",
+            "base_branch": "main",
+        },
+    }
+    if envelope_invocation_id is not None:
+        document["invocation_id"] = envelope_invocation_id
+    return project(document)
+
+
+def test_pr_filed_refuses_historical_publication_across_recreate(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-current",
+    )
+    reduced = _update_slices({"leaf-a": current}, PRFiled(44, "head-44", "leaf-a"))
+    quarantined: list[str] = []
+
+    # Historical #44 at ledger seq 39829 from the predecessor run replays into
+    # the recreated run and must stay audit-only.
+    historical = _pr_filed_event("inv-historical", 44, "head-44", 39829)
+    bound = _bind_publication_evidence(
+        reduced,
+        PRFiled(44, "head-44", "leaf-a"),
+        historical,
+        "leaf-a",
+        controller_epoch="epoch-current",
+        quarantine=quarantined.append,
+    )
+
+    assert bound["leaf-a"].publication is None
+    assert bound["leaf-a"].handoff is None
+    assert quarantined == [
+        "publication invocation does not match the current dispatch "
+        "invocation or a recorded recovery succession"
+    ]
+
+    # Current #45 at ledger seq 42329 binds only with matching invocation and
+    # exact publication identity.
+    current_pr = _pr_filed_event("inv-current", 45, "head-45", 42329)
+    bound = _bind_publication_evidence(
+        reduced,
+        PRFiled(45, "head-45", "leaf-a"),
+        current_pr,
+        "leaf-a",
+        controller_epoch="epoch-current",
+    )
+
+    publication = bound["leaf-a"].publication
+    assert publication is not None
+    assert publication.pr_number == 45
+    assert publication.head_sha == "head-45"
+    assert publication.invocation_id == "inv-current"
+
+
+def test_pr_filed_without_invocation_identity_is_quarantined(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-current",
+    )
+    reduced = _update_slices({"leaf-a": current}, PRFiled(44, "head-44", "leaf-a"))
+    quarantined: list[str] = []
+    legacy = _pr_filed_event(None, 44, "head-44", 39829)
+
+    bound = _bind_publication_evidence(
+        reduced,
+        PRFiled(44, "head-44", "leaf-a"),
+        legacy,
+        "leaf-a",
+        controller_epoch="epoch-current",
+        quarantine=quarantined.append,
+    )
+
+    assert bound["leaf-a"].publication is None
+    assert quarantined == ["publication event carries no invocation identity"]
+
+
+def test_pr_filed_refuses_prior_controller_epoch(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-current",
+    )
+    reduced = _update_slices({"leaf-a": current}, PRFiled(45, "head-45", "leaf-a"))
+    document = {
+        "type": "pr.filed",
+        "run_seq": 42329,
+        "run_id": "review-run",
+        "agent_id": "leaf-a",
+        "invocation_id": "inv-current",
+        "lifecycle_state": "observed",
+        "observed_at": "2026-09-22T00:00:00Z",
+        "data": {
+            "slice_id": "leaf-a",
+            "controller_epoch": "epoch-previous",
+            "pr_number": 45,
+            "head_sha": "head-45",
+            "head_branch": "main.leaf-a",
+            "base_branch": "main",
+        },
+    }
+
+    bound = _bind_publication_evidence(
+        reduced,
+        PRFiled(45, "head-45", "leaf-a"),
+        project(document),
+        "leaf-a",
+        controller_epoch="epoch-current",
+    )
+
+    assert bound["leaf-a"].publication is None
 
 
 def test_worker_self_approval_is_not_gate_evidence(tmp_path: Path) -> None:

@@ -161,7 +161,7 @@ impl<
             author_agent: Some(ctx.agent_name.to_string()),
             author_role: Some("dev".to_string()),
             provenance: PublicationProvenance::LedgerOwned,
-            slice_id: Some(slice_id),
+            slice_id: Some(slice_id.clone()),
             invocation_id: Some(invocation.invocation_id.clone()),
             invocation_trigger: Some(format!("{:?}", invocation.trigger).to_ascii_lowercase()),
             invocation_runtime: Some(format!("{:?}", invocation.runtime).to_ascii_lowercase()),
@@ -234,6 +234,13 @@ impl<
                 ctx.agent_name.as_ref(),
                 &serde_json::json!({
                     "agent_id": ctx.agent_name.to_string(),
+                    "slice_id": slice_id,
+                    // The exact publishing invocation is durable provenance: a
+                    // recreated controller binds publications by this identity,
+                    // never by the reused agent name or swarm run_id.
+                    "invocation_id": invocation.invocation_id.clone(),
+                    "invocation_trigger": format!("{:?}", invocation.trigger).to_ascii_lowercase(),
+                    "invocation_runtime": format!("{:?}", invocation.runtime).to_ascii_lowercase(),
                     "pr_number": output.pr_number.as_u64(),
                     "pr_url": output.pr_url,
                     "head_branch": output.head_branch.to_string(),
