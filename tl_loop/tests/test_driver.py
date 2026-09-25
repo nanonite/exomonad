@@ -35,6 +35,7 @@ from tl_loop.loop.driver import (
     DISPATCH_INTEGRITY_CONFLICT,
     DepthLimitExceeded,
     DispatchAttempt,
+    EffectIntent,
     EventDiagnostics,
     LoopCancelled,
     LoopLimitExceeded,
@@ -53,10 +54,12 @@ from tl_loop.loop.driver import (
     _event_belongs_to_plan,
     _execute_direct_reviewer_intent,
     _initial_slices,
+    _integrate_one_candidate,
     _merge_result_is_authoritative,
     _migrate_audit_marked_quarantine,
     _ordered_child_complete,
     _publication_from_watcher,
+    _reconcile_pending_merge_entry,
     _replayable_quarantine_documents,
     _park_repeated_action,
     _phase_after_slice_merge,
@@ -102,6 +105,7 @@ from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
+    ActionState,
     BudgetLedger,
     FSMState,
     GateState,
@@ -2098,6 +2102,115 @@ def test_aggregate_review_advances_hierarchical_lifecycle(tmp_path: Path) -> Non
     )
     assert restored.slices["leaf-a"].verdict is Verdict.GO
     assert _effect_names(transport) == []
+
+
+def _unresolved_publication_snapshot(*, merged: bool, pr_number: int = 42) -> JsonObject:
+    return {
+        "found": True,
+        "merged": merged,
+        "pr_number": pr_number,
+        "head_sha": "head-a",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "base_sha": "base-a",
+        "patch_digest": "patch-a",
+        "merge_tree_sha": "tree-a",
+        "ci_status": "success",
+        # Ownership is explicitly unresolved: this snapshot may not resolve a
+        # merge or advance an aggregate candidate.
+        "publication_ownership_verified": False,
+        "publication_ownership_error": "publication ownership is unverified",
+        "publication": {
+            "invocation_id": "inv-current",
+            "slice_id": "leaf-a",
+            "author_agent": "leaf-a",
+            "succession_invocation_ids": [],
+        },
+    }
+
+
+def test_aggregate_candidate_unresolved_ownership_is_not_merged(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    current = replace(
+        state.slices["leaf-a"],
+        pr_number=42,
+        reviewed_head="head-a",
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.UNKNOWN,
+            intent_id="merge-intent",
+            head_sha="head-a",
+        ),
+    )
+    candidate = IntegrationCandidateState(
+        lifecycle=IntegrationLifecycle.MERGING,
+        aggregate_pr_number=42,
+        aggregate_head_sha="head-a",
+        aggregate_patch_digest="patch-a",
+        aggregate_original_base_sha="main",
+        head_sha="head-a",
+        patch_digest="patch-a",
+        validated_base_sha="base-a",
+        merge_tree_sha="tree-a",
+        ci_status="success",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {"leaf-a": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+        integration=IntegrationRuntimeState(
+            lifecycle=IntegrationLifecycle.MERGING,
+            sub_tl_states={"leaf-a": IntegrationLifecycle.MERGING},
+            head_sha="head-a",
+            patch_digest="patch-a",
+            validated_base_sha="base-a",
+            merge_tree_sha="tree-a",
+            ci_status="success",
+            candidates={"leaf-a": candidate},
+        ),
+    )
+    transport = IntegrationTransport(
+        snapshots=[_unresolved_publication_snapshot(merged=True)]
+    )
+    task = SubTLTask("leaf-a", WorkPlan(), source=SyntheticQueue([]))
+    config = TLLoopConfig(
+        active=True,
+        chainlink_issue_id=1052,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
+    )
+
+    result = _integrate_one_candidate(task, state, config, EffectClient(transport), store, [])
+
+    # The unresolved snapshot may not reconcile an aggregate merge.
+    assert result.slices["leaf-a"].status is SliceStatus.IN_REVIEW
+    assert result.slices["leaf-a"].post_merge is None
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+
+
+def test_pending_merge_entry_unresolved_ownership_is_not_resolved(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    journal = EffectJournal("review-run", tmp_path / "action-journal.json")
+    intent = EffectIntent("merge_pr", "leaf-a", {"pr_number": 42}, True)
+    journal.append(intent)
+    entry = next(
+        candidate
+        for candidate in journal.pending_entries()
+        if candidate.get("operation") == "merge_pr"
+    )
+    transport = IntegrationTransport(
+        snapshots=[_unresolved_publication_snapshot(merged=True)]
+    )
+
+    resolved = _reconcile_pending_merge_entry(
+        entry, state, store, journal, EffectClient(transport)
+    )
+
+    assert resolved is False
+    # The pending merge stays pending; it was not confirmed from the snapshot.
+    assert journal.pending_entries()
 
 
 def test_go_with_nits_persists_follow_up_in_per_head_state(tmp_path: Path) -> None:

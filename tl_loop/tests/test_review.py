@@ -517,6 +517,108 @@ def test_unresolved_publication_ownership_blocks_direct_merge(tmp_path: Path) ->
     assert store.load().slices["leaf"].action == before.slices["leaf"].action
 
 
+def _lost_merge_then_unresolved(merged: bool) -> DirectMergeTransport:
+    class Transport(DirectMergeTransport):
+        watcher_count: int = 0
+
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            if tool_name == "watcher_pr_state":
+                self.calls.append((tool_name, arguments))
+                self.watcher_count += 1
+                if self.watcher_count == 1:
+                    return {"success": True, "result": _snapshot(head_sha="abc123")}
+                return {
+                    "success": True,
+                    "result": {
+                        "merged": merged,
+                        "pr_number": 42,
+                        "head_sha": "abc123",
+                        "head_branch": "task/leaf",
+                        "base_branch": "main",
+                        "base_sha": "base-a",
+                        "patch_digest": "patch-a",
+                        "merge_tree_sha": "tree-a",
+                        "ci_status": "success",
+                        "pr_state": "closed" if merged else "open",
+                        "publication_ownership_verified": False,
+                        "publication_ownership_error": "publication ownership is unverified",
+                        "publication": {
+                            "invocation_id": "inv-current",
+                            "slice_id": "leaf",
+                            "author_agent": "leaf-agent",
+                            "succession_invocation_ids": [],
+                        },
+                    },
+                }
+            if tool_name == "merge_pr":
+                self.calls.append((tool_name, arguments))
+                raise RuntimeError("merge response lost")
+            return super().call_tool(role, name, tool_name, arguments)
+
+    return Transport()
+
+
+def test_unknown_merge_merged_with_unresolved_ownership_is_not_adopted(
+    tmp_path: Path,
+) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.checkpoint(
+        state.fsm,
+        {"leaf": replace(state.slices["leaf"], dispatch_invocation_id="inv-current")},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
+    transport = _lost_merge_then_unresolved(merged=True)
+
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
+        TLLoopConfig(active=True, chainlink_issue_id=599),
+        journal,
+    )
+
+    slice_state = result.slices["leaf"]
+    assert slice_state.action is not None
+    assert slice_state.action.phase.value == "unknown"
+    assert slice_state.post_merge is None
+    assert result.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+
+
+def test_unknown_merge_nonmerged_with_unresolved_ownership_retains_action(
+    tmp_path: Path,
+) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.checkpoint(
+        state.fsm,
+        {"leaf": replace(state.slices["leaf"], dispatch_invocation_id="inv-current")},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
+    transport = _lost_merge_then_unresolved(merged=False)
+
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
+        TLLoopConfig(active=True, chainlink_issue_id=599),
+        journal,
+    )
+
+    slice_state = result.slices["leaf"]
+    assert slice_state.action is not None
+    assert slice_state.action.phase.value == "unknown"
+    assert result.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+
+
 def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
     state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))

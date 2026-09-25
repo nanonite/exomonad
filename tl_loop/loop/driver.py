@@ -3493,7 +3493,9 @@ def _refresh_post_merge_evidence(
     observation = _watcher_result_observation(watcher)
     if observation is None:
         return None
-    if _watcher_publication_refused(current, watcher):
+    if _watcher_publication_refused(current, watcher) or (
+        _watcher_publication_ownership_unresolved(watcher)
+    ):
         return None
     return _watcher_merge_evidence(observation)
 
@@ -5197,18 +5199,20 @@ def _reconcile_unknown_merge(
         raise_on_failure=False,
     )
     observation = _watcher_result_observation(watcher)
-    # A present-but-refused publication record may not resolve the unknown
-    # merge in either direction; fall through to the unknown-outcome path that
-    # retains the action.
+    # A present-but-refused or ownership-unresolved publication record may not
+    # resolve the unknown merge in either direction; fall through to the
+    # unknown-outcome path that retains the action.
     refused = observation is not None and publication_refused(
         current, observation, observation.head_sha, None
     )
+    unresolved = _watcher_publication_ownership_unresolved(watcher)
     if (
         watcher is not None
         and watcher.success is True
         and observation is not None
         and observation.merged
         and not refused
+        and not unresolved
     ):
         if isinstance(effects_log, EffectJournal):
             key = stable_action_key(state.run_id, "merge_pr", current.id, arguments)
@@ -5240,6 +5244,7 @@ def _reconcile_unknown_merge(
         and observation.merged is False
         and observation.pr_number in {None, current.pr_number}
         and not refused
+        and not unresolved
     ):
         diagnostic = "authoritative watcher state says the merge did not happen"
         key = stable_action_key(state.run_id, "merge_pr", current.id, arguments)
@@ -5393,6 +5398,12 @@ def _adopt_direct_merge_result(
     if _watcher_publication_refused(current, watcher):
         LOGGER.warning(
             "[TL loop] refusing to confirm direct merge for %s: publication provenance mismatch",
+            slice_id,
+        )
+        return store.load()
+    if _watcher_publication_ownership_unresolved(watcher):
+        LOGGER.warning(
+            "[TL loop] refusing to confirm direct merge for %s: publication ownership unresolved",
             slice_id,
         )
         return store.load()
@@ -6064,8 +6075,11 @@ def _reconcile_pending_merge_entry(
     except (ConnectionError, OSError, RuntimeError, TimeoutError):
         return False
     observation = _watcher_result_observation(watcher)
-    if _watcher_publication_refused(state.slices[target], watcher):
-        # A refused publication record may not resolve the pending merge.
+    if _watcher_publication_refused(state.slices[target], watcher) or (
+        _watcher_publication_ownership_unresolved(watcher)
+    ):
+        # A refused or ownership-unresolved publication record may not resolve
+        # the pending merge.
         return False
     if watcher.success is True and observation is not None and observation.merged is False:
         _resolve_nonmerged_merge(
@@ -9520,7 +9534,9 @@ def _integrate_one_candidate(
         first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
         if first is None:
             return state
-        if _watcher_publication_refused(current, first):
+        if _watcher_publication_refused(current, first) or (
+            _watcher_publication_ownership_unresolved(first)
+        ):
             LOGGER.warning(
                 "[TL loop] refusing aggregate merge for %s: publication provenance mismatch",
                 task.name,
@@ -9550,7 +9566,9 @@ def _integrate_one_candidate(
     first = first or _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if first is None:
         return state
-    if _watcher_publication_refused(current, first):
+    if _watcher_publication_refused(current, first) or (
+        _watcher_publication_ownership_unresolved(first)
+    ):
         LOGGER.warning(
             "[TL loop] refusing aggregate merge for %s: publication provenance mismatch",
             task.name,
@@ -9643,7 +9661,9 @@ def _integrate_one_candidate(
     second = _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if second is None:
         return state
-    if _watcher_publication_refused(current, second):
+    if _watcher_publication_refused(current, second) or (
+        _watcher_publication_ownership_unresolved(second)
+    ):
         LOGGER.warning(
             "[TL loop] refusing aggregate merge for %s: publication provenance mismatch",
             task.name,
