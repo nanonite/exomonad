@@ -1838,6 +1838,71 @@ def test_decoder_maps_wire_pr_filed_and_pr_updated_events() -> None:
     assert updated == PRUpdated(42, "head-b", "leaf-a")
 
 
+def test_pr_published_is_acknowledged_without_a_publication_transition(
+    tmp_path: Path,
+) -> None:
+    run_id = "publication-telemetry-run"
+    base: dict[str, object] = {
+        "run_id": run_id,
+        "agent_id": "leaf-a",
+        "invocation_id": "inv-a",
+        "lifecycle_state": "emitted",
+        "observed_at": "2026-08-12T00:00:00Z",
+    }
+
+    def wire(event_type: str, sequence: int) -> EventEnvelope:
+        return project(
+            {
+                **base,
+                "type": event_type,
+                "run_seq": sequence,
+                "data": {
+                    "slice_id": "leaf-a",
+                    "pr_number": 42,
+                    "head_sha": "head-a",
+                    "verified": True,
+                },
+            }
+        )
+
+    source = SyntheticQueue(
+        [
+            wire("pr.published", 1),
+            wire("pr.filed", 2),
+            _event(3, "all_children_done", run_id=run_id),
+        ]
+    )
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "implement the change",
+                    "boundary": ["src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                }
+            ]
+        }
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(RecordingTransport()),
+        config=TLLoopConfig(max_workers=0, max_leaves=1, max_events=3, poll_interval=0.001),
+        root_dir=tmp_path,
+    )
+
+    # The telemetry row is acknowledged...
+    assert 1 in source.acknowledged
+    # ...but never produces an FSM transition of its own...
+    assert all(transition.event_type != "pr.published" for transition in result.transitions)
+    # ...and the definitive pr.filed still produces exactly one transition.
+    assert sum(transition.event_type == "pr.filed" for transition in result.transitions) == 1
+    assert result.final_state.slices["leaf-a"].pr_number == 42
+
+
 def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Path) -> None:
     run_id = "reviewer-spawn-run"
     raw_pr_filed = {

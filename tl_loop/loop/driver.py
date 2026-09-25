@@ -41,6 +41,7 @@ from tl_loop.fsm.event import (
     PRFiled,
     PRMerged,
     PRUpdated,
+    PublicationObserved,
     TLEvent,
 )
 from tl_loop.fsm.lane import (
@@ -2549,6 +2550,21 @@ def _run_loop(
             fsm_event = decoder.decode(event)
         except Exception as error:
             raise TLLoopError(str(error)) from error
+        if isinstance(fsm_event, PublicationObserved):
+            # Telemetry-only: ``file_pr`` writes ``pr.published`` before the
+            # definitive ``pr.filed``/``pr.updated`` row and carries no created
+            # flag, so it is acknowledged without an FSM transition or slice
+            # mutation. The immutable ledger row and projected payload remain
+            # available for audit and observability.
+            diagnostics.correlated += 1
+            _checkpoint_and_ack(
+                store, source, event, state, phase, acknowledge=not replaying
+            )
+            if not replaying:
+                diagnostics.acknowledged += 1
+            _release_replayed_event(store, event, replaying)
+            state = store.load()
+            continue
         event_slice_id = _event_slice_id(event, state)
         if (
             isinstance(fsm_event, (PRFiled, PRUpdated))

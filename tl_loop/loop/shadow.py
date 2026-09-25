@@ -23,6 +23,7 @@ from tl_loop.fsm.event import (
     PRHeadChanged,
     PRMerged,
     PRUpdated,
+    PublicationObserved,
     TLEvent,
 )
 from tl_loop.fsm.phase import (
@@ -204,6 +205,20 @@ class TLEventDecoder:
                 _positive_int(event.data, "pr_number", event.event_type),
                 _head_sha(event),
                 event.slice_id,
+            )
+        if event.kind is EventKind.PR_PUBLISHED:
+            # Telemetry-only: acknowledged without an FSM transition. The row
+            # precedes the definitive pr.filed/pr.updated and has no created
+            # flag, so it must never be classified as one of them.
+            pr_number = event.data.get("pr_number")
+            verified = event.data.get("verified")
+            return PublicationObserved(
+                pr_number=(
+                    pr_number if type(pr_number) is int and pr_number > 0 else None
+                ),
+                head_sha=event.head_sha or "",
+                slice_id=event.slice_id,
+                verified=verified if type(verified) is bool else None,
             )
         if event.kind is EventKind.PR_MERGED:
             return PRMerged(_positive_int(event.data, "pr_number", event.event_type), _agent(event))

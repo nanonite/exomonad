@@ -13,7 +13,13 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
-from tl_loop.fsm.event import ChildBlocked, ChildSpawned, PRFiled
+from tl_loop.fsm.event import (
+    ChildBlocked,
+    ChildSpawned,
+    PRFiled,
+    PRUpdated,
+    PublicationObserved,
+)
 from tl_loop.fsm.phase import ChildHandle
 from tl_loop.loop.shadow import ShadowLoop, TLEventDecoder, _update_slices
 from tl_loop.state.schema import SliceState, SliceStatus
@@ -97,6 +103,44 @@ def test_shadow_decoder_accepts_typed_task_blocked_payload() -> None:
     decoded = TLEventDecoder().decode(project(raw))
 
     assert decoded == ChildBlocked("slice-a", "base_ci_unstable", True, "repair base CI", 2)
+
+
+def _pr_published_raw(run_seq: int = 3) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "event_id": "published-event",
+        "id": "published-event",
+        "event_time": "2026-08-11T00:00:00Z",
+        "observed_at": "2026-08-11T00:00:00Z",
+        "run_seq": run_seq,
+        "type": "pr.published",
+        "agent_id": "leaf-a",
+        "run_id": "run-1",
+        "session_id": "session-1",
+        "lifecycle_state": "observed",
+        "data": {
+            "verified": True,
+            "pr_number": 101,
+            "head_branch": "task/leaf-a",
+            "base_branch": "main",
+            "head_sha": "head-101",
+            "publication": "NewHead",
+            "invocation_id": "inv-1",
+        },
+    }
+
+
+def test_shadow_decoder_treats_pr_published_as_telemetry_only() -> None:
+    decoded = TLEventDecoder().decode(project(_pr_published_raw()))
+
+    assert isinstance(decoded, PublicationObserved)
+    # Never classified as the definitive publication transition.
+    assert not isinstance(decoded, (PRFiled, PRUpdated))
+    # Payload remains available for audit/observability.
+    assert decoded.pr_number == 101
+    assert decoded.head_sha == "head-101"
+    assert decoded.verified is True
+    assert decoded.slice_id is None
 
 
 def test_shadow_recovery_stays_nonterminal_until_pr_is_filed() -> None:

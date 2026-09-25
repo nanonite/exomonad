@@ -77,6 +77,22 @@ PRHeadChanged = PRUpdated
 
 
 @dataclass(frozen=True)
+class PublicationObserved(TLEvent):
+    """Telemetry-only verified-publication row; never drives an FSM transition.
+
+    ``file_pr`` writes ``pr.published`` before the definitive ``pr.filed`` or
+    ``pr.updated`` row and carries no created flag, so it must be acknowledged
+    without changing phase or slice state. The immutable ledger row and this
+    projected payload remain available for audit and observability.
+    """
+
+    pr_number: int | None = None
+    head_sha: str = ""
+    slice_id: str | None = None
+    verified: bool | None = None
+
+
+@dataclass(frozen=True)
 class AllChildrenDone(TLEvent):
     """All children have completed their lifecycle."""
 
