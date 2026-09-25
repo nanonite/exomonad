@@ -250,6 +250,7 @@ from .reconcile import (
     _publication_ownership_status,
     accepted_publication_from_watcher,
     derive_next_action,
+    publication_ownership_malformed,
     publication_ownership_unresolved,
     publication_refused,
     reconcile_merge_observation,
@@ -6414,11 +6415,14 @@ def _reconcile_nonterminal_slices(
             or (merge_evidence is not None and _merge_action_is_exact(current, merge_evidence))
         )
         merge_authorized = accepted_publication is not None or durable_merge_authorized
-        if _watcher_publication_refused(current, watcher, owner_id):
-            # A present-but-refused publication record may not change any
-            # durable slice or run state: no reconciliation result, merge
+        if _watcher_publication_refused(current, watcher, owner_id) or (
+            publication_ownership_malformed(watcher)
+        ):
+            # A present-but-refused or malformed-ownership record may not change
+            # any durable slice or run state: no reconciliation result, merge
             # readiness, unknown-merge resolution, review replay, park, or
-            # state-changing effect.
+            # state-changing effect. An explicit unverified verdict is excluded
+            # here so it still reaches the ownership park path below.
             LOGGER.warning(
                 "[TL loop] refusing watcher snapshot for %s: publication provenance mismatch",
                 current.id,

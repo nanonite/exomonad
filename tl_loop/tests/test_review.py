@@ -435,6 +435,7 @@ def test_refused_publication_blocks_direct_merge(tmp_path: Path) -> None:
                 "merge_tree_sha": "tree-a",
                 "ci_status": "success",
                 "publication_ownership_verified": True,
+                "publication_ownership_error": "",
                 # Unrelated to the current dispatch, so the binding is refused.
                 "publication": {
                     "invocation_id": "inv-other",
@@ -517,7 +518,63 @@ def test_unresolved_publication_ownership_blocks_direct_merge(tmp_path: Path) ->
     assert store.load().slices["leaf"].action == before.slices["leaf"].action
 
 
-def _lost_merge_then_unresolved(merged: bool) -> DirectMergeTransport:
+def test_malformed_ownership_blocks_direct_merge(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    current = state.slices["leaf"]
+    state = store.checkpoint(
+        state.fsm,
+        {"leaf": replace(current, dispatch_invocation_id="inv-current")},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    before = store.load()
+    transport = DirectMergeTransport(
+        snapshots=[
+            {
+                "found": True,
+                "pr_number": 42,
+                "head_sha": "abc123",
+                "head_branch": "task/leaf",
+                "base_branch": "main",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+                # verified=True with the ownership error field omitted: the
+                # complete ownership contract is not satisfied.
+                "publication_ownership_verified": True,
+                "publication": {
+                    "invocation_id": "inv-current",
+                    "slice_id": "leaf",
+                    "author_agent": "leaf-agent",
+                    "succession_invocation_ids": [],
+                },
+            }
+        ]
+    )
+    effects_log: list[EffectIntent] = []
+
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
+        TLLoopConfig(
+            poll_interval=0.001,
+            review_policy_path=Path(".exo/review-policy.toml"),
+        ),
+        effects_log,
+    )
+
+    assert result.slices["leaf"].status is SliceStatus.IN_REVIEW
+    assert result.slices["leaf"].action == before.slices["leaf"].action
+    assert result.integration == before.integration
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+    assert store.load().slices["leaf"].action == before.slices["leaf"].action
+
+
+def _lost_merge_then(second_snapshot: dict[str, object]) -> DirectMergeTransport:
+    """A transport whose merge response is lost, then reports ``second_snapshot``."""
+
     class Transport(DirectMergeTransport):
         watcher_count: int = 0
 
@@ -533,35 +590,44 @@ def _lost_merge_then_unresolved(merged: bool) -> DirectMergeTransport:
                 self.watcher_count += 1
                 if self.watcher_count == 1:
                     return {"success": True, "result": _snapshot(head_sha="abc123")}
-                return {
-                    "success": True,
-                    "result": {
-                        "merged": merged,
-                        "pr_number": 42,
-                        "head_sha": "abc123",
-                        "head_branch": "task/leaf",
-                        "base_branch": "main",
-                        "base_sha": "base-a",
-                        "patch_digest": "patch-a",
-                        "merge_tree_sha": "tree-a",
-                        "ci_status": "success",
-                        "pr_state": "closed" if merged else "open",
-                        "publication_ownership_verified": False,
-                        "publication_ownership_error": "publication ownership is unverified",
-                        "publication": {
-                            "invocation_id": "inv-current",
-                            "slice_id": "leaf",
-                            "author_agent": "leaf-agent",
-                            "succession_invocation_ids": [],
-                        },
-                    },
-                }
+                return {"success": True, "result": second_snapshot}
             if tool_name == "merge_pr":
                 self.calls.append((tool_name, arguments))
                 raise RuntimeError("merge response lost")
             return super().call_tool(role, name, tool_name, arguments)
 
     return Transport()
+
+
+def _second_merge_snapshot(*, merged: bool, ownership: str) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "merged": merged,
+        "pr_number": 42,
+        "head_sha": "abc123",
+        "head_branch": "task/leaf",
+        "base_branch": "main",
+        "base_sha": "base-a",
+        "patch_digest": "patch-a",
+        "merge_tree_sha": "tree-a",
+        "ci_status": "success",
+        "pr_state": "closed" if merged else "open",
+        "publication": {
+            "invocation_id": "inv-current",
+            "slice_id": "leaf",
+            "author_agent": "leaf-agent",
+            "succession_invocation_ids": [],
+        },
+    }
+    if ownership == "unresolved":
+        snapshot["publication_ownership_verified"] = False
+        snapshot["publication_ownership_error"] = "publication ownership is unverified"
+    elif ownership == "malformed":
+        # verified=True but the ownership error field is omitted: the complete
+        # ownership contract is not satisfied.
+        snapshot["publication_ownership_verified"] = True
+    else:
+        raise AssertionError(f"unknown ownership mode {ownership!r}")
+    return snapshot
 
 
 def test_unknown_merge_merged_with_unresolved_ownership_is_not_adopted(
@@ -575,7 +641,7 @@ def test_unknown_merge_merged_with_unresolved_ownership_is_not_adopted(
         state.events.last_consumed_offset,
     )
     journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
-    transport = _lost_merge_then_unresolved(merged=True)
+    transport = _lost_merge_then(_second_merge_snapshot(merged=True, ownership="unresolved"))
 
     result = _run_direct_merge(
         state,
@@ -603,7 +669,7 @@ def test_unknown_merge_nonmerged_with_unresolved_ownership_retains_action(
         state.events.last_consumed_offset,
     )
     journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
-    transport = _lost_merge_then_unresolved(merged=False)
+    transport = _lost_merge_then(_second_merge_snapshot(merged=False, ownership="unresolved"))
 
     result = _run_direct_merge(
         state,
@@ -616,6 +682,35 @@ def test_unknown_merge_nonmerged_with_unresolved_ownership_retains_action(
     slice_state = result.slices["leaf"]
     assert slice_state.action is not None
     assert slice_state.action.phase.value == "unknown"
+    assert result.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+
+
+@pytest.mark.parametrize("merged", [True, False])
+def test_unknown_merge_malformed_ownership_retains_action(
+    tmp_path: Path, merged: bool
+) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.checkpoint(
+        state.fsm,
+        {"leaf": replace(state.slices["leaf"], dispatch_invocation_id="inv-current")},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
+    transport = _lost_merge_then(_second_merge_snapshot(merged=merged, ownership="malformed"))
+
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
+        TLLoopConfig(active=True, chainlink_issue_id=599),
+        journal,
+    )
+
+    slice_state = result.slices["leaf"]
+    assert slice_state.action is not None
+    assert slice_state.action.phase.value == "unknown"
+    assert slice_state.post_merge is None
     assert result.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
 
 

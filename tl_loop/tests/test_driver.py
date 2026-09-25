@@ -85,6 +85,8 @@ from tl_loop.loop.reconcile import (
     ReconciliationResult,
     action_key,
     derive_next_action,
+    publication_ownership_malformed,
+    publication_ownership_unresolved,
     publication_refused,
     reconcile_merge_observation,
     repeated_action_gate_name,
@@ -2104,8 +2106,10 @@ def test_aggregate_review_advances_hierarchical_lifecycle(tmp_path: Path) -> Non
     assert _effect_names(transport) == []
 
 
-def _unresolved_publication_snapshot(*, merged: bool, pr_number: int = 42) -> JsonObject:
-    return {
+def _ownership_publication_snapshot(
+    *, merged: bool, ownership: str, pr_number: int = 42
+) -> JsonObject:
+    snapshot: JsonObject = {
         "found": True,
         "merged": merged,
         "pr_number": pr_number,
@@ -2116,10 +2120,6 @@ def _unresolved_publication_snapshot(*, merged: bool, pr_number: int = 42) -> Js
         "patch_digest": "patch-a",
         "merge_tree_sha": "tree-a",
         "ci_status": "success",
-        # Ownership is explicitly unresolved: this snapshot may not resolve a
-        # merge or advance an aggregate candidate.
-        "publication_ownership_verified": False,
-        "publication_ownership_error": "publication ownership is unverified",
         "publication": {
             "invocation_id": "inv-current",
             "slice_id": "leaf-a",
@@ -2127,9 +2127,24 @@ def _unresolved_publication_snapshot(*, merged: bool, pr_number: int = 42) -> Js
             "succession_invocation_ids": [],
         },
     }
+    if ownership == "unresolved":
+        # Explicitly unresolved ownership: the park path owns this case, but a
+        # merge/recovery path may never resolve it.
+        snapshot["publication_ownership_verified"] = False
+        snapshot["publication_ownership_error"] = "publication ownership is unverified"
+    elif ownership == "malformed":
+        # verified=True with the ownership error field omitted: the complete
+        # ownership contract is not satisfied.
+        snapshot["publication_ownership_verified"] = True
+    else:
+        raise AssertionError(f"unknown ownership mode {ownership!r}")
+    return snapshot
 
 
-def test_aggregate_candidate_unresolved_ownership_is_not_merged(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ownership", ["unresolved", "malformed"])
+def test_aggregate_candidate_untrusted_ownership_is_not_merged(
+    tmp_path: Path, ownership: str
+) -> None:
     store = _review_store(tmp_path)
     state = store.load()
     current = replace(
@@ -2172,7 +2187,7 @@ def test_aggregate_candidate_unresolved_ownership_is_not_merged(tmp_path: Path) 
         ),
     )
     transport = IntegrationTransport(
-        snapshots=[_unresolved_publication_snapshot(merged=True)]
+        snapshots=[_ownership_publication_snapshot(merged=True, ownership=ownership)]
     )
     task = SubTLTask("leaf-a", WorkPlan(), source=SyntheticQueue([]))
     config = TLLoopConfig(
@@ -2183,13 +2198,16 @@ def test_aggregate_candidate_unresolved_ownership_is_not_merged(tmp_path: Path) 
 
     result = _integrate_one_candidate(task, state, config, EffectClient(transport), store, [])
 
-    # The unresolved snapshot may not reconcile an aggregate merge.
+    # The untrusted snapshot may not reconcile an aggregate merge.
     assert result.slices["leaf-a"].status is SliceStatus.IN_REVIEW
     assert result.slices["leaf-a"].post_merge is None
     assert not any(name == "merge_pr" for name, _ in transport.calls)
 
 
-def test_pending_merge_entry_unresolved_ownership_is_not_resolved(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ownership", ["unresolved", "malformed"])
+def test_pending_merge_entry_untrusted_ownership_is_not_resolved(
+    tmp_path: Path, ownership: str
+) -> None:
     store = _review_store(tmp_path)
     state = store.load()
     journal = EffectJournal("review-run", tmp_path / "action-journal.json")
@@ -2201,7 +2219,7 @@ def test_pending_merge_entry_unresolved_ownership_is_not_resolved(tmp_path: Path
         if candidate.get("operation") == "merge_pr"
     )
     transport = IntegrationTransport(
-        snapshots=[_unresolved_publication_snapshot(merged=True)]
+        snapshots=[_ownership_publication_snapshot(merged=True, ownership=ownership)]
     )
 
     resolved = _reconcile_pending_merge_entry(
@@ -3581,6 +3599,7 @@ def test_reconciliation_backfills_handoff_from_host_publication_provenance(
         "review_state": "approved",
         "ci_status": "success",
         "publication_ownership_verified": True,
+        "publication_ownership_error": "",
         "publication": {
             "invocation_id": "inv-host",
             "slice_id": "leaf-a",
@@ -3632,6 +3651,7 @@ def test_reconciliation_without_active_invocation_refuses_host_publication(
         "review_state": "approved",
         "ci_status": "success",
         "publication_ownership_verified": True,
+        "publication_ownership_error": "",
         "publication": {
             "invocation_id": "inv-host",
             "slice_id": "leaf-a",
@@ -3644,6 +3664,54 @@ def test_reconciliation_without_active_invocation_refuses_host_publication(
 
     # Without an active invocation or a durable binding, the host record is a
     # historical record that cannot bind on its own.
+    assert updated.publication is None
+    assert updated.handoff is None
+    assert updated.status is SliceStatus.IN_REVIEW
+
+
+def test_reconciliation_malformed_ownership_does_not_bind_or_backfill(
+    tmp_path: Path,
+) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-host",
+        publication=None,
+        handoff=None,
+        verdict=Verdict.GO,
+        reviewer_attempt={"head-a": 1},
+    )
+    result = ReconciliationResult(
+        slice_id="leaf-a",
+        confirmed_stage="review",
+        authoritative_evidence=("published_pr",),
+        missing_evidence=("handoff",),
+        conflicts=(),
+        next_action="await_handoff",
+    )
+    watcher = {
+        "found": True,
+        "pr_number": 42,
+        "head_sha": "head-a",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "review_state": "approved",
+        "ci_status": "success",
+        # verified=True with the ownership error field omitted: the complete
+        # ownership contract is not satisfied.
+        "publication_ownership_verified": True,
+        "publication": {
+            "invocation_id": "inv-host",
+            "slice_id": "leaf-a",
+            "author_agent": "leaf-a",
+            "succession_invocation_ids": [],
+        },
+    }
+
+    updated = _apply_reconciliation_observations(current, result, watcher, None)
+
+    # Malformed ownership metadata can never bind or backfill evidence.
     assert updated.publication is None
     assert updated.handoff is None
     assert updated.status is SliceStatus.IN_REVIEW
@@ -3677,6 +3745,7 @@ def test_reconciliation_refused_watcher_does_not_backfill_handoff(tmp_path: Path
         "review_state": "approved",
         "ci_status": "success",
         "publication_ownership_verified": True,
+        "publication_ownership_error": "",
         # The record invocation is unrelated to the current dispatch, so the
         # watcher binding is refused.
         "publication": {
@@ -3728,6 +3797,7 @@ def test_reconciliation_refused_watcher_does_not_apply_merge_or_head(
         "ci_status": "success",
         "merged": True,
         "publication_ownership_verified": True,
+        "publication_ownership_error": "",
         # Unrelated to the current dispatch, so the watcher binding is refused.
         "publication": {
             "invocation_id": "inv-other",
@@ -4022,6 +4092,7 @@ def _watcher_publication(
         "head_branch": "main.leaf-a",
         "base_branch": "main",
         "publication_ownership_verified": True,
+        "publication_ownership_error": "",
         "publication": {
             "invocation_id": invocation_id,
             "slice_id": "leaf-a",
@@ -4116,6 +4187,7 @@ def test_malformed_publication_is_refused_not_absent(tmp_path: Path) -> None:
         "head_branch": "main.leaf-a",
         "base_branch": "main",
         "publication_ownership_verified": True,
+        "publication_ownership_error": "",
         # Present but not a publication object: this must be refused, never
         # treated as a genuinely absent record eligible for the fallback.
         "publication": "not-a-publication-record",
@@ -4123,6 +4195,24 @@ def test_malformed_publication_is_refused_not_absent(tmp_path: Path) -> None:
     assert watcher_presents_publication(watcher) is True
     assert publication_refused(current, watcher, "head-45", "leaf-a") is True
     assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
+
+
+def test_absent_publication_record_retains_compatibility(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = {
+        "found": True,
+        "pr_number": 45,
+        "head_sha": "head-45",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "merged": False,
+    }
+    # A genuinely absent record is not a refusal and not malformed/unresolved;
+    # the established durable-merge compatibility behavior still applies.
+    assert watcher_presents_publication(watcher) is False
+    assert publication_refused(current, watcher, "head-45", "leaf-a") is False
+    assert publication_ownership_malformed(watcher) is False
+    assert publication_ownership_unresolved(watcher) is False
 
 
 def test_publication_from_watcher_refuses_branch_mismatch(tmp_path: Path) -> None:

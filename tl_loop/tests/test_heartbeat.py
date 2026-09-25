@@ -41,6 +41,8 @@ class HeartbeatTransport:
     head_reachable: bool = True
     publication_ownership_verified: bool | None = None
     publication_ownership_error: str = ""
+    omit_ownership_error: bool = False
+    ownership_error_raw: object | None = None
     publication: JsonObject | None = None
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
@@ -101,8 +103,13 @@ class HeartbeatTransport:
                     "pr_head_unreachable: object missing" if not self.head_reachable else ""
                 ),
                 "publication_ownership_verified": self.publication_ownership_verified,
-                "publication_ownership_error": self.publication_ownership_error,
             }
+            if not self.omit_ownership_error:
+                result["publication_ownership_error"] = (
+                    self.publication_ownership_error
+                    if self.ownership_error_raw is None
+                    else self.ownership_error_raw
+                )
             if self.publication is not None:
                 result["publication"] = self.publication
             return cast(JsonObject, {"success": True, "result": result})
@@ -517,6 +524,75 @@ def test_heartbeat_unverified_ownership_does_not_persist_resolved_pr(
         state.events.last_consumed_offset,
     )
     transport = HeartbeatTransport(publication=_refused_publication("inv-current"))
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    assert result.state.slices["slice-a"].pr_number is None
+    assert store.load().slices["slice-a"].pr_number is None
+    assert [event.kind for event in result.events] == ["pr.publication_refused"]
+
+
+@pytest.mark.parametrize(
+    "transport_kwargs",
+    [
+        {"omit_ownership_error": True},
+        {"ownership_error_raw": 17},
+        {"publication_ownership_error": "contradictory ownership evidence"},
+    ],
+    ids=["omitted-error", "non-string-error", "contradictory-error"],
+)
+def test_heartbeat_malformed_ownership_cannot_mutate(
+    tmp_path: Path, transport_kwargs: dict[str, object]
+) -> None:
+    store, result = _run_refused_heartbeat(
+        tmp_path,
+        HeartbeatTransport(
+            merged=False,
+            pr_state="open",
+            publication_ownership_verified=True,
+            publication=_refused_publication("inv-current"),
+            **transport_kwargs,
+        ),
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.reviewed_head == "head-old"
+    assert observed.reconciliation is None
+    assert observed.park_cause is None
+    assert result.parked_slice_ids == ()
+    assert [event.kind for event in result.events] == ["pr.publication_refused"]
+    assert store.load().slices["slice-a"].reviewed_head == "head-old"
+
+
+def test_heartbeat_malformed_ownership_does_not_persist_resolved_pr(
+    tmp_path: Path,
+) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0, pr_number=None)
+    current = state.slices["slice-a"]
+    state = store.checkpoint(
+        state.fsm,
+        {
+            "slice-a": replace(
+                current,
+                dispatch_invocation_id="inv-current",
+                dispatch_agent_id="agent-slice-a",
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    transport = HeartbeatTransport(
+        publication_ownership_verified=True,
+        omit_ownership_error=True,
+        publication=_refused_publication("inv-current"),
+    )
 
     result = heartbeat_once(
         state,

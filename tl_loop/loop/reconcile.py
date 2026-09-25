@@ -176,7 +176,10 @@ def accepted_publication_from_watcher(
     observation = _watcher_observation(snapshot)
     if observation is None:
         return None
-    if observation.publication_ownership_verified is not True or not head_sha:
+    # A binding requires the complete ownership contract: the verdict present
+    # and exactly boolean True, the error field present, a string, and empty.
+    # A bare ``publication_ownership_verified=True`` is not sufficient proof.
+    if observation.ownership_status()[0] is not True or not head_sha:
         return None
     pr_number = observation.pr_number
     head_branch = observation.head_branch
@@ -239,26 +242,32 @@ def accepted_publication_from_watcher(
     )
 
 
-def publication_ownership_unverified(snapshot: object) -> bool:
-    """Whether a watcher presents a record whose ownership was never verified.
+def publication_ownership_malformed(snapshot: object) -> bool:
+    """Whether a watcher presents a record whose ownership response is malformed.
 
-    Ownership fields omitted or malformed leave ``publication_ownership_verified``
-    ``None``. An explicit unverified verdict is deliberately excluded: the
-    reconciliation and heartbeat park paths handle that case.
+    Ownership fields omitted, non-boolean, or contradictory fail the complete
+    ownership contract and are refused. An explicit ``False`` verdict is
+    deliberately excluded: the reconciliation and heartbeat park paths handle
+    that case.
     """
     observation = _watcher_observation(snapshot)
     if observation is None:
         return False
     if observation.publication is None and not observation.publication_present:
         return False
-    return observation.publication_ownership_verified is None
+    if (
+        observation.ownership_verified_present
+        and observation.publication_ownership_verified is False
+    ):
+        return False
+    return observation.ownership_status()[0] is not True
 
 
 def publication_ownership_unresolved(snapshot: object) -> bool:
     """Whether a watcher presents publication evidence with unresolved ownership.
 
-    Covers both an explicit unverified verdict and a publication record whose
-    ownership was never verified. Merge paths that do not park must refuse both.
+    Covers both an explicit unverified verdict and malformed ownership metadata
+    on a present record. Merge paths that do not park must refuse both.
     """
     observation = _watcher_observation(snapshot)
     if observation is None:
@@ -267,7 +276,7 @@ def publication_ownership_unresolved(snapshot: object) -> bool:
         return True
     return (
         observation.publication is not None or observation.publication_present
-    ) and observation.publication_ownership_verified is not True
+    ) and observation.ownership_status()[0] is not True
 
 
 def publication_refused(

@@ -91,6 +91,7 @@ class FakeClient:
     head_reachable: bool = True
     publication_ownership_verified: bool = True
     publication_ownership_error: str = ""
+    omit_publication_ownership_error: bool = False
     publication_invocation_id: str | None = "invocation-a"
     publication_succession: tuple[str, ...] = ()
     publication_malformed: bool = False
@@ -156,7 +157,8 @@ class FakeClient:
                 "head_reachable": self.head_reachable,
             }
             result["publication_ownership_verified"] = self.publication_ownership_verified
-            result["publication_ownership_error"] = self.publication_ownership_error
+            if not self.omit_publication_ownership_error:
+                result["publication_ownership_error"] = self.publication_ownership_error
             if self.publication_malformed:
                 result["publication"] = "not-a-publication-record"
             elif self.publication_invocation_id is not None:
@@ -942,6 +944,57 @@ def test_refused_merged_false_snapshot_cannot_set_merge_readiness(tmp_path) -> N
     assert slice_state.status is SliceStatus.IN_REVIEW
     assert slice_state.action is None
     # The refusal is durable: no derived readiness was checkpointed.
+    assert store.load().slices["slice-a"].reconciliation == seeded_reconciliation
+
+
+def test_malformed_ownership_snapshot_cannot_set_merge_readiness(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    seeded_reconciliation = {
+        "confirmed_stage": "review",
+        "authoritative_evidence": [],
+        "missing_evidence": [],
+        "conflicts": [],
+        "next_action": "await_authoritative_evidence",
+    }
+    state = store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {
+            "slice-a": replace(
+                state.slices["slice-a"],
+                status=SliceStatus.IN_REVIEW,
+                pr_number=99,
+                reviewed_head="head-a",
+                verdict=Verdict.GO,
+                dispatch_invocation_id="inv-current",
+                handoff=HandoffEvidence(
+                    99, "head-a", 1, "inv-current", "agent-a", "2026-09-03T00:00:00Z"
+                ),
+                ci_state={"head-a": "success"},
+                reconciliation=seeded_reconciliation,
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    client = FakeClient(
+        review_state="approved",
+        merged=False,
+        pr_state="open",
+        publication_ownership_verified=True,
+        # verified=True with the ownership error omitted is malformed.
+        omit_publication_ownership_error=True,
+        publication_invocation_id="inv-current",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+
+    slice_state = recovered.slices["slice-a"]
+    # Malformed ownership may not derive merge readiness or any other state.
+    assert slice_state.reconciliation == seeded_reconciliation
+    assert slice_state.status is SliceStatus.IN_REVIEW
+    assert slice_state.action is None
+    assert slice_state.publication is None
     assert store.load().slices["slice-a"].reconciliation == seeded_reconciliation
 
 
