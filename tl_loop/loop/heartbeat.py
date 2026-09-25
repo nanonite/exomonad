@@ -19,7 +19,7 @@ from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.observation import WatcherObservation
-from tl_loop.loop.reconcile import reconcile_merge_observation
+from tl_loop.loop.reconcile import publication_refused, reconcile_merge_observation
 from tl_loop.loop.recovery_policy import (
     ProbeResult,
     RecoveryAction,
@@ -352,6 +352,19 @@ def heartbeat_once(
                 progress = True
             slice_state = current.slices[slice_state.id]
         watcher = _watch_pr(effects, pr_number, slice_state.id)
+        if publication_refused(slice_state, watcher, watcher.head_sha, None):
+            # A present-but-refused publication record may not change head,
+            # review, CI, handoff, action, status, integration, or merge state,
+            # nor park the slice or trigger state-changing effects.
+            events.append(
+                _event(
+                    "pr.publication_refused",
+                    "watcher_pr_state",
+                    slice_state.id,
+                    _pr_payload(watcher),
+                )
+            )
+            continue
         terminal_cause = _pr_terminal_cause(watcher)
         if terminal_cause is not None:
             if isinstance(effects, ReadOnlyEffectClient):

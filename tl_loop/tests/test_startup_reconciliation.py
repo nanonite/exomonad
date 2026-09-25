@@ -31,6 +31,7 @@ from tl_loop.state.schema import (
     DurableReviewEvidence,
     FSMState,
     GateStatus,
+    HandoffEvidence,
     RepositoryIdentity,
     ReviewValidationDisposition,
     ReviewValidationObservation,
@@ -846,6 +847,95 @@ def test_confirmed_merge_with_refused_publication_provenance_is_not_adopted(
     assert slice_state.status is SliceStatus.IN_REVIEW
     assert slice_state.post_merge is None
     assert client.merge_calls == []
+
+
+def test_refused_merged_false_snapshot_cannot_set_merge_readiness(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    seeded_reconciliation = {
+        "confirmed_stage": "review",
+        "authoritative_evidence": [],
+        "missing_evidence": [],
+        "conflicts": [],
+        "next_action": "await_authoritative_evidence",
+    }
+    state = store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {
+            "slice-a": replace(
+                state.slices["slice-a"],
+                status=SliceStatus.IN_REVIEW,
+                pr_number=99,
+                reviewed_head="head-a",
+                verdict=Verdict.GO,
+                dispatch_invocation_id="inv-current",
+                handoff=HandoffEvidence(
+                    99, "head-a", 1, "inv-current", "agent-a", "2026-09-03T00:00:00Z"
+                ),
+                ci_state={"head-a": "success"},
+                reconciliation=seeded_reconciliation,
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    client = FakeClient(
+        review_state="approved",
+        merged=False,
+        pr_state="open",
+        publication_ownership_verified=True,
+        publication_invocation_id="inv-other",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+
+    slice_state = recovered.slices["slice-a"]
+    assert slice_state.reconciliation == seeded_reconciliation
+    assert slice_state.status is SliceStatus.IN_REVIEW
+    assert slice_state.action is None
+    # The refusal is durable: no derived readiness was checkpointed.
+    assert store.load().slices["slice-a"].reconciliation == seeded_reconciliation
+
+
+def test_refused_merged_false_snapshot_retains_unknown_merge_action(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    state = store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {
+            "slice-a": replace(
+                state.slices["slice-a"],
+                status=SliceStatus.IN_REVIEW,
+                pr_number=99,
+                reviewed_head="head-a",
+                dispatch_invocation_id="inv-current",
+                action=ActionState(
+                    ActionKind.MERGE,
+                    ActionPhase.UNKNOWN,
+                    intent_id="merge-intent",
+                    head_sha="head-a",
+                ),
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    before_state = store.load()
+    before = before_state.slices["slice-a"]
+    client = FakeClient(
+        merged=False,
+        pr_state="open",
+        publication_ownership_verified=True,
+        publication_invocation_id="inv-other",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
+
+    slice_state = recovered.slices["slice-a"]
+    assert slice_state.action == before.action
+    assert slice_state.status is SliceStatus.IN_REVIEW
+    assert recovered.integration == before_state.integration
+    assert store.load().slices["slice-a"].action == before.action
 
 
 def test_review_validation_failure_reason_round_trips_through_checkpoint(tmp_path) -> None:

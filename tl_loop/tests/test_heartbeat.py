@@ -41,6 +41,7 @@ class HeartbeatTransport:
     head_reachable: bool = True
     publication_ownership_verified: bool | None = None
     publication_ownership_error: str = ""
+    publication: JsonObject | None = None
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -85,26 +86,26 @@ class HeartbeatTransport:
                 },
             )
         if tool_name == "watcher_pr_state":
-            return cast(
-                JsonObject,
-                {
-                    "success": True,
-                    "result": {
-                        "head_sha": "head-new",
-                        "review_state": "approved",
-                        "ci_status": "success",
-                        "found": True,
-                        "pr_state": self.pr_state,
-                        "merged": self.merged,
-                        "head_reachable": self.head_reachable,
-                        "evidence_error": (
-                            "pr_head_unreachable: object missing" if not self.head_reachable else ""
-                        ),
-                        "publication_ownership_verified": self.publication_ownership_verified,
-                        "publication_ownership_error": self.publication_ownership_error,
-                    },
-                },
-            )
+            result: dict[str, object] = {
+                "pr_number": 42,
+                "head_sha": "head-new",
+                "head_branch": "task/slice-a",
+                "base_branch": "main",
+                "review_state": "approved",
+                "ci_status": "success",
+                "found": True,
+                "pr_state": self.pr_state,
+                "merged": self.merged,
+                "head_reachable": self.head_reachable,
+                "evidence_error": (
+                    "pr_head_unreachable: object missing" if not self.head_reachable else ""
+                ),
+                "publication_ownership_verified": self.publication_ownership_verified,
+                "publication_ownership_error": self.publication_ownership_error,
+            }
+            if self.publication is not None:
+                result["publication"] = self.publication
+            return cast(JsonObject, {"success": True, "result": result})
         if tool_name == "resolve_live_pr_for_slice":
             return cast(
                 JsonObject,
@@ -367,6 +368,125 @@ def test_heartbeat_parks_unresolved_publication_ownership(tmp_path: Path) -> Non
     parked = result.state.slices["slice-a"]
     assert parked.status is SliceStatus.PARKED
     assert parked.park_cause is ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED
+
+
+def _refused_publication(invocation_id: str = "inv-other") -> JsonObject:
+    return {
+        "invocation_id": invocation_id,
+        "slice_id": "slice-a",
+        "author_agent": "agent-slice-a",
+        "succession_invocation_ids": [],
+    }
+
+
+def _heartbeat_in_review(tmp_path: Path, invocation_id: str) -> tuple[RunStore, RunState]:
+    store, state = _state(
+        tmp_path,
+        status="in_review",
+        heartbeat_at=0.0,
+        pr_number=42,
+        reviewed_head="head-old",
+    )
+    current = state.slices["slice-a"]
+    state = store.checkpoint(
+        state.fsm,
+        {"slice-a": replace(current, dispatch_invocation_id=invocation_id)},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    return store, state
+
+
+def _run_refused_heartbeat(
+    tmp_path: Path, transport: HeartbeatTransport
+) -> tuple[RunStore, object]:
+    store, state = _heartbeat_in_review(tmp_path, "inv-current")
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+    return store, result
+
+
+def test_heartbeat_refused_publication_cannot_mutate_or_park(tmp_path: Path) -> None:
+    store, result = _run_refused_heartbeat(
+        tmp_path,
+        HeartbeatTransport(
+            merged=True,
+            pr_state="closed",
+            publication_ownership_verified=True,
+            publication=_refused_publication(),
+        ),
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.status is SliceStatus.IN_REVIEW
+    assert observed.reviewed_head == "head-old"
+    assert observed.post_merge is None
+    assert observed.park_cause is None
+    assert observed.reconciliation is None
+    assert result.parked_slice_ids == ()
+    assert [event.kind for event in result.events] == ["pr.publication_refused"]
+    # The refusal is durable: no watcher-derived state was checkpointed.
+    reloaded = store.load().slices["slice-a"]
+    assert reloaded.status is SliceStatus.IN_REVIEW
+    assert reloaded.reviewed_head == "head-old"
+    assert reloaded.post_merge is None
+
+
+def test_heartbeat_refused_publication_cannot_park_closed_unmerged(tmp_path: Path) -> None:
+    _store, result = _run_refused_heartbeat(
+        tmp_path,
+        HeartbeatTransport(
+            merged=False,
+            pr_state="closed",
+            publication_ownership_verified=True,
+            publication=_refused_publication(),
+        ),
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.status is SliceStatus.IN_REVIEW
+    assert observed.park_cause is None
+    assert result.parked_slice_ids == ()
+    assert [event.kind for event in result.events] == ["pr.publication_refused"]
+
+
+def test_heartbeat_refused_publication_cannot_change_head(tmp_path: Path) -> None:
+    _store, result = _run_refused_heartbeat(
+        tmp_path,
+        HeartbeatTransport(
+            merged=False,
+            pr_state="open",
+            publication_ownership_verified=True,
+            publication=_refused_publication(),
+        ),
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.reviewed_head == "head-old"
+    assert result.parked_slice_ids == ()
+    assert [event.kind for event in result.events] == ["pr.publication_refused"]
+
+
+def test_heartbeat_accepted_publication_reconciles(tmp_path: Path) -> None:
+    _store, result = _run_refused_heartbeat(
+        tmp_path,
+        HeartbeatTransport(
+            merged=False,
+            pr_state="open",
+            publication_ownership_verified=True,
+            publication=_refused_publication("inv-current"),
+        ),
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.reviewed_head == "head-new"
+    assert result.parked_slice_ids == ()
 
 
 def test_poll_workers_uses_persisted_runtime_identity(tmp_path: Path) -> None:

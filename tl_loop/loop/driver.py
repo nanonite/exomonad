@@ -248,9 +248,12 @@ from .reconcile import (
     Quiescent,
     ReconciliationResult,
     _publication_ownership_status,
+    accepted_publication_from_watcher,
     derive_next_action,
+    publication_refused,
     reconcile_merge_observation,
     reconcile_slice,
+    watcher_presents_publication,
 )
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
@@ -3490,6 +3493,8 @@ def _refresh_post_merge_evidence(
     observation = _watcher_result_observation(watcher)
     if observation is None:
         return None
+    if _watcher_publication_refused(current, watcher):
+        return None
     return _watcher_merge_evidence(observation)
 
 
@@ -4885,6 +4890,12 @@ def _execute_direct_merge_intent(
         effects_log,
         raise_on_failure=False,
     )
+    if _watcher_publication_refused(current, watcher):
+        LOGGER.warning(
+            "[TL loop] refusing direct merge for %s: publication provenance mismatch",
+            current.id,
+        )
+        return state
     if (
         watcher is not None
         and watcher.success is True
@@ -5177,11 +5188,18 @@ def _reconcile_unknown_merge(
         raise_on_failure=False,
     )
     observation = _watcher_result_observation(watcher)
+    # A present-but-refused publication record may not resolve the unknown
+    # merge in either direction; fall through to the unknown-outcome path that
+    # retains the action.
+    refused = observation is not None and publication_refused(
+        current, observation, observation.head_sha, None
+    )
     if (
         watcher is not None
         and watcher.success is True
         and observation is not None
         and observation.merged
+        and not refused
     ):
         if isinstance(effects_log, EffectJournal):
             key = stable_action_key(state.run_id, "merge_pr", current.id, arguments)
@@ -5212,6 +5230,7 @@ def _reconcile_unknown_merge(
         and observation is not None
         and observation.merged is False
         and observation.pr_number in {None, current.pr_number}
+        and not refused
     ):
         diagnostic = "authoritative watcher state says the merge did not happen"
         key = stable_action_key(state.run_id, "merge_pr", current.id, arguments)
@@ -5362,6 +5381,12 @@ def _adopt_direct_merge_result(
         effects_log,
         raise_on_failure=False,
     )
+    if _watcher_publication_refused(current, watcher):
+        LOGGER.warning(
+            "[TL loop] refusing to confirm direct merge for %s: publication provenance mismatch",
+            slice_id,
+        )
+        return store.load()
     if (
         watcher is not None
         and watcher.success is True
@@ -6030,6 +6055,9 @@ def _reconcile_pending_merge_entry(
     except (ConnectionError, OSError, RuntimeError, TimeoutError):
         return False
     observation = _watcher_result_observation(watcher)
+    if _watcher_publication_refused(state.slices[target], watcher):
+        # A refused publication record may not resolve the pending merge.
+        return False
     if watcher.success is True and observation is not None and observation.merged is False:
         _resolve_nonmerged_merge(
             state,
@@ -6362,6 +6390,16 @@ def _reconcile_nonterminal_slices(
             or (merge_evidence is not None and _merge_action_is_exact(current, merge_evidence))
         )
         merge_authorized = accepted_publication is not None or durable_merge_authorized
+        if _watcher_publication_refused(current, watcher, owner_id):
+            # A present-but-refused publication record may not change any
+            # durable slice or run state: no reconciliation result, merge
+            # readiness, unknown-merge resolution, review replay, park, or
+            # state-changing effect.
+            LOGGER.warning(
+                "[TL loop] refusing watcher snapshot for %s: publication provenance mismatch",
+                current.id,
+            )
+            continue
         if (
             current.action is not None
             and current.action.kind is ActionKind.MERGE
@@ -6576,13 +6614,28 @@ def _reconcile_nonterminal_slices(
 def _watcher_presents_publication(watcher: WatcherObservation | None) -> bool:
     """Whether the watcher snapshot carries any publication provenance at all.
 
-    A present-but-refused record may not authorize a merge; only a genuinely
-    absent record permits falling back to an independently durable merge
-    authorization.
+    Delegates to the shared validator so the driver and heartbeat agree.
     """
-    if watcher is None:
+    return watcher_presents_publication(watcher)
+
+
+def _watcher_publication_refused(
+    current: SliceState,
+    watcher: ToolResult | WatcherObservation | Mapping[str, object] | None,
+    owner_id: str | None = None,
+) -> bool:
+    """Whether a watcher presents a publication record that fails validation.
+
+    A present-but-refused record may not change any durable slice or run state
+    through any watcher-driven path.
+    """
+    if isinstance(watcher, ToolResult):
+        observation = _watcher_result_observation(watcher)
+    else:
+        observation = _as_watcher_observation(watcher)
+    if observation is None:
         return False
-    return _publication_evidence(watcher) is not None
+    return publication_refused(current, observation, observation.head_sha, owner_id)
 
 
 def _persisted_merge_head(current: SliceState) -> str | None:
@@ -7177,92 +7230,18 @@ def _publication_from_watcher(
     head_sha: str | None,
     owner_id: str | None,
 ) -> PublicationBinding | None:
-    """Recover a publication only from an ownership-verified watcher snapshot."""
-    watcher = _as_watcher_observation(watcher)
-    assert watcher is not None
-    if watcher.publication_ownership_verified is not True or not head_sha:
-        return None
-    pr_number = watcher.pr_number
-    head_branch = watcher.head_branch
-    base_branch = watcher.base_branch
-    if (
-        type(pr_number) is not int
-        or pr_number <= 0
-        or not isinstance(head_branch, str)
-        or not head_branch
-        or not isinstance(base_branch, str)
-        or not base_branch
-    ):
+    """Recover a publication only from an ownership-verified watcher snapshot.
+
+    Delegates to the authoritative shared validator so the active driver and
+    the heartbeat cannot diverge.
+    """
+    binding = accepted_publication_from_watcher(current, watcher, head_sha, owner_id)
+    if binding is None and watcher_presents_publication(watcher):
         LOGGER.warning(
-            "[TL loop] cannot recover publication evidence for target=%s: incomplete watcher identity",
+            "[TL loop] refusing watcher publication evidence for %s: provenance mismatch",
             current.id,
         )
-        return None
-    existing = current.publication
-    if existing is not None and (existing.pr_number != pr_number or existing.head_sha != head_sha):
-        LOGGER.warning(
-            "[TL loop] refusing watcher publication replacement for target=%s: head changed",
-            current.id,
-        )
-        return None
-    publication_record = _publication_evidence(watcher)
-    record_slice_id = _publication_record_text(publication_record, "slice_id")
-    if record_slice_id is not None and record_slice_id != current.id:
-        LOGGER.warning(
-            "[TL loop] refusing publication evidence for %s: slice identity %s disagrees",
-            current.id,
-            record_slice_id,
-        )
-        return None
-    expected_owner = current.dispatch_agent_id or owner_id
-    record_owner = _publication_record_text(publication_record, "author_agent")
-    if record_owner is not None and expected_owner is not None and record_owner != expected_owner:
-        LOGGER.warning(
-            "[TL loop] refusing publication evidence for %s: owner identity %s disagrees",
-            current.id,
-            record_owner,
-        )
-        return None
-    # The durable record's original publishing invocation is required; never
-    # infer it from the current dispatch when provenance is missing.
-    record_invocation_id = _publication_record_text(publication_record, "invocation_id")
-    if not record_invocation_id:
-        LOGGER.warning(
-            "[TL loop] refusing publication evidence for %s: publication record has "
-            "no durable invocation provenance",
-            current.id,
-        )
-        return None
-    # Succession is directional: the current dispatch or active recovery
-    # invocation must be reachable from the recorded original invocation, not
-    # the other way around.
-    succession = _publication_record_succession(publication_record)
-    active_invocations = [
-        value
-        for value in (
-            current.dispatch_invocation_id,
-            _recorded_recovery_invocation(current),
-        )
-        if value is not None
-    ]
-    if active_invocations and not any(
-        active == record_invocation_id or active in succession
-        for active in active_invocations
-    ):
-        LOGGER.warning(
-            "[TL loop] refusing publication evidence for %s: current or recovery "
-            "invocation is not reachable from the recorded publication invocation",
-            current.id,
-        )
-        return None
-    return PublicationBinding(
-        pr_number=pr_number,
-        head_sha=head_sha,
-        head_branch=head_branch,
-        base_branch=base_branch,
-        attempt=existing.attempt if existing is not None else current.attempts,
-        invocation_id=record_invocation_id,
-    )
+    return binding
 
 
 def _dispatch_waiting_phase(slices: Mapping[str, SliceState]) -> TLWaiting:
@@ -9511,6 +9490,12 @@ def _integrate_one_candidate(
         first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
         if first is None:
             return state
+        if _watcher_publication_refused(current, first):
+            LOGGER.warning(
+                "[TL loop] refusing aggregate merge for %s: publication provenance mismatch",
+                task.name,
+            )
+            return state
         if _snapshot_bool(first, "merged"):
             _record_controller_event(
                 task.name,
@@ -9534,6 +9519,12 @@ def _integrate_one_candidate(
         return state
     first = first or _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if first is None:
+        return state
+    if _watcher_publication_refused(current, first):
+        LOGGER.warning(
+            "[TL loop] refusing aggregate merge for %s: publication provenance mismatch",
+            task.name,
+        )
         return state
     if _snapshot_bool(first, "merged"):
         merged_head = _snapshot_text(first, "head_sha") or candidate_runtime.head_sha
@@ -9621,6 +9612,12 @@ def _integrate_one_candidate(
     )
     second = _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if second is None:
+        return state
+    if _watcher_publication_refused(current, second):
+        LOGGER.warning(
+            "[TL loop] refusing aggregate merge for %s: publication provenance mismatch",
+            task.name,
+        )
         return state
     if _snapshot_text(second, "base_sha") != base_sha:
         return _handle_external_base_change(

@@ -413,6 +413,55 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
     }
 
 
+def test_refused_publication_blocks_direct_merge(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    current = state.slices["leaf"]
+    state = store.checkpoint(
+        state.fsm,
+        {"leaf": replace(current, dispatch_invocation_id="inv-current")},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    transport = DirectMergeTransport(
+        snapshots=[
+            {
+                "found": True,
+                "pr_number": 42,
+                "head_sha": "abc123",
+                "head_branch": "task/leaf",
+                "base_branch": "main",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+                "publication_ownership_verified": True,
+                # Unrelated to the current dispatch, so the binding is refused.
+                "publication": {
+                    "invocation_id": "inv-other",
+                    "slice_id": "leaf",
+                    "author_agent": "leaf-agent",
+                    "succession_invocation_ids": [],
+                },
+            }
+        ]
+    )
+    effects_log: list[EffectIntent] = []
+
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
+        TLLoopConfig(poll_interval=0.001),
+        effects_log,
+    )
+
+    assert result.slices["leaf"].status is SliceStatus.IN_REVIEW
+    assert result.slices["leaf"].action == current.action
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+    # The refusal is durable: no merge state was checkpointed.
+    assert store.load().slices["leaf"].status is SliceStatus.IN_REVIEW
+
+
 def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
     state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))

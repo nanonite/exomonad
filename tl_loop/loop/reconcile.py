@@ -19,6 +19,7 @@ from tl_loop.state.schema import (
     ActionPhase,
     GateStatus,
     ObservationProvenance,
+    PublicationBinding,
     RunState,
     SliceState,
     SliceStatus,
@@ -110,6 +111,136 @@ def reconcile_merge_observation(
     if state.reconciliation == reconciliation:
         return state
     return replace(state, reconciliation=reconciliation)
+
+
+def _watcher_observation(snapshot: object) -> WatcherObservation | None:
+    if snapshot is None or isinstance(snapshot, WatcherObservation):
+        return snapshot
+    if isinstance(snapshot, Mapping):
+        return WatcherObservation.from_response(snapshot)
+    return None
+
+
+def _publication_record_of(snapshot: object) -> object | None:
+    observation = _watcher_observation(snapshot)
+    return observation.publication if observation is not None else None
+
+
+def _publication_record_text(record: object | None, key: str) -> str | None:
+    if record is None:
+        return None
+    value = getattr(record, key, None)
+    return value if isinstance(value, str) and value else None
+
+
+def _publication_record_succession(record: object | None) -> tuple[str, ...]:
+    if record is None:
+        return ()
+    if isinstance(record, Mapping):
+        value = record.get("succession_invocation_ids")
+    else:
+        value = getattr(record, "succession_invocation_ids", None)
+    if isinstance(value, (list, tuple)):
+        return tuple(item for item in value if isinstance(item, str) and item)
+    return ()
+
+
+def _recorded_recovery_invocation(current: SliceState) -> str | None:
+    if current.recovery is None:
+        return None
+    value = current.recovery.evidence.get("invocation_id")
+    return value if isinstance(value, str) and value else None
+
+
+def watcher_presents_publication(snapshot: object) -> bool:
+    """Whether a watcher snapshot carries any publication provenance at all."""
+    return _publication_record_of(snapshot) is not None
+
+
+def accepted_publication_from_watcher(
+    current: SliceState,
+    snapshot: object,
+    head_sha: str | None,
+    owner_id: str | None,
+) -> PublicationBinding | None:
+    """Authoritative publication correlation for every watcher-driven path.
+
+    A publication binds only when the watcher ownership is verified, the exact
+    PR/head/branch/base agree, and the record's durable invocation provenance
+    matches the current dispatch or an explicitly recorded recovery succession.
+    Missing provenance is refused and never inferred from the current dispatch.
+    Returns None for a refused or unverifiable snapshot.
+    """
+    observation = _watcher_observation(snapshot)
+    if observation is None:
+        return None
+    if observation.publication_ownership_verified is not True or not head_sha:
+        return None
+    pr_number = observation.pr_number
+    head_branch = observation.head_branch
+    base_branch = observation.base_branch
+    if (
+        type(pr_number) is not int
+        or pr_number <= 0
+        or not isinstance(head_branch, str)
+        or not head_branch
+        or not isinstance(base_branch, str)
+        or not base_branch
+    ):
+        return None
+    existing = current.publication
+    if existing is not None and (existing.pr_number != pr_number or existing.head_sha != head_sha):
+        return None
+    publication_record = observation.publication
+    record_slice_id = _publication_record_text(publication_record, "slice_id")
+    if record_slice_id is not None and record_slice_id != current.id:
+        return None
+    expected_owner = current.dispatch_agent_id or owner_id
+    record_owner = _publication_record_text(publication_record, "author_agent")
+    if record_owner is not None and expected_owner is not None and record_owner != expected_owner:
+        return None
+    record_invocation_id = _publication_record_text(publication_record, "invocation_id")
+    if not record_invocation_id:
+        return None
+    succession = _publication_record_succession(publication_record)
+    active_invocations = [
+        value
+        for value in (current.dispatch_invocation_id, _recorded_recovery_invocation(current))
+        if value is not None
+    ]
+    if active_invocations and not any(
+        active == record_invocation_id or active in succession
+        for active in active_invocations
+    ):
+        return None
+    return PublicationBinding(
+        pr_number=pr_number,
+        head_sha=head_sha,
+        head_branch=head_branch,
+        base_branch=base_branch,
+        attempt=existing.attempt if existing is not None else current.attempts,
+        invocation_id=record_invocation_id,
+    )
+
+
+def publication_refused(
+    current: SliceState,
+    snapshot: object,
+    head_sha: str | None,
+    owner_id: str | None,
+) -> bool:
+    """Whether a watcher presents a record that fails ownership/provenance.
+
+    A genuinely absent record is not a refusal (established compatibility
+    behavior applies), and an explicitly unresolved ownership observation is
+    not a refusal (its park path is preserved).
+    """
+    observation = _watcher_observation(snapshot)
+    if observation is None or observation.publication is None:
+        return False
+    if observation.publication_ownership_verified is not True:
+        return False
+    return accepted_publication_from_watcher(current, observation, head_sha, owner_id) is None
 
 
 @dataclass(frozen=True)
