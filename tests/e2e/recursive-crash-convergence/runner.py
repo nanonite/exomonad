@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any
 
 ORDERED_DIR = Path(__file__).resolve().parents[1] / "ordered-recursive"
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# tests/e2e/recursive-crash-convergence/runner.py -> parents[3] is the repo root
+# that owns target/debug/exomonad and .exo/wasm/. parents[2] would resolve to
+# the tests/ directory and make start_server reject every acceptance run.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(ORDERED_DIR))
 
@@ -320,6 +323,10 @@ def run_case(
     chainlink_issue_id: int,
     chainlink_db: Path,
 ) -> dict[str, Any]:
+    state_root = root / "controller-state"
+    ledger_run_id = real.server_run_id(repo)
+    # Structure-only plan for seeding (sources are not serialized into the
+    # manifest, so seeding is unaffected by them).
     work_plan = plan()
     case_name = _case_name(root, boundary)
     if boundary.name in {"publication", "aggregate_publication"}:
@@ -353,8 +360,14 @@ def run_case(
                 "changes_requested" if boundary.name == "repair" else "approved"
             ),
         )
-    state_root = root / "controller-state"
-    ledger_run_id = real.server_run_id(repo)
+    # Rebuild with distinct child ledger sources now that the parent run id is
+    # known. The declaration structure is identical, so the persisted manifest
+    # digest is unchanged; only the in-memory sources differ.
+    work_plan = plan(
+        segments=repo / ".exo" / "ledger" / "segments",
+        state_root=state_root / run_id,
+        ledger_run_id=ledger_run_id,
+    )
     marker = root / "crash-traces" / f"{case_name}.jsonl"
     process = multiprocessing.get_context("fork").Process(
         target=controller,

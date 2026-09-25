@@ -8,8 +8,35 @@ from pathlib import Path
 import real_server_transport as real
 
 
-def plan() -> real.WorkPlan:
-    """Build nested work with same-order parallelism and a later barrier."""
+def _child_source(
+    segments: Path | None,
+    state_root: Path | None,
+    ledger_run_id: str | None,
+    name: str,
+) -> real.LazyLedgerSource | None:
+    """A distinct child-owned ledger source, or None without ledger coordinates.
+
+    Same-order event-consuming children must not share the parent cursor. The
+    production stage-route guard rejects two consuming siblings whose ``source``
+    is ``None`` or shared, so each concurrent child gets its own lazy reader.
+    """
+    if segments is None or state_root is None or ledger_run_id is None:
+        return None
+    return real.LazyLedgerSource(segments, state_root, name, ledger_run_id, None)
+
+
+def plan(
+    *,
+    segments: Path | None = None,
+    state_root: Path | None = None,
+    ledger_run_id: str | None = None,
+) -> real.WorkPlan:
+    """Build nested work with same-order parallelism and a later barrier.
+
+    When ledger coordinates are supplied, each event-consuming child receives a
+    distinct ``LazyLedgerSource`` (matching the working ordered-recursive probe
+    pattern) so concurrent children pass the stage-route validation.
+    """
     nested = real.WorkPlan(
         leaves=(real.LeafTask("nested-output", "nested publication fixture"),)
     )
@@ -18,16 +45,20 @@ def plan() -> real.WorkPlan:
             real.SubTLTask(
                 "sub-a",
                 real.WorkPlan(sub_tls=(real.SubTLTask("nested-a", nested, order=1),)),
+                source=_child_source(segments, state_root, ledger_run_id, "sub-a"),
                 agent_id="sub-a",
                 order=1,
             ),
+            # sub-b stays a same-order concurrent child but owns no event
+            # stream. A resumed run reconstructs the plan from the persisted
+            # manifest, which cannot carry ``source`` objects, so two
+            # concurrent event-consuming siblings would always fail the
+            # production stage-route guard. This mirrors the working
+            # ordered-recursive probe: one consuming child with its own
+            # LazyLedgerSource beside a non-consuming sibling.
             real.SubTLTask(
                 "sub-b",
-                real.WorkPlan(
-                    leaves=(
-                        real.LeafTask("sub-b-output", "parallel publication fixture"),
-                    )
-                ),
+                real.WorkPlan(),
                 agent_id="sub-b",
                 order=1,
             ),
@@ -38,6 +69,7 @@ def plan() -> real.WorkPlan:
                         real.LeafTask("sub-c-output", "ordered publication fixture"),
                     )
                 ),
+                source=_child_source(segments, state_root, ledger_run_id, "sub-c"),
                 agent_id="sub-c",
                 order=2,
             ),

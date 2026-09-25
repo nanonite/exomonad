@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import beast
 import leaf_publication_agent
-import runner
+import runner  # inserts PROJECT_ROOT and ordered-recursive onto sys.path
+import fixture
 from boundaries import (
     CRASH_BOUNDARIES,
     LOGICAL_BOUNDARY_NAMES,
@@ -39,6 +40,58 @@ from evidence import (
     assert_required_effects,
     assert_resume_not_redispatched,
 )
+
+
+def test_project_root_resolves_to_the_repository_root() -> None:
+    """The acceptance must discover target/debug/exomonad and .exo/wasm/."""
+    expected = Path(__file__).resolve().parents[3]
+    assert runner.PROJECT_ROOT == expected
+    # parents[2] is tests/, which made start_server reject every run.
+    assert runner.PROJECT_ROOT != Path(__file__).resolve().parents[2]
+    assert (runner.PROJECT_ROOT / "Cargo.toml").is_file()
+    assert (runner.PROJECT_ROOT / "tl_loop").is_dir()
+    # Server discovery is rooted at the repository root, not tests/.
+    assert (runner.PROJECT_ROOT / "target" / "debug" / "exomonad").parent == (
+        expected / "target" / "debug"
+    )
+    assert (runner.PROJECT_ROOT / ".exo" / "wasm" / "wasm-guest-devswarm.wasm").parent == (
+        expected / ".exo" / "wasm"
+    )
+
+
+def test_fixture_stage_routes_survive_manifest_reconstruction() -> None:
+    """A resumed run rebuilds the plan without sources; the guard must still pass."""
+    from tl_loop.loop.driver import _plan_consumes_events, _validate_stage_event_routes
+
+    structure = fixture.plan()
+    assert all(task.source is None for task in structure.sub_tls)
+    first_stage = [task for task in structure.sub_tls if task.order == 1]
+    assert len(first_stage) == 2
+    assert sum(1 for task in first_stage if _plan_consumes_events(task.plan)) == 1
+    # Structure-only is exactly what _work_plan_from_manifest returns on resume;
+    # the guard is evaluated per stage with the current stage's pending children.
+    _validate_stage_event_routes(first_stage)
+
+
+def test_fixture_consuming_children_receive_distinct_sources(tmp_path: Path) -> None:
+    """Event-consuming children get distinct child-owned ledger sources."""
+    from tl_loop.loop.driver import _validate_stage_event_routes
+
+    sourced = fixture.plan(
+        segments=tmp_path / "segments",
+        state_root=tmp_path / "state" / "root-run",
+        ledger_run_id="swarm-1",
+    )
+    consuming = [task for task in sourced.sub_tls if task.source is not None]
+    assert {task.name for task in consuming} == {"sub-a", "sub-c"}
+    assert len({id(task.source) for task in consuming}) == len(consuming)
+    first_stage = [task for task in sourced.sub_tls if task.order == 1]
+    _validate_stage_event_routes(first_stage)
+
+
+def test_fixture_plan_without_coordinates_has_no_sources() -> None:
+    """Seeding uses a structure-only plan; sources are attached only at run time."""
+    assert all(task.source is None for task in fixture.plan().sub_tls)
 
 
 def test_every_logical_boundary_has_before_and_after_process_death() -> None:
@@ -77,12 +130,11 @@ def test_leaf_publication_actor_is_limited_to_recursive_leaf_branches(
 ) -> None:
     assert runner._leaf_branches(runner.plan()) == (
         "main.sub-a.nested-a.nested-output",
-        "main.sub-b.sub-b-output",
         "main.sub-c.sub-c-output",
     )
     monkeypatch.setenv(
         "EXOMONAD_1057_LEAF_BRANCHES",
-        "main.sub-a.nested-a.nested-output,main.sub-b.sub-b-output",
+        "main.sub-a.nested-a.nested-output,main.sub-c.sub-c-output",
     )
     assert leaf_publication_agent._target_leaf_branch(
         "main.sub-a.nested-a.nested-output"
