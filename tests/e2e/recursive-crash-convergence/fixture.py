@@ -119,7 +119,7 @@ def seed_aggregate_publication(
             )
             for leaf in nested_plan.leaves:
                 leaf_branch = f"{nested_branch}.{leaf.name}"
-                leaf_worktree = real.agent_worktree(repo, leaf_branch)
+                leaf_worktree = real.agent_leaf_worktree(repo, leaf_branch)
                 real.git(leaf_worktree, "merge", "-q", "--ff-only", nested_branch)
                 real.commit_fixture_worktree(
                     leaf_worktree,

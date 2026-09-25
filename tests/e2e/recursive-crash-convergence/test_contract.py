@@ -112,6 +112,24 @@ def test_ordered_parent_identity_matches_configured_parent_branch() -> None:
     assert record["working_dir"] == "/tmp/parent-worktree"
 
 
+def test_worktree_and_identity_layout_matches_server_owned_paths(tmp_path: Path) -> None:
+    """Seeded worktrees/identities must match the server-owned layout."""
+    repo = tmp_path / "repo"
+    # Ordered sub-TL worktrees nest below their parent under .exo/worktrees.
+    assert real.agent_worktree(repo, "main.sub-a") == repo / ".exo/worktrees/sub-a"
+    assert real.agent_worktree(repo, "main.sub-a.nested-a") == (
+        repo / ".exo/worktrees/sub-a/nested-a"
+    )
+    # Identities are flat, keyed by agent name.
+    assert real.agent_identity_dir(repo, "nested-a") == repo / ".exo/agents/nested-a"
+    # Spawned-leaf worktrees stay flat by slug, never inside a parent worktree,
+    # or the TL spawn preflight sees an untracked directory.
+    parent = real.agent_worktree(repo, "main.sub-a.nested-a")
+    leaf = real.agent_leaf_worktree(repo, "main.sub-a.nested-a.nested-output")
+    assert leaf == repo / ".exo/worktrees/nested-output"
+    assert parent not in leaf.parents
+
+
 def test_two_concurrent_consuming_children_without_sources_are_rejected() -> None:
     """Why the fixture keeps one consuming child per same-order stage.
 

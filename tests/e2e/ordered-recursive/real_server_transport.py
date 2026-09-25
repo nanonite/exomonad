@@ -559,14 +559,41 @@ def git(repo: Path, *args: str) -> str:
 
 
 def agent_worktree(repo: Path, branch: str) -> Path:
-    """Map a recursive main.* branch to its hierarchical fixture worktree."""
+    """Map a recursive main.* branch to its server-owned worktree path.
+
+    Production provisions ordered sub-TL worktrees under the server-owned
+    ``.exo/worktrees/`` namespace, nesting deeper scopes below their parent
+    (``main.sub-a.nested-a`` -> ``.exo/worktrees/sub-a/nested-a``). Identities
+    live separately at ``.exo/agents/<name>`` (see ``agent_identity_dir``).
+    """
     prefix = "main."
     if not branch.startswith(prefix):
         raise HarnessError(f"recursive fixture branch has no main.* root: {branch!r}")
     parts = tuple(part for part in branch[len(prefix) :].split(".") if part)
     if not parts:
         raise HarnessError(f"recursive fixture branch has no agent path: {branch!r}")
-    return repo / ".exo" / "agents" / Path(*parts)
+    return repo / ".exo" / "worktrees" / Path(*parts)
+
+
+def agent_identity_dir(repo: Path, name: str) -> Path:
+    """Flat durable identity directory the server resolves by agent name."""
+    return repo / ".exo" / "agents" / name
+
+
+def agent_leaf_worktree(repo: Path, branch: str) -> Path:
+    """Flat worktree path for a spawned leaf, keyed by its branch slug.
+
+    Leaves are spawned into ``.exo/worktrees/<slug>`` (not nested below their
+    parent worktree): a worktree nested inside another worktree appears as an
+    untracked directory to the parent and blocks the TL spawn preflight.
+    """
+    prefix = "main."
+    if not branch.startswith(prefix):
+        raise HarnessError(f"recursive fixture branch has no main.* root: {branch!r}")
+    parts = tuple(part for part in branch[len(prefix) :].split(".") if part)
+    if not parts:
+        raise HarnessError(f"recursive fixture branch has no agent path: {branch!r}")
+    return repo / ".exo" / "worktrees" / parts[-1]
 
 
 def create_branch_with_commit(
@@ -856,9 +883,18 @@ def start_server(
         "nested": "main.nested",
     }
     default_branches.update(identity_agents or {})
+    leaf_branch_set = set(leaf_branches or ())
+
+    def worktree_for(branch: str) -> Path:
+        # Ordered sub-TL worktrees nest below their parent; spawned-leaf
+        # worktrees stay flat by slug so they never sit inside a parent.
+        if branch in leaf_branch_set:
+            return agent_leaf_worktree(repo, branch)
+        return agent_worktree(repo, branch)
+
     for branch_name in default_branches.values():
-        agent_dir = agent_worktree(repo, branch_name)
-        agent_dir.parent.mkdir(parents=True, exist_ok=True)
+        worktree = worktree_for(branch_name)
+        worktree.parent.mkdir(parents=True, exist_ok=True)
         parent_branch = (
             branch_name.rsplit(".", 1)[0] if branch_name.count(".") >= 2 else "main"
         )
@@ -872,11 +908,15 @@ def start_server(
                 "-q",
                 "-b",
                 branch_name,
-                str(agent_dir),
+                str(worktree),
                 parent_branch,
             ]
         )
-        (agent_dir / ".birth_branch").write_text(f"{branch_name}\n", encoding="utf-8")
+        identity_dir = agent_identity_dir(repo, branch_name.rsplit(".", 1)[-1])
+        identity_dir.mkdir(parents=True, exist_ok=True)
+        (identity_dir / ".birth_branch").write_text(
+            f"{branch_name}\n", encoding="utf-8"
+        )
     parent_worktree = repo / ".exo/worktrees/parent"
     parent_worktree.parent.mkdir(parents=True, exist_ok=True)
     run_command(
@@ -907,9 +947,10 @@ def start_server(
     )
     (parent_agent_dir / ".birth_branch").write_text("main\n", encoding="utf-8")
     for agent_id, branch in (identity_agents or {}).items():
-        agent_dir = agent_worktree(repo, branch)
-        agent_dir.mkdir(parents=True, exist_ok=True)
-        worktree = agent_dir
+        worktree = worktree_for(branch)
+        worktree.mkdir(parents=True, exist_ok=True)
+        identity_dir = agent_identity_dir(repo, agent_id)
+        identity_dir.mkdir(parents=True, exist_ok=True)
         identity = {
             "agent_name": agent_id,
             "slug": agent_id,
@@ -922,7 +963,7 @@ def start_server(
             "ledger_owned": True,
             "slice_id": agent_id,
         }
-        (agent_dir / "identity.json").write_text(
+        (identity_dir / "identity.json").write_text(
             json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         invocation = {
@@ -939,7 +980,7 @@ def start_server(
             "branch": branch,
             "worktree": str(worktree),
         }
-        (agent_dir / "invocation.json").write_text(
+        (identity_dir / "invocation.json").write_text(
             json.dumps(invocation, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
     shutil.copy2(wasm, repo / ".exo/wasm/wasm-guest-devswarm.wasm")
