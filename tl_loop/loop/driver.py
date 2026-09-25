@@ -6331,34 +6331,67 @@ def _reconcile_nonterminal_slices(
             recovered_pr_number = watcher.get("pr_number") if watcher else None
             if isinstance(recovered_pr_number, int) and recovered_pr_number > 0:
                 snapshots[recovered_pr_number] = watcher
+        owner_id = _agent_for_dispatch_intent(
+            agent_listing,
+            current.dispatch_intent_id or "",
+        )
+        # A watcher-driven merge may only be adopted when the watcher's
+        # publication provenance validates against the dispatch or active
+        # recovery succession. A refused snapshot must not change merge or
+        # post-merge state.
+        accepted_publication = (
+            _publication_from_watcher(current, watcher, watcher.head_sha, owner_id)
+            if watcher is not None
+            else None
+        )
+        # When the watcher presents publication provenance it must validate; a
+        # refused record may not authorize a merge. When it presents none, an
+        # independently durable merge intent that is exact to the persisted
+        # PR/head may still authorize adoption without borrowing watcher
+        # identity.
+        watcher_presents_publication = _watcher_presents_publication(watcher)
+        watcher_merged = watcher is not None and watcher.merged is True
+        merge_evidence = _watcher_merge_evidence(watcher) if watcher_merged else None
+        merge_entry = (
+            _confirmed_merge_entry(effects_log, current, watcher.pr_number)
+            if watcher_merged and watcher is not None
+            else None
+        )
+        durable_merge_authorized = not watcher_presents_publication and (
+            (merge_entry is not None and _merge_journal_is_exact(current, merge_entry))
+            or (merge_evidence is not None and _merge_action_is_exact(current, merge_evidence))
+        )
+        merge_authorized = accepted_publication is not None or durable_merge_authorized
         if (
             current.action is not None
             and current.action.kind is ActionKind.MERGE
             and current.action.phase is ActionPhase.UNKNOWN
         ):
-            if watcher is not None and watcher.merged is True:
-                merge_evidence = _watcher_merge_evidence(watcher)
-                if (
-                    current.action.intent_id
-                    and isinstance(merge_evidence.get("head_sha"), str)
-                    and isinstance(merge_evidence.get("base_sha"), str)
-                    and watcher.pr_number in {None, current.pr_number}
-                ):
-                    state = _reconcile_merged_slice(
-                        store.load(),
-                        current.id,
-                        watcher.pr_number or current.pr_number or 0,
-                        current.action.intent_id,
-                        config,
-                        effects,
-                        store,
-                        effects_log,
-                        boundary="legacy_unknown_merge_reconciled",
-                        merge_evidence=merge_evidence,
-                    )
-                    updated = dict(state.slices)
-                    changed = False
-                    continue
+            if (
+                watcher is not None
+                and watcher.merged is True
+                and merge_evidence is not None
+                and merge_authorized
+                and current.action.intent_id
+                and isinstance(merge_evidence.get("head_sha"), str)
+                and isinstance(merge_evidence.get("base_sha"), str)
+                and watcher.pr_number in {None, current.pr_number}
+            ):
+                state = _reconcile_merged_slice(
+                    store.load(),
+                    current.id,
+                    watcher.pr_number or current.pr_number or 0,
+                    current.action.intent_id,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    boundary="legacy_unknown_merge_reconciled",
+                    merge_evidence=merge_evidence,
+                )
+                updated = dict(state.slices)
+                changed = False
+                continue
             if (
                 watcher is not None
                 and watcher.merged is False
@@ -6385,31 +6418,26 @@ def _reconcile_nonterminal_slices(
                 updated = dict(state.slices)
                 changed = False
                 continue
-        if watcher is not None and watcher.merged is True:
-            merge_entry = _confirmed_merge_entry(
+        if (
+            watcher is not None
+            and watcher.merged is True
+            and merge_entry is not None
+            and merge_authorized
+        ):
+            state = _adopt_authoritative_merged_snapshot(
+                state,
+                current.id,
+                watcher.pr_number or current.pr_number or 0,
+                merge_entry,
+                config,
+                effects,
+                store,
                 effects_log,
-                current,
-                watcher.pr_number,
+                merge_evidence=merge_evidence,
             )
-            if merge_entry is not None:
-                state = _adopt_authoritative_merged_snapshot(
-                    state,
-                    current.id,
-                    watcher.pr_number or current.pr_number or 0,
-                    merge_entry,
-                    config,
-                    effects,
-                    store,
-                    effects_log,
-                    merge_evidence=_watcher_merge_evidence(watcher),
-                )
-                updated = dict(state.slices)
-                changed = False
-                continue
-        owner_id = _agent_for_dispatch_intent(
-            agent_listing,
-            current.dispatch_intent_id or "",
-        )
+            updated = dict(state.slices)
+            changed = False
+            continue
         result = reconcile_slice(
             current,
             authoritative_owner_id=owner_id,
@@ -6420,6 +6448,7 @@ def _reconcile_nonterminal_slices(
             result,
             watcher,
             owner_id,
+            accepted_publication=accepted_publication,
         )
         if watcher is not None:
             replay_state = replace(
@@ -6439,7 +6468,9 @@ def _reconcile_nonterminal_slices(
             if replayed != state:
                 state = replayed
                 reconciled = state.slices[current.id]
-        if watcher is not None:
+        if watcher is not None and (not watcher_merged or merge_authorized):
+            # A refused snapshot may not adopt merge readiness either; only an
+            # authorized merge (or a non-merged observation) folds here.
             reconciled = reconcile_merge_observation(reconciled, watcher)
         if current.handoff is None and watcher is not None:
             handoff_payload = _handoff_reconciliation_event_payload(
@@ -6540,6 +6571,53 @@ def _reconcile_nonterminal_slices(
     if conflicts_found:
         state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
     return state
+
+
+def _watcher_presents_publication(watcher: WatcherObservation | None) -> bool:
+    """Whether the watcher snapshot carries any publication provenance at all.
+
+    A present-but-refused record may not authorize a merge; only a genuinely
+    absent record permits falling back to an independently durable merge
+    authorization.
+    """
+    if watcher is None:
+        return False
+    return _publication_evidence(watcher) is not None
+
+
+def _persisted_merge_head(current: SliceState) -> str | None:
+    if current.reviewed_head:
+        return current.reviewed_head
+    if current.action is not None and current.action.head_sha:
+        return current.action.head_sha
+    return None
+
+
+def _merge_journal_is_exact(current: SliceState, merge_entry: Mapping[str, object]) -> bool:
+    """Whether a confirmed merge journal entry is exact to the persisted PR/head."""
+    arguments = merge_entry.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return False
+    journal_pr_number = arguments.get("pr_number")
+    if type(journal_pr_number) is not int or journal_pr_number <= 0:
+        return False
+    if current.pr_number is not None and journal_pr_number != current.pr_number:
+        return False
+    expected_head = arguments.get("expected_head_sha")
+    if not isinstance(expected_head, str) or not expected_head:
+        return False
+    persisted_head = _persisted_merge_head(current)
+    return persisted_head is not None and expected_head == persisted_head
+
+
+def _merge_action_is_exact(
+    current: SliceState, merge_evidence: Mapping[str, object]
+) -> bool:
+    """Whether the durable unknown-merge action head matches the observed head."""
+    action = current.action
+    if action is None or not action.intent_id or not action.head_sha:
+        return False
+    return merge_evidence.get("head_sha") == action.head_sha
 
 
 def _confirmed_merge_entry(
@@ -6984,11 +7062,16 @@ def _request_review_revalidation(
     return requested_state
 
 
+_ACCEPTED_PUBLICATION_UNSET = object()
+
+
 def _apply_reconciliation_observations(
     current: SliceState,
     result: ReconciliationResult,
     watcher: WatcherObservation | Mapping[str, object] | None,
     owner_id: str | None,
+    *,
+    accepted_publication: PublicationBinding | None | object = _ACCEPTED_PUBLICATION_UNSET,
 ) -> SliceState:
     watcher = _as_watcher_observation(watcher)
     updates: dict[str, object] = {"reconciliation": result.as_state()}
@@ -6999,7 +7082,12 @@ def _apply_reconciliation_observations(
     if watcher is not None and watcher.found is True:
         head_sha = watcher.head_sha
         ci_status = watcher.ci_status
-        publication = _publication_from_watcher(current, watcher, head_sha, owner_id)
+        # Reuse the caller's validated binding when supplied so the merge and
+        # handoff decisions cannot diverge between reconciliation paths.
+        if accepted_publication is _ACCEPTED_PUBLICATION_UNSET:
+            publication = _publication_from_watcher(current, watcher, head_sha, owner_id)
+        else:
+            publication = cast(PublicationBinding | None, accepted_publication)
         if publication is not None:
             # PR number, head/CI evidence, handoff, and merge adoption all
             # require the accepted binding, so a refused provenance mismatch can

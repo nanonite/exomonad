@@ -757,6 +757,97 @@ def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_pa
     assert journal.pending_entries() == []
 
 
+def test_unknown_merge_with_refused_publication_provenance_is_not_adopted(
+    tmp_path,
+) -> None:
+    store, state = _load_state(tmp_path)
+    state = store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {
+            "slice-a": replace(
+                state.slices["slice-a"],
+                status=SliceStatus.IN_REVIEW,
+                pr_number=99,
+                reviewed_head="head-a",
+                dispatch_invocation_id="inv-current",
+                action=ActionState(
+                    ActionKind.MERGE,
+                    ActionPhase.UNKNOWN,
+                    intent_id="merge-intent",
+                    head_sha="head-a",
+                ),
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+    client = FakeClient(
+        merged=True,
+        pr_state="closed",
+        publication_ownership_verified=True,
+        # Unrelated to the current dispatch, so the watcher binding is refused.
+        publication_invocation_id="inv-other",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    slice_state = recovered.slices["slice-a"]
+    assert slice_state.status is SliceStatus.IN_REVIEW
+    assert slice_state.post_merge is None
+    assert client.merge_calls == []
+
+
+def test_confirmed_merge_with_refused_publication_provenance_is_not_adopted(
+    tmp_path,
+) -> None:
+    store, state = _load_state(tmp_path)
+    state = store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {
+            "slice-a": replace(
+                state.slices["slice-a"],
+                status=SliceStatus.IN_REVIEW,
+                pr_number=99,
+                dispatch_invocation_id="inv-current",
+                reviewed_head="head-a",
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+    intent = EffectIntent(
+        "merge_pr", "slice-a", {"pr_number": 99, "expected_head_sha": "head-a"}, True
+    )
+    journal.append(intent)
+    journal.mark_result(
+        intent,
+        ToolResult(
+            raw={"success": True, "result": {"merged": True}},
+            success=True,
+            result={"merged": True},
+            error=None,
+        ),
+    )
+    client = FakeClient(
+        merged=True,
+        pr_state="closed",
+        publication_ownership_verified=True,
+        # Unrelated to the current dispatch, so the watcher binding is refused.
+        publication_invocation_id="inv-other",
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    slice_state = recovered.slices["slice-a"]
+    assert slice_state.status is SliceStatus.IN_REVIEW
+    assert slice_state.post_merge is None
+    assert client.merge_calls == []
+
+
 def test_review_validation_failure_reason_round_trips_through_checkpoint(tmp_path) -> None:
     store, state = _load_state(tmp_path)
     failed = slice_transition(
