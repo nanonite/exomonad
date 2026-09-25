@@ -93,6 +93,7 @@ class FakeClient:
     publication_ownership_error: str = ""
     publication_invocation_id: str | None = "invocation-a"
     publication_succession: tuple[str, ...] = ()
+    publication_malformed: bool = False
     review_id: int | None = None
     review_verdict: str | None = None
     review_head_sha: str | None = None
@@ -156,7 +157,9 @@ class FakeClient:
             }
             result["publication_ownership_verified"] = self.publication_ownership_verified
             result["publication_ownership_error"] = self.publication_ownership_error
-            if self.publication_invocation_id is not None:
+            if self.publication_malformed:
+                result["publication"] = "not-a-publication-record"
+            elif self.publication_invocation_id is not None:
                 result["publication"] = {
                     "invocation_id": self.publication_invocation_id,
                     "slice_id": "slice-a",
@@ -450,7 +453,9 @@ def test_reconciliation_does_not_respawn_reviewer_when_head_already_claimed(
 
 def test_reconciliation_parks_closed_unmerged_pr_without_resurrecting_slice(tmp_path) -> None:
     store, state = _load_state(tmp_path)
-    client = FakeClient(pr_state="closed")
+    # No active dispatch invocation is persisted here, so the watcher must not
+    # present a publication record it cannot correlate against.
+    client = FakeClient(pr_state="closed", publication_invocation_id=None)
     config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
 
     new_state = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
@@ -756,6 +761,49 @@ def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_pa
     assert client.spawn_reviewer_calls == []
     assert client.merge_calls == []
     assert journal.pending_entries() == []
+
+
+def test_malformed_publication_cannot_authorize_durable_merge_fallback(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    state = store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {
+            "slice-a": replace(
+                state.slices["slice-a"],
+                status=SliceStatus.IN_REVIEW,
+                pr_number=99,
+                reviewed_head="head-a",
+                dispatch_invocation_id="inv-current",
+                action=ActionState(
+                    ActionKind.MERGE,
+                    ActionPhase.UNKNOWN,
+                    intent_id="merge-intent",
+                    head_sha="head-a",
+                ),
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    journal = EffectJournal("run-1", tmp_path / "action-journal.json")
+    client = FakeClient(
+        merged=True,
+        pr_state="closed",
+        publication_ownership_verified=True,
+        publication_invocation_id=None,
+        publication_malformed=True,
+    )
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    slice_state = recovered.slices["slice-a"]
+    # A malformed record is refused, so it can never be treated as a genuinely
+    # absent record eligible for the durable merge fallback.
+    assert slice_state.status is SliceStatus.IN_REVIEW
+    assert slice_state.post_merge is None
+    assert client.merge_calls == []
+    assert store.load().slices["slice-a"].status is SliceStatus.IN_REVIEW
 
 
 def test_unknown_merge_with_refused_publication_provenance_is_not_adopted(

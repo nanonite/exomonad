@@ -82,8 +82,10 @@ from tl_loop.loop.reconcile import (
     ReconciliationResult,
     action_key,
     derive_next_action,
+    publication_refused,
     reconcile_merge_observation,
     repeated_action_gate_name,
+    watcher_presents_publication,
 )
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
 from tl_loop.ordered import (
@@ -3443,7 +3445,7 @@ def test_reconciliation_backfills_handoff_from_host_publication_provenance(
     current = replace(
         store.load().slices["leaf-a"],
         dispatch_agent_id="leaf-a",
-        dispatch_invocation_id=None,
+        dispatch_invocation_id="inv-host",
         publication=None,
         handoff=None,
         verdict=Verdict.GO,
@@ -3485,6 +3487,53 @@ def test_reconciliation_backfills_handoff_from_host_publication_provenance(
     merge_ready = reconcile_merge_observation(updated, watcher)
     assert merge_ready.reconciliation is not None
     assert merge_ready.reconciliation["next_action"] == "queue_merge"
+
+
+def test_reconciliation_without_active_invocation_refuses_host_publication(
+    tmp_path: Path,
+) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id=None,
+        publication=None,
+        handoff=None,
+        verdict=Verdict.GO,
+        reviewer_attempt={"head-a": 1},
+    )
+    result = ReconciliationResult(
+        slice_id="leaf-a",
+        confirmed_stage="review",
+        authoritative_evidence=("published_pr",),
+        missing_evidence=("handoff",),
+        conflicts=(),
+        next_action="await_handoff",
+    )
+    watcher = {
+        "found": True,
+        "pr_number": 42,
+        "head_sha": "head-a",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "review_state": "approved",
+        "ci_status": "success",
+        "publication_ownership_verified": True,
+        "publication": {
+            "invocation_id": "inv-host",
+            "slice_id": "leaf-a",
+            "author_agent": "leaf-a",
+            "succession_invocation_ids": [],
+        },
+    }
+
+    updated = _apply_reconciliation_observations(current, result, watcher, None)
+
+    # Without an active invocation or a durable binding, the host record is a
+    # historical record that cannot bind on its own.
+    assert updated.publication is None
+    assert updated.handoff is None
+    assert updated.status is SliceStatus.IN_REVIEW
 
 
 def test_reconciliation_refused_watcher_does_not_backfill_handoff(tmp_path: Path) -> None:
@@ -3905,6 +3954,61 @@ def test_publication_from_watcher_refuses_missing_invocation_provenance(
 def test_publication_from_watcher_refuses_unrelated_succession(tmp_path: Path) -> None:
     current = _watcher_current(tmp_path, "inv-current")
     watcher = _watcher_publication("inv-origin", ("inv-other", "inv-third"))
+    assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
+
+
+def test_publication_from_watcher_refuses_without_active_invocation(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, None)
+    assert current.dispatch_invocation_id is None
+    assert current.publication is None
+    # No active dispatch/recovery invocation and no durable publication
+    # binding: a historical record may not bind by itself.
+    assert _publication_from_watcher(
+        current, _watcher_publication("inv-historical"), "head-45", "leaf-a"
+    ) is None
+
+
+def test_publication_from_watcher_binds_without_active_invocation_when_durable(
+    tmp_path: Path,
+) -> None:
+    current = _watcher_current(tmp_path, None)
+    durable = replace(
+        current,
+        publication=PublicationBinding(
+            pr_number=45,
+            head_sha="head-45",
+            head_branch="main.leaf-a",
+            base_branch="main",
+            attempt=1,
+            invocation_id="inv-historical",
+        ),
+    )
+    publication = _publication_from_watcher(
+        durable, _watcher_publication("inv-historical"), "head-45", "leaf-a"
+    )
+    assert publication is not None
+    assert publication.invocation_id == "inv-historical"
+    # A durable binding proves only its own invocation.
+    assert _publication_from_watcher(
+        durable, _watcher_publication("inv-other"), "head-45", "leaf-a"
+    ) is None
+
+
+def test_malformed_publication_is_refused_not_absent(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = {
+        "found": True,
+        "pr_number": 45,
+        "head_sha": "head-45",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "publication_ownership_verified": True,
+        # Present but not a publication object: this must be refused, never
+        # treated as a genuinely absent record eligible for the fallback.
+        "publication": "not-a-publication-record",
+    }
+    assert watcher_presents_publication(watcher) is True
+    assert publication_refused(current, watcher, "head-45", "leaf-a") is True
     assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
 
 

@@ -489,6 +489,38 @@ def test_heartbeat_accepted_publication_reconciles(tmp_path: Path) -> None:
     assert result.parked_slice_ids == ()
 
 
+def test_heartbeat_refused_resolver_publication_does_not_persist_pr_number(
+    tmp_path: Path,
+) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0, pr_number=None)
+    current = state.slices["slice-a"]
+    state = store.checkpoint(
+        state.fsm,
+        {"slice-a": replace(current, dispatch_invocation_id="inv-current")},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    transport = HeartbeatTransport(
+        publication_ownership_verified=True,
+        publication=_refused_publication(),
+    )
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.pr_number is None
+    # The resolved PR number is never checkpointed behind a refused snapshot.
+    assert store.load().slices["slice-a"].pr_number is None
+    assert [event.kind for event in result.events] == ["pr.publication_refused"]
+
+
 def test_poll_workers_uses_persisted_runtime_identity(tmp_path: Path) -> None:
     _, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
     transport = HeartbeatTransport()

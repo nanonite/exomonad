@@ -327,6 +327,7 @@ def heartbeat_once(
     current = store.load()
     for slice_state in _active_slices(current):
         pr_number = slice_state.pr_number
+        resolved_pr_number = pr_number is None
         if pr_number is None:
             resolution, pr_number = _resolve_live_pr(effects, slice_state.id)
             if pr_number is None:
@@ -339,18 +340,6 @@ def heartbeat_once(
                     )
                 )
                 continue
-            current = store.load()
-            current_slice = current.slices[slice_state.id]
-            if current_slice.pr_number != pr_number:
-                current_slice = replace(current_slice, pr_number=pr_number)
-                current = store.checkpoint(
-                    current.fsm,
-                    {**current.slices, slice_state.id: current_slice},
-                    current.budgets,
-                    current.events.last_consumed_offset,
-                )
-                progress = True
-            slice_state = current.slices[slice_state.id]
         watcher = _watch_pr(effects, pr_number, slice_state.id)
         if publication_refused(slice_state, watcher, watcher.head_sha, None):
             # A present-but-refused publication record may not change head,
@@ -365,6 +354,21 @@ def heartbeat_once(
                 )
             )
             continue
+        if resolved_pr_number:
+            # Correlate before persisting: a refused snapshot must never leave
+            # a recovered PR number saved in durable state.
+            current = store.load()
+            current_slice = current.slices[slice_state.id]
+            if current_slice.pr_number != pr_number:
+                current_slice = replace(current_slice, pr_number=pr_number)
+                current = store.checkpoint(
+                    current.fsm,
+                    {**current.slices, slice_state.id: current_slice},
+                    current.budgets,
+                    current.events.last_consumed_offset,
+                )
+                progress = True
+            slice_state = current.slices[slice_state.id]
         terminal_cause = _pr_terminal_cause(watcher)
         if terminal_cause is not None:
             if isinstance(effects, ReadOnlyEffectClient):

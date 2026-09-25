@@ -91,6 +91,7 @@ class WatcherObservation:
     reviewer_identity_error: str | None
     ownership_verified_present: bool
     ownership_error_present: bool
+    publication_present: bool = False
 
     def get(self, name: str, default: object = None) -> object:
         """Compatibility accessor for non-migrated observation consumers."""
@@ -135,6 +136,7 @@ class WatcherObservation:
             reviewer_identity_error=_optional_text(raw.get("reviewer_identity_error")),
             ownership_verified_present="publication_ownership_verified" in raw,
             ownership_error_present="publication_ownership_error" in raw,
+            publication_present="publication" in raw,
         )
 
     def ownership_status(self) -> tuple[bool, str | None]:
@@ -216,4 +218,5 @@ class WatcherObservation:
             reviewer_identity_error=self.reviewer_identity_error,
             ownership_verified_present=self.ownership_verified_present,
             ownership_error_present=self.ownership_error_present,
+            publication_present=publication is not None,
         )

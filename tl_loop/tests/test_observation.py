@@ -46,6 +46,25 @@ def test_projection_keeps_verified_publication_identity() -> None:
     assert observed.publication.slice_id == "slice-a"
 
 
+def test_projection_preserves_malformed_publication_presence() -> None:
+    observed = WatcherObservation.from_response(
+        {
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
+            "publication": "not-a-publication-record",
+        }
+    )
+
+    assert observed.publication is None
+    assert observed.publication_present is True
+
+    absent = WatcherObservation.from_response(
+        {"publication_ownership_verified": True, "publication_ownership_error": ""}
+    )
+    assert absent.publication is None
+    assert absent.publication_present is False
+
+
 def test_projection_preserves_exact_head_review_evidence() -> None:
     observed = WatcherObservation.from_response(
         {

@@ -121,11 +121,6 @@ def _watcher_observation(snapshot: object) -> WatcherObservation | None:
     return None
 
 
-def _publication_record_of(snapshot: object) -> object | None:
-    observation = _watcher_observation(snapshot)
-    return observation.publication if observation is not None else None
-
-
 def _publication_record_text(record: object | None, key: str) -> str | None:
     if record is None:
         return None
@@ -153,8 +148,15 @@ def _recorded_recovery_invocation(current: SliceState) -> str | None:
 
 
 def watcher_presents_publication(snapshot: object) -> bool:
-    """Whether a watcher snapshot carries any publication provenance at all."""
-    return _publication_record_of(snapshot) is not None
+    """Whether a watcher snapshot carries any publication provenance at all.
+
+    A present-but-malformed value still counts as present so it is refused
+    rather than treated as a genuinely absent record.
+    """
+    observation = _watcher_observation(snapshot)
+    if observation is None:
+        return False
+    return observation.publication is not None or observation.publication_present
 
 
 def accepted_publication_from_watcher(
@@ -208,10 +210,16 @@ def accepted_publication_from_watcher(
         for value in (current.dispatch_invocation_id, _recorded_recovery_invocation(current))
         if value is not None
     ]
-    if active_invocations and not any(
-        active == record_invocation_id or active in succession
-        for active in active_invocations
-    ):
+    if active_invocations:
+        if not any(
+            active == record_invocation_id or active in succession
+            for active in active_invocations
+        ):
+            return None
+    elif existing is None or existing.invocation_id != record_invocation_id:
+        # No active dispatch or recovery invocation to correlate against: the
+        # record may bind only when the persisted publication durably proves
+        # the same invocation. A historical record never binds on its own.
         return None
     return PublicationBinding(
         pr_number=pr_number,
@@ -236,7 +244,9 @@ def publication_refused(
     not a refusal (its park path is preserved).
     """
     observation = _watcher_observation(snapshot)
-    if observation is None or observation.publication is None:
+    if observation is None:
+        return False
+    if observation.publication is None and not observation.publication_present:
         return False
     if observation.publication_ownership_verified is not True:
         return False
