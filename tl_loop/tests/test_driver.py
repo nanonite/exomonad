@@ -57,6 +57,7 @@ from tl_loop.loop.driver import (
     _migrate_audit_marked_quarantine,
     _ordered_child_complete,
     _publication_from_watcher,
+    _replayable_quarantine_documents,
     _park_repeated_action,
     _phase_after_slice_merge,
     _record_review_event,
@@ -3532,6 +3533,60 @@ def test_reconciliation_refused_watcher_does_not_backfill_handoff(tmp_path: Path
     assert updated.handoff is None
 
 
+def test_reconciliation_refused_watcher_does_not_apply_merge_or_head(
+    tmp_path: Path,
+) -> None:
+    store = _review_store(tmp_path)
+    current = replace(
+        store.load().slices["leaf-a"],
+        status=SliceStatus.SPAWNED,
+        pr_number=None,
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-current",
+        publication=None,
+        handoff=None,
+        reviewed_head=None,
+        ci_state={},
+    )
+    result = ReconciliationResult(
+        slice_id="leaf-a",
+        confirmed_stage="review",
+        authoritative_evidence=(),
+        missing_evidence=("published_pr",),
+        conflicts=(),
+        next_action="await_authoritative_evidence",
+    )
+    watcher = {
+        "found": True,
+        "pr_number": 45,
+        "head_sha": "head-45",
+        "head_branch": "main.leaf-a",
+        "base_branch": "main",
+        "review_state": "approved",
+        "ci_status": "success",
+        "merged": True,
+        "publication_ownership_verified": True,
+        # Unrelated to the current dispatch, so the watcher binding is refused.
+        "publication": {
+            "invocation_id": "inv-other",
+            "slice_id": "leaf-a",
+            "author_agent": "leaf-a",
+            "succession_invocation_ids": [],
+        },
+    }
+
+    updated = _apply_reconciliation_observations(current, result, watcher, None)
+
+    # A refused provenance mismatch must not set the PR number, head/CI
+    # evidence, or merge the slice.
+    assert updated.status is SliceStatus.SPAWNED
+    assert updated.pr_number is None
+    assert updated.reviewed_head is None
+    assert updated.ci_state == {}
+    assert updated.publication is None
+    assert updated.handoff is None
+
+
 def test_pr_filed_binds_host_verified_publication_to_owner(tmp_path: Path) -> None:
     store = _review_store(tmp_path)
     current = replace(
@@ -3999,6 +4054,8 @@ def test_audit_migration_retains_conflicting_pending_row(tmp_path: Path) -> None
     # The conflicting pending row is retained, not released into a conflict.
     assert [entry.get("run_seq") for entry in store.quarantined_events()] == [5]
     assert len(store.audited_events()) == 1
+    # A retained audit-marked row is never eligible for replay.
+    assert _replayable_quarantine_documents(store) == []
 
 
 def test_worker_self_approval_is_not_gate_evidence(tmp_path: Path) -> None:

@@ -2184,7 +2184,7 @@ def _run_loop(
     # before replay selection so they are never replayed or released.
     _migrate_audit_marked_quarantine(store)
     quarantined: list[EventEnvelope] = []
-    for document in store.quarantined_events():
+    for document in _replayable_quarantine_documents(store):
         try:
             event = project(document)
         except EnvelopeError as error:
@@ -6997,75 +6997,77 @@ def _apply_reconciliation_observations(
         return replace(current, **updates)
 
     if watcher is not None and watcher.found is True:
-        if current.pr_number is None:
-            recovered_pr_number = watcher.pr_number
-            if isinstance(recovered_pr_number, int) and recovered_pr_number > 0:
-                updates["pr_number"] = recovered_pr_number
         head_sha = watcher.head_sha
         ci_status = watcher.ci_status
-        if head_sha and ci_status in CI_STATUS_VALUES:
-            transitioned = slice_transition(
-                transitioned,
-                HeadEvidenceObserved(
-                    head_sha=head_sha,
-                    ci_status=ci_status,
-                    bind_reviewed_head=transitioned.reviewed_head in {None, head_sha},
-                ),
-            )
         publication = _publication_from_watcher(current, watcher, head_sha, owner_id)
         if publication is not None:
+            # PR number, head/CI evidence, handoff, and merge adoption all
+            # require the accepted binding, so a refused provenance mismatch can
+            # never mutate the slice.
             updates["publication"] = publication
             updates["pr_number"] = publication.pr_number
-        published_pr_number = (
-            publication.pr_number if publication is not None else current.pr_number
-        )
-        effective_agent_id = current.dispatch_agent_id or owner_id
-        invocation_id = current.dispatch_invocation_id
-        if invocation_id is None and publication is not None:
-            invocation_id = publication.invocation_id
-        if (
-            publication is not None
-            and watcher.publication_ownership_verified is True
-            and head_sha
-            and published_pr_number is not None
-            and effective_agent_id
-            and invocation_id
-            and (
-                current.publication is None
-                or (
-                    current.publication.pr_number == published_pr_number
-                    and current.publication.head_sha == head_sha
-                )
-            )
-        ):
-            attempt = current.publication.attempt if current.publication else current.attempts
-            updates["handoff"] = HandoffEvidence(
-                pr_number=published_pr_number,
-                head_sha=head_sha,
-                attempt=attempt,
-                invocation_id=invocation_id,
-                agent_id=effective_agent_id,
-                observed_at=_now_timestamp(),
-            )
-            if current.status is SliceStatus.SPAWNED:
+            if head_sha and ci_status in CI_STATUS_VALUES:
                 transitioned = slice_transition(
-                    transitioned, SliceStatusChanged(SliceStatus.IN_REVIEW)
+                    transitioned,
+                    HeadEvidenceObserved(
+                        head_sha=head_sha,
+                        ci_status=ci_status,
+                        bind_reviewed_head=transitioned.reviewed_head in {None, head_sha},
+                    ),
+                )
+            effective_agent_id = current.dispatch_agent_id or owner_id
+            invocation_id = current.dispatch_invocation_id
+            if invocation_id is None:
+                invocation_id = publication.invocation_id
+            if (
+                head_sha
+                and effective_agent_id
+                and invocation_id
+                and (
+                    current.publication is None
+                    or (
+                        current.publication.pr_number == publication.pr_number
+                        and current.publication.head_sha == head_sha
+                    )
+                )
+            ):
+                attempt = current.publication.attempt if current.publication else current.attempts
+                updates["handoff"] = HandoffEvidence(
+                    pr_number=publication.pr_number,
+                    head_sha=head_sha,
+                    attempt=attempt,
+                    invocation_id=invocation_id,
+                    agent_id=effective_agent_id,
+                    observed_at=_now_timestamp(),
+                )
+                if current.status is SliceStatus.SPAWNED:
+                    transitioned = slice_transition(
+                        transitioned, SliceStatusChanged(SliceStatus.IN_REVIEW)
+                    )
+            else:
+                missing = [
+                    name
+                    for name, value in (
+                        ("head_sha", head_sha),
+                        ("pr_number", publication.pr_number),
+                        ("owner_agent_id", effective_agent_id),
+                        ("invocation_id_provenance", invocation_id),
+                    )
+                    if not value
+                ]
+                LOGGER.warning(
+                    "[TL loop] skipping handoff backfill for %s: missing %s",
+                    current.id,
+                    ", ".join(missing) or "matching publication identity",
+                )
+            if watcher.merged is True:
+                transitioned = slice_transition(
+                    transitioned, MergeCompleted(watcher.pr_number or 0)
                 )
         elif watcher.publication_ownership_verified is True:
-            missing = [
-                name
-                for name, value in (
-                    ("head_sha", head_sha),
-                    ("pr_number", published_pr_number),
-                    ("owner_agent_id", effective_agent_id),
-                    ("invocation_id_provenance", invocation_id),
-                )
-                if not value
-            ]
             LOGGER.warning(
-                "[TL loop] skipping handoff backfill for %s: missing %s",
+                "[TL loop] skipping watcher reconciliation for %s: publication provenance was refused",
                 current.id,
-                ", ".join(missing) or "matching publication identity",
             )
         elif watcher.found is True:
             _, ownership_reason = _publication_ownership_status(watcher)
@@ -7076,8 +7078,6 @@ def _apply_reconciliation_observations(
                 or ownership_reason
                 or "host publication identity unavailable",
             )
-        if watcher.merged is True:
-            transitioned = slice_transition(transitioned, MergeCompleted(watcher.pr_number or 0))
     if owner_id is not None and current.dispatch_agent_id is None:
         updates["dispatch_agent_id"] = owner_id
     return replace(transitioned, **updates)
@@ -11960,6 +11960,20 @@ def _quarantine_historical_publication(
             "correlation_reason": reason,
         }
     )
+
+
+def _replayable_quarantine_documents(store: RunStore) -> list[Mapping[str, object]]:
+    """Pending documents eligible for replay, excluding permanent audit rows.
+
+    A conflicting audit-marked row is retained in the pending queue by the
+    migration, but its top-level audit marker is not preserved by the event
+    projection, so it is filtered out here and can never re-enter replay.
+    """
+    return [
+        document
+        for document in store.quarantined_events()
+        if document.get("correlation") != "publication_history_audit"
+    ]
 
 
 def _migrate_audit_marked_quarantine(store: RunStore) -> None:
