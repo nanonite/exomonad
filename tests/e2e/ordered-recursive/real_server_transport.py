@@ -804,6 +804,29 @@ def start_mock(
     raise HarnessError(f"timed out waiting for mock API: {stderr.name}")
 
 
+def ordered_parent_identity(worktree: Path) -> dict[str, object]:
+    """Durable identity for the ordered controller's authenticated parent.
+
+    The ordered sub-TL provisioning check requires the caller's resolved birth
+    branch to equal the configured parent branch (``config.branch == "main"``),
+    and the server resolves ``identity.json`` before the worktree git branch.
+    The parent worktree itself stays on its own ``main.parent`` branch, so the
+    root identity must be recorded explicitly.
+    """
+    return {
+        "agent_name": "parent",
+        "slug": "parent",
+        "agent_type": "codex",
+        "birth_branch": "main",
+        "parent_branch": "main",
+        "working_dir": str(worktree),
+        "display_name": "🤖 parent",
+        "topology": "worktree_per_agent",
+        "ledger_owned": True,
+        "slice_id": "parent",
+    }
+
+
 def start_server(
     root: Path,
     repo: Path,
@@ -872,7 +895,17 @@ def start_server(
     )
     parent_agent_dir = repo / ".exo/agents/parent"
     parent_agent_dir.mkdir(parents=True, exist_ok=True)
-    (parent_agent_dir / ".birth_branch").write_text("main.parent\n", encoding="utf-8")
+    # The controller authenticates as role=tl, name=parent and the ordered
+    # sub-TL provisioning check requires the caller's resolved birth branch to
+    # equal the configured parent branch (config.branch == "main"). The server
+    # resolves identity.json before the worktree git branch, so record the root
+    # identity here; the parent worktree keeps its own "main.parent" branch.
+    (parent_agent_dir / "identity.json").write_text(
+        json.dumps(ordered_parent_identity(parent_worktree), indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    (parent_agent_dir / ".birth_branch").write_text("main\n", encoding="utf-8")
     for agent_id, branch in (identity_agents or {}).items():
         agent_dir = agent_worktree(repo, branch)
         agent_dir.mkdir(parents=True, exist_ok=True)

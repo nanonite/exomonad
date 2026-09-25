@@ -19,6 +19,7 @@ import beast
 import leaf_publication_agent
 import runner  # inserts PROJECT_ROOT and ordered-recursive onto sys.path
 import fixture
+import real_server_transport as real
 from boundaries import (
     CRASH_BOUNDARIES,
     LOGICAL_BOUNDARY_NAMES,
@@ -92,6 +93,45 @@ def test_fixture_consuming_children_receive_distinct_sources(tmp_path: Path) -> 
 def test_fixture_plan_without_coordinates_has_no_sources() -> None:
     """Seeding uses a structure-only plan; sources are attached only at run time."""
     assert all(task.source is None for task in fixture.plan().sub_tls)
+
+
+def test_ordered_parent_identity_matches_configured_parent_branch() -> None:
+    """The authenticated parent must resolve to the configured branch (main).
+
+    The ordered sub-TL provisioning check compares the caller's resolved birth
+    branch with config.branch; the server reads identity.json before the
+    parent worktree's own main.parent branch.
+    """
+    record = real.ordered_parent_identity(Path("/tmp/parent-worktree"))
+    assert record["agent_name"] == "parent"
+    assert record["birth_branch"] == "main"
+    assert record["parent_branch"] == "main"
+    assert record["agent_type"] == "codex"
+    assert record["topology"] == "worktree_per_agent"
+    assert record["ledger_owned"] is True
+    assert record["working_dir"] == "/tmp/parent-worktree"
+
+
+def test_two_concurrent_consuming_children_without_sources_are_rejected() -> None:
+    """Why the fixture keeps one consuming child per same-order stage.
+
+    A resumed run rebuilds the plan from the manifest, which cannot carry
+    ``source`` objects, so two concurrent event-consuming children are always
+    rejected. The fixture therefore pairs one consuming child with a
+    non-consuming sibling (the working ordered-recursive probe pattern).
+    """
+    from tl_loop.loop.driver import TLLoopError, _validate_stage_event_routes
+
+    consuming = (
+        real.SubTLTask(
+            "left", real.WorkPlan(leaves=(real.LeafTask("left-leaf", "x"),)), order=1
+        ),
+        real.SubTLTask(
+            "right", real.WorkPlan(leaves=(real.LeafTask("right-leaf", "x"),)), order=1
+        ),
+    )
+    with pytest.raises(TLLoopError):
+        _validate_stage_event_routes(consuming)
 
 
 def test_every_logical_boundary_has_before_and_after_process_death() -> None:
