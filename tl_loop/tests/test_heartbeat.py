@@ -479,6 +479,59 @@ def test_heartbeat_refused_publication_cannot_change_head(tmp_path: Path) -> Non
     assert [event.kind for event in result.events] == ["pr.publication_refused"]
 
 
+def test_heartbeat_unverified_publication_ownership_cannot_mutate(tmp_path: Path) -> None:
+    store, result = _run_refused_heartbeat(
+        tmp_path,
+        HeartbeatTransport(
+            merged=False,
+            pr_state="open",
+            # A publication record whose ownership fields are omitted: the
+            # binding was never verified and must not be applied.
+            publication=_refused_publication("inv-current"),
+        ),
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.reviewed_head == "head-old"
+    assert observed.park_cause is None
+    assert result.parked_slice_ids == ()
+    assert [event.kind for event in result.events] == ["pr.publication_refused"]
+    assert store.load().slices["slice-a"].reviewed_head == "head-old"
+
+
+def test_heartbeat_unverified_ownership_does_not_persist_resolved_pr(
+    tmp_path: Path,
+) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0, pr_number=None)
+    current = state.slices["slice-a"]
+    state = store.checkpoint(
+        state.fsm,
+        {
+            "slice-a": replace(
+                current,
+                dispatch_invocation_id="inv-current",
+                dispatch_agent_id="agent-slice-a",
+            )
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    transport = HeartbeatTransport(publication=_refused_publication("inv-current"))
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    assert result.state.slices["slice-a"].pr_number is None
+    assert store.load().slices["slice-a"].pr_number is None
+    assert [event.kind for event in result.events] == ["pr.publication_refused"]
+
+
 def test_heartbeat_accepted_publication_reconciles(tmp_path: Path) -> None:
     _store, result = _run_refused_heartbeat(
         tmp_path,

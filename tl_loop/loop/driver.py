@@ -250,6 +250,7 @@ from .reconcile import (
     _publication_ownership_status,
     accepted_publication_from_watcher,
     derive_next_action,
+    publication_ownership_unresolved,
     publication_refused,
     reconcile_merge_observation,
     reconcile_slice,
@@ -6675,11 +6676,7 @@ def _watcher_publication_ownership_unresolved(
         observation = _as_watcher_observation(watcher)
     if observation is None:
         return False
-    if observation.ownership_verified_present and observation.ownership_status()[0] is not True:
-        return True
-    return (
-        observation.publication is not None or observation.publication_present
-    ) and observation.publication_ownership_verified is not True
+    return publication_ownership_unresolved(observation)
 
 
 def _persisted_merge_head(current: SliceState) -> str | None:

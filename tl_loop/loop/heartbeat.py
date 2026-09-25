@@ -19,7 +19,11 @@ from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.observation import WatcherObservation
-from tl_loop.loop.reconcile import publication_refused, reconcile_merge_observation
+from tl_loop.loop.reconcile import (
+    publication_ownership_unverified,
+    publication_refused,
+    reconcile_merge_observation,
+)
 from tl_loop.loop.recovery_policy import (
     ProbeResult,
     RecoveryAction,
@@ -341,10 +345,14 @@ def heartbeat_once(
                 )
                 continue
         watcher = _watch_pr(effects, pr_number, slice_state.id)
-        if publication_refused(slice_state, watcher, watcher.head_sha, None):
-            # A present-but-refused publication record may not change head,
-            # review, CI, handoff, action, status, integration, or merge state,
-            # nor park the slice or trigger state-changing effects.
+        if publication_refused(slice_state, watcher, watcher.head_sha, None) or (
+            publication_ownership_unverified(watcher)
+        ):
+            # A present-but-refused or never-verified publication record may not
+            # change head, review, CI, handoff, action, status, integration, or
+            # merge state, persist a recovered PR number, nor park the slice or
+            # trigger state-changing effects. An explicit unverified verdict
+            # still reaches the terminal park path below.
             events.append(
                 _event(
                     "pr.publication_refused",

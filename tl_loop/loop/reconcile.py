@@ -239,6 +239,37 @@ def accepted_publication_from_watcher(
     )
 
 
+def publication_ownership_unverified(snapshot: object) -> bool:
+    """Whether a watcher presents a record whose ownership was never verified.
+
+    Ownership fields omitted or malformed leave ``publication_ownership_verified``
+    ``None``. An explicit unverified verdict is deliberately excluded: the
+    reconciliation and heartbeat park paths handle that case.
+    """
+    observation = _watcher_observation(snapshot)
+    if observation is None:
+        return False
+    if observation.publication is None and not observation.publication_present:
+        return False
+    return observation.publication_ownership_verified is None
+
+
+def publication_ownership_unresolved(snapshot: object) -> bool:
+    """Whether a watcher presents publication evidence with unresolved ownership.
+
+    Covers both an explicit unverified verdict and a publication record whose
+    ownership was never verified. Merge paths that do not park must refuse both.
+    """
+    observation = _watcher_observation(snapshot)
+    if observation is None:
+        return False
+    if observation.ownership_verified_present and observation.ownership_status()[0] is not True:
+        return True
+    return (
+        observation.publication is not None or observation.publication_present
+    ) and observation.publication_ownership_verified is not True
+
+
 def publication_refused(
     current: SliceState,
     snapshot: object,
