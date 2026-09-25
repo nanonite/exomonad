@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Prevent historical publication events from binding recreated runs and recover failed checkpoints (#1115)
 - Fix Chainlink escalation result parsing and exactly-once issue creation (#1113)
 - Validate existing leaf worktrees before reuse (#1106)
 - Fix archived TL checkpoints blocking recreated worktrees (#1104)
