@@ -4012,6 +4012,43 @@ def test_malformed_publication_is_refused_not_absent(tmp_path: Path) -> None:
     assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
 
 
+def test_publication_from_watcher_refuses_branch_mismatch(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-current")
+    watcher["head_branch"] = "main.other"
+    assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
+
+
+def test_publication_from_watcher_refuses_base_branch_mismatch(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-current")
+    watcher["base_branch"] = "develop"
+    assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
+
+
+def test_publication_from_watcher_refuses_unrelated_owner(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-current")
+    publication = cast(dict[str, object], watcher["publication"])
+    publication["author_agent"] = "someone-else"
+    assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
+
+
+def test_publication_from_watcher_refuses_missing_author(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-current")
+    publication = cast(dict[str, object], watcher["publication"])
+    publication.pop("author_agent")
+    assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
+
+
+def test_publication_from_watcher_refuses_when_no_expected_owner(tmp_path: Path) -> None:
+    current = replace(_watcher_current(tmp_path, "inv-current"), dispatch_agent_id=None)
+    assert _publication_from_watcher(
+        current, _watcher_publication("inv-current"), "head-45", None
+    ) is None
+
+
 def test_publication_from_watcher_binds_succession_in_origin_direction(
     tmp_path: Path,
 ) -> None:

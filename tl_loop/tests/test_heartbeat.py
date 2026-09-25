@@ -390,7 +390,13 @@ def _heartbeat_in_review(tmp_path: Path, invocation_id: str) -> tuple[RunStore, 
     current = state.slices["slice-a"]
     state = store.checkpoint(
         state.fsm,
-        {"slice-a": replace(current, dispatch_invocation_id=invocation_id)},
+        {
+            "slice-a": replace(
+                current,
+                dispatch_invocation_id=invocation_id,
+                dispatch_agent_id="agent-slice-a",
+            )
+        },
         state.budgets,
         state.events.last_consumed_offset,
     )

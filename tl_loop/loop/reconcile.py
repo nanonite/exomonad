@@ -193,13 +193,21 @@ def accepted_publication_from_watcher(
     existing = current.publication
     if existing is not None and (existing.pr_number != pr_number or existing.head_sha != head_sha):
         return None
+    # Exact branch and base identity: a watcher that names a different branch
+    # than the slice's durable coordinates can never be the same publication.
+    if current.branch and head_branch != current.branch:
+        return None
+    if current.base_ref and base_branch != current.base_ref:
+        return None
     publication_record = observation.publication
     record_slice_id = _publication_record_text(publication_record, "slice_id")
     if record_slice_id is not None and record_slice_id != current.id:
         return None
+    # Owner identity must be durably provable. A missing expected owner or a
+    # missing/unrelated author_agent fails closed instead of binding.
     expected_owner = current.dispatch_agent_id or owner_id
     record_owner = _publication_record_text(publication_record, "author_agent")
-    if record_owner is not None and expected_owner is not None and record_owner != expected_owner:
+    if expected_owner is None or record_owner is None or record_owner != expected_owner:
         return None
     record_invocation_id = _publication_record_text(publication_record, "invocation_id")
     if not record_invocation_id:

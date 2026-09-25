@@ -4896,6 +4896,15 @@ def _execute_direct_merge_intent(
             current.id,
         )
         return state
+    if _watcher_publication_ownership_unresolved(watcher):
+        # The reconciliation path parks unresolved ownership; a destructive
+        # direct merge must apply the same gate rather than proceed on
+        # unverified watcher evidence.
+        LOGGER.warning(
+            "[TL loop] refusing direct merge for %s: publication ownership unresolved",
+            current.id,
+        )
+        return state
     if (
         watcher is not None
         and watcher.success is True
@@ -6636,6 +6645,27 @@ def _watcher_publication_refused(
     if observation is None:
         return False
     return publication_refused(current, observation, observation.head_sha, owner_id)
+
+
+def _watcher_publication_ownership_unresolved(
+    watcher: ToolResult | WatcherObservation | Mapping[str, object] | None,
+) -> bool:
+    """Whether a watcher presents publication evidence with unresolved ownership.
+
+    An explicit unverified verdict, or a publication record whose ownership was
+    never verified, must not authorize a destructive merge.
+    """
+    if isinstance(watcher, ToolResult):
+        observation = _watcher_result_observation(watcher)
+    else:
+        observation = _as_watcher_observation(watcher)
+    if observation is None:
+        return False
+    if observation.ownership_verified_present and observation.ownership_status()[0] is not True:
+        return True
+    return (
+        observation.publication is not None or observation.publication_present
+    ) and observation.publication_ownership_verified is not True
 
 
 def _persisted_merge_head(current: SliceState) -> str | None:

@@ -143,7 +143,7 @@ class FakeClient:
                 "found": True,
                 "pr_number": self.resolved_pr_number,
                 "head_sha": "head-a",
-                "head_branch": "main.slice-a",
+                "head_branch": "task/slice-a",
                 "base_branch": "main",
                 "base_sha": "base-a",
                 "patch_digest": "patch-a",
@@ -396,7 +396,7 @@ def test_reconciliation_adopts_authoritative_publication_handoff_after_restart(
     assert recovered.handoff.agent_id == "agent-a"
     assert recovered.publication is not None
     assert recovered.publication.head_sha == "head-a"
-    assert recovered.publication.head_branch == "main.slice-a"
+    assert recovered.publication.head_branch == "task/slice-a"
     assert recovered.publication.invocation_id == "inv-old"
     assert store.load().slices["slice-a"].handoff == recovered.handoff
 

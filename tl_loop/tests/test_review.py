@@ -462,6 +462,61 @@ def test_refused_publication_blocks_direct_merge(tmp_path: Path) -> None:
     assert store.load().slices["leaf"].status is SliceStatus.IN_REVIEW
 
 
+def test_unresolved_publication_ownership_blocks_direct_merge(tmp_path: Path) -> None:
+    state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    current = state.slices["leaf"]
+    state = store.checkpoint(
+        state.fsm,
+        {"leaf": replace(current, dispatch_invocation_id="inv-current")},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    before = store.load()
+    transport = DirectMergeTransport(
+        snapshots=[
+            {
+                "found": True,
+                "pr_number": 42,
+                "head_sha": "abc123",
+                "head_branch": "task/leaf",
+                "base_branch": "main",
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+                # Ownership is explicitly unresolved, so this complete merge
+                # evidence must not authorize a destructive direct merge.
+                "publication_ownership_verified": False,
+                "publication_ownership_error": "publication ownership is unverified",
+                "publication": {
+                    "invocation_id": "inv-current",
+                    "slice_id": "leaf",
+                    "author_agent": "leaf-agent",
+                    "succession_invocation_ids": [],
+                },
+            }
+        ]
+    )
+    effects_log: list[EffectIntent] = []
+
+    result = _run_direct_merge(
+        state,
+        store,
+        transport,
+        TLLoopConfig(
+            poll_interval=0.001,
+            review_policy_path=Path(".exo/review-policy.toml"),
+        ),
+        effects_log,
+    )
+
+    assert result.slices["leaf"].status is SliceStatus.IN_REVIEW
+    assert result.slices["leaf"].action == before.slices["leaf"].action
+    assert result.integration == before.integration
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+    assert store.load().slices["leaf"].action == before.slices["leaf"].action
+
+
 def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
     state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
