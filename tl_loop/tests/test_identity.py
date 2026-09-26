@@ -197,18 +197,20 @@ def _routing_event(
     *,
     agent_id: str,
     data: dict[str, object],
+    invocation_id: str | None = None,
 ) -> object:
-    return project(
-        {
-            "type": event_type,
-            "run_seq": sequence,
-            "run_id": "routing-run",
-            "agent_id": agent_id,
-            "lifecycle_state": "observed",
-            "observed_at": "2026-08-18T00:00:00Z",
-            "data": data,
-        }
-    )
+    document: dict[str, object] = {
+        "type": event_type,
+        "run_seq": sequence,
+        "run_id": "routing-run",
+        "agent_id": agent_id,
+        "lifecycle_state": "observed",
+        "observed_at": "2026-08-18T00:00:00Z",
+        "data": data,
+    }
+    if invocation_id is not None:
+        document["invocation_id"] = invocation_id
+    return project(document)
 
 
 def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> None:
@@ -227,6 +229,8 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
         reviewed_head=None,
         attempts=1,
         verdict=None,
+        dispatch_agent_id="tunable-operator-body",
+        dispatch_invocation_id="inv-42",
     )
     create(
         "routing-run",
@@ -251,6 +255,8 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
                     "reviewed_head": None,
                     "attempts": 1,
                     "verdict": None,
+                    "dispatch_agent_id": "tunable-operator-body",
+                    "dispatch_invocation_id": "inv-42",
                 }
             }
         },
@@ -287,11 +293,14 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
             2,
             "pr.filed",
             agent_id="tunable-operator-body",
+            invocation_id="inv-42",
             data={
                 "slice_id": "tunable-operator-body",
                 "pr_number": 42,
                 "head_sha": "head-42",
                 "branch": branch,
+                "head_branch": branch,
+                "base_branch": "main",
             },
         ),
         _routing_event(

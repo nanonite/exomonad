@@ -44,6 +44,7 @@
         "run_seq": 1,
         "type": "agent.notify_parent",
         "agent_id": "child-leaf",
+        "invocation_id": "child-invocation",
         "run_id": null,
         "session_id": "recovery-session",
         "lifecycle_state": "observed",
@@ -53,7 +54,7 @@
             "slug": "child-leaf",
             "branch": "main.stage-a.child-leaf",
             "agent_type": "codex/gpt-luna",
-            "intent_id": "child-intent"
+            "intent_id": "f9abc41fca343c6759f4260a43200854"
           }
         }
       },
@@ -66,6 +67,7 @@
         "run_seq": 2,
         "type": "pr.filed",
         "agent_id": "child-leaf",
+        "invocation_id": "child-invocation",
         "run_id": null,
         "session_id": "recovery-session",
         "lifecycle_state": "observed",
@@ -73,7 +75,7 @@
           "pr_number": 42,
           "head_sha": "head-a",
           "head_branch": "main.stage-a.child-leaf",
-          "base_branch": "main.stage-a",
+          "base_branch": "main",
           "invocation_id": "child-invocation"
         }
       },

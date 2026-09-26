@@ -1860,6 +1860,8 @@ def test_pr_published_is_acknowledged_without_a_publication_transition(
                     "slice_id": "leaf-a",
                     "pr_number": 42,
                     "head_sha": "head-a",
+                    "head_branch": "main.leaf-a",
+                    "base_branch": "main",
                     "verified": True,
                 },
             }
@@ -1889,7 +1891,12 @@ def test_pr_published_is_acknowledged_without_a_publication_transition(
         run_id,
         plan,
         source,
-        EffectClient(RecordingTransport()),
+        EffectClient(
+            RecordingTransport(
+                spawned_agent_id="leaf-a",
+                spawned_invocation_id="inv-a",
+            )
+        ),
         config=TLLoopConfig(max_workers=0, max_leaves=1, max_events=3, poll_interval=0.001),
         root_dir=tmp_path,
     )
@@ -4145,6 +4152,129 @@ def test_historical_publication_rejected_before_reduction_across_recreate(
     reloaded = RunStore(run_id, tmp_path)
     assert reloaded.quarantined_events() == ()
     assert any(entry.get("run_seq") == 3 for entry in reloaded.audited_events())
+
+
+def test_conflicting_publication_refused_before_reduction_preserves_owner(
+    tmp_path: Path,
+) -> None:
+    """A refused same-invocation conflict must never reach the slice reducer.
+
+    The reducer clears publication, handoff, and recovery state and rewrites the
+    PR number and head, so a conflicting PR/head, a wrong owner, or a wrong
+    branch that is refused by the binder must be stopped before reduction.
+    """
+    run_id = "conflicting-publication-run"
+    agent_id = "tunable-operator-body-opencode"
+    leaf = "tunable-operator-body"
+
+    def pr_filed(
+        seq: int,
+        invocation: str,
+        number: int,
+        head: str,
+        *,
+        owner: str = agent_id,
+        branch: str | None = None,
+    ) -> EventEnvelope:
+        return project(
+            {
+                "type": "pr.filed",
+                "run_seq": seq,
+                "run_id": run_id,
+                "agent_id": owner,
+                "invocation_id": invocation,
+                "lifecycle_state": "observed",
+                "observed_at": "2026-09-22T00:00:00Z",
+                "data": {
+                    "slice_id": leaf,
+                    "pr_number": number,
+                    "head_sha": head,
+                    "head_branch": branch or f"main.{agent_id}",
+                    "base_branch": "main",
+                },
+            }
+        )
+
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": leaf,
+                    "task": "implement the change",
+                    "boundary": ["src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "done_criteria": ["covered"],
+                }
+            ]
+        }
+    )
+
+    def run(events: list[EventEnvelope], root: Path) -> TLRunResult:
+        transport = RecordingTransport(
+            spawned_agent_id=agent_id,
+            spawned_invocation_id="inv-current",
+        )
+        return run_tl_loop(
+            run_id,
+            plan,
+            SyntheticQueue(events),
+            EffectClient(transport),
+            config=TLLoopConfig(
+                max_workers=0,
+                max_leaves=1,
+                max_events=len(events),
+                poll_interval=0.001,
+            ),
+            root_dir=root,
+        )
+
+    # Baseline: #45 is accepted, then a real active recovery is established.
+    baseline = run(
+        [
+            pr_filed(1, "inv-current", 45, "head-45"),
+            _blocked_event(2, leaf, run_id),
+            _event(3, "all_children_done", run_id=run_id),
+        ],
+        tmp_path / "baseline",
+    )
+
+    # Same accepted #45 and recovery, then three refused publications that must
+    # not reduce: a same-invocation conflicting PR/head, a wrong owner, and a
+    # wrong head branch.
+    conflicting = run(
+        [
+            pr_filed(1, "inv-current", 45, "head-45"),
+            _blocked_event(2, leaf, run_id),
+            pr_filed(3, "inv-current", 46, "head-46"),
+            pr_filed(4, "inv-current", 47, "head-47", owner="someone-else"),
+            pr_filed(5, "inv-current", 48, "head-48", branch="main.other"),
+            _event(6, "all_children_done", run_id=run_id),
+        ],
+        tmp_path / "conflicting",
+    )
+
+    baseline_slice = baseline.final_state.slices[leaf]
+    final = conflicting.final_state.slices[leaf]
+
+    # The accepted owner state and the phase are unchanged by the refusals.
+    assert conflicting.final_state.fsm.phase == baseline.final_state.fsm.phase
+    assert final.publication == baseline_slice.publication
+    assert final.publication is not None
+    assert final.publication.pr_number == 45
+    assert final.publication.head_sha == "head-45"
+    assert final.pr_number == baseline_slice.pr_number == 45
+    assert final.reviewed_head == baseline_slice.reviewed_head == "head-45"
+    assert final.handoff == baseline_slice.handoff
+    assert final.handoff is not None and final.handoff.head_sha == "head-45"
+    assert final.recovery is not None
+    assert final.recovery.cause == baseline_slice.recovery.cause
+    assert final.recovery.phase == baseline_slice.recovery.phase
+    assert final.status == baseline_slice.status
+
+    # Ordinary refusals are acknowledged, not retained as replayable work.
+    store = RunStore(run_id, tmp_path / "conflicting")
+    assert store.quarantined_events() == ()
+    assert store.audited_events() == ()
 
 
 def _watcher_publication(

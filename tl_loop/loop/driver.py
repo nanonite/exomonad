@@ -2620,30 +2620,39 @@ def _run_loop(
                 phase = next_phase
                 continue
         if isinstance(fsm_event, (PRFiled, PRUpdated)):
-            # Validate ownership and generation against pre-reduction state:
-            # the reducer clears publication, handoff, and recovery state, so a
-            # refused historical event must never reach it.
+            # Validate ownership and generation against pre-reduction state.
+            # The reducer clears publication, handoff, and recovery state, so
+            # every refused publication must be stopped here -- not only the
+            # historical ones. A same-invocation conflicting PR/head, a wrong
+            # owner, or a wrong branch would otherwise mutate the slice before
+            # the binder refuses it.
             refusal, historical = _publication_event_rejection(
                 state.slices, fsm_event, event, event_slice_id, state.controller_epoch
             )
-            if historical:
-                # A generation/historical refusal must not reach the reducer,
-                # which would clear publication, handoff, and recovery state.
+            if refusal is not None:
                 diagnostics.filtered += 1
-                assert refusal is not None
-                _quarantine_historical_publication(store, event, refusal)
-                LOGGER.warning(
-                    "[TL loop] rejecting historical publication before reduction pr=%s: %s",
-                    fsm_event.pr_number,
-                    refusal,
-                )
+                if historical:
+                    # Generation/historical evidence is retained permanently for
+                    # audit; it must never re-enter replay.
+                    _quarantine_historical_publication(store, event, refusal)
+                    LOGGER.warning(
+                        "[TL loop] rejecting historical publication before reduction pr=%s: %s",
+                        fsm_event.pr_number,
+                        refusal,
+                    )
+                else:
+                    LOGGER.warning(
+                        "[TL loop] refusing publication before reduction pr=%s: %s",
+                        fsm_event.pr_number,
+                        refusal,
+                    )
                 _checkpoint_and_ack(
                     store, source, event, state, phase, acknowledge=not replaying
                 )
                 if not replaying:
                     diagnostics.acknowledged += 1
-                # The audit record is durable; only now drop a replayed pending
-                # row so a legacy audit row cannot survive in the replay queue.
+                # The refusal is durable; only now drop a replayed pending row
+                # so a refused event cannot survive in the replay queue.
                 _release_replayed_event(store, event, replaying)
                 state = store.load()
                 continue
