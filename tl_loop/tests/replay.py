@@ -228,6 +228,14 @@ def replay_fixture(
     effects = EffectClient(transport)
     active = spec.get("active", True) is True
     client = effects if active else ReadOnlyEffectClient(effects)
+    nested = {
+        key: value
+        for key, value in (
+            ("branch", _optional_text(spec.get("branch"))),
+            ("parent_branch", _optional_text(spec.get("parent_branch"))),
+        )
+        if value is not None
+    }
     config = TLLoopConfig(
         active=active,
         source=source,
@@ -246,6 +254,7 @@ def replay_fixture(
         chainlink_issue_id=_optional_positive_int(spec.get("chainlink_issue_id")),
         repository_identity=_repository_identity(spec.get("repository_identity")),
         session_mode=session_mode,
+        **nested,
     )
     run_result = None
     original_checkpoint = RunStore.checkpoint
@@ -524,6 +533,14 @@ def _attach_live_child_sources(
             )
         )
     return replace(plan, sub_tls=tuple(children))
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise TypeError("fixture text fields must be a non-empty string or null")
+    return value
 
 
 def _optional_positive_int(value: object) -> int | None:
