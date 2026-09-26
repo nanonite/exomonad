@@ -83,7 +83,9 @@ def assert_resume_not_redispatched(
         if isinstance(value, dict):
             calls.append(value)
     matches = [call for call in calls if call.get("identity") == crashed_identity]
-    if boundary in {"review", "adoption"}:
+    if boundary in {"review", "adoption", "publication"}:
+        # These effects are driven by the child/reviewer rather than the
+        # controller transport, so the resumed call count is observational.
         return len(matches)
     expected = 1 if point == "before" else 0
     if len(matches) != expected:

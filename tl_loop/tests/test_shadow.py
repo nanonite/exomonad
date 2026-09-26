@@ -143,6 +143,76 @@ def test_shadow_decoder_treats_pr_published_as_telemetry_only() -> None:
     assert decoded.slice_id is None
 
 
+def test_shadow_loop_acknowledges_pr_published_without_a_transition(
+    tmp_path: Path,
+) -> None:
+    run_id = "shadow-publication"
+    create(
+        run_id,
+        {
+            "slices": {
+                "leaf-a": {
+                    "id": "leaf-a",
+                    "status": "dispatch_unconfirmed",
+                    "paths": ["src/leaf.py"],
+                    "depends_on": [],
+                    "base_ref": "main",
+                    "test_plan": ["just test"],
+                    "agent_type": "codex",
+                    "model": None,
+                    "branch": "main.leaf-a",
+                    "worktree": None,
+                    "pr_number": None,
+                    "reviewed_head": None,
+                    "attempts": 1,
+                    "verdict": None,
+                    "dispatch_intent_id": _dispatch_intent(run_id, "leaf-a"),
+                    "dispatch_started_at": 0.0,
+                    "dispatch_last_boundary": "dispatch_intended",
+                }
+            }
+        },
+        root_dir=tmp_path / run_id,
+    )
+    base: dict[str, object] = {
+        "run_id": run_id,
+        "agent_id": "leaf-a",
+        "lifecycle_state": "emitted",
+        "observed_at": "2026-08-12T00:00:00Z",
+    }
+
+    def wire(event_type: str, sequence: int) -> EventEnvelope:
+        return project(
+            {
+                **base,
+                "type": event_type,
+                "run_seq": sequence,
+                "data": {
+                    "slice_id": "leaf-a",
+                    "pr_number": 42,
+                    "head_sha": "head-a",
+                    "verified": True,
+                },
+            }
+        )
+
+    source = SyntheticQueue([wire("pr.published", 1), wire("pr.filed", 2)])
+
+    result = ShadowLoop.for_run(
+        source,
+        run_id,
+        readonly_client=ReadOnlyEffectClient(EffectClient(_RecordingTransport())),
+        root_dir=tmp_path / run_id,
+    ).run()
+
+    # The telemetry row is acknowledged but never becomes an intended action;
+    # the following pr.filed produces exactly one publication transition.
+    assert source.acknowledged == [1, 2]
+    assert [action.event_seq for action in result.actions] == [2]
+    assert result.actions[0].arguments["fsm_event"] == "PRFiled"
+    assert result.final_state.slices["leaf-a"].pr_number == 42
+
+
 def test_shadow_recovery_stays_nonterminal_until_pr_is_filed() -> None:
     current = SliceState(
         id="slice-a",

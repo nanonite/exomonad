@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing
 import os
 import time
@@ -12,6 +13,20 @@ import real_server_transport as real
 from boundaries import CrashBoundary
 from crash_transport import CrashBoundaryTransport, RecordingTransport
 from evidence import AcceptanceError
+
+
+def _write_handoff(repo: Path, payload: dict[str, object]) -> None:
+    """Publish the crash/resume contract the leaf actor reads at file_pr time.
+
+    The leaf ``file_pr`` runs in the fake-codex process, which the controller's
+    crash transport cannot observe. The actor reads this handoff to inject the
+    publication boundary and to record its resumed call for cardinality checks.
+    """
+    path = repo / ".exo" / "e2e-crash-handoff.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def controller(
@@ -28,6 +43,16 @@ def controller(
 ) -> None:
     """Run one controller invocation until the injected process death."""
     os.environ["CHAINLINK_DB"] = str(chainlink_db)
+    _write_handoff(
+        repo,
+        {
+            "phase": "crash",
+            "boundary": boundary.name,
+            "point": boundary.point,
+            "marker": str(trace_path),
+            "owner_pid": os.getpid(),
+        },
+    )
     transport = CrashBoundaryTransport(
         repo,
         trace_path,
@@ -101,6 +126,7 @@ def resume(
 ) -> Any:
     """Resume from the persisted manifest, recording all resumed UDS calls."""
     os.environ["CHAINLINK_DB"] = str(chainlink_db)
+    _write_handoff(repo, {"phase": "resume", "resume_trace": str(trace_path)})
     source = real.LazyLedgerSource(
         repo / ".exo" / "ledger" / "segments",
         state_root,

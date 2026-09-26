@@ -130,6 +130,53 @@ def test_worktree_and_identity_layout_matches_server_owned_paths(tmp_path: Path)
     assert parent not in leaf.parents
 
 
+def test_leaf_actor_honors_publication_crash_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The leaf actor must inject the publication boundary it is handed."""
+    exo = tmp_path / ".exo"
+    exo.mkdir(parents=True)
+    monkeypatch.setenv("EXOMONAD_SOCKET", str(exo / "server.sock"))
+
+    (exo / "e2e-crash-handoff.json").write_text(
+        json.dumps(
+            {
+                "phase": "crash",
+                "boundary": "publication",
+                "point": "before",
+                "marker": str(tmp_path / "marker.jsonl"),
+                "owner_pid": 1,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    handoff = leaf_publication_agent._read_handoff()
+    assert (
+        leaf_publication_agent._publication_crash_point(handoff, {"title": "Leaf x"})
+        == "before"
+    )
+    # Aggregate publication is the controller's own boundary, not the leaf's.
+    assert (
+        leaf_publication_agent._publication_crash_point(
+            handoff, {"title": "Aggregate x into main"}
+        )
+        is None
+    )
+
+    (exo / "e2e-crash-handoff.json").write_text(
+        json.dumps({"phase": "resume", "resume_trace": str(tmp_path / "resume.jsonl")})
+        + "\n",
+        encoding="utf-8",
+    )
+    assert (
+        leaf_publication_agent._publication_crash_point(
+            leaf_publication_agent._read_handoff(), {"title": "Leaf x"}
+        )
+        is None
+    )
+
+
 def test_two_concurrent_consuming_children_without_sources_are_rejected() -> None:
     """Why the fixture keeps one consuming child per same-order stage.
 

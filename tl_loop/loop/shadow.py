@@ -361,6 +361,11 @@ class ShadowLoop:
                 self.source.acknowledge(event)
                 continue
             fsm_event = self.decoder.decode(event)
+            if isinstance(fsm_event, PublicationObserved):
+                # Telemetry-only: acknowledge without an FSM transition or slice
+                # mutation; a following pr.filed/pr.updated is applied normally.
+                self.source.acknowledge(event)
+                continue
             if isinstance(fsm_event, ChildSpawned) and not _shadow_spawn_matches(
                 state.slices, event, fsm_event
             ):

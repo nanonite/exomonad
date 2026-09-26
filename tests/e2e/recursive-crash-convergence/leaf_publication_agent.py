@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -16,7 +17,9 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from boundaries import effect_identity, redacted_arguments  # noqa: E402
 from tl_loop.client.effects import EffectClient  # noqa: E402
 from tl_loop.client.transport import TransportClient, TransportError  # noqa: E402
 
@@ -85,6 +88,91 @@ def _target_leaf_branch(branch: str) -> bool:
         if value
     }
     return branch in configured
+
+
+def _read_handoff() -> Mapping[str, object] | None:
+    """Read the controller's crash/resume contract next to the server socket."""
+    socket = os.environ.get("EXOMONAD_SOCKET", "")
+    if not socket:
+        return None
+    path = Path(socket).parent / "e2e-crash-handoff.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
+def _publication_crash_point(
+    handoff: Mapping[str, object] | None, arguments: Mapping[str, object]
+) -> str | None:
+    """Return the publication boundary point this leaf file_pr must honor."""
+    if handoff is None or handoff.get("phase") != "crash":
+        return None
+    if handoff.get("boundary") != "publication":
+        return None
+    title = arguments.get("title")
+    if isinstance(title, str) and title.startswith("Aggregate "):
+        return None
+    point = handoff.get("point")
+    return point if point in {"before", "after"} else None
+
+
+def _append_record(path: Path, record: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _inject_publication_crash(
+    handoff: Mapping[str, object],
+    arguments: Mapping[str, object],
+    *,
+    success: bool | None,
+) -> None:
+    """Record the publication boundary and terminate the owning controller.
+
+    Only the controller dies at the boundary; the leaf keeps running so the
+    resumed controller observes the real publication exactly as it would when
+    the controller crashes while a child is mid-effect.
+    """
+    record: dict[str, object] = {
+        "boundary": "publication",
+        "point": handoff.get("point"),
+        "tool_name": "file_pr",
+        "identity": effect_identity(arguments, "file_pr"),
+        "arguments": redacted_arguments(arguments),
+    }
+    if success is not None:
+        record["success"] = success
+    marker = handoff.get("marker")
+    if not isinstance(marker, str) or not marker:
+        raise LeafPublicationError("crash handoff is missing its marker path")
+    _append_record(Path(marker), record)
+    owner = handoff.get("owner_pid")
+    if isinstance(owner, int) and owner > 0 and owner != os.getpid():
+        try:
+            os.kill(owner, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _record_resume_call(
+    handoff: Mapping[str, object], arguments: Mapping[str, object]
+) -> None:
+    trace = handoff.get("resume_trace")
+    if not isinstance(trace, str) or not trace:
+        return
+    _append_record(
+        Path(trace),
+        {
+            "tool_name": "file_pr",
+            "identity": effect_identity(arguments, "file_pr"),
+            "arguments": redacted_arguments(arguments),
+        },
+    )
 
 
 def _review_pr_number(arguments: list[str]) -> int | None:
@@ -164,6 +252,24 @@ def publish_leaf() -> bool:
     parent_branch = branch.rsplit(".", 1)[0]
     leaf_name = branch.rsplit(".", 1)[-1]
     head_sha = _current_head()
+    title = f"Leaf {leaf_name} into {parent_branch}"
+    body = (
+        f"Deterministic #1057 leaf publication for {leaf_name}.\n\n"
+        f"Prepared head: {head_sha}\n"
+        f"TL-Slice-ID: {leaf_name}\n"
+        "## Acceptance Criteria\n"
+        "- Publish the prepared leaf commit to its direct parent branch."
+    )
+    arguments: dict[str, object] = {
+        "title": title,
+        "body": body,
+        "base_branch": parent_branch,
+    }
+    handoff = _read_handoff()
+    crash_point = _publication_crash_point(handoff, arguments)
+    if crash_point == "before":
+        assert handoff is not None
+        _inject_publication_crash(handoff, arguments, success=None)
     result = EffectClient(
         TransportClient(
             socket_path=_server_socket(),
@@ -172,19 +278,14 @@ def publish_leaf() -> bool:
         ),
         role="tl",
         name=leaf_name,
-    ).file_pr(
-        title=f"Leaf {leaf_name} into {parent_branch}",
-        body=(
-            f"Deterministic #1057 leaf publication for {leaf_name}.\n\n"
-            f"Prepared head: {head_sha}\n"
-            f"TL-Slice-ID: {leaf_name}\n"
-            "## Acceptance Criteria\n"
-            "- Publish the prepared leaf commit to its direct parent branch."
-        ),
-        base_branch=parent_branch,
-    )
+    ).file_pr(title=title, body=body, base_branch=parent_branch)
     if result.success is not True:
         raise LeafPublicationError(result.error or "file_pr returned no success")
+    if crash_point == "after":
+        assert handoff is not None
+        _inject_publication_crash(handoff, arguments, success=result.success)
+    if handoff is not None and handoff.get("phase") == "resume":
+        _record_resume_call(handoff, arguments)
     return True
 
 
