@@ -144,10 +144,7 @@ mod tests {
 
     #[test]
     fn classifies_success() {
-        assert_eq!(
-            classify_bwrap_result(true, ""),
-            CodexSandboxCapability::Ok
-        );
+        assert_eq!(classify_bwrap_result(true, ""), CodexSandboxCapability::Ok);
     }
 
     #[test]
