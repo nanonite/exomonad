@@ -49,15 +49,44 @@ pub struct ImportOptions {
     pub format: SourceFormat,
     pub dry_run: bool,
     pub rebuild: bool,
+    /// Import quarantined residue sources, which replay excludes by default.
+    pub include_quarantined: bool,
 }
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
 pub struct ImportSummary {
+    /// Every source the scan found, replayable or quarantined.
     pub discovered_sources: usize,
     pub imported_sources: usize,
     pub skipped_sources: usize,
+    /// Quarantined residue sources left out of replay.
+    pub excluded_quarantined_sources: usize,
     pub rows_read: usize,
     pub rows_rejected: usize,
+}
+
+/// Quarantine directory residue cleanup moves unregistered worktrees into,
+/// relative to the project `.exo` directory. Its contents are forensic evidence
+/// about a worktree that no longer exists, never a live sink destination.
+const RESIDUE_QUARANTINE_DIR: &str = "worktrees-residue";
+
+/// Whether a source is quarantined residue rather than a live sink source.
+///
+/// Quarantined ledger segments and events describe a worktree that no longer
+/// exists, so importing them by default would replay their events as if they
+/// were authoritative. The quarantine manifest records the same classification
+/// for operators; this predicate keeps the exclusion in force even when a
+/// manifest entry is missing after a crash.
+fn is_quarantined_residue(path: &Path) -> bool {
+    path.ancestors().any(|ancestor| {
+        ancestor
+            .file_name()
+            .is_some_and(|name| name == RESIDUE_QUARANTINE_DIR)
+            && ancestor
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == ".exo")
+    })
 }
 
 /// The local, rebuildable analysis database at `.exo/analysis/atlas.db`.
@@ -249,9 +278,11 @@ pub fn import_sources(options: &ImportOptions) -> Result<ImportSummary> {
     if options.sources.is_empty() {
         bail!("at least one --source path is required");
     }
-    let paths = discover_sources(&options.sources, &options.project_dir)?;
+    let discovered = discover_sources(&options.sources, &options.project_dir)?;
+    let (paths, excluded) = classify_sources(discovered, options.include_quarantined);
     let mut summary = ImportSummary {
-        discovered_sources: paths.len(),
+        discovered_sources: paths.len() + excluded,
+        excluded_quarantined_sources: excluded,
         ..ImportSummary::default()
     };
     let fingerprints = paths
@@ -812,6 +843,28 @@ fn refresh_derived_tables(store: &AnalysisStore) -> Result<()> {
     Ok(())
 }
 
+/// Split discovered sources into replayable ones and quarantined residue.
+///
+/// Quarantined sources are dropped rather than skipped: they are forensic
+/// evidence, and importing them would attribute events from a worktree that no
+/// longer exists to the live session. An operator who needs that history passes
+/// the opt-in flag.
+fn classify_sources(discovered: Vec<PathBuf>, include_quarantined: bool) -> (Vec<PathBuf>, usize) {
+    if include_quarantined {
+        return (discovered, 0);
+    }
+    let mut replayable = Vec::with_capacity(discovered.len());
+    let mut excluded = 0;
+    for path in discovered {
+        if is_quarantined_residue(&path) {
+            excluded += 1;
+        } else {
+            replayable.push(path);
+        }
+    }
+    (replayable, excluded)
+}
+
 fn discover_sources(inputs: &[PathBuf], project_dir: &Path) -> Result<Vec<PathBuf>> {
     let analysis_db = project_dir.join(".exo/analysis/atlas.db");
     let mut paths = Vec::new();
@@ -971,7 +1024,80 @@ mod tests {
             format: SourceFormat::Auto,
             dry_run: false,
             rebuild: false,
+            include_quarantined: false,
         }
+    }
+
+    fn quarantined_segment(project_dir: &Path) -> PathBuf {
+        let segment =
+            project_dir.join(".exo/worktrees-residue/leaf-1/.exo/ledger/segments/segment-0.jsonl");
+        fs::create_dir_all(segment.parent().expect("segment parent")).unwrap();
+        fs::write(
+            &segment,
+            "{\"event_id\":\"quarantined\",\"type\":\"agent.invocation.started\",\"session_id\":\"s1\",\"run_seq\":1}\n",
+        )
+        .unwrap();
+        segment
+    }
+
+    #[test]
+    fn excludes_quarantined_residue_by_default() -> Result<()> {
+        let temp = TempDir::new()?;
+        let quarantined = quarantined_segment(temp.path());
+        let live = temp.path().join(".exo/ledger/segments/segment-0.jsonl");
+        fs::create_dir_all(live.parent().expect("live parent"))?;
+        fs::write(&live, "{\"event_id\":\"live\",\"type\":\"custom.one\"}\n")?;
+
+        // A directory sweep is the shape an operator uses to import a project.
+        let summary = import_sources(&ImportOptions {
+            project_dir: temp.path().to_path_buf(),
+            sources: vec![temp.path().join(".exo/ledger"), quarantined.clone()],
+            format: SourceFormat::Auto,
+            dry_run: false,
+            rebuild: false,
+            include_quarantined: false,
+        })?;
+
+        assert_eq!(summary.discovered_sources, 2);
+        assert_eq!(summary.excluded_quarantined_sources, 1);
+        assert_eq!(summary.imported_sources, 1);
+        let connection = Connection::open(temp.path().join(".exo/analysis/atlas.db"))?;
+        let event_id = connection.query_row("SELECT event_id FROM events", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        assert_eq!(event_id, "live");
+        Ok(())
+    }
+
+    #[test]
+    fn imports_quarantined_residue_when_the_operator_opts_in() -> Result<()> {
+        let temp = TempDir::new()?;
+        let quarantined = quarantined_segment(temp.path());
+        let mut opted_in = options(temp.path(), quarantined);
+        opted_in.include_quarantined = true;
+
+        let summary = import_sources(&opted_in)?;
+
+        assert_eq!(summary.excluded_quarantined_sources, 0);
+        assert_eq!(summary.imported_sources, 1);
+        let connection = Connection::open(temp.path().join(".exo/analysis/atlas.db"))?;
+        let event_id = connection.query_row("SELECT event_id FROM events", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        assert_eq!(event_id, "quarantined");
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_outside_exo_is_not_treated_as_residue() {
+        let temp = TempDir::new().unwrap();
+        let elsewhere = temp
+            .path()
+            .join("archive/worktrees-residue/segment-0.jsonl");
+        assert!(!is_quarantined_residue(&elsewhere));
+        assert!(is_quarantined_residue(&temp.path().join(
+            ".exo/worktrees-residue/leaf-1/.exo/ledger/segments/segment-0.jsonl"
+        )));
     }
 
     #[test]

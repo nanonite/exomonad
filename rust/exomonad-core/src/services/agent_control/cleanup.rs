@@ -577,24 +577,65 @@ fn worktree_name_is_identified(project_dir: &Path, name: &str) -> bool {
     false
 }
 
-fn append_quarantine_manifest(quarantine_root: &Path, source: &Path, destination: &Path) {
+/// Quarantine directory relative to the project root.
+const RESIDUE_QUARANTINE_DIR: &str = ".exo/worktrees-residue";
+/// Durable manifest of quarantined residue, relative to the quarantine root.
+const RESIDUE_MANIFEST: &str = "manifest.jsonl";
+/// Source kind recorded for every quarantined directory.
+///
+/// Quarantined trees are forensic evidence about a failed worktree, never a
+/// live sink destination, so replay and import exclude them unless an operator
+/// opts in.
+const RESIDUE_SOURCE_KIND: &str = "unregistered_worktree_residue";
+
+/// Record one quarantined directory durably.
+///
+/// The entry is written to a temporary file, fsynced, renamed over the manifest,
+/// and the quarantine directory is fsynced, so a crash cannot leave a
+/// half-written record. Callers run inside the exclusive lifecycle lock, so the
+/// read-modify-write of the manifest needs no lock of its own. A failure leaves
+/// the already-quarantined directory in place and is surfaced to the caller
+/// rather than ignored: the evidence stays, but the record is missing.
+fn append_quarantine_manifest(
+    quarantine_root: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<()> {
     use std::io::Write;
-    let manifest = quarantine_root.join("manifest.jsonl");
+    let manifest = quarantine_root.join(RESIDUE_MANIFEST);
+    let mut existing = std::fs::read(&manifest).unwrap_or_default();
     let record = serde_json::json!({
         "source": source.display().to_string(),
         "destination": destination.display().to_string(),
+        "source_kind": RESIDUE_SOURCE_KIND,
+        "forensic_only": true,
         "quarantined_at_unix_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or(0),
     });
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&manifest)
+    writeln!(existing, "{record}")
+        .with_context(|| format!("format quarantine manifest entry for {}", source.display()))?;
+    let temporary = quarantine_root.join(format!(".manifest-{}.tmp", uuid::Uuid::new_v4()));
     {
-        let _ = writeln!(file, "{record}");
+        let mut file = std::fs::File::create(&temporary)
+            .with_context(|| format!("create {}", temporary.display()))?;
+        file.write_all(&existing)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsync {}", temporary.display()))?;
     }
+    if let Err(error) = std::fs::rename(&temporary, &manifest) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("replace quarantine manifest {}", manifest.display()));
+    }
+    // The rename is only durable once the directory entry itself is synced.
+    let quarantine_dir = std::fs::File::open(quarantine_root)
+        .with_context(|| format!("open quarantine directory {}", quarantine_root.display()))?;
+    quarantine_dir
+        .sync_all()
+        .with_context(|| format!("fsync quarantine directory {}", quarantine_root.display()))
 }
 
 fn residue_quarantine_name(name: &str) -> String {
@@ -609,21 +650,35 @@ fn residue_quarantine_name(name: &str) -> String {
 
 /// Quarantine `.exo/worktrees/*` residue directories that are provably disposable.
 ///
-/// Only directories that Git's worktree registry does not know, carry no agent
-/// identity, and contain nothing but known sink artifacts are moved into the
-/// project-owned `.exo/worktrees-residue/` quarantine. Registered, dirty,
-/// identified, or ambiguous directories are left untouched, and every record in
-/// a quarantined directory is preserved rather than deleted. Returns the
-/// original residue paths that were moved.
+/// The whole classification and quarantine pass runs under the project-scoped
+/// exclusive lifecycle lock, so a worktree cannot be created between deciding a
+/// directory is residue and moving it. Only directories that Git's worktree
+/// registry does not know, carry no agent identity, and contain nothing but
+/// known sink artifacts are moved into the project-owned quarantine. Registered,
+/// dirty, identified, or ambiguous directories are left untouched, and every
+/// record in a quarantined directory is preserved rather than deleted. Returns
+/// the original residue paths that were moved.
+///
+/// Fails closed: without the exclusive lock the pass is skipped and the residue
+/// is left exactly as found.
 pub(crate) fn cleanup_unregistered_worktree_residue(
     project_dir: &Path,
     git_wt: &GitWorktreeService,
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>> {
+    let Some(_lifecycle) =
+        LifecycleGuard::try_acquire(project_dir, LifecycleMode::Exclusive, DECISION_TIMEOUT)?
+    else {
+        warn!(
+            project = %project_dir.display(),
+            "worktree lifecycle lock is held by another decision; skipping the residue cleanup pass"
+        );
+        return Ok(Vec::new());
+    };
     let worktrees_dir = project_dir.join(".exo/worktrees");
     let Ok(entries) = std::fs::read_dir(&worktrees_dir) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let quarantine_root = project_dir.join(".exo/worktrees-residue");
+    let quarantine_root = project_dir.join(RESIDUE_QUARANTINE_DIR);
     let mut moved = Vec::new();
     for entry in entries {
         // An entry we cannot inspect is ambiguous: leave it untouched.
@@ -654,16 +709,28 @@ pub(crate) fn cleanup_unregistered_worktree_residue(
         if !contains_only_sink_artifacts(&path) || contains_symlink(&path) {
             continue;
         }
-        if std::fs::create_dir_all(&quarantine_root).is_err() {
-            continue;
-        }
+        std::fs::create_dir_all(&quarantine_root)
+            .with_context(|| format!("create residue quarantine {}", quarantine_root.display()))?;
         let destination = quarantine_root.join(residue_quarantine_name(&name));
-        if std::fs::rename(&path, &destination).is_ok() {
-            append_quarantine_manifest(&quarantine_root, &path, &destination);
-            moved.push(path);
-        }
+        std::fs::rename(&path, &destination).with_context(|| {
+            format!(
+                "quarantine residue {} into {}",
+                path.display(),
+                destination.display()
+            )
+        })?;
+        // The directory is already preserved at this point; a manifest failure
+        // leaves it in quarantine and is surfaced, never swallowed.
+        append_quarantine_manifest(&quarantine_root, &path, &destination)?;
+        info!(
+            source = %path.display(),
+            destination = %destination.display(),
+            source_kind = RESIDUE_SOURCE_KIND,
+            "quarantined unregistered worktree residue"
+        );
+        moved.push(path);
     }
-    moved
+    Ok(moved)
 }
 
 #[cfg(test)]
@@ -714,7 +781,7 @@ mod tests {
         std::fs::create_dir_all(residue.join(".exo/ledger/segments")).unwrap();
         std::fs::write(residue.join(".exo/ledger/segments/segment-0.jsonl"), "{}\n").unwrap();
 
-        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt);
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt).unwrap();
 
         assert_eq!(moved, vec![residue.clone()]);
         assert!(!residue.exists());
@@ -728,10 +795,176 @@ mod tests {
             .path()
             .join(".exo/ledger/segments/segment-0.jsonl")
             .is_file());
-        // A durable manifest records the preserved evidence.
-        assert!(project
-            .join(".exo/worktrees-residue/manifest.jsonl")
-            .is_file());
+    }
+
+    /// The manifest is the durable record of what was quarantined and of the
+    /// source kind replay must classify it by.
+    #[test]
+    fn residue_cleanup_records_a_durable_classified_manifest_entry() -> Result<()> {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
+        std::fs::write(residue.join(".exo/ledger/segments/segment-0.jsonl"), "{}\n")?;
+
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt)?;
+        let destination = moved
+            .first()
+            .map(|source| quarantine_destination_for(&project, source.as_path()))
+            .expect("the residue was quarantined");
+
+        let manifest =
+            std::fs::read_to_string(project.join(".exo/worktrees-residue/manifest.jsonl"))?;
+        let entry: serde_json::Value = serde_json::from_str(manifest.trim())?;
+        assert_eq!(entry["source"], residue.display().to_string());
+        assert_eq!(entry["destination"], destination.display().to_string());
+        assert_eq!(entry["source_kind"], RESIDUE_SOURCE_KIND);
+        assert_eq!(entry["forensic_only"], true);
+        // Every entry ends on its own line, so a second pass appends rather than
+        // overwrites and no temporary file is left behind.
+        assert!(manifest.ends_with('\n'));
+        assert!(!quarantine_temporary_files(&project).any(|path| path.exists()));
+        Ok(())
+    }
+
+    /// A manifest failure must leave the quarantined evidence in place and be
+    /// surfaced to the caller, never swallowed.
+    #[test]
+    fn residue_cleanup_surfaces_a_manifest_failure_and_keeps_the_evidence() -> Result<()> {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
+        std::fs::write(
+            residue.join(".exo/ledger/segments/segment-0.jsonl"),
+            "evidence\n",
+        )?;
+        // The manifest path is occupied, so the durable entry cannot be
+        // installed once the directory has been moved.
+        std::fs::create_dir_all(project.join(".exo/worktrees-residue/manifest.jsonl"))?;
+
+        let error = cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .expect_err("a manifest failure must be surfaced");
+
+        assert!(error.to_string().contains("quarantine manifest"), "{error}");
+        assert!(!residue.exists(), "the residue was already moved");
+        let quarantined = quarantine_destination_for(&project, &residue);
+        assert!(
+            quarantined
+                .join(".exo/ledger/segments/segment-0.jsonl")
+                .is_file(),
+            "the evidence stays in quarantine"
+        );
+        assert!(
+            !quarantine_temporary_files(&project).any(|path| path.exists()),
+            "a failed manifest write leaves no temporary file behind"
+        );
+        Ok(())
+    }
+
+    /// A sink write holds the shared lock across verification and its write, so
+    /// a cleanup pass cannot quarantine a directory that a writer is using.
+    /// `flock` is held per open file description, so an in-test holder excludes
+    /// the pass exactly as a concurrent writer process would.
+    #[test]
+    fn residue_cleanup_skips_while_a_sink_holds_the_shared_lock() -> Result<()> {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
+        let _writer = LifecycleGuard::try_acquire(
+            &project,
+            LifecycleMode::Shared,
+            std::time::Duration::ZERO,
+        )?
+        .expect("the test holds the shared lifecycle lock like an in-flight sink");
+
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt)?;
+
+        assert!(
+            moved.is_empty(),
+            "the pass is skipped, not partially applied"
+        );
+        assert!(residue.exists(), "residue is left untouched");
+        assert!(!project.join(".exo/worktrees-residue").exists());
+
+        // Once the writer drains, the same pass quarantines the residue.
+        drop(_writer);
+        assert_eq!(
+            cleanup_unregistered_worktree_residue(&project, &git_wt)?,
+            vec![residue.clone()]
+        );
+        Ok(())
+    }
+
+    /// A worktree created inside the exclusive lifecycle region cannot be
+    /// quarantined by a pass that started from a stale view, and the pass itself
+    /// cannot start while that region is held. Both sides take the same lock, so
+    /// the interleaving the lock exists to prevent is not reachable.
+    #[test]
+    fn residue_cleanup_cannot_interleave_with_a_worktree_create_decision() -> Result<()> {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/other-codex");
+        std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
+        let worktree = project.join(".exo/worktrees/leaf-codex");
+        let default_branch = fixture_branch(&project);
+        let branch =
+            crate::domain::BranchName::try_from_str(format!("{default_branch}.leaf").as_str())?;
+        let base = crate::domain::BranchName::try_from_str(default_branch.as_str())?;
+
+        // The create decision holds the exclusive lock across the Git command.
+        let _lifecycle = LifecycleGuard::try_acquire(
+            &project,
+            LifecycleMode::Exclusive,
+            std::time::Duration::ZERO,
+        )?
+        .expect("the first exclusive acquisition is uncontended");
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)?.is_empty());
+        assert!(
+            residue.exists(),
+            "a pass that cannot take the lock leaves residue untouched"
+        );
+        git_wt.create_workspace(&worktree, &branch, &base)?;
+        std::fs::create_dir_all(worktree.join(".exo/ledger/segments"))?;
+        drop(_lifecycle);
+
+        // After the create completes the new worktree is registered, so it is
+        // never classified as residue.
+        assert_eq!(
+            cleanup_unregistered_worktree_residue(&project, &git_wt)?,
+            vec![residue]
+        );
+        assert!(worktree.exists());
+        Ok(())
+    }
+
+    fn quarantine_destination_for(project: &Path, source: &Path) -> PathBuf {
+        let name = source
+            .file_name()
+            .expect("residue has a directory name")
+            .to_string_lossy();
+        std::fs::read_dir(project.join(".exo/worktrees-residue"))
+            .expect("quarantine root")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .map(|entry| entry.to_string_lossy().starts_with(name.as_ref()))
+                        .unwrap_or(false)
+            })
+            .expect("quarantined directory")
+    }
+
+    fn quarantine_temporary_files(project: &Path) -> impl Iterator<Item = PathBuf> {
+        std::fs::read_dir(project.join(".exo/worktrees-residue"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with(".manifest-"))
+                    .unwrap_or(false)
+            })
     }
 
     #[test]
@@ -746,7 +979,9 @@ mod tests {
         git_wt.create_workspace(&worktree, &branch, &base).unwrap();
         std::fs::create_dir_all(worktree.join(".exo/ledger/segments")).unwrap();
 
-        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .unwrap()
+            .is_empty());
         assert!(worktree.exists());
     }
 
@@ -763,7 +998,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .unwrap()
+            .is_empty());
         assert!(residue.exists());
     }
 
@@ -777,7 +1014,9 @@ mod tests {
         std::fs::write(&target, "evidence\n").unwrap();
         std::os::unix::fs::symlink(&target, deep.join("link")).unwrap();
 
-        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .unwrap()
+            .is_empty());
         assert!(residue.exists());
     }
 
@@ -788,7 +1027,9 @@ mod tests {
         std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
         std::fs::write(residue.join("seed"), "real work\n").unwrap();
 
-        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt).is_empty());
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .unwrap()
+            .is_empty());
         assert!(residue.exists());
     }
 

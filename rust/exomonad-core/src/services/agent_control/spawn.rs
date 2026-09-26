@@ -843,8 +843,12 @@ impl<
             let base_branch = BranchName::try_from_str(base.as_str())
                 .expect("validated string input is non-empty");
 
+            // Exclusive lifecycle region: creation and a concurrent residue
+            // cleanup pass must never interleave.
+            let _lifecycle = self.acquire_worktree_lifecycle("create a worktree")?;
             self.create_worktree_checked(&worktree_path, &branch_name, &base_branch)
                 .await?;
+            drop(_lifecycle);
 
             let agent_config_dir = self
                 .project_dir()
@@ -1461,13 +1465,19 @@ impl<
             };
 
             if options.standalone_repo {
+                let _lifecycle = self.acquire_worktree_lifecycle("initialize a worktree")?;
                 self.init_standalone_repo(&worktree_path).await?;
                 if !options.allowed_dirs.is_empty() {
                     self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
                 }
+                drop(_lifecycle);
             } else if !is_custom_dir {
+                // Exclusive lifecycle region: creation and a concurrent residue
+                // cleanup pass must never interleave.
+                let _lifecycle = self.acquire_worktree_lifecycle("create a worktree")?;
                 let branch = BranchName::try_from_str(branch_name.as_str()).expect("validated string input is non-empty");
                 self.create_worktree_checked(&worktree_path, &branch, &current_branch).await?;
+                drop(_lifecycle);
             }
 
             self.create_socket_symlink(&worktree_path).await;
@@ -1861,9 +1871,17 @@ impl<
             // Bounded preflight: drop sink-only residue directories left behind
             // by earlier failed spawns before deciding whether the planned path
             // is a reusable worktree. Registered, dirty, identified, or
-            // ambiguous directories are never removed.
-            let _ =
-                super::cleanup::cleanup_unregistered_worktree_residue(self.project_dir(), self.git_wt());
+            // ambiguous directories are never removed. A cleanup failure leaves
+            // the residue in place and is reported, never silently ignored.
+            if let Err(error) =
+                super::cleanup::cleanup_unregistered_worktree_residue(self.project_dir(), self.git_wt())
+            {
+                warn!(
+                    project = %self.project_dir().display(),
+                    %error,
+                    "worktree residue preflight failed; residue left in place"
+                );
+            }
 
             // Derive the expected deterministic birth branch from durable
             // identity and deterministic naming only. The branch observed on
@@ -1959,6 +1977,13 @@ impl<
 
             let mut worktree_rollback: Option<WorktreeRollback> = None;
 
+            // Exclusive lifecycle region: the create, attach, and reuse
+            // decisions below read the same registry and tree a residue cleanup
+            // pass reads. Holding the lock across them means a live worktree
+            // cannot be created behind a cleanup classification, and a verified
+            // worktree cannot be quarantined before this decision completes.
+            let _lifecycle = self.acquire_worktree_lifecycle("create or reuse a leaf worktree")?;
+
             if options.standalone_repo {
                 worktree_rollback = Some(WorktreeRollback::armed(
                     self.git_wt().clone(),
@@ -1975,7 +2000,18 @@ impl<
                         worktree_path.display()
                     ));
                 }
-                // Ownership was verified before the idempotency check.
+                // Re-verify inside the lifecycle region. The preflight check ran
+                // before the idempotency check, so ownership is proved again here
+                // while no cleanup pass can quarantine the path.
+                verify_existing_leaf_worktree(
+                    self.git_wt(),
+                    effective_project_dir,
+                    &worktree_path,
+                    &branch_name,
+                    expected_head,
+                    true,
+                )
+                .await?;
                 info!(
                     worktree_path = %worktree_path.display(),
                     branch_name = %branch_name,
@@ -2055,6 +2091,9 @@ impl<
                     }
                 }
             }
+            // The lifecycle decision is complete; release the lock before the
+            // long-running spawn work that follows.
+            drop(_lifecycle);
 
             self.create_socket_symlink(&worktree_path).await;
 

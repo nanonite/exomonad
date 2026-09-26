@@ -126,6 +126,32 @@ This asymmetry is intentional — only the `notify_parent` relationship has a we
 
 `check_inbox` resolves a bare agent key through the `AgentResolver` slug table before exact-name fallback. This lets a root context whose runtime identity is `root` drain mail stored under the canonical suffixed agent name such as `root-claude`, preventing unread poke loops.
 
+### Sink destinations and the worktree lifecycle lock
+
+`services/sink_paths.rs` is the only place a telemetry, logging, ledger, or health sink decides where to write. `resolve_sink` returns the candidate path only when it is a live Git worktree registered to the same repository (same common git dir, and the directory is a linked-worktree root); otherwise the project-owned directory is returned. Resolution happens at the write boundary, never at enqueue time, so a planned worktree that appeared or vanished in between can never be materialized by a sink write. The inbox `project_dir` carries the project root so a nested worktree can always fall back to a directory it owns.
+
+`services/worktree_lifecycle.rs` holds the project-scoped advisory lock at `.exo/worktree-lifecycle.lock`, taken with `flock(2)` like the sink health, event log, and ledger writers:
+
+| Region | Mode | Holder |
+|---------|------|--------|
+| Sink verify -> write | shared | `resolve_sink`, `run_inbox_consumer`, the injection closure, the duplicate-cache append |
+| Worktree create/attach/reuse decision | exclusive | `AgentControlService::acquire_worktree_lifecycle` in `spawn.rs` |
+| Residue classify -> quarantine rename | exclusive | `cleanup_unregistered_worktree_residue` |
+
+Exclusive and shared are the same lock, so a cleanup pass drains in-flight sink writers before it classifies, and a leaf worktree cannot be created between a cleanup classification and its rename. Acquisition is bounded and every caller fails closed:
+
+- A sink that cannot take the shared lock writes to the project-owned directory and never to a candidate worktree path (`tracing::warn!`).
+- A cleanup pass that cannot take the exclusive lock skips the pass and leaves residue untouched (`tracing::warn!`).
+- A spawn that cannot take the exclusive lock returns an error instead of creating, attaching, or reusing a worktree.
+
+The project-owned directory needs no lock: no lifecycle decision creates, removes, or quarantines it. A sink destination must stay in scope for the whole write, because dropping it releases the lock before the bytes land.
+
+Residue cleanup quarantines a directory only when Git's worktree registry does not know it, no `.exo/agents/*/identity.json` claims it, and it contains nothing but known sink artifacts. Registered, dirty, identified, and ambiguous directories are refused, and `cleanup_unregistered_worktree_residue` returns `Result`: it is not a best-effort void. Each quarantined directory is preserved by rename into `.exo/worktrees-residue/`, and its manifest entry is written to a temporary file, fsynced, renamed over `manifest.jsonl`, and followed by an fsync of the quarantine directory, all inside the exclusive lock. A manifest failure leaves the quarantined directory in place and is surfaced to the caller, which logs it and continues.
+
+### Replay classification of quarantined evidence
+
+The quarantine manifest records `source_kind: "unregistered_worktree_residue"` and `forensic_only: true` for every entry. Quarantined `.exo/ledger/segments` and `.exo/events` describe a worktree that no longer exists, so `exomonad logs import` excludes any source under `.exo/worktrees-residue/` by default and reports the count as `excluded_quarantined_sources`. `exomonad logs import --include-quarantined` is the explicit operator opt-in. The exclusion is a path predicate, so it holds even when a manifest entry is missing after a crash.
+
 ### Session memory ledger
 
 `SessionMemoryService` is the append-only SQLite ledger for durable semantic

@@ -47,6 +47,7 @@ pub(crate) use super::git_worktree::GitWorktreeService;
 pub(crate) use super::github::{GitHubClient, GitHubService, Repo};
 pub(crate) use super::tmux_events;
 pub(crate) use super::tmux_ipc;
+pub(crate) use super::worktree_lifecycle::{LifecycleGuard, LifecycleMode, DECISION_TIMEOUT};
 pub(crate) use claude_teams_bridge::TeamRegistry;
 pub(crate) use std::sync::Arc;
 
@@ -1112,6 +1113,24 @@ impl<
     /// Git worktree service Arc (from capability context).
     pub(crate) fn git_wt(&self) -> &Arc<GitWorktreeService> {
         self.ctx.git_worktree_service()
+    }
+
+    /// Take the project-scoped exclusive worktree lifecycle lock.
+    ///
+    /// Held across a worktree verify and the create, attach, or reuse decision
+    /// that follows, so neither this decision nor a residue cleanup pass can
+    /// interleave with the other. Fails closed: a spawn that cannot take the
+    /// lock refuses to touch the worktree path rather than deciding from a view
+    /// another decision is already changing.
+    pub(crate) fn acquire_worktree_lifecycle(&self, decision: &str) -> Result<LifecycleGuard> {
+        LifecycleGuard::try_acquire(
+            self.project_dir(),
+            LifecycleMode::Exclusive,
+            DECISION_TIMEOUT,
+        )?
+        .ok_or_else(|| {
+            anyhow!("worktree lifecycle lock is held by another decision; refusing to {decision}")
+        })
     }
 
     /// Team registry (from capability context).

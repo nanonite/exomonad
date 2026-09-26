@@ -193,9 +193,13 @@ exomonad shutdown                # Gracefully shut down the running server
 
 **Log and evidence management:**
 ```bash
-exomonad logs import --source <path> [--source <path>] [--format auto|jsonl|json|sqlite|text] [--dry-run] [--rebuild]
+exomonad logs import --source <path> [--source <path>] [--format auto|jsonl|json|sqlite|text] [--dry-run] [--rebuild] [--include-quarantined]
                                  # Normalize log sources into .exo/analysis/atlas.db. Explicit,
                                  # idempotent, and read-only with respect to the source files.
+                                 # Sources under .exo/worktrees-residue/ are forensic evidence about a
+                                 # worktree that no longer exists and are excluded unless
+                                 # --include-quarantined is passed; the count is reported as
+                                 # excluded_quarantined_sources.
 exomonad logs drop-segments --older-than-seconds 2592000 [--dry-run]
                                  # Whole-segment retention on closed ledger segments
 exomonad logs export --mode aggregate --output .exo/analysis/export

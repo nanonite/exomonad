@@ -194,12 +194,12 @@ impl AgentInbox {
 
         if let Some(cache_key) = message.cache_key.as_deref() {
             if queue.queued_cache_keys.contains(cache_key) {
-                let sink_dir = crate::services::sink_paths::sink_project_dir(
+                let sink = crate::services::sink_paths::resolve_sink(
                     &message.project_root,
-                    message.project_dir.clone(),
+                    &message.project_dir,
                 );
                 append_inbox_event(
-                    &sink_dir,
+                    &sink.dir,
                     &message.recipient,
                     "agent_inbox.duplicates_dropped",
                     serde_json::json!({

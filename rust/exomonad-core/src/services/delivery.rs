@@ -1007,15 +1007,16 @@ async fn spawn_inbox_consumer(agent: String) {
         agent,
         |message: InboxMessage| async move {
             // Injection writes `.exo/tmp` for multiline bodies, so it must use
-            // the verified sink destination rather than a raw planned path.
-            let sink_dir = crate::services::sink_paths::sink_project_dir(
+            // the verified sink destination rather than a raw planned path, and
+            // it must hold the shared lifecycle lock across the write.
+            let sink = crate::services::sink_paths::resolve_sink(
                 &message.project_root,
-                message.project_dir.clone(),
+                &message.project_dir,
             );
             tmux_events::inject_input_with_options(
                 &message.target,
                 &message.body,
-                &sink_dir,
+                &sink.dir,
                 message.injection_options,
             )
             .await
@@ -1051,24 +1052,29 @@ where
                 "detail": message.detail,
             });
             // Resolve the sink destination at the write boundary, not when the
-            // message was enqueued: a planned worktree can disappear between
-            // the two, and sinks must never recreate it.
-            let sink_dir = crate::services::sink_paths::sink_project_dir(
-                &message.project_root,
-                message.project_dir.clone(),
-            );
-            if let Ok(log) = crate::services::EventLog::open(sink_dir.join(".exo/logs")) {
-                let _ = log.append("message.delivery", &message.from, &attempt_data);
-            }
+            // message was enqueued: a planned worktree can appear or disappear
+            // between the two, and sinks must never recreate one. The shared
+            // lifecycle lock is held across verification and these writes only;
+            // it is released before the retry backoff so a failing delivery
+            // never holds off a concurrent worktree decision.
+            {
+                let sink = crate::services::sink_paths::resolve_sink(
+                    &message.project_root,
+                    &message.project_dir,
+                );
+                if let Ok(log) = crate::services::EventLog::open(sink.dir.join(".exo/logs")) {
+                    let _ = log.append("message.delivery", &message.from, &attempt_data);
+                }
 
-            crate::services::lifecycle::record_guidance_delivery(
-                &sink_dir,
-                &message.recipient,
-                &message.from,
-                "tmux_injection",
-                if success { "success" } else { "failed" },
-            )
-            .await;
+                crate::services::lifecycle::record_guidance_delivery(
+                    &sink.dir,
+                    &message.recipient,
+                    &message.from,
+                    "tmux_injection",
+                    if success { "success" } else { "failed" },
+                )
+                .await;
+            }
 
             tracing::info!(
                 otel.name = "message.delivery",
@@ -1104,17 +1110,25 @@ where
                     attempts = attempt,
                     "[metric] agent_inbox.messages_abandoned"
                 );
-                if let Ok(log) = crate::services::EventLog::open(sink_dir.join(".exo/logs")) {
-                    let _ = log.append(
-                        "agent_inbox.messages_abandoned",
-                        &message.recipient,
-                        &serde_json::json!({
-                            "message_id": message.id,
-                            "recipient": message.recipient,
-                            "attempts": attempt,
-                            "outcome": "abandoned"
-                        }),
+                // A separate write boundary, so it resolves its own verified
+                // destination instead of reusing the earlier attempt's.
+                {
+                    let sink = crate::services::sink_paths::resolve_sink(
+                        &message.project_root,
+                        &message.project_dir,
                     );
+                    if let Ok(log) = crate::services::EventLog::open(sink.dir.join(".exo/logs")) {
+                        let _ = log.append(
+                            "agent_inbox.messages_abandoned",
+                            &message.recipient,
+                            &serde_json::json!({
+                                "message_id": message.id,
+                                "recipient": message.recipient,
+                                "attempts": attempt,
+                                "outcome": "abandoned"
+                            }),
+                        );
+                    }
                 }
                 GLOBAL_AGENT_INBOX
                     .abandon_delivery(&agent, message.id)
@@ -1347,8 +1361,11 @@ async fn deliver_via_tmux(
         } else {
             crate::services::resolve_working_dir(agent_key)
         };
+        // Advisory destination hint only. The write boundary re-resolves it
+        // under the shared lifecycle lock, because this decision is not a write
+        // and a planned worktree can appear or vanish before the write lands.
         let effective_pd =
-            crate::services::sink_paths::sink_project_dir(project_dir, project_dir.join(worktree));
+            crate::services::sink_paths::sink_dir_hint(project_dir, &project_dir.join(worktree));
         return enqueue_tmux_delivery(
             agent_key,
             &target,
@@ -1375,7 +1392,7 @@ async fn deliver_via_tmux(
         crate::services::resolve_worktree_from_tab(tmux_target)
     };
     let effective_pd =
-        crate::services::sink_paths::sink_project_dir(project_dir, project_dir.join(worktree));
+        crate::services::sink_paths::sink_dir_hint(project_dir, &project_dir.join(worktree));
     // Resolve the current pane from the display name. Window and pane indexes
     // are session-local and can become stale after a restart; the display name
     // is the stable identity supplied by AgentResolver.
@@ -1911,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn sink_project_dir_uses_registered_git_worktree() {
+    fn sink_destination_uses_registered_git_worktree() {
         let (_temp, project) = init_sink_repo();
         let default_branch = current_branch(&project);
         let git_wt = crate::services::git_worktree::GitWorktreeService::new(project.clone());
@@ -1923,19 +1940,19 @@ mod tests {
         git_wt.create_workspace(&worktree, &branch, &base).unwrap();
 
         assert_eq!(
-            crate::services::sink_paths::sink_project_dir(&project, worktree.clone()),
+            crate::services::sink_paths::resolve_sink(&project, &worktree).dir,
             worktree
         );
     }
 
     #[test]
-    fn sink_project_dir_falls_back_without_creating_missing_worktree() {
+    fn sink_destination_falls_back_without_creating_missing_worktree() {
         let (_temp, project) = init_sink_repo();
         let planned = project.join(".exo/worktrees/leaf-codex");
 
-        let resolved = crate::services::sink_paths::sink_project_dir(&project, planned.clone());
+        let sink = crate::services::sink_paths::resolve_sink(&project, &planned);
 
-        assert_eq!(resolved, project);
+        assert_eq!(sink.dir, project);
         assert!(
             !planned.exists(),
             "sink resolution must not materialize a planned worktree"
@@ -1943,13 +1960,13 @@ mod tests {
     }
 
     #[test]
-    fn sink_project_dir_rejects_unregistered_residue() {
+    fn sink_destination_rejects_unregistered_residue() {
         let (_temp, project) = init_sink_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(&residue).unwrap();
 
         assert_eq!(
-            crate::services::sink_paths::sink_project_dir(&project, residue.clone()),
+            crate::services::sink_paths::resolve_sink(&project, &residue).dir,
             project
         );
     }
@@ -1959,14 +1976,45 @@ mod tests {
         let (_temp, project) = init_sink_repo();
         let planned = project.join(".exo/worktrees/leaf-codex");
 
-        let sink_dir = crate::services::sink_paths::sink_project_dir(&project, planned.clone());
-        crate::services::EventLog::open(sink_dir.join(".exo/logs")).unwrap();
+        let sink = crate::services::sink_paths::resolve_sink(&project, &planned);
+        crate::services::EventLog::open(sink.dir.join(".exo/logs")).unwrap();
 
         assert!(
             !planned.exists(),
             "sink write must not create the planned leaf worktree"
         );
         assert!(project.join(".exo/logs").exists());
+    }
+
+    /// A sink write holds the shared lock from verification through the write,
+    /// so a cleanup pass that needs the same lock cannot start in between.
+    /// `flock` is held per open file description, so an in-test holder on this
+    /// thread excludes a second acquisition exactly as a second process would.
+    #[test]
+    fn sink_write_excludes_an_exclusive_lifecycle_holder() -> anyhow::Result<()> {
+        use crate::services::worktree_lifecycle::{LifecycleGuard, LifecycleMode};
+        let (_temp, project) = init_sink_repo();
+        let planned = project.join(".exo/worktrees/leaf-codex");
+        let held = LifecycleGuard::try_acquire(
+            &project,
+            LifecycleMode::Exclusive,
+            std::time::Duration::ZERO,
+        )?
+        .expect("the test holds the exclusive lifecycle lock");
+
+        // The sink cannot verify under contention, so it writes project-owned and
+        // never the candidate.
+        let sink = crate::services::sink_paths::resolve_sink(&project, &planned);
+        assert_eq!(sink.dir, project);
+        assert!(!planned.exists());
+
+        // With the exclusive holder gone the same sink verifies again.
+        drop(held);
+        assert_eq!(
+            crate::services::sink_paths::resolve_sink(&project, &planned).dir,
+            project
+        );
+        Ok(())
     }
 
     /// Injector that fails its first `fail_times` calls, then succeeds.

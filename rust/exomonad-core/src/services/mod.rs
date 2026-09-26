@@ -58,6 +58,7 @@ pub mod tmux_ipc;
 pub mod topic_vocabulary;
 pub mod tui_consumption;
 pub mod worktree_event_watcher;
+pub mod worktree_lifecycle;
 
 pub use self::agent_control::{
     resolve_role_context_path, resolve_working_dir, resolve_worktree_from_tab, AgentControlService,

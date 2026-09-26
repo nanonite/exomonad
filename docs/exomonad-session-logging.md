@@ -27,6 +27,17 @@ Legacy import is explicit and read-only when requested:
     exomonad logs import --source PATH --dry-run
     exomonad init --import-legacy PATH --import-legacy-dry-run
 
+Import excludes quarantined worktree residue. When residue cleanup proves a
+.exo/worktrees/<name> directory is not a live worktree, it is preserved by
+rename under .exo/worktrees-residue/ and recorded in
+.exo/worktrees-residue/manifest.jsonl with source_kind
+"unregistered_worktree_residue" and forensic_only true. Those ledger segments
+and events describe a worktree that no longer exists, so replay skips them and
+reports the count as excluded_quarantined_sources. An operator who needs that
+history opts in explicitly:
+
+    exomonad logs import --source .exo --include-quarantined
+
 An apply import is idempotent and never edits the source. Use
 exomonad logs measure with a preregistration to run the Failure Atlas
 signal/incident/adjudication pipeline; provider, runtime, and harness

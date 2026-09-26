@@ -277,6 +277,9 @@ enum LogsCommands {
         /// Rebuild all derived rows from the selected sources.
         #[arg(long)]
         rebuild: bool,
+        /// Import quarantined worktree residue, which is excluded by default.
+        #[arg(long)]
+        include_quarantined: bool,
     },
     /// Drop closed immutable ledger segments according to local retention.
     DropSegments {
@@ -364,6 +367,7 @@ async fn main() -> Result<()> {
                     format,
                     dry_run,
                     rebuild,
+                    include_quarantined,
                 },
         } => {
             let project_dir = if config.project_dir.is_absolute() {
@@ -371,7 +375,14 @@ async fn main() -> Result<()> {
             } else {
                 std::env::current_dir()?.join(&config.project_dir)
             };
-            return logs::run(&project_dir, source, format, dry_run, rebuild);
+            return logs::run(
+                &project_dir,
+                source,
+                format,
+                dry_run,
+                rebuild,
+                include_quarantined,
+            );
         }
 
         Commands::Logs {

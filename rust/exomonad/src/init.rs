@@ -5564,6 +5564,7 @@ pub async fn run(
             "auto".to_string(),
             import_legacy_dry_run,
             false,
+            false,
         )?;
         info!(
             dry_run = import_legacy_dry_run,

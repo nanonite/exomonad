@@ -11,6 +11,7 @@ pub fn run(
     format: String,
     dry_run: bool,
     rebuild: bool,
+    include_quarantined: bool,
 ) -> Result<()> {
     let summary: ImportSummary = import_sources(&ImportOptions {
         project_dir: project_dir.to_path_buf(),
@@ -18,6 +19,7 @@ pub fn run(
         format: SourceFormat::parse(&format)?,
         dry_run,
         rebuild,
+        include_quarantined,
     })?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
