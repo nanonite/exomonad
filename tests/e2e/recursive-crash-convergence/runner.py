@@ -369,6 +369,9 @@ def run_case(
         ledger_run_id=ledger_run_id,
     )
     marker = root / "crash-traces" / f"{case_name}.jsonl"
+    # The leaf actor writes its own file_pr attempts here before calling, so the
+    # crash handoff must carry the path before the controller process starts.
+    resume_trace = root / "crash-traces" / f"{case_name}.resume.jsonl"
     process = multiprocessing.get_context("fork").Process(
         target=controller,
         args=(
@@ -379,6 +382,7 @@ def run_case(
             work_plan,
             boundary,
             marker,
+            resume_trace,
             boundary.name == "review",
             chainlink_issue_id,
             chainlink_db,
@@ -390,7 +394,6 @@ def run_case(
     checkpoint = state_root / run_id / "run.json"
     before_restart = root / "crash-traces" / f"{case_name}.before.json"
     shutil.copy2(checkpoint, before_restart)
-    resume_trace = root / "crash-traces" / f"{case_name}.resume.jsonl"
     result = resume(
         run_id,
         state_root,

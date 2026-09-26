@@ -37,6 +37,7 @@ def controller(
     plan: real.WorkPlan | None,
     boundary: CrashBoundary,
     trace_path: Path,
+    resume_trace: Path,
     advance_base: bool,
     chainlink_issue_id: int,
     chainlink_db: Path,
@@ -50,6 +51,10 @@ def controller(
             "boundary": boundary.name,
             "point": boundary.point,
             "marker": str(trace_path),
+            # The leaf records its own file_pr attempts here before it calls, so
+            # a call made during a publication:before crash cannot escape the
+            # resumed trace the runner later correlates.
+            "resume_trace": str(resume_trace),
             "owner_pid": os.getpid(),
         },
     )

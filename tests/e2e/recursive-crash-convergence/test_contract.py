@@ -307,6 +307,71 @@ def test_leaf_publication_uses_the_explicit_root_socket(
     assert json.loads(body)["arguments"]["base_branch"] == "main.sub-a.nested-a"
 
 
+def test_leaf_records_file_pr_attempt_before_the_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A publication:before crash must not lose the surviving leaf's call."""
+    exo = tmp_path / ".exo"
+    exo.mkdir(parents=True)
+    monkeypatch.setenv("EXOMONAD_SOCKET", str(exo / "server.sock"))
+    monkeypatch.setenv(
+        "EXOMONAD_1057_LEAF_BRANCHES", "main.sub-a.nested-a.nested-output"
+    )
+    monkeypatch.setattr(
+        leaf_publication_agent,
+        "_current_branch",
+        lambda: "main.sub-a.nested-a.nested-output",
+    )
+    monkeypatch.setattr(leaf_publication_agent, "_current_head", lambda: "leaf-head")
+    marker = tmp_path / "marker.jsonl"
+    resume = tmp_path / "resume.jsonl"
+    (exo / "e2e-crash-handoff.json").write_text(
+        json.dumps(
+            {
+                "phase": "crash",
+                "boundary": "publication",
+                "point": "before",
+                "marker": str(marker),
+                "resume_trace": str(resume),
+                "owner_pid": 0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    calls: list[str] = []
+
+    class FakeResult:
+        success = True
+        error = None
+
+    class FakeClient:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def file_pr(self, **_: object) -> FakeResult:
+            # The attempt and the crash boundary must already be durable before
+            # the call is issued.
+            assert resume.is_file(), "file_pr attempt was not recorded before the call"
+            assert marker.is_file(), "crash boundary was not recorded before the call"
+            calls.append("call")
+            return FakeResult()
+
+    monkeypatch.setattr(leaf_publication_agent, "EffectClient", FakeClient)
+
+    assert leaf_publication_agent.publish_leaf()
+    assert calls == ["call"]
+    records = [
+        json.loads(line)
+        for line in resume.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["tool_name"] == "file_pr"
+    assert records[0]["crash_point"] == "before"
+    assert len(marker.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_leaf_publication_requires_the_root_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -678,4 +743,38 @@ def test_resume_trace_enforces_before_and_after_effect_cardinality(
     with pytest.raises(AcceptanceError, match="cardinality"):
         assert_resume_not_redispatched(
             trace, "same", boundary="remote_merge", point="after"
+        )
+
+
+def test_resume_trace_enforces_exact_publication_actor_cardinality(
+    tmp_path: Path,
+) -> None:
+    record = {
+        "identity": "leaf-file-pr",
+        "tool_name": "file_pr",
+        "crash_point": "before",
+    }
+    trace = tmp_path / "publication.jsonl"
+    trace.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    assert (
+        assert_resume_not_redispatched(
+            trace, "leaf-file-pr", boundary="publication", point="before"
+        )
+        == 1
+    )
+    # The escaped-call bug: the surviving leaf's call was never recorded.
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(AcceptanceError, match="publication effect cardinality"):
+        assert_resume_not_redispatched(
+            empty, "leaf-file-pr", boundary="publication", point="before"
+        )
+    # A duplicate publication is rejected.
+    duplicated = tmp_path / "duplicated.jsonl"
+    duplicated.write_text(
+        "\n".join(json.dumps(record) for _ in range(2)) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(AcceptanceError, match="publication effect cardinality"):
+        assert_resume_not_redispatched(
+            duplicated, "leaf-file-pr", boundary="publication", point="after"
         )

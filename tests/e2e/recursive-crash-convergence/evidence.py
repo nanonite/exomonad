@@ -83,7 +83,18 @@ def assert_resume_not_redispatched(
         if isinstance(value, dict):
             calls.append(value)
     matches = [call for call in calls if call.get("identity") == crashed_identity]
-    if boundary in {"review", "adoption", "publication"}:
+    if boundary == "publication":
+        # The leaf owns the publication boundary and records every file_pr
+        # attempt before it calls, so exactly one attempt must be present:
+        # the surviving leaf's post-crash call (point=before) or the pre-crash
+        # call (point=after). A missing record is the escaped-call bug; a
+        # second record is a duplicate publication.
+        if len(matches) != 1:
+            raise AcceptanceError(
+                f"publication effect cardinality was {len(matches)}, expected 1: {matches!r}"
+            )
+        return len(matches)
+    if boundary in {"review", "adoption"}:
         # These effects are driven by the child/reviewer rather than the
         # controller transport, so the resumed call count is observational.
         return len(matches)

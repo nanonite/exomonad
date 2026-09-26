@@ -159,9 +159,20 @@ def _inject_publication_crash(
             pass
 
 
-def _record_resume_call(
-    handoff: Mapping[str, object], arguments: Mapping[str, object]
+def _record_file_pr_attempt(
+    handoff: Mapping[str, object],
+    arguments: Mapping[str, object],
+    *,
+    crash_point: str | None,
 ) -> None:
+    """Record the leaf's file_pr attempt before the call is made.
+
+    The leaf owns the publication boundary, so recording only after a successful
+    call lets a call made during a ``publication:before`` crash escape the
+    resumed trace. The attempt is written first, tagged with the crash point, so
+    the acceptance check can prove exactly-once publication whether the crash
+    preceded or followed the call.
+    """
     trace = handoff.get("resume_trace")
     if not isinstance(trace, str) or not trace:
         return
@@ -171,6 +182,7 @@ def _record_resume_call(
             "tool_name": "file_pr",
             "identity": effect_identity(arguments, "file_pr"),
             "arguments": redacted_arguments(arguments),
+            "crash_point": crash_point,
         },
     )
 
@@ -270,6 +282,10 @@ def publish_leaf() -> bool:
     if crash_point == "before":
         assert handoff is not None
         _inject_publication_crash(handoff, arguments, success=None)
+    if handoff is not None:
+        # Record the attempt before the call so a call made after a
+        # publication:before crash is still in the resumed trace.
+        _record_file_pr_attempt(handoff, arguments, crash_point=crash_point)
     result = EffectClient(
         TransportClient(
             socket_path=_server_socket(),
@@ -284,8 +300,6 @@ def publish_leaf() -> bool:
     if crash_point == "after":
         assert handoff is not None
         _inject_publication_crash(handoff, arguments, success=result.success)
-    if handoff is not None and handoff.get("phase") == "resume":
-        _record_resume_call(handoff, arguments)
     return True
 
 
