@@ -47,6 +47,36 @@ resolved by the operator through the appropriate recovery or recreate path.
 Answering that gate does not authorize the controller to guess ownership or
 discard resources.
 
+## Recorded terminal checkpoint answer (#1112)
+
+The captured Beast workspace ended with the root and its
+`substitution-model-architecture-stage` child both at `tl_failed`, the leaf
+parked for `publication_ownership_unresolved` behind Chainlink escalation #816,
+and PR #45 open on the leaf branch. That checkpoint is proven with
+`tl_loop/tests/test_beast_terminal_checkpoint_recovery.py`, which synthesizes
+the shape under a temporary directory and drives the real `--continue` path.
+
+`--continue` alone does not recover it. The run stays `tl_failed`, no effect is
+dispatched, and the named gate
+`tl-ordered-child-recovery-substitution-model-architecture-stage` is opened,
+because two independent proofs fail closed:
+
+- the recorded child exit reason,
+  `chainlink issue result has no positive issue ID: {'cicoIssueId': 816}`, is
+  not a retryable startup, transport, or process failure;
+- even with a retryable exit reason, the leaf `tunable-operator-body` is an
+  unsafe terminal status, because its publication ownership behind PR #45 is
+  unresolved.
+
+Operator order for that checkpoint: resolve the publication ownership for
+PR #45, bind the pre-existing escalation with
+`tl_loop.loop.escalate.bind_legacy_escalation` (issue id, slice, cause, attempt,
+PR number, and head SHA must all be verified), then answer the named gate. A
+recreate remains the alternative when the recorded publication evidence cannot
+be proven. Repeating `--continue` without those steps is idempotent: it never
+mints a second child, never repeats a confirmed effect, and never adopts
+another owner's publication.
+
 ## Stale reviewer action self-heal
 
 A verdict recorded by older code (or any prior bug) can leave a matching
