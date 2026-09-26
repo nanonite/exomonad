@@ -746,35 +746,132 @@ def test_resume_trace_enforces_before_and_after_effect_cardinality(
         )
 
 
-def test_resume_trace_enforces_exact_publication_actor_cardinality(
-    tmp_path: Path,
-) -> None:
-    record = {
-        "identity": "leaf-file-pr",
+def _publication_attempt(identity: str = "leaf-file-pr", **overrides: object) -> str:
+    record: dict[str, object] = {
+        "identity": identity,
         "tool_name": "file_pr",
         "crash_point": "before",
     }
-    trace = tmp_path / "publication.jsonl"
-    trace.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    record.update(overrides)
+    return json.dumps(record)
+
+
+def _write_trace(path: Path, *rows: str) -> Path:
+    path.write_text("".join(f"{row}\n" for row in rows), encoding="utf-8")
+    return path
+
+
+def test_resume_trace_accepts_exactly_one_publication_actor_attempt(
+    tmp_path: Path,
+) -> None:
+    """Both crash points keep the exact-one actor-attempt rule from af6fa425."""
+    before = _write_trace(
+        tmp_path / "before.jsonl", _publication_attempt(crash_point="before")
+    )
+    after = _write_trace(
+        tmp_path / "after.jsonl", _publication_attempt(crash_point="after")
+    )
+
     assert (
         assert_resume_not_redispatched(
-            trace, "leaf-file-pr", boundary="publication", point="before"
+            before, "leaf-file-pr", boundary="publication", point="before"
         )
         == 1
     )
-    # The escaped-call bug: the surviving leaf's call was never recorded.
-    empty = tmp_path / "empty.jsonl"
-    empty.write_text("", encoding="utf-8")
+    assert (
+        assert_resume_not_redispatched(
+            after, "leaf-file-pr", boundary="publication", point="after"
+        )
+        == 1
+    )
+
+
+def test_publication_evidence_rejects_a_missing_actor_attempt(tmp_path: Path) -> None:
+    """The escaped-call bug: the surviving leaf's call was never recorded."""
+    empty = _write_trace(tmp_path / "empty.jsonl")
+
     with pytest.raises(AcceptanceError, match="publication effect cardinality"):
         assert_resume_not_redispatched(
             empty, "leaf-file-pr", boundary="publication", point="before"
         )
-    # A duplicate publication is rejected.
-    duplicated = tmp_path / "duplicated.jsonl"
-    duplicated.write_text(
-        "\n".join(json.dumps(record) for _ in range(2)) + "\n", encoding="utf-8"
+
+
+def test_publication_evidence_rejects_a_duplicate_actor_attempt(tmp_path: Path) -> None:
+    """Two attempts for one crashed publication are a duplicate publication."""
+    duplicated = _write_trace(
+        tmp_path / "duplicated.jsonl",
+        _publication_attempt(crash_point="after"),
+        _publication_attempt(crash_point="after"),
     )
+
     with pytest.raises(AcceptanceError, match="publication effect cardinality"):
         assert_resume_not_redispatched(
             duplicated, "leaf-file-pr", boundary="publication", point="after"
+        )
+
+
+def test_publication_evidence_rejects_another_tools_attempt(tmp_path: Path) -> None:
+    """Only a file_pr attempt can prove the leaf published exactly once."""
+    aggregate = _write_trace(
+        tmp_path / "aggregate.jsonl", _publication_attempt(tool_name="merge_pr")
+    )
+
+    with pytest.raises(AcceptanceError, match="not a file_pr attempt"):
+        assert_resume_not_redispatched(
+            aggregate, "leaf-file-pr", boundary="publication", point="before"
+        )
+
+
+def test_publication_evidence_rejects_another_crash_point(tmp_path: Path) -> None:
+    """A record from the other crash point belongs to a different boundary."""
+    other_point = _write_trace(
+        tmp_path / "other-point.jsonl", _publication_attempt(crash_point="after")
+    )
+    untagged = _write_trace(
+        tmp_path / "untagged.jsonl", _publication_attempt(crash_point=None)
+    )
+
+    for trace in (other_point, untagged):
+        with pytest.raises(AcceptanceError, match="not from the publication:before"):
+            assert_resume_not_redispatched(
+                trace, "leaf-file-pr", boundary="publication", point="before"
+            )
+
+
+def test_publication_evidence_rejects_an_unregistered_crash_point(
+    tmp_path: Path,
+) -> None:
+    """A crash point outside the matrix never authorizes a binding claim."""
+    trace = _write_trace(tmp_path / "matrix.jsonl", _publication_attempt())
+
+    with pytest.raises(AcceptanceError, match="unregistered publication crash point"):
+        assert_resume_not_redispatched(
+            trace, "leaf-file-pr", boundary="publication", point="during"
+        )
+
+
+def test_resume_trace_rejects_malformed_and_untyped_rows(tmp_path: Path) -> None:
+    """A dropped or corrupt row would hide the redispatch evidence."""
+    malformed = tmp_path / "malformed.jsonl"
+    malformed.write_text("{not json\n", encoding="utf-8")
+    untyped = _write_trace(tmp_path / "untyped.jsonl", json.dumps(["leaf-file-pr"]))
+
+    with pytest.raises(AcceptanceError, match="malformed"):
+        assert_resume_not_redispatched(
+            malformed, "leaf-file-pr", boundary="publication", point="before"
+        )
+    with pytest.raises(AcceptanceError, match="not an object"):
+        assert_resume_not_redispatched(
+            untyped, "leaf-file-pr", boundary="publication", point="before"
+        )
+
+
+def test_resume_trace_rejects_a_missing_file(tmp_path: Path) -> None:
+    """A missing trace proves nothing about redispatch."""
+    with pytest.raises(AcceptanceError, match="resume call trace is missing"):
+        assert_resume_not_redispatched(
+            tmp_path / "absent.jsonl",
+            "leaf-file-pr",
+            boundary="publication",
+            point="before",
         )

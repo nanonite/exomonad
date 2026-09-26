@@ -10,6 +10,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from boundaries import boundary_for
+
 REQUIRED_RECURSIVE_EFFECTS = frozenset(
     {
         "file_pr",
@@ -26,6 +28,9 @@ REQUIRED_RECURSIVE_EFFECTS = frozenset(
 REQUIRED_RECURSIVE_EFFECT_GROUPS = {
     "spawn": frozenset({"spawn_leaf", "spawn_worker", "spawn_reviewer"}),
 }
+# The leaf owns this boundary, so its attempt record is the only evidence that
+# can prove the publication was issued exactly once across the crash.
+PUBLICATION_BOUNDARY = "publication"
 
 
 class AcceptanceError(RuntimeError):
@@ -68,6 +73,42 @@ def assert_crash_record(path: Path, boundary: str, point: str) -> str:
     return identity
 
 
+def _publication_attempts(
+    calls: Sequence[Mapping[str, Any]], crashed_identity: str, *, point: str
+) -> list[Mapping[str, Any]]:
+    """Return the single leaf publication attempt the crashed call left behind.
+
+    The leaf owns the publication boundary and records its ``file_pr`` attempt
+    before it calls, tagged with the crash point. Exactly one attempt must
+    survive for this effect identity: a missing record is the escaped-call bug
+    and a second record is a duplicate publication. The surviving record must
+    then name this boundary, because a record left by another tool or another
+    crash point cannot prove that this publication was attempted.
+    """
+    try:
+        expected_tool = boundary_for(PUBLICATION_BOUNDARY, point).tool_name
+    except KeyError as error:
+        raise AcceptanceError(
+            f"unregistered {PUBLICATION_BOUNDARY} crash point: {point!r}"
+        ) from error
+    matches = [call for call in calls if call.get("identity") == crashed_identity]
+    if len(matches) != 1:
+        raise AcceptanceError(
+            f"publication effect cardinality was {len(matches)}, expected 1: {matches!r}"
+        )
+    record = matches[0]
+    if record.get("tool_name") != expected_tool:
+        raise AcceptanceError(
+            f"publication record is not a {expected_tool} attempt: {record!r}"
+        )
+    if record.get("crash_point") != point:
+        raise AcceptanceError(
+            f"publication record is not from the {PUBLICATION_BOUNDARY}:{point} "
+            f"boundary: {record!r}"
+        )
+    return matches
+
+
 def assert_resume_not_redispatched(
     path: Path, crashed_identity: str, *, boundary: str, point: str
 ) -> int:
@@ -80,20 +121,14 @@ def assert_resume_not_redispatched(
             value = json.loads(line)
         except json.JSONDecodeError as error:
             raise AcceptanceError(f"resume call trace is malformed: {path}") from error
-        if isinstance(value, dict):
-            calls.append(value)
+        if not isinstance(value, dict):
+            # Silently dropping a row would hide the record that proves whether
+            # the effect was redispatched, so an untyped row fails closed.
+            raise AcceptanceError(f"resume call trace row is not an object: {value!r}")
+        calls.append(value)
     matches = [call for call in calls if call.get("identity") == crashed_identity]
-    if boundary == "publication":
-        # The leaf owns the publication boundary and records every file_pr
-        # attempt before it calls, so exactly one attempt must be present:
-        # the surviving leaf's post-crash call (point=before) or the pre-crash
-        # call (point=after). A missing record is the escaped-call bug; a
-        # second record is a duplicate publication.
-        if len(matches) != 1:
-            raise AcceptanceError(
-                f"publication effect cardinality was {len(matches)}, expected 1: {matches!r}"
-            )
-        return len(matches)
+    if boundary == PUBLICATION_BOUNDARY:
+        return len(_publication_attempts(calls, crashed_identity, point=point))
     if boundary in {"review", "adoption"}:
         # These effects are driven by the child/reviewer rather than the
         # controller transport, so the resumed call count is observational.
