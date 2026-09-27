@@ -47,29 +47,29 @@ resolved by the operator through the appropriate recovery or recreate path.
 Answering that gate does not authorize the controller to guess ownership or
 discard resources.
 
-## Recorded terminal checkpoint answer (#1112)
+## Terminal checkpoint answer (#1112)
 
-The captured Beast workspace ended with the root and its
-`substitution-model-architecture-stage` child both at `tl_failed`, the leaf
-parked for `publication_ownership_unresolved` behind Chainlink escalation #816,
-and PR #45 open on the leaf branch. That checkpoint is proven with
-`tl_loop/tests/test_beast_terminal_checkpoint_recovery.py`, which synthesizes
-the shape under a temporary directory and drives the real `--continue` path.
+A recorded production run ended with the root and its `recreate-stage` child
+both at `tl_failed`, the leaf parked for `publication_ownership_unresolved`
+behind Chainlink escalation #9001, and PR #102 open on the leaf branch. That
+checkpoint shape is proven with
+`tl_loop/tests/test_terminal_checkpoint_recovery.py`, which synthesizes it under
+the test's temporary directory and drives the real `--continue` path. No
+recorded or live workspace is read: every value in that module is synthetic.
 
 `--continue` alone does not recover it. The run stays `tl_failed`, no effect is
-dispatched, and the named gate
-`tl-ordered-child-recovery-substitution-model-architecture-stage` is opened,
-because two independent proofs fail closed:
+dispatched, and the named gate `tl-ordered-child-recovery-recreate-stage` is
+opened, because two independent proofs fail closed:
 
 - the recorded child exit reason,
-  `chainlink issue result has no positive issue ID: {'cicoIssueId': 816}`, is
+  `chainlink issue result has no positive issue ID: {'cicoIssueId': 9001}`, is
   not a retryable startup, transport, or process failure;
-- even with a retryable exit reason, the leaf `tunable-operator-body` is an
-  unsafe terminal status, because its publication ownership behind PR #45 is
+- even with a retryable exit reason, the leaf `recreated-leaf` is an unsafe
+  terminal status, because its publication ownership behind PR #102 is
   unresolved.
 
 Operator order for that checkpoint: resolve the publication ownership for
-PR #45, bind the pre-existing escalation with
+PR #102, bind the pre-existing escalation with
 `tl_loop.loop.escalate.bind_legacy_escalation` (issue id, slice, cause, attempt,
 PR number, and head SHA must all be verified), then answer the named gate. A
 recreate remains the alternative when the recorded publication evidence cannot
