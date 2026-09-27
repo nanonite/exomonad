@@ -58,11 +58,22 @@ fn creation_failure_allows_attach(error: &anyhow::Error) -> bool {
     )
 }
 
+/// The branch state a leaf provisioning decision reads, in the only safe order.
+///
+/// `ensure_branch_fetched` can materialize the local branch from the remote
+/// tracking ref when it is absent, so existence may only be read after the fetch.
+/// Reading it first classifies a remote-only branch as absent, sends it down the
+/// create path, and lets it succeed only through the BranchExists race recovery.
+struct LeafBranchState {
+    exists: bool,
+    remote: crate::services::git_worktree::RemoteEvidence,
+}
+
 /// Everything the leaf provisioning decision reads.
 ///
-/// `branch_exists` is the branch state observed before this attempt created
-/// anything, and `fresh_remote` is the remote evidence fetched immediately
-/// before it, so the decision never reads state another writer can invalidate.
+/// `branch_exists` and `fresh_remote` both come from [`LeafBranchState`], taken
+/// under the lifecycle lock immediately before this attempt created anything, so
+/// the decision never reads state another writer has already invalidated.
 struct LeafProvisioning<'a, 'b> {
     project_dir: &'a Path,
     worktree_path: &'a Path,
@@ -142,11 +153,20 @@ struct RecordedHead {
 
 /// Read the recorded dispatch/publication head for a deterministic branch.
 ///
-/// Resolution is ordered and deterministic: the latest publication this agent
-/// owns for the branch, otherwise the owner invocation record's head when that
-/// record is about the same branch. A publication filed by another agent, or a
-/// head recorded against a different branch, is not evidence for this branch, so
-/// an unreadable or foreign record leaves the attach decision without evidence.
+/// Resolution is ordered and deterministic: the latest ledger-owned publication
+/// this agent owns for the branch, otherwise the owner invocation record's head
+/// when that record is about the same branch.
+///
+/// Only a ledger-owned publication is evidence. A migrated legacy publication
+/// was never verified at its filing boundary, so it cannot prove a commit head —
+/// the same rule the watcher applies to publication ownership. A publication
+/// filed by another agent, or a head recorded against a different branch, is
+/// likewise not evidence for this branch.
+///
+/// An unreadable publication registry is authoritative, so it ends the search
+/// instead of falling through: a possibly stale invocation head must never
+/// substitute for a record that could not be read. An invocation record that
+/// cannot be parsed is not evidence either.
 async fn recorded_branch_head(
     project_dir: &Path,
     agent_name: &AgentName,
@@ -156,33 +176,32 @@ async fn recorded_branch_head(
         read_published_heads, PublicationProvenance, PUBLISHED_HEADS_FILENAME,
     };
 
-    match read_published_heads(project_dir).await {
-        Ok(publications) => {
-            let owned = |head: &&crate::services::pr_registry::PublishedHead| {
-                head.head_branch == branch_name.as_str()
-                    && head.author_agent.as_deref() == Some(agent_name.as_str())
-            };
-            let publication = publications
-                .iter()
-                .filter(owned)
-                .rfind(|head| head.provenance == PublicationProvenance::LedgerOwned)
-                .or_else(|| publications.iter().rfind(owned))
-                .map(|head| head.head_sha.trim().to_string())
-                .filter(|sha| !sha.is_empty());
-            if let Some(sha) = publication {
-                return Some(RecordedHead {
-                    sha,
-                    evidence: PUBLISHED_HEADS_FILENAME,
-                });
-            }
-        }
+    let publications = match read_published_heads(project_dir).await {
+        Ok(publications) => publications,
         Err(error) => {
             warn!(
                 project = %project_dir.display(),
                 %error,
-                "Recorded publication heads are unreadable; attaching a preserved branch requires other head evidence"
+                "Publication registry is unreadable; no recorded head can be proven for this branch"
             );
+            return None;
         }
+    };
+    let owned = |head: &&crate::services::pr_registry::PublishedHead| {
+        head.head_branch == branch_name.as_str()
+            && head.author_agent.as_deref() == Some(agent_name.as_str())
+    };
+    let publication = publications
+        .iter()
+        .filter(owned)
+        .rfind(|head| head.provenance == PublicationProvenance::LedgerOwned)
+        .map(|head| head.head_sha.trim().to_string())
+        .filter(|sha| !sha.is_empty());
+    if let Some(sha) = publication {
+        return Some(RecordedHead {
+            sha,
+            evidence: PUBLISHED_HEADS_FILENAME,
+        });
     }
 
     let agent_dir = project_dir.join(".exo/agents").join(agent_name.as_str());
@@ -965,6 +984,22 @@ impl<
             + 'static,
     > AgentControlService<C>
 {
+    /// Fetch the branch's remote evidence, then read whether the local branch
+    /// exists.
+    ///
+    /// The order is the contract: the fetch materializes a remote-only branch
+    /// locally, so existence read beforehand would report it absent and send a
+    /// preserved branch down the create path.
+    async fn read_leaf_branch_state(
+        &self,
+        effective_project_dir: &Path,
+        branch: &BranchName,
+    ) -> Result<LeafBranchState> {
+        let remote = ensure_branch_fetched(effective_project_dir, branch).await;
+        let exists = self.git_wt().branch_exists(branch)?;
+        Ok(LeafBranchState { exists, remote })
+    }
+
     /// Provision the deterministic leaf worktree for an absent path.
     ///
     /// Cleanup is armed before the first fallible creation, so any error after
@@ -2326,21 +2361,23 @@ impl<
             } else {
                 let recorded_head =
                     recorded_branch_head(self.project_dir(), &agent_name, &branch_name).await;
+                // Fetch first, then read existence: the fetch can materialize a
+                // remote-only branch locally, and reading existence beforehand
+                // would send a preserved branch down the create path.
+                let branch_state = self
+                    .read_leaf_branch_state(effective_project_dir, &branch_name)
+                    .await?;
                 worktree_rollback = self
                     .provision_leaf_worktree(LeafProvisioning {
                         project_dir: effective_project_dir,
                         worktree_path: &worktree_path,
                         branch: &branch_name,
                         base_branch: &current_branch,
-                        branch_exists: self.git_wt().branch_exists(&branch_name)?,
+                        branch_exists: branch_state.exists,
                         start_point: options.start_point.as_deref(),
                         expected_head,
                         recorded_head: recorded_head.as_ref(),
-                        fresh_remote: ensure_branch_fetched(
-                            effective_project_dir,
-                            &branch_name,
-                        )
-                        .await,
+                        fresh_remote: branch_state.remote,
                     })
                     .await?;
             }
@@ -3061,9 +3098,32 @@ mod tests {
             ensure_branch_fetched(self.repo(), &self.branch).await
         }
 
+        /// The same state the spawn call site reads, through the same function.
+        async fn branch_state(&self) -> LeafBranchState {
+            self.service
+                .read_leaf_branch_state(self.repo(), &self.branch)
+                .await
+                .expect("branch state inspection must succeed")
+        }
+
         async fn provisioning<'a, 'b>(
             &'a self,
             branch_exists: bool,
+            recorded_head: Option<&'b RecordedHead>,
+        ) -> LeafProvisioning<'a, 'b> {
+            self.provisioning_with_state(
+                LeafBranchState {
+                    exists: branch_exists,
+                    remote: self.fresh_remote().await,
+                },
+                recorded_head,
+            )
+            .await
+        }
+
+        async fn provisioning_with_state<'a, 'b>(
+            &'a self,
+            state: LeafBranchState,
             recorded_head: Option<&'b RecordedHead>,
         ) -> LeafProvisioning<'a, 'b> {
             LeafProvisioning {
@@ -3071,11 +3131,11 @@ mod tests {
                 worktree_path: &self.leaf_path,
                 branch: &self.branch,
                 base_branch: &self.base,
-                branch_exists,
+                branch_exists: state.exists,
                 start_point: None,
                 expected_head: None,
                 recorded_head,
-                fresh_remote: self.fresh_remote().await,
+                fresh_remote: state.remote,
             }
         }
     }
@@ -3226,6 +3286,52 @@ mod tests {
                 .expect("registry lookup must succeed"),
             Some(std::fs::canonicalize(&fixture.leaf_path).unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn a_remote_only_branch_is_attached_through_the_ordinary_path() {
+        let fixture = LeafFixture::new("remote-only");
+        fixture.seed_branch();
+        let head = fixture.commit_on_branch("remote work");
+        git(fixture.repo(), &["push", "origin", fixture.branch.as_str()]);
+        git(fixture.repo(), &["branch", "-D", fixture.branch.as_str()]);
+        assert!(
+            !fixture
+                .git_wt
+                .branch_exists(&fixture.branch)
+                .expect("branch inspection must succeed"),
+            "the branch must live only on the remote before the decision reads it"
+        );
+
+        // The production read order must fetch first, so existence is reported
+        // after the recovery fetch materialized the local branch.
+        let state = fixture.branch_state().await;
+
+        assert!(
+            state.exists,
+            "the recovery fetch must materialize a remote-only branch before existence is read"
+        );
+        assert!(
+            matches!(&state.remote, crate::services::git_worktree::RemoteEvidence::AtSha(sha) if *sha == head),
+            "the fetched remote evidence must be the published head, got {:?}",
+            state.remote
+        );
+        assert_eq!(
+            leaf_worktree_action(state.exists, None),
+            LeafWorktreeAction::Attach,
+            "a remote-only branch must take the ordinary attach path, not branch creation"
+        );
+
+        let rollback = provisioned(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning_with_state(state, None).await)
+                .await,
+        );
+
+        assert!(rollback.is_some());
+        assert_eq!(fixture.branch_head(), head);
+        assert_eq!(git_output(&fixture.leaf_path, &["rev-parse", "HEAD"]), head);
     }
 
     #[tokio::test]
@@ -3524,7 +3630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recorded_branch_head_prefers_the_latest_owned_publication() {
+    async fn recorded_branch_head_prefers_the_latest_ledger_owned_publication() {
         let fixture = LeafFixture::new("publication");
         let branch = fixture.branch.as_str().to_string();
         let owner = fixture.leaf_agent.as_str();
@@ -3560,24 +3666,105 @@ mod tests {
             Some("2222222222222222222222222222222222222222"),
             "the newest ledger-owned publication of this agent must win over a later legacy one"
         );
+    }
 
+    #[tokio::test]
+    async fn a_legacy_publication_alone_is_not_head_evidence() {
+        let fixture = LeafFixture::new("legacy");
+        let branch = fixture.branch.as_str().to_string();
+        let owner = fixture.leaf_agent.as_str();
+        let head = fixture.preserve_branch("legacy work");
+        write_publications(fixture.repo(), &[publication(owner, &branch, &head, false)]);
+
+        let recorded =
+            recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
+
+        assert!(
+            recorded.is_none(),
+            "a never-verified legacy publication must not prove a commit head"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_remote_with_only_a_legacy_publication_fails_closed() {
+        let fixture = LeafFixture::new("legacy-attach");
+        let branch = fixture.branch.as_str().to_string();
+        let head = fixture.preserve_branch("legacy work");
         write_publications(
             fixture.repo(),
             &[publication(
-                owner,
+                fixture.leaf_agent.as_str(),
                 &branch,
-                "3333333333333333333333333333333333333333",
+                &head,
                 false,
             )],
         );
-
-        let legacy_only =
+        assert!(matches!(
+            fixture.fresh_remote().await,
+            crate::services::git_worktree::RemoteEvidence::Absent
+        ));
+        let recorded =
             recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
 
-        assert_eq!(
-            legacy_only.map(|head| head.sha).as_deref(),
-            Some("3333333333333333333333333333333333333333"),
-            "a migrated legacy publication is still this agent's recorded head"
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning(true, recorded.as_ref()).await)
+                .await,
+        );
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(fixture.branch.as_str()) && message.contains("no head is recorded"),
+            "an unverified publication must leave the attach decision without evidence, got {message}"
+        );
+        assert!(!fixture.leaf_path.exists());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_publication_registry_never_falls_through_to_the_invocation() {
+        let fixture = LeafFixture::new("unreadable-registry");
+        let branch = fixture.branch.as_str().to_string();
+        // Leave the registry unparseable while the invocation record carries a
+        // head, so a fall-through would happily prove the wrong commit.
+        write_publications(fixture.repo(), &[]);
+        std::fs::write(
+            fixture.repo().join(".exo/published-heads.json"),
+            b"{\"heads\": [",
+        )
+        .unwrap();
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            &branch,
+            "6666666666666666666666666666666666666666",
+        );
+
+        let recorded =
+            recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
+
+        assert!(
+            recorded.is_none(),
+            "an unreadable authoritative registry must not be replaced by the invocation head"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_invocation_record_is_not_head_evidence() {
+        let fixture = LeafFixture::new("unreadable-invocation");
+        let agent_dir = fixture
+            .repo()
+            .join(".exo/agents")
+            .join(fixture.leaf_agent.as_str());
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("invocation.json"), b"{\"invocation_id\": ").unwrap();
+
+        let recorded =
+            recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
+
+        assert!(
+            recorded.is_none(),
+            "an invocation record that cannot be parsed must not prove a commit head"
         );
     }
 

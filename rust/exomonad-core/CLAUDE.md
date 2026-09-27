@@ -165,8 +165,17 @@ fallible creation:
 | Create from revision | no branch, an expected head was supplied | none beyond the revision |
 | Create from base | no branch, no expected head | none beyond the base |
 
-`verify_attachable_branch` runs only after `ensure_branch_fetched`, so its remote
-evidence is fresh, and it classifies the branch as follows.
+Both decision inputs are read by one function, `read_leaf_branch_state`, and the
+order inside it is the contract: `ensure_branch_fetched` first, then
+`branch_exists`. The fetch materializes the local branch from the remote
+tracking ref when it is absent, so a branch that lives only on the remote reads
+as *absent* if existence is inspected first — that misclassifies a preserved
+branch as a create and lets it succeed only through the race recovery below,
+instead of attaching it. `read_leaf_branch_state` is the single place this order
+is expressed, and the caller passes its result straight into `LeafProvisioning`.
+
+`verify_attachable_branch` runs only on that freshly fetched evidence, and it
+classifies the branch as follows.
 
 - Checked out at the deterministic leaf path: verified and reused. The
   provisioning result carries no rollback guard, so a later failure can never
@@ -180,12 +189,22 @@ evidence is fresh, and it classifies the branch as follows.
   is required; with neither, attachment fails closed. Durable identity proves
   ownership and the deterministic branch, never a commit.
 - A recorded head (`recorded_branch_head`) is read from
-  `.exo/published-heads.json` for the latest publication this agent owns on that
-  branch, otherwise from the owner `invocation.json` when it records the same
-  branch. Because a publication head may be older than the work, it is proven by
-  `head_coverage` ancestry — the local head must equal it or descend from it — so
-  unique unpushed commits survive the reattach. A publication filed by another
-  agent, or a head recorded against another branch, is not evidence here.
+  `.exo/published-heads.json` for the latest **ledger-owned** publication this
+  agent owns on that branch, otherwise from the owner `invocation.json` when it
+  records the same branch. Because a publication head may be older than the
+  work, it is proven by `head_coverage` ancestry — the local head must equal it
+  or descend from it — so unique unpushed commits survive the reattach.
+
+  Recorded-head evidence is deliberately narrow, and each exclusion is a
+  fail-closed one:
+
+  | Excluded | Why |
+  |----------|-----|
+  | A migrated `Legacy` publication | never verified at its filing boundary, so it cannot prove a commit head — the same rule the watcher applies to publication ownership |
+  | A publication filed by another agent | it is not this branch's owner's record |
+  | A head recorded against another branch | a SHA is only evidence for the branch it was recorded against |
+  | Any head at all, when the publication registry is unreadable | the registry is authoritative, so a possibly stale `invocation.json` head must not substitute for it; the unreadable case ends the search instead of falling through |
+  | An `invocation.json` that cannot be parsed | `read_invocation_conservatively` treats a malformed record as no record |
 
 A resume keeps its exact expected-head equality check; a recorded head is only
 consulted where no expected head exists. Every refusal is a typed
