@@ -2,7 +2,7 @@
 """Disposable real-server acceptance for ordered TL recovery (chainlink #1100/#1103).
 
 Two scenarios run against a real ``exomonad serve`` process in a throwaway Git
-repository. Neither scenario touches the captured Beast workspace.
+repository. Neither scenario reads a recorded workspace: both build their own.
 
 Scenario 1 -- failed child startup and safe continuation:
   * A real ordered sub-TL is provisioned through the server
@@ -18,9 +18,9 @@ Scenario 1 -- failed child startup and safe continuation:
 
   Scenario 2 -- recreate followed by a same-plan restart:
     * A disposable repository carries an identity-less orphan ordered branch
-      (branch present, no identity, no worktree) -- the Beast #1100 shape.
+      (branch present, no identity, no worktree) -- the recorded #1100 shape.
     * The same repository also carries a root checkpoint with a nonterminal
-      ordered child that records the child worktree -- the Beast #1104 shape.
+      ordered child that records the child worktree -- the recorded #1104 shape.
     * The real ``exomonad init --recreate --confirm-recreate`` binary must remove
       that branch and archive the whole root beneath ``root.invalid-*``.
     * The archive bytes must be unchanged, and the same plan must restart through

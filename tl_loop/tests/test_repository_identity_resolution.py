@@ -5,8 +5,8 @@ adopt a merged PR: ``_repository_identity`` fails closed, the failure is caught
 by ``_reconcile_merged_slice`` and turned into a ``tl-post-merge-<slice>``
 gate, and the only writer of ``repository_identity`` was guarded on the caller
 already supplying one -- a closed loop with no self-heal. This module reuses
-test_legacy_manifest_convergence.py's sanitized "captured Beast" fixtures (see
-that module's docstring for why they are not the real captured checkpoint),
+test_legacy_manifest_convergence.py's sanitized fixtures (see that module's
+docstring for why no recorded checkpoint is read),
 but seeds the checkpoint *without* repository_identity -- the exact #1062
 shape -- and drives it through the real ``run_tl_loop()`` outer loop.
 """
@@ -49,7 +49,7 @@ from tl_loop.tests.test_legacy_manifest_convergence import (
 
 
 def _seed_without_repository_identity(tmp_path: Path):
-    """Same captured-Beast fixture as _seed_and_migrate, but the checkpoint's
+    """Same sanitized fixture as _seed_and_migrate, but the checkpoint's
     repository_identity is left null -- the exact #1062 shape."""
     create(RUN_ID, {}, root_dir=tmp_path)
     store = RunStore(RUN_ID, tmp_path)

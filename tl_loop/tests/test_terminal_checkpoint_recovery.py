@@ -1,22 +1,21 @@
-"""Beast-shaped terminal checkpoint recovery acceptance (#1112, #1117).
+"""Synthetic terminal checkpoint recovery acceptance (#1112, #1117).
 
-The recorded Beast workspace ended with the root and its
-``substitution-model-architecture-stage`` child both at ``tl_failed``: the leaf
-``tunable-operator-body`` was parked for ``publication_ownership_unresolved``
-behind Chainlink escalation #816, and the child controller then died on the
-``{'cicoIssueId': 816}`` escalation result. The leaf later republished its head
-as PR #45.
+A recorded production run ended with the root and its ``recreate-stage`` child
+both at ``tl_failed``: the leaf ``recreated-leaf`` was parked for
+``publication_ownership_unresolved`` behind Chainlink escalation #9001, and the
+child controller then died on the ``{'cicoIssueId': 9001}`` escalation result.
+The leaf later republished its head as PR #102.
 
 This module synthesizes that shape from scratch under the test's temporary
-directory. It never reads or writes the live Beast checkpoint, the live
-escalation, or the live PR, and it drives the real ``--continue`` code path
-(``run_tl_loop`` with ``session_mode="continue"``) instead of ``exomonad init``.
+directory. It never reads or writes any recorded checkpoint, escalation, or PR,
+and it drives the real ``--continue`` code path (``run_tl_loop`` with
+``session_mode="continue"``) instead of ``exomonad init``.
 
 The recorded answer is encoded as an assertion: ``--continue`` alone does not
 recover this checkpoint. It keeps ``tl_failed`` and opens the named
-``tl-ordered-child-recovery-substitution-model-architecture-stage`` gate, so the
-operator must resolve the parked publication ownership and answer that gate (or
-use the recreate path) before the child is relaunched.
+``tl-ordered-child-recovery-recreate-stage`` gate, so the operator must resolve
+the parked publication ownership and answer that gate (or use the recreate
+path) before the child is relaunched.
 """
 
 from __future__ import annotations
@@ -59,18 +58,18 @@ from tl_loop.state.schema import (
 from tl_loop.state.store import RunStore, create
 
 ROOT_RUN = "root"
-CHILD = "substitution-model-architecture-stage"
-LEAF = "tunable-operator-body"
-LEAF_AGENT = "tunable-operator-body-opencode"
-LEAF_INVOCATION = "inv-beast-recreated-1"
-HEAD_BRANCH = "main.substitution-model-architecture-stage.tunable-operator-body"
-HEAD_45 = "cb5f10c6f9aa6b8d5d8dc2dc9734a3d714a2ef83"
-PR_45 = 45
-ESCALATION_816 = 816
+CHILD = "recreate-stage"
+LEAF = "recreated-leaf"
+LEAF_AGENT = "recreated-leaf-opencode"
+LEAF_INVOCATION = "inv-recreated-1"
+HEAD_BRANCH = "main.recreate-stage.recreated-leaf"
+HEAD_102 = "b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5"
+PR_102 = 102
+ESCALATION_ISSUE = 9001
 GATE_PREFIX = "tl-ordered-child-recovery-"
 PARK_GATE = f"task-blocked:{CHILD}:{LEAF}:1:{ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED.value}"
-# The exact pre-fix failure reason recorded in the Beast recursive checkpoints.
-CHAINLINK_FAILURE = "chainlink issue result has no positive issue ID: {'cicoIssueId': 816}"
+# The exact pre-fix failure reason the recorded child checkpoint carried.
+CHAINLINK_FAILURE = "chainlink issue result has no positive issue ID: {'cicoIssueId': 9001}"
 RETRYABLE_EXIT = "sub-TL controller exited before authoritative resolution with code 1"
 
 
@@ -119,16 +118,16 @@ def _config(state_root: Path, root: Path) -> TLLoopConfig:
     )
 
 
-def _beast_failed_checkpoints(
+def _terminal_failed_checkpoints(
     root: Path,
     *,
     child_failure_reason: str = CHAINLINK_FAILURE,
     exit_reason: str = CHAINLINK_FAILURE,
     leaf_status: SliceStatus = SliceStatus.PARKED,
 ) -> tuple[RunStore, WorkPlan, TLLoopConfig]:
-    """Build the Beast-shaped root/child ``tl_failed`` pair under ``root``."""
+    """Build the synthetic root/child ``tl_failed`` pair under ``root``."""
     state_root = root / ".exo" / "tl-loop"
-    child_plan = WorkPlan(leaves=(LeafTask(LEAF, "implement the tuned operator body"),))
+    child_plan = WorkPlan(leaves=(LeafTask(LEAF, "implement the recreated leaf"),))
     plan = WorkPlan(sub_tls=(SubTLTask(CHILD, child_plan, order=1),))
     config = _config(state_root, root)
     manifest = _manifest_for_plan(plan, ROOT_RUN, config)
@@ -206,11 +205,11 @@ def _beast_failed_checkpoints(
         branch=HEAD_BRANCH,
         base_ref="main",
         attempts=1,
-        pr_number=PR_45,
-        reviewed_head=HEAD_45,
+        pr_number=PR_102,
+        reviewed_head=HEAD_102,
         publication=PublicationBinding(
-            PR_45,
-            HEAD_45,
+            PR_102,
+            HEAD_102,
             HEAD_BRANCH,
             "main",
             1,
@@ -223,12 +222,12 @@ def _beast_failed_checkpoints(
         dispatch_last_boundary="agent.spawned",
     )
     if leaf_status is SliceStatus.PARKED:
-        # The escalation that created #816 is durable park evidence, not a
+        # The escalation that created #9001 is durable park evidence, not a
         # guess: the park cause, issue id, and named gate are all recorded.
         leaf = replace(
             leaf,
             park_cause=ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED,
-            park_issue_id=ESCALATION_816,
+            park_issue_id=ESCALATION_ISSUE,
             park_audit={"attempts": 1, "gate_name": PARK_GATE, "attempt": 1},
         )
     child_state = child_store.checkpoint(
@@ -287,12 +286,12 @@ def _leaf_evidence(parent_store: RunStore) -> dict[str, Any]:
 def test_continue_alone_keeps_the_recorded_failure_and_names_the_gate(
     tmp_path: Path,
 ) -> None:
-    """The answer for the recorded checkpoint: a named gate, not a continuation."""
-    parent_store, plan, config = _beast_failed_checkpoints(tmp_path)
+    """The answer for the synthetic checkpoint: a named gate, not a continuation."""
+    parent_store, plan, config = _terminal_failed_checkpoints(tmp_path)
     before = _leaf_evidence(parent_store)
-    assert before["park_issue_id"] == ESCALATION_816
+    assert before["park_issue_id"] == ESCALATION_ISSUE
     assert before["publication"] is not None
-    assert before["publication"].pr_number == PR_45
+    assert before["publication"].pr_number == PR_102
 
     result, transport = _continue(parent_store, plan, config)
 
@@ -304,13 +303,13 @@ def test_continue_alone_keeps_the_recorded_failure_and_names_the_gate(
     assert state.fsm.phase.value == "tl_failed"
     assert [gate.name for gate in state.gates] == [f"{GATE_PREFIX}{CHILD}"]
     assert result.diagnostics["recovery_gate"] == f"{GATE_PREFIX}{CHILD}"
-    # The child checkpoint keeps PR #45, escalation #816, and its own failure.
+    # The child checkpoint keeps PR #102, escalation #9001, and its own failure.
     assert _leaf_evidence(parent_store) == before
 
 
 def test_continue_names_the_precise_unproven_child_exit(tmp_path: Path) -> None:
     """The recorded Chainlink failure is not a retryable controller boundary."""
-    parent_store, plan, config = _beast_failed_checkpoints(tmp_path)
+    parent_store, plan, config = _terminal_failed_checkpoints(tmp_path)
 
     decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
@@ -327,7 +326,7 @@ def test_continue_names_the_parked_publication_ownership_slice(
     tmp_path: Path,
 ) -> None:
     """A retryable child exit still cannot reopen a parked publication owner."""
-    parent_store, plan, config = _beast_failed_checkpoints(
+    parent_store, plan, config = _terminal_failed_checkpoints(
         tmp_path,
         child_failure_reason=RETRYABLE_EXIT,
         exit_reason=RETRYABLE_EXIT,
@@ -345,7 +344,7 @@ def test_repeated_continue_is_idempotent_and_never_guesses_ownership(
     tmp_path: Path,
 ) -> None:
     """Answering nothing and repeating the continuation changes no evidence."""
-    parent_store, plan, config = _beast_failed_checkpoints(tmp_path)
+    parent_store, plan, config = _terminal_failed_checkpoints(tmp_path)
     first, first_transport = _continue(parent_store, plan, config)
     before = _leaf_evidence(parent_store)
     second, second_transport = _continue(parent_store, plan, config)
@@ -363,7 +362,7 @@ def test_same_evidence_without_the_parked_slice_reopens_the_child(
     tmp_path: Path,
 ) -> None:
     """Control: the gate is caused by the recorded evidence, not the mechanism."""
-    parent_store, plan, config = _beast_failed_checkpoints(
+    parent_store, plan, config = _terminal_failed_checkpoints(
         tmp_path,
         child_failure_reason=RETRYABLE_EXIT,
         exit_reason=RETRYABLE_EXIT,
@@ -391,7 +390,7 @@ def test_same_evidence_without_the_parked_slice_reopens_the_child(
 @pytest.mark.parametrize("leaf_status", [SliceStatus.PARKED, SliceStatus.FAILED])
 def test_unsafe_child_slice_status_never_reopens(leaf_status: SliceStatus, tmp_path: Path) -> None:
     """Both terminal child statuses fail closed on the same proof."""
-    parent_store, plan, config = _beast_failed_checkpoints(
+    parent_store, plan, config = _terminal_failed_checkpoints(
         tmp_path,
         child_failure_reason=RETRYABLE_EXIT,
         exit_reason=RETRYABLE_EXIT,

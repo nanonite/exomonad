@@ -1,13 +1,12 @@
-"""Captured-Beast convergence regression for #1060 evidence-bound legacy migration.
+"""Sanitized convergence regression for #1060 evidence-bound legacy migration.
 
 Reproduces, in sanitized and independently-constructed form, the exact
 Chainlink #1060 case: an active legacy manifest placeholder for one root leaf
 whose merge is already confirmed in the durable action journal but not yet
-reflected in slice status, continued against a canonical external plan. This
-is not a copy of the real captured checkpoint at
-/home/goya/beast-workspace/workspace (#1060 forbids editing, restoring, or
-rewriting that file) -- every value below is rebuilt to match its documented
-shape through the same dataclasses and journal API production code uses.
+reflected in slice status, continued against a canonical external plan. No
+recorded checkpoint is read, edited, restored, or rewritten -- every value below
+is rebuilt to match the documented shape through the same dataclasses and
+journal API production code uses.
 
 This exercises the exact two functions run_tl_loop's legacy-manifest
 continuation block calls (reconcile_legacy_manifest, RunStore.set_plan_manifest)
@@ -54,14 +53,14 @@ from tl_loop.state.store import RunStore, create
 from tl_loop.tests.test_driver import IntegrationTransport
 
 RUN_ID = "root"
-SLICE_ID = "tunable-operator-body-retry"
+SLICE_ID = "recreated-leaf-retry"
 PR_NUMBER = 43
 HEAD_SHA = "090098863e9c9945506e6e25ade35e6f4a3eca4d"
 MERGE_TREE_SHA = "620d6709ec4d442e65977a647bb702f9fbe4d759"
-SPAWN_INTENT_ID = "spawn-intent-captured-beast"
-INVOCATION_ID = "invocation-captured-beast"
+SPAWN_INTENT_ID = "spawn-intent-sanitized"
+INVOCATION_ID = "invocation-sanitized"
 BRANCH = f"main.{SLICE_ID}"
-WORKTREE = "/workspace/tunable-operator-body-retry"
+WORKTREE = "/workspace/recreated-leaf-retry"
 CHAINLINK_ISSUE_ID = 599
 
 
@@ -70,7 +69,7 @@ def _candidate_plan() -> WorkPlan:
         leaves=(
             LeafTask(
                 name=SLICE_ID,
-                task="retry the tunable operator body",
+                task="retry the recreated leaf",
                 agent_type="codex",
                 boundary=("src",),
             ),
@@ -84,7 +83,7 @@ def _candidate_manifest():
             "leaves": [
                 {
                     "name": SLICE_ID,
-                    "task": "retry the tunable operator body",
+                    "task": "retry the recreated leaf",
                     "agent_type": "codex",
                     "boundary": ["src"],
                 }
@@ -154,7 +153,7 @@ def _seed_action_journal(store: RunStore) -> str:
         SLICE_ID,
         {
             "name": SLICE_ID,
-            "task": "retry the tunable operator body",
+            "task": "retry the recreated leaf",
             "agent_type": "codex",
             "boundary": ["src"],
             "intent_id": SPAWN_INTENT_ID,
@@ -212,7 +211,7 @@ def _merged_watcher_transport() -> IntegrationTransport:
                 "merged": True,
                 "head_sha": HEAD_SHA,
                 "base_sha": "base-main",
-                "patch_digest": "patch-tunable-operator-body-retry",
+                "patch_digest": "patch-recreated-leaf-retry",
                 "merge_tree_sha": MERGE_TREE_SHA,
                 "ci_status": "success",
                 "pr_state": "closed",
@@ -222,7 +221,7 @@ def _merged_watcher_transport() -> IntegrationTransport:
 
 
 def _seed_and_migrate(tmp_path: Path):
-    """Build the sanitized captured-Beast checkpoint and install the migration.
+    """Build the sanitized legacy-manifest checkpoint and install the migration.
 
     Returns (store, migrated_state, reconciliation) with the legacy manifest
     already reconciled and replaced by the canonical candidate manifest,
@@ -279,7 +278,7 @@ def _drain_to_complete(store: RunStore, config: TLLoopConfig, effects, effects_l
     raise AssertionError("post-merge recovery did not reach COMPLETE within the bounded drain")
 
 
-def test_captured_beast_legacy_migration_converges_through_post_merge_complete(
+def test_sanitized_legacy_migration_converges_through_post_merge_complete(
     tmp_path: Path,
 ) -> None:
     store, migrated, reconciliation = _seed_and_migrate(tmp_path)
@@ -325,7 +324,7 @@ def test_captured_beast_legacy_migration_converges_through_post_merge_complete(
     assert not any(name.startswith("plan-manifest-migration:") for name in gate_names)
 
 
-def test_captured_beast_repeated_continuation_is_a_terminal_no_op(tmp_path: Path) -> None:
+def test_sanitized_repeated_continuation_is_a_terminal_no_op(tmp_path: Path) -> None:
     store, migrated, _ = _seed_and_migrate(tmp_path)
     config = _config()
     transport = _merged_watcher_transport()

@@ -1,16 +1,16 @@
 """Replay acceptance for recreated publication correlation (#1112, #1117).
 
-The committed fixture replays the recorded Beast ledger shape. The predecessor
-controller generation filed PR #44 at ledger seq 39829. The recreated
-generation re-confirmed the leaf dispatch, consumed the still-present #44 row
-under its own owner, and filed PR #45 at seq 42329 under the new invocation and
+The committed fixture replays a synthetic recorded ledger shape. The
+predecessor controller generation filed PR #101 at ledger seq 200. The recreated
+generation re-confirmed the leaf dispatch, consumed the still-present #101 row
+under its own owner, and filed PR #102 at seq 300 under the new invocation and
 controller epoch.
 
 The acceptance proves two properties of the production binder through the real
 reducer:
 
-* the historical #44 row is permanent audit evidence and never mutates state;
-* #45 binds only with exact invocation, PR number, SHA, head branch, base
+* the historical #101 row is permanent audit evidence and never mutates state;
+* #102 binds only with exact invocation, PR number, SHA, head branch, base
   branch, owner, slice, dispatch generation, and controller epoch identity, so
   every single-field mismatch refuses binding.
 """
@@ -33,12 +33,12 @@ from tl_loop.tests.replay import (
 )
 
 FIXTURE = FIXTURE_ROOT / "recreated-publication-correlation.json"
-CHILD_SCOPE = "substitution-model-architecture-stage"
-LEAF = "tunable-operator-body"
-DISPATCH_CONFIRMATION = "beast-dispatch-confirmed-39828"
-HISTORICAL_PUBLICATION = "beast-pr-44-filed-39829"
-CURRENT_PUBLICATION = "beast-pr-45-filed-42329"
-COMPLETION_ROWS = ("beast-child-completed-42332", "beast-all-children-done-42333")
+CHILD_SCOPE = "recreate-stage"
+LEAF = "recreated-leaf"
+DISPATCH_CONFIRMATION = "synthetic-dispatch-confirmed-100"
+HISTORICAL_PUBLICATION = "synthetic-pr-101-filed-200"
+CURRENT_PUBLICATION = "synthetic-pr-102-filed-300"
+COMPLETION_ROWS = ("synthetic-child-completed-330", "synthetic-all-children-done-340")
 BASELINE_ROWS = (
     DISPATCH_CONFIRMATION,
     HISTORICAL_PUBLICATION,
@@ -48,22 +48,22 @@ BASELINE_ROWS = (
 CONTROL_ROWS = (DISPATCH_CONFIRMATION, *COMPLETION_ROWS)
 WITHOUT_HISTORICAL_ROWS = (DISPATCH_CONFIRMATION, CURRENT_PUBLICATION, *COMPLETION_ROWS)
 
-RUN_ID = "replay-beast-recreate"
-LEAF_AGENT_ID = "tunable-operator-body-opencode"
-RECREATED_INVOCATION = "inv-beast-recreated-1"
-RECREATED_EPOCH = "80d30599ab11f7d8410fd85244bba6be"
-PREDECESSOR_EPOCH = "1f0c9a7d4b6e2835a5c4d7e90b182f36a4c8d5e71"
-HEAD_BRANCH = "main.substitution-model-architecture-stage.tunable-operator-body"
+RUN_ID = "replay-recreate"
+LEAF_AGENT_ID = "recreated-leaf-opencode"
+RECREATED_INVOCATION = "inv-recreated-1"
+RECREATED_EPOCH = "fd510ebdd318dec7c78d56df90ea9627"
+PREDECESSOR_EPOCH = "1111aaaa2222bbbb3333cccc4444dddd"
+HEAD_BRANCH = "main.recreate-stage.recreated-leaf"
 BASE_BRANCH = "main"
-HEAD_44 = "ed77565ea509e2e6946e2060813ead55bc907747"
-HEAD_45 = "cb5f10c6f9aa6b8d5d8dc2dc9734a3d714a2ef83"
+HEAD_101 = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4"
+HEAD_102 = "b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5"
 
 HISTORICAL_REFUSAL = (
     "publication invocation does not match the current dispatch invocation or a "
     "recorded recovery succession"
 )
-HISTORICAL_RUN_SEQ = 39829
-CURRENT_RUN_SEQ = 42329
+HISTORICAL_RUN_SEQ = 200
+CURRENT_RUN_SEQ = 300
 
 
 def _spec() -> dict[str, Any]:
@@ -177,7 +177,7 @@ def _pending_seqs(root: Path) -> list[Any]:
 
 
 def test_recreated_generation_is_the_only_owner_of_the_leaf(tmp_path: Path) -> None:
-    """The recreated dispatch carries the exact owner provenance of #45."""
+    """The recreated dispatch carries the exact owner provenance of #102."""
     root = tmp_path / "recreated"
     _replay(root, _rows(BASELINE_ROWS))
     document = _child_document(root)
@@ -198,7 +198,7 @@ def test_recreated_generation_is_the_only_owner_of_the_leaf(tmp_path: Path) -> N
 
 
 def test_current_publication_binds_only_with_exact_identity(tmp_path: Path) -> None:
-    """#45 binds with all nine identity fields; #44 never reaches the state."""
+    """#102 binds with all nine identity fields; #101 never reaches the state."""
     root = tmp_path / "baseline"
     _replay(root, _rows(BASELINE_ROWS))
     document = _child_document(root)
@@ -206,18 +206,18 @@ def test_current_publication_binds_only_with_exact_identity(tmp_path: Path) -> N
 
     publication = state.get("publication")
     assert publication == {
-        "pr_number": 45,
-        "head_sha": HEAD_45,
+        "pr_number": 102,
+        "head_sha": HEAD_102,
         "head_branch": HEAD_BRANCH,
         "base_branch": BASE_BRANCH,
         "attempt": 1,
         "invocation_id": RECREATED_INVOCATION,
     }
-    assert state.get("pr_number") == 45
-    assert state.get("reviewed_head") == HEAD_45
+    assert state.get("pr_number") == 102
+    assert state.get("reviewed_head") == HEAD_102
     assert state.get("handoff") == {
-        "pr_number": 45,
-        "head_sha": HEAD_45,
+        "pr_number": 102,
+        "head_sha": HEAD_102,
         "attempt": 1,
         "invocation_id": RECREATED_INVOCATION,
         "agent_id": LEAF_AGENT_ID,
@@ -225,12 +225,12 @@ def test_current_publication_binds_only_with_exact_identity(tmp_path: Path) -> N
     }
     # No field of the bound state may carry the historical publication.
     bound = json.dumps(state)
-    assert HEAD_44 not in bound
-    assert '"pr_number": 44' not in bound
+    assert HEAD_101 not in bound
+    assert '"pr_number": 101' not in bound
 
 
 def test_historical_publication_is_permanent_audit_evidence(tmp_path: Path) -> None:
-    """#44 is retained for audit, never as replayable pending work."""
+    """#101 is retained for audit, never as replayable pending work."""
     root = tmp_path / "audit"
     _replay(root, _rows(BASELINE_ROWS))
 
@@ -241,9 +241,9 @@ def test_historical_publication_is_permanent_audit_evidence(tmp_path: Path) -> N
             "correlation": "publication_history_audit",
             "correlation_reason": HISTORICAL_REFUSAL,
             "agent_id": LEAF_AGENT_ID,
-            "invocation_id": "inv-beast-predecessor-1",
-            "pr_number": 44,
-            "head_sha": HEAD_44,
+            "invocation_id": "inv-predecessor-1",
+            "pr_number": 101,
+            "head_sha": HEAD_101,
             "controller_epoch": PREDECESSOR_EPOCH,
         }
     ]
@@ -251,7 +251,7 @@ def test_historical_publication_is_permanent_audit_evidence(tmp_path: Path) -> N
 
 
 def test_historical_publication_never_mutates_state(tmp_path: Path) -> None:
-    """Removing the #44 row changes nothing but the audit evidence."""
+    """Removing the #101 row changes nothing but the audit evidence."""
     with_historical = tmp_path / "with-historical"
     without_historical = tmp_path / "without-historical"
     _replay(with_historical, _rows(BASELINE_ROWS))
@@ -308,8 +308,8 @@ def test_generation_mismatch_is_retained_as_audit_evidence(case_name: str, tmp_p
         assert row["correlation_reason"] == case["audit_reason"]
         assert row["event_type"] == "pr.filed"
         assert row["correlation"] == "publication_history_audit"
-        assert row["pr_number"] == 45
-        assert row["head_sha"] == HEAD_45
+        assert row["pr_number"] == 102
+        assert row["head_sha"] == HEAD_102
     else:
         # Owner, branch, and slice-identity refusals are not publication
         # history: they are acknowledged without durable audit evidence.
@@ -332,8 +332,8 @@ def test_conflicting_publication_after_binding_is_refused(case_name: str, tmp_pa
 
     publication = _child_document(root)["slices"][LEAF].get("publication")
     assert publication is not None
-    assert publication["pr_number"] == 45
-    assert publication["head_sha"] == HEAD_45
+    assert publication["pr_number"] == 102
+    assert publication["head_sha"] == HEAD_102
     assert _leaf_state(root) == _leaf_state(baseline)
     # An ordinary conflict is not publication history and never becomes work.
     assert [row["run_seq"] for row in _audit_rows(root)] == [HISTORICAL_RUN_SEQ]

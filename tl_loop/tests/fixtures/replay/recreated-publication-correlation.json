@@ -1,29 +1,29 @@
 {
   "name": "recreated-publication-correlation",
-  "run_id": "replay-beast-recreate",
+  "run_id": "replay-recreate",
   "policy": "selector_policy_cheap_only.toml",
-  "chainlink_issue_id": 816,
+  "chainlink_issue_id": 9001,
   "repository_identity": {
-    "owner": "beast",
-    "repo": "beast",
+    "owner": "synthetic-org",
+    "repo": "synthetic-repo",
     "base_branch": "main"
   },
-  "controller_epoch": "80d30599ab11f7d8410fd85244bba6be",
-  "predecessor_controller_epoch": "1f0c9a7d4b6e2835a5c4d7e90b182f36a4c8d5e71",
+  "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
+  "predecessor_controller_epoch": "1111aaaa2222bbbb3333cccc4444dddd",
   "plan": {
     "sub_tls": [
       {
-        "name": "substitution-model-architecture-stage",
+        "name": "recreate-stage",
         "order": 1,
         "integration": {"aggregate_pr_required": false},
         "plan": {
           "leaves": [
             {
-              "name": "tunable-operator-body",
-              "task": "implement the tuned operator body",
-              "boundary": ["src/operator_body.rs"],
+              "name": "recreated-leaf",
+              "task": "implement the recreated leaf",
+              "boundary": ["src/recreated_leaf.rs"],
               "verify": ["just tl-loop-test"],
-              "done_criteria": ["the tuned operator body is covered"]
+              "done_criteria": ["the recreated leaf is covered"]
             }
           ]
         }
@@ -32,163 +32,163 @@
   },
   "events": [],
   "child_events": {
-    "substitution-model-architecture-stage": [
+    "recreate-stage": [
       {
         "schema_version": 1,
-        "event_id": "beast-dispatch-confirmed-39828",
-        "id": "beast-dispatch-confirmed-39828",
+        "event_id": "synthetic-dispatch-confirmed-100",
+        "id": "synthetic-dispatch-confirmed-100",
         "event_time": "2026-09-22T20:00:00Z",
         "observed_at": "2026-09-22T20:00:00Z",
-        "run_seq": 39828,
+        "run_seq": 100,
         "type": "agent.notify_parent",
-        "agent_id": "tunable-operator-body-opencode",
-        "invocation_id": "inv-beast-recreated-1",
+        "agent_id": "recreated-leaf-opencode",
+        "invocation_id": "inv-recreated-1",
         "run_id": null,
-        "session_id": "beast-recreated-session",
+        "session_id": "recreated-session",
         "lifecycle_state": "observed",
         "data": {
           "attempt": 1,
-          "child_agent": "tunable-operator-body-opencode",
-          "controller_epoch": "80d30599ab11f7d8410fd85244bba6be",
+          "child_agent": "recreated-leaf-opencode",
+          "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
           "dispatch_generation": 0,
-          "intent_id": "79999c0406f11f23c6a08402d2e178fb",
+          "intent_id": "ffec2635a1c70770eb09d8549b5b5e4c",
           "shadow_event": {
             "kind": "child_spawned",
-            "slug": "tunable-operator-body",
-            "branch": "main.substitution-model-architecture-stage.tunable-operator-body",
+            "slug": "recreated-leaf",
+            "branch": "main.recreate-stage.recreated-leaf",
             "agent_type": "codex/gpt-luna",
-            "intent_id": "79999c0406f11f23c6a08402d2e178fb"
+            "intent_id": "ffec2635a1c70770eb09d8549b5b5e4c"
           }
         }
       },
       {
         "schema_version": 1,
-        "event_id": "beast-pr-44-filed-39829",
-        "id": "beast-pr-44-filed-39829",
+        "event_id": "synthetic-pr-101-filed-200",
+        "id": "synthetic-pr-101-filed-200",
         "event_time": "2026-09-18T09:12:00Z",
         "observed_at": "2026-09-18T09:12:00Z",
-        "run_seq": 39829,
+        "run_seq": 200,
         "type": "pr.filed",
-        "agent_id": "tunable-operator-body-opencode",
-        "invocation_id": "inv-beast-predecessor-1",
+        "agent_id": "recreated-leaf-opencode",
+        "invocation_id": "inv-predecessor-1",
         "generation": 0,
         "run_id": null,
-        "session_id": "beast-predecessor-session",
+        "session_id": "predecessor-session",
         "lifecycle_state": "observed",
         "data": {
-          "slice_id": "tunable-operator-body",
-          "controller_epoch": "1f0c9a7d4b6e2835a5c4d7e90b182f36a4c8d5e71",
-          "pr_number": 44,
-          "head_sha": "ed77565ea509e2e6946e2060813ead55bc907747",
-          "head_branch": "main.substitution-model-architecture-stage.tunable-operator-body",
+          "slice_id": "recreated-leaf",
+          "controller_epoch": "1111aaaa2222bbbb3333cccc4444dddd",
+          "pr_number": 101,
+          "head_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
+          "head_branch": "main.recreate-stage.recreated-leaf",
           "base_branch": "main",
-          "invocation_id": "inv-beast-predecessor-1"
+          "invocation_id": "inv-predecessor-1"
         }
       },
       {
         "schema_version": 1,
-        "event_id": "beast-pr-45-filed-42329",
-        "id": "beast-pr-45-filed-42329",
+        "event_id": "synthetic-pr-102-filed-300",
+        "id": "synthetic-pr-102-filed-300",
         "event_time": "2026-09-22T20:14:00Z",
         "observed_at": "2026-09-22T20:14:00Z",
-        "run_seq": 42329,
+        "run_seq": 300,
         "type": "pr.filed",
-        "agent_id": "tunable-operator-body-opencode",
-        "invocation_id": "inv-beast-recreated-1",
+        "agent_id": "recreated-leaf-opencode",
+        "invocation_id": "inv-recreated-1",
         "generation": 0,
         "run_id": null,
-        "session_id": "beast-recreated-session",
+        "session_id": "recreated-session",
         "lifecycle_state": "observed",
         "data": {
-          "slice_id": "tunable-operator-body",
-          "controller_epoch": "80d30599ab11f7d8410fd85244bba6be",
-          "pr_number": 45,
-          "head_sha": "cb5f10c6f9aa6b8d5d8dc2dc9734a3d714a2ef83",
-          "head_branch": "main.substitution-model-architecture-stage.tunable-operator-body",
+          "slice_id": "recreated-leaf",
+          "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
+          "pr_number": 102,
+          "head_sha": "b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5",
+          "head_branch": "main.recreate-stage.recreated-leaf",
           "base_branch": "main",
-          "invocation_id": "inv-beast-recreated-1"
+          "invocation_id": "inv-recreated-1"
         }
       },
       {
         "schema_version": 1,
-        "event_id": "beast-pr-46-filed-42330",
-        "id": "beast-pr-46-filed-42330",
+        "event_id": "synthetic-pr-103-filed-310",
+        "id": "synthetic-pr-103-filed-310",
         "event_time": "2026-09-22T20:16:00Z",
         "observed_at": "2026-09-22T20:16:00Z",
-        "run_seq": 42330,
+        "run_seq": 310,
         "type": "pr.filed",
-        "agent_id": "tunable-operator-body-opencode",
-        "invocation_id": "inv-beast-recreated-1",
+        "agent_id": "recreated-leaf-opencode",
+        "invocation_id": "inv-recreated-1",
         "generation": 0,
         "run_id": null,
-        "session_id": "beast-recreated-session",
+        "session_id": "recreated-session",
         "lifecycle_state": "observed",
         "data": {
-          "slice_id": "tunable-operator-body",
-          "controller_epoch": "80d30599ab11f7d8410fd85244bba6be",
-          "pr_number": 46,
-          "head_sha": "cb5f10c6f9aa6b8d5d8dc2dc9734a3d714a2ef83",
-          "head_branch": "main.substitution-model-architecture-stage.tunable-operator-body",
+          "slice_id": "recreated-leaf",
+          "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
+          "pr_number": 103,
+          "head_sha": "b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5",
+          "head_branch": "main.recreate-stage.recreated-leaf",
           "base_branch": "main",
-          "invocation_id": "inv-beast-recreated-1"
+          "invocation_id": "inv-recreated-1"
         }
       },
       {
         "schema_version": 1,
-        "event_id": "beast-pr-45-refiled-42331",
-        "id": "beast-pr-45-refiled-42331",
+        "event_id": "synthetic-pr-102-refiled-320",
+        "id": "synthetic-pr-102-refiled-320",
         "event_time": "2026-09-22T20:18:00Z",
         "observed_at": "2026-09-22T20:18:00Z",
-        "run_seq": 42331,
+        "run_seq": 320,
         "type": "pr.filed",
-        "agent_id": "tunable-operator-body-opencode",
-        "invocation_id": "inv-beast-recreated-1",
+        "agent_id": "recreated-leaf-opencode",
+        "invocation_id": "inv-recreated-1",
         "generation": 0,
         "run_id": null,
-        "session_id": "beast-recreated-session",
+        "session_id": "recreated-session",
         "lifecycle_state": "observed",
         "data": {
-          "slice_id": "tunable-operator-body",
-          "controller_epoch": "80d30599ab11f7d8410fd85244bba6be",
-          "pr_number": 45,
-          "head_sha": "3069b9a1c6b1b5232db088c0e5ce49d276cd5665",
-          "head_branch": "main.substitution-model-architecture-stage.tunable-operator-body",
+          "slice_id": "recreated-leaf",
+          "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
+          "pr_number": 102,
+          "head_sha": "c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6",
+          "head_branch": "main.recreate-stage.recreated-leaf",
           "base_branch": "main",
-          "invocation_id": "inv-beast-recreated-1"
+          "invocation_id": "inv-recreated-1"
         }
       },
       {
         "schema_version": 1,
-        "event_id": "beast-child-completed-42332",
-        "id": "beast-child-completed-42332",
+        "event_id": "synthetic-child-completed-330",
+        "id": "synthetic-child-completed-330",
         "event_time": "2026-09-22T20:20:00Z",
         "observed_at": "2026-09-22T20:20:00Z",
-        "run_seq": 42332,
+        "run_seq": 330,
         "type": "agent.notify_parent",
-        "agent_id": "tunable-operator-body-opencode",
-        "invocation_id": "inv-beast-recreated-1",
+        "agent_id": "recreated-leaf-opencode",
+        "invocation_id": "inv-recreated-1",
         "run_id": null,
-        "session_id": "beast-recreated-session",
+        "session_id": "recreated-session",
         "lifecycle_state": "observed",
         "data": {
           "shadow_event": {
             "kind": "child_completed",
-            "slug": "tunable-operator-body"
+            "slug": "recreated-leaf"
           }
         }
       },
       {
         "schema_version": 1,
-        "event_id": "beast-all-children-done-42333",
-        "id": "beast-all-children-done-42333",
+        "event_id": "synthetic-all-children-done-340",
+        "id": "synthetic-all-children-done-340",
         "event_time": "2026-09-22T20:21:00Z",
         "observed_at": "2026-09-22T20:21:00Z",
-        "run_seq": 42333,
+        "run_seq": 340,
         "type": "agent.notify_parent",
         "agent_id": null,
-        "invocation_id": "inv-beast-recreated-1",
+        "invocation_id": "inv-recreated-1",
         "run_id": null,
-        "session_id": "beast-recreated-session",
+        "session_id": "recreated-session",
         "lifecycle_state": "observed",
         "data": {
           "shadow_event": {
@@ -201,49 +201,49 @@
   "binding_cases": [
     {
       "case": "invocation",
-      "row": "beast-pr-45-filed-42329",
-      "patch": {"invocation_id": "inv-beast-unrelated-2", "data": {"invocation_id": "inv-beast-unrelated-2"}},
+      "row": "synthetic-pr-102-filed-300",
+      "patch": {"invocation_id": "inv-unrelated-2", "data": {"invocation_id": "inv-unrelated-2"}},
       "audit_reason": "publication invocation does not match the current dispatch invocation or a recorded recovery succession"
     },
     {
       "case": "dispatch-generation",
-      "row": "beast-pr-45-filed-42329",
+      "row": "synthetic-pr-102-filed-300",
       "patch": {"generation": 2},
       "audit_reason": "publication event generation does not match the current dispatch"
     },
     {
       "case": "controller-epoch",
-      "row": "beast-pr-45-filed-42329",
-      "patch": {"data": {"controller_epoch": "1f0c9a7d4b6e2835a5c4d7e90b182f36a4c8d5e71"}},
+      "row": "synthetic-pr-102-filed-300",
+      "patch": {"data": {"controller_epoch": "1111aaaa2222bbbb3333cccc4444dddd"}},
       "audit_reason": "publication event belongs to a prior controller epoch"
     },
     {
       "case": "owner-agent",
-      "row": "beast-pr-45-filed-42329",
-      "patch": {"agent_id": "tunable-operator-body-stale-opencode"}
+      "row": "synthetic-pr-102-filed-300",
+      "patch": {"agent_id": "recreated-leaf-stale-opencode"}
     },
     {
       "case": "head-branch",
-      "row": "beast-pr-45-filed-42329",
-      "patch": {"data": {"head_branch": "main.substitution-model-architecture-stage.tunable-operator-body-stale"}}
+      "row": "synthetic-pr-102-filed-300",
+      "patch": {"data": {"head_branch": "main.recreate-stage.recreated-leaf-stale"}}
     },
     {
       "case": "base-branch",
-      "row": "beast-pr-45-filed-42329",
-      "patch": {"data": {"base_branch": "main.substitution-model-architecture-stage"}}
+      "row": "synthetic-pr-102-filed-300",
+      "patch": {"data": {"base_branch": "main.recreate-stage"}}
     },
     {
       "case": "slice-identity",
-      "row": "beast-pr-45-filed-42329",
-      "patch": {"data": {"slice_id": "tunable-operator-body-stale"}}
+      "row": "synthetic-pr-102-filed-300",
+      "patch": {"data": {"slice_id": "recreated-leaf-stale"}}
     },
     {
       "case": "pr-number-conflict",
-      "deliver": "beast-pr-46-filed-42330"
+      "deliver": "synthetic-pr-103-filed-310"
     },
     {
       "case": "head-sha-conflict",
-      "deliver": "beast-pr-45-refiled-42331"
+      "deliver": "synthetic-pr-102-refiled-320"
     }
   ]
 }

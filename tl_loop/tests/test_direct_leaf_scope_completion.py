@@ -9,12 +9,12 @@ no further incoming ledger events to nudge it. ``_run_sub_tls`` drains that
 same recovery to completion within one call, but it is gated on
 ``plan.sub_tls`` and is untouched here.
 
-This module reuses that file's sanitized "captured Beast" fixtures (a single
-already-merged leaf with durable action-journal evidence, reconstructed
-through the same dataclasses and journal API production code uses -- not the
-real captured checkpoint, which #1060 forbids editing) and drives them
-through the real outer ``run_tl_loop()`` loop with an empty event source,
-instead of calling the inner reconciliation/convergence pipeline directly.
+This module reuses that file's sanitized fixtures (a single already-merged
+leaf with durable action-journal evidence, reconstructed through the same
+dataclasses and journal API production code uses -- no recorded checkpoint is
+read or edited) and drives them through the real outer ``run_tl_loop()`` loop
+with an empty event source, instead of calling the inner
+reconciliation/convergence pipeline directly.
 """
 
 from __future__ import annotations
