@@ -211,12 +211,40 @@ names the deterministic branch, the missing or conflicting evidence, and the
 operator action, because the branch is deterministic and no alternative slug
 exists.
 
-Both create actions can lose a race with a concurrent creator. Only the stable
-`worktree.branch_exists` code is recoverable: the race is re-verified through
-the same attach predicate and retried exactly once, and any other creation error
-is returned unchanged. `WorktreeRollback` then covers everything this attempt
-created — worktree, MCP configuration, tmux launch, and identity finalization —
-and is defused only after the agent is finalized.
+### The head set is proven on reuse too, not only on attach
+
+`verify_leaf_head_evidence` is the single implementation, and it runs on both
+decisions that admit a deterministic branch:
+
+| Decision | Where it runs | What it proves |
+|----------|---------------|----------------|
+| Attach a preserved branch | `verify_attachable_branch`, after the fresh fetch | the whole set, plus at least one head when the remote is absent or uninspectable |
+| Reuse the worktree that already holds the branch | `verify_existing_leaf_worktree`, at the preflight, the live-route return, and the reuse decision inside the exclusive lifecycle region | the whole set |
+
+So an ordinary re-spawn of a live worktree — not only a resume — fails closed
+when the branch no longer contains a head its owner recorded. Presence is not
+required on reuse, only proof: a worktree with no recorded head is still
+reusable, and a reuse never consults the remote, so it needs no fetch. The
+reuse decision is the last check before the launch and arms no
+`WorktreeRollback`, so a refusal there leaves the existing worktree registered
+exactly as it was.
+
+Two recorded-head refusals are distinct facts, and both apply to attach and
+reuse alike:
+
+| `head_coverage` | Meaning | Refusal |
+|-----------------|---------|---------|
+| `Covers` | the local head is the recorded commit or descends from it | accepted, so unique unpushed commits survive |
+| `Diverged` | both commits are present, neither is an ancestor of the other | the branch was rewritten off the recorded work |
+| `UnknownCommit` | this repository cannot resolve the recorded commit at all | the branch was rewritten, or the recorded commit was reclaimed by garbage collection |
+
+`UnknownCommit` is **intended behavior**, not a gap: a recorded head nobody can
+produce again means the history is gone, and continuing on that branch would
+hand the leaf work descending from nothing its owner ever published. It carries
+its own message naming the branch, the recorded head, its evidence source, the
+observed head, both ways a head goes missing, and the operator action — so the
+operator sees "fetch or restore this commit, or re-dispatch from the current
+head" rather than a generic ownership conflict.
 
 ### Resume lineage and restored PR context
 
@@ -231,11 +259,11 @@ a resume safe is the head evidence it carries, and that evidence is a set
 | `prior_publication` | `recorded_branch_head` | ancestry |
 | `resume_lineage` | `resolve_resume_lineage_head` | ancestry |
 
-Every entry present is proven, not just the strongest one, so a resume whose
-lineage head the branch no longer contains is refused even when its expected head
-matches. Ancestry rather than equality for the two recorded heads is what lets
-unique unpushed commits survive the reattach. A refusal names the branch, the
-expected head, and the observed head.
+Every entry present is proven, not just the strongest one, on both the attach and
+the reuse path, so a resume whose lineage head the branch no longer contains is
+refused even when its expected head matches. Ancestry rather than equality for
+the two recorded heads is what lets unique unpushed commits survive the
+reattach. A refusal names the branch, the expected head, and the observed head.
 
 `resolve_resume_lineage_head` runs before any worktree decision, including the
 idempotent return, because a resume is authorized against exactly one prior
@@ -276,9 +304,14 @@ outage must not look like a branch with no PR. The refusal propagates with `?`
 at the call site, before any tmux launch and while the `WorktreeRollback` guard
 is armed, so the worktree this spawn created is removed. A first spawn owns no
 pull request and cannot be blind to one, so it proceeds with the loss recorded —
-a documented, logged first-spawn behavior rather than a silent fallback. A
-missing configured forge (`forgejo_client()` is `None`) and an unverified head
-both count as `NoQualifyingPr`: neither is an outage. Review and inline-comment
+a documented, logged first-spawn behavior rather than a silent fallback.
+
+`LookupFailed` covers every way the question could not be asked: an
+unresolvable repository, a forge API error, **and an unconfigured forge client**.
+A missing client is a misconfiguration, not an answer — the query was never made
+— so a resume refuses it rather than starting blind, and a first spawn records
+it. Only an *unverified head* (a standalone repo, which owns no host pull
+request) is `NoQualifyingPr` before any query happens. Review and inline-comment
 listing failures stay non-fatal and each `warn!`s with the PR number and the
 error, so no failure in this path is silent.
 

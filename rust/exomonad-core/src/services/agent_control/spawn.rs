@@ -141,21 +141,26 @@ fn expected_leaf_birth(
 /// A missing path is a no-op here: the remote-dependent attach checks require
 /// fresh evidence and run only after `ensure_branch_fetched`. Used by the
 /// preflight and the live-route return, where the path must already exist.
+///
+/// Reuse is proved exactly as attachment is: a registered worktree on the
+/// deterministic branch, plus the whole [`LeafHeadEvidence`] set. An ordinary
+/// re-spawn of a live worktree therefore fails closed too when the branch no
+/// longer contains a head this owner recorded, instead of quietly continuing on
+/// a rewritten branch. Presence of evidence is not required here — only its
+/// proof — so a worktree with no recorded head is still reusable.
 async fn verify_existing_leaf_worktree(
     git_wt: &GitWorktreeService,
     effective_project_dir: &Path,
     worktree_path: &Path,
     branch_name: &BranchName,
-    expected_head: Option<&str>,
+    heads: LeafHeadEvidence<'_>,
     require_existing_worktree: bool,
 ) -> Result<()> {
     if worktree_path.exists() {
         git_wt
             .verify_existing_worktree(worktree_path, branch_name)
             .map_err(|error| anyhow!(EffectError::from(error)))?;
-        if let Some(head) = expected_head {
-            verify_branch_head(effective_project_dir, branch_name, head).await?;
-        }
+        verify_leaf_head_evidence(git_wt, effective_project_dir, branch_name, heads).await?;
         return Ok(());
     }
     if require_existing_worktree {
@@ -164,6 +169,33 @@ async fn verify_existing_leaf_worktree(
                 path: worktree_path.display().to_string(),
             },
         )));
+    }
+    Ok(())
+}
+
+/// Prove every authoritative head a leaf attempt carries.
+///
+/// One implementation for both decisions that can admit a deterministic branch:
+/// the attach of a preserved branch and the reuse of a worktree that already
+/// holds it. An expected head must match by equality; each recorded head must be
+/// contained in the branch, proven by ancestry so unique unpushed commits
+/// survive. A recorded head the branch no longer contains, or that this
+/// repository cannot resolve at all, is a rewritten or reclaimed branch and is
+/// refused.
+async fn verify_leaf_head_evidence(
+    git_wt: &GitWorktreeService,
+    effective_project_dir: &Path,
+    branch_name: &BranchName,
+    heads: LeafHeadEvidence<'_>,
+) -> Result<()> {
+    if let Some(head) = heads.expected {
+        verify_branch_head(effective_project_dir, branch_name, head).await?;
+    }
+    if let Some(recorded) = heads.prior_publication {
+        verify_recorded_head_coverage(git_wt, branch_name, recorded)?;
+    }
+    if let Some(recorded) = heads.resume_lineage {
+        verify_recorded_head_coverage(git_wt, branch_name, recorded)?;
     }
     Ok(())
 }
@@ -348,7 +380,7 @@ async fn verify_attachable_branch(
                 effective_project_dir,
                 worktree_path,
                 branch_name,
-                heads.expected,
+                heads,
                 true,
             )
             .await?;
@@ -398,19 +430,10 @@ async fn verify_attachable_branch(
         }
     }
     // Every authoritative head this attempt carries is proven, not just the
-    // strongest one: an expected resume head by exact equality, and the prior
-    // publication and resume lineage heads by ancestry. A resume whose lineage
-    // head the branch no longer contains is a stale or rewritten target, and is
-    // refused here rather than attached.
-    if let Some(head) = heads.expected {
-        verify_branch_head(effective_project_dir, branch_name, head).await?;
-    }
-    if let Some(recorded) = heads.prior_publication {
-        verify_recorded_head_coverage(git_wt, branch_name, recorded)?;
-    }
-    if let Some(recorded) = heads.resume_lineage {
-        verify_recorded_head_coverage(git_wt, branch_name, recorded)?;
-    }
+    // strongest one, and by the same function that proves reuse. A resume whose
+    // lineage head the branch no longer contains is a stale or rewritten target,
+    // and is refused here rather than attached.
+    verify_leaf_head_evidence(git_wt, effective_project_dir, branch_name, heads).await?;
     Ok(LeafAttachability::Attachable)
 }
 
@@ -418,6 +441,18 @@ async fn verify_attachable_branch(
 /// head. Equal or descendant coverage is accepted so unique unpushed commits
 /// survive the reattach; anything else fails closed and names both the expected
 /// and the observed head.
+///
+/// Two refusals come out of this, and they are different facts:
+///
+/// | Coverage | Meaning | Why it refuses |
+/// |----------|---------|---------------|
+/// | `Diverged` | both commits are here, neither is an ancestor of the other | the branch was rewritten, so the recorded work is not on it |
+/// | `UnknownCommit` | this repository cannot resolve the recorded commit at all | the branch was rewritten, or the recorded commit was reclaimed by garbage collection, so there is nothing to compare against |
+///
+/// `UnknownCommit` is intended on both the attach and the reuse path: a recorded
+/// head nobody can produce again is a branch whose history is gone, and
+/// continuing on it would hand the leaf work that descends from nothing this
+/// owner ever published.
 fn verify_recorded_head_coverage(
     git_wt: &GitWorktreeService,
     branch_name: &BranchName,
@@ -433,15 +468,16 @@ fn verify_recorded_head_coverage(
     {
         HeadCoverage::Covers => Ok(()),
         HeadCoverage::Diverged => Err(branch_ownership_conflict(format!(
-            "branch {branch_name} cannot be attached: its head {observed} does not contain the {} head {}. \
-             Restore that commit onto {branch_name}, or re-dispatch the leaf from it, then retry \
-             the spawn.",
+            "branch {branch_name} cannot be attached or reused: its head {observed} does not contain \
+             the {} head {}. Restore that commit onto {branch_name}, or re-dispatch the leaf from it, \
+             then retry the spawn.",
             recorded.evidence, recorded.sha
         ))),
         HeadCoverage::UnknownCommit => Err(branch_ownership_conflict(format!(
-            "branch {branch_name} cannot be attached: the {} head {} is not present in this repository \
-             (its head is {observed}). Fetch the commit that carries it, or re-dispatch the leaf from \
-             it, then retry the spawn.",
+            "branch {branch_name} cannot be attached or reused: the {} head {} is unknown to this \
+             repository, so the branch was rewritten or that commit was garbage-collected (its head \
+             is {observed}). Restore that commit onto {branch_name}, or re-dispatch the leaf from its \
+             current head, then retry the spawn.",
             recorded.evidence, recorded.sha
         ))),
     }
@@ -1327,7 +1363,9 @@ impl<
     /// moved past the local branch, a closed or merged one, a PR the forge does
     /// not report a head for, and no PR at all are all the same fact — no
     /// qualifying PR — and never a guess. An unanswerable query is a different
-    /// fact and is reported as `LookupFailed` with the underlying error.
+    /// fact and is reported as `LookupFailed` with the underlying reason: an
+    /// unresolvable repository, a forge error, and an unconfigured forge client
+    /// are all failures to ask, not answers that nothing qualifies.
     async fn resolve_existing_pull_request(
         &self,
         project_dir: &Path,
@@ -1337,10 +1375,15 @@ impl<
         let Some(verified_head) = verified_head.map(str::trim).filter(|sha| !sha.is_empty()) else {
             return PullRequestContext::NoQualifyingPr;
         };
-        // No configured forge means this project has no host pull request to
-        // continue, which is a steady state rather than a failure to look one up.
+        // A missing forge client is a misconfiguration, not a fact about pull
+        // requests: the query was never made, so it is a failed lookup. A resume
+        // refuses it, and a first spawn records it. An unverified head, by
+        // contrast, really does mean there is no PR to match — a standalone repo
+        // owns no host pull request.
         let Some(forgejo) = self.ctx.forgejo_client() else {
-            return PullRequestContext::NoQualifyingPr;
+            return PullRequestContext::LookupFailed(
+                "no forge client is configured for this project".to_string(),
+            );
         };
         let repo_info = match crate::services::repo::get_repo_info(project_dir).await {
             Ok(repo_info) => repo_info,
@@ -2572,18 +2615,30 @@ impl<
                 }
                 None => None,
             };
+            // The prior publication head is resolved here, before any decision,
+            // because reuse proves the same head set as attach: a live worktree
+            // whose branch no longer contains what this owner published is a
+            // rewritten branch, and an ordinary re-spawn must refuse it too.
+            let recorded_head =
+                recorded_branch_head(self.project_dir(), &agent_name, &branch_name).await;
+            let heads = LeafHeadEvidence {
+                expected: expected_head,
+                prior_publication: recorded_head.as_ref(),
+                resume_lineage: resume_lineage_head.as_ref(),
+            };
 
             // Validate ownership before any idempotent return or reuse so a
             // stale routing record cannot bypass it. Existing paths must be
-            // registered worktrees on the derived branch; an absent path may be
-            // attached later only with proven ownership.
+            // registered worktrees on the derived branch carrying every recorded
+            // head; an absent path may be attached later only with proven
+            // ownership.
             if !options.standalone_repo {
                 verify_existing_leaf_worktree(
                     self.git_wt(),
                     effective_project_dir,
                     &worktree_path,
                     &branch_name,
-                    expected_head,
+                    heads,
                     false,
                 )
                 .await?;
@@ -2603,15 +2658,16 @@ impl<
             };
             if tab_alive {
                 // A live worktree-per-agent route must still own a verified,
-                // registered worktree. A stale route whose worktree was deleted
-                // must never return success.
+                // registered worktree whose branch carries every recorded head.
+                // A stale route whose worktree was deleted, or whose branch was
+                // rewritten away from them, must never return success.
                 if !options.standalone_repo {
                     verify_existing_leaf_worktree(
                         self.git_wt(),
                         effective_project_dir,
                         &worktree_path,
                         &branch_name,
-                        expected_head,
+                        heads,
                         true,
                     )
                     .await?;
@@ -2669,14 +2725,17 @@ impl<
                     ));
                 }
                 // Re-verify inside the lifecycle region. The preflight check ran
-                // before the idempotency check, so ownership is proved again here
-                // while no cleanup pass can quarantine the path.
+                // before the idempotency check, so ownership and the recorded
+                // head set are proved again here while no cleanup pass can
+                // quarantine the path. This is the reuse decision, and it is the
+                // last point before the launch: a refusal here leaves the
+                // existing worktree exactly as it was.
                 verify_existing_leaf_worktree(
                     self.git_wt(),
                     effective_project_dir,
                     &worktree_path,
                     &branch_name,
-                    expected_head,
+                    heads,
                     true,
                 )
                 .await?;
@@ -2686,8 +2745,6 @@ impl<
                     "Reusing verified existing leaf worktree"
                 );
             } else {
-                let recorded_head =
-                    recorded_branch_head(self.project_dir(), &agent_name, &branch_name).await;
                 // Fetch first, then read existence: the fetch can materialize a
                 // remote-only branch locally, and reading existence beforehand
                 // would send a preserved branch down the create path.
@@ -2702,11 +2759,7 @@ impl<
                         base_branch: &current_branch,
                         branch_exists: branch_state.exists,
                         start_point: options.start_point.as_deref(),
-                        heads: LeafHeadEvidence {
-                            expected: expected_head,
-                            prior_publication: recorded_head.as_ref(),
-                            resume_lineage: resume_lineage_head.as_ref(),
-                        },
+                        heads,
                         fresh_remote: branch_state.remote,
                     })
                     .await?;
@@ -3344,10 +3397,51 @@ mod tests {
 
         /// Move the released deterministic branch onto `revision`, leaving the
         /// commit it pointed at in the repository but out of the branch.
+        ///
+        /// The branch must not be checked out anywhere, which is why a test that
+        /// rewrites it calls this before attaching the leaf worktree.
         fn move_branch_to(&self, revision: &str) {
             git(
                 self.repo(),
                 &["branch", "--force", self.branch.as_str(), revision],
+            );
+        }
+
+        /// Create the deterministic leaf worktree and leave it there, as a
+        /// preserved owner leaves it across invocations.
+        fn attach_leaf_worktree(&self) {
+            self.git_wt
+                .create_workspace_from_existing_branch(&self.leaf_path, &self.branch)
+                .expect("failed to attach the leaf worktree");
+        }
+
+        /// The reuse decision the spawn call site makes inside the exclusive
+        /// lifecycle region, before any launch: a registered worktree on the
+        /// deterministic branch, plus the whole head evidence set.
+        async fn reuse_leaf_worktree(&self, heads: LeafHeadEvidence<'_>) -> Result<()> {
+            verify_existing_leaf_worktree(
+                &self.git_wt,
+                self.repo(),
+                &self.leaf_path,
+                &self.branch,
+                heads,
+                true,
+            )
+            .await
+        }
+
+        /// The recorded publication head, resolved through the same function the
+        /// spawn call site uses, for a ledger-owned publication this agent owns
+        /// on the deterministic branch.
+        async fn record_published_head(&self, agent: &AgentName, head_sha: &str) {
+            write_publications(
+                self.repo(),
+                &[publication(
+                    agent.as_str(),
+                    self.branch.as_str(),
+                    head_sha,
+                    true,
+                )],
             );
         }
 
@@ -4399,6 +4493,15 @@ mod tests {
                 .expect("a resume whose pull request is readable must compose a task")
         }
 
+        /// A second service over the same repository with no forge client, as a
+        /// project that never configured one has.
+        fn service_without_forge(&self) -> AgentControlService<crate::services::Services> {
+            let mut services = crate::services::Services::test();
+            services.project_dir = self.repo.clone();
+            services.git_wt = Arc::new(GitWorktreeService::new(self.repo.clone()));
+            AgentControlService::new(Arc::new(services))
+        }
+
         /// The HTTP methods the fake forge saw. A resume only ever reads.
         async fn forge_methods(&self) -> Vec<String> {
             self.forge
@@ -4416,6 +4519,30 @@ mod tests {
         match result {
             Err(error) => error,
             Ok(task) => panic!("task composition unexpectedly succeeded: {task}"),
+        }
+    }
+
+    /// A recorded head this repository cannot resolve is refused with the
+    /// dedicated message: it must name the branch, the recorded head, its
+    /// evidence source, the observed head, the two ways a head goes missing, and
+    /// the operator action.
+    fn assert_unknown_recorded_head(error: &anyhow::Error, unknown: &str, fixture: &LeafFixture) {
+        let message = ownership_conflict(error);
+        let observed = fixture.branch_head();
+        for expected in [
+            fixture.branch.as_str(),
+            unknown,
+            "published-heads.json",
+            observed.as_str(),
+            "unknown to this repository",
+            "rewritten",
+            "garbage-collected",
+            "retry the spawn",
+        ] {
+            assert!(
+                message.contains(expected),
+                "the refusal must name {expected:?}, got {message}"
+            );
         }
     }
 
@@ -4761,6 +4888,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reused_live_worktree_must_contain_its_recorded_publication_head() {
+        let fixture = LeafFixture::new("reuse-recorded");
+        let head = fixture.preserve_branch("published work");
+        fixture.attach_leaf_worktree();
+        fixture
+            .record_published_head(&fixture.leaf_agent.clone(), &head)
+            .await;
+        let recorded = recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch)
+            .await
+            .expect("a ledger-owned publication for this agent and branch is evidence");
+
+        fixture
+            .reuse_leaf_worktree(LeafHeadEvidence {
+                prior_publication: Some(&recorded),
+                ..Default::default()
+            })
+            .await
+            .expect("a branch that still contains its recorded head must be reusable");
+
+        assert!(fixture.leaf_path.exists());
+        assert_eq!(fixture.branch_head(), head);
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_live_worktree_fails_closed_and_is_left_untouched() {
+        let fixture = LeafFixture::new("reuse-rewritten");
+        let published = fixture.preserve_branch("published work");
+        fixture
+            .record_published_head(&fixture.leaf_agent.clone(), &published)
+            .await;
+        let recorded = recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch)
+            .await
+            .expect("the publication is evidence");
+        // The branch was rewritten away from what this owner published, and the
+        // worktree is then (re)created on the rewritten branch.
+        fixture.move_branch_to(fixture.base.as_str());
+        fixture.attach_leaf_worktree();
+        let observed = fixture.branch_head();
+
+        let error = fixture
+            .reuse_leaf_worktree(LeafHeadEvidence {
+                prior_publication: Some(&recorded),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a rewritten branch must not be reused");
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(fixture.branch.as_str())
+                && message.contains(&published)
+                && message.contains(&observed)
+                && message.contains("published-heads.json"),
+            "the refusal must name the branch, the recorded head, its evidence source, and the \
+             observed head, got {message}"
+        );
+        assert!(
+            fixture.leaf_path.exists(),
+            "a refused reuse must leave the existing worktree in place"
+        );
+        assert_eq!(
+            fixture
+                .git_wt
+                .registered_worktree_for_branch(&fixture.branch)
+                .expect("registry lookup must succeed")
+                .as_deref(),
+            Some(
+                std::fs::canonicalize(&fixture.leaf_path)
+                    .expect("the attached leaf path must resolve")
+                    .as_path()
+            ),
+            "a refused reuse must leave the worktree registered to the branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_resume_lineage_head_fails_closed_on_a_live_worktree() {
+        let fixture = LeafFixture::new("reuse-lineage");
+        let prior = fixture.preserve_branch("prior attempt work");
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            fixture.branch.as_str(),
+            &prior,
+            FIRST_GENERATION,
+        );
+        let lineage_head = resolve_resume_lineage_head(
+            fixture.repo(),
+            &fixture.leaf_agent,
+            &fixture.branch,
+            &lineage(FIRST_GENERATION),
+        )
+        .await
+        .expect("the lineage is current")
+        .expect("the finished generation recorded a head for this branch");
+        fixture.move_branch_to(fixture.base.as_str());
+        fixture.attach_leaf_worktree();
+        let observed = fixture.branch_head();
+
+        let error = fixture
+            .reuse_leaf_worktree(LeafHeadEvidence {
+                resume_lineage: Some(&lineage_head),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a branch that dropped its lineage head must not be reused");
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(fixture.branch.as_str())
+                && message.contains(&prior)
+                && message.contains(&observed)
+                && message.contains("invocation.json"),
+            "the refusal must name the branch, the lineage head, its evidence source, and the \
+             observed head, got {message}"
+        );
+        assert!(
+            fixture.leaf_path.exists(),
+            "a refused reuse must leave the existing worktree in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_recorded_head_refuses_an_attach() {
+        let fixture = LeafFixture::new("unknown-attach");
+        fixture.preserve_branch("prior attempt work");
+        // A head this repository has never received: the recorded commit was
+        // rewritten away or reclaimed, so there is nothing to compare against.
+        let unknown = "c".repeat(40);
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(
+                    fixture.provisioning(true, Some(&recorded(&unknown))).await,
+                )
+                .await,
+        );
+
+        assert_unknown_recorded_head(&error, &unknown, &fixture);
+        assert!(!fixture.leaf_path.exists());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_recorded_head_refuses_a_reused_worktree() {
+        let fixture = LeafFixture::new("unknown-reuse");
+        fixture.preserve_branch("prior attempt work");
+        fixture.attach_leaf_worktree();
+        let unknown = "c".repeat(40);
+        let observed = fixture.branch_head();
+
+        let error = fixture
+            .reuse_leaf_worktree(LeafHeadEvidence {
+                prior_publication: Some(&recorded(&unknown)),
+                ..Default::default()
+            })
+            .await
+            .expect_err("a recorded head this repository cannot resolve must refuse reuse");
+
+        assert_unknown_recorded_head(&error, &unknown, &fixture);
+        assert!(
+            fixture.leaf_path.exists(),
+            "a refused reuse must leave the existing worktree in place"
+        );
+        assert_eq!(fixture.branch_head(), observed);
+    }
+
+    #[tokio::test]
     async fn a_resume_fails_closed_when_the_pull_request_cannot_be_read() {
         let fixture = PullRequestFixture::new("pr-outage").await;
         fixture
@@ -4789,6 +5084,43 @@ mod tests {
         assert!(
             !fixture.leaf_path.exists(),
             "a resume refused before launch must not leave its worktree behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_fails_closed_when_no_forge_is_configured() {
+        let fixture = PullRequestFixture::new("pr-no-forge").await;
+        // No client means the query was never made, which is not the same fact
+        // as "this branch has no pull request".
+        let unconfigured = fixture.service_without_forge();
+
+        let error = task_refusal(
+            unconfigured
+                .leaf_task(
+                    &fixture.resume_options(),
+                    &fixture.repo,
+                    &fixture.branch,
+                    Some(&fixture.head),
+                )
+                .await,
+        );
+
+        let effect = error
+            .downcast_ref::<EffectError>()
+            .expect("a refused resume must be a typed effect error");
+        let EffectError::Custom { code, .. } = effect else {
+            panic!("a refused resume must be custom coded, got {effect:?}");
+        };
+        assert_eq!(code, "worktree.pr_context_unavailable");
+        let message = effect.to_string();
+        assert!(
+            message.contains(fixture.branch.as_str())
+                && message.contains("no forge client is configured"),
+            "the refusal must name the branch and the missing configuration, got {message}"
+        );
+        assert!(
+            fixture.forge_methods().await.is_empty(),
+            "with no client configured there is nothing to query"
         );
     }
 
