@@ -46,7 +46,10 @@ impl From<WorktreeError> for EffectError {
         match err {
             WorktreeError::BranchExists { branch } => EffectError::custom(
                 "worktree.branch_exists",
-                format!("Branch already exists: {}", branch),
+                format!(
+                    "branch {branch} already exists and this spawn could not attach it. \
+                     Stop the agent that holds {branch} or remove that worktree, then retry the spawn."
+                ),
             ),
             WorktreeError::PathExists { path } => EffectError::custom(
                 "worktree.path_exists",
@@ -114,6 +117,17 @@ pub enum RemoteEvidence {
     AtSha(String),
     /// The remote-tracking ref could not be inspected.
     Unavailable,
+}
+
+/// How a branch's local head relates to a recorded commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadCoverage {
+    /// The local head is the recorded commit or descends from it.
+    Covers,
+    /// Both commits are present and neither is an ancestor of the other.
+    Diverged,
+    /// The recorded commit is not present in this repository.
+    UnknownCommit,
 }
 
 /// Service for git worktree operations via git CLI.
@@ -607,6 +621,43 @@ impl GitWorktreeService {
                 Ok(output.status.success())
             }
         }
+    }
+
+    /// Classify how the branch's local head relates to a recorded commit.
+    ///
+    /// Equality and unique local commits on top of the recorded commit are
+    /// `Covers`; a rewritten history is `Diverged`; a commit this repository
+    /// never received is `UnknownCommit`. A recorded value that git could not
+    /// be asked about is never treated as coverage.
+    pub fn head_coverage(
+        &self,
+        branch: &BranchName,
+        recorded: &str,
+    ) -> Result<HeadCoverage, WorktreeError> {
+        let recorded = recorded.trim();
+        if recorded.is_empty() || recorded.starts_with('-') {
+            return Ok(HeadCoverage::UnknownCommit);
+        }
+        let local = self.git_path(
+            &self.project_dir,
+            &["rev-parse", &format!("refs/heads/{}", branch.as_str())],
+        )?;
+        let ancestry = self.git_output(
+            &self.project_dir,
+            &["merge-base", "--is-ancestor", recorded, &local],
+        )?;
+        if ancestry.status.success() {
+            return Ok(HeadCoverage::Covers);
+        }
+        let known = self.git_output(
+            &self.project_dir,
+            &["cat-file", "-e", &format!("{recorded}^{{commit}}")],
+        )?;
+        Ok(if known.status.success() {
+            HeadCoverage::Diverged
+        } else {
+            HeadCoverage::UnknownCommit
+        })
     }
 
     fn migrate_worktree_identities(
@@ -1308,6 +1359,13 @@ mod tests {
         });
     }
 
+    fn branch_head(repo_dir: &std::path::Path, branch: &BranchName) -> String {
+        let reference = format!("refs/heads/{}", branch.as_str());
+        let output = run_fixture_git_command(repo_dir, &["rev-parse", &reference])
+            .expect("rev-parse failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     #[test]
     fn test_create_workspace_happy_path() {
         let (temp, service) = init_test_repo();
@@ -1598,6 +1656,104 @@ mod tests {
         assert!(
             !service.local_head_is_current_or_ahead(&branch).unwrap(),
             "a local branch behind its remote head must fail closed"
+        );
+    }
+
+    #[test]
+    fn head_coverage_accepts_the_recorded_head_and_its_descendants() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let branch = BranchName::try_from_str(format!("{default_branch}.leaf").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        let worktree_path = temp.path().join("coverage-leaf");
+        service
+            .create_workspace(&worktree_path, &branch, &base)
+            .unwrap();
+        let recorded = branch_head(temp.path(), &branch);
+
+        assert_eq!(
+            service.head_coverage(&branch, &recorded).unwrap(),
+            HeadCoverage::Covers
+        );
+
+        run_git(
+            &worktree_path,
+            &["commit", "--allow-empty", "-m", "unique local commit"],
+        );
+
+        assert_eq!(
+            service.head_coverage(&branch, &recorded).unwrap(),
+            HeadCoverage::Covers,
+            "unique commits on top of the recorded head must stay attachable"
+        );
+    }
+
+    #[test]
+    fn head_coverage_reports_a_rewritten_recorded_head_as_diverged() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let branch = BranchName::try_from_str(format!("{default_branch}.leaf").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        let worktree_path = temp.path().join("coverage-leaf");
+        service
+            .create_workspace(&worktree_path, &branch, &base)
+            .unwrap();
+        run_git(
+            &worktree_path,
+            &["commit", "--allow-empty", "-m", "replacement commit"],
+        );
+        // The recorded head moved onto a different history: both commits are
+        // present and neither is an ancestor of the other.
+        run_git(
+            temp.path(),
+            &["commit", "--allow-empty", "-m", "published elsewhere"],
+        );
+        let recorded = branch_head(temp.path(), &base);
+
+        assert_eq!(
+            service.head_coverage(&branch, &recorded).unwrap(),
+            HeadCoverage::Diverged
+        );
+    }
+
+    #[test]
+    fn head_coverage_reports_a_recorded_commit_this_repository_never_received() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let branch = BranchName::try_from_str(format!("{default_branch}.leaf").as_str())
+            .expect("validated string input is non-empty");
+        let base = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+        service
+            .create_workspace(&temp.path().join("coverage-leaf"), &branch, &base)
+            .unwrap();
+
+        assert_eq!(
+            service.head_coverage(&branch, &"a".repeat(40)).unwrap(),
+            HeadCoverage::UnknownCommit
+        );
+    }
+
+    #[test]
+    fn head_coverage_never_trusts_a_recorded_value_git_cannot_be_asked_about() {
+        let (temp, service) = init_test_repo();
+        let default_branch = get_default_branch(temp.path());
+        let branch = BranchName::try_from_str(default_branch.as_str())
+            .expect("validated string input is non-empty");
+
+        assert_eq!(
+            service.head_coverage(&branch, "   ").unwrap(),
+            HeadCoverage::UnknownCommit
+        );
+        assert_eq!(
+            service
+                .head_coverage(&branch, "--upload-pack=touch /tmp/pwned")
+                .unwrap(),
+            HeadCoverage::UnknownCommit
         );
     }
 

@@ -80,9 +80,11 @@ import GHC.Generics (Generic)
 spawnErrorMessage :: EffectError -> Text
 spawnErrorMessage (EffectError kind) = case kind of
   Just (EffectErrorKindCustom c) -> case customCode c of
-    "worktree.branch_exists" -> "Branch already exists. Try a different slug."
     "worktree.push_rejected" -> "Push rejected (non-fast-forward). Remote branch has diverged."
     "worktree.lock_conflict" -> "Git lock file conflict - another git operation may be in progress. Retry in a few seconds."
+    -- Every other code, including worktree.branch_exists, carries the host's
+    -- own message: the leaf branch is deterministic, so the host names the
+    -- branch, the conflicting owner, and the operator action.
     _ -> TL.toStrict (customMessage c)
   Just (EffectErrorKindNotFound n) -> "Not found: " <> TL.toStrict (notFoundResource n)
   Just (EffectErrorKindInvalidInput i) -> "Invalid input: " <> TL.toStrict (invalidInputMessage i)

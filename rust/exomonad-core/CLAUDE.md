@@ -152,7 +152,54 @@ The project-owned directory needs no lock: no lifecycle decision creates, remove
 
 Residue cleanup quarantines a directory only when Git's worktree registry does not know it, no `.exo/agents/*/identity.json` claims it, and it contains nothing but known sink artifacts. Registered, dirty, identified, and ambiguous directories are refused, and `cleanup_unregistered_worktree_residue` returns `Result`: it is not a best-effort void. Each quarantined directory is preserved by rename into `.exo/worktrees-residue/`, and its manifest entry is written to a temporary file, fsynced, renamed over `manifest.jsonl`, and followed by an fsync of the quarantine directory, all inside the exclusive lock. A manifest failure leaves the quarantined directory in place and is surfaced to the caller, which logs it and continues. An existing manifest is read with `NotFound` as the only empty case: a manifest that cannot be read for any other reason keeps its bytes and stops the append, because rewriting it from an empty buffer would silently erase every prior quarantine record.
 
-### Replay classification of quarantined evidence
+### Deterministic leaf branch attachment
+
+A worktree-per-agent leaf always works on its deterministic birth branch, so
+provisioning never invents a branch name. `provision_leaf_worktree` in
+`spawn.rs` owns the whole decision, and cleanup is armed before its first
+fallible creation:
+
+| Leaf action | Condition | Proof required |
+|-------------|-----------|----------------|
+| Attach | the deterministic branch exists | `verify_attachable_branch` |
+| Create from revision | no branch, an expected head was supplied | none beyond the revision |
+| Create from base | no branch, no expected head | none beyond the base |
+
+`verify_attachable_branch` runs only after `ensure_branch_fetched`, so its remote
+evidence is fresh, and it classifies the branch as follows.
+
+- Checked out at the deterministic leaf path: verified and reused. The
+  provisioning result carries no rollback guard, so a later failure can never
+  remove a worktree this attempt did not create.
+- Checked out at any other live path, or registered at a path Git cannot
+  resolve: refused with `worktree.branch_ownership_conflict`, naming both the
+  registered owner and the deterministic leaf path.
+- Held by nothing: the local head must be proven. Freshly observed remote
+  evidence must not be behind or diverged. With an absent or uninspectable
+  remote, either an expected resume head or a recorded dispatch/publication head
+  is required; with neither, attachment fails closed. Durable identity proves
+  ownership and the deterministic branch, never a commit.
+- A recorded head (`recorded_branch_head`) is read from
+  `.exo/published-heads.json` for the latest publication this agent owns on that
+  branch, otherwise from the owner `invocation.json` when it records the same
+  branch. Because a publication head may be older than the work, it is proven by
+  `head_coverage` ancestry — the local head must equal it or descend from it — so
+  unique unpushed commits survive the reattach. A publication filed by another
+  agent, or a head recorded against another branch, is not evidence here.
+
+A resume keeps its exact expected-head equality check; a recorded head is only
+consulted where no expected head exists. Every refusal is a typed
+`worktree.branch_ownership_conflict` whose message names the deterministic
+branch, the missing or conflicting evidence, and the operator action, because
+the branch is deterministic and no alternative slug exists.
+
+Both create actions can lose a race with a concurrent creator. Only the stable
+`worktree.branch_exists` code is recoverable: the race is re-verified through
+the same attach predicate and retried exactly once, and any other creation error
+is returned unchanged. `WorktreeRollback` then covers everything this attempt
+created — worktree, MCP configuration, tmux launch, and identity finalization —
+and is defused only after the agent is finalized.
+
 
 The quarantine manifest records `source_kind: "unregistered_worktree_residue"` and `forensic_only: true` for every entry. Quarantined `.exo/ledger/segments` and `.exo/events` describe a worktree that no longer exists, so `exomonad logs import` excludes any source under `.exo/worktrees-residue/` by default and reports the count as `excluded_quarantined_sources`. `exomonad logs import --include-quarantined` is the explicit operator opt-in. The exclusion is a path predicate, so it holds even when a manifest entry is missing after a crash.
 

@@ -46,6 +46,35 @@ fn leaf_worktree_action(branch_exists: bool, start_point: Option<&str>) -> LeafW
     }
 }
 
+/// Decide whether a failed branch creation may be recovered by one attach.
+///
+/// Only the stable branch-exists code proves that another creator won the race.
+/// Every other failure is returned unchanged, so an unrelated creation error
+/// never turns into an attach.
+fn creation_failure_allows_attach(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<EffectError>(),
+        Some(EffectError::Custom { code, .. }) if code == "worktree.branch_exists"
+    )
+}
+
+/// Everything the leaf provisioning decision reads.
+///
+/// `branch_exists` is the branch state observed before this attempt created
+/// anything, and `fresh_remote` is the remote evidence fetched immediately
+/// before it, so the decision never reads state another writer can invalidate.
+struct LeafProvisioning<'a, 'b> {
+    project_dir: &'a Path,
+    worktree_path: &'a Path,
+    branch: &'a BranchName,
+    base_branch: &'a BranchName,
+    branch_exists: bool,
+    start_point: Option<&'a str>,
+    expected_head: Option<&'a str>,
+    recorded_head: Option<&'b RecordedHead>,
+    fresh_remote: crate::services::git_worktree::RemoteEvidence,
+}
+
 /// Derive the expected deterministic leaf birth branch.
 ///
 /// Durable identity wins; otherwise deterministic naming from an explicit base
@@ -100,6 +129,92 @@ async fn verify_existing_leaf_worktree(
     Ok(())
 }
 
+/// A commit the durable owner records for its deterministic branch.
+///
+/// This is dispatch or publication evidence, not a second owner: it proves which
+/// commit the agent was last given, so a preserved branch whose remote evidence
+/// is absent can still be proven to descend from its own recorded work.
+struct RecordedHead {
+    sha: String,
+    /// Durable record the SHA was read from, named in refusals.
+    evidence: &'static str,
+}
+
+/// Read the recorded dispatch/publication head for a deterministic branch.
+///
+/// Resolution is ordered and deterministic: the latest publication this agent
+/// owns for the branch, otherwise the owner invocation record's head when that
+/// record is about the same branch. A publication filed by another agent, or a
+/// head recorded against a different branch, is not evidence for this branch, so
+/// an unreadable or foreign record leaves the attach decision without evidence.
+async fn recorded_branch_head(
+    project_dir: &Path,
+    agent_name: &AgentName,
+    branch_name: &BranchName,
+) -> Option<RecordedHead> {
+    use crate::services::pr_registry::{
+        read_published_heads, PublicationProvenance, PUBLISHED_HEADS_FILENAME,
+    };
+
+    match read_published_heads(project_dir).await {
+        Ok(publications) => {
+            let owned = |head: &&crate::services::pr_registry::PublishedHead| {
+                head.head_branch == branch_name.as_str()
+                    && head.author_agent.as_deref() == Some(agent_name.as_str())
+            };
+            let publication = publications
+                .iter()
+                .filter(owned)
+                .rfind(|head| head.provenance == PublicationProvenance::LedgerOwned)
+                .or_else(|| publications.iter().rfind(owned))
+                .map(|head| head.head_sha.trim().to_string())
+                .filter(|sha| !sha.is_empty());
+            if let Some(sha) = publication {
+                return Some(RecordedHead {
+                    sha,
+                    evidence: PUBLISHED_HEADS_FILENAME,
+                });
+            }
+        }
+        Err(error) => {
+            warn!(
+                project = %project_dir.display(),
+                %error,
+                "Recorded publication heads are unreadable; attaching a preserved branch requires other head evidence"
+            );
+        }
+    }
+
+    let agent_dir = project_dir.join(".exo/agents").join(agent_name.as_str());
+    let record = read_invocation_conservatively(&agent_dir).await?;
+    if record.branch.as_deref() != Some(branch_name.as_str()) {
+        return None;
+    }
+    let sha = record.head_sha?.trim().to_string();
+    (!sha.is_empty()).then_some(RecordedHead {
+        sha,
+        evidence: "invocation.json",
+    })
+}
+
+/// Typed attach refusal: the branch is deterministic, so the message names the
+/// branch, the conflicting or missing evidence, and the operator action.
+fn branch_ownership_conflict(detail: String) -> anyhow::Error {
+    anyhow!(EffectError::custom(
+        "worktree.branch_ownership_conflict",
+        detail
+    ))
+}
+
+/// What the attach predicate proved about a deterministic branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeafAttachability {
+    /// Nothing holds the branch, so it can be attached at the leaf path.
+    Attachable,
+    /// The branch is already checked out at the deterministic leaf path.
+    ReuseExistingWorktree,
+}
+
 /// Verify that an absent-worktree branch may be attached.
 ///
 /// Must be called only after `ensure_branch_fetched` so `fresh_remote` reflects
@@ -108,67 +223,140 @@ async fn verify_existing_leaf_worktree(
 async fn verify_attachable_branch(
     git_wt: &GitWorktreeService,
     effective_project_dir: &Path,
+    worktree_path: &Path,
     branch_name: &BranchName,
     expected_head: Option<&str>,
+    recorded_head: Option<&RecordedHead>,
     fresh_remote: crate::services::git_worktree::RemoteEvidence,
-) -> Result<()> {
+) -> Result<LeafAttachability> {
     use crate::services::git_worktree::RemoteEvidence;
     let branch_exists = git_wt
         .branch_exists(branch_name)
         .map_err(|error| anyhow!(EffectError::from(error)))?;
     if !branch_exists {
-        return Ok(());
+        return Ok(LeafAttachability::Attachable);
     }
-    if let Some(owner) = git_wt
-        .registered_worktree_for_branch(branch_name)
-        .map_err(|error| anyhow!(EffectError::from(error)))?
-    {
-        return Err(anyhow!(EffectError::custom(
-            "worktree.branch_ownership_conflict",
-            format!(
-                "branch {} is already checked out at {}",
+    // A branch is checked out in exactly one registered worktree. Being held at
+    // the deterministic leaf path is recoverable reuse; being held anywhere
+    // else is a conflict that names both paths.
+    let owner = match git_wt.registered_worktree_for_branch(branch_name) {
+        Ok(owner) => owner,
+        Err(crate::services::git_worktree::WorktreeError::BranchOwnershipConflict {
+            path, ..
+        }) => {
+            return Err(checked_out_elsewhere(branch_name, worktree_path, &path));
+        }
+        Err(error) => return Err(anyhow!(EffectError::from(error))),
+    };
+    if let Some(owner) = owner {
+        if std::fs::canonicalize(worktree_path).ok().as_deref() == Some(owner.as_path()) {
+            verify_existing_leaf_worktree(
+                git_wt,
+                effective_project_dir,
+                worktree_path,
                 branch_name,
-                owner.display()
-            ),
-        )));
+                expected_head,
+                true,
+            )
+            .await?;
+            return Ok(LeafAttachability::ReuseExistingWorktree);
+        }
+        return Err(checked_out_elsewhere(
+            branch_name,
+            worktree_path,
+            &owner.display().to_string(),
+        ));
     }
     // Authoritative head evidence is required before attaching a preserved
-    // branch. Remote state is only accepted when freshly verified; an expected
-    // head is the fallback. Durable identity proves ownership, not a commit.
-    let has_expected_head = expected_head.is_some();
+    // branch. Remote state is only accepted when freshly verified; otherwise an
+    // expected resume head or a recorded dispatch/publication head must prove
+    // the local head. Durable identity alone proves ownership, not a commit.
+    let has_head_evidence = expected_head.is_some() || recorded_head.is_some();
     match fresh_remote {
         RemoteEvidence::Unavailable => {
-            if !has_expected_head {
-                return Err(anyhow!(EffectError::custom(
-                    "worktree.branch_ownership_conflict",
-                    format!("remote evidence for branch {branch_name} is unavailable"),
+            if !has_head_evidence {
+                return Err(branch_ownership_conflict(format!(
+                    "branch {branch_name} cannot be attached: the configured remote could not be inspected, \
+                     and no head is recorded for it. Restore remote access, or re-dispatch the leaf with \
+                     its recorded head, then retry the spawn."
                 )));
             }
         }
         RemoteEvidence::Absent => {
-            if !has_expected_head {
-                return Err(anyhow!(EffectError::custom(
-                    "worktree.branch_ownership_conflict",
-                    format!("branch {branch_name} has no authoritative head evidence"),
+            if !has_head_evidence {
+                return Err(branch_ownership_conflict(format!(
+                    "branch {branch_name} cannot be attached: the configured remote has no head for it, \
+                     and no head is recorded for it. Push the branch to the configured remote, or \
+                     re-dispatch the leaf so its publication head is recorded, then retry the spawn."
                 )));
             }
         }
-        RemoteEvidence::AtSha(_) => {
+        RemoteEvidence::AtSha(remote_sha) => {
             if !git_wt
                 .local_head_is_current_or_ahead(branch_name)
                 .map_err(|error| anyhow!(EffectError::from(error)))?
             {
-                return Err(anyhow!(EffectError::custom(
-                    "worktree.branch_ownership_conflict",
-                    format!("branch {branch_name} is behind or diverged from its remote head"),
+                return Err(branch_ownership_conflict(format!(
+                    "branch {branch_name} cannot be attached: it is behind or diverged from its remote \
+                     head {remote_sha}. Reconcile {branch_name} with the configured remote, or \
+                     re-dispatch the leaf from {remote_sha}, then retry the spawn."
                 )));
             }
         }
     }
-    if let Some(head) = expected_head {
-        verify_branch_head(effective_project_dir, branch_name, head).await?;
+    match (expected_head, recorded_head) {
+        // A resume still requires its exact expected head.
+        (Some(head), _) => verify_branch_head(effective_project_dir, branch_name, head).await?,
+        // A recorded dispatch/publication head may carry unique local commits,
+        // so it is proven by ancestry rather than equality.
+        (None, Some(recorded)) => {
+            verify_recorded_head_coverage(git_wt, branch_name, recorded)?;
+        }
+        (None, None) => {}
     }
-    Ok(())
+    Ok(LeafAttachability::Attachable)
+}
+
+/// Prove a preserved branch's local head equals or descends from the recorded
+/// head. Equal or descendant coverage is accepted so unique unpushed commits
+/// survive the reattach; anything else fails closed.
+fn verify_recorded_head_coverage(
+    git_wt: &GitWorktreeService,
+    branch_name: &BranchName,
+    recorded: &RecordedHead,
+) -> Result<()> {
+    use crate::services::git_worktree::HeadCoverage;
+    let coverage = git_wt
+        .head_coverage(branch_name, &recorded.sha)
+        .map_err(|error| anyhow!(EffectError::from(error)))?;
+    match coverage {
+        HeadCoverage::Covers => Ok(()),
+        HeadCoverage::Diverged => Err(branch_ownership_conflict(format!(
+            "branch {branch_name} cannot be attached: its history does not contain the {} head {}. \
+             Restore that commit onto {branch_name}, or re-dispatch the leaf from it, then retry \
+             the spawn.",
+            recorded.evidence, recorded.sha
+        ))),
+        HeadCoverage::UnknownCommit => Err(branch_ownership_conflict(format!(
+            "branch {branch_name} cannot be attached: the {} head {} is not present in this \
+             repository. Fetch the commit that carries it, or re-dispatch the leaf from it, then \
+             retry the spawn.",
+            recorded.evidence, recorded.sha
+        ))),
+    }
+}
+
+/// The deterministic branch is checked out at a path this spawn does not own.
+fn checked_out_elsewhere(
+    branch_name: &BranchName,
+    worktree_path: &Path,
+    owner: &str,
+) -> anyhow::Error {
+    branch_ownership_conflict(format!(
+        "branch {branch_name} is checked out at {owner}, not at the deterministic leaf path {}. \
+         Stop the agent holding {branch_name} or remove that worktree, then retry the spawn.",
+        worktree_path.display()
+    ))
 }
 
 /// Removes a worktree created by this spawn attempt if provisioning fails
@@ -777,6 +965,115 @@ impl<
             + 'static,
     > AgentControlService<C>
 {
+    /// Provision the deterministic leaf worktree for an absent path.
+    ///
+    /// Cleanup is armed before the first fallible creation, so any error after
+    /// this point drops the guard and removes what this attempt created. The
+    /// guard is returned only when this attempt created the worktree, so a later
+    /// failure can never roll back a worktree it merely reused.
+    async fn provision_leaf_worktree(
+        &self,
+        request: LeafProvisioning<'_, '_>,
+    ) -> Result<Option<WorktreeRollback>> {
+        let git_wt = self.git_wt();
+        let mut rollback =
+            WorktreeRollback::armed(git_wt.clone(), request.worktree_path.to_path_buf());
+        git_wt.prune_worktrees()?;
+        let created = match leaf_worktree_action(request.branch_exists, request.start_point) {
+            LeafWorktreeAction::Attach => {
+                let fresh_remote = request.fresh_remote.clone();
+                self.attach_leaf_branch(&request, fresh_remote).await?
+                    == LeafAttachability::Attachable
+            }
+            LeafWorktreeAction::CreateFromRevision => {
+                let start_point = request
+                    .start_point
+                    .expect("CreateFromRevision requires a start point");
+                self.recover_lost_creation_race(
+                    &request,
+                    self.create_worktree_from_revision_checked(
+                        request.worktree_path,
+                        request.branch,
+                        start_point,
+                    )
+                    .await,
+                )
+                .await?
+            }
+            LeafWorktreeAction::CreateFromBase => {
+                self.recover_lost_creation_race(
+                    &request,
+                    self.create_worktree_checked(
+                        request.worktree_path,
+                        request.branch,
+                        request.base_branch,
+                    )
+                    .await,
+                )
+                .await?
+            }
+        };
+        if created {
+            return Ok(Some(rollback));
+        }
+        info!(
+            worktree_path = %request.worktree_path.display(),
+            branch = %request.branch,
+            "Reusing the worktree that already holds the deterministic branch"
+        );
+        rollback.defuse();
+        Ok(None)
+    }
+
+    /// Attach the deterministic branch at the leaf path, or report that the
+    /// leaf path already holds it. Ownership is proved before any attachment.
+    async fn attach_leaf_branch(
+        &self,
+        request: &LeafProvisioning<'_, '_>,
+        fresh_remote: crate::services::git_worktree::RemoteEvidence,
+    ) -> Result<LeafAttachability> {
+        let attachability = verify_attachable_branch(
+            self.git_wt(),
+            request.project_dir,
+            request.worktree_path,
+            request.branch,
+            request.expected_head,
+            request.recorded_head,
+            fresh_remote,
+        )
+        .await?;
+        if attachability == LeafAttachability::ReuseExistingWorktree {
+            return Ok(attachability);
+        }
+        self.create_worktree_from_existing_branch_checked(request.worktree_path, request.branch)
+            .await?;
+        Ok(LeafAttachability::Attachable)
+    }
+
+    /// Recover a branch-creation race with at most one ownership-verified
+    /// attach. Only the stable branch-exists code is recoverable; any other
+    /// creation failure is returned unchanged.
+    async fn recover_lost_creation_race(
+        &self,
+        request: &LeafProvisioning<'_, '_>,
+        created: Result<()>,
+    ) -> Result<bool> {
+        let Err(error) = created else {
+            return Ok(true);
+        };
+        if !creation_failure_allows_attach(&error) {
+            return Err(error);
+        }
+        // The winning creator may also have pushed the branch, so the race is
+        // re-evaluated against remote evidence fetched after the race.
+        let fresh_remote = ensure_branch_fetched(request.project_dir, request.branch).await;
+        info!(
+            branch = %request.branch,
+            "Lost a branch-creation race; re-verifying ownership before a single attach"
+        );
+        Ok(self.attach_leaf_branch(request, fresh_remote).await? == LeafAttachability::Attachable)
+    }
+
     /// Spawn an agent for a GitHub issue.
     ///
     /// This is the high-level semantic operation that:
@@ -2027,78 +2324,25 @@ impl<
                     "Reusing verified existing leaf worktree"
                 );
             } else {
-                worktree_rollback = Some(WorktreeRollback::armed(
-                    self.git_wt().clone(),
-                    worktree_path.clone(),
-                ));
-                let fresh_remote = ensure_branch_fetched(effective_project_dir, &branch_name).await;
-                self.git_wt().prune_worktrees()?;
-                match leaf_worktree_action(
-                    self.git_wt().branch_exists(&branch_name)?,
-                    options.start_point.as_deref(),
-                ) {
-                    LeafWorktreeAction::Attach => {
-                        verify_attachable_branch(
-                            self.git_wt(),
+                let recorded_head =
+                    recorded_branch_head(self.project_dir(), &agent_name, &branch_name).await;
+                worktree_rollback = self
+                    .provision_leaf_worktree(LeafProvisioning {
+                        project_dir: effective_project_dir,
+                        worktree_path: &worktree_path,
+                        branch: &branch_name,
+                        base_branch: &current_branch,
+                        branch_exists: self.git_wt().branch_exists(&branch_name)?,
+                        start_point: options.start_point.as_deref(),
+                        expected_head,
+                        recorded_head: recorded_head.as_ref(),
+                        fresh_remote: ensure_branch_fetched(
                             effective_project_dir,
                             &branch_name,
-                            expected_head,
-                            fresh_remote.clone(),
                         )
-                        .await?;
-                        self.create_worktree_from_existing_branch_checked(
-                            &worktree_path,
-                            &branch_name,
-                        )
-                        .await?;
-                    }
-                    LeafWorktreeAction::CreateFromRevision => {
-                        let start_point = options
-                            .start_point
-                            .as_deref()
-                            .expect("CreateFromRevision requires a start point");
-                        self.create_worktree_from_revision_checked(
-                            &worktree_path,
-                            &branch_name,
-                            start_point,
-                        )
-                        .await?;
-                    }
-                    LeafWorktreeAction::CreateFromBase => {
-                        match self
-                            .create_worktree_checked(&worktree_path, &branch_name, &current_branch)
-                            .await
-                        {
-                            Ok(()) => {}
-                            Err(error) => {
-                                // TOCTOU: only a branch-exists failure can be
-                                // recovered by a single attach. Any other error
-                                // fails closed unchanged.
-                                let branch_raced = matches!(
-                                    error.downcast_ref::<EffectError>(),
-                                    Some(EffectError::Custom { code, .. })
-                                        if code == "worktree.branch_exists"
-                                );
-                                if !branch_raced {
-                                    return Err(error);
-                                }
-                                verify_attachable_branch(
-                                    self.git_wt(),
-                                    effective_project_dir,
-                                    &branch_name,
-                                    expected_head,
-                                    fresh_remote.clone(),
-                                )
-                                .await?;
-                                self.create_worktree_from_existing_branch_checked(
-                                    &worktree_path,
-                                    &branch_name,
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                }
+                        .await,
+                    })
+                    .await?;
             }
             // The lifecycle decision is complete; release the lock before the
             // long-running spawn work that follows.
@@ -2625,7 +2869,8 @@ impl<
 mod tests {
     use super::*;
     use exomonad_test_support::{
-        assert_fixture_git_root, init_fixture_git_repository, ScrubGitRepositoryEnv,
+        assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
+        ScrubGitRepositoryEnv,
     };
 
     #[test]
@@ -2687,6 +2932,714 @@ mod tests {
         assert_eq!(
             leaf_worktree_action(false, None),
             LeafWorktreeAction::CreateFromBase
+        );
+    }
+
+    #[test]
+    fn only_the_branch_exists_code_may_be_recovered_by_an_attach() {
+        let raced = anyhow::Error::from(EffectError::custom(
+            "worktree.branch_exists",
+            "Branch already exists: main.leaf",
+        ));
+        let unrelated = anyhow::Error::from(EffectError::custom(
+            "worktree.base_branch_not_found",
+            "Base branch not found: main.missing",
+        ));
+        let not_an_effect_error = anyhow!("git worktree creation panicked: boom");
+
+        assert!(creation_failure_allows_attach(&raced));
+        assert!(!creation_failure_allows_attach(&unrelated));
+        assert!(!creation_failure_allows_attach(&not_an_effect_error));
+    }
+
+    /// A temporary repository with a bare remote, a leaf service, and the
+    /// deterministic branch state the attach predicate reads.
+    struct LeafFixture {
+        /// Owns the temporary repository for the fixture's lifetime.
+        _temp: tempfile::TempDir,
+        repo: PathBuf,
+        service: AgentControlService<crate::services::Services>,
+        git_wt: Arc<GitWorktreeService>,
+        leaf_agent: AgentName,
+        base: BranchName,
+        branch: BranchName,
+        leaf_path: PathBuf,
+    }
+
+    impl LeafFixture {
+        fn new(slug: &str) -> Self {
+            let temp = tempfile::tempdir().expect("failed to create temp dir");
+            let repo = temp.path().to_path_buf();
+            init_fixture_git_repository(&repo).expect("git init failed");
+            git(&repo, &["config", "user.email", "leaf@example.invalid"]);
+            git(&repo, &["config", "user.name", "Leaf"]);
+            git(&repo, &["commit", "--allow-empty", "-m", "base"]);
+            let base_name = git_output(&repo, &["branch", "--show-current"]);
+            let base = BranchName::try_from_str(base_name.as_str())
+                .expect("validated string input is non-empty");
+            let branch = BranchName::try_from_str(format!("{base_name}.{slug}").as_str())
+                .expect("validated string input is non-empty");
+            let remote = repo.join("remote.git");
+            git(
+                &repo,
+                &["init", "--bare", remote.to_str().expect("valid UTF-8 path")],
+            );
+            git(
+                &repo,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    remote.to_str().expect("valid UTF-8 path"),
+                ],
+            );
+            git(&repo, &["push", "-u", "origin", base_name.as_str()]);
+
+            let git_wt = Arc::new(GitWorktreeService::new(repo.clone()));
+            let mut services = crate::services::Services::test();
+            services.project_dir = repo.clone();
+            services.git_wt = git_wt.clone();
+            Self {
+                leaf_path: temp.path().join("worktrees").join(slug),
+                service: AgentControlService::new(Arc::new(services)),
+                leaf_agent: agent(&format!("{slug}-codex")),
+                _temp: temp,
+                git_wt,
+                base,
+                branch,
+                repo,
+            }
+        }
+
+        fn repo(&self) -> &Path {
+            &self.repo
+        }
+
+        /// Create the deterministic branch and release its worktree, so only
+        /// the branch survives.
+        fn seed_branch(&self) {
+            let scratch = self.repo().join("scratch");
+            self.git_wt
+                .create_workspace(&scratch, &self.branch, &self.base)
+                .expect("failed to create the leaf branch");
+            self.git_wt
+                .remove_workspace(&scratch)
+                .expect("failed to release the leaf branch");
+        }
+
+        /// Commit on the deterministic branch through a temporary worktree and
+        /// release it again, leaving the branch where the commit put it.
+        fn commit_on_branch(&self, message: &str) -> String {
+            let scratch = self.repo().join("scratch");
+            self.git_wt
+                .create_workspace_from_existing_branch(&scratch, &self.branch)
+                .expect("failed to attach the leaf branch");
+            git(&scratch, &["commit", "--allow-empty", "-m", message]);
+            let head = git_output(&scratch, &["rev-parse", "HEAD"]);
+            self.git_wt
+                .remove_workspace(&scratch)
+                .expect("failed to release the leaf branch");
+            head
+        }
+
+        /// A preserved leaf branch carrying one commit, with no worktree on it.
+        fn preserve_branch(&self, message: &str) -> String {
+            self.seed_branch();
+            self.commit_on_branch(message)
+        }
+
+        fn branch_head(&self) -> String {
+            git_output(
+                self.repo(),
+                &["rev-parse", &format!("refs/heads/{}", self.branch)],
+            )
+        }
+
+        /// The fresh remote evidence the production path fetches immediately
+        /// before it decides.
+        async fn fresh_remote(&self) -> crate::services::git_worktree::RemoteEvidence {
+            ensure_branch_fetched(self.repo(), &self.branch).await
+        }
+
+        async fn provisioning<'a, 'b>(
+            &'a self,
+            branch_exists: bool,
+            recorded_head: Option<&'b RecordedHead>,
+        ) -> LeafProvisioning<'a, 'b> {
+            LeafProvisioning {
+                project_dir: self.repo(),
+                worktree_path: &self.leaf_path,
+                branch: &self.branch,
+                base_branch: &self.base,
+                branch_exists,
+                start_point: None,
+                expected_head: None,
+                recorded_head,
+                fresh_remote: self.fresh_remote().await,
+            }
+        }
+    }
+
+    /// Unwrap a provisioning result, whose rollback guard is deliberately not
+    /// printable.
+    fn provisioned(result: Result<Option<WorktreeRollback>>) -> Option<WorktreeRollback> {
+        match result {
+            Ok(guard) => guard,
+            Err(error) => panic!("leaf provisioning failed: {error}"),
+        }
+    }
+
+    /// Unwrap a provisioning refusal; the success value carries the same
+    /// non-printable rollback guard.
+    fn refusal(result: Result<Option<WorktreeRollback>>) -> anyhow::Error {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("leaf provisioning unexpectedly succeeded"),
+        }
+    }
+
+    fn git(repo_dir: &Path, args: &[&str]) {
+        run_fixture_git_command(repo_dir, args)
+            .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
+    }
+
+    fn git_output(repo_dir: &Path, args: &[&str]) -> String {
+        String::from_utf8_lossy(
+            &run_fixture_git_command(repo_dir, args)
+                .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"))
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    }
+
+    fn recorded(sha: &str) -> RecordedHead {
+        RecordedHead {
+            sha: sha.to_string(),
+            evidence: "published-heads.json",
+        }
+    }
+
+    fn ownership_conflict(error: &anyhow::Error) -> String {
+        let effect = error
+            .downcast_ref::<EffectError>()
+            .expect("an attach refusal must be a typed effect error");
+        let EffectError::Custom { code, .. } = effect else {
+            panic!("attach refusals must be custom coded, got {effect:?}");
+        };
+        assert_eq!(code, "worktree.branch_ownership_conflict");
+        effect.to_string()
+    }
+
+    fn write_publications(project_dir: &Path, heads: &[serde_json::Value]) {
+        std::fs::create_dir_all(project_dir.join(".exo")).unwrap();
+        std::fs::write(
+            project_dir.join(".exo/published-heads.json"),
+            serde_json::json!({ "schema_version": 2, "heads": heads }).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn publication(
+        author: &str,
+        branch: &str,
+        head_sha: &str,
+        ledger_owned: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "pr_number": 7,
+            "head_branch": branch,
+            "base_branch": "main",
+            "head_sha": head_sha,
+            "author_agent": author,
+            "provenance": if ledger_owned { "ledger_owned" } else { "legacy" },
+        })
+    }
+
+    fn write_invocation(project_dir: &Path, agent: &str, branch: &str, head_sha: &str) {
+        let agent_dir = project_dir.join(".exo/agents").join(agent);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("invocation.json"),
+            serde_json::json!({
+                "invocation_id": "11111111-1111-1111-1111-111111111111",
+                "runtime": "codex",
+                "trigger": "spawn",
+                "routing": {"window_id": null, "pane_id": null, "parent_tab": null},
+                "started_at": 1,
+                "status": "exited",
+                "exit_code": 0,
+                "branch": branch,
+                "head_sha": head_sha,
+                "generation": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn agent(name: &str) -> AgentName {
+        AgentName::try_from_str(name).expect("validated string input is non-empty")
+    }
+
+    #[tokio::test]
+    async fn preserved_branch_with_unique_commits_attaches_without_moving_its_head() {
+        let fixture = LeafFixture::new("preserved");
+        fixture.seed_branch();
+        let published = fixture.commit_on_branch("published work");
+        git(fixture.repo(), &["push", "origin", fixture.branch.as_str()]);
+        // The preserved branch now carries a commit the remote has never seen.
+        let head = fixture.commit_on_branch("unique unpushed commit");
+        assert!(
+            matches!(
+                fixture.fresh_remote().await,
+                crate::services::git_worktree::RemoteEvidence::AtSha(sha) if sha == published
+            ),
+            "the remote head must still be the published commit"
+        );
+
+        let rollback = provisioned(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning(true, None).await)
+                .await,
+        );
+
+        assert!(
+            rollback.is_some(),
+            "an attach this attempt performed must stay covered by the rollback guard"
+        );
+        assert_eq!(
+            fixture.branch_head(),
+            head,
+            "attaching must not move the head"
+        );
+        assert_eq!(
+            git_output(&fixture.leaf_path, &["rev-parse", "HEAD"]),
+            head,
+            "the attached worktree must check out the preserved head"
+        );
+        assert_eq!(
+            fixture
+                .git_wt
+                .registered_worktree_for_branch(&fixture.branch)
+                .expect("registry lookup must succeed"),
+            Some(std::fs::canonicalize(&fixture.leaf_path).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn diverged_local_and_remote_heads_fail_with_an_ownership_conflict() {
+        let fixture = LeafFixture::new("diverged");
+        fixture.preserve_branch("local work");
+        git(fixture.repo(), &["push", "origin", fixture.branch.as_str()]);
+        let other = fixture.repo().join("other-clone");
+        git(
+            fixture.repo(),
+            &[
+                "clone",
+                fixture.repo().join("remote.git").to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git(&other, &["config", "user.email", "other@example.invalid"]);
+        git(&other, &["config", "user.name", "Other"]);
+        git(&other, &["checkout", fixture.branch.as_str()]);
+        git(&other, &["commit", "--allow-empty", "-m", "remote ahead"]);
+        git(&other, &["push", "origin", fixture.branch.as_str()]);
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning(true, None).await)
+                .await,
+        );
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(fixture.branch.as_str())
+                && message.contains("behind or diverged from its remote head"),
+            "the refusal must name the divergence, got {message}"
+        );
+        assert!(
+            !fixture.leaf_path.exists(),
+            "a refused attach must not create the leaf worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_branch_creation_race_attaches_once_and_keeps_the_head() {
+        let fixture = LeafFixture::new("raced");
+        let head = fixture.preserve_branch("raced work");
+        git(fixture.repo(), &["push", "origin", fixture.branch.as_str()]);
+
+        // The decision observed an absent branch, then a concurrent creator
+        // made it: creation must fail with branch-exists and recover through a
+        // single ownership-verified attach.
+        assert!(
+            fixture
+                .git_wt
+                .branch_exists(&fixture.branch)
+                .expect("branch inspection must succeed"),
+            "the branch must exist when creation runs, or there is no race to recover"
+        );
+        let rollback = provisioned(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning(false, None).await)
+                .await,
+        );
+
+        assert!(rollback.is_some());
+        assert_eq!(fixture.branch_head(), head);
+        assert_eq!(git_output(&fixture.leaf_path, &["rev-parse", "HEAD"]), head);
+        let worktrees = git_output(fixture.repo(), &["worktree", "list"]);
+        assert_eq!(
+            worktrees.lines().count(),
+            2,
+            "exactly one leaf worktree may exist, got {worktrees}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_branch_creation_race_reverifies_ownership_before_attaching() {
+        let fixture = LeafFixture::new("raced-owner");
+        fixture.preserve_branch("raced work");
+        let winner = fixture.repo().join("winner");
+        fixture
+            .git_wt
+            .create_workspace_from_existing_branch(&winner, &fixture.branch)
+            .expect("the concurrent creator must hold the branch");
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning(false, None).await)
+                .await,
+        );
+
+        assert_both_paths_named(&error, &winner, &fixture.leaf_path);
+        assert!(!fixture.leaf_path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_branch_checked_out_elsewhere_fails_closed_naming_both_paths() {
+        let fixture = LeafFixture::new("conflict");
+        fixture.preserve_branch("held elsewhere");
+        let holder = fixture.repo().join("holder");
+        fixture
+            .git_wt
+            .create_workspace_from_existing_branch(&holder, &fixture.branch)
+            .expect("the holder worktree must take the branch");
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning(true, None).await)
+                .await,
+        );
+
+        assert_both_paths_named(&error, &holder, &fixture.leaf_path);
+        assert!(!fixture.leaf_path.exists());
+    }
+
+    /// A checked-out-elsewhere refusal must name the registered owner and the
+    /// deterministic leaf path, both as Git reports them.
+    fn assert_both_paths_named(error: &anyhow::Error, owner: &Path, expected: &Path) {
+        let message = ownership_conflict(error);
+        for path in [owner, expected] {
+            let canonical = std::fs::canonicalize(path)
+                .unwrap_or_else(|_| path.to_path_buf())
+                .display()
+                .to_string();
+            assert!(
+                message.contains(&canonical),
+                "the refusal must name {canonical}, got {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_branch_checked_out_at_the_expected_path_is_recovered_as_reuse() {
+        let fixture = LeafFixture::new("reuse");
+        fixture.preserve_branch("reused work");
+        fixture
+            .git_wt
+            .create_workspace_from_existing_branch(&fixture.leaf_path, &fixture.branch)
+            .expect("the deterministic path must take the branch");
+        let head = fixture.branch_head();
+
+        let rollback = provisioned(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning(true, None).await)
+                .await,
+        );
+
+        assert!(
+            rollback.is_none(),
+            "a reused worktree must not be covered by this attempt's rollback guard"
+        );
+        assert_eq!(fixture.branch_head(), head);
+        assert_eq!(
+            fixture
+                .git_wt
+                .registered_worktree_for_branch(&fixture.branch)
+                .expect("registry lookup must succeed"),
+            Some(std::fs::canonicalize(&fixture.leaf_path).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_remote_with_a_matching_recorded_head_attaches() {
+        let fixture = LeafFixture::new("recorded");
+        fixture.seed_branch();
+        let published = fixture.commit_on_branch("published work");
+        // The local head has moved past the recorded head, and the remote never
+        // saw either commit.
+        let head = fixture.commit_on_branch("unique unpushed commit");
+        assert!(
+            matches!(
+                fixture.fresh_remote().await,
+                crate::services::git_worktree::RemoteEvidence::Absent
+            ),
+            "the branch was never pushed, so remote evidence must be absent"
+        );
+
+        let rollback = provisioned(
+            fixture
+                .service
+                .provision_leaf_worktree(
+                    fixture
+                        .provisioning(true, Some(&recorded(&published)))
+                        .await,
+                )
+                .await,
+        );
+
+        assert!(
+            rollback.is_some(),
+            "an attach this attempt performed must stay covered by the rollback guard"
+        );
+        assert_eq!(fixture.branch_head(), head);
+        assert_eq!(git_output(&fixture.leaf_path, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn an_absent_remote_with_a_mismatched_recorded_head_fails_closed() {
+        let fixture = LeafFixture::new("mismatched");
+        fixture.preserve_branch("recorded work");
+        let unusable = "a".repeat(40);
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(
+                    fixture.provisioning(true, Some(&recorded(&unusable))).await,
+                )
+                .await,
+        );
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(&unusable) && message.contains("published-heads.json"),
+            "the refusal must name the unusable recorded head, got {message}"
+        );
+        assert!(!fixture.leaf_path.exists());
+    }
+
+    #[tokio::test]
+    async fn an_absent_remote_without_a_recorded_head_fails_closed() {
+        let fixture = LeafFixture::new("unproven");
+        fixture.preserve_branch("unproven work");
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.provisioning(true, None).await)
+                .await,
+        );
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(fixture.branch.as_str()) && message.contains("no head is recorded"),
+            "the refusal must name the missing evidence, got {message}"
+        );
+        assert!(!fixture.leaf_path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_branch_creation_returns_without_a_worktree() {
+        let fixture = LeafFixture::new("failing-create");
+        let missing_base =
+            BranchName::try_from_str("main.absent").expect("validated string input is non-empty");
+        let mut request = fixture.provisioning(false, None).await;
+        request.base_branch = &missing_base;
+        let error = refusal(fixture.service.provision_leaf_worktree(request).await);
+
+        assert!(
+            !creation_failure_allows_attach(&error),
+            "an unrelated creation failure must never be retried as an attach, got {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("Base branch not found"),
+            "the failure must come from branch creation, got {error:#}"
+        );
+
+        assert!(!fixture.leaf_path.exists());
+        assert_eq!(
+            fixture
+                .git_wt
+                .registered_worktree_for_branch(&fixture.branch)
+                .expect("registry lookup must succeed"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_rollback_guard_removes_the_worktree_it_created() {
+        let fixture = LeafFixture::new("rollback");
+        let created = fixture.repo().join("created");
+        fixture
+            .git_wt
+            .create_workspace(&created, &fixture.branch, &fixture.base)
+            .expect("failed to create the worktree under test");
+
+        drop(WorktreeRollback::armed(
+            fixture.git_wt.clone(),
+            created.clone(),
+        ));
+
+        assert!(
+            !created.exists(),
+            "a failed spawn must not leave the worktree it created"
+        );
+        assert_eq!(
+            fixture
+                .git_wt
+                .registered_worktree_for_branch(&fixture.branch)
+                .expect("registry lookup must succeed"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_branch_head_prefers_the_latest_owned_publication() {
+        let fixture = LeafFixture::new("publication");
+        let branch = fixture.branch.as_str().to_string();
+        let owner = fixture.leaf_agent.as_str();
+        write_publications(
+            fixture.repo(),
+            &[
+                publication(
+                    owner,
+                    &branch,
+                    "1111111111111111111111111111111111111111",
+                    true,
+                ),
+                publication(
+                    owner,
+                    &branch,
+                    "2222222222222222222222222222222222222222",
+                    true,
+                ),
+                publication(
+                    owner,
+                    &branch,
+                    "3333333333333333333333333333333333333333",
+                    false,
+                ),
+            ],
+        );
+
+        let recorded =
+            recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
+
+        assert_eq!(
+            recorded.map(|head| head.sha).as_deref(),
+            Some("2222222222222222222222222222222222222222"),
+            "the newest ledger-owned publication of this agent must win over a later legacy one"
+        );
+
+        write_publications(
+            fixture.repo(),
+            &[publication(
+                owner,
+                &branch,
+                "3333333333333333333333333333333333333333",
+                false,
+            )],
+        );
+
+        let legacy_only =
+            recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
+
+        assert_eq!(
+            legacy_only.map(|head| head.sha).as_deref(),
+            Some("3333333333333333333333333333333333333333"),
+            "a migrated legacy publication is still this agent's recorded head"
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_branch_head_ignores_a_publication_filed_by_another_agent() {
+        let fixture = LeafFixture::new("foreign");
+        let branch = fixture.branch.as_str().to_string();
+        write_publications(
+            fixture.repo(),
+            &[publication(
+                "someone-else",
+                &branch,
+                "1111111111111111111111111111111111111111",
+                true,
+            )],
+        );
+
+        let recorded =
+            recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
+
+        assert!(
+            recorded.is_none(),
+            "another agent's publication is not head evidence for this branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_branch_head_reads_the_owner_invocation_for_the_same_branch() {
+        let fixture = LeafFixture::new("invocation");
+        let branch = fixture.branch.as_str().to_string();
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            &branch,
+            "4444444444444444444444444444444444444444",
+        );
+
+        let recorded =
+            recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
+
+        assert_eq!(
+            recorded.map(|head| head.sha).as_deref(),
+            Some("4444444444444444444444444444444444444444")
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_branch_head_is_absent_without_durable_evidence() {
+        let fixture = LeafFixture::new("unrecorded");
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            "main.some-other-branch",
+            "5555555555555555555555555555555555555555",
+        );
+
+        let recorded =
+            recorded_branch_head(fixture.repo(), &fixture.leaf_agent, &fixture.branch).await;
+
+        assert!(
+            recorded.is_none(),
+            "a head recorded against another branch is not evidence for this one"
         );
     }
 
