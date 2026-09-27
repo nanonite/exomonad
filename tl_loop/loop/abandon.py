@@ -23,6 +23,9 @@ ABANDONABLE_STATUSES = frozenset(
         SliceStatus.REPAIRING,
     }
 )
+# A scheduled retry has no runtime agent identity: nothing was created, so
+# there is nothing to clean up and no attempt to abandon.
+UNCREATED_STATUSES = frozenset({SliceStatus.DISPATCH_RETRY_SCHEDULED})
 
 
 class AbandonmentError(RuntimeError):
@@ -123,6 +126,12 @@ def abandon_slice(
 
 
 def _validate_live_attempt(slice_state: SliceState) -> None:
+    if slice_state.status in UNCREATED_STATUSES:
+        raise AbandonmentError(
+            f"slice {slice_state.id!r} attempt {slice_state.attempts} created no agent; "
+            f"it is on a dispatch retry boundary (machine code "
+            f"{slice_state.dispatch_error_code!r})"
+        )
     if slice_state.attempts <= 0:
         raise AbandonmentError(f"slice {slice_state.id!r} has no dispatched attempt")
     if slice_state.status not in ABANDONABLE_STATUSES:

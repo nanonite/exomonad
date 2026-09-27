@@ -33,7 +33,10 @@ inbox first. It then uses this order:
 The FIFO has a 32-message hard cap, a single active consumer, a 30-second
 deduplication window, and up to eight injection attempts with capped
 exponential backoff. An item that exhausts those attempts emits
-`agent_inbox.messages_abandoned`. The durable SQLite row remains the recovery
+`agent_inbox.messages_abandoned` and is re-queued, not dropped: the durable
+SQLite row is untouched, the cache-local key is cleared, and the event records
+the durable `batch_id` alongside the process-local `message_id`, so a rebuild
+re-queues exactly that batch. The durable SQLite row remains the recovery
 record and can be surfaced by the inbox poke path.
 
 `services/inbox_watcher.rs` is a separate Claude Teams compatibility consumer
@@ -87,7 +90,11 @@ state mutation did not happen.
   identified by the cross-runtime inbox ADR; a tmux lock only serializes
   writers.
 - A failed injection is retried eight times. After the eighth failure the
-  in-memory queue item is abandoned and emits an explicit abandonment event.
+  in-memory queue item is released back to the durable queue and emits an
+  explicit abandonment event carrying the durable `batch_id`. It is not
+  deleted: the recovery signal must survive the cache, so the row that a
+  rebuild re-queues is named in the ledger rather than only a message id that
+  dies with the process.
 - Deduplication suppresses repeated structured notifications within 30 seconds
   and emits `agent_inbox.duplicates_dropped`. That prevents some duplicates,
   but it is not a durable idempotency key across process restarts.

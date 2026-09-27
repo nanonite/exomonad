@@ -85,6 +85,7 @@ def test_reconciliation_is_defined_for_every_slice_status(status: SliceStatus) -
     expected_action = {
         SliceStatus.DISPATCHING: "await_authoritative_spawn_event",
         SliceStatus.DISPATCH_UNCONFIRMED: "await_authoritative_spawn_event",
+        SliceStatus.DISPATCH_RETRY_SCHEDULED: "await_dispatch_retry_boundary",
         SliceStatus.SPAWNED: "await_review_event",
         SliceStatus.IN_REVIEW: "await_merge_event",
         SliceStatus.REPAIRING: "await_repair_event",

@@ -830,6 +830,23 @@ The controller resumes from the checkpoint. It does not coax a model to keep
 working, silently retry beyond a ceiling, or ask a second interactive TL to
 make the decision.
 
+A dispatch failure is one of those bounded failures, and it is classified by a
+stable machine code rather than by a message. The code is the `code` the runtime
+recorded on the correlated `agent.spawn_failed` ledger event. A transient code —
+`worktree.branch_exists` (a creation race), `worktree.lifecycle_lock_timeout`,
+or an explicit `dispatch.transport_timeout` — schedules a durable
+`dispatch_retry_scheduled` boundary with bounded exponential backoff and is
+re-driven idempotently, so the only recovery signal is never traded for a
+duplicate leaf, branch, worktree, or PR. The boundary carries no intent, because
+nothing was created; a restart inside the window resumes the same boundary and
+issues no effect. Every other code, including one the runtime never recorded, is
+terminal: `worktree.branch_ownership_conflict` parks immediately on
+`tl-dispatch-ownership-conflict`, and exhausting `dispatch_retry_limit` (default
+3) opens `tl-dispatch-failed` keeping the machine code. Elapsed time and silence
+are never evidence of failure, and abandoned durable guidance is re-queued with
+its `batch_id` recorded rather than dropped. See
+[tl_loop/CLAUDE.md](tl_loop/CLAUDE.md) for the full table and knobs.
+
 ### Plan quality
 
 Every plan follows the same compact contract:

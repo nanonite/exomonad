@@ -211,6 +211,35 @@ names the deterministic branch, the missing or conflicting evidence, and the
 operator action, because the branch is deterministic and no alternative slug
 exists.
 
+### Provisioning events and the machine codes a caller classifies
+
+Provisioning records its own decisions in the ledger, because a caller that must
+decide whether to retry cannot see the in-process outcome:
+
+| Event | Written when | Carries |
+|-------|--------------|---------|
+| `agent.attach_decided` | once per provisioning, before the first fallible creation | `action` (`attach` / `create_from_revision` / `create_from_base`), `branch_exists`, `start_point`, `branch`, `worktree_path` |
+| `agent.attach_completed` | once per provisioning that reached an outcome | the same `action` plus `created`, so a reuse is never reported as a creation |
+| `agent.branch_ownership_conflict` | once per refused provisioning whose typed code is `worktree.branch_ownership_conflict` | `machine_code`, `branch`, `worktree_path` |
+
+`provision_leaf_worktree` wraps the whole run, so a refusal emits the decision
+and, when it is an ownership conflict, the conflict — and no completion. The
+recorded events name the leaf they are about, so they are attributable without
+a separate correlation table.
+
+Every resource-creation refusal a controller may need to classify carries a
+stable code, read from the typed `EffectError` variant and never recovered from
+prose. `agent.spawn_failed` in `handlers/agent.rs` writes that `code` as its own
+field beside the operator-facing `error` string; an untyped error records a null
+`code` rather than a guess, and a `EffectError::Timeout` records
+`dispatch.transport_timeout`. The codes a caller classifies are
+`worktree.branch_exists` (a creation race that an attach recovers),
+`worktree.lifecycle_lock_timeout` (the exclusive lock was busy, so the
+create/attach decision never ran), `worktree.branch_ownership_conflict`
+(terminal), and `worktree.pr_context_unavailable` (terminal). A lifecycle-lock
+timeout is a transient refusal and carries its code from
+`acquire_worktree_lifecycle`, so a caller does not have to infer it.
+
 ### The head set is proven on reuse too, not only on attach
 
 `verify_leaf_head_evidence` is the single implementation, and it runs on both

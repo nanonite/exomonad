@@ -211,7 +211,9 @@ layer. `tl_loop/events/envelope.py` is a read-only typed projection of Rust's
 other second durable event path. The loop never writes ledger segments. Its
 closed event kinds map only onto event types already present in the
 observability allowlist, and absent review head SHAs remain absent for the
-server-emission findings tracked by M2.7.
+server-emission findings tracked by M2.7. `agent.spawn_failed` is one of them:
+it is the runtime's refusal record, projected so the controller can read its
+machine code rather than infer one.
 
 `tl_loop/events/reader.py` replays those projections by global `run_seq` across
 lexically ordered segments and applies the ledger's supersession and sequence
@@ -234,18 +236,79 @@ ledger event carries the same `intent_id`. That event is the authoritative
 transition to `spawned` and records its `run_seq` as
 `dispatch_authoritative_event_seq`.
 
-An explicit tool rejection becomes `dispatch_failed` and opens the named
-`tl-dispatch-failed` gate. An accepted request with delayed evidence remains
-`dispatch_unconfirmed` indefinitely; `dispatch_timeout` bounds only the
-transport operation and never creates a lifecycle failure. The persisted intent
-and last boundary remain visible until a matching event, verified owner
-reconciliation, explicit cancellation, or human escalation resolves the slice.
+An accepted request with delayed evidence remains `dispatch_unconfirmed`
+indefinitely; `dispatch_timeout` bounds only the transport operation and never
+creates a lifecycle failure. The persisted intent and last boundary remain
+visible until a matching event, verified owner reconciliation, explicit
+cancellation, or human escalation resolves the slice.
 
 On restart, `dispatching` and `dispatch_unconfirmed` slices are reconciled by
 their persisted intent IDs before new effects are considered. Reconciliation
 never issues a second spawn for an existing intent; it waits for matching
 evidence or an explicit resolution. Controller boundary events are limited to
 scalar dimensions and are written by Rust through the `tl` event allowlist.
+
+### Dispatch failure classification and retry
+
+A rejected spawn request is classified by its stable machine code and by
+nothing else. The code is the `code` field of the correlated durable
+`agent.spawn_failed` ledger event, which Rust writes from the typed
+`EffectError` it already returned. The `dispatch_error` prose is written for an
+operator reading a parked run and is never inspected. An unreadable ledger, a
+missing event, and an empty or absent code all resolve to "no code", which is
+terminal.
+
+`tl_loop.loop.dispatch_classification` is the single source of that decision:
+
+| Class | Codes | Why |
+|---|---|---|
+| retryable | `worktree.branch_exists` | a creation race; the branch now exists, so a re-drive attaches to it |
+| retryable | `worktree.lifecycle_lock_timeout` | the shared lifecycle lock was busy, so the create/attach decision never ran |
+| retryable | `dispatch.transport_timeout` | an explicit transport timeout rejection, so the boundary is known incomplete |
+| terminal | `worktree.branch_ownership_conflict` | the birth branch belongs to another worktree owner; no retry can change that |
+| terminal | `worktree.pr_context_unavailable` | the forge could not supply the resume context; the operator must fix it first |
+| terminal | every other code, and no code | fail closed: an unclassified refusal is never retried by default |
+
+Adding a code to `RETRYABLE_CODES` asserts both that re-driving the same
+dispatch is safe and that the underlying condition is transient. It is never a
+prose pattern and never a time-based inference.
+
+A retryable rejection does not leave a `dispatching` intent behind. The slice
+moves to `dispatch_retry_scheduled` with `dispatch_retry_attempt`,
+`dispatch_next_attempt_at`, `dispatch_error_code`, and `dispatch_error`; the
+intent, agent, and invocation identities are cleared, because no leaf, branch,
+worktree, or PR exists yet. That status is the only evidence of the boundary
+and the schema rejects it if it carries a leaf identity, a missing code, or a
+missing instant. Reconciliation leaves it alone: re-driving happens through the
+ordinary dispatch path, once `dispatch_next_attempt_at` has arrived, which makes
+the backoff a durable scheduled boundary rather than an in-memory sleep. A
+restart inside the window resumes the same boundary and issues no intent and no
+spawn.
+
+The boundary is idempotent per dispatch attempt. `dispatch_retry_for_attempt`
+records which attempt it was scheduled for, so repeated reconciliation of the
+same rejected attempt neither consumes budget twice nor reschedules.
+
+The delay is bounded exponential backoff. The knobs are `dispatch_retry_limit`
+(default 3 scheduled retries), `dispatch_retry_base_delay_seconds` (default
+5.0), and `dispatch_retry_max_delay_seconds` (default 60.0) on `TLLoopConfig`;
+the first scheduled retry waits one base delay and each later one doubles up
+to the cap. `wall_clock` injects the dispatch clock, and every backoff decision
+reads it rather than sleeping.
+
+Exactly one named human gate is opened for a terminal dispatch failure, and
+`tl.gate_opened` is emitted only when that gate is not already pending.
+`tl-dispatch-ownership-conflict` is opened immediately for a terminal
+ownership conflict, because the operator action differs: they must resolve who
+owns the branch, not merely acknowledge a refusal. `tl-dispatch-failed` is
+opened when the configured attempt limit is exhausted, keeping the machine code
+that proved the last attempt retryable.
+
+`tl.dispatch_retry_scheduled` carries `machine_code`, `retry_attempt`, and
+`next_attempt_at` as their own dimensions beside the operator prose, so a
+reader can classify a retry without parsing a message. `agent.spawn_failed`
+rows are telemetry for the loop: the boundary is already persisted, and the
+event is the evidence the classification reads.
 
 Recursive sub-TL controllers remain supervised until their own authoritative
 terminal phase. Parent joins and configured leaf/reviewer session-age

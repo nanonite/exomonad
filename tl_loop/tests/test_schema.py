@@ -136,6 +136,36 @@ def test_spawned_slice_requires_authoritative_dispatch_evidence() -> None:
     _assert_rejected(missing_evidence, "dispatch_intent_id")
 
 
+def test_a_scheduled_dispatch_retry_carries_no_leaf_identity() -> None:
+    """A retry boundary exists because nothing was created, and must say so."""
+    document = _valid_document()
+    slice_state = _slice(document, "slice-a")
+    slice_state.update(
+        {
+            "status": "dispatch_retry_scheduled",
+            "attempts": 1,
+            "dispatch_error": "branch already exists in another checkout",
+            "dispatch_error_code": "worktree.branch_exists",
+            "dispatch_retry_attempt": 1,
+            "dispatch_next_attempt_at": 1010.0,
+        }
+    )
+    validate(document)
+
+    for absent in ("dispatch_intent_id", "dispatch_agent_id", "dispatch_invocation_id"):
+        stale = deepcopy(document)
+        _slice(stale, "slice-a")[absent] = "identity-that-claims-a-leaf"
+        _assert_rejected(stale, absent)
+
+
+def test_a_scheduled_dispatch_retry_must_carry_its_code_and_instant() -> None:
+    document = _valid_document()
+    slice_state = _slice(document, "slice-a")
+    slice_state.update({"status": "dispatch_retry_scheduled", "attempts": 1})
+    for field in ("dispatch_error_code", "dispatch_next_attempt_at", "dispatch_retry_attempt"):
+        _assert_rejected(document, field)
+
+
 def test_merge_evidence_is_typed_and_exact_head_bound() -> None:
     document = _valid_document()
     document["state_version"] = 3

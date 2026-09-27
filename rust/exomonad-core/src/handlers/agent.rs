@@ -1250,7 +1250,7 @@ impl<
                     ctx.agent_name.as_ref(),
                     &req.name,
                     &req.intent_id,
-                    &error.to_string(),
+                    &error,
                 );
                 return Err(error);
             }
@@ -2402,7 +2402,7 @@ impl<
                     ctx.agent_name.as_ref(),
                     &req.branch_name,
                     &req.intent_id,
-                    &error.to_string(),
+                    &error,
                 );
                 return Err(error);
             }
@@ -4550,19 +4550,31 @@ fn spawn_result_branch_name(
     Ok(&result.branch_name)
 }
 
+/// Record one refused spawn, carrying the typed code the controller classifies.
+///
+/// The controller's dispatch classification reads only `code`. `error` stays
+/// operator-facing prose, so re-wording a message can never change whether a
+/// dispatch is retried. An error with no typed code records a null `code`,
+/// which the controller classifies as terminal.
 fn append_spawn_failed<C: HasEventLog>(
     ctx: &Arc<C>,
     parent_agent: &str,
     child_agent: &str,
     intent_id: &str,
-    error: &str,
+    error: &EffectError,
 ) {
     let Some(log) = ctx.event_log() else {
         return;
     };
+    let code = match error {
+        EffectError::Custom { code, .. } => Some(code.clone()),
+        EffectError::Timeout { .. } => Some("dispatch.transport_timeout".to_string()),
+        _ => None,
+    };
     let mut payload = serde_json::json!({
         "child_agent": child_agent,
-        "error": error,
+        "error": error.to_string(),
+        "code": code,
         "source": "rust",
     });
     if !intent_id.trim().is_empty() {
@@ -4844,6 +4856,65 @@ mod tests {
         let services = Arc::new(crate::services::Services::test());
         let service = Arc::new(AgentControlService::new(services.clone()));
         AgentHandler::new(service, services)
+    }
+
+    /// The controller classifies a refused spawn by this field alone, so the
+    /// typed code must survive into the ledger next to the operator prose.
+    #[test]
+    fn a_refused_spawn_records_its_machine_code() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp.path().to_path_buf();
+        services.event_log = Some(Arc::new(
+            crate::services::EventLog::open(temp.path().join(".exo/logs")).expect("event log"),
+        ));
+        let services = Arc::new(services);
+
+        append_spawn_failed(
+            &services,
+            "root",
+            "leaf-a",
+            "intent-1",
+            &EffectError::custom("worktree.branch_exists", "branch already exists"),
+        );
+
+        let records = crate::services::immutable_ledger::LedgerWriter::open_project(temp.path())
+            .expect("ledger opens")
+            .read_resolved_events()
+            .expect("ledger reads");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event.event_type, "agent.spawn_failed");
+        assert_eq!(records[0].event.data["code"], "worktree.branch_exists");
+        assert_eq!(records[0].event.data["intent_id"], "intent-1");
+    }
+
+    #[test]
+    fn an_untyped_refusal_records_no_code_rather_than_a_guess() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp.path().to_path_buf();
+        services.event_log = Some(Arc::new(
+            crate::services::EventLog::open(temp.path().join(".exo/logs")).expect("event log"),
+        ));
+        let services = Arc::new(services);
+
+        append_spawn_failed(
+            &services,
+            "root",
+            "leaf-a",
+            "intent-1",
+            &EffectError::invalid_input("branch_name is required"),
+        );
+
+        let records = crate::services::immutable_ledger::LedgerWriter::open_project(temp.path())
+            .expect("ledger opens")
+            .read_resolved_events()
+            .expect("ledger reads");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].event.data["code"].is_null(),
+            "an untyped refusal must leave the code absent, never inferred from prose"
+        );
     }
 
     async fn ownership_services(

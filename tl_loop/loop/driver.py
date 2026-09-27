@@ -239,6 +239,14 @@ from tl_loop.state.store import (
     create,
 )
 
+from .dispatch_classification import (
+    DEFAULT_RETRY_BASE_DELAY_SECONDS,
+    DEFAULT_RETRY_LIMIT,
+    DEFAULT_RETRY_MAX_DELAY_SECONDS,
+    DispatchFailureClass,
+    classify_dispatch_failure,
+    dispatch_retry_delay,
+)
 from .journal import MUTATING_OPERATIONS, ActionJournalError, EffectJournal, stable_action_key
 from .observation import WatcherObservation
 from .reconcile import (
@@ -262,6 +270,7 @@ from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slice
 
 LOGGER = logging.getLogger(__name__)
 DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
+DISPATCH_OWNERSHIP_CONFLICT_GATE_NAME = "tl-dispatch-ownership-conflict"
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
@@ -279,6 +288,8 @@ MAX_CONVERGENCE_STEPS = 8
 # direct-leaf/worker scope may need.
 DIRECT_SCOPE_DRAIN_STEP_LIMIT = 64
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
+#: Statuses whose next effect is a fresh spawn attempt, not an observation.
+REDRIVEN_DISPATCH_STATUSES = frozenset({SliceStatus.DISPATCH_RETRY_SCHEDULED})
 REMOTE_ADVANCE_FAILURE_MARKERS = (
     "force-with-lease",
     "stale info",
@@ -693,6 +704,10 @@ class TLLoopConfig:
     task_timeout_source: str = "built_in"
     max_base_revalidations: int = 3
     max_integration_repairs: int = 3
+    dispatch_retry_limit: int = DEFAULT_RETRY_LIMIT
+    dispatch_retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
+    dispatch_retry_max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
+    wall_clock: Callable[[], float] | None = None
     heartbeat: HeartbeatConfig | None = None
     goals: GoalState | None = None
     chainlink_issue_id: int | None = None
@@ -739,10 +754,27 @@ class TLLoopConfig:
             "max_events",
             "max_base_revalidations",
             "max_integration_repairs",
+            "dispatch_retry_limit",
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        for name in (
+            "dispatch_retry_base_delay_seconds",
+            "dispatch_retry_max_delay_seconds",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ValueError(f"{name} must be a non-negative number")
+        if (
+            self.dispatch_retry_max_delay_seconds
+            < self.dispatch_retry_base_delay_seconds
+        ):
+            raise ValueError(
+                "dispatch_retry_max_delay_seconds must be at least the base delay"
+            )
+        if self.wall_clock is not None and not callable(self.wall_clock):
+            raise TypeError("wall_clock must be a zero-argument callable or null")
         if self.max_parallel_slices is not None and (
             type(self.max_parallel_slices) is not int or self.max_parallel_slices < 0
         ):
@@ -2453,6 +2485,20 @@ def _run_loop(
             _release_replayed_event(store, event, replaying)
             if _is_terminal_phase(phase):
                 break
+            continue
+        if event.kind is EventKind.AGENT_SPAWN_FAILED:
+            # Telemetry-only: the refused spawn is already persisted as a
+            # dispatch boundary by the dispatch path, and this row is the
+            # durable evidence its machine code is read from. There is no
+            # transition to apply and no second decision to make here.
+            diagnostics.correlated += 1
+            _checkpoint_and_ack(
+                store, source, event, state, phase, acknowledge=not replaying
+            )
+            if not replaying:
+                diagnostics.acknowledged += 1
+            _release_replayed_event(store, event, replaying)
+            state = store.load()
             continue
         # Rust's direct agent.spawned records carry the canonical branch and
         # child identity; shadowed replay records use the normal decoder path.
@@ -5820,6 +5866,7 @@ def _record_dispatch_result(
             config,
             effects,
             effects_log,
+            code=_dispatch_failure_code(store, config, attempt),
         )
     boundary = "spawn_request_accepted" if result is not None else "spawn_not_executed"
     current = state.slices[slice_id]
@@ -5831,6 +5878,9 @@ def _record_dispatch_result(
         dispatch_agent_id=_spawn_agent_id(result),
         dispatch_invocation_id=_spawn_invocation_id(result),
         dispatch_error=None,
+        dispatch_error_code=None,
+        dispatch_next_attempt_at=None,
+        dispatch_retry_for_attempt=0,
     )
     state = store.checkpoint(
         state.fsm,
@@ -5859,33 +5909,72 @@ def _record_dispatch_failure(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    *,
+    code: str | None = None,
 ) -> RunState:
+    """Persist one rejected spawn request, retrying or parking from its code.
+
+    A retryable machine code schedules a durable re-drive boundary instead of
+    an unqualified intent: no leaf, branch, worktree, or PR exists yet, so the
+    intent, agent, and invocation identities are cleared. Every other code,
+    including an absent one, is terminal and opens the named gate.
+    """
     bounded_reason = reason[:500]
+    if classify_dispatch_failure(code) is DispatchFailureClass.RETRYABLE:
+        return _record_dispatch_retry_scheduled(
+            store,
+            state,
+            slice_id,
+            attempt,
+            bounded_reason,
+            code,
+            config,
+            effects,
+            effects_log,
+        )
+    return _record_terminal_dispatch_failure(
+        store, state, slice_id, attempt, bounded_reason, code, config, effects, effects_log
+    )
+
+
+def _record_terminal_dispatch_failure(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    attempt: DispatchAttempt,
+    reason: str,
+    code: str | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Park one terminal dispatch failure and open its single named gate."""
     current = state.slices[slice_id]
     updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCH_FAILED))
     updated = replace(
         updated,
         park_cause=ParkCause.DISPATCH_FAILED,
         dispatch_last_boundary="spawn_request_failed",
-        dispatch_error=bounded_reason,
+        dispatch_error=reason,
+        dispatch_error_code=code,
+        dispatch_next_attempt_at=None,
+        dispatch_retry_for_attempt=0,
     )
     before_phase = _phase_from_state(state)
     state = store.checkpoint(
-        _failure_phase(state, f"dispatch failed for {slice_id!r}: {bounded_reason}"),
+        _failure_phase(state, f"dispatch failed for {slice_id!r}: {reason}"),
         {**state.slices, slice_id: updated},
         state.budgets,
         state.events.last_consumed_offset,
     )
-    previous_gate = next(
-        (gate for gate in state.gates if gate.name == DISPATCH_FAILURE_GATE_NAME),
-        None,
-    )
-    state = store.set_gate(DISPATCH_FAILURE_GATE_NAME)
+    gate_name = _dispatch_failure_gate_name(code)
+    previous_gate = next((gate for gate in state.gates if gate.name == gate_name), None)
+    state = store.set_gate(gate_name)
     if previous_gate is None or previous_gate.status is not GateStatus.PENDING:
         _record_controller_event(
             "controller",
             "tl.gate_opened",
-            {"gate_name": DISPATCH_FAILURE_GATE_NAME, "run_id": state.run_id},
+            {"gate_name": gate_name, "run_id": state.run_id},
             config,
             effects,
             effects_log,
@@ -5893,7 +5982,7 @@ def _record_dispatch_failure(
     _record_controller_event(
         slice_id,
         "tl.spawn_request_failed",
-        _dispatch_payload(slice_id, attempt, "spawn_request_failed", error=bounded_reason),
+        _dispatch_payload(slice_id, attempt, "spawn_request_failed", error=reason),
         config,
         effects,
         effects_log,
@@ -5907,6 +5996,143 @@ def _record_dispatch_failure(
         effects_log,
     )
     return state
+
+
+def _dispatch_failure_gate_name(code: str | None) -> str:
+    """Name the gate an operator must answer for one terminal dispatch code.
+
+    An ownership conflict gets its own gate because the operator action differs
+    from every other terminal dispatch failure: they must resolve who owns the
+    branch, not merely acknowledge that a spawn was refused.
+    """
+    if code == "worktree.branch_ownership_conflict":
+        return DISPATCH_OWNERSHIP_CONFLICT_GATE_NAME
+    return DISPATCH_FAILURE_GATE_NAME
+
+
+def _record_dispatch_retry_scheduled(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    attempt: DispatchAttempt,
+    reason: str,
+    code: str | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Record the durable uncreated boundary a retryable rejection schedules.
+
+    The boundary is idempotent per dispatch attempt: a repeated reconciliation
+    that observes the same rejected attempt leaves the counter and the
+    scheduled instant untouched instead of consuming the retry budget twice.
+    Exhausting the configured attempt limit is terminal and keeps the machine
+    code that proved the last attempt retryable.
+    """
+    current = state.slices[slice_id]
+    if current.dispatch_retry_for_attempt == attempt.attempt:
+        return state
+    if current.dispatch_retry_attempt >= config.dispatch_retry_limit:
+        return _record_terminal_dispatch_failure(
+            store, state, slice_id, attempt, reason, code, config, effects, effects_log
+        )
+    retry_attempt = current.dispatch_retry_attempt + 1
+    delay = dispatch_retry_delay(
+        retry_attempt,
+        config.dispatch_retry_base_delay_seconds,
+        config.dispatch_retry_max_delay_seconds,
+    )
+    next_attempt_at = _wall_clock(config) + delay
+    updated = slice_transition(
+        current, SliceStatusChanged(SliceStatus.DISPATCH_RETRY_SCHEDULED)
+    )
+    updated = replace(
+        updated,
+        park_cause=None,
+        dispatch_last_boundary="dispatch_retry_scheduled",
+        dispatch_error=reason,
+        dispatch_error_code=code,
+        dispatch_retry_attempt=retry_attempt,
+        dispatch_next_attempt_at=next_attempt_at,
+        dispatch_retry_for_attempt=attempt.attempt,
+        dispatch_intent_id=None,
+        dispatch_started_at=None,
+        dispatch_agent_id=None,
+        dispatch_invocation_id=None,
+        dispatch_authoritative_event_seq=None,
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, slice_id: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    _record_controller_event(
+        slice_id,
+        "tl.spawn_request_failed",
+        _dispatch_payload(slice_id, attempt, "spawn_request_failed", error=reason),
+        config,
+        effects,
+        effects_log,
+    )
+    _record_controller_event(
+        slice_id,
+        "tl.dispatch_retry_scheduled",
+        _dispatch_retry_payload(
+            slice_id, attempt, reason, code, retry_attempt, next_attempt_at
+        ),
+        config,
+        effects,
+        effects_log,
+    )
+    return state
+
+
+def _wall_clock(config: TLLoopConfig) -> float:
+    """Read the injected dispatch clock, defaulting to the wall clock."""
+    if config.wall_clock is not None:
+        return float(config.wall_clock())
+    return time.time()
+
+
+def _dispatch_failure_code(
+    store: RunStore,
+    config: TLLoopConfig,
+    attempt: DispatchAttempt,
+) -> str | None:
+    """Resolve one rejected dispatch's stable machine code, or None.
+
+    The runtime writes one ``agent.spawn_failed`` ledger event per refused
+    spawn, carrying the typed ``EffectError`` code it already returned. That
+    event is the only channel this classification reads: the rejected tool
+    result's ``error`` prose is operator-facing and is never inspected. The
+    read starts at the first sequence rather than the consumption cursor,
+    because the refusal is written before the response returns and may carry a
+    sequence the loop has not reached yet. An unreadable ledger, a missing
+    event, or an event with no code all resolve to None, which classifies as
+    terminal.
+    """
+    if config.project_root is None or config.ledger_run_id is None:
+        return None
+    try:
+        reader = LedgerReader(
+            Path(config.project_root) / ".exo" / "ledger" / "segments",
+            run_dir=store.run_dir,
+            ledger_run_id=config.ledger_run_id,
+        )
+        result = reader.read_from(cursor=0)
+    except (LedgerReadError, OSError, ValueError):
+        return None
+    code: str | None = None
+    for event in result.events:
+        if event.event_type != "agent.spawn_failed":
+            continue
+        if event.data.get("intent_id") != attempt.intent_id:
+            continue
+        raw = event.data.get("code")
+        if isinstance(raw, str) and raw:
+            code = raw
+    return code
 
 
 ACTION_JOURNAL_GATE_PREFIX = "tl-action-journal-"
@@ -6183,7 +6409,13 @@ def _reconcile_dispatches(
     store: RunStore,
     effects_log: list[EffectIntent],
 ) -> RunState:
-    """Adopt persisted dispatches before any restart can issue a duplicate."""
+    """Adopt persisted dispatches before any restart can issue a duplicate.
+
+    A slice parked on a retry boundary has no intent to reconcile: resource
+    creation never completed, so there is nothing to adopt and nothing to
+    wait for. It is left on its persisted boundary, and the dispatch path
+    re-drives it only once that boundary's instant has arrived.
+    """
     pending = [
         slice_state
         for slice_state in state.slices.values()
@@ -7392,6 +7624,28 @@ def _dispatch_payload(
     return payload
 
 
+def _dispatch_retry_payload(
+    slice_id: str,
+    attempt: DispatchAttempt,
+    reason: str,
+    code: str | None,
+    retry_attempt: int,
+    next_attempt_at: float,
+) -> dict[str, object]:
+    """Build the scheduled-retry payload, keeping the code beside the prose.
+
+    The machine code is its own dimension so a reader can classify a retry
+    without parsing the operator-facing error text.
+    """
+    payload = _dispatch_payload(
+        slice_id, attempt, "dispatch_retry_scheduled", error=reason
+    )
+    payload["machine_code"] = code
+    payload["retry_attempt"] = retry_attempt
+    payload["next_attempt_at"] = next_attempt_at
+    return payload
+
+
 def _spawn_route(
     attempt: DispatchAttempt, fallback_harness: str | None
 ) -> tuple[str | None, str | None]:
@@ -7650,6 +7904,36 @@ def _spawn_invocation_id(result: ToolResult | None) -> str | None:
     return None
 
 
+def _dispatch_candidate(name: str, state: RunState, config: TLLoopConfig) -> bool:
+    """Whether this slice's next dispatch effect may be issued now.
+
+    A due retry boundary is a fresh dispatch of a slice that already holds a
+    scheduling slot, so it is not re-gated by the pending-slice width ceiling.
+    A boundary whose scheduled instant has not arrived is not a candidate at
+    all: the backoff is a durable boundary, never an in-memory sleep.
+    """
+    current = state.slices.get(name)
+    if current is not None and _retry_boundary_due(current, config):
+        return True
+    if _already_dispatched(name, state):
+        return False
+    return _can_dispatch(name, state, config)
+
+
+def _retry_boundary_due(current: SliceState, config: TLLoopConfig) -> bool:
+    """Whether one persisted retry boundary has reached its scheduled instant.
+
+    A boundary without a scheduled instant is never due: the controller fails
+    closed rather than re-driving a dispatch it cannot date.
+    """
+    if current.status not in REDRIVEN_DISPATCH_STATUSES:
+        return False
+    scheduled = current.dispatch_next_attempt_at
+    if scheduled is None:
+        return False
+    return scheduled <= _wall_clock(config)
+
+
 def _dispatch_children(
     plan: WorkPlan,
     state: RunState,
@@ -7661,14 +7945,7 @@ def _dispatch_children(
     live = cast(EffectClient, effects) if config.active else None
     before_slices = state.slices
     for worker in plan.workers:
-        try:
-            dispatchable = _can_dispatch(worker.name, state, config)
-        except ScheduleDeadlock as error:
-            _park_schedule_deadlock(error, state, config, live, store)
-            raise TLLoopError(str(error)) from error
-        if not dispatchable:
-            continue
-        if _already_dispatched(worker.name, state):
+        if not _dispatch_candidate(worker.name, state, config):
             continue
         attempt = _prepare_spawn(worker.name, state, config, effects, store, effects_log)
         state = store.load()
@@ -7691,7 +7968,15 @@ def _dispatch_children(
             )
         except Exception as error:  # noqa: BLE001 - persist the boundary failure
             return _record_dispatch_failure(
-                store, state, worker.name, attempt, str(error), config, effects, effects_log
+                store,
+                state,
+                worker.name,
+                attempt,
+                str(error),
+                config,
+                effects,
+                effects_log,
+                code=_dispatch_failure_code(store, config, attempt),
             )
         state = _record_dispatch_result(
             store, state, worker.name, attempt, result, config, effects, effects_log
@@ -7699,14 +7984,7 @@ def _dispatch_children(
         if state.fsm.phase is TLPhase.TLFailed:
             return state
     for leaf in plan.leaves:
-        try:
-            dispatchable = _can_dispatch(leaf.name, state, config)
-        except ScheduleDeadlock as error:
-            _park_schedule_deadlock(error, state, config, live, store)
-            raise TLLoopError(str(error)) from error
-        if not dispatchable:
-            continue
-        if _already_dispatched(leaf.name, state):
+        if not _dispatch_candidate(leaf.name, state, config):
             continue
         attempt = _prepare_spawn(leaf.name, state, config, effects, store, effects_log)
         state = store.load()
@@ -7739,7 +8017,15 @@ def _dispatch_children(
             )
         except Exception as error:  # noqa: BLE001 - persist the boundary failure
             return _record_dispatch_failure(
-                store, state, leaf.name, attempt, str(error), config, effects, effects_log
+                store,
+                state,
+                leaf.name,
+                attempt,
+                str(error),
+                config,
+                effects,
+                effects_log,
+                code=_dispatch_failure_code(store, config, attempt),
             )
         state = _record_dispatch_result(
             store, state, leaf.name, attempt, result, config, effects, effects_log

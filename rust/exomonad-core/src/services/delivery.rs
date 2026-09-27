@@ -1104,7 +1104,7 @@ where
                     recipient = %message.recipient,
                     attempts = attempt,
                     error = %error,
-                    "agent inbox delivery abandoned after exhausting retries; message dropped"
+                    "agent inbox delivery abandoned after exhausting retries; guidance stays durably queued"
                 );
                 tracing::info!(
                     otel.name = "agent_inbox.messages_abandoned",
@@ -1121,18 +1121,27 @@ where
                     )
                     .await;
                     if let Ok(log) = crate::services::EventLog::open(sink.dir.join(".exo/logs")) {
+                        // The durable batch id is the recovery handle: it names
+                        // the row a rebuild re-queues, so the only recovery signal
+                        // for this guidance is never reduced to a process-local
+                        // message id that dies with this cache.
                         let _ = log.append(
                             "agent_inbox.messages_abandoned",
                             &message.recipient,
                             &serde_json::json!({
                                 "message_id": message.id,
+                                "batch_id": message.batch_id(),
                                 "recipient": message.recipient,
                                 "attempts": attempt,
-                                "outcome": "abandoned"
+                                "outcome": "requeued",
+                                "recovery": "durable_guidance_queue"
                             }),
                         );
                     }
                 }
+                // The durable row is untouched and its cache key is cleared, so
+                // this guidance is re-queued rather than dropped: the only
+                // recovery signal for a parked or stalled run must survive.
                 GLOBAL_AGENT_INBOX
                     .abandon_delivery(&agent, message.id)
                     .await;
@@ -2382,6 +2391,43 @@ mod tests {
             .await
             .unwrap();
         assert!(!retry.dropped_as_duplicate);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_guidance_records_its_durable_recovery_handle() {
+        let agent = "abandoned-guidance-agent";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let message = tmux_message("[MERGE READY] PR #77")
+            .with_project_root(temp.path().to_path_buf())
+            .with_cache_key("batch-recovery-1");
+        GLOBAL_AGENT_INBOX.enqueue(agent, message).await.unwrap();
+
+        let (calls, inject) = flaky_injector(u32::MAX);
+        run_inbox_consumer(agent.to_string(), inject).await;
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), MAX_DELIVERY_ATTEMPTS);
+        let abandoned = read_abandonment_events(temp.path());
+        assert_eq!(abandoned.len(), 1, "one row per exhausted delivery");
+        assert_eq!(abandoned[0]["batch_id"], "batch-recovery-1");
+        assert_eq!(abandoned[0]["outcome"], "requeued");
+        assert_eq!(abandoned[0]["recovery"], "durable_guidance_queue");
+        assert!(
+            abandoned[0]["message_id"].is_u64(),
+            "the process-local id is still recorded, but not alone"
+        );
+    }
+
+    /// Read the durable rows one abandoned delivery appended, through the
+    /// ledger the runtime itself writes.
+    fn read_abandonment_events(project_root: &std::path::Path) -> Vec<serde_json::Value> {
+        crate::services::immutable_ledger::LedgerWriter::open_project(project_root)
+            .expect("ledger opens")
+            .read_resolved_events()
+            .expect("ledger reads")
+            .into_iter()
+            .filter(|record| record.event.event_type == "agent_inbox.messages_abandoned")
+            .map(|record| record.event.data.clone())
+            .collect()
     }
 
     /// Regression test for #543: a failed delivery must not end the consumer while

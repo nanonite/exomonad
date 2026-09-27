@@ -49,6 +49,15 @@ fn leaf_worktree_action(branch_exists: bool, start_point: Option<&str>) -> LeafW
     }
 }
 
+/// The durable name of one provisioning decision, as recorded in the ledger.
+fn action_name(action: LeafWorktreeAction) -> &'static str {
+    match action {
+        LeafWorktreeAction::Attach => "attach",
+        LeafWorktreeAction::CreateFromRevision => "create_from_revision",
+        LeafWorktreeAction::CreateFromBase => "create_from_base",
+    }
+}
+
 /// Decide whether a failed branch creation may be recovered by one attach.
 ///
 /// Only the stable branch-exists code proves that another creator won the race.
@@ -82,6 +91,9 @@ struct LeafProvisioning<'a, 'b> {
     worktree_path: &'a Path,
     branch: &'a BranchName,
     base_branch: &'a BranchName,
+    /// The leaf these provisioning events are about, so an event names the
+    /// agent whose spawn made the decision rather than an anonymous actor.
+    agent_name: &'a AgentName,
     branch_exists: bool,
     start_point: Option<&'a str>,
     heads: LeafHeadEvidence<'b>,
@@ -331,6 +343,24 @@ fn branch_ownership_conflict(detail: String) -> anyhow::Error {
         detail
     ))
 }
+
+/// The stable code that identifies one typed resource-creation refusal.
+///
+/// The controller's dispatch classification reads this code and nothing else.
+/// It is read from the error's typed variant, never recovered from prose, so a
+/// reworded message can never change whether a failure is retried.
+fn stable_error_code(error: &anyhow::Error) -> Option<&str> {
+    match error.downcast_ref::<EffectError>() {
+        Some(EffectError::Custom { code, .. }) => Some(code.as_str()),
+        _ => None,
+    }
+}
+
+/// The leaf branch holds a machine code whose retryability is a reviewed fact.
+///
+/// Every other code, including an untyped error, is terminal: the controller
+/// fails closed rather than inferring that an untyped refusal is temporary.
+pub(crate) const BRANCH_OWNERSHIP_CONFLICT_CODE: &str = "worktree.branch_ownership_conflict";
 
 /// What the attach predicate proved about a deterministic branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1167,6 +1197,7 @@ impl<
             + super::super::HasGitWorktreeService
             + super::super::HasInboxStore
             + super::super::HasSessionMemory
+            + crate::services::HasEventLog
             + 'static,
     > AgentControlService<C>
 {
@@ -1196,14 +1227,28 @@ impl<
         &self,
         request: LeafProvisioning<'_, '_>,
     ) -> Result<Option<WorktreeRollback>> {
+        let action = leaf_worktree_action(request.branch_exists, request.start_point);
+        self.record_attach_decision(&request, action);
+        let provisioned = self.run_leaf_provisioning(&request, action).await;
+        if let Err(error) = provisioned.as_ref() {
+            self.record_ownership_conflict(&request, error);
+        }
+        provisioned
+    }
+
+    async fn run_leaf_provisioning(
+        &self,
+        request: &LeafProvisioning<'_, '_>,
+        action: LeafWorktreeAction,
+    ) -> Result<Option<WorktreeRollback>> {
         let git_wt = self.git_wt();
         let mut rollback =
             WorktreeRollback::armed(git_wt.clone(), request.worktree_path.to_path_buf());
         git_wt.prune_worktrees()?;
-        let created = match leaf_worktree_action(request.branch_exists, request.start_point) {
+        let created = match action {
             LeafWorktreeAction::Attach => {
                 let fresh_remote = request.fresh_remote.clone();
-                self.attach_leaf_branch(&request, fresh_remote).await?
+                self.attach_leaf_branch(request, fresh_remote).await?
                     == LeafAttachability::Attachable
             }
             LeafWorktreeAction::CreateFromRevision => {
@@ -1211,7 +1256,7 @@ impl<
                     .start_point
                     .expect("CreateFromRevision requires a start point");
                 self.recover_lost_creation_race(
-                    &request,
+                    request,
                     self.create_worktree_from_revision_checked(
                         request.worktree_path,
                         request.branch,
@@ -1223,7 +1268,7 @@ impl<
             }
             LeafWorktreeAction::CreateFromBase => {
                 self.recover_lost_creation_race(
-                    &request,
+                    request,
                     self.create_worktree_checked(
                         request.worktree_path,
                         request.branch,
@@ -1235,6 +1280,7 @@ impl<
             }
         };
         if created {
+            self.record_attach_completed(request, action, true);
             return Ok(Some(rollback));
         }
         info!(
@@ -1242,8 +1288,83 @@ impl<
             branch = %request.branch,
             "Reusing the worktree that already holds the deterministic branch"
         );
+        self.record_attach_completed(request, action, false);
         rollback.defuse();
         Ok(None)
+    }
+
+    /// Record the durable attach-versus-create decision for one provisioning.
+    ///
+    /// The decision is durable because the controller's dispatch classification
+    /// and any operator reading a parked run both need to know which branch of
+    /// the spawn state machine ran, not just its outcome.
+    fn record_attach_decision(
+        &self,
+        request: &LeafProvisioning<'_, '_>,
+        action: LeafWorktreeAction,
+    ) {
+        self.append_spawn_event(
+            "agent.attach_decided",
+            request.agent_name,
+            &serde_json::json!({
+                "branch": request.branch.as_str(),
+                "worktree_path": request.worktree_path.display().to_string(),
+                "action": action_name(action),
+                "branch_exists": request.branch_exists,
+                "start_point": request.start_point,
+            }),
+        );
+    }
+
+    /// Record whether provisioning created the worktree or reused an existing one.
+    fn record_attach_completed(
+        &self,
+        request: &LeafProvisioning<'_, '_>,
+        action: LeafWorktreeAction,
+        created: bool,
+    ) {
+        self.append_spawn_event(
+            "agent.attach_completed",
+            request.agent_name,
+            &serde_json::json!({
+                "branch": request.branch.as_str(),
+                "worktree_path": request.worktree_path.display().to_string(),
+                "action": action_name(action),
+                "created": created,
+            }),
+        );
+    }
+
+    /// Record one branch-ownership conflict, which is always terminal.
+    ///
+    /// Emitted at the boundary where the refusal leaves this attempt, so the
+    /// event is recorded exactly once per refused spawn and carries no prose
+    /// the controller would have to classify.
+    fn record_ownership_conflict(&self, request: &LeafProvisioning<'_, '_>, error: &anyhow::Error) {
+        if stable_error_code(error) != Some(BRANCH_OWNERSHIP_CONFLICT_CODE) {
+            return;
+        }
+        self.append_spawn_event(
+            "agent.branch_ownership_conflict",
+            request.agent_name,
+            &serde_json::json!({
+                "branch": request.branch.as_str(),
+                "worktree_path": request.worktree_path.display().to_string(),
+                "machine_code": BRANCH_OWNERSHIP_CONFLICT_CODE,
+            }),
+        );
+    }
+
+    fn append_spawn_event(
+        &self,
+        event_type: &str,
+        agent_name: &AgentName,
+        payload: &serde_json::Value,
+    ) {
+        let Some(log) = self.ctx.event_log() else {
+            return;
+        };
+        let _ = log.append(event_type, agent_name.as_str(), payload);
     }
 
     /// Attach the deterministic branch at the leaf path, or report that the
@@ -2757,6 +2878,7 @@ impl<
                         worktree_path: &worktree_path,
                         branch: &branch_name,
                         base_branch: &current_branch,
+                        agent_name: &agent_name,
                         branch_exists: branch_state.exists,
                         start_point: options.start_point.as_deref(),
                         heads,
@@ -3368,6 +3490,12 @@ mod tests {
             let mut services = crate::services::Services::test();
             services.project_dir = repo.clone();
             services.git_wt = git_wt.clone();
+            // The provisioning events are durable, so a test that asserts one
+            // must read the same ledger a run would.
+            services.event_log = Some(Arc::new(
+                crate::services::EventLog::open(repo.join(".exo").join("logs"))
+                    .expect("event log opens"),
+            ));
             Self {
                 leaf_path: temp.path().join("worktrees").join(slug),
                 service: AgentControlService::new(Arc::new(services)),
@@ -3378,6 +3506,19 @@ mod tests {
                 branch,
                 repo,
             }
+        }
+
+        /// Every provisioning event this fixture's ledger recorded, by type.
+        fn recorded(&self, event_type: &str) -> Vec<serde_json::Value> {
+            let writer = crate::services::immutable_ledger::LedgerWriter::open_project(&self.repo)
+                .expect("ledger opens");
+            writer
+                .read_resolved_events()
+                .expect("ledger reads")
+                .into_iter()
+                .filter(|record| record.event.event_type == event_type)
+                .map(|record| record.event.data.clone())
+                .collect()
         }
 
         fn repo(&self) -> &Path {
@@ -3571,6 +3712,7 @@ mod tests {
                 worktree_path: &self.leaf_path,
                 branch: &self.branch,
                 base_branch: &self.base,
+                agent_name: &self.leaf_agent,
                 branch_exists: state.exists,
                 start_point: None,
                 heads,
@@ -3796,6 +3938,123 @@ mod tests {
         assert!(rollback.is_some());
         assert_eq!(fixture.branch_head(), head);
         assert_eq!(git_output(&fixture.leaf_path, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn a_created_branch_records_the_decision_and_the_completion() {
+        let fixture = LeafFixture::new("decided");
+
+        let rollback = provisioned(
+            fixture
+                .service
+                .provision_leaf_worktree(
+                    fixture
+                        .provisioning_with_heads(false, LeafHeadEvidence::default())
+                        .await,
+                )
+                .await,
+        );
+
+        assert!(rollback.is_some());
+        let decided = fixture.recorded("agent.attach_decided");
+        assert_eq!(decided.len(), 1, "exactly one decision per provisioning");
+        assert_eq!(decided[0]["action"], "create_from_base");
+        assert_eq!(decided[0]["branch_exists"], false);
+        assert_eq!(decided[0]["branch"], fixture.branch.as_str());
+        let completed = fixture.recorded("agent.attach_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["created"], true);
+        assert_eq!(completed[0]["action"], "create_from_base");
+    }
+
+    #[tokio::test]
+    async fn a_reused_worktree_records_completion_without_claiming_a_creation() {
+        let fixture = LeafFixture::new("reused");
+        fixture.seed_branch();
+        fixture.attach_leaf_worktree();
+
+        let rollback = provisioned(
+            fixture
+                .service
+                .provision_leaf_worktree(
+                    fixture
+                        .provisioning_with_heads(true, LeafHeadEvidence::default())
+                        .await,
+                )
+                .await,
+        );
+
+        assert!(
+            rollback.is_none(),
+            "a reused worktree must never be rolled back by this attempt"
+        );
+        let decided = fixture.recorded("agent.attach_decided");
+        assert_eq!(decided[0]["action"], "attach");
+        let completed = fixture.recorded("agent.attach_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["created"], false);
+    }
+
+    #[tokio::test]
+    async fn an_ownership_conflict_records_its_terminal_machine_code() {
+        let fixture = LeafFixture::new("conflict");
+        fixture.preserve_branch("work in progress");
+        git(fixture.repo(), &["push", "origin", fixture.branch.as_str()]);
+        // A second worktree of this repository holds the deterministic branch,
+        // which is the only shape `registered_worktree_for_branch` can see.
+        let holder = fixture.repo().join("holder");
+        git(
+            fixture.repo(),
+            &[
+                "worktree",
+                "add",
+                holder.to_str().unwrap(),
+                fixture.branch.as_str(),
+            ],
+        );
+        let state = fixture
+            .service
+            .read_leaf_branch_state(fixture.repo(), &fixture.branch)
+            .await
+            .expect("branch state inspection must succeed");
+        assert!(state.exists);
+        assert!(
+            fixture
+                .git_wt
+                .registered_worktree_for_branch(&fixture.branch)
+                .expect("registry lookup must succeed")
+                .is_some(),
+            "another worktree of this repository must hold the branch"
+        );
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(
+                    fixture
+                        .provisioning_with_state(state, LeafHeadEvidence::default())
+                        .await,
+                )
+                .await,
+        );
+
+        assert_eq!(
+            stable_error_code(&error),
+            Some(BRANCH_OWNERSHIP_CONFLICT_CODE),
+            "the refusal must carry the terminal code the controller classifies"
+        );
+        let conflicts = fixture.recorded("agent.branch_ownership_conflict");
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "one conflict row per refused provisioning"
+        );
+        assert_eq!(conflicts[0]["machine_code"], BRANCH_OWNERSHIP_CONFLICT_CODE);
+        assert_eq!(conflicts[0]["branch"], fixture.branch.as_str());
+        assert!(
+            fixture.recorded("agent.attach_completed").is_empty(),
+            "a refused provisioning must not claim a completion"
+        );
     }
 
     #[tokio::test]

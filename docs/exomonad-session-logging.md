@@ -262,7 +262,8 @@ standard EventLog row:
 - `message.delivery`: delivery channel, method, outcome, detail, and attempt;
 - `agent.message_sent`: address, method, and success;
 - `agent_inbox.duplicates_dropped`: recipient, durable cache key, and transport-cache authority;
-- `agent_inbox.messages_abandoned`: recipient and retry count;
+- `agent_inbox.messages_abandoned`: recipient, retry count, and the durable
+  `batch_id` that a rebuild re-queues;
 - `agent.guidance.delivery`: also has a lifecycle EventLog representation;
 - delivery/inbox retry and backoff spans.
 
@@ -377,7 +378,8 @@ suspension, and worker exit diagnostics.
 | `message.delivery` | OTel/tracing | sender, recipient, channel/method, outcome, detail, attempt |
 | `agent.message_sent` | OTel/tracing | address, method, success |
 | `agent_inbox.duplicates_dropped` | OTel/tracing | recipient, durable cache key, transport-cache authority |
-| `agent_inbox.messages_abandoned` | OTel/tracing | recipient, attempts |
+| `agent_inbox.messages_abandoned` | OTel/tracing and EventLog | recipient, attempts,
+  durable batch id, re-queue outcome |
 
 WASM effect dispatch is also traced with effect type, namespace, and agent. Host
 function spans include the yielded effect. Plugin calls include function, agent, and
@@ -400,7 +402,8 @@ The following names were found in `otel.name` fields or instrumentation spans:
 | `agent.notify_parent` | Event/log | Parent notification |
 | `message.delivery` | Event/log | Delivery attempt and outcome |
 | `agent_inbox.duplicates_dropped` | Event/log | Deduplication |
-| `agent_inbox.messages_abandoned` | Event/log | Retry exhaustion |
+| `agent_inbox.messages_abandoned` | Event/log | Retry exhaustion; the guidance is re-queued,
+  and the row records the durable `batch_id` |
 | `agent.sibling_merged` | Event/log | Sibling merge notification |
 | `issue.closed` | Event/log | Closed issue observed before worktree disposal |
 | `inbox.message` | Event/log | Teams inbox message observed before tmux injection |

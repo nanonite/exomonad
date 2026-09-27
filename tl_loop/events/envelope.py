@@ -46,6 +46,7 @@ class EventKind(str, Enum):
     COPILOT_REVIEW = "copilot.review"
     CI_STATUS_CHANGED = "ci.status_changed"
     AGENT_SPAWNED = "agent.spawned"
+    AGENT_SPAWN_FAILED = "agent.spawn_failed"
     AGENT_COMPLETED = "agent.completed"
     AGENT_TASK_BLOCKED = "agent.task_blocked"
     AGENT_RECOVERY_STARTED = "agent.recovery.started"

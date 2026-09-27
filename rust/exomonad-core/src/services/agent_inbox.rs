@@ -69,6 +69,15 @@ impl InboxMessage {
         self.cache_key = Some(cache_key.into());
         self
     }
+
+    /// The durable batch this message was copied from, when it has one.
+    ///
+    /// A free-form message has none. Abandoning a durable message records this
+    /// identity so the recovery signal names the row to re-queue, not only the
+    /// process-local message id that dies with the cache.
+    pub fn batch_id(&self) -> Option<&str> {
+        self.cache_key.as_deref()
+    }
 }
 
 /// Return the durable producer identity for a structured message or a fresh
@@ -336,27 +345,32 @@ impl AgentInbox {
         queue.consumer_active = false;
     }
 
-    /// Drop the head message after delivery attempts are exhausted. Clears its
-    /// cache-local key so a later durable rebuild can retry the batch.
-    pub async fn abandon_delivery(&self, agent: &str, message_id: u64) {
+    /// Return the abandoned head message to the durable queue's consumer.
+    ///
+    /// The message is popped so it is not injected again in this pass, but its
+    /// cache-local key is cleared, so a durable rebuild re-queues the same
+    /// batch. Returns the popped message so the caller can record the durable
+    /// identity of the abandoned guidance; the row itself is never deleted.
+    pub async fn abandon_delivery(&self, agent: &str, message_id: u64) -> Option<InboxMessage> {
         let mut queues = self.queues.lock().await;
-        let Some(queue) = queues.get_mut(agent) else {
-            return;
-        };
+        let queue = queues.get_mut(agent)?;
 
+        let mut abandoned = None;
         if queue
             .messages
             .front()
             .is_some_and(|message| message.id == message_id)
         {
             if let Some(message) = queue.messages.pop_front() {
-                if let Some(cache_key) = message.cache_key {
+                if let Some(cache_key) = message.cache_key.clone() {
                     queue.queued_cache_keys.remove(&cache_key);
                 }
+                abandoned = Some(message);
             }
         }
 
         queue.consumer_active = false;
+        abandoned
     }
 
     pub async fn queue_depth(&self, agent: &str) -> usize {
@@ -851,9 +865,47 @@ mod tests {
         inbox.enqueue("agent", message("first")).await.unwrap();
         let queued = inbox.begin_delivery("agent").await.unwrap();
 
-        inbox.abandon_delivery("agent", queued.id + 999).await;
+        let abandoned = inbox.abandon_delivery("agent", queued.id + 999).await;
 
         assert_eq!(inbox.queue_depth("agent").await, 1);
+        assert!(
+            abandoned.is_none(),
+            "a stale id must not claim a message it did not abandon"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandon_delivery_returns_the_durable_batch_identity() {
+        let inbox = AgentInbox::new(8, 32);
+        inbox
+            .enqueue("agent", cached_message("guidance", "batch-42"))
+            .await
+            .unwrap();
+
+        let queued = inbox.begin_delivery("agent").await.unwrap();
+        let abandoned = inbox
+            .abandon_delivery("agent", queued.id)
+            .await
+            .expect("the head message is returned to the durable queue");
+
+        assert_eq!(
+            abandoned.batch_id(),
+            Some("batch-42"),
+            "the recovery signal must name the durable row, not a local message id"
+        );
+        // The row is untouched and its cache key is gone, so a rebuild re-queues
+        // exactly this batch instead of losing the only recovery signal.
+        let retry = inbox
+            .enqueue("agent", cached_message("guidance", "batch-42"))
+            .await
+            .unwrap();
+        assert!(!retry.dropped_as_duplicate);
+        assert_eq!(inbox.queue_depth("agent").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_free_form_message_has_no_durable_batch_identity() {
+        assert_eq!(message("no durable batch").batch_id(), None);
     }
 
     #[tokio::test]

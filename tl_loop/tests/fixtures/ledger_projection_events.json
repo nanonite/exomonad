@@ -516,5 +516,30 @@
     "source": "watcher",
     "lifecycle_state": "observed",
     "data": {"slice_id": "slice-a", "active_slices": 1}
+  },
+  {
+    "schema_version": 1,
+    "event_id": "spawn-failed-event",
+    "id": "spawn-failed-event",
+    "event_time": "2026-08-12T15:06:00Z",
+    "observed_at": "2026-08-12T15:06:00Z",
+    "run_seq": 105,
+    "type": "agent.spawn_failed",
+    "agent_id": "root",
+    "run_id": "run-a",
+    "session_id": "session-a",
+    "invocation_id": "inv-a",
+    "generation": 1,
+    "harness": "codex",
+    "role": "tl",
+    "source": "rust",
+    "lifecycle_state": "observed",
+    "data": {
+      "child_agent": "slice-a",
+      "error": "[worktree.branch_exists] branch already exists",
+      "code": "worktree.branch_exists",
+      "intent_id": "intent-slice-a-1",
+      "source": "rust"
+    }
   }
 ]

@@ -81,6 +81,13 @@ def test_review_and_ci_fields_are_projected_from_data_without_synthesis() -> Non
         == "not_available_without_verified_pr_context"
         for event_type in SERVER_EMIT_HEAD_SHA_GAPS
     )
+    # A refused spawn projects its machine code as data, beside the prose, so
+    # the dispatch classification never has to read the message.
+    assert projected["agent.spawn_failed"].data["code"] == "worktree.branch_exists"
+    assert projected["agent.spawn_failed"].data["intent_id"] == "intent-slice-a-1"
+    assert projected["agent.spawn_failed"].data["error"] == (
+        "[worktree.branch_exists] branch already exists"
+    )
 
 
 def test_review_authority_projects_verified_reviewer_and_fails_closed() -> None:

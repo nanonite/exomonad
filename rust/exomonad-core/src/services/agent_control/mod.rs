@@ -1125,6 +1125,11 @@ impl<
     ///
     /// Async because the bounded wait for the lock must not block a runtime
     /// worker for the length of `DECISION_TIMEOUT`.
+    ///
+    /// A timeout is a transient refusal, not a lifecycle failure: the decision
+    /// was never made, so the same call can be re-driven later. It therefore
+    /// carries the stable `worktree.lifecycle_lock_timeout` code the
+    /// controller's dispatch classification treats as retryable.
     pub(crate) async fn acquire_worktree_lifecycle(
         &self,
         decision: &str,
@@ -1136,7 +1141,12 @@ impl<
         )
         .await?
         .ok_or_else(|| {
-            anyhow!("worktree lifecycle lock is held by another decision; refusing to {decision}")
+            anyhow!(EffectError::custom(
+                "worktree.lifecycle_lock_timeout",
+                format!(
+                    "worktree lifecycle lock is held by another decision; refusing to {decision}"
+                )
+            ))
         })
     }
 
@@ -1757,6 +1767,45 @@ mod tests {
         })
     }
     use super::*;
+
+    /// A lifecycle-lock timeout is transient, so the refusal must carry the
+    /// stable code the controller's dispatch classification treats as
+    /// retryable. Without it the controller sees an untyped refusal and fails
+    /// closed into an immediate park.
+    #[tokio::test]
+    async fn a_lifecycle_lock_timeout_carries_its_retryable_code() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp.path().to_path_buf();
+        let service = AgentControlService::new(Arc::new(services));
+
+        let held = LifecycleGuard::try_acquire(
+            temp.path(),
+            LifecycleMode::Exclusive,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("acquisition succeeds")
+        .expect("the first acquisition wins the lock");
+
+        let error = service
+            .acquire_worktree_lifecycle("create a worktree")
+            .await
+            .expect_err("a held lock must refuse the second decision");
+
+        let EffectError::Custom { code, message, .. } = error
+            .downcast_ref::<EffectError>()
+            .expect("the refusal must stay typed through anyhow")
+        else {
+            panic!("expected a typed custom refusal");
+        };
+        assert_eq!(code, "worktree.lifecycle_lock_timeout");
+        assert!(
+            message.contains("create a worktree"),
+            "the refusal must name the decision it refused, got {message}"
+        );
+        drop(held);
+    }
 
     #[test]
     fn test_slugify() {

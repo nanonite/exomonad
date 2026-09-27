@@ -57,6 +57,7 @@ class SliceStatus(str, Enum):
     READY = "ready"
     DISPATCHING = "dispatching"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
+    DISPATCH_RETRY_SCHEDULED = "dispatch_retry_scheduled"
     DISPATCH_FAILED = "dispatch_failed"
     SPAWNED = "spawned"
     IN_REVIEW = "in_review"
@@ -610,6 +611,10 @@ SLICE_KEYS = frozenset(
         "dispatch_started_at",
         "dispatch_last_boundary",
         "dispatch_error",
+        "dispatch_error_code",
+        "dispatch_retry_attempt",
+        "dispatch_next_attempt_at",
+        "dispatch_retry_for_attempt",
         "dispatch_agent_id",
         "dispatch_invocation_id",
         "dispatch_authoritative_event_seq",
@@ -836,6 +841,10 @@ class SliceState:
     dispatch_started_at: float | None = None
     dispatch_last_boundary: str | None = None
     dispatch_error: str | None = None
+    dispatch_error_code: str | None = None
+    dispatch_retry_attempt: int = 0
+    dispatch_next_attempt_at: float | None = None
+    dispatch_retry_for_attempt: int = 0
     dispatch_agent_id: str | None = None
     dispatch_invocation_id: str | None = None
     dispatch_authoritative_event_seq: int | None = None
@@ -1430,6 +1439,12 @@ def _validate_slice(
     _nullable_number(value, "dispatch_started_at", path, errors)
     _nullable_string(value, "dispatch_last_boundary", path, errors)
     _nullable_string(value, "dispatch_error", path, errors)
+    _nullable_string(value, "dispatch_error_code", path, errors)
+    if "dispatch_retry_attempt" in value:
+        _non_negative_int(value, "dispatch_retry_attempt", path, errors)
+    _nullable_number(value, "dispatch_next_attempt_at", path, errors)
+    if "dispatch_retry_for_attempt" in value:
+        _non_negative_int(value, "dispatch_retry_for_attempt", path, errors)
     _nullable_string(value, "dispatch_agent_id", path, errors)
     _nullable_non_negative_int(value, "dispatch_authoritative_event_seq", path, errors)
     if "dispatch_generation" in value:
@@ -1456,6 +1471,18 @@ def _validate_slice(
                     "is required for spawned slices",
                 )
             )
+    if value.get("status") == SliceStatus.DISPATCH_RETRY_SCHEDULED.value:
+        _non_empty_string(value, "dispatch_error_code", path, errors)
+        _non_empty_number(value, "dispatch_next_attempt_at", path, errors)
+        _non_negative_int(value, "dispatch_retry_attempt", path, errors)
+        for absent in ("dispatch_intent_id", "dispatch_agent_id", "dispatch_invocation_id"):
+            if value.get(absent) is not None:
+                errors.append(
+                    (
+                        f"{path}.{absent}",
+                        "must be null while a dispatch retry is scheduled: no leaf exists",
+                    )
+                )
     classification = value.get("stall_classification")
     if classification is not None and classification not in STALL_CLASSIFICATION_VALUES:
         errors.append(
@@ -2178,6 +2205,14 @@ def _positive_int(
     value = holder.get(key)
     if type(value) is not int or value <= 0:
         errors.append((f"{path}.{key}", "must be a positive integer"))
+
+
+def _non_empty_number(
+    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+) -> None:
+    value = holder.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        errors.append((f"{path}.{key}", "must be a number"))
 
 
 def _nullable_positive_int(

@@ -768,6 +768,7 @@ def _derive_slice_action(
             if state.action.phase in {ActionPhase.CONFIRMED, ActionPhase.RECONCILED}:
                 return Quiescent("await_merge_reconciliation")
     if state.status in {
+        SliceStatus.DISPATCH_RETRY_SCHEDULED,
         SliceStatus.DISPATCH_FAILED,
         SliceStatus.FAILED,
         SliceStatus.PARKED,
@@ -1046,6 +1047,27 @@ def reconcile_slice(
             missing,
             conflicts,
             "await_authoritative_spawn_event",
+        )
+
+    if slice_state.status is SliceStatus.DISPATCH_RETRY_SCHEDULED:
+        # Resource creation never completed, so there is no intent, owner, or
+        # publication to reconcile. The machine code and the scheduled instant
+        # are the whole evidence for this boundary.
+        if slice_state.dispatch_error_code:
+            evidence.append("dispatch_error_code")
+        else:
+            missing.append("dispatch_error_code")
+        if slice_state.dispatch_next_attempt_at is not None:
+            evidence.append("dispatch_next_attempt_at")
+        else:
+            missing.append("dispatch_next_attempt_at")
+        return _result(
+            slice_state,
+            "dispatch_retry",
+            evidence,
+            missing,
+            conflicts,
+            "await_dispatch_retry_boundary",
         )
 
     if slice_state.status is SliceStatus.MERGED:

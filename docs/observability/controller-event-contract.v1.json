@@ -112,6 +112,24 @@
         "dispatch_generation"
       ]
     },
+    "tl.dispatch_retry_scheduled": {
+      "fields": [
+        "slice_id",
+        "intent_id",
+        "boundary",
+        "started_at",
+        "attempt",
+        "error",
+        "harness",
+        "agent_type",
+        "model",
+        "controller_epoch",
+        "dispatch_generation",
+        "machine_code",
+        "retry_attempt",
+        "next_attempt_at"
+      ]
+    },
     "tl.dispatch_confirmed": {
       "fields": [
         "slice_id",
