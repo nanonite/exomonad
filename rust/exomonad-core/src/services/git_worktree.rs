@@ -601,10 +601,7 @@ impl GitWorktreeService {
         &self,
         branch: &BranchName,
     ) -> Result<bool, WorktreeError> {
-        let local = self.git_path(
-            &self.project_dir,
-            &["rev-parse", &format!("refs/heads/{}", branch.as_str())],
-        )?;
+        let local = self.local_head(branch)?;
         match self.remote_evidence(branch) {
             RemoteEvidence::Absent => Ok(true),
             RemoteEvidence::Unavailable => Ok(false),
@@ -623,6 +620,18 @@ impl GitWorktreeService {
         }
     }
 
+    /// The commit the branch's local ref points at.
+    ///
+    /// The single place a local branch head is read, so a caller that has to
+    /// name the observed head in a refusal and a caller that has to classify it
+    /// against a recorded head read the same value.
+    pub fn local_head(&self, branch: &BranchName) -> Result<String, WorktreeError> {
+        self.git_path(
+            &self.project_dir,
+            &["rev-parse", &format!("refs/heads/{}", branch.as_str())],
+        )
+    }
+
     /// Classify how the branch's local head relates to a recorded commit.
     ///
     /// Equality and unique local commits on top of the recorded commit are
@@ -638,10 +647,7 @@ impl GitWorktreeService {
         if recorded.is_empty() || recorded.starts_with('-') {
             return Ok(HeadCoverage::UnknownCommit);
         }
-        let local = self.git_path(
-            &self.project_dir,
-            &["rev-parse", &format!("refs/heads/{}", branch.as_str())],
-        )?;
+        let local = self.local_head(branch)?;
         let ancestry = self.git_output(
             &self.project_dir,
             &["merge-base", "--is-ancestor", recorded, &local],

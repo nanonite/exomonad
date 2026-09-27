@@ -185,9 +185,9 @@ classifies the branch as follows.
   registered owner and the deterministic leaf path.
 - Held by nothing: the local head must be proven. Freshly observed remote
   evidence must not be behind or diverged. With an absent or uninspectable
-  remote, either an expected resume head or a recorded dispatch/publication head
-  is required; with neither, attachment fails closed. Durable identity proves
-  ownership and the deterministic branch, never a commit.
+  remote, at least one authoritative head is required; with none, attachment
+  fails closed. Durable identity proves ownership and the deterministic branch,
+  never a commit.
 - A recorded head (`recorded_branch_head`) is read from
   `.exo/published-heads.json` for the latest **ledger-owned** publication this
   agent owns on that branch, otherwise from the owner `invocation.json` when it
@@ -206,11 +206,10 @@ classifies the branch as follows.
   | Any head at all, when the publication registry is unreadable | the registry is authoritative, so a possibly stale `invocation.json` head must not substitute for it; the unreadable case ends the search instead of falling through |
   | An `invocation.json` that cannot be parsed | `read_invocation_conservatively` treats a malformed record as no record |
 
-A resume keeps its exact expected-head equality check; a recorded head is only
-consulted where no expected head exists. Every refusal is a typed
-`worktree.branch_ownership_conflict` whose message names the deterministic
-branch, the missing or conflicting evidence, and the operator action, because
-the branch is deterministic and no alternative slug exists.
+Every refusal is a typed `worktree.branch_ownership_conflict` whose message
+names the deterministic branch, the missing or conflicting evidence, and the
+operator action, because the branch is deterministic and no alternative slug
+exists.
 
 Both create actions can lose a race with a concurrent creator. Only the stable
 `worktree.branch_exists` code is recoverable: the race is re-verified through
@@ -219,6 +218,45 @@ is returned unchanged. `WorktreeRollback` then covers everything this attempt
 created — worktree, MCP configuration, tmux launch, and identity finalization —
 and is defused only after the agent is finalized.
 
+### Resume lineage and restored PR context
+
+A resume takes the same verified attach path as a first spawn — there is no
+second attach path, and `start_point` is only expected-head evidence. What makes
+a resume safe is the head evidence it carries, and that evidence is a set
+(`LeafHeadEvidence`), not a single value:
+
+| Evidence | Source | Proof |
+|----------|--------|-------|
+| `expected` | the head the host resolved for the resume | exact equality |
+| `prior_publication` | `recorded_branch_head` | ancestry |
+| `resume_lineage` | `resolve_resume_lineage_head` | ancestry |
+
+Every entry present is proven, not just the strongest one, so a resume whose
+lineage head the branch no longer contains is refused even when its expected head
+matches. Ancestry rather than equality for the two recorded heads is what lets
+unique unpushed commits survive the reattach. A refusal names the branch, the
+expected head, and the observed head.
+
+`resolve_resume_lineage_head` runs before any worktree decision, including the
+idempotent return, because a resume is authorized against exactly one prior
+generation. It fails closed when the durable `invocation.json` is unreadable,
+missing, or no longer the invocation the lineage names, and it reads a head only
+from a record naming the deterministic branch. `Ok(None)` means the lineage
+verified and recorded no head for this branch; only another authoritative record
+can then prove it.
+
+PR context is resolved, never created, and the first-spawn and expected-agent
+resume paths share one composition function (`leaf_task`), so a re-spawn after
+worktree loss and a `resume_pr` invocation restore the same context instead of
+the resumed leaf starting blind. The head is read from git after the
+provisioning decision and is what the PR is matched against, because a branch
+name never identifies a PR. Only an open, unmerged PR on the deterministic
+branch whose reported head SHA equals that verified head contributes context
+(`pr_carries_verified_head`); a PR whose head has moved, a closed or merged one,
+a PR the forge reports no head for, and no PR at all all yield none. Review
+feedback is best effort — the PR identity is the context, and a failed review
+listing must not cost the leaf its PR. A standalone repo owns no host PR, has no
+verified head to match, and therefore gets no PR context.
 
 The quarantine manifest records `source_kind: "unregistered_worktree_residue"` and `forensic_only: true` for every entry. Quarantined `.exo/ledger/segments` and `.exo/events` describe a worktree that no longer exists, so `exomonad logs import` excludes any source under `.exo/worktrees-residue/` by default and reports the count as `excluded_quarantined_sources`. `exomonad logs import --include-quarantined` is the explicit operator opt-in. The exclusion is a path predicate, so it holds even when a manifest entry is missing after a crash.
 

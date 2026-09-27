@@ -1,4 +1,7 @@
 use super::*;
+use crate::services::forgejo::{
+    ForgejoPullRequest, ForgejoPullRequestReview, ForgejoPullRequestReviewComment,
+};
 
 fn resume_spawn_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -81,9 +84,34 @@ struct LeafProvisioning<'a, 'b> {
     base_branch: &'a BranchName,
     branch_exists: bool,
     start_point: Option<&'a str>,
-    expected_head: Option<&'a str>,
-    recorded_head: Option<&'b RecordedHead>,
+    heads: LeafHeadEvidence<'b>,
     fresh_remote: crate::services::git_worktree::RemoteEvidence,
+}
+
+/// The authoritative heads a leaf must prove before its branch is attached.
+///
+/// Every entry is a record some part of the system already committed to, and
+/// every one of them must be proven against the observed branch head. A resume
+/// therefore carries up to three: the exact head its caller was authorized
+/// against, the prior publication head for the branch, and the head its recovery
+/// lineage recorded. Absence of all three is not a pass; it is missing
+/// evidence, and the attach fails closed.
+#[derive(Default, Clone, Copy)]
+struct LeafHeadEvidence<'a> {
+    /// The exact head a resume was authorized against, matched by equality.
+    expected: Option<&'a str>,
+    /// The prior ledger-owned publication head for the branch, matched by
+    /// ancestry so unique unpushed commits survive the attach.
+    prior_publication: Option<&'a RecordedHead>,
+    /// The head the resume's recovery lineage recorded for the branch, matched
+    /// by ancestry for the same reason.
+    resume_lineage: Option<&'a RecordedHead>,
+}
+
+impl<'a> LeafHeadEvidence<'a> {
+    fn is_empty(&self) -> bool {
+        self.expected.is_none() && self.prior_publication.is_none() && self.resume_lineage.is_none()
+    }
 }
 
 /// Derive the expected deterministic leaf birth branch.
@@ -145,6 +173,7 @@ async fn verify_existing_leaf_worktree(
 /// This is dispatch or publication evidence, not a second owner: it proves which
 /// commit the agent was last given, so a preserved branch whose remote evidence
 /// is absent can still be proven to descend from its own recorded work.
+#[derive(Debug)]
 struct RecordedHead {
     sha: String,
     /// Durable record the SHA was read from, named in refusals.
@@ -216,6 +245,52 @@ async fn recorded_branch_head(
     })
 }
 
+/// Resolve the head a resume's recovery lineage carries for its branch.
+///
+/// Resolution is the stale-lineage proof, so it happens before any worktree
+/// decision. A resume is authorized against exactly one prior generation: if
+/// the durable record is unreadable, missing, or no longer the invocation the
+/// lineage names, the resume target is not the one that was approved and the
+/// attach is refused with a typed ownership conflict. Nothing here inspects git,
+/// so the result can be threaded into the single attach predicate rather than
+/// opening a second resume path.
+///
+/// The head is read only from a record that names this deterministic branch, so
+/// a SHA recorded against another branch is not evidence for this one. `Ok(None)`
+/// means the lineage verified and simply recorded no head; only another
+/// authoritative record can then prove the branch.
+async fn resolve_resume_lineage_head(
+    project_dir: &Path,
+    agent_name: &AgentName,
+    branch_name: &BranchName,
+    lineage: &RecoveryInvocationLineage,
+) -> Result<Option<RecordedHead>> {
+    let agent_dir = project_dir.join(".exo/agents").join(agent_name.as_str());
+    let Some(record) = read_invocation_conservatively(&agent_dir).await else {
+        return Err(branch_ownership_conflict(format!(
+            "branch {branch_name} cannot be resumed: {agent_name} has no readable invocation record to \
+             prove the recovery lineage. Restore that record, or re-dispatch the leaf from its \
+             deterministic branch, then retry the resume."
+        )));
+    };
+    if record.invocation_id != lineage.prior_invocation_id {
+        return Err(branch_ownership_conflict(format!(
+            "branch {branch_name} cannot be resumed: the recovery lineage names prior invocation {}, \
+             but {agent_name}'s durable record is now {}. Re-read the owner's current invocation and \
+             retry the resume against it.",
+            lineage.prior_invocation_id, record.invocation_id
+        )));
+    }
+    if record.branch.as_deref() != Some(branch_name.as_str()) {
+        return Ok(None);
+    }
+    let sha = record.head_sha.as_deref().unwrap_or_default().trim();
+    Ok((!sha.is_empty()).then(|| RecordedHead {
+        sha: sha.to_string(),
+        evidence: "the resume lineage head in invocation.json",
+    }))
+}
+
 /// Typed attach refusal: the branch is deterministic, so the message names the
 /// branch, the conflicting or missing evidence, and the operator action.
 fn branch_ownership_conflict(detail: String) -> anyhow::Error {
@@ -244,8 +319,7 @@ async fn verify_attachable_branch(
     effective_project_dir: &Path,
     worktree_path: &Path,
     branch_name: &BranchName,
-    expected_head: Option<&str>,
-    recorded_head: Option<&RecordedHead>,
+    heads: LeafHeadEvidence<'_>,
     fresh_remote: crate::services::git_worktree::RemoteEvidence,
 ) -> Result<LeafAttachability> {
     use crate::services::git_worktree::RemoteEvidence;
@@ -274,7 +348,7 @@ async fn verify_attachable_branch(
                 effective_project_dir,
                 worktree_path,
                 branch_name,
-                expected_head,
+                heads.expected,
                 true,
             )
             .await?;
@@ -288,12 +362,12 @@ async fn verify_attachable_branch(
     }
     // Authoritative head evidence is required before attaching a preserved
     // branch. Remote state is only accepted when freshly verified; otherwise an
-    // expected resume head or a recorded dispatch/publication head must prove
-    // the local head. Durable identity alone proves ownership, not a commit.
-    let has_head_evidence = expected_head.is_some() || recorded_head.is_some();
+    // expected resume head, a recorded dispatch/publication head, or a resume
+    // lineage head must prove the local head. Durable identity alone proves
+    // ownership, not a commit.
     match fresh_remote {
         RemoteEvidence::Unavailable => {
-            if !has_head_evidence {
+            if heads.is_empty() {
                 return Err(branch_ownership_conflict(format!(
                     "branch {branch_name} cannot be attached: the configured remote could not be inspected, \
                      and no head is recorded for it. Restore remote access, or re-dispatch the leaf with \
@@ -302,7 +376,7 @@ async fn verify_attachable_branch(
             }
         }
         RemoteEvidence::Absent => {
-            if !has_head_evidence {
+            if heads.is_empty() {
                 return Err(branch_ownership_conflict(format!(
                     "branch {branch_name} cannot be attached: the configured remote has no head for it, \
                      and no head is recorded for it. Push the branch to the configured remote, or \
@@ -323,43 +397,51 @@ async fn verify_attachable_branch(
             }
         }
     }
-    match (expected_head, recorded_head) {
-        // A resume still requires its exact expected head.
-        (Some(head), _) => verify_branch_head(effective_project_dir, branch_name, head).await?,
-        // A recorded dispatch/publication head may carry unique local commits,
-        // so it is proven by ancestry rather than equality.
-        (None, Some(recorded)) => {
-            verify_recorded_head_coverage(git_wt, branch_name, recorded)?;
-        }
-        (None, None) => {}
+    // Every authoritative head this attempt carries is proven, not just the
+    // strongest one: an expected resume head by exact equality, and the prior
+    // publication and resume lineage heads by ancestry. A resume whose lineage
+    // head the branch no longer contains is a stale or rewritten target, and is
+    // refused here rather than attached.
+    if let Some(head) = heads.expected {
+        verify_branch_head(effective_project_dir, branch_name, head).await?;
+    }
+    if let Some(recorded) = heads.prior_publication {
+        verify_recorded_head_coverage(git_wt, branch_name, recorded)?;
+    }
+    if let Some(recorded) = heads.resume_lineage {
+        verify_recorded_head_coverage(git_wt, branch_name, recorded)?;
     }
     Ok(LeafAttachability::Attachable)
 }
 
 /// Prove a preserved branch's local head equals or descends from the recorded
 /// head. Equal or descendant coverage is accepted so unique unpushed commits
-/// survive the reattach; anything else fails closed.
+/// survive the reattach; anything else fails closed and names both the expected
+/// and the observed head.
 fn verify_recorded_head_coverage(
     git_wt: &GitWorktreeService,
     branch_name: &BranchName,
     recorded: &RecordedHead,
 ) -> Result<()> {
     use crate::services::git_worktree::HeadCoverage;
-    let coverage = git_wt
-        .head_coverage(branch_name, &recorded.sha)
+    let observed = git_wt
+        .local_head(branch_name)
         .map_err(|error| anyhow!(EffectError::from(error)))?;
-    match coverage {
+    match git_wt
+        .head_coverage(branch_name, &recorded.sha)
+        .map_err(|error| anyhow!(EffectError::from(error)))?
+    {
         HeadCoverage::Covers => Ok(()),
         HeadCoverage::Diverged => Err(branch_ownership_conflict(format!(
-            "branch {branch_name} cannot be attached: its history does not contain the {} head {}. \
+            "branch {branch_name} cannot be attached: its head {observed} does not contain the {} head {}. \
              Restore that commit onto {branch_name}, or re-dispatch the leaf from it, then retry \
              the spawn.",
             recorded.evidence, recorded.sha
         ))),
         HeadCoverage::UnknownCommit => Err(branch_ownership_conflict(format!(
-            "branch {branch_name} cannot be attached: the {} head {} is not present in this \
-             repository. Fetch the commit that carries it, or re-dispatch the leaf from it, then \
-             retry the spawn.",
+            "branch {branch_name} cannot be attached: the {} head {} is not present in this repository \
+             (its head is {observed}). Fetch the commit that carries it, or re-dispatch the leaf from \
+             it, then retry the spawn.",
             recorded.evidence, recorded.sha
         ))),
     }
@@ -376,6 +458,58 @@ fn checked_out_elsewhere(
          Stop the agent holding {branch_name} or remove that worktree, then retry the spawn.",
         worktree_path.display()
     ))
+}
+
+/// Whether a pull request still carries the exact work this spawn verified.
+///
+/// The head SHA is what makes the match exact: a PR on the right branch whose
+/// head has moved describes commits this branch does not have, and a PR the
+/// forge reports no head for cannot be matched at all.
+fn pr_carries_verified_head(
+    pr: &ForgejoPullRequest,
+    branch_name: &BranchName,
+    verified_head: &str,
+) -> bool {
+    !verified_head.is_empty()
+        && !pr.merged
+        && pr.state.eq_ignore_ascii_case("open")
+        && pr.head_ref == *branch_name
+        && pr.head_sha.as_deref() == Some(verified_head)
+}
+
+/// The task text that tells a leaf which pull request it is continuing.
+fn pr_resume_context(
+    pr: &ForgejoPullRequest,
+    reviews: &[ForgejoPullRequestReview],
+    inline: &[ForgejoPullRequestReviewComment],
+) -> String {
+    let mut context = format!(
+        "\n\nIMPORTANT: You are resuming work on an existing pull request, not starting fresh.\n\
+         Existing PR: #{} — {}\n\
+         Do NOT create a new pull request. Continue working on this branch.\n",
+        pr.number.as_u64(),
+        pr.title
+    );
+    for comment in inline {
+        let file_label = comment.path.as_deref().unwrap_or("unknown file");
+        context.push_str(&format!(
+            "Review comment on {}: {}\n",
+            file_label, comment.body
+        ));
+    }
+    let bodies = reviews
+        .iter()
+        .map(|review| review.body.as_str())
+        .filter(|body| !body.is_empty())
+        .collect::<Vec<_>>();
+    if !bodies.is_empty() {
+        context.push_str("\nExisting review feedback:\n");
+        for body in bodies {
+            context.push_str(body);
+            context.push('\n');
+        }
+    }
+    context
 }
 
 /// Removes a worktree created by this spawn attempt if provisioning fails
@@ -1072,8 +1206,7 @@ impl<
             request.project_dir,
             request.worktree_path,
             request.branch,
-            request.expected_head,
-            request.recorded_head,
+            request.heads,
             fresh_remote,
         )
         .await?;
@@ -1107,6 +1240,91 @@ impl<
             "Lost a branch-creation race; re-verifying ownership before a single attach"
         );
         Ok(self.attach_leaf_branch(request, fresh_remote).await? == LeafAttachability::Attachable)
+    }
+
+    /// The leaf task, carrying the context of a PR that already owns the branch.
+    ///
+    /// One function serves the first spawn and the expected-agent resume, so a
+    /// re-spawn after worktree loss and a `resume_pr` invocation restore the
+    /// same context instead of the resumed leaf starting blind. The context is
+    /// restored from the PR, never created here: a leaf whose branch has no
+    /// qualifying open PR gets no PR context and files its own.
+    async fn leaf_task(
+        &self,
+        options: &SpawnLeafOptions,
+        project_dir: &Path,
+        branch: &BranchName,
+        verified_head: Option<&str>,
+    ) -> String {
+        let mut task = options.task.clone();
+        if let Some(context) = self
+            .existing_pull_request_context(project_dir, branch, verified_head)
+            .await
+        {
+            task.push_str(&context);
+        }
+        if options.standalone_repo && !options.allowed_dirs.is_empty() {
+            task.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
+        }
+        task
+    }
+
+    /// The context an existing open PR contributes to a leaf task.
+    ///
+    /// A branch name never identifies a PR. Only an open, unmerged PR whose head
+    /// branch is the deterministic branch and whose head SHA equals the head this
+    /// spawn verified describes the work being continued. A PR whose head has
+    /// moved past the local branch, a closed or merged one, a PR the forge does
+    /// not report a head for, and no PR at all all yield no context rather than a
+    /// guess. Review feedback is best effort: the PR identity is the context, so
+    /// a failed review listing must not cost the leaf its PR.
+    async fn existing_pull_request_context(
+        &self,
+        project_dir: &Path,
+        branch: &BranchName,
+        verified_head: Option<&str>,
+    ) -> Option<String> {
+        let verified_head = verified_head.map(str::trim).filter(|sha| !sha.is_empty())?;
+        let forgejo = self.ctx.forgejo_client()?;
+        let repo_info = crate::services::repo::get_repo_info(project_dir)
+            .await
+            .ok()?;
+        let pr = forgejo
+            .find_open_pull_request(&repo_info.owner, &repo_info.repo, branch)
+            .await
+            .ok()
+            .flatten()?;
+        if !pr_carries_verified_head(&pr, branch, verified_head) {
+            return None;
+        }
+        let reviews = forgejo
+            .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, pr.number)
+            .await
+            .unwrap_or_default();
+        let mut inline = Vec::new();
+        for review in &reviews {
+            let Some(review_id) = review.id else {
+                continue;
+            };
+            if let Ok(comments) = forgejo
+                .list_pull_request_review_comments(
+                    &repo_info.owner,
+                    &repo_info.repo,
+                    pr.number,
+                    review_id,
+                )
+                .await
+            {
+                inline.extend(comments);
+            }
+        }
+        info!(
+            pr_number = pr.number.as_u64(),
+            branch = %branch,
+            head_sha = %verified_head,
+            "Restoring the existing open pull request into the leaf task"
+        );
+        Some(pr_resume_context(&pr, &reviews, &inline))
     }
 
     /// Spawn an agent for a GitHub issue.
@@ -2246,6 +2464,24 @@ impl<
                 None
             };
 
+            // A resume is authorized against exactly one prior generation, so
+            // its lineage is resolved before any worktree decision — including
+            // the idempotent return below. A resume whose named prior invocation
+            // is no longer the durable record is a stale target and is refused
+            // here instead of attaching a branch nobody approved.
+            let resume_lineage_head = match options.recovery_lineage.as_ref() {
+                Some(lineage) => {
+                    resolve_resume_lineage_head(
+                        self.project_dir(),
+                        &agent_name,
+                        &branch_name,
+                        lineage,
+                    )
+                    .await?
+                }
+                None => None,
+            };
+
             // Validate ownership before any idempotent return or reuse so a
             // stale routing record cannot bypass it. Existing paths must be
             // registered worktrees on the derived branch; an absent path may be
@@ -2375,8 +2611,11 @@ impl<
                         base_branch: &current_branch,
                         branch_exists: branch_state.exists,
                         start_point: options.start_point.as_deref(),
-                        expected_head,
-                        recorded_head: recorded_head.as_ref(),
+                        heads: LeafHeadEvidence {
+                            expected: expected_head,
+                            prior_publication: recorded_head.as_ref(),
+                            resume_lineage: resume_lineage_head.as_ref(),
+                        },
                         fresh_remote: branch_state.remote,
                     })
                     .await?;
@@ -2405,91 +2644,29 @@ impl<
             self.write_agent_mcp_config(effective_project_dir, &worktree_path, agent_type, role)
                 .await?;
 
-            let mut task = options.task.clone();
-
-            // If an open PR already exists for this branch (re-spawn after worktree loss),
-            // inject PR context so the leaf resumes instead of filing a new PR.
-            if options.expected_agent_name.is_none() {
-                if let Some(forgejo) = self.ctx.forgejo_client() {
-                if let Ok(repo_info) =
-                    crate::services::repo::get_repo_info(effective_project_dir).await
-                {
-                    if let Ok(Some(pr)) = forgejo
-                        .find_open_pull_request(
-                            &repo_info.owner,
-                            &repo_info.repo,
-                            &branch_name,
-                        )
-                        .await
-                    {
-                        let pr_number = pr.number;
-                        let mut resume_context = format!(
-                            "\n\nIMPORTANT: You are resuming work on an existing pull request, not starting fresh.\n\
-                            Existing PR: #{} — {}\n\
-                            Do NOT create a new pull request. Continue working on this branch.\n",
-                            pr_number.as_u64(),
-                            pr.title
-                        );
-
-                        // Fetch review comments so the leaf sees existing feedback
-                        if let Ok(reviews) = forgejo
-                            .list_pull_request_reviews(
-                                &repo_info.owner,
-                                &repo_info.repo,
-                                pr_number,
-                            )
-                            .await
-                        {
-                            let mut review_bodies: Vec<String> = Vec::new();
-                            for review in &reviews {
-                                if !review.body.is_empty() {
-                                    review_bodies.push(review.body.clone());
-                                }
-                                // Fetch inline review comments
-                                if let Some(review_id) = review.id {
-                                    if let Ok(comments) = forgejo
-                                        .list_pull_request_review_comments(
-                                            &repo_info.owner,
-                                            &repo_info.repo,
-                                            pr_number,
-                                            review_id,
-                                        )
-                                        .await
-                                    {
-                                        for comment in &comments {
-                                            let file_label =
-                                                comment.path.as_deref().unwrap_or("unknown file");
-                                            resume_context.push_str(&format!(
-                                                "Review comment on {}: {}\n",
-                                                file_label, comment.body
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                            if !review_bodies.is_empty() {
-                                resume_context.push_str("\nExisting review feedback:\n");
-                                for body in &review_bodies {
-                                    resume_context.push_str(body);
-                                    resume_context.push('\n');
-                                }
-                            }
-                        }
-
-                        info!(
-                            pr_number = pr_number.as_u64(),
-                            branch = %branch_name,
-                            "Injecting existing PR context into re-spawned leaf task"
-                        );
-                        task.push_str(&resume_context);
-                    }
-                }
-            }
-            }
-
-            if options.standalone_repo && !options.allowed_dirs.is_empty() {
-                task.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
-            }
+            // The branch head this spawn settled on is what a PR is matched
+            // against, so it is read from git rather than taken on trust. A
+            // standalone repo owns no host PR, so it has no PR to match and
+            // therefore no PR context to restore.
+            let verified_head = match options.standalone_repo {
+                true => None,
+                false => Some(
+                    self.git_wt()
+                        .local_head(&branch_name)
+                        .map_err(|error| anyhow!(EffectError::from(error)))?,
+                ),
+            };
+            // Both the first spawn and the expected-agent resume compose the task
+            // here, so a resume restores the PR context the new-spawn path
+            // already restored instead of starting blind.
+            let task = self
+                .leaf_task(
+                    options,
+                    effective_project_dir,
+                    &branch_name,
+                    verified_head.as_deref(),
+                )
+                .await;
 
             // Open tmux window (not pane)
             // Task already includes leaf completion protocol — rendered by Haskell Prompt builder.
@@ -2905,10 +3082,18 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::PRNumber;
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
         ScrubGitRepositoryEnv,
     };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Invocation identifiers of two consecutive process generations, so a
+    /// resume can name the one it continues.
+    const FIRST_GENERATION: &str = "11111111-1111-1111-1111-111111111111";
+    const SECOND_GENERATION: &str = "22222222-2222-2222-2222-222222222222";
 
     #[test]
     fn expected_leaf_birth_prefers_durable_identity() {
@@ -3052,6 +3237,40 @@ mod tests {
             &self.repo
         }
 
+        /// The local branch refs, so a test can prove an attach created none.
+        fn local_branches(&self) -> Vec<String> {
+            git_output(
+                self.repo(),
+                &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+            )
+            .lines()
+            .map(str::to_string)
+            .collect()
+        }
+
+        /// Move the released deterministic branch onto `revision`, leaving the
+        /// commit it pointed at in the repository but out of the branch.
+        fn move_branch_to(&self, revision: &str) {
+            git(
+                self.repo(),
+                &["branch", "--force", self.branch.as_str(), revision],
+            );
+        }
+
+        /// The single identity directory the owner recorded under `.exo/agents`.
+        fn recorded_identities(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(self.repo().join(".exo/agents"))
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok())
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        }
+
         /// Create the deterministic branch and release its worktree, so only
         /// the branch survives.
         fn seed_branch(&self) {
@@ -3111,12 +3330,45 @@ mod tests {
             branch_exists: bool,
             recorded_head: Option<&'b RecordedHead>,
         ) -> LeafProvisioning<'a, 'b> {
+            self.provisioning_with_heads(
+                branch_exists,
+                LeafHeadEvidence {
+                    prior_publication: recorded_head,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+
+        /// The resume-shaped request: an expected resume head plus the head the
+        /// resume's recovery lineage recorded for the deterministic branch.
+        async fn resume_provisioning<'a, 'b>(
+            &'a self,
+            expected_head: Option<&'b str>,
+            resume_lineage: Option<&'b RecordedHead>,
+        ) -> LeafProvisioning<'a, 'b> {
+            self.provisioning_with_heads(
+                true,
+                LeafHeadEvidence {
+                    expected: expected_head,
+                    resume_lineage,
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+
+        async fn provisioning_with_heads<'a, 'b>(
+            &'a self,
+            branch_exists: bool,
+            heads: LeafHeadEvidence<'b>,
+        ) -> LeafProvisioning<'a, 'b> {
             self.provisioning_with_state(
                 LeafBranchState {
                     exists: branch_exists,
                     remote: self.fresh_remote().await,
                 },
-                recorded_head,
+                heads,
             )
             .await
         }
@@ -3124,7 +3376,7 @@ mod tests {
         async fn provisioning_with_state<'a, 'b>(
             &'a self,
             state: LeafBranchState,
-            recorded_head: Option<&'b RecordedHead>,
+            heads: LeafHeadEvidence<'b>,
         ) -> LeafProvisioning<'a, 'b> {
             LeafProvisioning {
                 project_dir: self.repo(),
@@ -3133,8 +3385,7 @@ mod tests {
                 base_branch: &self.base,
                 branch_exists: state.exists,
                 start_point: None,
-                expected_head: None,
-                recorded_head,
+                heads,
                 fresh_remote: state.remote,
             }
         }
@@ -3216,13 +3467,23 @@ mod tests {
         })
     }
 
-    fn write_invocation(project_dir: &Path, agent: &str, branch: &str, head_sha: &str) {
+    /// Write the finished invocation record of one process generation.
+    ///
+    /// The generation is identified by `invocation_id`, so a test can prove a
+    /// resume against a record that has since been replaced.
+    fn write_invocation(
+        project_dir: &Path,
+        agent: &str,
+        branch: &str,
+        head_sha: &str,
+        invocation_id: &str,
+    ) {
         let agent_dir = project_dir.join(".exo/agents").join(agent);
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(
             agent_dir.join("invocation.json"),
             serde_json::json!({
-                "invocation_id": "11111111-1111-1111-1111-111111111111",
+                "invocation_id": invocation_id,
                 "runtime": "codex",
                 "trigger": "spawn",
                 "routing": {"window_id": null, "pane_id": null, "parent_tab": null},
@@ -3236,6 +3497,17 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    /// The recovery lineage a resume is authorized against, naming the prior
+    /// generation and continuing it by one.
+    fn lineage(prior_invocation_id: &str) -> RecoveryInvocationLineage {
+        RecoveryInvocationLineage {
+            prior_invocation_id: prior_invocation_id.to_string(),
+            invocation_generation: 2,
+            recovery_round: 1,
+            authorization_source: RecoveryAuthorization::HumanApproved,
+        }
     }
 
     fn agent(name: &str) -> AgentName {
@@ -3325,7 +3597,11 @@ mod tests {
         let rollback = provisioned(
             fixture
                 .service
-                .provision_leaf_worktree(fixture.provisioning_with_state(state, None).await)
+                .provision_leaf_worktree(
+                    fixture
+                        .provisioning_with_state(state, LeafHeadEvidence::default())
+                        .await,
+                )
                 .await,
         );
 
@@ -3738,6 +4014,7 @@ mod tests {
             fixture.leaf_agent.as_str(),
             &branch,
             "6666666666666666666666666666666666666666",
+            FIRST_GENERATION,
         );
 
         let recorded =
@@ -3800,6 +4077,7 @@ mod tests {
             fixture.leaf_agent.as_str(),
             &branch,
             "4444444444444444444444444444444444444444",
+            FIRST_GENERATION,
         );
 
         let recorded =
@@ -3819,6 +4097,7 @@ mod tests {
             fixture.leaf_agent.as_str(),
             "main.some-other-branch",
             "5555555555555555555555555555555555555555",
+            FIRST_GENERATION,
         );
 
         let recorded =
@@ -3828,6 +4107,558 @@ mod tests {
             recorded.is_none(),
             "a head recorded against another branch is not evidence for this one"
         );
+    }
+
+    /// A repository whose origin is a hosted URL, with a deterministic branch at
+    /// a known head and a fake Forgejo that answers PR lookups over HTTP.
+    ///
+    /// The hosted origin is required because PR resolution reads owner and repo
+    /// from it; the fake answers on its own port, so no forge is contacted.
+    struct PullRequestFixture {
+        /// Owns the temporary repository for the fixture's lifetime.
+        _temp: tempfile::TempDir,
+        /// Keeps the fake Forgejo serving for the fixture's lifetime.
+        forge: MockServer,
+        repo: PathBuf,
+        service: AgentControlService<crate::services::Services>,
+        slug: String,
+        branch: BranchName,
+        /// The head the fake forge may report for the branch instead.
+        other_head: String,
+        head: String,
+        leaf: AgentName,
+    }
+
+    /// The pull request the fake Forgejo reports for the deterministic branch.
+    const PR_NUMBER: u64 = 7;
+    const PR_TITLE: &str = "Restore resume lineage";
+    const HOSTED_REMOTE: &str = "https://forge.example/owner/repo.git";
+    const REVIEW_BODY: &str = "Tighten the refusal message.";
+    const REVIEW_COMMENT: &str = "Name the observed head.";
+
+    impl PullRequestFixture {
+        async fn new(slug: &str) -> Self {
+            let temp = tempfile::tempdir().expect("failed to create temp dir");
+            let repo = temp.path().to_path_buf();
+            init_fixture_git_repository(&repo).expect("git init failed");
+            git(&repo, &["config", "user.email", "leaf@example.invalid"]);
+            git(&repo, &["config", "user.name", "Leaf"]);
+            git(&repo, &["commit", "--allow-empty", "-m", "base"]);
+            let base_name = git_output(&repo, &["branch", "--show-current"]);
+            let branch = BranchName::try_from_str(format!("{base_name}.{slug}").as_str())
+                .expect("validated string input is non-empty");
+            // The branch sits one commit past the base, so a test can offer the
+            // forge a different head for the same branch.
+            let other_head = git_output(&repo, &["rev-parse", "HEAD"]);
+            git(&repo, &["commit", "--allow-empty", "-m", "branch work"]);
+            git(&repo, &["branch", branch.as_str()]);
+            git(&repo, &["remote", "add", "origin", HOSTED_REMOTE]);
+            let head = git_output(&repo, &["rev-parse", branch.as_str()]);
+
+            let forge = MockServer::start().await;
+            let mut services = crate::services::Services::test();
+            services.project_dir = repo.clone();
+            services.forgejo_client = Some(
+                crate::services::forgejo::ForgejoClient::new(&forge.uri(), "token-123")
+                    .expect("a fake Forgejo URL must construct a client"),
+            );
+            Self {
+                repo,
+                service: AgentControlService::new(Arc::new(services)),
+                slug: slug.to_string(),
+                branch,
+                other_head,
+                head,
+                leaf: agent(&format!("{slug}-codex")),
+                forge,
+                _temp: temp,
+            }
+        }
+
+        /// Report one open pull request for the deterministic branch, whose head
+        /// is whatever the caller claims the forge has for it.
+        async fn report_open_pull_request(&self, head_sha: &str) {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/repos/owner/repo/pulls"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "number": PR_NUMBER,
+                        "title": PR_TITLE,
+                        "state": "open",
+                        "head": {"ref": self.branch.as_str(), "sha": head_sha},
+                        "base": {"ref": "main"},
+                    }])),
+                )
+                .mount(&self.forge)
+                .await;
+        }
+
+        /// Report review feedback and one inline comment for the open PR.
+        async fn report_review_feedback(&self) {
+            let reviews = format!("/api/v1/repos/owner/repo/pulls/{PR_NUMBER}/reviews");
+            Mock::given(method("GET"))
+                .and(path(reviews.clone()))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "id": 1,
+                        "state": "changes_requested",
+                        "body": REVIEW_BODY,
+                        "commit_id": self.head,
+                    }])),
+                )
+                .mount(&self.forge)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("{reviews}/1/comments")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "body": REVIEW_COMMENT,
+                        "path": "src/spawn.rs",
+                    }])),
+                )
+                .mount(&self.forge)
+                .await;
+        }
+
+        /// The spawn options the host builds for a `resume_pr`: it resolved the
+        /// identity and the PR head, so the branch and start point are
+        /// host-owned and no directory scan may replace them.
+        fn resume_options(&self) -> SpawnLeafOptions {
+            SpawnLeafOptions {
+                task: "Address the review feedback.".to_string(),
+                branch_name: self.slug.clone(),
+                role: Some(crate::domain::Role::dev()),
+                agent_type: AgentType::Codex,
+                claude_flags: ClaudeSpawnFlags::default(),
+                standalone_repo: false,
+                allowed_dirs: Vec::new(),
+                start_point: Some(self.head.clone()),
+                base_branch: Some("main".to_string()),
+                expected_agent_name: Some(self.leaf.clone()),
+                invocation_pr_number: Some(PR_NUMBER),
+                recovery_lineage: None,
+                model: None,
+            }
+        }
+
+        /// The task the resume path composes, at the head it verified.
+        async fn resume_task(&self) -> String {
+            self.service
+                .leaf_task(
+                    &self.resume_options(),
+                    &self.repo,
+                    &self.branch,
+                    Some(&self.head),
+                )
+                .await
+        }
+
+        /// The HTTP methods the fake forge saw. A resume only ever reads.
+        async fn forge_methods(&self) -> Vec<String> {
+            self.forge
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|request| request.method.to_string())
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resume_attaches_a_verified_branch_without_creating_one() {
+        let fixture = LeafFixture::new("resume-attach");
+        let head = fixture.preserve_branch("prior attempt work");
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            fixture.branch.as_str(),
+            &head,
+            FIRST_GENERATION,
+        );
+        let branches_before = fixture.local_branches();
+        let lineage_head = resolve_resume_lineage_head(
+            fixture.repo(),
+            &fixture.leaf_agent,
+            &fixture.branch,
+            &lineage(FIRST_GENERATION),
+        )
+        .await
+        .expect("a resume against the current record must resolve")
+        .expect("the finished generation recorded a head for this branch");
+
+        let rollback = provisioned(
+            fixture
+                .service
+                .provision_leaf_worktree(
+                    fixture.resume_provisioning(None, Some(&lineage_head)).await,
+                )
+                .await,
+        );
+
+        assert!(
+            rollback.is_some(),
+            "the resume attached a worktree, so this attempt must own its rollback"
+        );
+        assert_eq!(
+            fixture.local_branches(),
+            branches_before,
+            "a resume must attach the deterministic branch, never create another one"
+        );
+        assert_eq!(fixture.branch_head(), head);
+        assert_eq!(git_output(&fixture.leaf_path, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn a_resume_with_a_stale_recovery_lineage_fails_closed() {
+        let fixture = LeafFixture::new("stale-lineage");
+        let head = fixture.preserve_branch("prior attempt work");
+        // The durable record is a newer generation than the lineage names, so
+        // the authorized resume target no longer exists.
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            fixture.branch.as_str(),
+            &head,
+            SECOND_GENERATION,
+        );
+
+        let error = resolve_resume_lineage_head(
+            fixture.repo(),
+            &fixture.leaf_agent,
+            &fixture.branch,
+            &lineage(FIRST_GENERATION),
+        )
+        .await
+        .expect_err("a resume naming a superseded generation must be refused");
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(fixture.branch.as_str())
+                && message.contains(FIRST_GENERATION)
+                && message.contains(SECOND_GENERATION),
+            "the refusal must name the branch, the authorized lineage head, and the observed one, got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_without_a_durable_invocation_record_fails_closed() {
+        let fixture = LeafFixture::new("unrecorded-resume");
+        fixture.preserve_branch("prior attempt work");
+
+        let error = resolve_resume_lineage_head(
+            fixture.repo(),
+            &fixture.leaf_agent,
+            &fixture.branch,
+            &lineage(FIRST_GENERATION),
+        )
+        .await
+        .expect_err("a resume with nothing to prove its lineage must be refused");
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(fixture.branch.as_str()) && message.contains("no readable invocation"),
+            "the refusal must name the missing evidence, got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_whose_lineage_head_the_branch_rewrote_fails_closed() {
+        let fixture = LeafFixture::new("rewritten-lineage");
+        let abandoned = fixture.preserve_branch("work the branch no longer has");
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            fixture.branch.as_str(),
+            &abandoned,
+            FIRST_GENERATION,
+        );
+        // The branch was rewritten back to the base, so the commit the prior
+        // generation recorded is no longer in its history.
+        fixture.move_branch_to(fixture.base.as_str());
+        let lineage_head = resolve_resume_lineage_head(
+            fixture.repo(),
+            &fixture.leaf_agent,
+            &fixture.branch,
+            &lineage(FIRST_GENERATION),
+        )
+        .await
+        .expect("the lineage itself is current, only the branch moved")
+        .expect("the finished generation recorded a head for this branch");
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(
+                    fixture.resume_provisioning(None, Some(&lineage_head)).await,
+                )
+                .await,
+        );
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(fixture.branch.as_str())
+                && message.contains(&abandoned)
+                && message.contains(&fixture.branch_head()),
+            "the refusal must name the branch, the expected lineage head, and the observed head, got {message}"
+        );
+        assert!(!fixture.leaf_path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_resume_with_a_wrong_expected_head_fails_closed() {
+        let fixture = LeafFixture::new("wrong-expected-head");
+        fixture.preserve_branch("prior attempt work");
+        let unrelated = "b".repeat(40);
+
+        let error = refusal(
+            fixture
+                .service
+                .provision_leaf_worktree(fixture.resume_provisioning(Some(&unrelated), None).await)
+                .await,
+        );
+
+        let message = ownership_conflict(&error);
+        assert!(
+            message.contains(&unrelated) && message.contains(&fixture.branch_head()),
+            "the refusal must name the expected and the observed head, got {message}"
+        );
+        assert!(!fixture.leaf_path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_repeated_resume_preserves_one_identity_worktree_and_branch() {
+        /// Resume once: prove the lineage against the current record, then
+        /// provision the deterministic branch. Reports whether this attempt had
+        /// to create the worktree.
+        async fn resume_once(fixture: &LeafFixture, generation: &str) -> bool {
+            let lineage_head = resolve_resume_lineage_head(
+                fixture.repo(),
+                &fixture.leaf_agent,
+                &fixture.branch,
+                &lineage(generation),
+            )
+            .await
+            .expect("a resume continues the current record")
+            .expect("each finished generation recorded a head for this branch");
+            let guard = provisioned(
+                fixture
+                    .service
+                    .provision_leaf_worktree(
+                        fixture.resume_provisioning(None, Some(&lineage_head)).await,
+                    )
+                    .await,
+            );
+            let created = guard.is_some();
+            // A live spawn holds this guard until its agent is finalized. This
+            // test stands in for that live agent, so the guard is never dropped
+            // and the second resume finds the worktree the first one attached.
+            std::mem::forget(guard);
+            created
+        }
+
+        let fixture = LeafFixture::new("repeat-resume");
+        let head = fixture.preserve_branch("first attempt work");
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            fixture.branch.as_str(),
+            &head,
+            FIRST_GENERATION,
+        );
+
+        let first_resume_created_the_worktree = resume_once(&fixture, FIRST_GENERATION).await;
+        // The resumed generation replaces the record it continued.
+        write_invocation(
+            fixture.repo(),
+            fixture.leaf_agent.as_str(),
+            fixture.branch.as_str(),
+            &head,
+            SECOND_GENERATION,
+        );
+        let second_resume_created_the_worktree = resume_once(&fixture, SECOND_GENERATION).await;
+
+        assert!(
+            first_resume_created_the_worktree,
+            "the first resume must attach the branch at the deterministic leaf path"
+        );
+        assert!(
+            !second_resume_created_the_worktree,
+            "a second resume must reuse the worktree that already holds the branch"
+        );
+        assert_eq!(
+            fixture.recorded_identities(),
+            vec![fixture.leaf_agent.as_str().to_string()],
+            "a repeated resume must not create a second workflow owner"
+        );
+        assert_eq!(
+            fixture.local_branches(),
+            vec![
+                fixture.base.as_str().to_string(),
+                fixture.branch.as_str().to_string()
+            ],
+            "a repeated resume must not create a second branch"
+        );
+        assert_eq!(
+            fixture
+                .git_wt
+                .registered_worktree_for_branch(&fixture.branch)
+                .expect("registry lookup must succeed")
+                .as_deref(),
+            Some(
+                std::fs::canonicalize(&fixture.leaf_path)
+                    .expect("the attached leaf path must resolve")
+                    .as_path()
+            ),
+            "the branch must stay checked out at the one deterministic leaf path"
+        );
+        assert_eq!(fixture.branch_head(), head);
+    }
+
+    #[tokio::test]
+    async fn a_resume_restores_the_existing_open_pull_request_context() {
+        let fixture = PullRequestFixture::new("pr-context").await;
+        fixture.report_open_pull_request(&fixture.head).await;
+        fixture.report_review_feedback().await;
+
+        let task = fixture.resume_task().await;
+
+        assert!(
+            task.starts_with("Address the review feedback."),
+            "the host task must survive intact, got {task}"
+        );
+        assert!(
+            task.contains(&format!("Existing PR: #{PR_NUMBER} — {PR_TITLE}"))
+                && task.contains("Do NOT create a new pull request."),
+            "a resume must be told which PR it continues, got {task}"
+        );
+        assert!(
+            task.contains(REVIEW_BODY) && task.contains(REVIEW_COMMENT),
+            "a resume must see the feedback already on that PR, got {task}"
+        );
+        assert!(
+            fixture
+                .forge_methods()
+                .await
+                .iter()
+                .all(|method| method == "GET"),
+            "restoring PR context must only read from the forge"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_at_a_different_head_is_not_injected() {
+        let fixture = PullRequestFixture::new("pr-other-head").await;
+        assert_ne!(
+            fixture.other_head, fixture.head,
+            "the fake must report a head this branch does not have"
+        );
+        fixture.report_open_pull_request(&fixture.other_head).await;
+        fixture.report_review_feedback().await;
+
+        let task = fixture.resume_task().await;
+
+        assert_eq!(
+            task, "Address the review feedback.",
+            "a PR whose head has moved past the verified branch describes other work"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_without_an_open_pull_request_gets_no_pr_context() {
+        let fixture = PullRequestFixture::new("pr-absent").await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&fixture.forge)
+            .await;
+
+        let task = fixture.resume_task().await;
+
+        assert_eq!(
+            task, "Address the review feedback.",
+            "a branch with no qualifying open PR must get no PR context"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_resume_restores_the_same_pull_request() {
+        let fixture = PullRequestFixture::new("pr-repeat").await;
+        fixture.report_open_pull_request(&fixture.head).await;
+        fixture.report_review_feedback().await;
+
+        let first = fixture.resume_task().await;
+        let second = fixture.resume_task().await;
+
+        assert_eq!(first, second, "a second resume must restore the same PR");
+        assert_eq!(
+            first.matches(&format!("Existing PR: #{PR_NUMBER}")).count(),
+            1,
+            "a repeated resume must name one PR, never a second one"
+        );
+        assert!(
+            fixture
+                .forge_methods()
+                .await
+                .iter()
+                .all(|method| method == "GET"),
+            "a repeated resume must not file another pull request"
+        );
+    }
+
+    #[test]
+    fn pr_context_requires_an_open_pull_request_at_the_verified_head() {
+        let open =
+            |state: &str, merged: bool, head_sha: Option<&str>, branch: &str| ForgejoPullRequest {
+                number: PRNumber::new(PR_NUMBER),
+                url: String::new(),
+                title: PR_TITLE.to_string(),
+                body: String::new(),
+                head_ref: BranchName::try_from_str(branch).expect("literal branch is non-empty"),
+                base_ref: BranchName::try_from_str("main").expect("literal branch is non-empty"),
+                state: state.to_string(),
+                merged,
+                head_sha: head_sha.map(str::to_string),
+                base_sha: None,
+                merge_commit_sha: None,
+            };
+        let branch = BranchName::try_from_str("main.leaf").expect("literal branch is non-empty");
+
+        assert!(pr_carries_verified_head(
+            &open("open", false, Some("abc"), "main.leaf"),
+            &branch,
+            "abc"
+        ));
+        assert!(!pr_carries_verified_head(
+            &open("open", false, Some("def"), "main.leaf"),
+            &branch,
+            "abc"
+        ));
+        assert!(!pr_carries_verified_head(
+            &open("open", false, None, "main.leaf"),
+            &branch,
+            "abc"
+        ));
+        assert!(!pr_carries_verified_head(
+            &open("closed", false, Some("abc"), "main.leaf"),
+            &branch,
+            "abc"
+        ));
+        assert!(!pr_carries_verified_head(
+            &open("open", true, Some("abc"), "main.leaf"),
+            &branch,
+            "abc"
+        ));
+        assert!(!pr_carries_verified_head(
+            &open("open", false, Some("abc"), "main.other"),
+            &branch,
+            "abc"
+        ));
+        assert!(!pr_carries_verified_head(
+            &open("open", false, Some("abc"), "main.leaf"),
+            &branch,
+            ""
+        ));
     }
 
     #[test]
