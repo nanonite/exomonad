@@ -1129,7 +1129,7 @@ impl<
         &self,
         decision: &str,
     ) -> Result<LifecycleGuard> {
-        LifecycleGuard::try_acquire_async(
+        LifecycleGuard::try_acquire(
             self.project_dir(),
             LifecycleMode::Exclusive,
             DECISION_TIMEOUT,

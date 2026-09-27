@@ -2006,7 +2006,8 @@ mod tests {
             &project,
             LifecycleMode::Exclusive,
             std::time::Duration::ZERO,
-        )?
+        )
+        .await?
         .expect("the test holds the exclusive lifecycle lock");
 
         // The sink cannot verify under contention, so it writes project-owned and

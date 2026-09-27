@@ -1877,8 +1877,11 @@ impl<
             // is a reusable worktree. Registered, dirty, identified, or
             // ambiguous directories are never removed. A cleanup failure leaves
             // the residue in place and is reported, never silently ignored.
-            if let Err(error) =
-                super::cleanup::cleanup_unregistered_worktree_residue(self.project_dir(), self.git_wt())
+            if let Err(error) = super::cleanup::cleanup_unregistered_worktree_residue(
+                self.project_dir(),
+                self.git_wt(),
+            )
+            .await
             {
                 warn!(
                     project = %self.project_dir().display(),

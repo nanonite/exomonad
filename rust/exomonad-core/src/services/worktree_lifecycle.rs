@@ -24,8 +24,8 @@
 //!
 //! Every attempt is non-blocking, so a contended acquisition spends its whole
 //! timeout waiting rather than deciding. That wait must not block a runtime
-//! worker: `try_acquire_async` yields to the runtime between attempts and
-//! `try_acquire` sleeps the thread it owns. The two entry points share one
+//! worker, so [`LifecycleGuard::try_acquire`] yields to the runtime between
+//! attempts and every caller uses it. [`LifecycleAcquisition`] is the single
 //! acquisition implementation, so the decision — which mode, which deadline,
 //! what an error means — is made in exactly one place.
 
@@ -156,36 +156,13 @@ impl LifecycleGuard {
     ///
     /// Returns `Ok(None)` when the lock is still held by another caller after
     /// the wait; the caller must then fail closed. A `timeout` of zero makes a
-    /// single non-blocking attempt.
+    /// single non-blocking attempt, which is how a test takes a lock in place of
+    /// another process.
     ///
-    /// For a caller that owns its thread. A caller running inside a runtime must
-    /// use [`Self::try_acquire_async`], because sleeping here would block a
-    /// runtime worker for the whole timeout.
-    pub(crate) fn try_acquire(
-        project_root: &Path,
-        mode: LifecycleMode,
-        timeout: Duration,
-    ) -> Result<Option<Self>> {
-        let mut acquisition = LifecycleAcquisition::start(project_root, mode, timeout)?;
-        loop {
-            if let Some(guard) = acquisition.attempt()? {
-                return Ok(Some(guard));
-            }
-            if !acquisition.may_retry() {
-                return Ok(None);
-            }
-            std::thread::sleep(RETRY_INTERVAL);
-        }
-    }
-
-    /// Try to take the lifecycle lock without blocking a runtime worker.
-    ///
-    /// Identical to [`Self::try_acquire`] except that the wait between two
-    /// non-blocking attempts yields to the runtime, so a contended acquisition
-    /// of `DECISION_TIMEOUT` never parks the thread it was awaited on. Both
-    /// entry points drive the same [`LifecycleAcquisition`], so the acquisition
-    /// decision is made in one place.
-    pub(crate) async fn try_acquire_async(
+    /// Async because the wait between two non-blocking attempts yields to the
+    /// runtime: a contended acquisition of `DECISION_TIMEOUT` must not park the
+    /// worker it was awaited on. [`LifecycleAcquisition`] owns the decision.
+    pub(crate) async fn try_acquire(
         project_root: &Path,
         mode: LifecycleMode,
         timeout: Duration,
@@ -211,46 +188,57 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::oneshot;
 
-    #[test]
-    fn exclusive_holder_blocks_every_other_mode() -> Result<()> {
+    #[tokio::test]
+    async fn exclusive_holder_blocks_every_other_mode() -> Result<()> {
         let temp = TempDir::new()?;
         let project = temp.path();
-        let held = LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
+        let held = LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)
+            .await?
             .expect("first exclusive acquisition is uncontended");
         assert!(
-            LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)?.is_none()
+            LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)
+                .await?
+                .is_none()
         );
         assert!(
-            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
+            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)
+                .await?
                 .is_none()
         );
         drop(held);
         assert!(
-            LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)?.is_some()
+            LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)
+                .await?
+                .is_some()
         );
         Ok(())
     }
 
-    #[test]
-    fn shared_holders_are_compatible_and_block_exclusive() -> Result<()> {
+    #[tokio::test]
+    async fn shared_holders_are_compatible_and_block_exclusive() -> Result<()> {
         let temp = TempDir::new()?;
         let project = temp.path();
-        let first = LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)?
+        let first = LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)
+            .await?
             .expect("first shared acquisition is uncontended");
-        let second = LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)?
+        let second = LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)
+            .await?
             .expect("shared locks are compatible with each other");
         assert!(
-            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
+            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)
+                .await?
                 .is_none()
         );
         drop(first);
         assert!(
-            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
+            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)
+                .await?
                 .is_none()
         );
         drop(second);
         assert!(
-            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
+            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)
+                .await?
                 .is_some()
         );
         Ok(())
@@ -263,31 +251,8 @@ mod tests {
         assert_eq!(lock_path, temp.path().join(LOCK_RELATIVE_PATH));
     }
 
-    /// The async entry point makes the same decision as the sync one and hands
-    /// back a guard that is still held, so both entry points drive the same
-    /// acquisition.
-    #[tokio::test]
-    async fn an_async_acquisition_hands_back_a_held_guard() -> Result<()> {
-        let temp = TempDir::new()?;
-        let project = temp.path();
-        let held =
-            LifecycleGuard::try_acquire_async(project, LifecycleMode::Exclusive, SINK_TIMEOUT)
-                .await?
-                .expect("an uncontended acquisition succeeds");
-        assert!(
-            LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)?.is_none(),
-            "the guard returned by the async path holds the lock"
-        );
-        drop(held);
-        assert!(
-            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
-                .is_some()
-        );
-        Ok(())
-    }
-
-    /// A contended acquisition from async code must yield between attempts, so a
-    /// runtime worker is never parked for the length of the timeout.
+    /// A contended acquisition must yield between attempts, so a runtime worker
+    /// is never parked for the length of the timeout.
     ///
     /// The runtime is `current_thread`, so the only way the ticker can run at all
     /// is if the acquisition reaches a suspension point. The ticker is released
@@ -298,10 +263,11 @@ mod tests {
     /// is asserted, only that the other task made progress and that the
     /// acquisition still failed closed.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_contended_async_acquisition_does_not_block_the_runtime() -> Result<()> {
+    async fn a_contended_acquisition_does_not_block_the_runtime() -> Result<()> {
         let temp = TempDir::new()?;
         let project = temp.path();
-        let _held = LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
+        let _held = LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)
+            .await?
             .expect("the test holds the exclusive lifecycle lock");
 
         let progress = Arc::new(AtomicUsize::new(0));
@@ -327,7 +293,7 @@ mod tests {
         // turn, so the ticker cannot have run before the acquisition starts.
         release_tx.send(()).ok();
         let outcome =
-            LifecycleGuard::try_acquire_async(project, LifecycleMode::Shared, SINK_TIMEOUT).await?;
+            LifecycleGuard::try_acquire(project, LifecycleMode::Shared, SINK_TIMEOUT).await?;
         let observed = progress.load(Ordering::SeqCst);
         ticker.await?;
 

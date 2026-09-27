@@ -136,7 +136,7 @@ This asymmetry is intentional — only the `notify_parent` relationship has a we
 |---------|------|--------|
 | Sink verify -> write | shared | `resolve_sink`, `run_inbox_consumer`, the injection closure, the duplicate-cache append |
 | Worktree create/attach/reuse decision | exclusive | `AgentControlService::acquire_worktree_lifecycle` in `spawn.rs` |
-| Residue classify -> quarantine rename | exclusive | `cleanup_unregistered_worktree_residue` |
+| Residue classify -> quarantine rename | exclusive | `cleanup_unregistered_worktree_residue`, awaited by the spawn preflight |
 
 Exclusive and shared are the same lock, so a cleanup pass drains in-flight sink writers before it classifies, and a leaf worktree cannot be created between a cleanup classification and its rename. Acquisition is bounded and every caller fails closed:
 
@@ -144,9 +144,11 @@ Exclusive and shared are the same lock, so a cleanup pass drains in-flight sink 
 - A cleanup pass that cannot take the exclusive lock skips the pass and leaves residue untouched (`tracing::warn!`).
 - A spawn that cannot take the exclusive lock returns an error instead of creating, attaching, or reusing a worktree.
 
-Every attempt is non-blocking, so a contended acquisition spends its whole timeout waiting. That wait must never park a runtime worker: `LifecycleGuard::try_acquire_async` yields with `tokio::time::sleep` between attempts and is what async code uses (`resolve_sink`, `acquire_worktree_lifecycle`), while `LifecycleGuard::try_acquire` sleeps the thread it owns and is for callers that are not on a runtime (`cleanup_unregistered_worktree_residue`, tests). Both entry points drive the same `LifecycleAcquisition`, so the mode, the deadline, and the meaning of an error are decided in one place.
+Every attempt is non-blocking, so a contended acquisition spends its whole timeout waiting. That wait must never park a runtime worker, so `LifecycleGuard::try_acquire` is async and yields with `tokio::time::sleep` between attempts. Every caller uses it — `resolve_sink`, `AgentControlService::acquire_worktree_lifecycle`, and `cleanup_unregistered_worktree_residue` — and there is no synchronous variant. The private `LifecycleAcquisition` is the single acquisition implementation, so the mode, the deadline, and the meaning of an error are decided in one place.
 
 The project-owned directory needs no lock: no lifecycle decision creates, removes, or quarantines it. A sink destination must stay in scope for the whole write, because dropping it releases the lock before the bytes land.
+
+`cleanup_unregistered_worktree_residue` is awaited by the spawn preflight in `spawn.rs`, so a preflight that waits out `DECISION_TIMEOUT` for the lock cannot park a runtime worker. There is one classification and quarantine implementation behind it.
 
 Residue cleanup quarantines a directory only when Git's worktree registry does not know it, no `.exo/agents/*/identity.json` claims it, and it contains nothing but known sink artifacts. Registered, dirty, identified, and ambiguous directories are refused, and `cleanup_unregistered_worktree_residue` returns `Result`: it is not a best-effort void. Each quarantined directory is preserved by rename into `.exo/worktrees-residue/`, and its manifest entry is written to a temporary file, fsynced, renamed over `manifest.jsonl`, and followed by an fsync of the quarantine directory, all inside the exclusive lock. A manifest failure leaves the quarantined directory in place and is surfaced to the caller, which logs it and continues. An existing manifest is read with `NotFound` as the only empty case: a manifest that cannot be read for any other reason keeps its bytes and stops the append, because rewriting it from an empty buffer would silently erase every prior quarantine record.
 

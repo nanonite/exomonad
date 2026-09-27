@@ -58,7 +58,7 @@ pub(crate) async fn resolve_sink(project_root: &Path, candidate: &Path) -> SinkD
             _lifecycle: None,
         };
     }
-    let lifecycle = match LifecycleGuard::try_acquire_async(
+    let lifecycle = match LifecycleGuard::try_acquire(
         project_root,
         LifecycleMode::Shared,
         SINK_TIMEOUT,
@@ -154,7 +154,8 @@ mod tests {
         let temp = TempDir::new()?;
         let candidate = temp.path().join(".exo/worktrees/leaf");
         let _held =
-            LifecycleGuard::try_acquire(temp.path(), LifecycleMode::Exclusive, Duration::ZERO)?
+            LifecycleGuard::try_acquire(temp.path(), LifecycleMode::Exclusive, Duration::ZERO)
+                .await?
                 .expect("the test holds the lifecycle lock");
         let sink = resolve_sink(temp.path(), &candidate).await;
         assert!(sink._lifecycle.is_none());

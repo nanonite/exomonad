@@ -685,12 +685,18 @@ fn residue_quarantine_name(name: &str) -> String {
 ///
 /// Fails closed: without the exclusive lock the pass is skipped and the residue
 /// is left exactly as found.
-pub(crate) fn cleanup_unregistered_worktree_residue(
+///
+/// Async because a contended acquisition spends up to `DECISION_TIMEOUT`
+/// waiting, and every caller is the spawn preflight on a runtime. The wait
+/// yields through `try_acquire` instead of parking a runtime worker; the
+/// classification and quarantine below it is a single implementation.
+pub(crate) async fn cleanup_unregistered_worktree_residue(
     project_dir: &Path,
     git_wt: &GitWorktreeService,
 ) -> Result<Vec<PathBuf>> {
     let Some(_lifecycle) =
-        LifecycleGuard::try_acquire(project_dir, LifecycleMode::Exclusive, DECISION_TIMEOUT)?
+        LifecycleGuard::try_acquire(project_dir, LifecycleMode::Exclusive, DECISION_TIMEOUT)
+            .await?
     else {
         warn!(
             project = %project_dir.display(),
@@ -766,7 +772,9 @@ mod tests {
     use crate::services::git_worktree::GitWorktreeService;
     use crate::services::Services;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::sync::oneshot;
 
     fn init_residue_repo() -> (tempfile::TempDir, PathBuf, GitWorktreeService) {
         let temp = tempfile::tempdir().unwrap();
@@ -798,14 +806,16 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    #[test]
-    fn residue_cleanup_quarantines_sink_only_directory() {
+    #[tokio::test]
+    async fn residue_cleanup_quarantines_sink_only_directory() {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/ledger/segments")).unwrap();
         std::fs::write(residue.join(".exo/ledger/segments/segment-0.jsonl"), "{}\n").unwrap();
 
-        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt).unwrap();
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .await
+            .unwrap();
 
         assert_eq!(moved, vec![residue.clone()]);
         assert!(!residue.exists());
@@ -823,14 +833,14 @@ mod tests {
 
     /// The manifest is the durable record of what was quarantined and of the
     /// source kind replay must classify it by.
-    #[test]
-    fn residue_cleanup_records_a_durable_classified_manifest_entry() -> Result<()> {
+    #[tokio::test]
+    async fn residue_cleanup_records_a_durable_classified_manifest_entry() -> Result<()> {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
         std::fs::write(residue.join(".exo/ledger/segments/segment-0.jsonl"), "{}\n")?;
 
-        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt)?;
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt).await?;
         let destination = moved
             .first()
             .map(|source| quarantine_destination_for(&project, source.as_path()))
@@ -852,8 +862,8 @@ mod tests {
 
     /// A manifest failure must leave the quarantined evidence in place and be
     /// surfaced to the caller, never swallowed.
-    #[test]
-    fn residue_cleanup_surfaces_a_manifest_failure_and_keeps_the_evidence() -> Result<()> {
+    #[tokio::test]
+    async fn residue_cleanup_surfaces_a_manifest_failure_and_keeps_the_evidence() -> Result<()> {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
@@ -866,6 +876,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".exo/worktrees-residue/manifest.jsonl"))?;
 
         let error = cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .await
             .expect_err("a manifest failure must be surfaced");
 
         assert!(error.to_string().contains("quarantine manifest"), "{error}");
@@ -887,8 +898,9 @@ mod tests {
     /// An existing manifest that cannot be read is not an empty manifest. Every
     /// prior quarantine record must survive byte for byte, the error must reach
     /// the caller, and the directory that was already moved stays in quarantine.
-    #[test]
-    fn residue_cleanup_preserves_an_unreadable_manifest_and_keeps_the_evidence() -> Result<()> {
+    #[tokio::test]
+    async fn residue_cleanup_preserves_an_unreadable_manifest_and_keeps_the_evidence() -> Result<()>
+    {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
@@ -912,6 +924,7 @@ mod tests {
         }
 
         let error = cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .await
             .expect_err("an unreadable manifest must be surfaced, not treated as empty");
 
         assert!(
@@ -941,8 +954,8 @@ mod tests {
     /// The control case for the unreadable manifest: a manifest that does not
     /// exist yet is the one state that legitimately means "no prior records", so
     /// the first append creates it.
-    #[test]
-    fn residue_cleanup_appends_when_no_manifest_exists_yet() -> Result<()> {
+    #[tokio::test]
+    async fn residue_cleanup_appends_when_no_manifest_exists_yet() -> Result<()> {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
@@ -950,7 +963,7 @@ mod tests {
             .join(".exo/worktrees-residue")
             .join(RESIDUE_MANIFEST);
 
-        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt)?;
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt).await?;
 
         assert_eq!(moved, vec![residue.clone()]);
         let entry: serde_json::Value =
@@ -963,19 +976,17 @@ mod tests {
     /// a cleanup pass cannot quarantine a directory that a writer is using.
     /// `flock` is held per open file description, so an in-test holder excludes
     /// the pass exactly as a concurrent writer process would.
-    #[test]
-    fn residue_cleanup_skips_while_a_sink_holds_the_shared_lock() -> Result<()> {
+    #[tokio::test]
+    async fn residue_cleanup_skips_while_a_sink_holds_the_shared_lock() -> Result<()> {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
-        let _writer = LifecycleGuard::try_acquire(
-            &project,
-            LifecycleMode::Shared,
-            std::time::Duration::ZERO,
-        )?
-        .expect("the test holds the shared lifecycle lock like an in-flight sink");
+        let _writer =
+            LifecycleGuard::try_acquire(&project, LifecycleMode::Shared, std::time::Duration::ZERO)
+                .await?
+                .expect("the test holds the shared lifecycle lock like an in-flight sink");
 
-        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt)?;
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt).await?;
 
         assert!(
             moved.is_empty(),
@@ -987,8 +998,66 @@ mod tests {
         // Once the writer drains, the same pass quarantines the residue.
         drop(_writer);
         assert_eq!(
-            cleanup_unregistered_worktree_residue(&project, &git_wt)?,
+            cleanup_unregistered_worktree_residue(&project, &git_wt).await?,
             vec![residue.clone()]
+        );
+        Ok(())
+    }
+
+    /// The spawn preflight runs inside a runtime, so a pass that waits out
+    /// `DECISION_TIMEOUT` for the lock must not park the worker it was awaited on.
+    ///
+    /// The runtime is `current_thread`, so the only way the ticker can run at all
+    /// is if the acquisition reaches a suspension point. The ticker is released
+    /// on the same turn that starts the pass, so it has run nothing before the
+    /// pass begins, and the counter is read before the ticker is awaited. A
+    /// blocking wait would freeze the single worker for the whole timeout and the
+    /// counter would still be zero. No wall-clock duration is asserted, only that
+    /// the other task made progress and that the pass still failed closed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn residue_cleanup_under_contention_does_not_block_the_runtime() -> Result<()> {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
+        let _writer =
+            LifecycleGuard::try_acquire(&project, LifecycleMode::Shared, std::time::Duration::ZERO)
+                .await?
+                .expect("the test holds the shared lifecycle lock like an in-flight sink");
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let ticker = tokio::spawn({
+            let progress = Arc::clone(&progress);
+            async move {
+                parked_tx.send(()).ok();
+                release_rx.await.ok();
+                // Bounded, so the ready queue drains and the pass's own timer can
+                // still fire.
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                    progress.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        parked_rx.await?;
+        let before = progress.load(Ordering::SeqCst);
+
+        // Releasing the ticker and awaiting the pass happen in the same turn, so
+        // the ticker cannot have run before the pass starts.
+        release_tx.send(()).ok();
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt).await?;
+        let observed = progress.load(Ordering::SeqCst);
+        ticker.await?;
+
+        assert!(
+            moved.is_empty(),
+            "the pass is skipped, not partially applied"
+        );
+        assert!(residue.exists(), "residue is left untouched");
+        assert!(
+            observed > before,
+            "another task must make progress while the cleanup pass waits for the lock"
         );
         Ok(())
     }
@@ -997,8 +1066,8 @@ mod tests {
     /// quarantined by a pass that started from a stale view, and the pass itself
     /// cannot start while that region is held. Both sides take the same lock, so
     /// the interleaving the lock exists to prevent is not reachable.
-    #[test]
-    fn residue_cleanup_cannot_interleave_with_a_worktree_create_decision() -> Result<()> {
+    #[tokio::test]
+    async fn residue_cleanup_cannot_interleave_with_a_worktree_create_decision() -> Result<()> {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/other-codex");
         std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
@@ -1013,9 +1082,12 @@ mod tests {
             &project,
             LifecycleMode::Exclusive,
             std::time::Duration::ZERO,
-        )?
+        )
+        .await?
         .expect("the first exclusive acquisition is uncontended");
-        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)?.is_empty());
+        assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .await?
+            .is_empty());
         assert!(
             residue.exists(),
             "a pass that cannot take the lock leaves residue untouched"
@@ -1027,7 +1099,7 @@ mod tests {
         // After the create completes the new worktree is registered, so it is
         // never classified as residue.
         assert_eq!(
-            cleanup_unregistered_worktree_residue(&project, &git_wt)?,
+            cleanup_unregistered_worktree_residue(&project, &git_wt).await?,
             vec![residue]
         );
         assert!(worktree.exists());
@@ -1066,8 +1138,8 @@ mod tests {
             })
     }
 
-    #[test]
-    fn residue_cleanup_refuses_registered_worktree() {
+    #[tokio::test]
+    async fn residue_cleanup_refuses_registered_worktree() {
         let (_temp, project, git_wt) = init_residue_repo();
         let default_branch = fixture_branch(&project);
         let worktree = project.join(".exo/worktrees/leaf-codex");
@@ -1079,13 +1151,14 @@ mod tests {
         std::fs::create_dir_all(worktree.join(".exo/ledger/segments")).unwrap();
 
         assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .await
             .unwrap()
             .is_empty());
         assert!(worktree.exists());
     }
 
-    #[test]
-    fn residue_cleanup_refuses_identified_worktree() {
+    #[tokio::test]
+    async fn residue_cleanup_refuses_identified_worktree() {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
@@ -1098,13 +1171,14 @@ mod tests {
         .unwrap();
 
         assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .await
             .unwrap()
             .is_empty());
         assert!(residue.exists());
     }
 
-    #[test]
-    fn residue_cleanup_refuses_deep_nested_symlink() {
+    #[tokio::test]
+    async fn residue_cleanup_refuses_deep_nested_symlink() {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         let deep = residue.join(".exo/ledger/segments/a/b/c/d/e");
@@ -1114,19 +1188,21 @@ mod tests {
         std::os::unix::fs::symlink(&target, deep.join("link")).unwrap();
 
         assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .await
             .unwrap()
             .is_empty());
         assert!(residue.exists());
     }
 
-    #[test]
-    fn residue_cleanup_refuses_dirty_or_ambiguous_directory() {
+    #[tokio::test]
+    async fn residue_cleanup_refuses_dirty_or_ambiguous_directory() {
         let (_temp, project, git_wt) = init_residue_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(residue.join(".exo/logs")).unwrap();
         std::fs::write(residue.join("seed"), "real work\n").unwrap();
 
         assert!(cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .await
             .unwrap()
             .is_empty());
         assert!(residue.exists());
