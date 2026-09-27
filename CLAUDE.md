@@ -300,6 +300,12 @@ poll_interval = 60           # optional — GitHub poll cycle in seconds (defaul
   tl_active_tail_timeout_seconds = 30.0         # ledger tailer active-tail timeout (default: 30)
   tl_task_timeout_seconds = 3600.0              # project task ceiling; 0 disables enforcement
   tl_preflight_runtime_paths = [".my-tool/runtime/"] # extra relative runtime paths ignored by spawn preflight
+# TL loop dispatch-retry budget. Only a refusal that PROVES nothing was created is
+# retried; an ambiguous refusal is held for evidence and never re-driven. The limit
+# must be >= 1, both delays positive, and the cap not below the base.
+  tl_dispatch_retry_limit = 3                  # scheduled retries before parking (default: 3)
+  tl_dispatch_retry_base_delay_seconds = 5.0   # delay before the first retry; doubles each (default: 5.0)
+  tl_dispatch_retry_max_delay_seconds = 60.0   # ceiling on that backoff (default: 60.0)
 forgejo_url = "http://localhost:3000"           # optional — Forgejo base URL
 forgejo_token = "forgejo_pat"                      # optional — Forgejo API token
 forgejo_webhook_secret = "shared-secret"           # optional — webhook signature secret
@@ -832,20 +838,28 @@ make the decision.
 
 A dispatch failure is one of those bounded failures, and it is classified by a
 stable machine code rather than by a message. The code is the `code` the runtime
-recorded on the correlated `agent.spawn_failed` ledger event. A transient code —
-`worktree.branch_exists` (a creation race), `worktree.lifecycle_lock_timeout`,
-or an explicit `dispatch.transport_timeout` — schedules a durable
-`dispatch_retry_scheduled` boundary with bounded exponential backoff and is
-re-driven idempotently, so the only recovery signal is never traded for a
-duplicate leaf, branch, worktree, or PR. The boundary carries no intent, because
-nothing was created; a restart inside the window resumes the same boundary and
-issues no effect. Every other code, including one the runtime never recorded, is
-terminal: `worktree.branch_ownership_conflict` parks immediately on
-`tl-dispatch-ownership-conflict`, and exhausting `dispatch_retry_limit` (default
-3) opens `tl-dispatch-failed` keeping the machine code. Elapsed time and silence
-are never evidence of failure, and abandoned durable guidance is re-queued with
-its `batch_id` recorded rather than dropped. See
-[tl_loop/CLAUDE.md](tl_loop/CLAUDE.md) for the full table and knobs.
+recorded on the correlated `agent.spawn_failed` ledger event. **Only a refusal
+that proves nothing was created is retryable**: a transient code —
+`worktree.branch_exists` (a creation race) or `worktree.lifecycle_lock_timeout`
+(the decision never ran) — schedules a durable `dispatch_retry_scheduled`
+boundary with bounded exponential backoff and is re-driven idempotently, so the
+only recovery signal is never traded for a duplicate leaf, branch, worktree, or
+PR. The boundary carries no intent, because nothing was created; a restart
+inside the window resumes the same boundary and issues no effect. An
+**ambiguous** code — currently `dispatch.transport_timeout`, which wraps the
+whole server-side spawn and so can fire after the worktree, identity, and tmux
+window exist — is not a failure: the slice holds at `dispatch_unconfirmed` with
+its intent intact and is resolved by matching evidence or verified owner
+reconciliation, never by a fresh spawn. Every other code, including one the
+runtime never recorded, is terminal:
+`worktree.branch_ownership_conflict` parks immediately on
+`tl-dispatch-ownership-conflict`, and exhausting `tl_dispatch_retry_limit`
+(default 3) opens `tl-dispatch-failed` keeping the machine code. The budget is
+operator-configurable (see Configuration). Elapsed time and silence are never
+evidence of failure, and abandoned durable guidance is re-queued with its
+`batch_id` recorded rather than dropped. See
+[tl_loop/CLAUDE.md](tl_loop/CLAUDE.md) for the full table and the rest of the
+knobs.
 
 ### Plan quality
 

@@ -43,7 +43,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::{fs, process::Command};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::services::{
     capture_memory, CleanupBranchActionStatus, CleanupReceipt, CleanupReceiptEntry,
@@ -4556,6 +4556,11 @@ fn spawn_result_branch_name(
 /// operator-facing prose, so re-wording a message can never change whether a
 /// dispatch is retried. An error with no typed code records a null `code`,
 /// which the controller classifies as terminal.
+///
+/// A refusal that cannot be recorded leaves the controller with nothing to
+/// classify, so both failure paths here are logged at `error!` with the child,
+/// the intent, and the code. The refusal itself stays authoritative through the
+/// tool response; this row is the durable evidence, not the decision.
 fn append_spawn_failed<C: HasEventLog>(
     ctx: &Arc<C>,
     parent_agent: &str,
@@ -4563,13 +4568,21 @@ fn append_spawn_failed<C: HasEventLog>(
     intent_id: &str,
     error: &EffectError,
 ) {
-    let Some(log) = ctx.event_log() else {
-        return;
-    };
     let code = match error {
         EffectError::Custom { code, .. } => Some(code.clone()),
         EffectError::Timeout { .. } => Some("dispatch.transport_timeout".to_string()),
         _ => None,
+    };
+    let Some(log) = ctx.event_log() else {
+        error!(
+            parent_agent,
+            child_agent,
+            intent_id,
+            code = code.as_deref().unwrap_or("untyped"),
+            error = %error,
+            "no event log; the refused spawn is unrecorded and the controller cannot classify it"
+        );
+        return;
     };
     let mut payload = serde_json::json!({
         "child_agent": child_agent,
@@ -4580,7 +4593,16 @@ fn append_spawn_failed<C: HasEventLog>(
     if !intent_id.trim().is_empty() {
         payload["intent_id"] = serde_json::json!(intent_id);
     }
-    let _ = log.append("agent.spawn_failed", parent_agent, &payload);
+    if let Err(write_error) = log.append("agent.spawn_failed", parent_agent, &payload) {
+        error!(
+            parent_agent,
+            child_agent,
+            intent_id,
+            code = code.as_deref().unwrap_or("untyped"),
+            error = %write_error,
+            "failed to record the refused spawn; the controller cannot classify it"
+        );
+    }
 }
 
 fn service_agent_type_to_proto(at: ServiceAgentType) -> i32 {
@@ -4748,6 +4770,7 @@ mod tests {
     use prost::Message;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
 
     #[test]
     fn cleanup_dry_run_reports_candidates_that_would_be_cleaned() {
@@ -4858,6 +4881,45 @@ mod tests {
         AgentHandler::new(service, services)
     }
 
+    /// A tracing subscriber that appends every event's level and fields to
+    /// `sink`, so a test can assert that a failure path was actually reported
+    /// rather than returning silently.
+    fn capture_subscriber(
+        sink: Arc<Mutex<Vec<String>>>,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        use std::fmt::Write as _;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+
+        #[derive(Default)]
+        struct Fields(String);
+
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+        }
+
+        impl<S> Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().expect("capture lock").push(format!(
+                    "LEVEL_{:?}{}",
+                    event.metadata().level(),
+                    fields.0
+                ));
+            }
+        }
+
+        tracing_subscriber::registry().with(Capture(sink))
+    }
+
     /// The controller classifies a refused spawn by this field alone, so the
     /// typed code must survive into the ledger next to the operator prose.
     #[test]
@@ -4915,6 +4977,55 @@ mod tests {
             records[0].event.data["code"].is_null(),
             "an untyped refusal must leave the code absent, never inferred from prose"
         );
+    }
+
+    /// A refusal the controller cannot read is a silent loss of the only
+    /// durable evidence it classifies from, so the missing write must be loud
+    /// and must name the child, the intent, and the code.
+    #[test]
+    fn a_refusal_without_an_event_log_is_reported_loudly() {
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let _guard = tracing::subscriber::set_default(capture_subscriber(captured.clone()));
+        let services = Arc::new(crate::services::Services::test());
+
+        append_spawn_failed(
+            &services,
+            "root",
+            "leaf-a",
+            "intent-1",
+            &EffectError::custom("worktree.branch_exists", "branch already exists"),
+        );
+
+        let records = captured.lock().expect("capture lock");
+        let refusal = records
+            .iter()
+            .find(|message| message.contains("leaf-a"))
+            .expect("the unrecorded refusal must be reported, not dropped");
+        assert!(refusal.contains("Level(Error)"), "{refusal}");
+        assert!(refusal.contains("intent-1"), "{refusal}");
+        assert!(refusal.contains("worktree.branch_exists"), "{refusal}");
+    }
+
+    #[test]
+    fn an_untyped_refusal_reports_no_code_rather_than_a_guess() {
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let _guard = tracing::subscriber::set_default(capture_subscriber(captured.clone()));
+        let services = Arc::new(crate::services::Services::test());
+
+        append_spawn_failed(
+            &services,
+            "root",
+            "leaf-a",
+            "intent-1",
+            &EffectError::invalid_input("branch_name is required"),
+        );
+
+        let records = captured.lock().expect("capture lock");
+        let refusal = records
+            .iter()
+            .find(|message| message.contains("leaf-a"))
+            .expect("the unrecorded refusal must be reported, not dropped");
+        assert!(refusal.contains("untyped"), "{refusal}");
     }
 
     async fn ownership_services(

@@ -240,6 +240,21 @@ create/attach decision never ran), `worktree.branch_ownership_conflict`
 timeout is a transient refusal and carries its code from
 `acquire_worktree_lifecycle`, so a caller does not have to infer it.
 
+`dispatch.transport_timeout` is deliberately **not** a retryable code. The
+`SPAWN_TIMEOUT` it derives from wraps the entire `spawn_leaf_subtree`, so it can
+fire after the worktree, the identity record, and the tmux window already exist.
+Its outcome is unproven, and a re-drive could launch a second actor on the same
+deterministic branch; the caller holds the intent and waits for evidence
+instead. Widening the typed code space therefore does not widen the retryable
+set: retryability is a reviewed statement that a refusal proves no side effect
+happened.
+
+A refusal that cannot be recorded leaves the controller with nothing to
+classify. `append_spawn_failed` therefore logs at `error!` with the child, the
+intent, and the code both when there is no event log and when the append fails.
+The refusal itself stays authoritative through the tool response; the ledger row
+is the durable evidence, not the decision.
+
 ### The head set is proven on reuse too, not only on attach
 
 `verify_leaf_head_evidence` is the single implementation, and it runs on both

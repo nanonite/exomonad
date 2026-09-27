@@ -181,7 +181,9 @@ mod tests {
     use super::*;
     use exomonad::config::{
         CompanionConfig, ReviewerConfig, DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS,
-        DEFAULT_TL_TASK_TIMEOUT_SECONDS, DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
+        DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS, DEFAULT_TL_DISPATCH_RETRY_LIMIT,
+        DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS, DEFAULT_TL_TASK_TIMEOUT_SECONDS,
+        DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
     };
     use exomonad_core::{services::AgentType, Role};
     use std::collections::HashMap;
@@ -222,6 +224,9 @@ mod tests {
             tl_transport_timeout_seconds: DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
             tl_active_tail_timeout_seconds: DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS,
             tl_task_timeout_seconds: DEFAULT_TL_TASK_TIMEOUT_SECONDS,
+            tl_dispatch_retry_limit: DEFAULT_TL_DISPATCH_RETRY_LIMIT,
+            tl_dispatch_retry_base_delay_seconds: DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS,
+            tl_dispatch_retry_max_delay_seconds: DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS,
             tl_preflight_runtime_paths: Vec::new(),
             openrouter: Default::default(),
             opencode: Default::default(),

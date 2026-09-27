@@ -162,18 +162,24 @@ intent before the spawn effect, remains `dispatch_unconfirmed` after an
 accepted request, and becomes `spawned` only when the correlated
 `agent.spawned` ledger event is consumed. A rejection is classified by the
 stable machine code the runtime recorded on the correlated
-`agent.spawn_failed` event, never by its message: a transient code (a
-`worktree.branch_exists` creation race, a busy lifecycle lock, an explicit
-transport timeout) schedules a durable `dispatch_retry_scheduled` boundary with
-bounded exponential backoff, and re-driving it is idempotent, so no duplicate
-leaf, branch, worktree, or PR is ever created. Every other code, including an
-unrecorded one, is terminal: a `worktree.branch_ownership_conflict` parks
-immediately on the named `tl-dispatch-ownership-conflict` gate, and exhausting
-the configured attempt limit opens `tl-dispatch-failed`. A missing confirmation
-after the five-second dispatch window opens `tl-dispatch-timeout` with the
-intent and last boundary visible in `status`. Restart reconciliation uses the
-persisted intent — or, for a scheduled retry, the persisted retry boundary — and
-never issues a duplicate spawn for the same attempt.
+`agent.spawn_failed` event, never by its message. Only a refusal that proves
+nothing was created is retried: a `worktree.branch_exists` creation race or a
+busy lifecycle lock schedules a durable `dispatch_retry_scheduled` boundary
+with bounded exponential backoff (`tl_dispatch_retry_limit`,
+`tl_dispatch_retry_base_delay_seconds`, `tl_dispatch_retry_max_delay_seconds`,
+defaulting to 3 / 5.0 / 60.0) and is re-driven idempotently, so no duplicate
+leaf, branch, worktree, or PR is ever created. A refusal whose outcome cannot be
+proven — currently `dispatch.transport_timeout`, which wraps the whole spawn —
+is not a failure: the slice holds at `dispatch_unconfirmed` with its intent
+intact until evidence or owner reconciliation resolves it, and is never
+re-driven. Every other code, including an unrecorded one, is terminal: a
+`worktree.branch_ownership_conflict` parks immediately on the named
+`tl-dispatch-ownership-conflict` gate, and exhausting the attempt limit opens
+`tl-dispatch-failed`. A missing confirmation after the five-second dispatch
+window opens `tl-dispatch-timeout` with the intent and last boundary visible in
+`status`. Restart reconciliation uses the persisted intent — or, for a scheduled
+retry, the persisted retry boundary — and never issues a duplicate spawn for the
+same attempt.
 
 ### Ordered recursive sub-TLs
 

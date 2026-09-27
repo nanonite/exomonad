@@ -217,6 +217,9 @@ def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) ->
             transport_timeout=45.5,
             active_tail_timeout=60.0,
             task_timeout=90.0,
+            dispatch_retry_limit=7,
+            dispatch_retry_base_delay=2.5,
+            dispatch_retry_max_delay=30.0,
         )
     )
 
@@ -225,6 +228,10 @@ def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) ->
     assert captured["tlloop_config"]["task_timeout_seconds"] == 90.0
     assert captured["tlloop_config"]["task_timeout_source"] == "project"
     assert captured["tlloop_config"]["enable_reviewer_spawn"] is True
+    # The operator's dispatch-retry budget reaches the controller verbatim.
+    assert captured["tlloop_config"]["dispatch_retry_limit"] == 7
+    assert captured["tlloop_config"]["dispatch_retry_base_delay_seconds"] == 2.5
+    assert captured["tlloop_config"]["dispatch_retry_max_delay_seconds"] == 30.0
 
 
 def test_run_defaults_preserve_current_values() -> None:
@@ -238,6 +245,54 @@ def test_run_defaults_preserve_current_values() -> None:
     assert args.task_timeout == 3600.0
 
     assert TLLoopConfig.task_timeout_seconds == 3600.0
+
+
+def test_dispatch_retry_defaults_are_documented_and_parseable() -> None:
+    assert TLLoopConfig.dispatch_retry_limit == 3
+    assert TLLoopConfig.dispatch_retry_base_delay_seconds == 5.0
+    assert TLLoopConfig.dispatch_retry_max_delay_seconds == 60.0
+
+    args = launcher._parser().parse_args(["run", "--project-root", "/tmp/repo"])
+    assert args.dispatch_retry_limit == 3
+    assert args.dispatch_retry_base_delay == 5.0
+    assert args.dispatch_retry_max_delay == 60.0
+
+    configured = launcher._parser().parse_args(
+        [
+            "run",
+            "--project-root",
+            "/tmp/repo",
+            "--dispatch-retry-limit",
+            "5",
+            "--dispatch-retry-base-delay",
+            "1.5",
+            "--dispatch-retry-max-delay",
+            "12",
+        ]
+    )
+    assert configured.dispatch_retry_limit == 5
+    assert configured.dispatch_retry_base_delay == 1.5
+    assert configured.dispatch_retry_max_delay == 12.0
+
+
+def test_dispatch_retry_flags_reject_a_non_positive_value() -> None:
+    parser = launcher._parser()
+    for flag, value in (
+        ("--dispatch-retry-limit", "0"),
+        ("--dispatch-retry-base-delay", "0"),
+        ("--dispatch-retry-max-delay", "-1"),
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["run", "--project-root", "/tmp/repo", flag, value])
+
+
+def test_a_retry_ceiling_below_its_own_base_delay_is_refused() -> None:
+    args = argparse.Namespace(dispatch_retry_base_delay=30.0, dispatch_retry_max_delay=5.0)
+    with pytest.raises(launcher.LauncherError, match="greater than or equal to"):
+        launcher._dispatch_retry_base_delay(args)
+
+    ordered = argparse.Namespace(dispatch_retry_base_delay=5.0, dispatch_retry_max_delay=5.0)
+    assert launcher._dispatch_retry_base_delay(ordered) == 5.0
 
 
 def test_positive_float_rejects_nan() -> None:

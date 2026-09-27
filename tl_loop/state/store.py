@@ -1386,6 +1386,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["dispatch_next_attempt_at"] = value.dispatch_next_attempt_at
         if value.dispatch_retry_for_attempt:
             record["dispatch_retry_for_attempt"] = value.dispatch_retry_for_attempt
+        if value.dispatch_ledger_floor:
+            record["dispatch_ledger_floor"] = value.dispatch_ledger_floor
         if value.dispatch_agent_id is not None:
             record["dispatch_agent_id"] = value.dispatch_agent_id
         if value.dispatch_invocation_id is not None:
@@ -2417,6 +2419,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         dispatch_retry_for_attempt=cast(
             int, value.get("dispatch_retry_for_attempt", 0)
         ),
+        dispatch_ledger_floor=cast(int, value.get("dispatch_ledger_floor", 0)),
         dispatch_agent_id=cast(str | None, value.get("dispatch_agent_id")),
         dispatch_invocation_id=cast(str | None, value.get("dispatch_invocation_id")),
         dispatch_authoritative_event_seq=cast(

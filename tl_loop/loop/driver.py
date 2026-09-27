@@ -472,6 +472,13 @@ class DispatchAttempt:
     attempt: int = 0
     controller_epoch: str | None = None
     dispatch_generation: int = 0
+    #: The consumed ledger position when this intent was recorded.
+    #:
+    #: A refusal for this attempt can only be at or after this position, so
+    #: correlating one reads forward from here instead of replaying the ledger
+    #: from zero. It is persisted with the slice, so a restart still knows the
+    #: floor its intent was issued at.
+    ledger_floor: int = 0
 
 
 @dataclass(frozen=True)
@@ -5912,16 +5919,32 @@ def _record_dispatch_failure(
     *,
     code: str | None = None,
 ) -> RunState:
-    """Persist one rejected spawn request, retrying or parking from its code.
+    """Persist one rejected spawn request, retrying, holding, or parking it.
 
     A retryable machine code schedules a durable re-drive boundary instead of
     an unqualified intent: no leaf, branch, worktree, or PR exists yet, so the
-    intent, agent, and invocation identities are cleared. Every other code,
+    intent, agent, and invocation identities are cleared. An ambiguous code
+    proves nothing either way, so the persisted intent is kept and the slice
+    holds at ``dispatch_unconfirmed`` for evidence and owner reconciliation --
+    never a second spawn, and never a gate of its own. Every other code,
     including an absent one, is terminal and opens the named gate.
     """
     bounded_reason = reason[:500]
-    if classify_dispatch_failure(code) is DispatchFailureClass.RETRYABLE:
+    failure_class = classify_dispatch_failure(code)
+    if failure_class is DispatchFailureClass.RETRYABLE:
         return _record_dispatch_retry_scheduled(
+            store,
+            state,
+            slice_id,
+            attempt,
+            bounded_reason,
+            code,
+            config,
+            effects,
+            effects_log,
+        )
+    if failure_class is DispatchFailureClass.AMBIGUOUS:
+        return _record_ambiguous_dispatch_outcome(
             store,
             state,
             slice_id,
@@ -5935,6 +5958,62 @@ def _record_dispatch_failure(
     return _record_terminal_dispatch_failure(
         store, state, slice_id, attempt, bounded_reason, code, config, effects, effects_log
     )
+
+
+def _record_ambiguous_dispatch_outcome(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    attempt: DispatchAttempt,
+    reason: str,
+    code: str | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Hold an unproven dispatch for evidence instead of re-driving it.
+
+    The intent is deliberately **kept**: it is the only correlation the
+    reconciler has against the correlated ``agent.spawned`` event and the
+    runtime's owner listing, so clearing it would make an already-launched leaf
+    unreachable. The slice stays ``dispatch_unconfirmed``, which is the
+    documented home for an accepted request with delayed evidence, and no gate
+    opens: this is a wait state, not a decision.
+    """
+    current = state.slices[slice_id]
+    if (
+        current.status is SliceStatus.DISPATCH_UNCONFIRMED
+        and current.dispatch_error_code == code
+        and current.dispatch_intent_id == attempt.intent_id
+    ):
+        return state
+    updated = slice_transition(
+        current, SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED)
+    )
+    updated = replace(
+        updated,
+        park_cause=ParkCause.DISPATCH_UNCONFIRMED,
+        dispatch_last_boundary="spawn_outcome_ambiguous",
+        dispatch_error=reason,
+        dispatch_error_code=code,
+        dispatch_next_attempt_at=None,
+        dispatch_retry_for_attempt=0,
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, slice_id: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    _record_controller_event(
+        slice_id,
+        "tl.spawn_request_failed",
+        _dispatch_payload(slice_id, attempt, "spawn_outcome_ambiguous", error=reason),
+        config,
+        effects,
+        effects_log,
+    )
+    return state
 
 
 def _record_terminal_dispatch_failure(
@@ -6105,12 +6184,16 @@ def _dispatch_failure_code(
     The runtime writes one ``agent.spawn_failed`` ledger event per refused
     spawn, carrying the typed ``EffectError`` code it already returned. That
     event is the only channel this classification reads: the rejected tool
-    result's ``error`` prose is operator-facing and is never inspected. The
-    read starts at the first sequence rather than the consumption cursor,
-    because the refusal is written before the response returns and may carry a
-    sequence the loop has not reached yet. An unreadable ledger, a missing
-    event, or an event with no code all resolve to None, which classifies as
-    terminal.
+    result's ``error`` prose is operator-facing and is never inspected.
+
+    The read starts at the attempt's recorded ledger floor rather than at the
+    consumption cursor or at zero, so it is bounded by the intent that is being
+    classified. A refusal for this attempt can only be at or after that
+    position, and a row recorded before it belongs to an earlier attempt even
+    if it happens to carry the same intent. The floor is persisted with the
+    slice, so a restart resolves against the same position the intent was
+    issued at. An unreadable ledger, a missing event, and an event with no code
+    all resolve to None, which classifies as terminal.
     """
     if config.project_root is None or config.ledger_run_id is None:
         return None
@@ -6120,12 +6203,14 @@ def _dispatch_failure_code(
             run_dir=store.run_dir,
             ledger_run_id=config.ledger_run_id,
         )
-        result = reader.read_from(cursor=0)
+        result = reader.read_from(cursor=attempt.ledger_floor)
     except (LedgerReadError, OSError, ValueError):
         return None
     code: str | None = None
     for event in result.events:
         if event.event_type != "agent.spawn_failed":
+            continue
+        if event.run_seq is None or event.run_seq <= attempt.ledger_floor:
             continue
         if event.data.get("intent_id") != attempt.intent_id:
             continue
@@ -6447,6 +6532,7 @@ def _reconcile_dispatches(
             attempt=max(1, current.attempts),
             controller_epoch=state.controller_epoch,
             dispatch_generation=current.dispatch_generation,
+            ledger_floor=current.dispatch_ledger_floor,
         )
         _record_controller_event(
             current.id,
@@ -10846,6 +10932,10 @@ def _prepare_spawn(
             dispatch_started_at=intent.started_at,
             dispatch_last_boundary="dispatch_intended",
             dispatch_error=None,
+            dispatch_error_code=None,
+            dispatch_ledger_floor=intent.ledger_floor,
+            dispatch_next_attempt_at=None,
+            dispatch_retry_for_attempt=0,
             dispatch_agent_id=None,
             dispatch_invocation_id=None,
             dispatch_authoritative_event_seq=None,
@@ -10905,6 +10995,9 @@ def _prepare_spawn(
     else:
         model_id = route.model
 
+    # The ledger floor is carried forward so a refusal for this attempt is read
+    # from the position its intent was issued at. The epoch and generation are
+    # left as this path already produced them.
     intent = DispatchAttempt(
         intent.intent_id,
         intent.started_at,
@@ -10912,6 +11005,7 @@ def _prepare_spawn(
         route.agent_type,
         model_id,
         intent.attempt,
+        ledger_floor=intent.ledger_floor,
     )
 
     def record_spawn(document: dict[str, object]) -> dict[str, object]:
@@ -10932,6 +11026,10 @@ def _prepare_spawn(
                 "dispatch_started_at": intent.started_at,
                 "dispatch_last_boundary": "dispatch_intended",
                 "dispatch_error": None,
+                "dispatch_error_code": None,
+                "dispatch_ledger_floor": intent.ledger_floor,
+                "dispatch_next_attempt_at": None,
+                "dispatch_retry_for_attempt": 0,
                 "dispatch_agent_id": None,
                 "dispatch_invocation_id": None,
                 "dispatch_authoritative_event_seq": None,
@@ -10968,6 +11066,7 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
         attempt=attempt,
         controller_epoch=state.controller_epoch,
         dispatch_generation=attempt if state.controller_epoch is not None else 0,
+        ledger_floor=state.events.last_consumed_offset,
     )
 
 

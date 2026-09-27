@@ -12,6 +12,9 @@ pub use exomonad_core::services::TL_PREFLIGHT_RUNTIME_PATHS_ENV;
 pub const DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS: f64 = 10.0;
 pub const DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS: f64 = 30.0;
 pub const DEFAULT_TL_TASK_TIMEOUT_SECONDS: f64 = 3600.0;
+pub const DEFAULT_TL_DISPATCH_RETRY_LIMIT: u32 = 3;
+pub const DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS: f64 = 5.0;
+pub const DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS: f64 = 60.0;
 
 pub fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
     let parsed = value
@@ -34,6 +37,32 @@ fn require_positive_timeout(name: &str, value: f64) -> Result<()> {
 fn require_task_timeout(name: &str, value: f64) -> Result<()> {
     if value.is_nan() || value < 0.0 {
         anyhow::bail!("{name} must be zero or greater");
+    }
+    Ok(())
+}
+
+/// Validate the dispatch-retry backoff pair: both delays must be positive and
+/// the ceiling must not sit below the first delay, or a backoff could be
+/// scheduled *earlier* than the first retry's own floor.
+fn require_dispatch_retry_delays(
+    base_name: &str,
+    base: f64,
+    max_name: &str,
+    max: f64,
+) -> Result<()> {
+    require_positive_timeout(base_name, base)?;
+    require_positive_timeout(max_name, max)?;
+    if max < base {
+        anyhow::bail!("{max_name} must be greater than or equal to {base_name}");
+    }
+    Ok(())
+}
+
+/// A zero budget would park every retryable refusal on its first failure,
+/// which is the behavior this knob exists to remove.
+fn require_dispatch_retry_limit(name: &str, value: u32) -> Result<()> {
+    if value == 0 {
+        anyhow::bail!("{name} must be at least 1");
     }
     Ok(())
 }
@@ -285,6 +314,15 @@ pub struct RawConfig {
     /// Project default per-task ceiling in seconds (default: 3600; zero disables).
     pub tl_task_timeout_seconds: Option<f64>,
 
+    /// Bounded retry budget for a retryable leaf-dispatch refusal (default: 3).
+    pub tl_dispatch_retry_limit: Option<u32>,
+
+    /// First dispatch-retry backoff in seconds (default: 5.0).
+    pub tl_dispatch_retry_base_delay_seconds: Option<f64>,
+
+    /// Ceiling on the dispatch-retry backoff in seconds (default: 60.0).
+    pub tl_dispatch_retry_max_delay_seconds: Option<f64>,
+
     /// Additional relative runtime paths ignored by TL spawn preflight.
     /// Built-in ExoMonad paths are always excluded; local role config overrides project config.
     pub tl_preflight_runtime_paths: Option<Vec<String>>,
@@ -384,6 +422,15 @@ pub struct Config {
 
     /// Project default per-task ceiling in seconds; zero means no ceiling.
     pub tl_task_timeout_seconds: f64,
+
+    /// Bounded retry budget for a retryable leaf-dispatch refusal.
+    pub tl_dispatch_retry_limit: u32,
+
+    /// First dispatch-retry backoff in seconds.
+    pub tl_dispatch_retry_base_delay_seconds: f64,
+
+    /// Ceiling on the dispatch-retry backoff in seconds.
+    pub tl_dispatch_retry_max_delay_seconds: f64,
 
     /// Additional relative runtime paths ignored by TL spawn preflight.
     pub tl_preflight_runtime_paths: Vec<String>,
@@ -587,6 +634,19 @@ impl Config {
             .or(global_raw.tl_task_timeout_seconds)
             .unwrap_or(DEFAULT_TL_TASK_TIMEOUT_SECONDS);
 
+        let tl_dispatch_retry_limit = local_raw
+            .tl_dispatch_retry_limit
+            .or(global_raw.tl_dispatch_retry_limit)
+            .unwrap_or(DEFAULT_TL_DISPATCH_RETRY_LIMIT);
+        let tl_dispatch_retry_base_delay_seconds = local_raw
+            .tl_dispatch_retry_base_delay_seconds
+            .or(global_raw.tl_dispatch_retry_base_delay_seconds)
+            .unwrap_or(DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS);
+        let tl_dispatch_retry_max_delay_seconds = local_raw
+            .tl_dispatch_retry_max_delay_seconds
+            .or(global_raw.tl_dispatch_retry_max_delay_seconds)
+            .unwrap_or(DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS);
+
         let tl_preflight_runtime_paths = local_raw
             .tl_preflight_runtime_paths
             .or(global_raw.tl_preflight_runtime_paths)
@@ -603,6 +663,13 @@ impl Config {
             require_positive_timeout(name, value)?;
         }
         require_task_timeout("tl_task_timeout_seconds", tl_task_timeout_seconds)?;
+        require_dispatch_retry_limit("tl_dispatch_retry_limit", tl_dispatch_retry_limit)?;
+        require_dispatch_retry_delays(
+            "tl_dispatch_retry_base_delay_seconds",
+            tl_dispatch_retry_base_delay_seconds,
+            "tl_dispatch_retry_max_delay_seconds",
+            tl_dispatch_retry_max_delay_seconds,
+        )?;
 
         // Resolve openrouter: local > global > default
         let openrouter = local_raw
@@ -693,6 +760,9 @@ impl Config {
             tl_transport_timeout_seconds,
             tl_active_tail_timeout_seconds,
             tl_task_timeout_seconds,
+            tl_dispatch_retry_limit,
+            tl_dispatch_retry_base_delay_seconds,
+            tl_dispatch_retry_max_delay_seconds,
             tl_preflight_runtime_paths,
             openrouter,
             opencode,
@@ -748,6 +818,9 @@ impl Default for Config {
             tl_transport_timeout_seconds: DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS,
             tl_active_tail_timeout_seconds: DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS,
             tl_task_timeout_seconds: DEFAULT_TL_TASK_TIMEOUT_SECONDS,
+            tl_dispatch_retry_limit: DEFAULT_TL_DISPATCH_RETRY_LIMIT,
+            tl_dispatch_retry_base_delay_seconds: DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS,
+            tl_dispatch_retry_max_delay_seconds: DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS,
             tl_preflight_runtime_paths: Vec::new(),
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
@@ -944,6 +1017,50 @@ mod tests {
         assert_eq!(raw.tl_transport_timeout_seconds, Some(45.5));
         assert_eq!(raw.tl_active_tail_timeout_seconds, Some(60.0));
         assert_eq!(raw.tl_task_timeout_seconds, Some(90.0));
+    }
+
+    #[test]
+    fn test_raw_config_parse_tl_dispatch_retry_budget() {
+        let content = r#"
+            tl_dispatch_retry_limit = 7
+            tl_dispatch_retry_base_delay_seconds = 2.5
+            tl_dispatch_retry_max_delay_seconds = 30.0
+        "#;
+        let raw: RawConfig = toml::from_str(content).unwrap();
+        assert_eq!(raw.tl_dispatch_retry_limit, Some(7));
+        assert_eq!(raw.tl_dispatch_retry_base_delay_seconds, Some(2.5));
+        assert_eq!(raw.tl_dispatch_retry_max_delay_seconds, Some(30.0));
+    }
+
+    #[test]
+    fn test_dispatch_retry_defaults_when_unset() {
+        let config = Config::default();
+        assert_eq!(config.tl_dispatch_retry_limit, 3);
+        assert_eq!(config.tl_dispatch_retry_base_delay_seconds, 5.0);
+        assert_eq!(config.tl_dispatch_retry_max_delay_seconds, 60.0);
+    }
+
+    #[test]
+    fn test_dispatch_retry_limit_must_be_positive() {
+        let error = require_dispatch_retry_limit("tl_dispatch_retry_limit", 0)
+            .expect_err("a zero budget would park every retryable refusal immediately");
+        assert!(error.to_string().contains("at least 1"), "{error}");
+    }
+
+    #[test]
+    fn test_dispatch_retry_delays_must_be_positive_and_ordered() {
+        for (base, max) in [(0.0, 60.0), (-1.0, 60.0), (5.0, 0.0), (5.0, -1.0)] {
+            require_dispatch_retry_delays("base", base, "max", max)
+                .expect_err("a non-positive delay must be refused");
+        }
+        require_dispatch_retry_delays("base", 5.0, "max", 60.0).expect("ordered pair");
+        require_dispatch_retry_delays("base", 5.0, "max", 5.0).expect("equal pair");
+        let error = require_dispatch_retry_delays("base", 30.0, "max", 5.0)
+            .expect_err("a cap below the base would schedule a retry before the first one");
+        assert!(
+            error.to_string().contains("greater than or equal to"),
+            "{error}"
+        );
     }
 
     #[test]

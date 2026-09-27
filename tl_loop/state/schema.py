@@ -615,6 +615,7 @@ SLICE_KEYS = frozenset(
         "dispatch_retry_attempt",
         "dispatch_next_attempt_at",
         "dispatch_retry_for_attempt",
+        "dispatch_ledger_floor",
         "dispatch_agent_id",
         "dispatch_invocation_id",
         "dispatch_authoritative_event_seq",
@@ -845,6 +846,7 @@ class SliceState:
     dispatch_retry_attempt: int = 0
     dispatch_next_attempt_at: float | None = None
     dispatch_retry_for_attempt: int = 0
+    dispatch_ledger_floor: int = 0
     dispatch_agent_id: str | None = None
     dispatch_invocation_id: str | None = None
     dispatch_authoritative_event_seq: int | None = None
@@ -1445,6 +1447,8 @@ def _validate_slice(
     _nullable_number(value, "dispatch_next_attempt_at", path, errors)
     if "dispatch_retry_for_attempt" in value:
         _non_negative_int(value, "dispatch_retry_for_attempt", path, errors)
+    if "dispatch_ledger_floor" in value:
+        _non_negative_int(value, "dispatch_ledger_floor", path, errors)
     _nullable_string(value, "dispatch_agent_id", path, errors)
     _nullable_non_negative_int(value, "dispatch_authoritative_event_seq", path, errors)
     if "dispatch_generation" in value:

@@ -23,6 +23,11 @@ from tl_loop.events.reader import LedgerReader, SequenceStatus
 from tl_loop.fingerprint import fingerprint_report
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.abandon import abandon_slice
+from tl_loop.loop.dispatch_classification import (
+    DEFAULT_RETRY_BASE_DELAY_SECONDS,
+    DEFAULT_RETRY_LIMIT,
+    DEFAULT_RETRY_MAX_DELAY_SECONDS,
+)
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult, WorkPlan, tl_run
 from tl_loop.loop.heartbeat import HeartbeatConfig
 from tl_loop.loop.observability import emit_controller_event
@@ -176,6 +181,24 @@ def _parser() -> argparse.ArgumentParser:
         type=_non_negative_float,
         default=DEFAULT_TASK_TIMEOUT_SECONDS,
         help="per-task ceiling in seconds; zero disables enforcement",
+    )
+    run.add_argument(
+        "--dispatch-retry-limit",
+        type=_positive_int,
+        default=DEFAULT_RETRY_LIMIT,
+        help="scheduled retries for a retryable dispatch refusal before parking",
+    )
+    run.add_argument(
+        "--dispatch-retry-base-delay",
+        type=_positive_float,
+        default=DEFAULT_RETRY_BASE_DELAY_SECONDS,
+        help="seconds before the first scheduled dispatch retry; doubles each retry",
+    )
+    run.add_argument(
+        "--dispatch-retry-max-delay",
+        type=_positive_float,
+        default=DEFAULT_RETRY_MAX_DELAY_SECONDS,
+        help="ceiling on the dispatch-retry backoff in seconds",
     )
     run.add_argument("--poll-interval", type=_positive_float, default=0.25)
     run.add_argument("--wait-for-plan", action="store_true")
@@ -392,6 +415,11 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         policy=policy,
         capabilities=capabilities,
         catalog=catalog,
+        dispatch_retry_limit=getattr(args, "dispatch_retry_limit", DEFAULT_RETRY_LIMIT),
+        dispatch_retry_base_delay_seconds=_dispatch_retry_base_delay(args),
+        dispatch_retry_max_delay_seconds=getattr(
+            args, "dispatch_retry_max_delay", DEFAULT_RETRY_MAX_DELAY_SECONDS
+        ),
     )
     budgets = plan_document.get("budgets", {"tokens": 0, "wall_seconds": 0})
     if not isinstance(budgets, Mapping):
@@ -893,6 +921,22 @@ def _non_negative_float(value: str) -> float:
     if parsed < 0 or not math.isfinite(parsed):
         raise argparse.ArgumentTypeError("must be non-negative")
     return parsed
+
+
+def _dispatch_retry_base_delay(args: argparse.Namespace) -> float:
+    """Reject a backoff ceiling that sits below its own first delay.
+
+    Without this the doubled backoff would be capped *under* the first
+    retry's floor, so a later retry could be scheduled before an earlier one.
+    """
+    base = getattr(args, "dispatch_retry_base_delay", DEFAULT_RETRY_BASE_DELAY_SECONDS)
+    ceiling = getattr(args, "dispatch_retry_max_delay", DEFAULT_RETRY_MAX_DELAY_SECONDS)
+    if ceiling < base:
+        raise LauncherError(
+            "--dispatch-retry-max-delay must be greater than or equal to "
+            "--dispatch-retry-base-delay"
+        )
+    return base
 
 
 def _configure_logging(

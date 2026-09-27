@@ -258,20 +258,34 @@ operator reading a parked run and is never inspected. An unreadable ledger, a
 missing event, and an empty or absent code all resolve to "no code", which is
 terminal.
 
-`tl_loop.loop.dispatch_classification` is the single source of that decision:
+`tl_loop.loop.dispatch_classification` is the single source of that decision,
+in three classes. **The retryable invariant: a code is retryable only when its
+refusal proves that no side effect of the dispatch happened** — either the
+decision never ran, or the attempt lost a creation race. Anything else is
+terminal or ambiguous.
 
 | Class | Codes | Why |
 |---|---|---|
-| retryable | `worktree.branch_exists` | a creation race; the branch now exists, so a re-drive attaches to it |
-| retryable | `worktree.lifecycle_lock_timeout` | the shared lifecycle lock was busy, so the create/attach decision never ran |
-| retryable | `dispatch.transport_timeout` | an explicit transport timeout rejection, so the boundary is known incomplete |
+| retryable | `worktree.branch_exists` | a creation race: the branch now exists and this attempt created nothing, so a re-drive attaches to it |
+| retryable | `worktree.lifecycle_lock_timeout` | the shared lifecycle lock was busy, so the create/attach decision never ran and nothing was created |
+| ambiguous | `dispatch.transport_timeout` | the server-side spawn timeout wraps the **whole** spawn, so a worktree, identity, and tmux window may already exist; the outcome is unproven |
 | terminal | `worktree.branch_ownership_conflict` | the birth branch belongs to another worktree owner; no retry can change that |
 | terminal | `worktree.pr_context_unavailable` | the forge could not supply the resume context; the operator must fix it first |
 | terminal | every other code, and no code | fail closed: an unclassified refusal is never retried by default |
 
-Adding a code to `RETRYABLE_CODES` asserts both that re-driving the same
-dispatch is safe and that the underlying condition is transient. It is never a
-prose pattern and never a time-based inference.
+Adding a code to `RETRYABLE_CODES` asserts the no-side-effect invariant. It is
+never a prose pattern and never a time-based inference.
+
+An **ambiguous** refusal is not a failure at all. The slice holds at
+`dispatch_unconfirmed` with its intent, agent-identity slots, and ledger floor
+**intact** — that intent is the only correlation the reconciler has against the
+correlated `agent.spawned` event and the runtime's owner listing — and it opens
+no gate, because this is a wait state rather than a decision. It is resolved by
+matching evidence or verified owner reconciliation, exactly like an accepted
+request with delayed evidence, and it is **never** re-driven: a second spawn
+could put a second actor on the same deterministic branch. An operator can still
+abandon it explicitly through `abandon_slice`, which is the documented
+destructive path.
 
 A retryable rejection does not leave a `dispatching` intent behind. The slice
 moves to `dispatch_retry_scheduled` with `dispatch_retry_attempt`,
@@ -289,12 +303,24 @@ The boundary is idempotent per dispatch attempt. `dispatch_retry_for_attempt`
 records which attempt it was scheduled for, so repeated reconciliation of the
 same rejected attempt neither consumes budget twice nor reschedules.
 
+Refusal correlation is bounded. Each intent records `dispatch_ledger_floor`, the
+consumed ledger position when it was issued, and the classification reads the
+ledger forward from there rather than from zero. A refusal for that intent can
+only be at or after that position, so a row recorded before it belongs to an
+earlier attempt even if it carries the same intent id, and a run with a long
+ledger does not re-read it on every refusal.
+
 The delay is bounded exponential backoff. The knobs are `dispatch_retry_limit`
 (default 3 scheduled retries), `dispatch_retry_base_delay_seconds` (default
 5.0), and `dispatch_retry_max_delay_seconds` (default 60.0) on `TLLoopConfig`;
 the first scheduled retry waits one base delay and each later one doubles up
-to the cap. `wall_clock` injects the dispatch clock, and every backoff decision
-reads it rather than sleeping.
+to the cap. They are operator-configurable in `.exo/config.toml` as
+`tl_dispatch_retry_limit`, `tl_dispatch_retry_base_delay_seconds`, and
+`tl_dispatch_retry_max_delay_seconds`, validated on load (a positive limit,
+positive delays, and a cap that is not below the base) and threaded into the
+controller launch as `--dispatch-retry-limit`, `--dispatch-retry-base-delay`,
+and `--dispatch-retry-max-delay`. `wall_clock` injects the dispatch clock, and
+every backoff decision reads it rather than sleeping.
 
 Exactly one named human gate is opened for a terminal dispatch failure, and
 `tl.gate_opened` is emitted only when that gate is not already pending.

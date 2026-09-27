@@ -4580,6 +4580,9 @@ struct TlLoopTimeouts {
     transport: f64,
     active_tail: f64,
     task: f64,
+    dispatch_retry_limit: u32,
+    dispatch_retry_base_delay: f64,
+    dispatch_retry_max_delay: f64,
 }
 
 impl From<&Config> for TlLoopTimeouts {
@@ -4588,6 +4591,9 @@ impl From<&Config> for TlLoopTimeouts {
             transport: config.tl_transport_timeout_seconds,
             active_tail: config.tl_active_tail_timeout_seconds,
             task: config.tl_task_timeout_seconds,
+            dispatch_retry_limit: config.tl_dispatch_retry_limit,
+            dispatch_retry_base_delay: config.tl_dispatch_retry_base_delay_seconds,
+            dispatch_retry_max_delay: config.tl_dispatch_retry_max_delay_seconds,
         }
     }
 }
@@ -4622,11 +4628,15 @@ fn tl_loop_command(
         .unwrap_or_default();
     let controller = format!(
         "EXOMONAD_BINARY={binary} EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan{expected_plan_arg} \
-           --transport-timeout {} --active-tail-timeout {} --task-timeout {}",
+           --transport-timeout {} --active-tail-timeout {} --task-timeout {} \
+           --dispatch-retry-limit {} --dispatch-retry-base-delay {} --dispatch-retry-max-delay {}",
         shell_escape::escape(tl_loop_python(cwd).into()),
         timeouts.transport,
         timeouts.active_tail,
           timeouts.task,
+        timeouts.dispatch_retry_limit,
+        timeouts.dispatch_retry_base_delay,
+        timeouts.dispatch_retry_max_delay,
     );
     tl_controller_wrapper_command(cwd, &controller)
 }
@@ -7090,6 +7100,10 @@ fn log_ignored_effort(role: &str, agent_type: AgentType, effort: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS, DEFAULT_TL_DISPATCH_RETRY_LIMIT,
+        DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS,
+    };
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
     };
@@ -11301,6 +11315,9 @@ mod tests {
             transport: 45.5,
             active_tail: 60.0,
             task: 90.0,
+            dispatch_retry_limit: 7,
+            dispatch_retry_base_delay: 2.5,
+            dispatch_retry_max_delay: 30.0,
         };
         let command = tl_loop_command(
             Path::new("/tmp/repo"),
@@ -11318,6 +11335,9 @@ mod tests {
         assert!(command.contains("--transport-timeout 45.5"));
         assert!(command.contains("--active-tail-timeout 60"));
         assert!(command.contains("--task-timeout 90"));
+        assert!(command.contains("--dispatch-retry-limit 7"));
+        assert!(command.contains("--dispatch-retry-base-delay 2.5"));
+        assert!(command.contains("--dispatch-retry-max-delay 30"));
     }
 
     #[test]
@@ -11326,6 +11346,9 @@ mod tests {
             transport: 1.0,
             active_tail: 2.0,
             task: 3.0,
+            dispatch_retry_limit: DEFAULT_TL_DISPATCH_RETRY_LIMIT,
+            dispatch_retry_base_delay: DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS,
+            dispatch_retry_max_delay: DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS,
         };
         let command = tl_loop_command(
             Path::new("/tmp/repo"),
@@ -11473,6 +11496,9 @@ mod tests {
             transport: 1.0,
             active_tail: 2.0,
             task: 3.0,
+            dispatch_retry_limit: DEFAULT_TL_DISPATCH_RETRY_LIMIT,
+            dispatch_retry_base_delay: DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS,
+            dispatch_retry_max_delay: DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS,
         };
         let expected = plan_digest(original);
         std::fs::write(plan_snapshot_path(dir.path()), substituted).unwrap();
