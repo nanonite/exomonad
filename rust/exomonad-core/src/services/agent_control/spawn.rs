@@ -460,6 +460,22 @@ fn checked_out_elsewhere(
     ))
 }
 
+/// What resolving the pull request for a deterministic branch found.
+///
+/// `NoQualifyingPr` and `LookupFailed` are kept apart on purpose: "the forge
+/// answered and no open PR carries this branch at this head" is a fact a spawn
+/// may proceed on, while "the forge could not be asked" is an outage, and
+/// collapsing the two would resume a leaf blind to the PR it owns.
+enum PullRequestContext {
+    /// An open PR carries the deterministic branch at the verified head, and
+    /// this is the task text that names it.
+    Resolved(String),
+    /// The query was answered and nothing qualifies.
+    NoQualifyingPr,
+    /// The query could not be answered, with the underlying reason.
+    LookupFailed(String),
+}
+
 /// Whether a pull request still carries the exact work this spawn verified.
 ///
 /// The head SHA is what makes the match exact: a PR on the right branch whose
@@ -1249,64 +1265,133 @@ impl<
     /// same context instead of the resumed leaf starting blind. The context is
     /// restored from the PR, never created here: a leaf whose branch has no
     /// qualifying open PR gets no PR context and files its own.
+    ///
+    /// A lookup that could not be answered is not the same fact as "no PR
+    /// exists", so the two are never merged:
+    ///
+    /// | Outcome | Expected-agent resume | First spawn |
+    /// |---------|-----------------------|-------------|
+    /// | PR resolved | context appended | context appended |
+    /// | no qualifying PR | no context | no context |
+    /// | lookup failed | **refused**, `worktree.pr_context_unavailable` | `warn!`, then no context |
+    ///
+    /// A resume that cannot see its own open PR would hand the leaf a task that
+    /// says nothing about the PR it owns, which is how a second PR gets filed.
+    /// Failing the resume keeps the owner intact and retryable; a first spawn
+    /// has no PR to be blind to, so it proceeds with the loss recorded. The
+    /// caller holds the rollback guard, so a refused resume still removes
+    /// whatever this spawn created.
     async fn leaf_task(
         &self,
         options: &SpawnLeafOptions,
         project_dir: &Path,
         branch: &BranchName,
         verified_head: Option<&str>,
-    ) -> String {
+    ) -> Result<String> {
         let mut task = options.task.clone();
-        if let Some(context) = self
-            .existing_pull_request_context(project_dir, branch, verified_head)
+        match self
+            .resolve_existing_pull_request(project_dir, branch, verified_head)
             .await
         {
-            task.push_str(&context);
+            PullRequestContext::Resolved(context) => task.push_str(&context),
+            PullRequestContext::NoQualifyingPr => {}
+            PullRequestContext::LookupFailed(error) => {
+                if options.expected_agent_name.is_some() {
+                    return Err(anyhow!(EffectError::custom(
+                        "worktree.pr_context_unavailable",
+                        format!(
+                            "branch {branch} cannot be resumed: the pull request that already owns it \
+                             could not be read, so the leaf would start blind. Restore access to the \
+                             configured forge ({error}), then retry the resume."
+                        )
+                    )));
+                }
+                warn!(
+                    branch = %branch,
+                    %error,
+                    "Could not read the pull request for this branch; starting without PR context"
+                );
+            }
         }
         if options.standalone_repo && !options.allowed_dirs.is_empty() {
             task.push_str("\n\nShared technical dependencies are available as read-only reference in `.exo/context/`. Do not modify files in this directory.");
         }
-        task
+        Ok(task)
     }
 
-    /// The context an existing open PR contributes to a leaf task.
+    /// Resolve the pull request that already owns the deterministic branch.
     ///
     /// A branch name never identifies a PR. Only an open, unmerged PR whose head
     /// branch is the deterministic branch and whose head SHA equals the head this
     /// spawn verified describes the work being continued. A PR whose head has
     /// moved past the local branch, a closed or merged one, a PR the forge does
-    /// not report a head for, and no PR at all all yield no context rather than a
-    /// guess. Review feedback is best effort: the PR identity is the context, so
-    /// a failed review listing must not cost the leaf its PR.
-    async fn existing_pull_request_context(
+    /// not report a head for, and no PR at all are all the same fact — no
+    /// qualifying PR — and never a guess. An unanswerable query is a different
+    /// fact and is reported as `LookupFailed` with the underlying error.
+    async fn resolve_existing_pull_request(
         &self,
         project_dir: &Path,
         branch: &BranchName,
         verified_head: Option<&str>,
-    ) -> Option<String> {
-        let verified_head = verified_head.map(str::trim).filter(|sha| !sha.is_empty())?;
-        let forgejo = self.ctx.forgejo_client()?;
-        let repo_info = crate::services::repo::get_repo_info(project_dir)
-            .await
-            .ok()?;
-        let pr = forgejo
+    ) -> PullRequestContext {
+        let Some(verified_head) = verified_head.map(str::trim).filter(|sha| !sha.is_empty()) else {
+            return PullRequestContext::NoQualifyingPr;
+        };
+        // No configured forge means this project has no host pull request to
+        // continue, which is a steady state rather than a failure to look one up.
+        let Some(forgejo) = self.ctx.forgejo_client() else {
+            return PullRequestContext::NoQualifyingPr;
+        };
+        let repo_info = match crate::services::repo::get_repo_info(project_dir).await {
+            Ok(repo_info) => repo_info,
+            Err(error) => {
+                return PullRequestContext::LookupFailed(format!(
+                    "could not resolve the repository for {}: {error}",
+                    project_dir.display()
+                ))
+            }
+        };
+        let pr = match forgejo
             .find_open_pull_request(&repo_info.owner, &repo_info.repo, branch)
             .await
-            .ok()
-            .flatten()?;
+        {
+            Ok(Some(pr)) => pr,
+            Ok(None) => return PullRequestContext::NoQualifyingPr,
+            Err(error) => {
+                return PullRequestContext::LookupFailed(format!(
+                    "the open pull request query for {}/{} failed: {error}",
+                    repo_info.owner.as_str(),
+                    repo_info.repo.as_str()
+                ))
+            }
+        };
         if !pr_carries_verified_head(&pr, branch, verified_head) {
-            return None;
+            return PullRequestContext::NoQualifyingPr;
         }
-        let reviews = forgejo
+        let pr_number = pr.number.as_u64();
+        // Review feedback is best effort: the PR identity is the context, so a
+        // failed listing must not cost the leaf its PR. Every such failure is
+        // recorded with the PR it belongs to, never dropped silently.
+        let reviews = match forgejo
             .list_pull_request_reviews(&repo_info.owner, &repo_info.repo, pr.number)
             .await
-            .unwrap_or_default();
+        {
+            Ok(reviews) => reviews,
+            Err(error) => {
+                warn!(
+                    pr_number,
+                    %error,
+                    "Could not list pull request reviews; restoring the pull request without its feedback"
+                );
+                Vec::new()
+            }
+        };
         let mut inline = Vec::new();
         for review in &reviews {
             let Some(review_id) = review.id else {
                 continue;
             };
-            if let Ok(comments) = forgejo
+            match forgejo
                 .list_pull_request_review_comments(
                     &repo_info.owner,
                     &repo_info.repo,
@@ -1315,16 +1400,22 @@ impl<
                 )
                 .await
             {
-                inline.extend(comments);
+                Ok(comments) => inline.extend(comments),
+                Err(error) => warn!(
+                    pr_number,
+                    review_id,
+                    %error,
+                    "Could not list inline review comments; restoring the pull request without them"
+                ),
             }
         }
         info!(
-            pr_number = pr.number.as_u64(),
+            pr_number,
             branch = %branch,
             head_sha = %verified_head,
             "Restoring the existing open pull request into the leaf task"
         );
-        Some(pr_resume_context(&pr, &reviews, &inline))
+        PullRequestContext::Resolved(pr_resume_context(&pr, &reviews, &inline))
     }
 
     /// Spawn an agent for a GitHub issue.
@@ -2658,7 +2749,10 @@ impl<
             };
             // Both the first spawn and the expected-agent resume compose the task
             // here, so a resume restores the PR context the new-spawn path
-            // already restored instead of starting blind.
+            // already restored instead of starting blind. A resume whose PR
+            // cannot be read is refused here, before any tmux launch and while
+            // the WorktreeRollback guard is still armed, so the worktree this
+            // spawn created is removed rather than left behind half-provisioned.
             let task = self
                 .leaf_task(
                     options,
@@ -2666,7 +2760,7 @@ impl<
                     &branch_name,
                     verified_head.as_deref(),
                 )
-                .await;
+                .await?;
 
             // Open tmux window (not pane)
             // Task already includes leaf completion protocol — rendered by Haskell Prompt builder.
@@ -4117,9 +4211,14 @@ mod tests {
     struct PullRequestFixture {
         /// Owns the temporary repository for the fixture's lifetime.
         _temp: tempfile::TempDir,
+        /// Owns the scratch directory the leaf worktree is created in, kept
+        /// outside the repository so a fixture leaves nothing behind in the main
+        /// worktree.
+        _worktrees: tempfile::TempDir,
         /// Keeps the fake Forgejo serving for the fixture's lifetime.
         forge: MockServer,
         repo: PathBuf,
+        leaf_path: PathBuf,
         service: AgentControlService<crate::services::Services>,
         slug: String,
         branch: BranchName,
@@ -4155,15 +4254,28 @@ mod tests {
             git(&repo, &["remote", "add", "origin", HOSTED_REMOTE]);
             let head = git_output(&repo, &["rev-parse", branch.as_str()]);
 
+            let worktrees = tempfile::tempdir().expect("failed to create the worktree dir");
+            let leaf_path = worktrees.path().join(slug);
+            let git_wt = Arc::new(GitWorktreeService::new(repo.clone()));
             let forge = MockServer::start().await;
             let mut services = crate::services::Services::test();
             services.project_dir = repo.clone();
+            // The default `git_wt` points at the process working directory, so
+            // every mutating call must name the fixture repository explicitly.
+            services.git_wt = git_wt.clone();
             services.forgejo_client = Some(
                 crate::services::forgejo::ForgejoClient::new(&forge.uri(), "token-123")
                     .expect("a fake Forgejo URL must construct a client"),
             );
+            assert!(
+                git_wt
+                    .branch_exists(&branch)
+                    .expect("the fixture branch must exist in the fixture repository"),
+                "the git service must operate on the fixture repository, not the working directory"
+            );
             Self {
                 repo,
+                leaf_path,
                 service: AgentControlService::new(Arc::new(services)),
                 slug: slug.to_string(),
                 branch,
@@ -4171,6 +4283,7 @@ mod tests {
                 head,
                 leaf: agent(&format!("{slug}-codex")),
                 forge,
+                _worktrees: worktrees,
                 _temp: temp,
             }
         }
@@ -4220,10 +4333,41 @@ mod tests {
                 .await;
         }
 
+        /// Make the named endpoint fail the way an unreachable forge does.
+        async fn report_forge_failure(&self, endpoint: &str) {
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(500).set_body_string("forge is down"))
+                .mount(&self.forge)
+                .await;
+        }
+
+        /// Attach the deterministic branch at the leaf path, the way
+        /// provisioning does before the task is composed, and return the guard
+        /// that a refusal must still clean up.
+        fn attach_leaf_worktree(&self) -> WorktreeRollback {
+            self.service
+                .git_wt()
+                .create_workspace_from_existing_branch(&self.leaf_path, &self.branch)
+                .expect("failed to attach the leaf worktree");
+            WorktreeRollback::armed(self.service.git_wt().clone(), self.leaf_path.clone())
+        }
+
         /// The spawn options the host builds for a `resume_pr`: it resolved the
         /// identity and the PR head, so the branch and start point are
         /// host-owned and no directory scan may replace them.
         fn resume_options(&self) -> SpawnLeafOptions {
+            SpawnLeafOptions {
+                expected_agent_name: Some(self.leaf.clone()),
+                start_point: Some(self.head.clone()),
+                invocation_pr_number: Some(PR_NUMBER),
+                ..self.first_spawn_options()
+            }
+        }
+
+        /// The spawn options the host builds for a first spawn: the host owns
+        /// no identity yet, so it has no pull request to be blind to.
+        fn first_spawn_options(&self) -> SpawnLeafOptions {
             SpawnLeafOptions {
                 task: "Address the review feedback.".to_string(),
                 branch_name: self.slug.clone(),
@@ -4232,25 +4376,27 @@ mod tests {
                 claude_flags: ClaudeSpawnFlags::default(),
                 standalone_repo: false,
                 allowed_dirs: Vec::new(),
-                start_point: Some(self.head.clone()),
+                start_point: None,
                 base_branch: Some("main".to_string()),
-                expected_agent_name: Some(self.leaf.clone()),
-                invocation_pr_number: Some(PR_NUMBER),
+                expected_agent_name: None,
+                invocation_pr_number: None,
                 recovery_lineage: None,
                 model: None,
             }
         }
 
+        /// The task the given path composes, at the head it verified.
+        async fn task_for(&self, options: &SpawnLeafOptions) -> Result<String> {
+            self.service
+                .leaf_task(options, &self.repo, &self.branch, Some(&self.head))
+                .await
+        }
+
         /// The task the resume path composes, at the head it verified.
         async fn resume_task(&self) -> String {
-            self.service
-                .leaf_task(
-                    &self.resume_options(),
-                    &self.repo,
-                    &self.branch,
-                    Some(&self.head),
-                )
+            self.task_for(&self.resume_options())
                 .await
+                .expect("a resume whose pull request is readable must compose a task")
         }
 
         /// The HTTP methods the fake forge saw. A resume only ever reads.
@@ -4262,6 +4408,14 @@ mod tests {
                 .iter()
                 .map(|request| request.method.to_string())
                 .collect()
+        }
+    }
+
+    /// Unwrap a task-composition refusal, which carries a stable code.
+    fn task_refusal(result: Result<String>) -> anyhow::Error {
+        match result {
+            Err(error) => error,
+            Ok(task) => panic!("task composition unexpectedly succeeded: {task}"),
         }
     }
 
@@ -4603,6 +4757,79 @@ mod tests {
                 .iter()
                 .all(|method| method == "GET"),
             "a repeated resume must not file another pull request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_fails_closed_when_the_pull_request_cannot_be_read() {
+        let fixture = PullRequestFixture::new("pr-outage").await;
+        fixture
+            .report_forge_failure("/api/v1/repos/owner/repo/pulls")
+            .await;
+        let guard = fixture.attach_leaf_worktree();
+
+        let error = task_refusal(fixture.task_for(&fixture.resume_options()).await);
+
+        let effect = error
+            .downcast_ref::<EffectError>()
+            .expect("a refused resume must be a typed effect error");
+        let EffectError::Custom { code, .. } = effect else {
+            panic!("a refused resume must be custom coded, got {effect:?}");
+        };
+        assert_eq!(code, "worktree.pr_context_unavailable");
+        let message = effect.to_string();
+        assert!(
+            message.contains(fixture.branch.as_str()) && message.contains("HTTP 500"),
+            "the refusal must name the branch and the underlying forge error, got {message}"
+        );
+
+        // The refusal propagates with `?` while the guard is armed, exactly as
+        // the call site does, so the worktree this spawn created is removed.
+        drop(guard);
+        assert!(
+            !fixture.leaf_path.exists(),
+            "a resume refused before launch must not leave its worktree behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_spawn_proceeds_when_the_pull_request_cannot_be_read() {
+        let fixture = PullRequestFixture::new("pr-outage-spawn").await;
+        fixture
+            .report_forge_failure("/api/v1/repos/owner/repo/pulls")
+            .await;
+
+        let task = fixture
+            .task_for(&fixture.first_spawn_options())
+            .await
+            .expect("a first spawn owns no pull request, so a forge outage is logged, not fatal");
+
+        assert_eq!(
+            task, "Address the review feedback.",
+            "a first spawn proceeds with the caller's task and records the loss in the log"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_review_listing_still_restores_the_pull_request_identity() {
+        let fixture = PullRequestFixture::new("pr-review-outage").await;
+        fixture.report_open_pull_request(&fixture.head).await;
+        fixture
+            .report_forge_failure(&format!(
+                "/api/v1/repos/owner/repo/pulls/{PR_NUMBER}/reviews"
+            ))
+            .await;
+
+        let task = fixture.resume_task().await;
+
+        assert!(
+            task.contains(&format!("Existing PR: #{PR_NUMBER} — {PR_TITLE}"))
+                && task.contains("Do NOT create a new pull request."),
+            "an unreadable review listing must not cost the leaf its pull request, got {task}"
+        );
+        assert!(
+            !task.contains(REVIEW_BODY) && !task.contains(REVIEW_COMMENT),
+            "feedback the forge could not return must not be invented, got {task}"
         );
     }
 

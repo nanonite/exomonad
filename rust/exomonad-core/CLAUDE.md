@@ -258,6 +258,30 @@ feedback is best effort — the PR identity is the context, and a failed review
 listing must not cost the leaf its PR. A standalone repo owns no host PR, has no
 verified head to match, and therefore gets no PR context.
 
+**A PR lookup that could not be answered is not "no PR exists".**
+`resolve_existing_pull_request` returns a typed `PullRequestContext` that keeps
+`NoQualifyingPr` (the forge answered, nothing qualifies) apart from
+`LookupFailed` (the forge could not be asked, carrying the reason), and
+`leaf_task` decides between them per path:
+
+| Outcome | Expected-agent resume | First spawn |
+|---------|-----------------------|-------------|
+| `Resolved` | context appended | context appended |
+| `NoQualifyingPr` | no context | no context |
+| `LookupFailed` | refused with `worktree.pr_context_unavailable` | `warn!` with branch and error, then no context |
+
+The resume must refuse: a leaf that cannot see the PR it owns receives a task
+that says nothing about it, which is how a second PR gets filed, and a forge
+outage must not look like a branch with no PR. The refusal propagates with `?`
+at the call site, before any tmux launch and while the `WorktreeRollback` guard
+is armed, so the worktree this spawn created is removed. A first spawn owns no
+pull request and cannot be blind to one, so it proceeds with the loss recorded —
+a documented, logged first-spawn behavior rather than a silent fallback. A
+missing configured forge (`forgejo_client()` is `None`) and an unverified head
+both count as `NoQualifyingPr`: neither is an outage. Review and inline-comment
+listing failures stay non-fatal and each `warn!`s with the PR number and the
+error, so no failure in this path is silent.
+
 The quarantine manifest records `source_kind: "unregistered_worktree_residue"` and `forensic_only: true` for every entry. Quarantined `.exo/ledger/segments` and `.exo/events` describe a worktree that no longer exists, so `exomonad logs import` excludes any source under `.exo/worktrees-residue/` by default and reports the count as `excluded_quarantined_sources`. `exomonad logs import --include-quarantined` is the explicit operator opt-in. The exclusion is a path predicate, so it holds even when a manifest entry is missing after a crash.
 
 ### Session memory ledger
