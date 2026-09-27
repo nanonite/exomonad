@@ -21,6 +21,13 @@
 //! cleanup that cannot take the exclusive lock skips the pass and leaves residue
 //! untouched; a spawn that cannot take it fails closed. No caller waits
 //! indefinitely and no caller proceeds on an unverified view.
+//!
+//! Every attempt is non-blocking, so a contended acquisition spends its whole
+//! timeout waiting rather than deciding. That wait must not block a runtime
+//! worker: `try_acquire_async` yields to the runtime between attempts and
+//! `try_acquire` sleeps the thread it owns. The two entry points share one
+//! acquisition implementation, so the decision — which mode, which deadline,
+//! what an error means — is made in exactly one place.
 
 use anyhow::{Context, Result};
 use nix::errno::Errno;
@@ -63,6 +70,82 @@ pub(crate) struct LifecycleGuard {
     _lock: Flock<std::fs::File>,
 }
 
+/// A bounded acquisition in progress.
+///
+/// This is the single acquisition implementation: it owns the open lock file,
+/// the mode, and the deadline, and it is the only code that interprets an
+/// attempt. Callers differ only in how they wait between two attempts, which
+/// the entry points on [`LifecycleGuard`] do.
+#[derive(Debug)]
+struct LifecycleAcquisition {
+    /// The open lock file, `None` once it has been handed to a guard.
+    file: Option<std::fs::File>,
+    mode: FlockArg,
+    lock_path: PathBuf,
+    deadline: Instant,
+}
+
+impl LifecycleAcquisition {
+    /// Open the project-scoped lock file and arm the deadline.
+    fn start(project_root: &Path, mode: LifecycleMode, timeout: Duration) -> Result<Self> {
+        let lock_path = LifecycleGuard::lock_path(project_root);
+        let Some(parent) = lock_path.parent() else {
+            return Err(anyhow::anyhow!(
+                "lifecycle lock path {} has no parent directory",
+                lock_path.display()
+            ));
+        };
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create lifecycle lock directory {}", parent.display()))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open {}", lock_path.display()))?;
+        let mode = match mode {
+            LifecycleMode::Shared => FlockArg::LockSharedNonblock,
+            LifecycleMode::Exclusive => FlockArg::LockExclusiveNonblock,
+        };
+        Ok(Self {
+            file: Some(file),
+            mode,
+            lock_path,
+            deadline: Instant::now() + timeout,
+        })
+    }
+
+    /// Make one non-blocking attempt.
+    ///
+    /// `Ok(Some(guard))` is the acquired lock. `Ok(None)` means another caller
+    /// holds it and the acquisition may continue; a hard error stops the
+    /// acquisition and is surfaced.
+    fn attempt(&mut self) -> Result<Option<LifecycleGuard>> {
+        let Some(file) = self.file.take() else {
+            return Err(anyhow::anyhow!(
+                "lifecycle lock {} is no longer open",
+                self.lock_path.display()
+            ));
+        };
+        match Flock::lock(file, self.mode) {
+            Ok(lock) => Ok(Some(LifecycleGuard { _lock: lock })),
+            Err((returned, Errno::EWOULDBLOCK)) => {
+                self.file = Some(returned);
+                Ok(None)
+            }
+            Err((_returned, errno)) => Err(anyhow::anyhow!(
+                "lock {}: {errno}",
+                self.lock_path.display()
+            )),
+        }
+    }
+
+    /// Whether the timeout has not yet elapsed, so another attempt is allowed.
+    fn may_retry(&self) -> bool {
+        Instant::now() < self.deadline
+    }
+}
+
 impl LifecycleGuard {
     /// Path of the project-scoped lock file.
     pub(crate) fn lock_path(project_root: &Path) -> PathBuf {
@@ -74,45 +157,48 @@ impl LifecycleGuard {
     /// Returns `Ok(None)` when the lock is still held by another caller after
     /// the wait; the caller must then fail closed. A `timeout` of zero makes a
     /// single non-blocking attempt.
+    ///
+    /// For a caller that owns its thread. A caller running inside a runtime must
+    /// use [`Self::try_acquire_async`], because sleeping here would block a
+    /// runtime worker for the whole timeout.
     pub(crate) fn try_acquire(
         project_root: &Path,
         mode: LifecycleMode,
         timeout: Duration,
     ) -> Result<Option<Self>> {
-        let lock_path = Self::lock_path(project_root);
-        let Some(parent) = lock_path.parent() else {
-            return Err(anyhow::anyhow!(
-                "lifecycle lock path {} has no parent directory",
-                lock_path.display()
-            ));
-        };
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create lifecycle lock directory {}", parent.display()))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("open {}", lock_path.display()))?;
-        let nonblocking = match mode {
-            LifecycleMode::Shared => FlockArg::LockSharedNonblock,
-            LifecycleMode::Exclusive => FlockArg::LockExclusiveNonblock,
-        };
-        let deadline = Instant::now() + timeout;
+        let mut acquisition = LifecycleAcquisition::start(project_root, mode, timeout)?;
         loop {
-            match Flock::lock(file, nonblocking) {
-                Ok(lock) => return Ok(Some(Self { _lock: lock })),
-                Err((returned, Errno::EWOULDBLOCK)) => {
-                    file = returned;
-                    if Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    std::thread::sleep(RETRY_INTERVAL);
-                }
-                Err((_returned, errno)) => {
-                    return Err(anyhow::anyhow!("lock {}: {errno}", lock_path.display()));
-                }
+            if let Some(guard) = acquisition.attempt()? {
+                return Ok(Some(guard));
             }
+            if !acquisition.may_retry() {
+                return Ok(None);
+            }
+            std::thread::sleep(RETRY_INTERVAL);
+        }
+    }
+
+    /// Try to take the lifecycle lock without blocking a runtime worker.
+    ///
+    /// Identical to [`Self::try_acquire`] except that the wait between two
+    /// non-blocking attempts yields to the runtime, so a contended acquisition
+    /// of `DECISION_TIMEOUT` never parks the thread it was awaited on. Both
+    /// entry points drive the same [`LifecycleAcquisition`], so the acquisition
+    /// decision is made in one place.
+    pub(crate) async fn try_acquire_async(
+        project_root: &Path,
+        mode: LifecycleMode,
+        timeout: Duration,
+    ) -> Result<Option<Self>> {
+        let mut acquisition = LifecycleAcquisition::start(project_root, mode, timeout)?;
+        loop {
+            if let Some(guard) = acquisition.attempt()? {
+                return Ok(Some(guard));
+            }
+            if !acquisition.may_retry() {
+                return Ok(None);
+            }
+            tokio::time::sleep(RETRY_INTERVAL).await;
         }
     }
 }
@@ -120,7 +206,10 @@ impl LifecycleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::oneshot;
 
     #[test]
     fn exclusive_holder_blocks_every_other_mode() -> Result<()> {
@@ -172,5 +261,84 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let lock_path = LifecycleGuard::lock_path(temp.path());
         assert_eq!(lock_path, temp.path().join(LOCK_RELATIVE_PATH));
+    }
+
+    /// The async entry point makes the same decision as the sync one and hands
+    /// back a guard that is still held, so both entry points drive the same
+    /// acquisition.
+    #[tokio::test]
+    async fn an_async_acquisition_hands_back_a_held_guard() -> Result<()> {
+        let temp = TempDir::new()?;
+        let project = temp.path();
+        let held =
+            LifecycleGuard::try_acquire_async(project, LifecycleMode::Exclusive, SINK_TIMEOUT)
+                .await?
+                .expect("an uncontended acquisition succeeds");
+        assert!(
+            LifecycleGuard::try_acquire(project, LifecycleMode::Shared, Duration::ZERO)?.is_none(),
+            "the guard returned by the async path holds the lock"
+        );
+        drop(held);
+        assert!(
+            LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// A contended acquisition from async code must yield between attempts, so a
+    /// runtime worker is never parked for the length of the timeout.
+    ///
+    /// The runtime is `current_thread`, so the only way the ticker can run at all
+    /// is if the acquisition reaches a suspension point. The ticker is released
+    /// on the same turn that starts the acquisition, so it has run nothing before
+    /// the acquisition begins, and the counter is read before the ticker is
+    /// awaited. A blocking wait would freeze the single worker for the whole
+    /// `SINK_TIMEOUT` and the counter would still be zero. No wall-clock duration
+    /// is asserted, only that the other task made progress and that the
+    /// acquisition still failed closed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_contended_async_acquisition_does_not_block_the_runtime() -> Result<()> {
+        let temp = TempDir::new()?;
+        let project = temp.path();
+        let _held = LifecycleGuard::try_acquire(project, LifecycleMode::Exclusive, Duration::ZERO)?
+            .expect("the test holds the exclusive lifecycle lock");
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let ticker = tokio::spawn({
+            let progress = Arc::clone(&progress);
+            async move {
+                parked_tx.send(()).ok();
+                release_rx.await.ok();
+                // Bounded, so the ready queue drains and the acquisition's own
+                // timer can still fire.
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                    progress.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        parked_rx.await?;
+        let before = progress.load(Ordering::SeqCst);
+
+        // Releasing the ticker and awaiting the acquisition happen in the same
+        // turn, so the ticker cannot have run before the acquisition starts.
+        release_tx.send(()).ok();
+        let outcome =
+            LifecycleGuard::try_acquire_async(project, LifecycleMode::Shared, SINK_TIMEOUT).await?;
+        let observed = progress.load(Ordering::SeqCst);
+        ticker.await?;
+
+        assert!(
+            outcome.is_none(),
+            "a contended acquisition fails closed instead of waiting forever"
+        );
+        assert!(
+            observed > before,
+            "another task must make progress while a contended acquisition waits"
+        );
+        Ok(())
     }
 }

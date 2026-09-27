@@ -197,7 +197,8 @@ impl AgentInbox {
                 let sink = crate::services::sink_paths::resolve_sink(
                     &message.project_root,
                     &message.project_dir,
-                );
+                )
+                .await;
                 append_inbox_event(
                     &sink.dir,
                     &message.recipient,

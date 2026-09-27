@@ -845,7 +845,7 @@ impl<
 
             // Exclusive lifecycle region: creation and a concurrent residue
             // cleanup pass must never interleave.
-            let _lifecycle = self.acquire_worktree_lifecycle("create a worktree")?;
+            let _lifecycle = self.acquire_worktree_lifecycle("create a worktree").await?;
             self.create_worktree_checked(&worktree_path, &branch_name, &base_branch)
                 .await?;
             drop(_lifecycle);
@@ -1465,7 +1465,9 @@ impl<
             };
 
             if options.standalone_repo {
-                let _lifecycle = self.acquire_worktree_lifecycle("initialize a worktree")?;
+                let _lifecycle = self
+                    .acquire_worktree_lifecycle("initialize a worktree")
+                    .await?;
                 self.init_standalone_repo(&worktree_path).await?;
                 if !options.allowed_dirs.is_empty() {
                     self.copy_allowed_dirs(&worktree_path, &options.allowed_dirs).await?;
@@ -1474,7 +1476,9 @@ impl<
             } else if !is_custom_dir {
                 // Exclusive lifecycle region: creation and a concurrent residue
                 // cleanup pass must never interleave.
-                let _lifecycle = self.acquire_worktree_lifecycle("create a worktree")?;
+                let _lifecycle = self
+                    .acquire_worktree_lifecycle("create a worktree")
+                    .await?;
                 let branch = BranchName::try_from_str(branch_name.as_str()).expect("validated string input is non-empty");
                 self.create_worktree_checked(&worktree_path, &branch, &current_branch).await?;
                 drop(_lifecycle);
@@ -1982,7 +1986,9 @@ impl<
             // pass reads. Holding the lock across them means a live worktree
             // cannot be created behind a cleanup classification, and a verified
             // worktree cannot be quarantined before this decision completes.
-            let _lifecycle = self.acquire_worktree_lifecycle("create or reuse a leaf worktree")?;
+            let _lifecycle = self
+                .acquire_worktree_lifecycle("create or reuse a leaf worktree")
+                .await?;
 
             if options.standalone_repo {
                 worktree_rollback = Some(WorktreeRollback::armed(

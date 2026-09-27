@@ -1012,7 +1012,8 @@ async fn spawn_inbox_consumer(agent: String) {
             let sink = crate::services::sink_paths::resolve_sink(
                 &message.project_root,
                 &message.project_dir,
-            );
+            )
+            .await;
             tmux_events::inject_input_with_options(
                 &message.target,
                 &message.body,
@@ -1061,7 +1062,8 @@ where
                 let sink = crate::services::sink_paths::resolve_sink(
                     &message.project_root,
                     &message.project_dir,
-                );
+                )
+                .await;
                 if let Ok(log) = crate::services::EventLog::open(sink.dir.join(".exo/logs")) {
                     let _ = log.append("message.delivery", &message.from, &attempt_data);
                 }
@@ -1116,7 +1118,8 @@ where
                     let sink = crate::services::sink_paths::resolve_sink(
                         &message.project_root,
                         &message.project_dir,
-                    );
+                    )
+                    .await;
                     if let Ok(log) = crate::services::EventLog::open(sink.dir.join(".exo/logs")) {
                         let _ = log.append(
                             "agent_inbox.messages_abandoned",
@@ -1927,8 +1930,8 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    #[test]
-    fn sink_destination_uses_registered_git_worktree() {
+    #[tokio::test]
+    async fn sink_destination_uses_registered_git_worktree() {
         let (_temp, project) = init_sink_repo();
         let default_branch = current_branch(&project);
         let git_wt = crate::services::git_worktree::GitWorktreeService::new(project.clone());
@@ -1940,17 +1943,19 @@ mod tests {
         git_wt.create_workspace(&worktree, &branch, &base).unwrap();
 
         assert_eq!(
-            crate::services::sink_paths::resolve_sink(&project, &worktree).dir,
+            crate::services::sink_paths::resolve_sink(&project, &worktree)
+                .await
+                .dir,
             worktree
         );
     }
 
-    #[test]
-    fn sink_destination_falls_back_without_creating_missing_worktree() {
+    #[tokio::test]
+    async fn sink_destination_falls_back_without_creating_missing_worktree() {
         let (_temp, project) = init_sink_repo();
         let planned = project.join(".exo/worktrees/leaf-codex");
 
-        let sink = crate::services::sink_paths::resolve_sink(&project, &planned);
+        let sink = crate::services::sink_paths::resolve_sink(&project, &planned).await;
 
         assert_eq!(sink.dir, project);
         assert!(
@@ -1959,24 +1964,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sink_destination_rejects_unregistered_residue() {
+    #[tokio::test]
+    async fn sink_destination_rejects_unregistered_residue() {
         let (_temp, project) = init_sink_repo();
         let residue = project.join(".exo/worktrees/leaf-codex");
         std::fs::create_dir_all(&residue).unwrap();
 
         assert_eq!(
-            crate::services::sink_paths::resolve_sink(&project, &residue).dir,
+            crate::services::sink_paths::resolve_sink(&project, &residue)
+                .await
+                .dir,
             project
         );
     }
 
-    #[test]
-    fn sink_event_log_for_missing_leaf_stays_in_project_fallback() {
+    #[tokio::test]
+    async fn sink_event_log_for_missing_leaf_stays_in_project_fallback() {
         let (_temp, project) = init_sink_repo();
         let planned = project.join(".exo/worktrees/leaf-codex");
 
-        let sink = crate::services::sink_paths::resolve_sink(&project, &planned);
+        let sink = crate::services::sink_paths::resolve_sink(&project, &planned).await;
         crate::services::EventLog::open(sink.dir.join(".exo/logs")).unwrap();
 
         assert!(
@@ -1990,8 +1997,8 @@ mod tests {
     /// so a cleanup pass that needs the same lock cannot start in between.
     /// `flock` is held per open file description, so an in-test holder on this
     /// thread excludes a second acquisition exactly as a second process would.
-    #[test]
-    fn sink_write_excludes_an_exclusive_lifecycle_holder() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn sink_write_excludes_an_exclusive_lifecycle_holder() -> anyhow::Result<()> {
         use crate::services::worktree_lifecycle::{LifecycleGuard, LifecycleMode};
         let (_temp, project) = init_sink_repo();
         let planned = project.join(".exo/worktrees/leaf-codex");
@@ -2004,14 +2011,16 @@ mod tests {
 
         // The sink cannot verify under contention, so it writes project-owned and
         // never the candidate.
-        let sink = crate::services::sink_paths::resolve_sink(&project, &planned);
+        let sink = crate::services::sink_paths::resolve_sink(&project, &planned).await;
         assert_eq!(sink.dir, project);
         assert!(!planned.exists());
 
         // With the exclusive holder gone the same sink verifies again.
         drop(held);
         assert_eq!(
-            crate::services::sink_paths::resolve_sink(&project, &planned).dir,
+            crate::services::sink_paths::resolve_sink(&project, &planned)
+                .await
+                .dir,
             project
         );
         Ok(())

@@ -1122,12 +1122,19 @@ impl<
     /// interleave with the other. Fails closed: a spawn that cannot take the
     /// lock refuses to touch the worktree path rather than deciding from a view
     /// another decision is already changing.
-    pub(crate) fn acquire_worktree_lifecycle(&self, decision: &str) -> Result<LifecycleGuard> {
-        LifecycleGuard::try_acquire(
+    ///
+    /// Async because the bounded wait for the lock must not block a runtime
+    /// worker for the length of `DECISION_TIMEOUT`.
+    pub(crate) async fn acquire_worktree_lifecycle(
+        &self,
+        decision: &str,
+    ) -> Result<LifecycleGuard> {
+        LifecycleGuard::try_acquire_async(
             self.project_dir(),
             LifecycleMode::Exclusive,
             DECISION_TIMEOUT,
-        )?
+        )
+        .await?
         .ok_or_else(|| {
             anyhow!("worktree lifecycle lock is held by another decision; refusing to {decision}")
         })

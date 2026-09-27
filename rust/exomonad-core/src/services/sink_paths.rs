@@ -46,7 +46,10 @@ fn verified_candidate(project_root: &Path, candidate: &Path) -> PathBuf {
 ///
 /// The caller must hold the returned destination for the whole write: dropping it
 /// releases the lock before the bytes land.
-pub(crate) fn resolve_sink(project_root: &Path, candidate: &Path) -> SinkDestination {
+///
+/// Async because the bounded wait for the shared lock must not block a runtime
+/// worker: every call site is on the delivery path, inside a runtime.
+pub(crate) async fn resolve_sink(project_root: &Path, candidate: &Path) -> SinkDestination {
     // The project-owned directory is never created, removed, or quarantined by a
     // lifecycle decision, so resolving to it needs no lock.
     if candidate == project_root {
@@ -55,11 +58,13 @@ pub(crate) fn resolve_sink(project_root: &Path, candidate: &Path) -> SinkDestina
             _lifecycle: None,
         };
     }
-    let lifecycle = match LifecycleGuard::try_acquire(
+    let lifecycle = match LifecycleGuard::try_acquire_async(
         project_root,
         LifecycleMode::Shared,
         SINK_TIMEOUT,
-    ) {
+    )
+    .await
+    {
         Ok(Some(lifecycle)) => Some(lifecycle),
         Ok(None) => {
             tracing::warn!(
@@ -136,22 +141,22 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    #[test]
-    fn project_owned_destination_needs_no_lifecycle_lock() {
+    #[tokio::test]
+    async fn project_owned_destination_needs_no_lifecycle_lock() {
         let temp = TempDir::new().unwrap();
-        let sink = resolve_sink(temp.path(), temp.path());
+        let sink = resolve_sink(temp.path(), temp.path()).await;
         assert_eq!(sink.dir, temp.path());
         assert!(sink._lifecycle.is_none());
     }
 
-    #[test]
-    fn an_exclusive_holder_forces_the_project_owned_destination() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn an_exclusive_holder_forces_the_project_owned_destination() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let candidate = temp.path().join(".exo/worktrees/leaf");
         let _held =
             LifecycleGuard::try_acquire(temp.path(), LifecycleMode::Exclusive, Duration::ZERO)?
                 .expect("the test holds the lifecycle lock");
-        let sink = resolve_sink(temp.path(), &candidate);
+        let sink = resolve_sink(temp.path(), &candidate).await;
         assert!(sink._lifecycle.is_none());
         assert_eq!(sink.dir, temp.path());
         assert!(
@@ -161,8 +166,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_free_lock_selects_a_registered_worktree() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn a_free_lock_selects_a_registered_worktree() -> anyhow::Result<()> {
         let (_temp, project) = init_sink_repository();
         let worktree = project.join(".exo/worktrees/leaf");
         let branch_name = default_branch(&project);
@@ -170,18 +175,18 @@ mod tests {
         let base = BranchName::try_from_str(branch_name.as_str())?;
         GitWorktreeService::new(project.clone()).create_workspace(&worktree, &branch, &base)?;
 
-        let sink = resolve_sink(&project, &worktree);
+        let sink = resolve_sink(&project, &worktree).await;
         assert!(sink._lifecycle.is_some());
         assert_eq!(sink.dir, worktree);
         Ok(())
     }
 
-    #[test]
-    fn a_free_lock_still_rejects_a_planned_worktree() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn a_free_lock_still_rejects_a_planned_worktree() -> anyhow::Result<()> {
         let (_temp, project) = init_sink_repository();
         let planned = project.join(".exo/worktrees/leaf");
 
-        let sink = resolve_sink(&project, &planned);
+        let sink = resolve_sink(&project, &planned).await;
         assert!(sink._lifecycle.is_some());
         assert_eq!(sink.dir, project);
         assert!(

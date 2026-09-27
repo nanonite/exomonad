@@ -596,6 +596,13 @@ const RESIDUE_SOURCE_KIND: &str = "unregistered_worktree_residue";
 /// read-modify-write of the manifest needs no lock of its own. A failure leaves
 /// the already-quarantined directory in place and is surfaced to the caller
 /// rather than ignored: the evidence stays, but the record is missing.
+///
+/// A manifest that cannot be read is never treated as empty. Only a missing
+/// manifest means there are no prior records to keep; every other read failure
+/// (permissions, I/O error, a path that is not a file) returns the error so the
+/// existing manifest keeps its bytes and the quarantined directory stays where
+/// it is. Rewriting the manifest from an unreadable read would silently erase
+/// every prior quarantine record.
 fn append_quarantine_manifest(
     quarantine_root: &Path,
     source: &Path,
@@ -603,7 +610,7 @@ fn append_quarantine_manifest(
 ) -> Result<()> {
     use std::io::Write;
     let manifest = quarantine_root.join(RESIDUE_MANIFEST);
-    let mut existing = std::fs::read(&manifest).unwrap_or_default();
+    let mut existing = read_existing_quarantine_manifest(&manifest)?;
     let record = serde_json::json!({
         "source": source.display().to_string(),
         "destination": destination.display().to_string(),
@@ -636,6 +643,23 @@ fn append_quarantine_manifest(
     quarantine_dir
         .sync_all()
         .with_context(|| format!("fsync quarantine directory {}", quarantine_root.display()))
+}
+
+/// Read the records already in the manifest, or nothing when it does not exist.
+///
+/// Only `NotFound` means "no prior records". Every other error stops the append
+/// so the manifest on disk is never rewritten from an empty buffer.
+fn read_existing_quarantine_manifest(manifest: &Path) -> Result<Vec<u8>> {
+    match std::fs::read(manifest) {
+        Ok(existing) => Ok(existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "read quarantine manifest {}; leaving it and the quarantined directory untouched",
+                manifest.display()
+            )
+        }),
+    }
 }
 
 fn residue_quarantine_name(name: &str) -> String {
@@ -837,8 +861,8 @@ mod tests {
             residue.join(".exo/ledger/segments/segment-0.jsonl"),
             "evidence\n",
         )?;
-        // The manifest path is occupied, so the durable entry cannot be
-        // installed once the directory has been moved.
+        // The manifest path is occupied by a directory, so it can neither be read
+        // to keep its prior records nor replaced once the directory has moved.
         std::fs::create_dir_all(project.join(".exo/worktrees-residue/manifest.jsonl"))?;
 
         let error = cleanup_unregistered_worktree_residue(&project, &git_wt)
@@ -857,6 +881,81 @@ mod tests {
             !quarantine_temporary_files(&project).any(|path| path.exists()),
             "a failed manifest write leaves no temporary file behind"
         );
+        Ok(())
+    }
+
+    /// An existing manifest that cannot be read is not an empty manifest. Every
+    /// prior quarantine record must survive byte for byte, the error must reach
+    /// the caller, and the directory that was already moved stays in quarantine.
+    #[test]
+    fn residue_cleanup_preserves_an_unreadable_manifest_and_keeps_the_evidence() -> Result<()> {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
+        std::fs::write(
+            residue.join(".exo/ledger/segments/segment-0.jsonl"),
+            "evidence\n",
+        )?;
+        let manifest = project
+            .join(".exo/worktrees-residue")
+            .join(RESIDUE_MANIFEST);
+        let prior = b"{\"source\":\"/first\",\"forensic_only\":true}\n";
+        std::fs::create_dir_all(manifest.parent().expect("manifest parent"))?;
+        std::fs::write(&manifest, prior)?;
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000))?;
+        if std::fs::read(&manifest).is_ok() {
+            // The mode is not enforced for this process (root), so the read never
+            // fails and there is nothing to prove.
+            println!("SKIP: manifest permissions are not enforced for this process");
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644))?;
+            return Ok(());
+        }
+
+        let error = cleanup_unregistered_worktree_residue(&project, &git_wt)
+            .expect_err("an unreadable manifest must be surfaced, not treated as empty");
+
+        assert!(
+            error.to_string().contains("read quarantine manifest"),
+            "{error}"
+        );
+        assert!(!residue.exists(), "the residue was already moved");
+        assert!(
+            quarantine_destination_for(&project, &residue)
+                .join(".exo/ledger/segments/segment-0.jsonl")
+                .is_file(),
+            "the evidence stays in quarantine"
+        );
+        assert!(
+            !quarantine_temporary_files(&project).any(|path| path.exists()),
+            "a refused manifest append leaves no temporary file behind"
+        );
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644))?;
+        assert_eq!(
+            std::fs::read(&manifest)?,
+            prior,
+            "an unreadable manifest keeps its prior records byte for byte"
+        );
+        Ok(())
+    }
+
+    /// The control case for the unreadable manifest: a manifest that does not
+    /// exist yet is the one state that legitimately means "no prior records", so
+    /// the first append creates it.
+    #[test]
+    fn residue_cleanup_appends_when_no_manifest_exists_yet() -> Result<()> {
+        let (_temp, project, git_wt) = init_residue_repo();
+        let residue = project.join(".exo/worktrees/leaf-codex");
+        std::fs::create_dir_all(residue.join(".exo/ledger/segments"))?;
+        let manifest = project
+            .join(".exo/worktrees-residue")
+            .join(RESIDUE_MANIFEST);
+
+        let moved = cleanup_unregistered_worktree_residue(&project, &git_wt)?;
+
+        assert_eq!(moved, vec![residue.clone()]);
+        let entry: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&manifest)?.trim())?;
+        assert_eq!(entry["source"], residue.display().to_string());
         Ok(())
     }
 

@@ -291,7 +291,7 @@ at warn level with the recorded owner PID.
 | CLI-based tmux IPC | `std::process::Command` calls to `tmux` binary |
 | Extism runtime | Mature WASM runtime with host function support |
 | File-based devswarm WASM | Single WASM for all roles, loaded from disk, hot reload in serve mode |
-| Project-scoped worktree lifecycle lock | `.exo/worktree-lifecycle.lock` (flock) makes worktree create/attach and residue cleanup mutually exclusive and serializes sink verification and its write, so no ownership decision is taken from a view another writer has already invalidated |
+| Project-scoped worktree lifecycle lock | `.exo/worktree-lifecycle.lock` (flock) makes worktree create/attach and residue cleanup mutually exclusive and serializes sink verification and its write, so no ownership decision is taken from a view another writer has already invalidated; async callers acquire through `try_acquire_async`, which yields between non-blocking attempts instead of parking a runtime worker |
 
 ## Related Documentation
 
