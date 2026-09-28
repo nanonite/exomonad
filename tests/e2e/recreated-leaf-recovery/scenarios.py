@@ -452,6 +452,64 @@ def t2_recreate_preserves_branch(project: Project) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _new_attach_decision(
+    project: Project, seen: int
+) -> list[Mapping[str, Any]] | None:
+    """Return the attach decisions written after ``seen``, else None.
+
+    Counting from the ledger directly, rather than re-listing every decision,
+    means a decision written by an earlier attempt cannot make this probe's wait
+    succeed before this probe's own dispatch has been answered. The path, the
+    segments, and the highest sequence read are reported on timeout, so a wait
+    that misses a row the server wrote can be read rather than guessed at.
+    """
+    found = ev.attach_decisions(
+        project.ledger(), branch=LEAF_BRANCH, action=ev.ATTACH
+    )
+    return found[seen:] or None
+
+
+def _ledger_state(project: Project) -> dict[str, Any]:
+    """Describe exactly what the ledger read returns, for a failure report.
+
+    A wait that times out over a durable record has to be able to say which
+    directory it read, which segments it found, and the highest sequence in
+    them, because "it did not arrive" and "it arrived somewhere else" are
+    different faults.
+    """
+    segments = project.repo / ev.LEDGER_SEGMENTS
+    present = sorted(path.name for path in segments.glob("*") if path.is_file())
+    highest = None
+    for event in project.ledger():
+        sequence = event.get("run_seq")
+        if isinstance(sequence, int):
+            highest = sequence if highest is None else max(highest, sequence)
+    return {
+        "ledger_path": str(segments),
+        "segments": present,
+        "highest_run_seq": highest,
+    }
+
+
+def _restore_leaf_worktree(project: Project) -> None:
+    """Put the leaf's worktree back after a probe removed it.
+
+    A probe that destroys shared state and then fails would make every later
+    item's verdict meaningless, so the loss is undone at the git level: the
+    worktree is re-registered on the same branch at the same head, which is the
+    state the probe found. This is a restore, not a retry of what the probe was
+    proving.
+    """
+    if ev.worktrees_for_branch(project.repo, LEAF_BRANCH):
+        return
+    path = project.repo / ".exo" / "worktrees" / LEAF_AGENT
+    subprocess.run(
+        ["git", "-C", str(project.repo), "worktree", "add", "-q", str(path), LEAF_BRANCH],
+        check=False,
+        capture_output=True,
+    )
+
+
 def _leaf_head_evidence(project: Project, branch: str) -> Any:
     """Return the head evidence the server itself records for a branch.
 
@@ -555,19 +613,27 @@ def t3_attach_preserved_branch(
     attach_before = len(
         ev.attach_decisions(project.ledger(), branch=LEAF_BRANCH, action=ev.ATTACH)
     )
-    result, attempt = dispatch_leaf(
-        project,
-        LEAF_NAME,
-        "Prove recreated leaf recovery end to end",
-    )
-    events = await_boundary(
-        lambda: (
-            ev.attach_decisions(project.ledger(), branch=LEAF_BRANCH, action=ev.ATTACH)
-            or None
-        ),
-        description=f"a verified attach decision for {LEAF_BRANCH}",
-        timeout=PUBLICATION_TIMEOUT_SECONDS,
-    )
+    try:
+        result, attempt = dispatch_leaf(
+            project,
+            LEAF_NAME,
+            "Prove recreated leaf recovery end to end",
+        )
+        events = await_boundary(
+            lambda: _new_attach_decision(project, attach_before),
+            description=(
+                f"a verified attach decision for {LEAF_BRANCH}; "
+                f"ledger {json.dumps(_ledger_state(project), default=str)}"
+            ),
+            timeout=PUBLICATION_TIMEOUT_SECONDS,
+        )
+    except BaseException as error:
+        # This probe removes the leaf's worktree on purpose, so a failure here
+        # would leave every later item asserting on a project that no longer
+        # has one. The loss is this probe's own state, so the probe puts it back
+        # before the failure travels on.
+        _restore_leaf_worktree(project)
+        raise error
     require(
         ev.is_success(result.raw),
         f"the same plan did not re-dispatch the leaf: {result.raw!r}",

@@ -104,14 +104,17 @@ def wasm_plugin() -> Path:
     return candidate.resolve()
 
 
-def session_name(scope: cl.RunScope, role: str) -> str:
-    """Return the unique tmux session name this run uses for one role.
+def session_name(scope: cl.RunScope) -> str:
+    """Return the unique tmux session name this run uses.
 
-    Recreating the session reuses the same name, because what the acceptance
-    recreates is the session itself; the suffix distinguishes it from another
-    run's identically named session.
+    The name is the run's own prefix, and it is within the server's
+    session-name limit. That limit is why the name carries no extra suffix: the
+    harness creates the tmux session itself, and the server sanitizes the name
+    it reads from the config, so any name the two do not share exactly is a
+    session the server cannot see. ``track_session`` refuses a name that would
+    not survive that sanitization.
     """
-    return scope.track_session(f"{scope.session_prefix}{role}")
+    return scope.track_session(scope.session_prefix)
 
 
 def kill_session(session: str) -> None:
@@ -415,7 +418,7 @@ def new_run(
         scope=scope,
         root=root,
         repo=repo,
-        session=session_name(scope, "session"),
+        session=session_name(scope),
         chainlink_db=chainlink_db,
         instance=instance,
         leaf_branches=tuple(leaf_branches),

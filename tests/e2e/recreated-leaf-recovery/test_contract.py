@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -31,6 +32,7 @@ sys.path.insert(0, str(HARNESS))
 
 import cleanup as cl  # noqa: E402
 import evidence as ev  # noqa: E402
+import project as pj  # noqa: E402
 import scenarios as sc  # noqa: E402
 import waiter  # noqa: E402
 
@@ -375,6 +377,92 @@ def test_there_is_no_quiescence_wait_to_misuse():
 
 
 # --------------------------------------------------------------------------
+# The session name the server and the harness must agree on
+# --------------------------------------------------------------------------
+
+
+def _sanitize_session_name(name: str) -> str:
+    """Mirror the server's own sanitization, as a test oracle.
+
+    This is ``sanitize_session_name`` from ``rust/exomonad/src/config.rs:878``:
+    dots become underscores and the first 36 characters are kept. It is
+    duplicated here only so the test can ask whether the two agree, and the
+    neighbouring test asserts that this mirror still matches the shipped rule.
+    """
+    return name.replace(".", "_")[:36]
+
+
+def test_the_harness_oracle_matches_the_shipped_session_name_rule():
+    """The oracle this file uses is the rule the server actually applies.
+
+    The server sanitizes ``tmux_session`` once, at config load
+    (``rust/exomonad/src/config.rs:525``). If that rule ever changes, the
+    oracle has to change with it or the checks below stop meaning anything, so
+    the rule is read out of the shipped source rather than trusted.
+    """
+    source = (PROJECT_ROOT / "rust/exomonad/src/config.rs").read_text(encoding="utf-8")
+    assert 'name.replace(\'.\', "_").chars().take(36).collect()' in source, (
+        "the shipped session-name rule changed; update _sanitize_session_name"
+    )
+    assert "let tmux_session = sanitize_session_name(tmux_session);" in source, (
+        "the server no longer sanitizes the session name at config load, so the "
+        "harness no longer has to match a truncated name"
+    )
+
+
+def test_every_session_name_the_harness_creates_survives_the_servers_sanitization():
+    """The harness's session name is the name the server will use.
+
+    The harness creates the tmux session itself rather than through
+    ``exomonad init``, so it holds its own name. The server reads the name from
+    the config and sanitizes it. A name longer than 36 characters is silently
+    truncated, the server then looks for a session that does not exist, and
+    every agent is reported dead. This asserts the two names are the same for
+    the names this harness actually produces.
+    """
+    import driver
+
+    for _attempt in range(50):
+        run_id = driver.run_id()
+        scope = cl.RunScope(run_id=run_id, root=cl.make_root("/tmp"))
+        try:
+            name = pj.session_name(scope)
+            assert _sanitize_session_name(name) == name, (
+                f"the server would look for "
+                f"{_sanitize_session_name(name)!r}, not {name!r}"
+            )
+            assert len(name) <= cl.SESSION_NAME_MAX_LENGTH
+        finally:
+            shutil.rmtree(scope.root, ignore_errors=True)
+
+
+def test_a_run_id_that_would_overflow_the_session_name_is_refused():
+    """An over-long run id fails immediately instead of silently misnaming.
+
+    The failure has to be loud. A name the server truncates produces a session
+    the server cannot find, and every later liveness check reports every agent
+    as dead, which reads as a product fault rather than as a naming mistake.
+    """
+    scope = cl.RunScope(run_id="x" * 40, root=cl.make_root("/tmp"))
+    try:
+        with pytest.raises(cl.CleanupError) as failure:
+            _ = scope.session_prefix
+        assert "session name limit" in str(failure.value)
+    finally:
+        shutil.rmtree(scope.root, ignore_errors=True)
+
+
+def test_a_session_name_over_the_limit_is_refused_rather_than_tracked():
+    scope = cl.RunScope(run_id="e2e1111-abc123", root=cl.make_root("/tmp"))
+    try:
+        with pytest.raises(cl.CleanupError) as failure:
+            scope.track_session(scope.session_prefix + "a" * 40)
+        assert "session name limit" in str(failure.value)
+    finally:
+        shutil.rmtree(scope.root, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
 # The wiring
 # --------------------------------------------------------------------------
 
@@ -507,7 +595,7 @@ def scope() -> Any:
     import secrets
 
     created = cl.RunScope(
-        run_id=f"contract-{secrets.token_hex(4)}", root=cl.make_root("/tmp")
+        run_id=f"ct{secrets.token_hex(3)}", root=cl.make_root("/tmp")
     )
     try:
         yield created
@@ -516,9 +604,14 @@ def scope() -> Any:
         assert problems == [], f"the contract test leaked: {problems}"
 
 
-def _start_probe_session(scope: cl.RunScope, label: str) -> str:
-    """Create a real tmux session owned by this scope."""
-    session = scope.track_session(f"{scope.session_prefix}{label}")
+def _start_probe_session(scope: cl.RunScope) -> str:
+    """Create the run's real tmux session.
+
+    The name is the scope's own session name, with nothing appended: the prefix
+    is already unique per test, and appending a label would push the name past
+    the server's limit, which is the mistake this contract exists to prevent.
+    """
+    session = scope.track_session(scope.session_prefix)
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", session, "-n", "probe", "sleep", "600"],
         check=True,
@@ -533,7 +626,7 @@ def test_teardown_removes_the_session_and_the_process_it_started(scope):
     This is the leak class that previously went unnoticed: a harness that
     starts a session and a server and then fails an item leaves both running.
     """
-    session = _start_probe_session(scope, "session")
+    session = _start_probe_session(scope)
     process = scope.track_process(
         subprocess.Popen(["sleep", "600"], cwd=scope.root, start_new_session=True),
         "probe process",
@@ -553,7 +646,7 @@ def test_teardown_removes_the_session_and_the_process_it_started(scope):
 @pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
 def test_teardown_is_idempotent(scope):
     """Tearing down twice is not an error, because cleanup runs on every path."""
-    _start_probe_session(scope, "idempotent")
+    _start_probe_session(scope)
     assert scope.teardown() == []
     assert scope.teardown() == []
     assert scope.leaks() == []
@@ -654,7 +747,7 @@ def test_a_compose_project_and_a_session_together_leave_nothing_behind(scope):
 
     compose_file = fj.template_path(PROJECT_ROOT)
     project = scope.track_compose(f"{scope.session_prefix}both", compose_file)
-    _start_probe_session(scope, "both")
+    _start_probe_session(scope)
     fj.up(project, compose_file)
     fj.published_host(project, compose_file)
     scope.track_process(
@@ -699,7 +792,7 @@ def test_a_sweep_reclaims_a_run_that_was_killed_before_its_teardown():
     )
     # No scope is created and no teardown is ever called: this run is aborted.
     try:
-        assert cl.stale_run_roots(prefix) != []
+        assert cl.stale_run_roots() != []
         assert any(
             pid == str(process.pid)
             for pid, _cwd, _command in cl.processes_in_scopes([str(root)])
@@ -712,14 +805,84 @@ def test_a_sweep_reclaims_a_run_that_was_killed_before_its_teardown():
         subprocess.run(
             ["tmux", "kill-session", "-t", session], check=False, capture_output=True
         )
-        import shutil
-
         shutil.rmtree(root, ignore_errors=True)
 
     assert not cl._process_alive(process.pid)
     assert not cl._session_exists(session)
     assert not root.exists()
     assert cl.processes_in_scopes([str(root)]) == []
+
+
+def test_the_sweep_kills_a_server_before_it_removes_the_directory_it_ran_in():
+    """Removing the directory is the last thing a sweep does, not the first.
+
+    A process whose working directory has been deleted keeps running, and is
+    then indistinguishable from a process that was never in a run directory at
+    all. This asserts the order directly: the directory is gone when the sweep
+    returns, and the process that was running in it is dead by then too.
+    """
+    import secrets
+
+    prefix = f"{cl.LEAK_PREFIX}order-{secrets.token_hex(3)}-"
+    root = cl.make_root("/tmp")
+    process = subprocess.Popen(["sleep", "600"], cwd=root, start_new_session=True)
+    try:
+        assert cl.sweep_stale(prefix, _compose_file()) == []
+        assert not root.exists(), "the sweep left the run directory behind"
+        assert not cl._process_alive(process.pid), (
+            "the sweep removed the directory but left the process running in it"
+        )
+    finally:
+        if cl._process_alive(process.pid):
+            process.kill()
+            process.wait(timeout=30)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_process_that_merely_mentions_a_run_path_survives_the_sweep():
+    """A run's processes are identified by where they run, not by what they say.
+
+    An earlier version also matched a run path anywhere on a command line, so
+    the start-of-run sweep matched any process *carrying* such a path as an
+    argument -- an editor, a ``grep``, a ``tail``, or an agent whose own prompt
+    quoted one -- and killed its process group along with the leak it was
+    looking for. Two processes are started here that differ in exactly that
+    respect, and only the one running inside the run directory may be killed.
+    """
+    import secrets
+
+    prefix = f"{cl.LEAK_PREFIX}argv-{secrets.token_hex(3)}-"
+    root = cl.make_root("/tmp")
+    # Runs inside the run directory: this one is the run's own and must die.
+    inside = subprocess.Popen(["sleep", "600"], cwd=root, start_new_session=True)
+    # Runs elsewhere and merely names the run directory as an argument: this one
+    # belongs to whoever is reading about the run, and must be left alone.
+    elsewhere = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; print(sys.argv[1]); time.sleep(600)", str(root)],
+        cwd="/",
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        assert any(
+            pid == str(inside.pid)
+            for pid, _cwd, _command in cl.processes_in_scopes([str(root)])
+        )
+        assert not any(
+            pid == str(elsewhere.pid)
+            for pid, _cwd, _command in cl.processes_in_scopes([str(root)])
+        ), "a process that only mentions the run path was treated as the run's"
+        assert cl.sweep_stale(prefix, _compose_file()) == []
+        assert not cl._process_alive(inside.pid), "the sweep missed a run process"
+        assert cl._process_alive(elsewhere.pid), (
+            "the sweep killed a process that only mentioned the run path"
+        )
+    finally:
+        for process in (inside, elsewhere):
+            if cl._process_alive(process.pid):
+                process.kill()
+                process.wait(timeout=30)
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_the_leak_check_sees_a_process_whose_directory_is_already_gone():
@@ -730,8 +893,6 @@ def test_the_leak_check_sees_a_process_whose_directory_is_already_gone():
     removed the directory. Without stripping that suffix the check reports clean
     while the process is still running.
     """
-    import shutil
-
     root = cl.make_root("/tmp")
     process = subprocess.Popen(["sleep", "600"], cwd=root, start_new_session=True)
     try:

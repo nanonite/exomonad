@@ -109,8 +109,13 @@ def run_id() -> str:
     It becomes the compose project name, the tmux session prefix, the Forgejo
     account and repository names, and the temporary directory, so two runs can
     never reach each other's state.
+
+    The length is bounded because the tmux session name is derived from it and
+    the server keeps only the first 36 characters of that name. A run id that
+    pushed the session name past the limit would make the server look for a
+    name that does not exist, and it would report every agent as dead.
     """
-    return f"e2e1111-{secrets.token_hex(4)}"
+    return f"e2e1111-{secrets.token_hex(3)}"
 
 
 class Walk:

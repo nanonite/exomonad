@@ -37,6 +37,25 @@ RUN_DIRECTORY_PREFIX = "exomonad-e2e-1111-"
 #: Where those run directories are created.
 TEMP_ROOT = "/tmp"
 
+#: The session-name limit the server imposes, mirrored here so a name this
+#: harness creates is never silently different from the one the server uses.
+#:
+#: The server sanitizes ``tmux_session`` exactly once, when it loads the config
+#: (``rust/exomonad/src/config.rs:525`` -> ``sanitize_session_name`` at
+#: ``config.rs:878``), replacing dots with underscores and keeping the first 36
+#: characters. Every consumer then reads that one sanitized value: ``exomonad
+#: init`` creates the session from it (``rust/exomonad/src/init.rs:5734``) and
+#: ``serve`` hands the same value to the agent control service
+#: (``rust/exomonad/src/serve.rs:1830``). Production therefore cannot diverge,
+#: because there is only ever one name.
+#:
+#: A harness that creates the tmux session itself, rather than through
+#: ``exomonad init``, holds a *different* name from the one the server will use
+#: as soon as the name is longer than 36 characters. The server then looks for
+#: its truncated name, finds no such session, and reports every agent as dead.
+#: This harness creates the session itself, so it has to respect the same limit.
+SESSION_NAME_MAX_LENGTH = 36
+
 #: Bounded wait for a terminated process to disappear before it is reported.
 STOP_TIMEOUT_SECONDS = 15.0
 
@@ -70,8 +89,21 @@ class RunScope:
 
     @property
     def session_prefix(self) -> str:
-        """Return the tmux session prefix this run owns exclusively."""
-        return f"{LEAK_PREFIX}{self.run_id}-"
+        """Return the tmux session prefix this run owns exclusively.
+
+        The result is the session name itself and is kept within the server's
+        session-name limit, because this harness creates the tmux session rather
+        than asking ``exomonad init`` to, and a name the server would silently
+        truncate is a name the server would look for and not find.
+        """
+        prefix = f"{LEAK_PREFIX}{self.run_id}"
+        if len(prefix) > SESSION_NAME_MAX_LENGTH:
+            raise CleanupError(
+                f"run id {self.run_id!r} makes the session name {prefix!r} "
+                f"longer than the server's {SESSION_NAME_MAX_LENGTH}-character "
+                f"session name limit; the server would look for a different name"
+            )
+        return prefix
 
     def track_session(self, session: str) -> str:
         """Record a tmux session this run created."""
@@ -79,6 +111,12 @@ class RunScope:
             raise CleanupError(
                 f"refusing to track session {session!r}: it does not begin with "
                 f"this run's prefix {self.session_prefix!r}"
+            )
+        if len(session) > SESSION_NAME_MAX_LENGTH:
+            raise CleanupError(
+                f"refusing to track session {session!r}: it is longer than the "
+                f"server's {SESSION_NAME_MAX_LENGTH}-character session name "
+                f"limit, so the server would look for a different name"
             )
         self.sessions.add(session)
         return session
@@ -300,17 +338,20 @@ def _live_processes() -> list[tuple[str, str, str]]:
 
 
 def processes_in_scopes(roots: Sequence[str]) -> list[tuple[str, str, str]]:
-    """Return every live process running in, or naming, one of ``roots``.
+    """Return every live process whose working directory is one of ``roots``.
 
-    Both signals matter. A server whose directory was already removed still
-    reports that directory through ``/proc``, but a process that was started
-    with a path argument rather than a working directory only names the run's
-    directory on its command line.
+    Only the working directory identifies a process as a run's own. A command
+    line must never be used for this: an editor, a ``grep``, a ``tail``, or any
+    process merely *carrying* a run's path as an argument would then match, and
+    a sweep that kills what it merely mentions can kill the operator. A process
+    that is running in a run directory is identified by that directory, whether
+    or not it is still on disk, because the kernel keeps reporting a removed
+    directory (with ``(deleted)`` appended, stripped in ``_live_processes``).
     """
     return [
         (pid, cwd, command)
         for pid, cwd, command in _live_processes()
-        if _is_within(cwd, roots) or any(root and root in command for root in roots)
+        if _is_within(cwd, roots)
     ]
 
 
@@ -371,24 +412,29 @@ def _compose_projects() -> list[str]:
     ]
 
 
-def stale_run_roots(run_prefix: str) -> list[str]:
+def stale_run_roots() -> list[str]:
     """Return every run directory this harness has ever named, live or not.
 
     A directory whose run was killed before its teardown is still on disk, and a
     process whose directory was already removed still reports that path, so a
-    sweep has to look for both: the directories that exist, and the paths that
-    live processes still claim.
+    sweep has to look for both: the directories that exist, and the working
+    directories live processes still claim.
+
+    Only a process's working directory contributes a root. A command line does
+    not, for the reason given on ``processes_in_scopes``.
     """
     roots = [
         str(path)
         for path in Path(TEMP_ROOT).glob(f"{RUN_DIRECTORY_PREFIX}*")
         if path.is_dir()
     ]
-    for _pid, cwd, command in _live_processes():
-        for candidate in (cwd, *command.split()):
-            if candidate.startswith(str(Path(TEMP_ROOT) / RUN_DIRECTORY_PREFIX)):
-                if candidate not in roots:
-                    roots.append(candidate)
+    base = f"{TEMP_ROOT}/{RUN_DIRECTORY_PREFIX}"
+    for _pid, cwd, _command in _live_processes():
+        if not cwd.startswith(base):
+            continue
+        head = "/".join(cwd.split("/")[:3])
+        if head not in roots:
+            roots.append(head)
     return roots
 
 
@@ -404,9 +450,16 @@ def sweep_stale(run_prefix: str, compose_file: Path) -> list[str]:
     It is deliberately prefix-driven rather than known-run-driven, because the
     thing being reclaimed is by definition a run this harness does not have a
     record of.
+
+    The order is load-bearing: **processes are killed before their directories
+    are removed**. A process whose working directory has been deleted keeps
+    running and is exactly as invisible as one whose directory never existed, so
+    removing a directory first converts a detectable leak into an untraceable
+    one. Directories go last, once everything that could have been running in
+    them is gone.
     """
     problems: list[str] = []
-    roots = stale_run_roots(run_prefix)
+    roots = stale_run_roots()
     for pid, cwd, command in processes_in_scopes(roots):
         problems.extend(_kill_process(int(pid), f"stale process in {cwd} ({command})"))
     for name in _sessions_with_prefix(run_prefix):
@@ -417,6 +470,10 @@ def sweep_stale(run_prefix: str, compose_file: Path) -> list[str]:
             problems.extend(_compose(project, compose_file, "down", "-v", "--remove-orphans"))
     for name in _volumes_with_prefix(run_prefix):
         problems.extend(_remove_volume(name.split(": ", 1)[-1]))
+    # A second pass, because a process can appear while the first pass is
+    # running and must not outlive the directory removal below.
+    for pid, cwd, command in processes_in_scopes(roots):
+        problems.extend(_kill_process(int(pid), f"late stale process in {cwd}"))
     for root in roots:
         if Path(root).is_dir():
             shutil.rmtree(root, ignore_errors=True)
