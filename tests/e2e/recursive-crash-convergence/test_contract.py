@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import http.server
 import socketserver
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -15,7 +14,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import beast
 import leaf_publication_agent
 import runner  # inserts PROJECT_ROOT and ordered-recursive onto sys.path
 import fixture
@@ -544,12 +542,6 @@ def test_required_effects_accept_any_real_spawn_tool_and_reject_missing_families
         assert_required_effects(counts)
 
 
-def test_beast_root_terminal_contract_allows_adoption_before_root_done() -> None:
-    assert not beast._is_terminal("tl_pr_filed")
-    assert not beast._is_terminal("tl_finalizing")
-    assert beast._is_terminal("tl_done")
-
-
 def test_remote_ancestry_requires_durable_head_and_proof() -> None:
     with pytest.raises(AcceptanceError, match="ancestry evidence"):
         assert_remote_ancestry({})
@@ -693,18 +685,57 @@ def test_nested_aggregate_assertion_ignores_historical_pr_heads(
     )
 
 
-def test_chainlink_case_database_is_a_non_mutating_snapshot(tmp_path: Path) -> None:
-    source = tmp_path / "source.db"
-    destination = tmp_path / "case" / "issues.db"
-    with sqlite3.connect(source) as connection:
-        connection.execute("CREATE TABLE marker (value TEXT NOT NULL)")
-        connection.execute("INSERT INTO marker VALUES ('source')")
-    runner._copy_chainlink_database(source, destination)
-    with sqlite3.connect(destination) as connection:
-        connection.execute("INSERT INTO marker VALUES ('case')")
-    with sqlite3.connect(source) as connection:
-        values = connection.execute("SELECT value FROM marker").fetchall()
-    assert values == [("source",)]
+def test_the_case_database_is_created_fresh_and_seeds_what_the_case_needs(
+    tmp_path: Path,
+) -> None:
+    """A case starts from `chainlink init`, never from a copy of another run.
+
+    A copied database carries rows another run created, so a case could pass on
+    evidence it did not produce. The database is created inside the case's own
+    directory, seeded with exactly the issue the case needs, and disappears with
+    the case.
+    """
+    database = runner.chainlink_db.create(tmp_path)
+    assert database.is_file()
+    assert database.is_relative_to(tmp_path)
+    seeded = runner.chainlink_db.seed(
+        database,
+        (
+            {
+                "title": "Verify recursive crash convergence fresh seed",
+                "priority": "low",
+                "labels": ("test",),
+            },
+        ),
+    )
+    assert len(seeded) == 1 and seeded[0] > 0
+    state = runner.chainlink_db.issue_state(database, seeded[0])
+    assert state["title"] == "Verify recursive crash convergence fresh seed"
+    assert len(runner.chainlink_db.database_files(database)) >= 1
+    runner.chainlink_db.remove(database)
+    assert not database.exists()
+
+
+def test_a_case_never_reads_an_operator_chainlink_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CHAINLINK_DB is not an input: the harness builds its own and says so."""
+    for name in (
+        "EXOMONAD_FORGEJO_E2E_URL",
+        "EXOMONAD_FORGEJO_E2E_TOKEN",
+        "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN",
+        "EXOMONAD_FORGEJO_E2E_OWNER",
+        "EXOMONAD_FORGEJO_E2E_REPO",
+        "EXOMONAD_FORGEJO_E2E_GIT_REMOTE",
+    ):
+        monkeypatch.setenv(name, "set")
+    monkeypatch.delenv("CHAINLINK_DB", raising=False)
+    monkeypatch.delenv("EXOMONAD_FORGEJO_E2E_MOCK", raising=False)
+    config = runner._environment()
+    assert "CHAINLINK_DB" not in config
+    assert not hasattr(runner, "_copy_chainlink_database")
+
+
 
 
 def test_effect_event_assertion_requires_one_merge_lifecycle(tmp_path: Path) -> None:

@@ -6,7 +6,6 @@ import json
 import multiprocessing
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,10 +18,13 @@ ORDERED_DIR = Path(__file__).resolve().parents[1] / "ordered-recursive"
 # that owns target/debug/exomonad and .exo/wasm/. parents[2] would resolve to
 # the tests/ directory and make start_server reject every acceptance run.
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+LIB_DIR = PROJECT_ROOT / "tests" / "e2e" / "lib"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(ORDERED_DIR))
+sys.path.insert(0, str(LIB_DIR))
 
-import real_server_transport as real
+import e2e_harness.chainlink_db as chainlink_db  # noqa: E402
+import real_server_transport as real  # noqa: E402
 from boundaries import CRASH_BOUNDARIES, CrashBoundary, validate_matrix
 from controller import controller, resume, wait_for_crash
 from evidence import (
@@ -46,7 +48,6 @@ def _environment() -> dict[str, str]:
         "EXOMONAD_FORGEJO_E2E_OWNER",
         "EXOMONAD_FORGEJO_E2E_REPO",
         "EXOMONAD_FORGEJO_E2E_GIT_REMOTE",
-        "CHAINLINK_DB",
     )
     missing = [name for name in required if not os.environ.get(name)]
     if missing:
@@ -56,9 +57,6 @@ def _environment() -> dict[str, str]:
         )
     if os.environ.get("EXOMONAD_FORGEJO_E2E_MOCK") == "1":
         raise AcceptanceError("#1057 cannot run with the Forgejo-shaped mock API")
-    database = Path(os.environ["CHAINLINK_DB"]).expanduser().resolve()
-    if not database.is_file():
-        raise AcceptanceError(f"CHAINLINK_DB is not a file: {database}")
     return {name: os.environ[name] for name in required}
 
 
@@ -102,18 +100,6 @@ def _chainlink_command_with_db(database: Path, *arguments: str) -> Any:
         raise AcceptanceError(
             f"Chainlink command returned non-JSON output: {result.stdout!r}"
         ) from error
-
-
-def _copy_chainlink_database(source: Path, destination: Path) -> None:
-    """Snapshot the operator DB without mutating its SQLite/WAL files."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    source_connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
-    destination_connection = sqlite3.connect(destination)
-    try:
-        source_connection.backup(destination_connection)
-    finally:
-        destination_connection.close()
-        source_connection.close()
 
 
 def _create_fixture_issue(database: Path, case_name: str) -> int:
@@ -460,12 +446,11 @@ def run_matrix() -> dict[str, Any]:
                 root = Path(raw)
                 repo, _, _ = real.clone_external_fixture(root)
                 case_name = _case_name(root, boundary)
-                chainlink_db = root / ".chainlink" / "issues.db"
-                _copy_chainlink_database(
-                    Path(config["CHAINLINK_DB"]).expanduser().resolve(),
-                    chainlink_db,
-                )
-                issue_id = _create_fixture_issue(chainlink_db, case_name)
+                # A fresh database inside this case's own directory: the
+                # operator's database is never read, so the case cannot depend
+                # on a row some other run left behind.
+                database = chainlink_db.create(root)
+                issue_id = _create_fixture_issue(database, case_name)
                 server = None
                 try:
                     server, _ = real.start_server(
@@ -479,7 +464,7 @@ def run_matrix() -> dict[str, Any]:
                         ],
                         identity_agents=_identity_agents(plan()),
                         leaf_branches=_leaf_branches(plan()),
-                        chainlink_db=chainlink_db,
+                        chainlink_db=database,
                     )
                     result = run_case(
                         root,
@@ -488,7 +473,7 @@ def run_matrix() -> dict[str, Any]:
                         config,
                         boundary,
                         issue_id,
-                        chainlink_db,
+                        database,
                     )
                     result["server_run"] = repetition
                     results.append(result)
@@ -511,7 +496,7 @@ def run_matrix() -> dict[str, Any]:
                             case_name,
                         )
                     finally:
-                        _cleanup_fixture_issue(chainlink_db, issue_id)
+                        _cleanup_fixture_issue(database, issue_id)
     assert_required_effects(operation_totals)
     return {
         "passed": True,

@@ -2,8 +2,8 @@
 
 This is the final real-server acceptance before #1058. It uses a disposable
 checkout, a dedicated Forgejo repository, the production Rust server, the
-generated WASM tools, the Unix-socket TransportClient, and process death at
-the external-effect boundary. The runner refuses the Forgejo-shaped mock.
+generated WASM tools, the Unix-socket TransportClient, and process death at the
+external-effect boundary. The runner refuses the Forgejo-shaped mock.
 
 Each logical operation is exercised immediately before and immediately after
 the operation. The restart invokes run_tl_loop with plan=None, so the
@@ -20,11 +20,7 @@ bookkeeping push, stage release, aggregate publication, and root finalization.
 Same-order sub-TLs run together, later orders remain barriers, and nested
 children publish only to their direct parent branches.
 
-command to the captured checkpoint three times. It requires monotonic versions
-and cursors, one merge intent, terminal journal entries, and no more than one
-The separately configured Beast runner applies the supplied continuation command
-to the captured checkpoint three times. It requires monotonic versions and
-cursors, one merge intent, terminal journal entries, and no more than one new
-merge reconciliation overall. If the captured checkpoint already contains the
-confirmed merge, the runner baselines it and requires adoption/bookkeeping
-without redispatching that merge.
+Each case owns its Chainlink database: `chainlink init` inside the case's own
+temporary directory, seeded with exactly the disposable issue the case needs.
+The operator's database is never read, so the evidence a case produces is its
+own.
