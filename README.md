@@ -174,8 +174,15 @@ is not a failure: the slice holds at `dispatch_unconfirmed` with its intent
 intact until evidence or owner reconciliation resolves it, and is never
 re-driven. Every other code, including an unrecorded one, is terminal: a
 `worktree.branch_ownership_conflict` parks immediately on the named
-`tl-dispatch-ownership-conflict` gate, and exhausting the attempt limit opens
-`tl-dispatch-failed`. A missing confirmation after the five-second dispatch
+`tl-dispatch-ownership-conflict-<slice>` gate, and exhausting the attempt limit
+opens `tl-dispatch-failed-<slice>`. Both gates are scoped to the slice whose
+dispatch stopped, so a second parked slice opens its own gate and its own
+`tl.gate_opened`, and answering one slice's gate leaves every other slice's
+question standing. A checkpoint written before per-slice naming has its pending
+run-global `tl-dispatch-failed` / `tl-dispatch-ownership-conflict` gate migrated
+onto the single slice parked on `dispatch_failed`; if exactly one such slice does
+not exist the controller fails closed and names them instead of guessing. A
+missing confirmation after the five-second dispatch
 window opens `tl-dispatch-timeout` with the intent and last boundary visible in
 `status`. Restart reconciliation uses the persisted intent — or, for a scheduled
 retry, the persisted retry boundary — and never issues a duplicate spawn for the

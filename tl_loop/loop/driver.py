@@ -243,6 +243,7 @@ from .dispatch_classification import (
     DEFAULT_RETRY_BASE_DELAY_SECONDS,
     DEFAULT_RETRY_LIMIT,
     DEFAULT_RETRY_MAX_DELAY_SECONDS,
+    OWNERSHIP_CONFLICT_CODE,
     DispatchFailureClass,
     classify_dispatch_failure,
     dispatch_retry_delay,
@@ -269,8 +270,23 @@ from .reconcile import (
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
-DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
-DISPATCH_OWNERSHIP_CONFLICT_GATE_NAME = "tl-dispatch-ownership-conflict"
+#: Dispatch gates are scoped to the slice whose dispatch exhausted or conflicted,
+#: exactly as ``tl-ordered-child-recovery-<child>`` is scoped to its child. A run's
+#: gate list is shared by every slice, so a run-global name lets a second
+#: exhaustion reuse the first's gate and emit no ``tl.gate_opened`` at all.
+DISPATCH_FAILURE_GATE_PREFIX = "tl-dispatch-failed-"
+DISPATCH_OWNERSHIP_CONFLICT_GATE_PREFIX = "tl-dispatch-ownership-conflict-"
+#: The pre-#1119 run-global names. Nothing creates them any more; they exist only
+#: so a checkpoint written before per-slice naming is migrated instead of
+#: silently losing the operator's pending decision.
+LEGACY_DISPATCH_FAILURE_GATE_NAME = "tl-dispatch-failed"
+LEGACY_DISPATCH_OWNERSHIP_CONFLICT_GATE_NAME = "tl-dispatch-ownership-conflict"
+#: Each pre-#1119 run-global name mapped to the prefix that now scopes the same
+#: decision per slice.
+LEGACY_DISPATCH_GATES = {
+    LEGACY_DISPATCH_OWNERSHIP_CONFLICT_GATE_NAME: DISPATCH_OWNERSHIP_CONFLICT_GATE_PREFIX,
+    LEGACY_DISPATCH_FAILURE_GATE_NAME: DISPATCH_FAILURE_GATE_PREFIX,
+}
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
@@ -935,6 +951,10 @@ def run_tl_loop(
     _validate_mode(selected, effects)
     store = RunStore(run_id, Path(root_dir))
     existing_state = store.load() if store.path.exists() else None
+    if existing_state is not None:
+        # Before anything reads the gates, so a parked run resumed from a
+        # pre-#1119 checkpoint resolves the same per-slice name this code opens.
+        existing_state = _migrate_legacy_dispatch_gates(store, existing_state)
     if existing_state is not None and _is_terminal_phase(_phase_from_state(existing_state)):
         if plan is not None:
             persisted_manifest = existing_state.plan_manifest
@@ -6046,7 +6066,7 @@ def _record_terminal_dispatch_failure(
         state.budgets,
         state.events.last_consumed_offset,
     )
-    gate_name = _dispatch_failure_gate_name(code)
+    gate_name = _dispatch_failure_gate_name(slice_id, code)
     previous_gate = next((gate for gate in state.gates if gate.name == gate_name), None)
     state = store.set_gate(gate_name)
     if previous_gate is None or previous_gate.status is not GateStatus.PENDING:
@@ -6077,16 +6097,83 @@ def _record_terminal_dispatch_failure(
     return state
 
 
-def _dispatch_failure_gate_name(code: str | None) -> str:
-    """Name the gate an operator must answer for one terminal dispatch code.
+def _dispatch_failure_gate_name(slice_id: str, code: str | None) -> str:
+    """Name the one gate an operator must answer for one slice's dispatch failure.
 
-    An ownership conflict gets its own gate because the operator action differs
-    from every other terminal dispatch failure: they must resolve who owns the
-    branch, not merely acknowledge that a spawn was refused.
+    The name is scoped to the slice, the way ``tl-ordered-child-recovery-<child>``
+    is scoped to its child, so two slices that both exhaust their retries are two
+    operator decisions instead of one shared gate whose second opening would emit
+    no ``tl.gate_opened``. The slice id is the whole scope: gates live in the
+    slice-owning run's checkpoint and slice ids are unique inside it.
+
+    The code picks the prefix, because the operator action differs: an ownership
+    conflict asks them to resolve who owns the branch, not merely to acknowledge
+    that a spawn was refused.
     """
-    if code == "worktree.branch_ownership_conflict":
-        return DISPATCH_OWNERSHIP_CONFLICT_GATE_NAME
-    return DISPATCH_FAILURE_GATE_NAME
+    prefix = (
+        DISPATCH_OWNERSHIP_CONFLICT_GATE_PREFIX
+        if code == OWNERSHIP_CONFLICT_CODE
+        else DISPATCH_FAILURE_GATE_PREFIX
+    )
+    return f"{prefix}{slice_id}"
+
+
+def _migrate_legacy_dispatch_gates(store: RunStore, state: RunState) -> RunState:
+    """Re-scope a pending pre-#1119 run-global dispatch gate onto its slice.
+
+    A run-global gate says *that* a dispatch needs a decision but not *which
+    slice's*, so it is migrated from durable state instead of renamed by
+    assumption: the slice parked on ``DISPATCH_FAILED`` names the exhaustion the
+    operator was asked about. Exactly one such slice is required. Zero or several
+    candidates is an ambiguous checkpoint, so the controller fails closed and
+    names them rather than attaching an operator's pending question to a slice
+    they were never asked about.
+
+    The migration preserves the gate's pending status and emits no
+    ``tl.gate_opened``: that exhaustion already emitted one, under the old name.
+
+    A legacy gate that is already answered is left exactly as it is. It is the
+    durable record of a decision an operator made, and every future exhaustion
+    opens its own per-slice gate, so there is nothing left to migrate.
+    """
+    for legacy_name, expected_prefix in LEGACY_DISPATCH_GATES.items():
+        gate = next((item for item in state.gates if item.name == legacy_name), None)
+        if gate is None or gate.status is not GateStatus.PENDING:
+            continue
+        parked = sorted(
+            slice_id
+            for slice_id, slice_state in state.slices.items()
+            if slice_state.status is SliceStatus.DISPATCH_FAILED
+            and slice_state.park_cause is ParkCause.DISPATCH_FAILED
+        )
+        if len(parked) != 1:
+            candidates = ", ".join(parked) if parked else "none"
+            raise TLLoopError(
+                f"pending gate {legacy_name!r} cannot be attributed to exactly one parked "
+                f"dispatch slice; candidates: {candidates}. Answer it with "
+                f"`python3 -m tl_loop gate --run-id {state.run_id} --name {legacy_name} "
+                f"--approve` to retire it; the next dispatch exhaustion then opens its own "
+                f"per-slice gate."
+            )
+        slice_id = parked[0]
+        code = state.slices[slice_id].dispatch_error_code
+        replacement = _dispatch_failure_gate_name(slice_id, code)
+        if not replacement.startswith(expected_prefix):
+            raise TLLoopError(
+                f"pending gate {legacy_name!r} contradicts the machine code {code!r} recorded "
+                f"for parked slice {slice_id!r}, which names {replacement!r}. Answer it with "
+                f"`python3 -m tl_loop gate --run-id {state.run_id} --name {legacy_name} "
+                f"--approve` to retire it."
+            )
+        if any(item.name == replacement for item in state.gates):
+            raise TLLoopError(
+                f"cannot migrate pending gate {legacy_name!r}: {replacement!r} is already "
+                f"pending for the parked slice {slice_id!r}. Answer the run-global duplicate "
+                f"with `python3 -m tl_loop gate --run-id {state.run_id} --name {legacy_name} "
+                f"--approve`; the slice's own gate stays pending."
+            )
+        state = store.rename_gate(legacy_name, replacement)
+    return state
 
 
 def _record_dispatch_retry_scheduled(

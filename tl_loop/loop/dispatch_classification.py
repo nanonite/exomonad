@@ -83,6 +83,11 @@ AMBIGUOUS_CODES: dict[str, str] = {
     "dispatch.transport_timeout": "the spawn boundary timed out; a side effect may already exist",
 }
 
+#: The one terminal code whose operator action differs from every other refusal:
+#: the branch is owned elsewhere, so the operator resolves ownership instead of
+#: acknowledging a refused spawn. It selects the gate prefix, not the class.
+OWNERSHIP_CONFLICT_CODE = "worktree.branch_ownership_conflict"
+
 #: Terminal codes named here to document intent. Every code absent from
 #: ``RETRYABLE_CODES`` and ``AMBIGUOUS_CODES`` is terminal too, so these
 #: entries are never consulted to widen either set.
@@ -90,7 +95,7 @@ TERMINAL_CODES: dict[str, str] = {
     # The branch is checked out in a worktree this owner does not own. No
     # retry can change that, and attaching a second agent to another owner's
     # checkout would be worse than parking.
-    "worktree.branch_ownership_conflict": "the birth branch belongs to another worktree owner",
+    OWNERSHIP_CONFLICT_CODE: "the birth branch belongs to another worktree owner",
     # The forge could not be read for this resume. The operator must fix the
     # forge configuration or the pull request, then re-drive deliberately.
     "worktree.pr_context_unavailable": "the forge could not supply the resume context",

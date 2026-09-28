@@ -718,6 +718,50 @@ class RunStore:
         apply(self.run_dir, mutate)
         return self.load()
 
+    def rename_gate(self, current: str, replacement: str) -> RunState:
+        """Rename one gate in place through the atomic writer.
+
+        The gate's answer travels with it, so a decision an operator already
+        recorded is never lost to a rename. A missing source or an occupied
+        destination is refused rather than merged: two gates are not one
+        decision, and silently collapsing them would lose a pending question.
+        The status change is a durable semantic transition, so the convergence
+        epoch advances exactly as answering a gate does.
+        """
+        for name in (current, replacement):
+            if not isinstance(name, str) or not name:
+                raise ValueError("gate name must be a non-empty string")
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            gates = document.get("gates")
+            if not isinstance(gates, list):
+                raise CorruptCheckpoint("run state gates are not an array")
+            source = next(
+                (gate for gate in gates if isinstance(gate, dict) and gate.get("name") == current),
+                None,
+            )
+            if source is None:
+                raise ValueError(f"gate {current!r} does not exist")
+            occupied = next(
+                (
+                    gate
+                    for gate in gates
+                    if isinstance(gate, dict) and gate.get("name") == replacement
+                ),
+                None,
+            )
+            if occupied is not None:
+                raise ValueError(f"gate {replacement!r} already exists")
+            source["name"] = replacement
+            state_version = document.get("state_version", 0)
+            document["state_version"] = (
+                state_version if type(state_version) is int else 0
+            ) + 1
+            return document
+
+        apply(self.run_dir, mutate)
+        return self.load()
+
     def answer_gate(self, name: str, status: GateStatus) -> RunState:
         """Answer an existing named gate without creating a new one."""
         if not isinstance(name, str) or not name:

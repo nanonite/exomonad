@@ -322,13 +322,35 @@ controller launch as `--dispatch-retry-limit`, `--dispatch-retry-base-delay`,
 and `--dispatch-retry-max-delay`. `wall_clock` injects the dispatch clock, and
 every backoff decision reads it rather than sleeping.
 
-Exactly one named human gate is opened for a terminal dispatch failure, and
-`tl.gate_opened` is emitted only when that gate is not already pending.
-`tl-dispatch-ownership-conflict` is opened immediately for a terminal
+Exactly one named human gate is opened per dispatch failure, and
+`tl.gate_opened` is emitted only when that gate is not already pending. Both
+gates are scoped to the slice that stopped, the way
+`tl-ordered-child-recovery-<child>` is scoped to its child:
+`tl-dispatch-ownership-conflict-<slice>` is opened immediately for a terminal
 ownership conflict, because the operator action differs: they must resolve who
-owns the branch, not merely acknowledge a refusal. `tl-dispatch-failed` is
-opened when the configured attempt limit is exhausted, keeping the machine code
-that proved the last attempt retryable.
+owns the branch, not merely acknowledge a refusal. `tl-dispatch-failed-<slice>`
+is opened when the configured attempt limit is exhausted, keeping the machine
+code that proved the last attempt retryable. The scope is required, not
+cosmetic: one run's `gates` list is shared by every slice, so a run-global name
+lets a second exhaustion reuse the first slice's gate and emit no
+`tl.gate_opened` at all. A slice id is the whole scope — gates live in the
+slice-owning run's checkpoint and slice ids are unique inside it — and the code
+picks the prefix, so an absent code still names the refusal gate rather than the
+conflict gate. Answering one slice's gate records that slice's decision and
+leaves every other gate pending; it never releases or re-dispatches anything by
+itself.
+
+A checkpoint written before per-slice naming holds one run-global
+`tl-dispatch-failed` or `tl-dispatch-ownership-conflict` gate. It is migrated,
+never renamed by assumption: the slice parked on `DISPATCH_FAILED` with
+`park_cause=dispatch_failed` names the exhaustion the gate was opened for, and
+the rename preserves the gate's pending status, advances `state_version` like a
+gate answer, and emits no second `tl.gate_opened`. Exactly one such slice is
+required — zero, several, or a recorded machine code that contradicts the
+legacy gate's prefix fails the controller closed with the exact answer command
+that retires the gate, and leaves the checkpoint untouched. A legacy gate that is
+already answered is left exactly as it is: it is the durable record of a
+decision, and every later exhaustion opens its own per-slice gate.
 
 `tl.dispatch_retry_scheduled` carries `machine_code`, `retry_attempt`, and
 `next_attempt_at` as their own dimensions beside the operator prose, so a

@@ -30,8 +30,8 @@ from tl_loop.loop.dispatch_classification import (
     dispatch_retry_delay,
 )
 from tl_loop.loop.driver import (
-    DISPATCH_FAILURE_GATE_NAME,
-    DISPATCH_OWNERSHIP_CONFLICT_GATE_NAME,
+    DISPATCH_FAILURE_GATE_PREFIX,
+    DISPATCH_OWNERSHIP_CONFLICT_GATE_PREFIX,
     TLLoopConfig,
     WorkPlan,
     run_tl_loop,
@@ -316,7 +316,9 @@ def test_an_unknown_code_is_terminal_and_never_retryable(
     assert slice_state.dispatch_error_code == persisted_code
     assert "tl.dispatch_retry_scheduled" not in transport.event_types()
     assert len(transport.spawn_calls) == 1
-    assert [gate.name for gate in result.final_state.gates] == [DISPATCH_FAILURE_GATE_NAME]
+    assert [gate.name for gate in result.final_state.gates] == [
+        f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-a"
+    ]
 
 
 def test_a_retryable_branch_race_recovers_without_parking(tmp_path: Path) -> None:
@@ -415,7 +417,7 @@ def test_a_terminal_ownership_conflict_parks_immediately_with_a_named_gate(
     assert slice_state.park_cause is ParkCause.DISPATCH_FAILED
     assert slice_state.dispatch_error_code == OWNERSHIP_CONFLICT
     assert [gate.name for gate in result.final_state.gates] == [
-        DISPATCH_OWNERSHIP_CONFLICT_GATE_NAME
+        f"{DISPATCH_OWNERSHIP_CONFLICT_GATE_PREFIX}leaf-a"
     ]
     assert "tl.dispatch_retry_scheduled" not in transport.event_types()
     assert transport.event_types().count("tl.gate_opened") == 1
@@ -441,7 +443,9 @@ def test_retry_exhaustion_opens_exactly_one_gate_after_the_configured_attempts(
     assert slice_state.status is SliceStatus.DISPATCH_FAILED
     assert slice_state.dispatch_retry_attempt == 2
     assert slice_state.dispatch_error_code == BRANCH_EXISTS
-    assert [gate.name for gate in result.final_state.gates] == [DISPATCH_FAILURE_GATE_NAME]
+    assert [gate.name for gate in result.final_state.gates] == [
+        f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-a"
+    ]
     assert transport.event_types().count("tl.gate_opened") == 1
     assert transport.event_types().count("tl.dispatch_retry_scheduled") == 2
     # One initial dispatch plus one re-drive per scheduled retry, and no more.
@@ -625,7 +629,9 @@ def test_a_configured_retry_limit_is_honored(tmp_path: Path) -> None:
     assert transport.event_types().count("tl.dispatch_retry_scheduled") == 1
     # One initial dispatch plus one re-drive, and no more.
     assert len(transport.spawn_calls) == 2
-    assert [gate.name for gate in result.final_state.gates] == [DISPATCH_FAILURE_GATE_NAME]
+    assert [gate.name for gate in result.final_state.gates] == [
+        f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-a"
+    ]
 
 
 def test_recording_one_rejected_attempt_twice_does_not_spend_the_budget_twice(

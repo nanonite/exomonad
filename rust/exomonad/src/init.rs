@@ -10478,14 +10478,14 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
               root.join("run.json"),
-              r#"{"fsm":{"phase":"tl_failed"},"gates":[{"name":"tl-dispatch-failed","status":"pending"}],"slices":{"leaf-a":{"dispatch_error":"worktree is dirty"}}}"#,
+              r#"{"fsm":{"phase":"tl_failed"},"gates":[{"name":"tl-dispatch-failed-leaf-a","status":"pending"}],"slices":{"leaf-a":{"dispatch_error":"worktree is dirty"}}}"#,
           )
           .unwrap();
 
         let checkpoint = read_startup_checkpoint(dir.path()).unwrap();
         let message = startup_checkpoint_message(&checkpoint).unwrap();
         assert!(message.contains("phase=tl_failed"));
-        assert!(message.contains("tl-dispatch-failed"));
+        assert!(message.contains("tl-dispatch-failed-leaf-a"));
         assert!(message.contains("python3 -m tl_loop gate --run-id root"));
         assert!(message.contains("worktree is dirty"));
         record_startup_checkpoint_classification(dir.path(), &checkpoint).unwrap();

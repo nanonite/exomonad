@@ -853,8 +853,17 @@ its intent intact and is resolved by matching evidence or verified owner
 reconciliation, never by a fresh spawn. Every other code, including one the
 runtime never recorded, is terminal:
 `worktree.branch_ownership_conflict` parks immediately on
-`tl-dispatch-ownership-conflict`, and exhausting `tl_dispatch_retry_limit`
-(default 3) opens `tl-dispatch-failed` keeping the machine code. The budget is
+`tl-dispatch-ownership-conflict-<slice>`, and exhausting `tl_dispatch_retry_limit`
+(default 3) opens `tl-dispatch-failed-<slice>` keeping the machine code. Both
+gates are scoped to the slice, the way `tl-ordered-child-recovery-<child>` is
+scoped to its child: one exhaustion is one pending gate and one
+`tl.gate_opened`, so a second parked slice cannot hide behind the first one's
+answered gate, and answering one slice's gate never resolves another's. A
+checkpoint written before per-slice naming has its pending run-global
+`tl-dispatch-failed` / `tl-dispatch-ownership-conflict` gate migrated onto the
+single slice parked on `dispatch_failed`, preserving its pending status; an
+ambiguous one fails closed and names the candidates rather than guessing. The
+budget is
 operator-configurable (see Configuration). Elapsed time and silence are never
 evidence of failure, and abandoned durable guidance is re-queued with its
 `batch_id` recorded rather than dropped. See

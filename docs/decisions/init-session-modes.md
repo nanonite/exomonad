@@ -133,6 +133,38 @@ command/route. Repeated continuations observe the parked slice and gate
 without re-raising or retrying the effect, and unrelated valid convergence
 still proceeds normally.
 
+## Per-slice dispatch exhaustion gates (#1119)
+
+A terminal dispatch failure opens exactly one named gate, and the name is scoped
+to the slice whose dispatch stopped: `tl-dispatch-failed-<slice>` when the
+configured retry limit is exhausted and
+`tl-dispatch-ownership-conflict-<slice>` for a terminal ownership conflict. The
+scope is the same one `tl-ordered-child-recovery-<child>` uses, and it is
+load-bearing: a run's `gates` list is shared by every slice, so a run-global name
+lets a second parked slice reuse the first one's gate and emit no
+`tl.gate_opened`, which is exactly how an operator misses a refusal. One
+exhaustion is one pending gate and one `tl.gate_opened`; answering one slice's
+gate records that decision and leaves every other gate pending, and it never
+releases or re-dispatches anything by itself. A later exhaustion of the same
+slice re-arms the same name as a fresh `pending` occurrence, so every refusal
+needs a new human decision.
+
+A checkpoint written before per-slice naming holds one run-global
+`tl-dispatch-failed` or `tl-dispatch-ownership-conflict` gate. The controller
+migrates it on startup, before it reads or reports any gate, instead of renaming
+it by assumption: the slice parked on `dispatch_failed` names the exhaustion the
+gate was opened for. The rename preserves the pending status, advances
+`state_version` exactly as a gate answer does, and emits no second
+`tl.gate_opened`, because that exhaustion already announced itself under the old
+name. Exactly one such slice is required. Zero candidates, several candidates, or
+a recorded machine code that contradicts the legacy gate's prefix fail the
+controller closed with the candidate slices and the exact answer command that
+retires the gate, and leave the checkpoint untouched, so the operator's pending
+question is never attached to a slice they were not asked about. A legacy gate
+that is already answered is left exactly as it is: it is the durable record of a
+decision an operator made, and every later exhaustion opens its own per-slice
+gate.
+
 ## Recreate publication authorization
 
 `--recreate` may remove an ordered-controller branch only when every
