@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix deterministic leaf recovery after recreated branch preservation (#1105)
+- Preserve controller epoch and dispatch generation through the policy spawn path (#1120)
+- Scope the dispatch-exhaustion gate per slice (#1119)
+- Prove recreated leaf recovery end to end (#1111)
+- Recover retryable leaf dispatch failures without immediate parking (#1110)
+- Restore resume lineage and PR context for preserved leaf branches (#1109)
+- Reattach preserved deterministic leaf branches atomically (#1108)
+- Prevent event sinks from materializing nonexistent leaf worktrees (#1107)
 - Prevent historical publication events from binding recreated runs and recover failed checkpoints (#1115)
 - Fix Chainlink escalation result parsing and exactly-once issue creation (#1113)
 - Validate existing leaf worktrees before reuse (#1106)
@@ -471,6 +479,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Replace Beast-derived identifiers in offline tests and docs with neutral synthetic ones (#1118)
 - Decide: full Codex sandbox bypass vs. containerized per-role isolation (uid_map/userns restricted on this host) (#1087)
 - Investigate bwrap-userns AppArmor profile as alternative to editing unprivileged_userns (#1088)
 - Extract a shared verified cleanup planner and executor (#1069)
