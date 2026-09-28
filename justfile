@@ -148,6 +148,27 @@ check-e2e-recursive-crash-convergence:
     bash -n tests/e2e/recursive-crash-convergence/run.sh
     {{py}} -m py_compile tests/e2e/recursive-crash-convergence/*.py
     {{py}} -m pytest -q tests/e2e/recursive-crash-convergence/test_contract.py
+
+# Run the recreated-leaf recovery acceptance (chainlink #1111). T1 through T9
+# each print one PASS/FAIL line with the durable evidence they used. The run owns
+# a disposable Forgejo on its own compose project with an ephemeral port, its own
+# Chainlink database, its own tmux session, and its own server process, and its
+# teardown fails the run if any of them outlive it. Pass `keep=true` to leave a
+# failed run's state for inspection.
+e2e-recreated-leaf-recovery keep="false":
+    nix develop --command cargo build -p exomonad
+    just wasm devswarm
+    ./tests/e2e/recreated-leaf-recovery/run.sh {{ if keep == "true" { "--keep" } else { "" } }}
+
+# Check the recreated-leaf acceptance harness without launching a server, a
+# forge, or a project. Covers the durable readers, the T-item wiring, the codes
+# the acceptance expects, the compose template's disposable properties, and the
+# cleanup contract, which is exercised against a real compose project, a real
+# tmux session, and a real process.
+check-e2e-recreated-leaf-recovery:
+    bash -n tests/e2e/recreated-leaf-recovery/run.sh
+    {{py}} -m py_compile tests/e2e/recreated-leaf-recovery/*.py
+    {{py}} -m pytest -q tests/e2e/recreated-leaf-recovery/test_contract.py
     test -s tests/e2e/recursive-crash-convergence/e2e-test.md
     test -s tests/e2e/recursive-crash-convergence/testrunner.md
 

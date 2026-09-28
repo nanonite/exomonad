@@ -1,0 +1,57 @@
+# Disposable Forgejo template for real-server E2E acceptance.
+#
+# This file is a TEMPLATE, not a running instance. Each harness brings up its
+# own copy under its own unique compose project name and tears it down with
+# `docker compose -p <project> down -v --remove-orphans`, so two harnesses can
+# run at once and neither can reach the other's database.
+#
+# Two properties are load-bearing and must not be changed:
+#
+#   * No `container_name`. The container is named by its compose project, which
+#     is what makes a run's teardown able to find and remove it. A fixed name
+#     would make concurrent runs collide and would let a stale container
+#     outlive the project that created it.
+#   * No fixed host port. `127.0.0.1::3000` asks Docker for an ephemeral port,
+#     which the harness reads back with `docker compose -p <project> port`.
+#     A fixed port would make concurrent runs collide and would let a previous
+#     run's database answer a later run's API calls.
+#
+# The instance is locked and has registration disabled, so the only way in is
+# through the container CLI the harness drives, and nothing a previous run left
+# behind can be reached by accident.
+#
+# The instance is reached on a port the harness learns after `up`, while
+# ROOT_URL stays on the container's own listener. ROOT_URL only shapes links
+# the harness never follows; every API and git request names the discovered
+# host explicitly.
+
+services:
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:15
+    restart: "no"
+    ports:
+      - "127.0.0.1::3000"
+    volumes:
+      - forgejo-data:/data
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - FORGEJO__DEFAULT__APP_NAME=Forgejo E2E (disposable)
+      - FORGEJO__database__DB_TYPE=sqlite3
+      - FORGEJO__security__INSTALL_LOCK=true
+      - FORGEJO__server__DOMAIN=localhost
+      - FORGEJO__server__HTTP_PORT=3000
+      - FORGEJO__server__ROOT_URL=http://localhost:3000/
+      - FORGEJO__server__LOCAL_ROOT_URL=http://localhost:3000/
+      - FORGEJO__service__DISABLE_REGISTRATION=true
+      - FORGEJO__actions__ENABLED=false
+      - FORGEJO__log__LEVEL=Info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+volumes:
+  forgejo-data:

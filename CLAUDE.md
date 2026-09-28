@@ -698,7 +698,14 @@ just e2e-oc-rewrite        # BeforeModel/AfterModel PII rewriting
 just e2e-tl-loop-shadow    # Live TL trajectory beside the read-only shadow loop
 just e2e-tl-loop-active    # Programmatic TL loop over a scratch repository
 just e2e-slice-abandon-redispatch # Real-server closed-PR recovery acceptance
+just e2e-recreated-leaf-recovery # Recreated-leaf recovery acceptance (T1-T9)
 ```
+
+`just e2e-recreated-leaf-recovery` is non-interactive like
+`just e2e-tl-loop-active`: it builds the binary and WASM from this worktree,
+brings up its own disposable Forgejo, and prints one PASS/FAIL line per T-item.
+It owns everything it creates and fails if anything outlives the run — see
+§ Real-server integration tests below.
 
 `just e2e-tl-loop-active` is intentionally non-interactive: it uses a bounded
 Python controller, a bare scratch remote, deterministic effect/review stubs,
@@ -743,6 +750,75 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 2. Create `testrunner.md` with the test plan (phases, assertions, report format)
 3. Create `e2e-test.md` with scenario-specific controller or harness rules
 4. Add `just e2e-{name}` recipe to `justfile`
+
+### Real-server integration tests: per-test Forgejo and run-scoped cleanup
+
+A test that runs the shipped server needs a real forge and leaves processes
+behind. Both are run-scoped, and both are owned by the test, never shared. This
+is the standard for real-server integration tests;
+`tests/e2e/recreated-leaf-recovery/` is the reference implementation.
+
+**A test owns its Forgejo.** The shared template is
+`tests/e2e/lib/forgejo/docker-compose.yml` — a template, not a running instance.
+Two properties of that file are load-bearing and must not change:
+
+- **No `container_name`.** The container is named by its compose project, which
+  is what makes a run's teardown able to find and remove it. A fixed name makes
+  concurrent runs collide and lets a stale container outlive its project.
+- **No fixed host port.** `127.0.0.1::3000` asks Docker for an ephemeral port,
+  which the harness reads back with `docker compose -p <project> port`. A fixed
+  port makes concurrent runs collide and lets a previous run's database answer
+  a later run's API calls.
+
+Each run then does all of this, with a project name derived from a per-run id:
+
+```bash
+docker compose -p "$PROJECT" -f tests/e2e/lib/forgejo/docker-compose.yml up -d --wait
+HOST=$(docker compose -p "$PROJECT" -f ... port forgejo 3000)   # discovered
+docker compose -p "$PROJECT" -f ... exec -u git forgejo forgejo admin user create --admin ...
+# ...provision the run's own author, reviewer, tokens, repository, collaborators
+docker compose -p "$PROJECT" -f ... down -v --remove-orphans
+```
+
+The instance is installed-locked with registration disabled, so the only way in
+is the container CLI, and the run's accounts and repository are created from
+code. Nothing is copied from a live forge and no account pre-exists.
+
+**A test owns everything it creates.** A run scope registers each resource
+*before* it is started, and one trap on `EXIT`/`INT`/`TERM` tears the run down
+whatever happens — including a failed assertion. Teardown is idempotent, because
+it runs on every exit path. It removes:
+
+| Resource | How it is found again after teardown |
+|----------|------------------------------------------|
+| tmux sessions | named from the run id, so a session is attributable to one run |
+| processes | tracked by pid, signalled by process group, checked for zombie state |
+| compose projects | by name, including the project-scoped volume |
+| the run's directory | `mktemp -d`, never a fixed path, so two runs cannot collide |
+
+Two rules follow from the leaks this replaced:
+
+- **A child process must start in its own process group.** A child that inherits
+  the harness's group makes a group signal a self-inflicted kill, so teardown
+  takes itself down with the thing it was cleaning up. `start_new_session=True`
+  on every `Popen`, and a kill path that falls back to the single pid when the
+  target shares the caller's group.
+- **Cleanup is verified, not assumed.** After teardown the scope reports what it
+  can still see — a session with the run's prefix, any process whose working
+  directory is under the run's directory, any compose project or volume with the
+  run's name — and the run **fails** if any of it remains. A leaked process is
+  detected through `/proc`, not through a name prefix, so a process that
+  outlives its run cannot hide by being renamed.
+  `just check-e2e-recreated-leaf-recovery` exercises this contract against a real
+  compose project, a real tmux session, and a real process.
+
+**Waits are on durable boundaries.** An integration test polls a ledger event, a
+`run.json`, git's worktree registry, or the forge's own record, with a bounded
+deadline and a diagnostic naming the last state it saw. A duration being long
+enough is never the thing being asserted. Where an actor has to stay alive for
+the system to observe it — an agent holding its tmux window — it blocks on
+standard input rather than sleeping, so it ends when teardown kills the session
+and never depends on a duration.
 
 ### Task Tracking
 

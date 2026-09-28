@@ -1,0 +1,672 @@
+"""Contract checks for the #1111 recreated-leaf acceptance.
+
+These run without a server, a Forgejo, or a project, so they are the fast gate
+that catches a broken harness before a real run is attempted. They cover three
+things:
+
+* the durable readers, driven against recorded artifacts, so a change in what
+  the server writes is caught here rather than by a slow acceptance run
+* the wiring: the T-items, the codes the acceptance expects, and the properties
+  the compose template must keep
+* the cleanup contract, by really starting a compose project, a tmux session,
+  and a process through the run scope, then tearing it down and proving
+  nothing it created is still there
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+HARNESS = Path(__file__).resolve().parent
+PROJECT_ROOT = HARNESS.parents[2]
+sys.path.insert(0, str(HARNESS))
+
+import cleanup as cl  # noqa: E402
+import evidence as ev  # noqa: E402
+import scenarios as sc  # noqa: E402
+import waiter  # noqa: E402
+
+#: One recorded ledger segment, written exactly as the server writes it: a
+#: JSON object per line, carrying the envelope fields the readers must not care
+#: about alongside the payload the acceptance asserts on.
+RECORDED_EVENTS: list[dict[str, object]] = [
+    {
+        "schema_version": 1,
+        "id": "a",
+        "run_seq": 4,
+        "type": "agent.attach_decided",
+        "agent_id": "leaf-codex",
+        "data": {
+            "branch": "main.leaf-codex",
+            "worktree_path": "/p/.exo/worktrees/leaf-codex",
+            "action": "create_from_base",
+            "branch_exists": False,
+            "start_point": None,
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "b",
+        "run_seq": 5,
+        "type": "agent.attach_completed",
+        "agent_id": "leaf-codex",
+        "data": {
+            "branch": "main.leaf-codex",
+            "worktree_path": "/p/.exo/worktrees/leaf-codex",
+            "action": "create_from_base",
+            "created": True,
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "c",
+        "run_seq": 7,
+        "type": "agent.spawned",
+        "agent_id": "parent",
+        "data": {
+            "child_agent": "leaf-codex",
+            "agent_type": "Codex",
+            "spawn_type": "leaf_subtree",
+            "branch": "main.leaf-codex",
+            "intent_id": "intent-1",
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "d",
+        "run_seq": 9,
+        "type": "agent.spawned",
+        "agent_id": "leaf-codex",
+        "data": {"agent_type": "auto", "intent_id": "intent-1", "slug": "leaf"},
+    },
+    {
+        "schema_version": 1,
+        "id": "e",
+        "run_seq": 11,
+        "type": "agent.attach_decided",
+        "agent_id": "leaf-codex",
+        "data": {
+            "branch": "main.leaf-codex",
+            "worktree_path": "/p/.exo/worktrees/leaf-codex",
+            "action": "attach",
+            "branch_exists": True,
+            "start_point": None,
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "f",
+        "run_seq": 13,
+        "type": "agent.attach_completed",
+        "agent_id": "leaf-codex",
+        "data": {
+            "branch": "main.leaf-codex",
+            "worktree_path": "/p/.exo/worktrees/leaf-codex",
+            "action": "attach",
+            "created": True,
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "g",
+        "run_seq": 17,
+        "type": "agent.branch_ownership_conflict",
+        "agent_id": "leaf-codex",
+        "data": {
+            "branch": "main.held-codex",
+            "worktree_path": "/p/.exo/worktrees/held-codex",
+            "machine_code": "worktree.branch_ownership_conflict",
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "h",
+        "run_seq": 19,
+        "type": "agent.spawn_failed",
+        "agent_id": "parent",
+        "data": {
+            "child_agent": "held",
+            "error": (
+                "[worktree.branch_ownership_conflict] branch main.held-codex is "
+                "checked out at /holder, not at the deterministic leaf path "
+                "/p/.exo/worktrees/held-codex. Stop the agent holding "
+                "main.held-codex or remove that worktree, then retry the spawn."
+            ),
+            "code": "worktree.branch_ownership_conflict",
+            "source": "rust",
+            "intent_id": "intent-2",
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "i",
+        "run_seq": 21,
+        "type": "agent.spawn_failed",
+        "agent_id": "parent",
+        "data": {
+            "child_agent": "residue",
+            "error": "[worktree.path_unregistered] worktree path is not registered with git: /p/.exo/worktrees/residue-codex",
+            "code": "worktree.path_unregistered",
+            "source": "rust",
+            "intent_id": "intent-3",
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "j",
+        "run_seq": 23,
+        "type": "agent.spawn_failed",
+        "agent_id": "parent",
+        "data": {
+            "child_agent": "retryable",
+            "error": "[worktree.lifecycle_lock_timeout] worktree lifecycle lock is held by another decision; refusing to create or reuse a leaf worktree",
+            "code": "worktree.lifecycle_lock_timeout",
+            "source": "rust",
+            "intent_id": "intent-4",
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "k",
+        "run_seq": 25,
+        "type": "pr.filed",
+        "agent_id": "leaf-codex",
+        "data": {
+            "pr_number": 7,
+            "head_branch": "main.leaf-codex",
+            "base_branch": "main",
+            "head_sha": "a" * 40,
+            "created": True,
+        },
+    },
+    {
+        "schema_version": 1,
+        "id": "l",
+        "run_seq": 27,
+        "type": "agent.resumed",
+        "agent_id": "parent",
+        "data": {"pr_number": 7, "child_agent": "leaf-codex"},
+    },
+]
+
+
+# --------------------------------------------------------------------------
+# The durable readers
+# --------------------------------------------------------------------------
+
+
+def test_only_the_authoritative_spawn_counts():
+    """The WASM log path writes a second ``agent.spawned`` with no branch."""
+    assert len(ev.authoritative_spawns(RECORDED_EVENTS)) == 1
+
+
+def test_authoritative_spawns_can_be_correlated_by_intent():
+    assert (
+        len(ev.authoritative_spawns(RECORDED_EVENTS, intent_id="intent-1")) == 1
+    )
+    assert ev.authoritative_spawns(RECORDED_EVENTS, intent_id="other") == []
+
+
+def test_attach_decisions_are_readable_by_action_and_branch():
+    assert len(ev.attach_decisions(RECORDED_EVENTS)) == 2
+    attached = ev.attach_decisions(
+        RECORDED_EVENTS, branch="main.leaf-codex", action=ev.ATTACH
+    )
+    assert len(attached) == 1
+    assert attached[0]["data"]["branch_exists"] is True
+
+
+def test_attach_completions_report_whether_the_worktree_was_created():
+    completions = ev.attach_completions(RECORDED_EVENTS, branch="main.leaf-codex")
+    assert [event["data"]["created"] for event in completions] == [True, True]
+
+
+def test_a_refusal_exposes_its_code_and_its_prose_without_the_code_prefix():
+    refusal = ev.refusals(RECORDED_EVENTS, intent_id="intent-2")[0]
+    assert refusal.code == "worktree.branch_ownership_conflict"
+    assert refusal.message.startswith("branch main.held-codex is checked out at")
+    assert "[" not in refusal.message
+    assert refusal.error.startswith("[worktree.branch_ownership_conflict]")
+    assert refusal.child_agent == "held"
+
+
+def test_every_refusal_code_the_acceptance_reads_is_a_real_code():
+    codes = set(ev.refusal_codes(RECORDED_EVENTS))
+    assert codes == {
+        "worktree.branch_ownership_conflict",
+        "worktree.path_unregistered",
+        "worktree.lifecycle_lock_timeout",
+    }
+
+
+def test_ownership_conflicts_are_readable_per_branch():
+    assert len(ev.ownership_conflicts(RECORDED_EVENTS)) == 1
+    assert (
+        len(
+            ev.ownership_conflicts(
+                RECORDED_EVENTS, branch="main.held-codex"
+            )
+        )
+        == 1
+    )
+    assert ev.ownership_conflicts(RECORDED_EVENTS, branch="main.other") == []
+
+
+def test_publications_are_found_under_either_branch_field():
+    assert len(ev.publications(RECORDED_EVENTS)) == 1
+    assert len(ev.publications(RECORDED_EVENTS, branch="main.leaf-codex")) == 1
+    assert ev.publications(RECORDED_EVENTS, branch="main.other") == []
+
+
+def test_typed_ignores_records_without_an_object_payload():
+    assert ev.typed([{"type": "agent.spawned", "data": "text"}], "agent.spawned") == []
+
+
+def test_ledger_events_reads_every_segment_in_order(tmp_path: Path):
+    segments = tmp_path / ".exo" / "ledger" / "segments"
+    segments.mkdir(parents=True)
+    (segments / "segment-000000000000.jsonl").write_text(
+        json.dumps(RECORDED_EVENTS[0]) + "\n",
+        encoding="utf-8",
+    )
+    (segments / "segment-000000000001.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in RECORDED_EVENTS[1:3]) + "\n",
+        encoding="utf-8",
+    )
+    assert [event["id"] for event in ev.ledger_events(tmp_path)] == ["a", "b", "c"]
+
+
+def test_ledger_events_report_a_project_with_no_ledger(tmp_path: Path):
+    with pytest.raises(ev.EvidenceError):
+        ev.ledger_events(tmp_path)
+
+
+def test_published_heads_accept_both_document_shapes(tmp_path: Path):
+    agent_dir = tmp_path / ".exo" / "agents" / "leaf-codex"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "published-heads.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "heads": [{"pr_number": 7, "head_branch": "main.leaf-codex"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert ev.published_heads(tmp_path, "leaf-codex") == [
+        {"pr_number": 7, "head_branch": "main.leaf-codex"}
+    ]
+    assert ev.published_heads(tmp_path, "absent") == []
+
+
+def test_pull_number_is_found_through_the_tool_envelope():
+    payload = {"success": True, "result": {"content": [{"text": '{"pr_number": 7}'}]}}
+    assert ev.find_pull_number(payload) == 7
+    assert ev.find_pull_number({"success": True}) is None
+
+
+def test_success_is_read_through_the_tool_envelope():
+    assert ev.is_success({"success": True}) is True
+    assert ev.is_success({"content": '{"success": true}'}) is True
+    assert ev.is_success({"success": False}) is False
+
+
+# --------------------------------------------------------------------------
+# The waits
+# --------------------------------------------------------------------------
+
+
+def test_a_wait_returns_the_first_non_empty_probe():
+    values = iter([None, None, "reached"])
+    assert (
+        waiter.await_boundary(
+            lambda: next(values, None),
+            description="the boundary",
+            timeout=5.0,
+            poll_interval=0.01,
+        )
+        == "reached"
+    )
+
+
+def test_a_wait_reports_what_it_last_saw():
+    with pytest.raises(waiter.Timeout) as failure:
+        waiter.await_boundary(
+            lambda: None,
+            description="the boundary",
+            timeout=0.2,
+            poll_interval=0.01,
+        )
+    assert "the boundary" in str(failure.value)
+    assert "last observed state" in str(failure.value)
+
+
+def test_a_wait_needs_no_elapsed_time_to_succeed():
+    started = time.monotonic()
+    assert (
+        waiter.await_boundary(
+            lambda: "already there",
+            description="the boundary",
+            timeout=30.0,
+            poll_interval=0.01,
+        )
+        == "already there"
+    )
+    assert time.monotonic() - started < 5.0
+
+
+def test_a_stability_wait_needs_the_value_to_hold():
+    assert (
+        waiter.await_stable(
+            lambda: 3,
+            description="the count",
+            stable_for=0.1,
+            timeout=10.0,
+            poll_interval=0.01,
+        )
+        == 3
+    )
+
+
+# --------------------------------------------------------------------------
+# The wiring
+# --------------------------------------------------------------------------
+
+
+def test_the_walk_declares_every_t_item_the_issue_names_in_order():
+    """T1 through T9 must each be a step the walk actually runs."""
+    import driver
+
+    walk = driver.Walk.__new__(driver.Walk)
+    walk.scope = None
+    walk.instance = None
+    walk.results = {}
+    walk.evidence = {}
+    walk.publication = {}
+    walk.starts = 0
+    steps = driver.Walk.steps(walk)
+    assert driver.ITEMS == ("T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9")
+    assert [name for name, _step in steps] == list(driver.ITEMS)
+    assert all(callable(step) for _name, step in steps)
+
+
+def test_the_acceptance_only_expects_codes_the_product_can_emit():
+    declared = {
+        sc.OWNERSHIP_CONFLICT,
+        sc.PATH_UNREGISTERED,
+        sc.LIFECYCLE_LOCK_TIMEOUT,
+        sc.BRANCH_EXISTS,
+    }
+    for code in declared:
+        assert code.startswith("worktree."), code
+
+
+def test_the_retryable_codes_the_acceptance_proves_are_retryable_to_the_controller():
+    """The acceptance's retryable code must be one the controller will retry.
+
+    If the product ever stops classifying it as retryable, the acceptance's
+    T9 would be proving a property the controller no longer relies on.
+    """
+    sys.path.insert(0, str(PROJECT_ROOT / "tl_loop"))
+    from loop.dispatch_classification import DispatchFailureClass, classify_dispatch_failure
+
+    assert (
+        classify_dispatch_failure(sc.LIFECYCLE_LOCK_TIMEOUT)
+        is DispatchFailureClass.RETRYABLE
+    )
+    assert (
+        classify_dispatch_failure(sc.OWNERSHIP_CONFLICT)
+        is DispatchFailureClass.TERMINAL
+    )
+    assert (
+        classify_dispatch_failure(sc.PATH_UNREGISTERED)
+        is DispatchFailureClass.TERMINAL
+    )
+
+
+def test_the_run_script_refuses_to_run_without_this_worktrees_build():
+    script = (HARNESS / "run.sh").read_text(encoding="utf-8")
+    assert "target/debug/exomonad" in script
+    assert ".exo/wasm/wasm-guest-devswarm.wasm" in script
+    assert "driver.py" in script
+    assert "install-all" not in script
+
+
+def test_the_compose_template_keeps_the_properties_a_disposable_instance_needs():
+    raw = (PROJECT_ROOT / "tests/e2e/lib/forgejo/docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    # The properties are about the compose specification, so the file's own
+    # prose about them is not the specification.
+    specification = "\n".join(
+        line for line in raw.splitlines() if not line.lstrip().startswith("#")
+    )
+    # A fixed container name or host port would make two runs collide and would
+    # let a previous run's container or database answer a later run.
+    assert "container_name" not in specification
+    assert '"127.0.0.1::3000"' in specification
+    assert not any(
+        line.strip().startswith("- ") and ":" in line and "::" not in line
+        for line in specification.splitlines()
+        if "127.0.0.1" in line
+    ), "a fixed host port would make two runs collide"
+    # The instance must be locked, unregistered, and without Actions.
+    assert "FORGEJO__security__INSTALL_LOCK=true" in specification
+    assert "FORGEJO__service__DISABLE_REGISTRATION=true" in specification
+    assert "FORGEJO__actions__ENABLED=false" in specification
+    # The volume must be named, so compose scopes it to the project.
+    assert "forgejo-data:/data" in specification
+    assert "volumes:" in specification
+
+
+def test_the_run_owns_a_directory_named_by_mktemp_and_never_a_fixed_path():
+    source = (HARNESS / "cleanup.py").read_text(encoding="utf-8")
+    assert '"mktemp", "-d"' in source
+
+
+# --------------------------------------------------------------------------
+# The cleanup contract
+# --------------------------------------------------------------------------
+
+
+def _docker_available() -> bool:
+    return (
+        subprocess.run(
+            ["docker", "info"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _tmux_available() -> bool:
+    return (
+        subprocess.run(
+            ["tmux", "-V"], check=False, capture_output=True
+        ).returncode
+        == 0
+    )
+
+
+@pytest.fixture
+def scope() -> Any:
+    """A uniquely named run scope that is torn down however the test ends.
+
+    A test that starts a real session, process, or compose project must not be
+    able to leave it running when an assertion fails: that is the leak class
+    this section exists to catch, so the contract tests hold themselves to it.
+    Each test gets its own run id, so two of them can never collide on a name.
+    """
+    import secrets
+
+    created = cl.RunScope(
+        run_id=f"contract-{secrets.token_hex(4)}", root=cl.make_root("/tmp")
+    )
+    try:
+        yield created
+    finally:
+        problems = created.teardown()
+        assert problems == [], f"the contract test leaked: {problems}"
+
+
+def _start_probe_session(scope: cl.RunScope, label: str) -> str:
+    """Create a real tmux session owned by this scope."""
+    session = scope.track_session(f"{scope.session_prefix}{label}")
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, "-n", "probe", "sleep", "600"],
+        check=True,
+    )
+    return session
+
+
+@pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
+def test_teardown_removes_the_session_and_the_process_it_started(scope):
+    """A real session and a real process, torn down, leave nothing behind.
+
+    This is the leak class that previously went unnoticed: a harness that
+    starts a session and a server and then fails an item leaves both running.
+    """
+    session = _start_probe_session(scope, "session")
+    process = scope.track_process(
+        subprocess.Popen(["sleep", "600"], cwd=scope.root, start_new_session=True),
+        "probe process",
+    )
+    assert cl._session_exists(session)
+    assert cl._process_alive(process.pid)
+
+    problems = scope.teardown()
+
+    assert problems == []
+    assert scope.leaks() == []
+    assert not cl._session_exists(session)
+    assert not cl._process_alive(process.pid)
+    assert not scope.root.exists()
+
+
+@pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
+def test_teardown_is_idempotent(scope):
+    """Tearing down twice is not an error, because cleanup runs on every path."""
+    _start_probe_session(scope, "idempotent")
+    assert scope.teardown() == []
+    assert scope.teardown() == []
+    assert scope.leaks() == []
+
+
+@pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
+def test_a_leaked_session_is_reported_rather_than_ignored(scope):
+    """The scope fails the run when a session it owns is still there."""
+    session = f"{scope.session_prefix}orphan"
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, "-n", "probe", "sleep", "600"],
+        check=True,
+    )
+    scope.sessions.add(session)
+    found = cl._sessions_with_prefix(scope.session_prefix)
+    assert found == [f"tmux session survived cleanup: {session}"]
+    assert scope.leaks() != []
+    with pytest.raises(cl.CleanupError) as failure:
+        scope.require_clean()
+    assert session in str(failure.value)
+
+
+@pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
+def test_a_leaked_process_under_the_run_directory_is_reported(scope):
+    """A process still running in the run's directory is found by its cwd."""
+    process = subprocess.Popen(
+        ["sleep", "600"], cwd=scope.root, start_new_session=True
+    )
+    try:
+        found = cl._processes_under(scope.root)
+        assert any(str(process.pid) in item for item in found), found
+    finally:
+        process.terminate()
+        process.wait(timeout=30)
+
+
+def test_the_scope_refuses_to_own_a_resource_it_did_not_name(scope):
+    """A scope must not be able to tear down something outside its own prefix."""
+    with pytest.raises(cl.CleanupError):
+        scope.track_session("exo-workers")
+    with pytest.raises(cl.CleanupError):
+        scope.track_compose("some-other-project", Path("docker-compose.yml"))
+
+
+@pytest.mark.skipif(
+    not (_docker_available() and _tmux_available()),
+    reason="docker and tmux are required",
+)
+def test_teardown_removes_a_compose_project_and_its_volume(scope):
+    """A real compose project, torn down, leaves no project and no volume."""
+    import forgejo as fj
+
+    compose_file = fj.template_path(PROJECT_ROOT)
+    project = scope.track_compose(f"{scope.session_prefix}compose", compose_file)
+    fj.up(project, compose_file)
+    host = fj.published_host(project, compose_file)
+    assert host.count(":") == 1
+    volume = f"{project}_forgejo-data"
+    assert volume in _volumes()
+
+    problems = scope.teardown()
+
+    assert problems == [], problems
+    assert scope.leaks() == []
+    assert volume not in _volumes()
+    assert not _compose_projects_present(project)
+
+
+def _volumes() -> list[str]:
+    result = subprocess.run(
+        ["docker", "volume", "ls", "--format", "{{.Name}}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.split()
+
+
+def _compose_projects_present(project: str) -> bool:
+    result = subprocess.run(
+        ["docker", "compose", "ls", "--all", "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        return True
+    return project in result.stdout
+
+
+@pytest.mark.skipif(
+    not (_docker_available() and _tmux_available()),
+    reason="docker and tmux are required",
+)
+def test_a_compose_project_and_a_session_together_leave_nothing_behind(scope):
+    """The shape the acceptance itself creates: a session plus a forge."""
+    import forgejo as fj
+
+    compose_file = fj.template_path(PROJECT_ROOT)
+    project = scope.track_compose(f"{scope.session_prefix}both", compose_file)
+    _start_probe_session(scope, "both")
+    fj.up(project, compose_file)
+    fj.published_host(project, compose_file)
+    scope.track_process(
+        subprocess.Popen(["sleep", "600"], cwd=scope.root, start_new_session=True),
+        "probe process",
+    )
+
+    # The detector must see what the run created before teardown; that is what
+    # makes an empty result afterwards mean something.
+    assert scope.leaks() != []
+    assert scope.teardown() == []
+    assert scope.leaks() == []
+    scope.require_clean()

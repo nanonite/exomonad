@@ -55,6 +55,29 @@ After first-time setup, `docker compose up -d` starts Forgejo, the Docker-in-Doc
 | 3000 | Forgejo web UI + API |
 | 2222 | Git SSH |
 
+## Test instances are not this instance
+
+This stack is the **operator's** Forgejo: it keeps its data across restarts, it
+runs Actions, and agents push to it during normal development. Acceptance tests
+must not use it and must not reset it.
+
+A real-server E2E test brings up its **own** Forgejo from the shared template at
+`tests/e2e/lib/forgejo/docker-compose.yml`. That file is a template, not a
+running instance: it declares no `container_name` and no fixed host port, so
+each run gets its own container, its own project-scoped volume, and an ephemeral
+port that the harness discovers with `docker compose port`. See
+`just e2e-recreated-leaf-recovery` and CLAUDE.md § "Real-server integration
+tests" for the full pattern.
+
+The practical difference from this stack:
+
+| | This stack | A test's own instance |
+|---|---|---|
+| Lifetime | Until you stop it | One run, torn down by the run |
+| Data | `./runner-data` and a named volume | A volume scoped to the compose project, removed with `down -v` |
+| Port | Fixed 3000 | Ephemeral, discovered after `up` |
+| Accounts | Yours | Created by the run through the container CLI |
+| Actions | Enabled | Disabled |
 
 ## Git Remote Token Auth
 
