@@ -491,6 +491,26 @@ def _ledger_state(project: Project) -> dict[str, Any]:
     }
 
 
+def _remove_leaf_worktree(project: Project, worktree: Path) -> None:
+    """Remove the leaf's worktree completely, directory included.
+
+    ``git worktree remove`` unregisters the worktree, but it does not remove
+    the directory when something still holds it -- and something does, because
+    the leaf's agent runs with that directory as its working directory. The
+    directory has to go as well, or the next spawn finds a path that exists but
+    is not a registered worktree and is refused for that, which is a different
+    scenario from the one this probe is proving. The branch is untouched, so
+    the state left behind is exactly "the worktree was lost".
+    """
+    subprocess.run(
+        ["git", "-C", str(project.repo), "worktree", "remove", "--force", str(worktree)],
+        check=False,
+        capture_output=True,
+    )
+    if worktree.exists():
+        subprocess.run(["rm", "-rf", str(worktree)], check=False)
+
+
 def _restore_leaf_worktree(project: Project) -> None:
     """Put the leaf's worktree back after a probe removed it.
 
@@ -594,13 +614,16 @@ def t3_attach_preserved_branch(
         len(lost) == 1,
         f"the worktree to lose is not singular: {lost!r}",
     )
-    subprocess.run(
-        ["git", "-C", str(project.repo), "worktree", "remove", "--force", str(lost[0])],
-        check=True,
-    )
+    _remove_leaf_worktree(project, lost[0])
     require(
         not ev.worktrees_for_branch(project.repo, LEAF_BRANCH),
         "the leaf's worktree survived the loss it was supposed to lose",
+    )
+    require(
+        not (project.repo / ".exo" / "worktrees" / LEAF_AGENT).exists(),
+        "the leaf's worktree directory survived the loss it was supposed to "
+        "lose, so the next spawn would be refused for an unregistered path "
+        "rather than reattaching the branch",
     )
     require(
         ev.branch_exists(project.repo, LEAF_BRANCH),
