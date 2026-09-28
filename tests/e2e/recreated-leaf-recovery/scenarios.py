@@ -492,16 +492,21 @@ def _ledger_state(project: Project) -> dict[str, Any]:
 
 
 def _remove_leaf_worktree(project: Project, worktree: Path) -> None:
-    """Remove the leaf's worktree completely, directory included.
+    """Lose the leaf's worktree: its agent stops, then the directory goes.
 
-    ``git worktree remove`` unregisters the worktree, but it does not remove
-    the directory when something still holds it -- and something does, because
-    the leaf's agent runs with that directory as its working directory. The
-    directory has to go as well, or the next spawn finds a path that exists but
-    is not a registered worktree and is refused for that, which is a different
-    scenario from the one this probe is proving. The branch is untouched, so
-    the state left behind is exactly "the worktree was lost".
+    The order matters, and getting it wrong makes this probe test something
+    else. The leaf's agent still runs with that directory as its working
+    directory, so ``git worktree remove`` unregisters the worktree but cannot
+    remove the directory, and the running agent then recreates whatever the
+    removal deleted. The next spawn would find a path that exists but is not a
+    registered worktree and be refused with ``worktree.path_unregistered``,
+    which is the residue scenario, not reattachment.
+
+    So the agent is stopped first, which is what "the worktree was lost" means:
+    no process holds it, the registration is gone, and the directory is gone.
+    The branch and the head it published are untouched.
     """
+    _stop_leaf_agent(project)
     subprocess.run(
         ["git", "-C", str(project.repo), "worktree", "remove", "--force", str(worktree)],
         check=False,
@@ -509,6 +514,26 @@ def _remove_leaf_worktree(project: Project, worktree: Path) -> None:
     )
     if worktree.exists():
         subprocess.run(["rm", "-rf", str(worktree)], check=False)
+
+
+def _stop_leaf_agent(project: Project) -> None:
+    """Stop the leaf's agent window, so it stops holding its worktree.
+
+    The window is named by the agent's own durable routing record, so this
+    stops the window the server believes is that agent and nothing else in the
+    run's session.
+    """
+    routing = ev.read_json_if_present(
+        project.repo / ".exo" / "agents" / LEAF_AGENT / "routing.json"
+    )
+    window = routing.get("window_id") if isinstance(routing, Mapping) else None
+    if not isinstance(window, str) or not window:
+        return
+    subprocess.run(
+        ["tmux", "kill-window", "-t", window],
+        check=False,
+        capture_output=True,
+    )
 
 
 def _restore_leaf_worktree(project: Project) -> None:
@@ -1295,11 +1320,23 @@ def t7_expected_agent_resume(
         f"the resume moved the preserved head from {head_before} to "
         f"{ev.head_of(recreated.repo, LEAF_BRANCH)}",
     )
-    pulls_after = await_boundary(
-        lambda: _pulls_when_settled(recreated, fixture, LEAF_BRANCH),
-        description=f"the pull requests on {LEAF_BRANCH} after the resume",
+    # The resumed invocation is the one that has to finish before the pull
+    # requests can be counted: a resume adds an invocation, not an
+    # authoritative leaf spawn, so counting spawns here would read the forge
+    # while the resumed agent was still working.
+    resumed_finished = len(finished_invocations(recreated, LEAF_BRANCH))
+    await_boundary(
+        lambda: (
+            len(finished_invocations(recreated, LEAF_BRANCH)) > resumed_finished
+            or None
+        ),
+        description=(
+            f"the resumed invocation on {LEAF_BRANCH} to record that it "
+            f"finished; currently {resumed_finished} finished"
+        ),
         timeout=PUBLICATION_TIMEOUT_SECONDS,
     )
+    pulls_after = pulls_on_branch(fixture, LEAF_BRANCH)
     require(
         len(pulls_after) == 1,
         f"the resume changed the open pull requests on {LEAF_BRANCH}: "
@@ -1333,8 +1370,10 @@ def published_context_available(project: Project, branch: str) -> bool:
     publication registry to still name this branch's pull request after the
     resume.
     """
-    heads = ev.published_heads(project.repo, LEAF_AGENT)
-    return any(head.get("head_branch") == branch for head in heads)
+    return any(
+        head.get("head_branch") == branch and head.get("author_agent") == LEAF_AGENT
+        for head in ev.published_heads(project.repo)
+    )
 
 
 def _liveness_inputs(project: Project) -> dict[str, Any]:

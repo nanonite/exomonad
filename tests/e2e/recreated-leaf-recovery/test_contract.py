@@ -292,7 +292,7 @@ def test_ledger_events_report_a_project_with_no_ledger(tmp_path: Path):
 
 
 def test_published_heads_accept_both_document_shapes(tmp_path: Path):
-    agent_dir = tmp_path / ".exo" / "agents" / "leaf-codex"
+    agent_dir = tmp_path / ".exo"
     agent_dir.mkdir(parents=True)
     (agent_dir / "published-heads.json").write_text(
         json.dumps(
@@ -303,10 +303,10 @@ def test_published_heads_accept_both_document_shapes(tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    assert ev.published_heads(tmp_path, "leaf-codex") == [
+    assert ev.published_heads(tmp_path) == [
         {"pr_number": 7, "head_branch": "main.leaf-codex"}
     ]
-    assert ev.published_heads(tmp_path, "absent") == []
+    assert ev.published_heads(tmp_path.parent / "absent") == []
 
 
 def test_pull_number_is_found_through_the_tool_envelope():

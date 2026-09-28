@@ -327,21 +327,23 @@ def agent_invocation(project: Path, name: str) -> dict[str, Any] | None:
     return value
 
 
-def published_heads(project: Path, name: str) -> list[dict[str, Any]]:
-    """Return the ledger-owned publication records for one agent."""
-    value = read_json_if_present(
-        project / ".exo" / "agents" / name / PUBLISHED_HEADS
-    )
+def published_heads(project: Path) -> list[dict[str, Any]]:
+    """Return the publications the server has recorded for this project.
+
+    The registry is one project-level document, ``.exo/published-heads.json``
+    (``rust/exomonad-core/src/services/pr_registry.rs:12``). Each entry names
+    the branch and the agent that published it, which is what lets a caller ask
+    whether a branch's pull request is still known to the server.
+    """
+    value = read_json_if_present(project / ".exo" / PUBLISHED_HEADS)
     if value is None:
         return []
-    if isinstance(value, dict):
-        entries = value.get("publications", value.get("heads"))
+    if isinstance(value, Mapping):
+        entries = value.get("heads", value.get("publications"))
         value = entries if isinstance(entries, list) else []
     if not isinstance(value, list):
-        raise EvidenceError(
-            f"published heads for {name!r} are not a list: {value!r}"
-        )
-    return [entry for entry in value if isinstance(entry, dict)]
+        raise EvidenceError(f"published heads are not a list: {value!r}")
+    return [entry for entry in value if isinstance(entry, Mapping)]
 
 
 def planned_worktree_exists(project: Path, path: Path) -> bool:
