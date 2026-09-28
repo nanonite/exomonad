@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-import cleanup as cl
+from . import cleanup as cl
 
 #: The shared template every harness copies its own instance from.
 COMPOSE_TEMPLATE = Path("tests") / "e2e" / "lib" / "forgejo" / "docker-compose.yml"
@@ -50,9 +50,6 @@ USER_VISIBLE_TIMEOUT_SECONDS = 30.0
 REPO_VISIBLE_TIMEOUT_SECONDS = 30.0
 
 _TOKEN = re.compile(r"\b[0-9a-f]{40}\b")
-
-#: The instance's own listener, used to build a repository URL. The discovered
-#: host port is what the harness actually talks to.
 
 
 class ForgejoError(RuntimeError):
@@ -278,7 +275,9 @@ def _user_ids(instance: Instance) -> dict[str, int]:
     to administrators and would hide every one of them.
     """
     ids: dict[str, int] = {}
-    for line in _cli(instance.project, instance.compose_file, "admin", "user", "list").splitlines():
+    for line in _cli(
+        instance.project, instance.compose_file, "admin", "user", "list"
+    ).splitlines():
         fields = line.split()
         if len(fields) >= 2 and fields[0].isdigit():
             ids[fields[1]] = int(fields[0])
@@ -353,7 +352,7 @@ def _create_account(instance: Instance, username: str) -> Account:
         "--must-change-password=false",
         "--access-token",
         "--access-token-name",
-        f"e2e-1111-{username}",
+        f"e2e-token-{username}",
     )
     _wait_for_user(instance, username)
     return Account(username=username, token=_token_from(output, "account creation"))
@@ -453,3 +452,18 @@ def _add_collaborator(instance: Instance) -> None:
         raise ForgejoError(
             f"the reviewer was not added as a collaborator: {listed!r}"
         )
+
+
+__all__ = [
+    "COMPOSE_TEMPLATE",
+    "Account",
+    "ForgejoError",
+    "Instance",
+    "api",
+    "down",
+    "provision",
+    "published_host",
+    "template_path",
+    "up",
+    "wait_healthy",
+]

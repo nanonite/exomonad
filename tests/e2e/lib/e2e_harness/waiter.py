@@ -1,4 +1,4 @@
-"""Bounded waits on durable boundaries for the #1111 acceptance.
+"""Bounded waits on durable boundaries for real-server acceptances.
 
 Every wait here polls a durable artifact until a boundary is reached, with an
 explicit deadline and a diagnostic that names the last state it saw, so a
@@ -9,7 +9,7 @@ boundary it proved.
 There is deliberately no "wait for the count to stop changing" wait here. A
 count that has not moved for a few seconds is not evidence that nothing further
 is coming, so a duplicate that lands after such a window would pass silently.
-Every count in this acceptance is read after a terminal boundary instead: the
+Every count in these acceptances is read after a terminal boundary instead: the
 deterministic agent's own durable record that its invocation finished.
 """
 

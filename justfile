@@ -168,6 +168,7 @@ e2e-recreated-leaf-recovery keep="false":
 check-e2e-recreated-leaf-recovery:
     bash -n tests/e2e/recreated-leaf-recovery/run.sh
     {{py}} -m py_compile tests/e2e/recreated-leaf-recovery/*.py
+    {{py}} -m py_compile tests/e2e/lib/e2e_harness/*.py
     {{py}} -m pytest -q tests/e2e/recreated-leaf-recovery/test_contract.py
     test -s tests/e2e/recursive-crash-convergence/e2e-test.md
     test -s tests/e2e/recursive-crash-convergence/testrunner.md

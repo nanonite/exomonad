@@ -28,13 +28,16 @@ import pytest
 
 HARNESS = Path(__file__).resolve().parent
 PROJECT_ROOT = HARNESS.parents[2]
+LIB_DIR = PROJECT_ROOT / "tests" / "e2e" / "lib"
 sys.path.insert(0, str(HARNESS))
+sys.path.insert(0, str(LIB_DIR))
 
-import cleanup as cl  # noqa: E402
+import e2e_harness.cleanup as cl  # noqa: E402
 import evidence as ev  # noqa: E402
 import project as pj  # noqa: E402
 import scenarios as sc  # noqa: E402
-import waiter  # noqa: E402
+import e2e_harness.waiter as waiter  # noqa: E402
+from run_prefix import PREFIX  # noqa: E402
 
 #: One recorded ledger segment, written exactly as the server writes it: a
 #: JSON object per line, carrying the envelope fields the readers must not care
@@ -424,7 +427,7 @@ def test_every_session_name_the_harness_creates_survives_the_servers_sanitizatio
 
     for _attempt in range(50):
         run_id = driver.run_id()
-        scope = cl.RunScope(run_id=run_id, root=cl.make_root("/tmp"))
+        scope = cl.RunScope(run_id=run_id, root=cl.make_root("/tmp", PREFIX), prefix=PREFIX)
         try:
             name = pj.session_name(scope)
             assert _sanitize_session_name(name) == name, (
@@ -443,7 +446,9 @@ def test_a_run_id_that_would_overflow_the_session_name_is_refused():
     the server cannot find, and every later liveness check reports every agent
     as dead, which reads as a product fault rather than as a naming mistake.
     """
-    scope = cl.RunScope(run_id="x" * 40, root=cl.make_root("/tmp"))
+    scope = cl.RunScope(
+            run_id="x" * 40, root=cl.make_root("/tmp", PREFIX), prefix=PREFIX
+        )
     try:
         with pytest.raises(cl.CleanupError) as failure:
             _ = scope.session_prefix
@@ -453,7 +458,11 @@ def test_a_run_id_that_would_overflow_the_session_name_is_refused():
 
 
 def test_a_session_name_over_the_limit_is_refused_rather_than_tracked():
-    scope = cl.RunScope(run_id="e2e1111-abc123", root=cl.make_root("/tmp"))
+    scope = cl.RunScope(
+            run_id="e2e1111-abc123",
+            root=cl.make_root("/tmp", PREFIX),
+            prefix=PREFIX,
+        )
     try:
         with pytest.raises(cl.CleanupError) as failure:
             scope.track_session(scope.session_prefix + "a" * 40)
@@ -554,7 +563,9 @@ def test_the_compose_template_keeps_the_properties_a_disposable_instance_needs()
 
 
 def test_the_run_owns_a_directory_named_by_mktemp_and_never_a_fixed_path():
-    source = (HARNESS / "cleanup.py").read_text(encoding="utf-8")
+    source = (
+        LIB_DIR / "e2e_harness" / "cleanup.py"
+    ).read_text(encoding="utf-8")
     assert '"mktemp", "-d"' in source
 
 
@@ -595,7 +606,9 @@ def scope() -> Any:
     import secrets
 
     created = cl.RunScope(
-        run_id=f"ct{secrets.token_hex(3)}", root=cl.make_root("/tmp")
+        run_id=f"ct{secrets.token_hex(3)}",
+        root=cl.make_root("/tmp", PREFIX),
+        prefix=PREFIX,
     )
     try:
         yield created
@@ -697,7 +710,7 @@ def test_the_scope_refuses_to_own_a_resource_it_did_not_name(scope):
 )
 def test_teardown_removes_a_compose_project_and_its_volume(scope):
     """A real compose project, torn down, leaves no project and no volume."""
-    import forgejo as fj
+    import e2e_harness.forgejo_stack as fj
 
     compose_file = fj.template_path(PROJECT_ROOT)
     project = scope.track_compose(f"{scope.session_prefix}compose", compose_file)
@@ -743,7 +756,7 @@ def _compose_projects_present(project: str) -> bool:
 )
 def test_a_compose_project_and_a_session_together_leave_nothing_behind(scope):
     """The shape the acceptance itself creates: a session plus a forge."""
-    import forgejo as fj
+    import e2e_harness.forgejo_stack as fj
 
     compose_file = fj.template_path(PROJECT_ROOT)
     project = scope.track_compose(f"{scope.session_prefix}both", compose_file)
@@ -780,8 +793,8 @@ def test_a_sweep_reclaims_a_run_that_was_killed_before_its_teardown():
     """
     import secrets
 
-    prefix = f"{cl.LEAK_PREFIX}aborted-{secrets.token_hex(4)}-"
-    root = cl.make_root("/tmp")
+    prefix = f"{PREFIX}aborted-{secrets.token_hex(4)}-"
+    root = cl.make_root("/tmp", PREFIX)
     process = subprocess.Popen(
         ["sleep", "600"], cwd=root, start_new_session=True
     )
@@ -792,12 +805,12 @@ def test_a_sweep_reclaims_a_run_that_was_killed_before_its_teardown():
     )
     # No scope is created and no teardown is ever called: this run is aborted.
     try:
-        assert cl.stale_run_roots() != []
+        assert cl.stale_run_roots(PREFIX) != []
         assert any(
             pid == str(process.pid)
             for pid, _cwd, _command in cl.processes_in_scopes([str(root)])
         )
-        assert cl.sweep_stale(prefix, _compose_file()) == []
+        assert cl.sweep_stale(prefix, _compose_file(), PREFIX) == []
     finally:
         if cl._process_alive(process.pid):
             process.terminate()
@@ -823,11 +836,11 @@ def test_the_sweep_kills_a_server_before_it_removes_the_directory_it_ran_in():
     """
     import secrets
 
-    prefix = f"{cl.LEAK_PREFIX}order-{secrets.token_hex(3)}-"
-    root = cl.make_root("/tmp")
+    prefix = f"{PREFIX}order-{secrets.token_hex(3)}-"
+    root = cl.make_root("/tmp", PREFIX)
     process = subprocess.Popen(["sleep", "600"], cwd=root, start_new_session=True)
     try:
-        assert cl.sweep_stale(prefix, _compose_file()) == []
+        assert cl.sweep_stale(prefix, _compose_file(), PREFIX) == []
         assert not root.exists(), "the sweep left the run directory behind"
         assert not cl._process_alive(process.pid), (
             "the sweep removed the directory but left the process running in it"
@@ -851,8 +864,8 @@ def test_a_process_that_merely_mentions_a_run_path_survives_the_sweep():
     """
     import secrets
 
-    prefix = f"{cl.LEAK_PREFIX}argv-{secrets.token_hex(3)}-"
-    root = cl.make_root("/tmp")
+    prefix = f"{PREFIX}argv-{secrets.token_hex(3)}-"
+    root = cl.make_root("/tmp", PREFIX)
     # Runs inside the run directory: this one is the run's own and must die.
     inside = subprocess.Popen(["sleep", "600"], cwd=root, start_new_session=True)
     # Runs elsewhere and merely names the run directory as an argument: this one
@@ -872,7 +885,7 @@ def test_a_process_that_merely_mentions_a_run_path_survives_the_sweep():
             pid == str(elsewhere.pid)
             for pid, _cwd, _command in cl.processes_in_scopes([str(root)])
         ), "a process that only mentions the run path was treated as the run's"
-        assert cl.sweep_stale(prefix, _compose_file()) == []
+        assert cl.sweep_stale(prefix, _compose_file(), PREFIX) == []
         assert not cl._process_alive(inside.pid), "the sweep missed a run process"
         assert cl._process_alive(elsewhere.pid), (
             "the sweep killed a process that only mentioned the run path"
@@ -893,7 +906,7 @@ def test_the_leak_check_sees_a_process_whose_directory_is_already_gone():
     removed the directory. Without stripping that suffix the check reports clean
     while the process is still running.
     """
-    root = cl.make_root("/tmp")
+    root = cl.make_root("/tmp", PREFIX)
     process = subprocess.Popen(["sleep", "600"], cwd=root, start_new_session=True)
     try:
         shutil.rmtree(root, ignore_errors=True)
@@ -917,7 +930,11 @@ def test_the_scope_tracks_a_process_that_runs_in_its_own_session():
     also means nothing about parentage identifies it afterwards, so the scope has
     to hold the pid itself and the leak check has to find it by its directory.
     """
-    scope = cl.RunScope(run_id=f"contract-{os.getpid()}", root=cl.make_root("/tmp"))
+    scope = cl.RunScope(
+        run_id=f"contract-{os.getpid()}",
+        root=cl.make_root("/tmp", PREFIX),
+        prefix=PREFIX,
+    )
     process = scope.track_process(
         subprocess.Popen(["sleep", "600"], cwd=scope.root, start_new_session=True),
         "detached probe",

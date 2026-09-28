@@ -1,10 +1,14 @@
-"""Run-scoped ownership and teardown for the #1111 acceptance.
+"""Run-scoped ownership and teardown for real-server acceptances.
 
-Every resource the acceptance creates is registered here, and one trap removes
+Every resource an acceptance creates is registered here, and one trap removes
 all of them. The teardown is idempotent, so running it twice, or running it
 after a step already cleaned up, is not an error. After teardown the scope is
 asked what it can still see; anything left is a leak, and a leak fails the run
 rather than being reported as a warning.
+
+The run's name prefixes are a constructor parameter rather than a constant, so
+two acceptances share this code without sharing names: each harness passes its
+own prefix and can only ever reclaim, report, or refuse on its own resources.
 
 The four kinds of resource this covers are the four an integration test leaks:
 
@@ -24,17 +28,9 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence, Sequence
+from typing import Any, Callable, Sequence
 
-#: Every run-scoped name begins with this, so a leak is attributable to a
-#: harness without knowing which harness started it.
-LEAK_PREFIX = "exo-e2e-1111-"
-
-#: The prefix of the run directory each run is given by ``mktemp -d``. A sweep
-#: looks for this so it can reclaim a run that was killed before its teardown.
-RUN_DIRECTORY_PREFIX = "exomonad-e2e-1111-"
-
-#: Where those run directories are created.
+#: Where run directories are created.
 TEMP_ROOT = "/tmp"
 
 #: The session-name limit the server imposes, mirrored here so a name this
@@ -72,10 +68,18 @@ class CleanupError(RuntimeError):
 
 @dataclass
 class RunScope:
-    """Every resource one acceptance run owns, and how to give them all back."""
+    """Every resource one acceptance run owns, and how to give them all back.
+
+    ``prefix`` names the harness this scope belongs to, for example
+    ``"exo-e2e-1111-"``. It prefixes every name the run takes on the host --
+    tmux sessions, compose projects, volumes, and the run directory -- so a
+    resource is attributable to exactly one harness and a sweep of one harness
+    can never reach another's.
+    """
 
     run_id: str
     root: Path
+    prefix: str
     sessions: set[str] = field(default_factory=set)
     processes: dict[int, str] = field(default_factory=dict)
     compose_projects: set[str] = field(default_factory=set)
@@ -96,7 +100,7 @@ class RunScope:
         than asking ``exomonad init`` to, and a name the server would silently
         truncate is a name the server would look for and not find.
         """
-        prefix = f"{LEAK_PREFIX}{self.run_id}"
+        prefix = f"{self.prefix}{self.run_id}"
         if len(prefix) > SESSION_NAME_MAX_LENGTH:
             raise CleanupError(
                 f"run id {self.run_id!r} makes the session name {prefix!r} "
@@ -150,7 +154,13 @@ class RunScope:
         self.processes.clear()
         for project in sorted(self.compose_projects):
             self.problems.extend(
-                _compose(project, self.compose_files[project], "down", "-v", "--remove-orphans")
+                _compose(
+                    project,
+                    self.compose_files[project],
+                    "down",
+                    "-v",
+                    "--remove-orphans",
+                )
             )
         self.compose_projects.clear()
         shutil.rmtree(self.root, ignore_errors=True)
@@ -292,7 +302,7 @@ def _processes_under(root: Path) -> list[str]:
     """Return every live process whose working directory is under ``root``.
 
     A process that outlives its run and still points into the run's temporary
-    directory is the leak this acceptance is required to prove cannot happen,
+    directory is the leak these acceptances are required to prove cannot happen,
     so it is detected by the filesystem rather than by a name prefix.
 
     A process whose directory has already been removed still reports it, with
@@ -412,7 +422,7 @@ def _compose_projects() -> list[str]:
     ]
 
 
-def stale_run_roots() -> list[str]:
+def stale_run_roots(run_directory_prefix: str) -> list[str]:
     """Return every run directory this harness has ever named, live or not.
 
     A directory whose run was killed before its teardown is still on disk, and a
@@ -425,10 +435,10 @@ def stale_run_roots() -> list[str]:
     """
     roots = [
         str(path)
-        for path in Path(TEMP_ROOT).glob(f"{RUN_DIRECTORY_PREFIX}*")
+        for path in Path(TEMP_ROOT).glob(f"{run_directory_prefix}*")
         if path.is_dir()
     ]
-    base = f"{TEMP_ROOT}/{RUN_DIRECTORY_PREFIX}"
+    base = f"{TEMP_ROOT}/{run_directory_prefix}"
     for _pid, cwd, _command in _live_processes():
         if not cwd.startswith(base):
             continue
@@ -438,7 +448,9 @@ def stale_run_roots() -> list[str]:
     return roots
 
 
-def sweep_stale(run_prefix: str, compose_file: Path) -> list[str]:
+def sweep_stale(
+    run_prefix: str, compose_file: Path, run_directory_prefix: str
+) -> list[str]:
     """Remove everything a previous, interrupted run of this harness left behind.
 
     Teardown is the normal path, but it cannot run when the harness is killed
@@ -449,7 +461,10 @@ def sweep_stale(run_prefix: str, compose_file: Path) -> list[str]:
 
     It is deliberately prefix-driven rather than known-run-driven, because the
     thing being reclaimed is by definition a run this harness does not have a
-    record of.
+    record of. ``run_prefix`` scopes the sessions, compose projects, and
+    volumes; ``run_directory_prefix`` scopes the directories and the processes
+    running in them, because a caller may sweep a narrower name than the one
+    every directory was created with.
 
     The order is load-bearing: **processes are killed before their directories
     are removed**. A process whose working directory has been deleted keeps
@@ -459,7 +474,7 @@ def sweep_stale(run_prefix: str, compose_file: Path) -> list[str]:
     them is gone.
     """
     problems: list[str] = []
-    roots = stale_run_roots()
+    roots = stale_run_roots(run_directory_prefix)
     for pid, cwd, command in processes_in_scopes(roots):
         problems.extend(_kill_process(int(pid), f"stale process in {cwd} ({command})"))
     for name in _sessions_with_prefix(run_prefix):
@@ -467,7 +482,9 @@ def sweep_stale(run_prefix: str, compose_file: Path) -> list[str]:
         problems.extend(_kill_session(session))
     for project in _compose_projects():
         if project.startswith(run_prefix):
-            problems.extend(_compose(project, compose_file, "down", "-v", "--remove-orphans"))
+            problems.extend(
+                _compose(project, compose_file, "down", "-v", "--remove-orphans")
+            )
     for name in _volumes_with_prefix(run_prefix):
         problems.extend(_remove_volume(name.split(": ", 1)[-1]))
     # A second pass, because a process can appear while the first pass is
@@ -538,14 +555,14 @@ def _compose(project: str, compose_file: Path, *arguments: str) -> list[str]:
     return []
 
 
-def make_root(prefix: str) -> Path:
+def make_root(temp_root: str, prefix: str) -> Path:
     """Create this run's temporary directory with ``mktemp -d``.
 
     A fixed path would let two runs share a project, would survive a crash into
     the next run, and would make a leak indistinguishable from ordinary state.
     """
     result = subprocess.run(
-        ["mktemp", "-d", f"{prefix.rstrip('/')}/exomonad-e2e-1111-XXXXXXXX"],
+        ["mktemp", "-d", f"{temp_root.rstrip('/')}/{prefix}XXXXXXXX"],
         check=False,
         capture_output=True,
         text=True,
@@ -558,9 +575,9 @@ def make_root(prefix: str) -> Path:
 __all__ = [
     "COMPOSE_TIMEOUT_SECONDS",
     "CleanupError",
-    "LEAK_PREFIX",
-    "RUN_DIRECTORY_PREFIX",
     "RunScope",
+    "SESSION_NAME_MAX_LENGTH",
+    "TEMP_ROOT",
     "install_trap",
     "make_root",
     "processes_in_scopes",

@@ -20,16 +20,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import cleanup as cl
-import forgejo as fj
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 HARNESS_DIR = Path(__file__).resolve().parent
 ORDERED_DIR = PROJECT_ROOT / "tests/e2e/ordered-recursive"
 
 sys.path.insert(0, str(HARNESS_DIR))
 sys.path.insert(0, str(ORDERED_DIR))
+sys.path.insert(0, str(PROJECT_ROOT / "tests" / "e2e" / "lib"))
 
+import e2e_harness.cleanup as cl  # noqa: E402
+import e2e_harness.forgejo_stack as fj  # noqa: E402
 import real_server_transport as real  # noqa: E402
 
 #: The shared harness's own failure type, re-exported so the driver can treat a

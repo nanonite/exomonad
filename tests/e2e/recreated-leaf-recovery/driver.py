@@ -22,16 +22,36 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-import chainlink_db
-import cleanup as cl
-import forgejo as fj
-import project as pj
-import scenarios as sc
-from scenarios import ScenarioError
-from waiter import Timeout
-
 #: Where the harness reads the shared artifacts from.
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+#: The shared run-scoped package both real-server acceptances import.
+LIB_DIR = PROJECT_ROOT / "tests" / "e2e" / "lib"
+sys.path.insert(0, str(LIB_DIR))
+
+import e2e_harness.chainlink_db as chainlink_db  # noqa: E402
+import e2e_harness.cleanup as cl  # noqa: E402
+import e2e_harness.forgejo_stack as fj  # noqa: E402
+import project as pj  # noqa: E402
+import scenarios as sc  # noqa: E402
+from run_prefix import PREFIX  # noqa: E402
+from scenarios import ScenarioError  # noqa: E402
+from e2e_harness.waiter import Timeout  # noqa: E402
+
+#: Every issue the scenario is seeded with. Each is created fresh in the
+#: disposable database on every run, so no run depends on another's rows, and
+#: no existing database is read or written.
+SEED_ISSUES: tuple[dict[str, Any], ...] = (
+    {
+        "title": "Prove recreated leaf recovery end to end",
+        "priority": "high",
+        "labels": ("bug",),
+    },
+    {
+        "title": "Preserve the recreated leaf branch across the session boundary",
+        "priority": "high",
+        "labels": ("bug",),
+    },
+)
 
 #: Where the run's temporary directory is created. The directory is named by
 #: ``mktemp -d``, never a fixed path, so two runs cannot share a project and a
@@ -207,7 +227,7 @@ def walk(scope: cl.RunScope, instance: fj.Instance) -> Walk:
     conjunction of all of them.
     """
     database = chainlink_db.create(scope.root)
-    seeded = chainlink_db.seed(database)
+    seeded = chainlink_db.seed(database, SEED_ISSUES)
     run = pj.new_run(scope, instance, database, leaf_branches=[pj.LEAF_BRANCH])
     walk_state = Walk(scope, instance)
     walk_state.project = sc.set_live_project(pj.start(run))
@@ -244,8 +264,10 @@ def main() -> int:
     arguments = parser.parse_args()
 
     identifier = run_id()
-    root = cl.make_root(TEMP_ROOT)
-    scope = cl.RunScope(run_id=identifier, root=root, keep=arguments.keep)
+    root = cl.make_root(TEMP_ROOT, PREFIX)
+    scope = cl.RunScope(
+        run_id=identifier, root=root, prefix=PREFIX, keep=arguments.keep
+    )
     report = Report()
     report.evidence["run_id"] = identifier
     report.evidence["run_directory"] = str(root)
@@ -259,7 +281,7 @@ def main() -> int:
         # what such a run left before starting this one, so an interrupted run
         # cannot accumulate a process, a session, a compose project, or a
         # directory that outlives it.
-        swept = cl.sweep_stale(cl.LEAK_PREFIX, fj.template_path(PROJECT_ROOT))
+        swept = cl.sweep_stale(PREFIX, fj.template_path(PROJECT_ROOT), PREFIX)
         report.sweep_problems = swept
         report.evidence["swept_before_run"] = swept
         if swept:

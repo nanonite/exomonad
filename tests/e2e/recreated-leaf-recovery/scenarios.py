@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import evidence as ev
-import forgejo
 import project as pj
 from evidence import Refusal
 from project import (
@@ -45,7 +44,11 @@ from project import (
     Project,
 )
 from tl_loop.client.transport import ServerError, TransportError
-from waiter import await_boundary
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+
+import e2e_harness.forgejo_stack as forgejo  # noqa: E402
+from e2e_harness.waiter import await_boundary  # noqa: E402
 
 
 class ScenarioError(RuntimeError):
