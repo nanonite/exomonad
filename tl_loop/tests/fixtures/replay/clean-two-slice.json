@@ -321,10 +321,12 @@
       "arguments": {
         "event_type": "tl.dispatch_confirmed",
         "payload": {
+          "agent_type": "codex",
           "attempt": 1,
           "boundary": "agent.spawned",
           "harness": "codex",
           "intent_id": "<intent-id>",
+          "model": "gpt-luna",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
         },
@@ -381,10 +383,12 @@
       "arguments": {
         "event_type": "tl.dispatch_confirmed",
         "payload": {
+          "agent_type": "codex",
           "attempt": 1,
           "boundary": "agent.spawned",
           "harness": "codex",
           "intent_id": "<intent-id>",
+          "model": "gpt-luna",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
         },

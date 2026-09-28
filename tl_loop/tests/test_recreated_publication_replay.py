@@ -13,6 +13,11 @@ reducer:
 * #102 binds only with exact invocation, PR number, SHA, head branch, base
   branch, owner, slice, dispatch generation, and controller epoch identity, so
   every single-field mismatch refuses binding.
+
+It also proves that the dispatch the recreated generation recorded is the one
+its publication binds to: the child scope dispatches through the policy path,
+and both the intent and the confirmation it records carry the recreated
+generation (#1120).
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import pytest
 from tl_loop.state.store import RunStore
 from tl_loop.tests.replay import (
     FIXTURE_ROOT,
+    ReplayResult,
     normalize_durable_state,
     replay_fixture,
 )
@@ -106,14 +112,41 @@ def _patched(row_name: str, fields: Mapping[str, Any]) -> Any:
     return transform
 
 
-def _replay(root: Path, transform: Any) -> None:
-    replay_fixture(
+def _replay(root: Path, transform: Any) -> ReplayResult:
+    return replay_fixture(
         FIXTURE,
         root,
         journal=True,
         production_clock=True,
         child_event_transform=transform,
     )
+
+
+def _child_row(event_id: str) -> Mapping[str, Any]:
+    """The committed ledger row one child event carries."""
+    for row in _spec()["child_events"][CHILD_SCOPE]:
+        if row["event_id"] == event_id:
+            return row
+    raise AssertionError(f"the fixture does not commit the {event_id!r} row")
+
+
+def _boundary_payload(
+    result: ReplayResult, event_type: str, slice_id: str
+) -> Mapping[str, Any]:
+    """The one payload one controller boundary recorded for one slice."""
+
+    def recorded(action: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        arguments = action["arguments"]
+        if not isinstance(arguments, Mapping) or arguments.get("event_type") != event_type:
+            return None
+        payload = arguments.get("payload")
+        if not isinstance(payload, Mapping) or payload.get("slice_id") != slice_id:
+            return None
+        return payload
+
+    payloads = [payload for payload in map(recorded, result.actions) if payload is not None]
+    assert len(payloads) == 1, f"expected one {event_type} for {slice_id!r}"
+    return payloads[0]
 
 
 def _child_document(root: Path) -> dict[str, Any]:
@@ -176,6 +209,14 @@ def _pending_seqs(root: Path) -> list[Any]:
     return [row.get("run_seq") for row in _child_store(root).quarantined_events()]
 
 
+def _dispatch_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The generation and epoch dimensions one boundary recorded."""
+    return {
+        name: payload[name]
+        for name in ("attempt", "controller_epoch", "dispatch_generation")
+    }
+
+
 def test_recreated_generation_is_the_only_owner_of_the_leaf(tmp_path: Path) -> None:
     """The recreated dispatch carries the exact owner provenance of #102."""
     root = tmp_path / "recreated"
@@ -195,6 +236,91 @@ def test_recreated_generation_is_the_only_owner_of_the_leaf(tmp_path: Path) -> N
     # The leaf owns dispatch generation 0 of the recreated generation; the
     # persisted checkpoint omits the zero rather than inventing a predecessor.
     assert state.get("dispatch_generation", 0) == 0
+
+
+def test_the_recreated_policy_dispatch_records_the_generation_its_publication_binds(
+    tmp_path: Path,
+) -> None:
+    """The child scope's policy dispatch is the recreated generation it binds.
+
+    The child dispatches through the policy path, so the intent it records must
+    carry the same controller epoch and dispatch generation a direct path
+    records, and the confirmation it derives from its persisted slice must
+    carry the epoch the correlated row proved.
+    """
+    root = tmp_path / "policy-dispatch"
+    result = _replay(root, _rows(BASELINE_ROWS))
+    document = _child_document(root)
+    state = document["slices"][LEAF]
+    provenance = _spec()["dispatch_provenance"]
+    confirmation = _child_row(DISPATCH_CONFIRMATION)["data"]
+
+    # The intent the recreated generation issued is the one the correlated row
+    # names, and it is the one this scope persisted.
+    assert provenance["child_scope"] == CHILD_SCOPE
+    assert provenance["slice_id"] == LEAF
+    assert state["dispatch_intent_id"] == provenance["intent_id"] == (
+        confirmation["intent_id"]
+    )
+
+    intended = _boundary_payload(result, "tl.dispatch_intended", LEAF)
+    assert _dispatch_identity(intended) == {
+        "attempt": 1,
+        "controller_epoch": provenance["controller_epoch"],
+        "dispatch_generation": provenance["dispatch_generation"],
+    }
+    assert intended["controller_epoch"] == document["controller_epoch"]
+
+    # The confirmation is reconstructed from the persisted slice, so it reports
+    # the generation that slice recorded and the epoch the correlated row proved.
+    confirmed = _boundary_payload(result, "tl.dispatch_confirmed", LEAF)
+    assert _dispatch_identity(confirmed) == {
+        "attempt": intended["attempt"],
+        "controller_epoch": document["controller_epoch"],
+        "dispatch_generation": state.get("dispatch_generation", 0),
+    }
+    assert confirmed["controller_epoch"] == confirmation["controller_epoch"]
+    assert confirmed["dispatch_generation"] == confirmation["dispatch_generation"]
+
+    # #102 binds to that dispatch, and the predecessor generation stays audit-only.
+    assert state["publication"] == {
+        "pr_number": 102,
+        "head_sha": HEAD_102,
+        "head_branch": HEAD_BRANCH,
+        "base_branch": BASE_BRANCH,
+        "attempt": 1,
+        "invocation_id": RECREATED_INVOCATION,
+    }
+    assert [row["run_seq"] for row in _audit_rows(root)] == [HISTORICAL_RUN_SEQ]
+    assert _pending_seqs(root) == []
+
+
+def test_a_dispatch_confirmed_by_a_prior_epoch_is_never_adopted(tmp_path: Path) -> None:
+    """A confirmation row from a prior generation proves no current owner.
+
+    The row still names the exact intent the recreated generation issued and
+    the exact leaf agent, so the controller epoch it was confirmed under is the
+    only thing that refuses it: without the mismatch the dispatch confirms and
+    #102 binds.
+    """
+    root = tmp_path / "prior-epoch-dispatch"
+    _replay(
+        root,
+        _patched(DISPATCH_CONFIRMATION, {"data": {"controller_epoch": PREDECESSOR_EPOCH}}),
+    )
+    baseline = tmp_path / "baseline"
+    _replay(baseline, _rows(BASELINE_ROWS))
+
+    state = _child_document(root)["slices"][LEAF]
+    assert state.get("dispatch_agent_id") is None
+    assert state.get("dispatch_invocation_id") is None
+    assert state.get("publication") is None
+    assert state.get("pr_number") is None
+    # The refused row leaves no replayable work behind, and the identical run
+    # without the epoch mismatch is the difference that mattered.
+    assert _pending_seqs(root) == []
+    assert _leaf_state(baseline)["publication"]["pr_number"] == 102
+    assert _leaf_state(root).get("publication") is None
 
 
 def test_current_publication_binds_only_with_exact_identity(tmp_path: Path) -> None:

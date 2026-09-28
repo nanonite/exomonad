@@ -248,6 +248,42 @@ never issues a second spawn for an existing intent; it waits for matching
 evidence or an explicit resolution. Controller boundary events are limited to
 scalar dimensions and are written by Rust through the `tl` event allowlist.
 
+### Dispatch attempt identity
+
+`DispatchAttempt` is the one durable identity of a spawn: the `intent_id`, the
+instant it was minted, its attempt number, the run's `controller_epoch`, its
+`dispatch_generation`, and the `ledger_floor` a refusal for it is correlated
+from. Exactly three sources may produce one, and each is a single method, so a
+newly added field cannot be dropped by a hand-copied reconstruction:
+
+- `_new_dispatch_attempt` mints it, with the run's current controller epoch and
+  `dispatch_generation = attempt` when an epoch is in force.
+- `DispatchAttempt.routed` attaches the harness the policy path selected. It is
+  `dataclasses.replace`, so the identity, ledger floor, epoch, and generation
+  survive selection. A policy-path dispatch therefore records the same
+  provenance as a direct one; the route is the only difference between them.
+- `DispatchAttempt.recorded_for` is the single reconstruction of an attempt from
+  persisted state. It reads every field from the slice's own dispatch boundary
+  (intent, instant, resolved agent type, model, attempt, generation, ledger
+  floor) plus the epoch its caller passes, and a slice that records no intent
+  has no attempt, so it fails closed instead of inventing one. The persisted
+  boundary records the resolved agent type rather than the qualified harness
+  identifier, so both routing dimensions of a reconstruction read that value.
+
+`tl_loop/tests/test_dispatch_provenance.py` holds all three: the two spawn paths
+must record and persist the same identity, the reconstruction must carry every
+field, and every field must be propagated by the one reconstruction. The last
+two are structural guards, so adding a field without propagating it fails
+rather than silently reaching a boundary event as its default.
+
+A sub-TL start is the one site that is a mint and not a reconstruction: it
+stamps a fresh identity for a child controller, so it carries neither this run's
+epoch nor a generation. The child controller mints its own epoch, and the
+generation persisted on a sub-TL slice is the one the parent's publication
+binder compares the child's own PR event against, not this run's attempt
+number. Carrying this run's epoch there would attribute the parent's generation
+to a child that never dispatched under it.
+
 ### Dispatch failure classification and retry
 
 A rejected spawn request is classified by its stable machine code and by

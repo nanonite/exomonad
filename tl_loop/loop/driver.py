@@ -496,6 +496,54 @@ class DispatchAttempt:
     #: floor its intent was issued at.
     ledger_floor: int = 0
 
+    def routed(self, *, harness: str, agent_type: str, model: str | None) -> DispatchAttempt:
+        """Return this attempt with the selected harness route attached.
+
+        The policy path resolves the harness after the intent is minted. The
+        route is the only thing that changes: the intent identity, its ledger
+        floor, and the controller epoch and dispatch generation the correlation
+        reads are carried by ``replace``, so selecting a harness can never
+        record an attempt with incomplete provenance.
+        """
+        return replace(self, harness=harness, agent_type=agent_type, model=model)
+
+    @classmethod
+    def recorded_for(
+        cls, slice_state: SliceState, controller_epoch: str | None
+    ) -> DispatchAttempt:
+        """Rebuild the attempt one slice's dispatch provenance records.
+
+        This is the only way an attempt is reconstructed from persisted state,
+        and it reads every field from the slice's own dispatch boundary, so a
+        new field cannot be dropped by a second hand-written construction. The
+        controller epoch is the current run's epoch, which is the epoch the
+        correlation admits; the generation and ledger floor are the ones the
+        persisted intent was recorded with. The slice records the resolved
+        agent type and not the qualified harness identifier a policy selection
+        chose, so both routing dimensions read that one recorded value.
+
+        A slice that records no intent has no attempt to rebuild, and
+        reconstruction fails closed rather than inventing one.
+        """
+        if (
+            slice_state.dispatch_intent_id is None
+            or slice_state.dispatch_started_at is None
+        ):
+            raise TLLoopError(
+                f"slice {slice_state.id!r} records no dispatch intent to reconstruct"
+            )
+        return cls(
+            intent_id=slice_state.dispatch_intent_id,
+            started_at=slice_state.dispatch_started_at,
+            harness=slice_state.agent_type or "",
+            agent_type=slice_state.agent_type or "",
+            model=slice_state.model,
+            attempt=max(1, slice_state.attempts),
+            controller_epoch=controller_epoch,
+            dispatch_generation=slice_state.dispatch_generation,
+            ledger_floor=slice_state.dispatch_ledger_floor,
+        )
+
 
 @dataclass(frozen=True)
 class DispatchCorrelation:
@@ -2601,6 +2649,7 @@ def _run_loop(
                 config,
                 effects,
                 effects_log,
+                state.controller_epoch,
             )
             state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
@@ -2791,6 +2840,7 @@ def _run_loop(
             config,
             effects,
             effects_log,
+            state.controller_epoch,
         )
         if (
             isinstance(phase, RecursiveTLRunning)
@@ -6612,15 +6662,7 @@ def _reconcile_dispatches(
         current = state.slices.get(pending_slice.id, pending_slice)
         if current.dispatch_intent_id is None or current.dispatch_started_at is None:
             continue
-        attempt = DispatchAttempt(
-            current.dispatch_intent_id,
-            current.dispatch_started_at,
-            current.agent_type or "",
-            attempt=max(1, current.attempts),
-            controller_epoch=state.controller_epoch,
-            dispatch_generation=current.dispatch_generation,
-            ledger_floor=current.dispatch_ledger_floor,
-        )
+        attempt = DispatchAttempt.recorded_for(current, state.controller_epoch)
         _record_controller_event(
             current.id,
             "tl.dispatch_reconciliation_started",
@@ -8017,6 +8059,7 @@ def _emit_dispatch_confirmation(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    controller_epoch: str | None = None,
 ) -> None:
     if not _is_spawn_confirmation_event(event) or slice_id is None:
         return
@@ -8026,16 +8069,12 @@ def _emit_dispatch_confirmation(
         previous is None
         or current is None
         or previous.dispatch_intent_id is None
+        or previous.dispatch_started_at is None
         or current.dispatch_authoritative_event_seq is None
         or previous.dispatch_authoritative_event_seq == current.dispatch_authoritative_event_seq
     ):
         return
-    attempt = DispatchAttempt(
-        previous.dispatch_intent_id,
-        previous.dispatch_started_at or time.time(),
-        previous.agent_type or "",
-        attempt=previous.attempts,
-    )
+    attempt = DispatchAttempt.recorded_for(previous, controller_epoch)
     _record_controller_event(
         slice_id,
         "tl.dispatch_confirmed",
@@ -8579,6 +8618,12 @@ def _prepare_sub_tl_stage(
             internal_intent_id = hashlib.sha256(
                 f"{store.run_id}:{task.name}:{current.attempts + 1}".encode()
             ).hexdigest()[:32]
+            # This mints a fresh identity for a child controller, it does not
+            # rebuild a leaf dispatch, so it carries neither this run's
+            # controller epoch nor a dispatch generation. The child mints its
+            # own epoch, and the generation persisted below is the one the
+            # parent's publication binder compares the child's own PR event
+            # against, so it is not this run's attempt number.
             internal_attempt = DispatchAttempt(
                 internal_intent_id,
                 time.time() if config.active else 0.0,
@@ -11082,17 +11127,14 @@ def _prepare_spawn(
     else:
         model_id = route.model
 
-    # The ledger floor is carried forward so a refusal for this attempt is read
-    # from the position its intent was issued at. The epoch and generation are
-    # left as this path already produced them.
-    intent = DispatchAttempt(
-        intent.intent_id,
-        intent.started_at,
-        choice.harness,
-        route.agent_type,
-        model_id,
-        intent.attempt,
-        ledger_floor=intent.ledger_floor,
+    # Only the selected route is attached here. The intent identity, its
+    # ledger floor, and the controller epoch and dispatch generation this
+    # attempt was minted with are carried through by construction, so a
+    # policy-path dispatch records the same provenance as a direct one.
+    intent = intent.routed(
+        harness=choice.harness,
+        agent_type=route.agent_type,
+        model=model_id,
     )
 
     def record_spawn(document: dict[str, object]) -> dict[str, object]:

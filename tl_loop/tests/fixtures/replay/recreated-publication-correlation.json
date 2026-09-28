@@ -10,6 +10,13 @@
   },
   "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
   "predecessor_controller_epoch": "1111aaaa2222bbbb3333cccc4444dddd",
+  "dispatch_provenance": {
+    "child_scope": "recreate-stage",
+    "slice_id": "recreated-leaf",
+    "intent_id": "ffec2635a1c70770eb09d8549b5b5e4c",
+    "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
+    "dispatch_generation": 1
+  },
   "plan": {
     "sub_tls": [
       {
