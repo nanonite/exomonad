@@ -23,6 +23,12 @@ Modules
     Bounded waits on durable boundaries only: a committed record, a registry
     entry, or a refusal. There is deliberately no "wait for the count to stop
     changing" helper.
+``tmuxio``
+    The only place a harness may talk to tmux. Every call names the run's own
+    socket, and ``child_env`` strips ``TMUX``/``TMUX_PANE`` from a child's
+    environment, because tmux resolves its server from the inherited ``TMUX``
+    before it looks at anything else -- which is how a harness running inside a
+    pane can end up stopping somebody else's server.
 
 Importing this package requires ``tests/e2e/lib`` on ``sys.path``::
 

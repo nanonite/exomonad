@@ -30,6 +30,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "tests" / "e2e" / "lib"))
 
 import e2e_harness.cleanup as cl  # noqa: E402
 import e2e_harness.forgejo_stack as fj  # noqa: E402
+import e2e_harness.tmuxio as tmuxio  # noqa: E402
 import real_server_transport as real  # noqa: E402
 
 #: The shared harness's own failure type, re-exported so the driver can treat a
@@ -117,27 +118,20 @@ def session_name(scope: cl.RunScope) -> str:
     return scope.track_session(scope.session_prefix)
 
 
-def kill_session(session: str) -> None:
-    """Kill exactly one named session, reporting no error when it is gone."""
-    subprocess.run(
-        ["tmux", "kill-session", "-t", session],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def kill_session(socket: Path, session: str) -> None:
+    """Kill one session on a named server, reporting no error when it is gone.
+
+    The socket is required rather than optional: a bare tmux call resolves the
+    server from the inherited ``TMUX`` variable first, so a harness running
+    inside a pane would kill a session on somebody else's server while its own
+    kept running.
+    """
+    tmuxio.tmux(socket, "kill-session", "-t", session)
 
 
-def session_exists(session: str) -> bool:
-    """Report whether a named tmux session exists."""
-    return (
-        subprocess.run(
-            ["tmux", "has-session", "-t", session],
-            check=False,
-            capture_output=True,
-            text=True,
-        ).returncode
-        == 0
-    )
+def session_exists(socket: Path, session: str) -> bool:
+    """Report whether a named session exists on a named server."""
+    return tmuxio.tmux(socket, "has-session", "-t", session).returncode == 0
 
 
 @dataclass(frozen=True)
@@ -210,7 +204,7 @@ class Project:
         try:
             real.stop_subprocess(self.process, "acceptance server")
         finally:
-            kill_session(self.run.session)
+            kill_session(self.run.scope.tmux_socket, self.run.session)
 
 
 def _clone(root: Path, instance: fj.Instance) -> Path:
@@ -359,22 +353,57 @@ def _provision_controller_worktree(run: Run) -> None:
 
 
 def _start_session(run: Run) -> None:
-    """Create this run's tmux session and give it the acceptance's PATH."""
+    """Create this run's tmux session on this run's own server.
+
+    The session is created with an environment built by ``tmuxio.child_env``,
+    so the server that hosts it is started by *this* call with the run's own
+    ``PATH`` and ``CHAINLINK_DB``. That is what makes the agent shims and the
+    disposable database reach the windows the server opens afterwards, without
+    any of it being visible to a tmux server this run does not own.
+    """
     fake_bin = _fake_agent_bin(run)
     test_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
-    real.run_command(
-        ["tmux", "new-session", "-d", "-s", run.session, "-n", "TL", "sleep", "600"]
+    socket = run.scope.tmux_socket
+    environment = tmuxio.child_env(
+        run.scope.root,
+        {
+            **os.environ,
+            "PATH": test_path,
+            "CHAINLINK_DB": str(run.chainlink_db),
+        },
     )
-    real.run_command(["tmux", "set-environment", "-t", run.session, "PATH", test_path])
-    real.run_command(
-        [
-            "tmux",
-            "set-environment",
-            "-t",
-            run.session,
-            "CHAINLINK_DB",
-            str(run.chainlink_db),
-        ]
+    tmuxio.tmux(
+        socket,
+        "new-session",
+        "-d",
+        "-s",
+        run.session,
+        "-n",
+        "TL",
+        "sleep",
+        "600",
+        check=True,
+        env=environment,
+    )
+    tmuxio.tmux(
+        socket,
+        "set-environment",
+        "-t",
+        run.session,
+        "PATH",
+        test_path,
+        check=True,
+        env=environment,
+    )
+    tmuxio.tmux(
+        socket,
+        "set-environment",
+        "-t",
+        run.session,
+        "CHAINLINK_DB",
+        str(run.chainlink_db),
+        check=True,
+        env=environment,
     )
 
 
@@ -385,7 +414,14 @@ def _serve(run: Run, port: int, log_name: str) -> Project:
     process = subprocess.Popen(
         [str(exomonad_binary()), "serve"],
         cwd=run.repo,
-        env={**os.environ, "PATH": test_path, "CHAINLINK_DB": str(run.chainlink_db)},
+        env=tmuxio.child_env(
+            run.scope.root,
+            {
+                **os.environ,
+                "PATH": test_path,
+                "CHAINLINK_DB": str(run.chainlink_db),
+            },
+        ),
         stdout=log,
         stderr=log,
         text=True,
@@ -399,7 +435,7 @@ def _serve(run: Run, port: int, log_name: str) -> Project:
         real.wait_for_server(client, process, Path(log.name))
     except BaseException:
         real.stop_subprocess(process, "acceptance server startup")
-        kill_session(run.session)
+        kill_session(run.scope.tmux_socket, run.session)
         raise
     return Project(run=run, port=port, process=process, client=client)
 

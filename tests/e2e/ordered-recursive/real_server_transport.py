@@ -39,6 +39,30 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "tests" / "e2e" / "lib"))
+
+import e2e_harness.tmuxio as tmuxio  # noqa: E402
+
+#: The marker ``start_server`` leaves so anything that has to stop this run's
+#: tmux session can name the server that session lives on. Without it a bare
+#: ``tmux`` call resolves the server from the inherited ``TMUX`` variable, which
+#: is the outer server whenever the harness itself runs inside a pane.
+TMUX_SOCKET_MARKER = ".exo/e2e-tmux-socket"
+
+
+def tmux_socket(repo: Path) -> Path:
+    """Return the socket of the server this project's session lives on."""
+    marker = repo / TMUX_SOCKET_MARKER
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise HarnessError(
+            f"no tmux socket marker at {marker}; the project's server was never "
+            "started through start_server"
+        ) from error
+    if not value:
+        raise HarnessError(f"the tmux socket marker is empty: {marker}")
+    return Path(value)
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import (
@@ -145,11 +169,8 @@ class RecoveryTrace:
                 raise HarnessError(f"invalid recovery action journal: {journal_path}")
             journal = payload
         session = f"ordered-server-e2e-{os.getpid()}"
-        panes = subprocess.run(
-            ["tmux", "list-panes", "-t", session, "-F", "#{pane_id}"],
-            check=False,
-            capture_output=True,
-            text=True,
+        panes = tmuxio.tmux(
+            tmux_socket(repo), "list-panes", "-t", session, "-F", "#{pane_id}"
         )
         record = {
             "boundary": boundary,
@@ -540,6 +561,17 @@ class DelayedAggregateEventSource:
             "data": data,
         }
         return project(raw)
+
+
+def run_command_tmux(socket: Path, *arguments: str) -> str:
+    """Run one tmux command against a named server, failing closed on error."""
+    result = tmuxio.tmux(socket, *arguments)
+    if result.returncode:
+        raise HarnessError(
+            f"tmux {' '.join(arguments)} failed ({result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return result.stdout.strip()
 
 
 def run_command(command: list[str], cwd: Path | None = None) -> str:
@@ -1027,25 +1059,40 @@ def start_server(
         fake_codex.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
     fake_codex.chmod(0o755)
     test_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
-    run_command(
-        ["tmux", "new-session", "-d", "-s", session, "-n", "TL", "sleep", "300"]
-    )
-    run_command(["tmux", "set-environment", "-t", session, "PATH", test_path])
-    if chainlink_db is not None:
-        run_command(
-            [
-                "tmux",
-                "set-environment",
-                "-t",
-                session,
-                "CHAINLINK_DB",
-                str(chainlink_db),
-            ]
-        )
-    log = (root / "server.log").open("w", encoding="utf-8")
-    environment = {**os.environ, "PATH": test_path}
+    socket = tmuxio.socket_path(root)
+    environment = tmuxio.child_env(root, {**os.environ, "PATH": test_path})
     if chainlink_db is not None:
         environment["CHAINLINK_DB"] = str(chainlink_db)
+    marker = repo / TMUX_SOCKET_MARKER
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"{socket}\n", encoding="utf-8")
+    tmuxio.tmux(
+        socket,
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-n",
+        "TL",
+        "sleep",
+        "300",
+        check=True,
+        env=environment,
+    )
+    tmuxio.tmux(
+        socket, "set-environment", "-t", session, "PATH", test_path, check=True
+    )
+    if chainlink_db is not None:
+        tmuxio.tmux(
+            socket,
+            "set-environment",
+            "-t",
+            session,
+            "CHAINLINK_DB",
+            str(chainlink_db),
+            check=True,
+        )
+    log = (root / "server.log").open("w", encoding="utf-8")
     process = subprocess.Popen(
         [str(binary), "serve"],
         cwd=repo,
@@ -1053,6 +1100,10 @@ def start_server(
         stdout=log,
         stderr=log,
         text=True,
+        # Its own process group, so a teardown can signal it without the signal
+        # reaching the harness, and without the inherited TMUX variable letting
+        # the server's own tmux calls reach an outer server.
+        start_new_session=True,
     )
     client = TransportClient(project_root=repo, timeout=5)
     try:
@@ -1081,16 +1132,15 @@ def stop_server(process: subprocess.Popen[str], repo: Path, label: str) -> None:
     stop_subprocess(process, label)
     session_path = repo / ".exo" / "e2e-tmux-session"
     try:
-        session = session_path.read_text(encoding="utf-8").strip()
+        session = session_path.read_text(encoding="utf-8").strip().removesuffix("\\n").strip()
     except OSError:
         return
     if session:
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            socket = tmux_socket(repo)
+        except HarnessError:
+            return
+        tmuxio.tmux(socket, "kill-session", "-t", session)
 
 
 def cleanup_external_case(
@@ -1294,16 +1344,15 @@ def stop_spawned_worker(repo: Path, worker_name: str) -> None:
         for line in config.splitlines()
         if line.startswith("tmux_session =")
     )
+    socket = tmux_socket(repo)
     try:
-        windows = run_command(
-            [
-                "tmux",
-                "list-panes",
-                "-t",
-                session,
-                "-F",
-                "#{window_id}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{pane_start_command}",
-            ]
+        windows = run_command_tmux(
+            socket,
+            "list-panes",
+            "-t",
+            session,
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{pane_start_command}",
         )
     except HarnessError as error:
         if "can't find session" in str(error):
@@ -1313,17 +1362,15 @@ def stop_spawned_worker(repo: Path, worker_name: str) -> None:
         line.split("\t", 1)[0] for line in windows.splitlines() if worker_name in line
     }
     for window_id in sorted(window_ids):
-        run_command(["tmux", "kill-window", "-t", window_id])
-    remaining = run_command(
-        [
-            "tmux",
-            "list-panes",
-            "-t",
-            session,
-            "-a",
-            "-F",
-            "#{pane_title}\t#{pane_current_command}\t#{pane_start_command}",
-        ]
+        run_command_tmux(socket, "kill-window", "-t", window_id)
+    remaining = run_command_tmux(
+        socket,
+        "list-panes",
+        "-t",
+        session,
+        "-a",
+        "-F",
+        "#{pane_title}\t#{pane_current_command}\t#{pane_start_command}",
     )
     if any(worker_name in line for line in remaining.splitlines()):
         raise HarnessError(f"temporary worker window survived cleanup: {worker_name}")
@@ -3136,10 +3183,11 @@ def main() -> None:
                     stop_subprocess(server, "ExoMonad server")
                 except Exception as error:  # noqa: BLE001 - cleanup must continue for every error
                     cleanup_errors.append(str(error))
-            subprocess.run(
-                ["tmux", "kill-session", "-t", f"ordered-server-e2e-{os.getpid()}"],
-                check=False,
-                capture_output=True,
+            tmuxio.tmux(
+                tmuxio.socket_path(root),
+                "kill-session",
+                "-t",
+                f"ordered-server-e2e-{os.getpid()}",
             )
             try:
                 stop_subprocess(mock, "mock API")

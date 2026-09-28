@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from . import tmuxio
+
 #: Where run directories are created.
 TEMP_ROOT = "/tmp"
 
@@ -109,6 +111,15 @@ class RunScope:
             )
         return prefix
 
+    @property
+    def tmux_socket(self) -> Path:
+        """Return the absolute socket of the tmux server this run owns.
+
+        Every tmux call this run makes names this socket, so a harness running
+        inside somebody else's pane still talks only to its own server.
+        """
+        return tmuxio.socket_path(self.root)
+
     def track_session(self, session: str) -> str:
         """Record a tmux session this run created."""
         if not session.startswith(self.session_prefix):
@@ -147,8 +158,12 @@ class RunScope:
             return list(self.problems)
         self.released = True
         for session in sorted(self.sessions):
-            self.problems.extend(_kill_session(session))
+            self.problems.extend(_kill_session(self.tmux_socket, session))
         self.sessions.clear()
+        # The server itself is a resource too: killing its sessions leaves it
+        # listening on a socket inside a directory this teardown is about to
+        # remove, and an unreachable server is still a running process.
+        self.problems.extend(tmuxio.kill_server(self.tmux_socket))
         for pid, label in sorted(self.processes.items()):
             self.problems.extend(_kill_process(pid, label))
         self.processes.clear()
@@ -177,7 +192,7 @@ class RunScope:
         if self.keep:
             return []
         found: list[str] = []
-        found.extend(_sessions_with_prefix(self.session_prefix))
+        found.extend(_sessions_with_prefix(self.tmux_socket, self.session_prefix))
         found.extend(_processes_under(self.root))
         found.extend(_compose_projects_with_prefix(self.session_prefix))
         found.extend(_volumes_with_prefix(self.session_prefix))
@@ -218,32 +233,19 @@ def install_trap(scope: RunScope) -> Callable[[], None]:
     return handler
 
 
-def _kill_session(session: str) -> list[str]:
-    """Kill one named tmux session and report whether it is gone."""
-    subprocess.run(
-        ["tmux", "kill-session", "-t", session],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def _kill_session(socket: Path, session: str) -> list[str]:
+    """Kill one named session on a named server and report whether it is gone."""
+    tmuxio.tmux(socket, "kill-session", "-t", session)
     deadline = time.monotonic() + TMUX_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        if not _session_exists(session):
+        if not _session_exists(socket, session):
             return []
         time.sleep(0.1)
     return [f"tmux session survived cleanup: {session}"]
 
 
-def _session_exists(session: str) -> bool:
-    return (
-        subprocess.run(
-            ["tmux", "has-session", "-t", session],
-            check=False,
-            capture_output=True,
-            text=True,
-        ).returncode
-        == 0
-    )
+def _session_exists(socket: Path, session: str) -> bool:
+    return tmuxio.tmux(socket, "has-session", "-t", session).returncode == 0
 
 
 def _kill_process(pid: int, label: str) -> list[str]:
@@ -373,15 +375,11 @@ def _command_line(entry: Path) -> str:
     return " ".join(part for part in raw.decode("utf-8", "replace").split("\0") if part)
 
 
-def _sessions_with_prefix(prefix: str) -> list[str]:
-    """Return every live tmux session carrying the run's prefix."""
-    result = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name}"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+def _sessions_with_prefix(socket: Path, prefix: str) -> list[str]:
+    """Return every live session on a named server carrying the run's prefix."""
+    result = tmuxio.tmux(socket, "list-sessions", "-F", "#{session_name}")
     if result.returncode:
+        # No server on this socket means no sessions on it either.
         return []
     return [
         f"tmux session survived cleanup: {name}"
@@ -475,11 +473,15 @@ def sweep_stale(
     """
     problems: list[str] = []
     roots = stale_run_roots(run_directory_prefix)
+    # A stale run's tmux server is stopped first: killing a server kills every
+    # session and window on it, which is what holds the agents and the server
+    # the run started. Each socket lives inside a run directory, so a sweep can
+    # only ever reach the servers of runs whose directories it has found -- it
+    # cannot reach anybody else's.
+    for root in roots:
+        problems.extend(tmuxio.kill_server(tmuxio.socket_path(Path(root))))
     for pid, cwd, command in processes_in_scopes(roots):
         problems.extend(_kill_process(int(pid), f"stale process in {cwd} ({command})"))
-    for name in _sessions_with_prefix(run_prefix):
-        session = name.split(": ", 1)[-1]
-        problems.extend(_kill_session(session))
     for project in _compose_projects():
         if project.startswith(run_prefix):
             problems.extend(

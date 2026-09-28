@@ -48,6 +48,7 @@ from tl_loop.client.transport import ServerError, TransportError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 import e2e_harness.forgejo_stack as forgejo  # noqa: E402
+import e2e_harness.tmuxio as tmuxio  # noqa: E402
 from e2e_harness.waiter import await_boundary  # noqa: E402
 
 
@@ -414,7 +415,7 @@ def t2_recreate_preserves_branch(project: Project) -> dict[str, Any]:
     session, pid = project.session, project.process.pid
     project.close()
     require(
-        not pj.session_exists(session),
+        not pj.session_exists(project.run.scope.tmux_socket, session),
         f"the acceptance's own tmux session {session} survived close()",
     )
     require(
@@ -532,11 +533,7 @@ def _stop_leaf_agent(project: Project) -> None:
     window = routing.get("window_id") if isinstance(routing, Mapping) else None
     if not isinstance(window, str) or not window:
         return
-    subprocess.run(
-        ["tmux", "kill-window", "-t", window],
-        check=False,
-        capture_output=True,
-    )
+    tmuxio.tmux(project.run.scope.tmux_socket, "kill-window", "-t", window)
 
 
 def _restore_leaf_worktree(project: Project) -> None:
@@ -1399,28 +1396,27 @@ def _liveness_inputs(project: Project) -> dict[str, Any]:
         "invocation_ended_at": invocation.get("ended_at") if invocation else None,
         "invocation_trigger": invocation.get("trigger") if invocation else None,
         "routing_window": window,
-        "tmux_panes_for_window": _tmux_panes(project.session, window),
+        "tmux_panes_for_window": _tmux_panes(
+            project.run.scope.tmux_socket, project.session, window
+        ),
     }
 
 
-def _tmux_panes(session: str, window: Any) -> list[str]:
+def _tmux_panes(socket: Path, session: str, window: Any) -> list[str]:
     """Return tmux's own rows for one window, in the shipped check's format.
 
     The shipped probe reads exactly this listing and requires a row whose
     session name matches the server's configured session, so recording it shows
-    whether the probe would find a live pane for that window.
+    whether the probe would find a live pane for that window. The listing is
+    taken from the run's own server, so a row here cannot be a window on an
+    outer server that merely happens to carry the same name.
     """
-    result = subprocess.run(
-        [
-            "tmux",
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_dead}",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+    result = tmuxio.tmux(
+        socket,
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_dead}",
     )
     if result.returncode:
         return [f"tmux list-panes failed: {result.stderr.strip()}"]

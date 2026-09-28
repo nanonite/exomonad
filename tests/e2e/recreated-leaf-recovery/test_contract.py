@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,7 @@ sys.path.insert(0, str(HARNESS))
 sys.path.insert(0, str(LIB_DIR))
 
 import e2e_harness.cleanup as cl  # noqa: E402
+import e2e_harness.tmuxio as tmuxio  # noqa: E402
 import evidence as ev  # noqa: E402
 import project as pj  # noqa: E402
 import scenarios as sc  # noqa: E402
@@ -586,12 +588,7 @@ def _docker_available() -> bool:
 
 
 def _tmux_available() -> bool:
-    return (
-        subprocess.run(
-            ["tmux", "-V"], check=False, capture_output=True
-        ).returncode
-        == 0
-    )
+    return shutil.which("tmux") is not None
 
 
 @pytest.fixture
@@ -625,8 +622,16 @@ def _start_probe_session(scope: cl.RunScope) -> str:
     the server's limit, which is the mistake this contract exists to prevent.
     """
     session = scope.track_session(scope.session_prefix)
-    subprocess.run(
-        ["tmux", "new-session", "-d", "-s", session, "-n", "probe", "sleep", "600"],
+    tmuxio.tmux(
+        scope.tmux_socket,
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-n",
+        "probe",
+        "sleep",
+        "600",
         check=True,
     )
     return session
@@ -644,14 +649,14 @@ def test_teardown_removes_the_session_and_the_process_it_started(scope):
         subprocess.Popen(["sleep", "600"], cwd=scope.root, start_new_session=True),
         "probe process",
     )
-    assert cl._session_exists(session)
+    assert cl._session_exists(scope.tmux_socket, session)
     assert cl._process_alive(process.pid)
 
     problems = scope.teardown()
 
     assert problems == []
     assert scope.leaks() == []
-    assert not cl._session_exists(session)
+    assert not cl._session_exists(scope.tmux_socket, session)
     assert not cl._process_alive(process.pid)
     assert not scope.root.exists()
 
@@ -669,12 +674,20 @@ def test_teardown_is_idempotent(scope):
 def test_a_leaked_session_is_reported_rather_than_ignored(scope):
     """The scope fails the run when a session it owns is still there."""
     session = f"{scope.session_prefix}orphan"
-    subprocess.run(
-        ["tmux", "new-session", "-d", "-s", session, "-n", "probe", "sleep", "600"],
+    tmuxio.tmux(
+        scope.tmux_socket,
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-n",
+        "probe",
+        "sleep",
+        "600",
         check=True,
     )
     scope.sessions.add(session)
-    found = cl._sessions_with_prefix(scope.session_prefix)
+    found = cl._sessions_with_prefix(scope.tmux_socket, scope.session_prefix)
     assert found == [f"tmux session survived cleanup: {session}"]
     assert scope.leaks() != []
     with pytest.raises(cl.CleanupError) as failure:
@@ -799,8 +812,16 @@ def test_a_sweep_reclaims_a_run_that_was_killed_before_its_teardown():
         ["sleep", "600"], cwd=root, start_new_session=True
     )
     session = f"{prefix}session"
-    subprocess.run(
-        ["tmux", "new-session", "-d", "-s", session, "-n", "probe", "sleep", "600"],
+    tmuxio.tmux(
+        tmuxio.socket_path(root),
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-n",
+        "probe",
+        "sleep",
+        "600",
         check=True,
     )
     # No scope is created and no teardown is ever called: this run is aborted.
@@ -815,13 +836,11 @@ def test_a_sweep_reclaims_a_run_that_was_killed_before_its_teardown():
         if cl._process_alive(process.pid):
             process.terminate()
             process.wait(timeout=30)
-        subprocess.run(
-            ["tmux", "kill-session", "-t", session], check=False, capture_output=True
-        )
+        tmuxio.tmux(tmuxio.socket_path(root), "kill-session", "-t", session)
         shutil.rmtree(root, ignore_errors=True)
 
     assert not cl._process_alive(process.pid)
-    assert not cl._session_exists(session)
+    assert not cl._session_exists(tmuxio.socket_path(root), session)
     assert not root.exists()
     assert cl.processes_in_scopes([str(root)]) == []
 
@@ -952,3 +971,203 @@ def test_the_scope_tracks_a_process_that_runs_in_its_own_session():
 def _compose_file() -> Path:
     """Return the shared disposable Forgejo template."""
     return PROJECT_ROOT / "tests" / "e2e" / "lib" / "forgejo" / "docker-compose.yml"
+
+
+# --------------------------------------------------------------------------
+# The tmux boundary
+# --------------------------------------------------------------------------
+
+
+#: Harness modules that predate the shared wrapper. Each one creates its
+#: sessions from its own shell entry point and has no run directory to name a
+#: socket from, so converting them means changing their shell entry points too
+#: -- a separate change from the shared package this contract guards. Anything
+#: *not* in this set must go through ``e2e_harness.tmuxio``.
+LEGACY_TMUX_CALLERS = frozenset(
+    {
+        "tests/e2e/init-continue/run.py",
+        "tests/e2e/ordered-recursive/ordered_recursive.py",
+        "tests/e2e/pre-pr-recovery-fsm/run.py",
+        "tests/e2e/task-blocked-human-gate/run.py",
+        "tests/e2e/tl-loop-active/active_run.py",
+        "tests/e2e/tl-loop-shadow/shadow_companion.py",
+    }
+)
+
+#: A tmux *invocation*: the binary as an argv element, or a shell command line
+#: that starts with it. A bare ``tmux`` resolves its server from the inherited
+#: ``TMUX`` variable first, so an invocation that does not pass ``-S`` talks to
+#: whichever server owns the caller's pane.
+_TMUX_ARGV = re.compile(r"""\[\s*["']tmux["']|[,\[]\s*["']tmux["']\s*,""")
+_TMUX_SHELL = re.compile(
+    r"""^\s*tmux\s+(?:-[A-Za-z]+\s+)*(?:new-session|kill-session|has-session|"""
+    r"""kill-window|new-window|set-environment|list-sessions|list-windows|"""
+    r"""list-panes|capture-pane|display-message|send-keys|kill-server)"""
+)
+
+
+def _tmux_bypasses(path: Path) -> list[int]:
+    """Return the line numbers where a file invokes tmux outside the wrapper."""
+    offenders: list[int] = []
+    for number, line in enumerate(
+        path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+    ):
+        if line.strip().startswith("#"):
+            continue
+        if _TMUX_ARGV.search(line) or _TMUX_SHELL.search(line):
+            offenders.append(number)
+    return offenders
+
+
+#: The harness trees that share a run scope, and therefore a socket to name.
+#: Their shell entry points are guarded too, because a ``run.sh`` that reaches
+#: for a bare ``tmux`` is exactly how a session ends up on somebody else's
+#: server.
+SHARED_HARNESS_TREES = (
+    "tests/e2e/lib/",
+    "tests/e2e/recreated-leaf-recovery/",
+    "tests/e2e/recursive-crash-convergence/",
+    "tests/e2e/ordered-recursive/",
+)
+
+
+def _tmux_guard_targets() -> list[Path]:
+    """Return every file the wrapper contract holds to account.
+
+    Every Python driver under ``tests/e2e`` is in scope: a driver is the thing
+    that owns a run, and the wrapper is a Python module. Shell scripts are in
+    scope only inside the shared harness trees, where the shell entry point and
+    the run scope are the same program. The harnesses outside those trees predate
+    the shared package, create their sessions from their own shell, and are named
+    individually in ``LEGACY_TMUX_CALLERS`` when they also drive tmux from
+    Python.
+    """
+    targets: list[Path] = []
+    for path in sorted((PROJECT_ROOT / "tests" / "e2e").rglob("*")):
+        if path.suffix not in {".py", ".sh"} or path.name == "tmuxio.py":
+            continue
+        if path.suffix == ".py":
+            targets.append(path)
+            continue
+        relative = path.relative_to(PROJECT_ROOT).as_posix()
+        if relative.startswith(SHARED_HARNESS_TREES):
+            targets.append(path)
+    return targets
+
+
+def test_no_harness_bypasses_the_shared_tmux_wrapper() -> None:
+    """Nothing in scope may talk to tmux without naming its server.
+
+    A bare ``tmux`` resolves the server from the inherited ``TMUX`` variable
+    *before* it reads ``TMUX_TMPDIR`` or any ``-S`` flag, so a harness started
+    from inside a pane silently addresses the server that owns the pane. That is
+    how a harness whose docstring claimed the operator's sessions were
+    unreachable ended up killing them. Every call therefore has to go through
+    ``e2e_harness.tmuxio``, which names the run's own socket and strips ``TMUX``
+    so nothing can override it.
+    """
+    found: dict[str, list[int]] = {}
+    for path in _tmux_guard_targets():
+        relative = path.relative_to(PROJECT_ROOT).as_posix()
+        if relative in LEGACY_TMUX_CALLERS:
+            continue
+        lines = _tmux_bypasses(path)
+        if lines:
+            found[relative] = lines
+    assert not found, (
+        "tmux must only be invoked through e2e_harness.tmuxio; add -S with the "
+        f"run's own socket instead: {found}"
+    )
+
+
+def test_the_legacy_tmux_exemptions_are_still_real() -> None:
+    """The exemption list cannot rot: every entry still exists and still calls tmux.
+
+    An allowlist that keeps entries after they were converted stops describing
+    anything, so each one has to keep justifying itself.
+    """
+    for relative in sorted(LEGACY_TMUX_CALLERS):
+        path = PROJECT_ROOT / relative
+        assert path.is_file(), f"legacy tmux exemption no longer exists: {relative}"
+        assert _tmux_bypasses(path), (
+            f"legacy tmux exemption no longer calls tmux; drop it: {relative}"
+        )
+
+
+@pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
+def test_teardown_cannot_reach_a_tmux_server_outside_the_run(tmp_path: Path) -> None:
+    """A run started from inside a pane must not stop that pane's server.
+
+    The outer server here stands in for the operator's: its socket is put in
+    ``TMUX`` exactly as a pane would carry it, and the harness's own teardown
+    and stale-run sweep are then run with that variable set. Both must touch
+    only the run's own server, which is why the run's session is gone
+    afterwards while the outer session is still there.
+    """
+    outer_root = tmp_path / "outer"
+    outer_root.mkdir()
+    outer_socket = tmuxio.socket_path(outer_root)
+    outer_session = "exo-e2e-outer-server-guard"
+    tmuxio.tmux(
+        outer_socket,
+        "new-session",
+        "-d",
+        "-s",
+        outer_session,
+        "sleep",
+        "600",
+        check=True,
+    )
+    previous = os.environ.get("TMUX")
+    stale_root = cl.make_root("/tmp", PREFIX)
+    scope = cl.RunScope(
+        run_id=f"guard{os.getpid()}", root=cl.make_root("/tmp", PREFIX), prefix=PREFIX
+    )
+    session = scope.track_session(scope.session_prefix)
+    stale_session = f"{PREFIX}stale-guard"
+    os.environ["TMUX"] = f"{outer_socket},{os.getpid()},0"
+    try:
+        tmuxio.tmux(
+            scope.tmux_socket,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-n",
+            "probe",
+            "sleep",
+            "600",
+            check=True,
+        )
+        tmuxio.tmux(
+            tmuxio.socket_path(stale_root),
+            "new-session",
+            "-d",
+            "-s",
+            stale_session,
+            "sleep",
+            "600",
+            check=True,
+        )
+        assert tmuxio.server_alive(outer_socket)
+        assert tmuxio.server_alive(scope.tmux_socket)
+
+        assert scope.teardown() == []
+        assert cl.sweep_stale(PREFIX, _compose_file(), PREFIX) == []
+        assert scope.leaks() == []
+
+        # The outer server is untouched by both, and both of the run's servers
+        # are gone.
+        assert tmuxio.tmux(
+            outer_socket, "has-session", "-t", outer_session
+        ).returncode == 0, "the outer tmux server lost its session"
+        assert not scope.tmux_socket.parent.is_dir()
+        assert not tmuxio.server_alive(tmuxio.socket_path(stale_root))
+    finally:
+        if previous is None:
+            os.environ.pop("TMUX", None)
+        else:
+            os.environ["TMUX"] = previous
+        tmuxio.tmux(outer_socket, "kill-server")
+        shutil.rmtree(stale_root, ignore_errors=True)
+        shutil.rmtree(scope.root, ignore_errors=True)

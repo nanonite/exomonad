@@ -57,6 +57,7 @@ sys.path.insert(0, str(ORDERED_DIR))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import real_server_transport as real
+import e2e_harness.tmuxio as tmuxio
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import ServerError
@@ -134,11 +135,7 @@ def _kill_tmux_session(repo: Path) -> None:
     session = marker.read_text(encoding="utf-8").strip().removesuffix("\\n").strip()
     if not session:
         return
-    subprocess.run(
-        ["tmux", "kill-session", "-t", session],
-        check=False,
-        capture_output=True,
-    )
+    tmuxio.tmux(real.tmux_socket(repo), "kill-session", "-t", session)
 
 
 def _identity(repo: Path, agent_name: str) -> dict[str, Any] | None:
@@ -1079,10 +1076,11 @@ def main() -> int:
             print(f"FAIL: {error}", file=sys.stderr)
             return 1
         finally:
-            subprocess.run(
-                ["tmux", "kill-session", "-t", f"ordered-recovery-recreate-{os.getpid()}"],
-                check=False,
-                capture_output=True,
+            tmuxio.tmux(
+                tmuxio.socket_path(root / "recreate"),
+                "kill-session",
+                "-t",
+                f"ordered-recovery-recreate-{os.getpid()}",
             )
             shutil.rmtree(root / "identity", ignore_errors=True)
             shutil.rmtree(root / "continuation", ignore_errors=True)
