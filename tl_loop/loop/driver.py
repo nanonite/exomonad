@@ -487,6 +487,13 @@ class DispatchAttempt:
     model: str | None = None
     attempt: int = 0
     controller_epoch: str | None = None
+    #: The per-slice dispatch attempt counter under the current controller epoch.
+    #:
+    #: It is minted with the intent and persisted on the slice in the same write,
+    #: so the intent events, the checkpoint, and every later reconstruction report
+    #: one generation for one dispatch. A spawn observation that carries a
+    #: generation is adopted only when it names this one, which is what refuses a
+    #: confirmation that belongs to an earlier attempt of the same intent.
     dispatch_generation: int = 0
     #: The consumed ledger position when this intent was recorded.
     #:
@@ -6273,6 +6280,9 @@ def _record_dispatch_retry_scheduled(
         dispatch_retry_for_attempt=attempt.attempt,
         dispatch_intent_id=None,
         dispatch_started_at=None,
+        # The rejected attempt created nothing, so its generation dies with its
+        # intent; the re-drive mints the next one with the same boundary.
+        dispatch_generation=0,
         dispatch_agent_id=None,
         dispatch_invocation_id=None,
         dispatch_authoritative_event_seq=None,
@@ -11066,6 +11076,7 @@ def _prepare_spawn(
             dispatch_error=None,
             dispatch_error_code=None,
             dispatch_ledger_floor=intent.ledger_floor,
+            dispatch_generation=intent.dispatch_generation,
             dispatch_next_attempt_at=None,
             dispatch_retry_for_attempt=0,
             dispatch_agent_id=None,
@@ -11157,6 +11168,7 @@ def _prepare_spawn(
                 "dispatch_error": None,
                 "dispatch_error_code": None,
                 "dispatch_ledger_floor": intent.ledger_floor,
+                "dispatch_generation": intent.dispatch_generation,
                 "dispatch_next_attempt_at": None,
                 "dispatch_retry_for_attempt": 0,
                 "dispatch_agent_id": None,

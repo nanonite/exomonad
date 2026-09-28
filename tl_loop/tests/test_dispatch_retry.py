@@ -363,6 +363,9 @@ def test_a_scheduled_retry_never_claims_a_leaf_exists(tmp_path: Path) -> None:
     assert persisted.dispatch_agent_id is None
     assert persisted.dispatch_invocation_id is None
     assert persisted.dispatch_started_at is None
+    # The refused attempt's generation dies with its intent; the re-drive mints
+    # the next one with the same boundary.
+    assert persisted.dispatch_generation == 0
     assert persisted.dispatch_last_boundary == "dispatch_retry_scheduled"
     assert persisted.dispatch_error_code == BRANCH_EXISTS
     assert result.final_state.gates == ()

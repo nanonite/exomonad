@@ -233,9 +233,9 @@ def test_recreated_generation_is_the_only_owner_of_the_leaf(tmp_path: Path) -> N
     assert state["base_ref"] == BASE_BRANCH
     assert state["dispatch_agent_id"] == LEAF_AGENT_ID
     assert state["dispatch_invocation_id"] == RECREATED_INVOCATION
-    # The leaf owns dispatch generation 0 of the recreated generation; the
-    # persisted checkpoint omits the zero rather than inventing a predecessor.
-    assert state.get("dispatch_generation", 0) == 0
+    # The leaf owns dispatch generation 1: the recreated generation's first
+    # dispatch attempt, the one this scope minted its intent with.
+    assert state["dispatch_generation"] == 1
 
 
 def test_the_recreated_policy_dispatch_records_the_generation_its_publication_binds(
@@ -293,6 +293,31 @@ def test_the_recreated_policy_dispatch_records_the_generation_its_publication_bi
     }
     assert [row["run_seq"] for row in _audit_rows(root)] == [HISTORICAL_RUN_SEQ]
     assert _pending_seqs(root) == []
+
+
+def test_a_dispatch_confirmed_by_another_generation_is_never_adopted(tmp_path: Path) -> None:
+    """A confirmation naming another dispatch attempt proves no owner.
+
+    The row is the baseline row with one field changed, so the intent, the
+    agent, and the controller epoch are all exact: only the generation it claims
+    is not the one the persisted slice holds for that intent.
+    """
+    root = tmp_path / "other-generation-dispatch"
+    _replay(
+        root,
+        _patched(DISPATCH_CONFIRMATION, {"data": {"dispatch_generation": 2}}),
+    )
+    baseline = tmp_path / "baseline"
+    _replay(baseline, _rows(BASELINE_ROWS))
+
+    state = _child_document(root)["slices"][LEAF]
+    # The persisted generation is the one the baseline confirmed.
+    assert state["dispatch_generation"] == 1
+    assert state.get("dispatch_agent_id") is None
+    assert state.get("dispatch_invocation_id") is None
+    assert state.get("publication") is None
+    assert _leaf_state(baseline)["publication"]["pr_number"] == 102
+    assert _leaf_state(root).get("publication") is None
 
 
 def test_a_dispatch_confirmed_by_a_prior_epoch_is_never_adopted(tmp_path: Path) -> None:

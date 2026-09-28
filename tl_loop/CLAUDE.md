@@ -270,11 +270,29 @@ newly added field cannot be dropped by a hand-copied reconstruction:
   boundary records the resolved agent type rather than the qualified harness
   identifier, so both routing dimensions of a reconstruction read that value.
 
-`tl_loop/tests/test_dispatch_provenance.py` holds all three: the two spawn paths
-must record and persist the same identity, the reconstruction must carry every
-field, and every field must be propagated by the one reconstruction. The last
-two are structural guards, so adding a field without propagating it fails
-rather than silently reaching a boundary event as its default.
+`dispatch_generation` has exactly one meaning: the per-slice dispatch attempt
+counter under the current controller epoch. It is minted with the intent,
+persisted on the slice in the same single-writer state mutation that records the
+intent, echoed on every `tl.dispatch_*` boundary, and is the value any later
+reconstruction reports. It is not a controller generation (that is
+`controller_epoch`) and not a publication counter. A spawn observation that
+carries a generation is adopted only when it names the persisted one, so a
+confirmation belonging to an earlier attempt of the same intent is refused as
+`dispatch_generation_mismatch`; a publication that carries one must carry the
+generation of the dispatch that owns it, which is why the same field serves
+both correlations. A scheduled retry created nothing, so it clears the
+generation with the rest of that attempt's identity and the re-drive mints the
+next one. The runtime's own ledger rows do not carry either field -- `file_pr`
+writes no `generation`, and no Rust writer emits `dispatch_generation` -- so
+both checks apply only to rows that carry one, and a row that carries none is
+never refused on a dimension it does not claim.
+
+`tl_loop/tests/test_dispatch_provenance.py` holds these properties: the two
+spawn paths must record and persist the same identity, a re-drive persists and
+emits its own generation, a reconstruction must carry every field, and every
+field must be propagated by the one reconstruction. The last two are structural
+guards, so adding a field without propagating it fails rather than silently
+reaching a boundary event as its default.
 
 A sub-TL start is the one site that is a mint and not a reconstruction: it
 stamps a fresh identity for a child controller, so it carries neither this run's

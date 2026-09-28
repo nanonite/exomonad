@@ -16,27 +16,33 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import textwrap
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 import tl_loop
 from tl_loop.client.effects import EffectClient
+from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.driver import (
+    DISPATCH_CORRELATED,
+    DISPATCH_INTEGRITY_CONFLICT,
     DispatchAttempt,
     TLLoopConfig,
     TLLoopError,
     WorkPlan,
     _dispatch_children,
+    _emit_dispatch_confirmation,
+    correlate_dispatch_event,
 )
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.policy import load_policy
-from tl_loop.state.schema import BudgetLedger, SliceState, SliceStatus
+from tl_loop.state.schema import BudgetLedger, RunState, SliceState, SliceStatus
 from tl_loop.state.store import RunStore, create
 
 PACKAGE_ROOT = Path(tl_loop.__file__).parent
@@ -47,6 +53,9 @@ CONTROLLER_EPOCH = "epoch-of-the-dispatch-provenance-run"
 HARNESS = "codex/gpt-luna"
 AGENT_TYPE = "codex"
 MODEL = "gpt-luna"
+#: A creation race: the branch now exists and this attempt created nothing.
+BRANCH_EXISTS = "worktree.branch_exists"
+BASE_DELAY = 10.0
 #: The identity both spawn paths must record, whichever one minted the attempt.
 IDENTITY_FIELDS = ("intent_id", "attempt", "controller_epoch", "dispatch_generation")
 #: The dispatch boundary each path persists on the slice. The recorded instant
@@ -70,11 +79,33 @@ AUDITED_CONSTRUCTIONS = frozenset({"_new_dispatch_attempt", "_prepare_sub_tl_sta
 
 
 @dataclass
+class ScriptedClock:
+    """A clock that only moves when a test moves it."""
+
+    now: float = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@dataclass
 class RecordingTransport:
-    """Accept the spawn and keep every emitted controller event."""
+    """Accept the spawn, or refuse the first ``refusals`` of them.
+
+    A refusal also records the one ``agent.spawn_failed`` ledger row the
+    controller classifies a rejection by, so a scheduled retry is driven through
+    the typed channel production reads rather than a hand-fed return value.
+    """
 
     events: list[dict[str, Any]] = field(default_factory=list)
     spawns: list[dict[str, Any]] = field(default_factory=list)
+    refusals: int = 0
+    code: str | None = None
+    project_root: Path | None = None
+    refusal_run_seq: int = 7
 
     def call_tool(
         self,
@@ -86,6 +117,9 @@ class RecordingTransport:
         del role, name
         if tool_name in {"spawn_leaf", "spawn_worker"}:
             self.spawns.append(dict(arguments))
+            if len(self.spawns) <= self.refusals:
+                self._record_refusal(arguments.get("intent_id"))
+                return {"success": False, "error": "spawn request rejected"}
             return {
                 "success": True,
                 "result": {"agent_id": f"{SLICE}-opencode", "invocation_id": "inv-1"},
@@ -94,6 +128,41 @@ class RecordingTransport:
             self.events.append(dict(arguments))
             return {"success": True, "result": {"event_id": "controller-event"}}
         return {"success": True, "result": {}}
+
+    def payloads(self, event_type: str) -> list[dict[str, Any]]:
+        return [
+            dict(event["payload"])
+            for event in self.events
+            if event.get("event_type") == event_type
+        ]
+
+    def _record_refusal(self, intent_id: object) -> None:
+        if self.project_root is None:
+            return
+        segments = self.project_root / ".exo" / "ledger" / "segments"
+        segments.mkdir(parents=True, exist_ok=True)
+        row = {
+            "schema_version": 1,
+            "event_id": f"spawn-failed-{self.refusal_run_seq}",
+            "id": f"spawn-failed-{self.refusal_run_seq}",
+            "event_time": "2026-08-11T00:00:00Z",
+            "observed_at": "2026-08-11T00:00:00Z",
+            "run_seq": self.refusal_run_seq,
+            "type": "agent.spawn_failed",
+            "agent_id": "root",
+            "run_id": RUN_ID,
+            "session_id": "session-1",
+            "lifecycle_state": "observed",
+            "data": {
+                "child_agent": SLICE,
+                "error": "spawn request rejected",
+                "code": self.code,
+                "intent_id": intent_id,
+                "source": "rust",
+            },
+        }
+        segment = segments / f"segment-{self.refusal_run_seq:012d}.jsonl"
+        segment.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
 
 @dataclass(frozen=True)
@@ -106,30 +175,50 @@ class DispatchPass:
     spawn: dict[str, Any]
 
 
-def _dispatch(root: Path, *, policy: bool) -> DispatchPass:
-    store = _store(root)
-    config = TLLoopConfig(
+def _config(
+    root: Path, clock: ScriptedClock, *, policy: bool
+) -> TLLoopConfig:
+    return TLLoopConfig(
         policy=load_policy(POLICY) if policy else None,
         capabilities=CapabilityMap({HARNESS: Difficulty.STANDARD}),
+        dispatch_retry_base_delay_seconds=BASE_DELAY,
+        dispatch_retry_max_delay_seconds=BASE_DELAY * 4,
+        wall_clock=clock,
+        project_root=root,
+        ledger_run_id=RUN_ID,
         root_dir=root,
         run_id=RUN_ID,
     )
-    transport = RecordingTransport()
-    state = _dispatch_children(
+
+
+def _dispatch_pass(
+    store: RunStore,
+    root: Path,
+    transport: RecordingTransport,
+    clock: ScriptedClock,
+    *,
+    policy: bool,
+) -> RunState:
+    return _dispatch_children(
         _plan(),
         store.load(),
-        config,
+        _config(root, clock, policy=policy),
         EffectClient(transport),
         [],
         store,
     )
-    payloads = {
-        str(event["event_type"]): dict(event["payload"])
-        for event in transport.events
-        if str(event.get("event_type")) in BOUNDARY_EVENTS
-    }
+
+
+def _dispatch(root: Path, *, policy: bool) -> DispatchPass:
+    store = _store(root)
+    transport = RecordingTransport(project_root=root)
+    state = _dispatch_pass(store, root, transport, ScriptedClock(), policy=policy)
     return DispatchPass(
-        payloads=payloads,
+        payloads={
+            str(event["event_type"]): dict(event["payload"])
+            for event in transport.events
+            if str(event.get("event_type")) in BOUNDARY_EVENTS
+        },
         slice_state=state.slices[SLICE],
         controller_epoch=state.controller_epoch,
         spawn=transport.spawns[0],
@@ -193,6 +282,60 @@ def _persisted(pass_result: DispatchPass) -> dict[str, object]:
     }
 
 
+@dataclass(frozen=True)
+class Redrive:
+    """A refused attempt and the re-drive that replaced it."""
+
+    store: RunStore
+    transport: RecordingTransport
+    refused: SliceState
+    redriven: SliceState
+
+
+def _redrive_after_retryable_refusal(root: Path, *, policy: bool) -> Redrive:
+    """Refuse one attempt, then re-drive it once its scheduled instant arrives.
+
+    The rejection is answered by the ledger row production writes, so the
+    controller classifies it as retryable, schedules a durable boundary, and
+    mints a second attempt only after the injected clock reaches that instant.
+    """
+    store = _store(root)
+    clock = ScriptedClock()
+    transport = RecordingTransport(refusals=1, code=BRANCH_EXISTS, project_root=root)
+    refused = _dispatch_pass(store, root, transport, clock, policy=policy).slices[SLICE]
+    assert refused.status is SliceStatus.DISPATCH_RETRY_SCHEDULED
+    clock.advance(BASE_DELAY)
+    redriven = _dispatch_pass(store, root, transport, clock, policy=policy).slices[SLICE]
+    return Redrive(store, transport, refused, redriven)
+
+
+def _spawn_confirmation(slice_state: SliceState, *, generation: int) -> EventEnvelope:
+    """One ``agent.spawned`` row claiming the given dispatch generation."""
+    assert slice_state.dispatch_intent_id is not None
+    raw = {
+        "schema_version": 1,
+        "event_id": f"spawned-{generation}",
+        "id": f"spawned-{generation}",
+        "event_time": "2026-08-11T00:00:00Z",
+        "observed_at": "2026-08-11T00:00:00Z",
+        "run_seq": 11,
+        "type": "agent.spawned",
+        "agent_id": f"{SLICE}-opencode",
+        "run_id": RUN_ID,
+        "session_id": "session-1",
+        "lifecycle_state": "observed",
+        "data": {
+            "child_agent": f"{SLICE}-opencode",
+            "agent_type": AGENT_TYPE,
+            "branch": f"main.{SLICE}",
+            "intent_id": slice_state.dispatch_intent_id,
+            "controller_epoch": CONTROLLER_EPOCH,
+            "dispatch_generation": generation,
+        },
+    }
+    return project(cast(dict[str, object], raw))
+
+
 @pytest.mark.parametrize("event_type", BOUNDARY_EVENTS)
 def test_every_spawn_path_records_the_same_dispatch_identity(
     event_type: str, tmp_path: Path
@@ -240,6 +383,97 @@ def test_every_spawn_path_persists_the_same_dispatch_boundary(tmp_path: Path) ->
     assert policy.payloads["tl.dispatch_intended"]["harness"] == HARNESS
     assert direct.slice_state.agent_type is None
     assert direct.payloads["tl.dispatch_intended"].get("harness") is None
+
+
+@pytest.mark.parametrize("policy", [False, True], ids=["direct", "policy"])
+def test_a_redispatched_attempt_persists_and_emits_its_own_generation(
+    policy: bool, tmp_path: Path
+) -> None:
+    """One dispatch has one generation: the attempt it was minted for.
+
+    A retryable rejection schedules a re-drive that creates nothing, so the
+    refused attempt's generation dies with its intent and the re-drive mints
+    generation 2, persists it, and reports it on every boundary it emits.
+    """
+    root = tmp_path / "redrive"
+    redrive = _redrive_after_retryable_refusal(root, policy=policy)
+
+    # The refused attempt created no leaf, so no generation survives its intent.
+    assert redrive.refused.status is SliceStatus.DISPATCH_RETRY_SCHEDULED
+    assert redrive.refused.dispatch_error_code == BRANCH_EXISTS
+    assert redrive.refused.dispatch_intent_id is None
+    assert redrive.refused.dispatch_generation == 0
+
+    assert redrive.redriven.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert redrive.redriven.attempts == 2
+    assert redrive.redriven.dispatch_generation == 2
+    for event_type in BOUNDARY_EVENTS:
+        payload = redrive.transport.payloads(event_type)[-1]
+        assert (payload["attempt"], payload["dispatch_generation"]) == (2, 2)
+        assert payload["intent_id"] == redrive.redriven.dispatch_intent_id
+        assert payload["controller_epoch"] == CONTROLLER_EPOCH
+
+
+def test_the_confirmation_boundary_reports_the_persisted_generation(tmp_path: Path) -> None:
+    """A confirmation is reconstructed from the slice, so it reports its generation."""
+    root = tmp_path / "redrive"
+    redrive = _redrive_after_retryable_refusal(root, policy=True)
+    assert redrive.redriven.dispatch_generation == 2
+    transport = RecordingTransport(project_root=root)
+
+    _emit_dispatch_confirmation(
+        {SLICE: redrive.redriven},
+        {SLICE: replace(redrive.redriven, dispatch_authoritative_event_seq=11)},
+        _spawn_confirmation(redrive.redriven, generation=2),
+        SLICE,
+        _config(root, ScriptedClock(), policy=True),
+        EffectClient(transport),
+        [],
+        CONTROLLER_EPOCH,
+    )
+
+    (payload,) = transport.payloads("tl.dispatch_confirmed")
+    assert payload["dispatch_generation"] == 2
+    assert payload["controller_epoch"] == CONTROLLER_EPOCH
+    assert payload["attempt"] == 2
+    assert payload["intent_id"] == redrive.redriven.dispatch_intent_id
+
+
+def test_a_resumed_checkpoint_reads_the_persisted_generation_back(tmp_path: Path) -> None:
+    """A restart reads the generation the intent was recorded with, unchanged."""
+    redrive = _redrive_after_retryable_refusal(tmp_path / "redrive", policy=True)
+
+    resumed = RunStore(RUN_ID, redrive.store.root_dir).load().slices[SLICE]
+
+    assert resumed.dispatch_generation == 2
+    rebuilt = DispatchAttempt.recorded_for(resumed, CONTROLLER_EPOCH)
+    assert rebuilt.dispatch_generation == 2
+    assert rebuilt.attempt == 2
+
+
+def test_a_spawn_observation_is_adopted_only_at_the_persisted_generation(
+    tmp_path: Path,
+) -> None:
+    """The generation a spawn claims is the one the slice persisted for it."""
+    redrive = _redrive_after_retryable_refusal(tmp_path / "redrive", policy=True)
+    redriven = redrive.store.load()
+
+    adopted = correlate_dispatch_event(
+        redriven, _spawn_confirmation(redrive.redriven, generation=2)
+    )
+    assert adopted.classification == DISPATCH_CORRELATED
+    assert adopted.slice_id == SLICE
+
+    for generation in (1, 3):
+        refused = correlate_dispatch_event(
+            redriven, _spawn_confirmation(redrive.redriven, generation=generation)
+        )
+        assert refused.classification == DISPATCH_INTEGRITY_CONFLICT
+        assert refused.reason == "dispatch_generation_mismatch"
+        assert refused.slice_id == SLICE
+
+    # The slice is still unconfirmed: only the loop adopts a correlated row.
+    assert redrive.redriven.dispatch_authoritative_event_seq is None
 
 
 def test_a_rebuilt_attempt_reads_every_field_from_its_slice() -> None:
