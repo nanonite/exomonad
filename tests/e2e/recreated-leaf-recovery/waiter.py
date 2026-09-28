@@ -1,9 +1,16 @@
 """Bounded waits on durable boundaries for the #1111 acceptance.
 
-Every wait here is a poll on a durable artifact with an explicit deadline and a
-diagnostic that names the last observed state, so a failure reports what the
-system looked like rather than only how long the harness waited. No wait
-returns success because time passed: each one names the boundary it proved.
+Every wait here polls a durable artifact until a boundary is reached, with an
+explicit deadline and a diagnostic that names the last state it saw, so a
+failure reports what the system looked like rather than only how long the
+harness waited. No wait returns success because time passed: each one names the
+boundary it proved.
+
+There is deliberately no "wait for the count to stop changing" wait here. A
+count that has not moved for a few seconds is not evidence that nothing further
+is coming, so a duplicate that lands after such a window would pass silently.
+Every count in this acceptance is read after a terminal boundary instead: the
+deterministic agent's own durable record that its invocation finished.
 """
 
 from __future__ import annotations
@@ -54,33 +61,9 @@ def await_boundary(
     )
 
 
-def await_stable(
-    probe: Callable[[], T],
-    *,
-    description: str,
-    stable_for: float,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
-    poll_interval: float = POLL_INTERVAL_SECONDS,
-) -> T:
-    """Return ``probe``'s value once it has stopped changing.
-
-    Used only for counters that must stop growing, such as "exactly one
-    authoritative spawn": the assertion is that the value held steady, not that
-    it was a particular number at a particular instant.
-    """
-    deadline = time.monotonic() + timeout
-    previous = probe()
-    unchanged_since = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(poll_interval)
-        current = probe()
-        if current != previous:
-            previous = current
-            unchanged_since = time.monotonic()
-            continue
-        if time.monotonic() - unchanged_since >= stable_for:
-            return current
-    raise Timeout(
-        f"timed out after {timeout:.0f}s waiting for {description} to hold steady "
-        f"for {stable_for:.0f}s; last observed state: {previous!r}"
-    )
+__all__ = [
+    "DEFAULT_TIMEOUT_SECONDS",
+    "POLL_INTERVAL_SECONDS",
+    "Timeout",
+    "await_boundary",
+]

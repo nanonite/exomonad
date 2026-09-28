@@ -26,7 +26,7 @@ its exit status is the verdict.
 | T4 | The head is unchanged, the cwd is a registered git worktree, and the identity's branch is the declared one | head, cwd, branch |
 | T5 | Exactly one identity, one worktree, one branch, one open pull request, and exactly one spawn per plan start | the counts |
 | T6 | A second recreate changes nothing | recreates, head, worktrees, worktree creations |
-| T7 | Five fail-closed shapes, each with its machine code, plus a resume that fails closed without forking the leaf | the code and the message per shape |
+| T7 | Four refusals with their machine code, a resume of an unowned pull request that fails closed, and the positive expected-agent resume | the code and the message per shape, or the resume refusal with every liveness input |
 | T8 | A sink write creates no planned directory, no worktree, and no identity for an agent that owns none | the planned path and the three "not created" facts |
 | T9 | A retryable refusal created nothing and the re-drive produced exactly one spawn; a terminal conflict is never re-driven and creates nothing | the code, the spawn count, the attach completion count |
 

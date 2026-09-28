@@ -270,6 +270,8 @@ def _fake_agent_bin(run: Run) -> Path:
         f"export EXOMONAD_SOCKET={shlex.quote(str(run.repo / '.exo' / 'server.sock'))}\n"
         f"export EXOMONAD_1111_LEAF_BRANCHES="
         f"{shlex.quote(','.join(sorted(run.leaf_branches)))}\n"
+        f"export EXOMONAD_1111_RELEASE_DIR="
+        f"{shlex.quote(str(run.root / 'release'))}\n"
         f"exec {shlex.quote(sys.executable)} "
         f"{shlex.quote(str(HARNESS_DIR / 'leaf_agent.py'))} \"$@\"\n",
         encoding="utf-8",
@@ -442,6 +444,43 @@ def recreate_session(run: Run, port: int) -> Project:
     return _serve(run, port, "server-recreated.log")
 
 
+def release_signal(project: Project, agent: str) -> Path:
+    """Return the durable file that releases one agent's next invocation."""
+    return project.run.root / "release" / agent
+
+
+def arm_release(project: Project, agent: str) -> str:
+    """Remove this agent's release signal before it is dispatched.
+
+    Without this, an agent dispatched after an earlier one would find that
+    earlier one's signal already present, skip the wait entirely, and finish
+    before the server had confirmed its window was live. The signal is therefore
+    per agent and is cleared immediately before every dispatch, so an agent can
+    only proceed on the release of its own dispatch.
+    """
+    signal = release_signal(project, agent)
+    signal.parent.mkdir(parents=True, exist_ok=True)
+    signal.unlink(missing_ok=True)
+    return str(signal)
+
+
+def release_agent(project: Project, agent: str) -> str:
+    """Let one spawned agent finish, and return the signal it was given.
+
+    The agent waits for this signal before doing anything, because the server
+    confirms the agent's tmux target is live as part of the spawn returning.
+    Releasing it here is therefore a consequence of an observed boundary rather
+    than a guess about how long the confirmation takes.
+
+    The signal is a file, so it does not depend on the agent's window carrying
+    standard input.
+    """
+    signal = release_signal(project, agent)
+    signal.parent.mkdir(parents=True, exist_ok=True)
+    signal.write_text(f"release {agent}\n", encoding="utf-8")
+    return str(signal)
+
+
 def provision_child(project: Project) -> Mapping[str, Any]:
     """Provision the ordered child through the real server route."""
     project.client.provision_ordered_sub_tl(
@@ -479,8 +518,11 @@ __all__ = [
     "ProjectError",
     "Run",
     "kill_session",
+    "arm_release",
     "new_run",
     "provision_child",
+    "release_agent",
+    "release_signal",
     "recreate_session",
     "session_exists",
     "session_name",

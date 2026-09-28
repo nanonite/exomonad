@@ -796,7 +796,7 @@ it runs on every exit path. It removes:
 | compose projects | by name, including the project-scoped volume |
 | the run's directory | `mktemp -d`, never a fixed path, so two runs cannot collide |
 
-Two rules follow from the leaks this replaced:
+Three rules follow from the leaks this replaced:
 
 - **A child process must start in its own process group.** A child that inherits
   the harness's group makes a group signal a self-inflicted kill, so teardown
@@ -809,8 +809,28 @@ Two rules follow from the leaks this replaced:
   run's name — and the run **fails** if any of it remains. A leaked process is
   detected through `/proc`, not through a name prefix, so a process that
   outlives its run cannot hide by being renamed.
-  `just check-e2e-recreated-leaf-recovery` exercises this contract against a real
-  compose project, a real tmux session, and a real process.
+- **A removed directory does not mean the process is gone.** The kernel reports a
+  deleted working directory with `(deleted)` appended, which is exactly the state
+  a leaked server is left in once teardown has removed the directory. That suffix
+  is stripped before the path is compared, or the check reports clean while the
+  process is still running.
+
+**Teardown cannot be the only reclamation path.** A SIGKILL, a host reboot, or a
+Docker restart takes the trap with it, so a run that was killed from outside
+never tears itself down. Every run therefore begins with a prefix-driven sweep
+that reclaims what such a run left — its processes, sessions, compose projects,
+volumes, and directories — and fails the run if it cannot. The sweep is
+prefix-driven rather than record-driven precisely because the thing being
+reclaimed is a run this harness has no record of.
+
+**Counts are read after a terminal boundary, never after a quiet period.** A
+count that has not moved for a few seconds is not evidence that nothing further
+is coming, so a duplicate landing after that window would pass silently. Every
+count is taken once the work that could change it has recorded that it finished:
+the deterministic agent writes a terminal record per invocation, and the count of
+authoritative spawns is only read once it equals the count of those records. A
+second spawn makes the two disagree, which fails the item instead of hiding.
+There is deliberately no "wait for quiescence" helper to misuse.
 
 **Waits are on durable boundaries.** An integration test polls a ledger event, a
 `run.json`, git's worktree registry, or the forge's own record, with a bounded

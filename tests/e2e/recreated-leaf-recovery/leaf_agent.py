@@ -18,8 +18,10 @@ import os
 import re
 import subprocess
 import sys
+import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -32,6 +34,14 @@ LEAF_BRANCHES = "EXOMONAD_1111_LEAF_BRANCHES"
 
 #: The file the leaf writes, relative to its own worktree root.
 PAYLOAD = "e2e-1111-leaf.txt"
+
+#: How long the actor waits for the harness's release before it gives up. The
+#: release is a file, so this is a bound on a missing signal rather than a
+#: window during which a signal might arrive.
+RELEASE_TIMEOUT_SECONDS = 300.0
+
+#: How often the actor looks for the release file while it is absent.
+RELEASE_POLL_SECONDS = 0.1
 
 #: The prompt that assigns a reviewer also contains a PR number, which is what
 #: distinguishes a review assignment from a spawn.
@@ -191,36 +201,96 @@ def review_pr(pr_number: int) -> bool:
     return review_assigned_pr(pr_number)
 
 
-def _hold_window() -> None:
-    """Keep the agent's window open, the way a real agent's stays open.
+def branch_derived_agent() -> str:
+    """Return this actor's own agent name, which its release signal is keyed by.
 
-    The server proves a spawned agent is live by finding its tmux window ready.
-    An actor that returned immediately would close that window out from under
-    the check, so the window is held by blocking on standard input: it ends when
-    the run's teardown kills the session, and it never depends on a duration
-    being long enough.
+    The server names the window after the internal agent name, and that is the
+    only name the actor can rely on: it is told its own branch, from which the
+    same suffix is derived.
     """
-    try:
-        sys.stdin.read()
-    except (OSError, ValueError):
-        pass
+    branch = _current_branch()
+    if not branch:
+        raise LeafActorError("the actor is not on a branch, so it has no agent name")
+    return branch.rsplit(".", 1)[-1]
+
+
+def release_path() -> Path:
+    """Return the durable file that releases this actor.
+
+    The release is a file, not a line on standard input and not a duration: the
+    server launches an agent in a tmux window whose standard input this harness
+    cannot rely on carrying anything, and a signal that might never arrive is
+    not a signal. The harness creates this file only after the spawn or resume
+    it was waiting on has returned, so the actor's lifetime is tied to a
+    boundary the harness observed rather than to how long the server takes.
+    """
+    directory = Path(_required("EXOMONAD_1111_RELEASE_DIR"))
+    return directory / branch_derived_agent()
+
+
+def await_release() -> dict[str, Any]:
+    """Block until the harness releases this actor, and record that it waited.
+
+    The server proves a spawned agent is live by finding its tmux window ready,
+    and it re-checks that liveness after a resume before it reports success. An
+    actor that did its work and exited immediately would close that window out
+    from under the check, so the actor waits here first and says so durably, so
+    a claim that the actor was live can be checked rather than assumed.
+    """
+    signal = release_path()
+    started = time.monotonic()
+    deadline = started + RELEASE_TIMEOUT_SECONDS
+    while not signal.is_file():
+        if time.monotonic() > deadline:
+            raise LeafActorError(
+                f"the harness never released this actor: {signal} did not appear "
+                f"within {RELEASE_TIMEOUT_SECONDS:.0f}s"
+            )
+        time.sleep(RELEASE_POLL_SECONDS)
+    return {
+        "stdin_isatty": sys.stdin.isatty(),
+        "release_file": str(signal),
+        "waited_seconds": round(time.monotonic() - started, 3),
+    }
+
+
+def _record_finished(branch: str, event: str, waited: Mapping[str, Any]) -> None:
+    """Record that this invocation finished, on the branch it was given.
+
+    This is the terminal record the acceptance counts against. One is written
+    per invocation that runs to completion, so a branch whose authoritative
+    spawn count and finished-record count differ has an invocation still in
+    flight, and a branch where the two agree has none.
+    """
+    _record(
+        {
+            "event": event,
+            "branch": branch,
+            "leaf": branch.rsplit(".", 1)[-1] if branch else "",
+            "head": _current_head(),
+            "awaited_release": dict(waited),
+        }
+    )
 
 
 def main() -> int:
     try:
-        assignment = _ASSIGNMENT.search(" ".join(sys.argv[1:]))
-        if assignment is not None:
-            review_pr(int(assignment.group(1)))
-            _hold_window()
-        elif not publish_leaf():
-            # Not a branch this acceptance owns; idle like a real agent.
-            _hold_window()
+        waited = await_release()
+        if publish_leaf():
+            _record_finished(_current_branch(), "leaf_finished", waited)
         else:
-            _hold_window()
-    except (KeyError, LeafActorError, TransportError, subprocess.CalledProcessError) as error:
+            # Not a branch this acceptance owns, so this actor has nothing to do
+            # beyond recording that it started and stopped.
+            _record_finished(_current_branch(), "leaf_idle", waited)
+        return 0
+    except (
+        KeyError,
+        LeafActorError,
+        TransportError,
+        subprocess.CalledProcessError,
+    ) as error:
         print(f"deterministic leaf failed: {error}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":

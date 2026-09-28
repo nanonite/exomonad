@@ -24,11 +24,18 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Sequence, Sequence
 
 #: Every run-scoped name begins with this, so a leak is attributable to a
 #: harness without knowing which harness started it.
 LEAK_PREFIX = "exo-e2e-1111-"
+
+#: The prefix of the run directory each run is given by ``mktemp -d``. A sweep
+#: looks for this so it can reclaim a run that was killed before its teardown.
+RUN_DIRECTORY_PREFIX = "exomonad-e2e-1111-"
+
+#: Where those run directories are created.
+TEMP_ROOT = "/tmp"
 
 #: Bounded wait for a terminated process to disappear before it is reported.
 STOP_TIMEOUT_SECONDS = 15.0
@@ -249,20 +256,62 @@ def _processes_under(root: Path) -> list[str]:
     A process that outlives its run and still points into the run's temporary
     directory is the leak this acceptance is required to prove cannot happen,
     so it is detected by the filesystem rather than by a name prefix.
+
+    A process whose directory has already been removed still reports it, with
+    ``(deleted)`` appended by the kernel, and that is the case that matters
+    most: the run directory is gone, so nothing else would notice the process.
     """
     found: list[str] = []
-    resolved = str(root.resolve()) if root.exists() else str(root)
+    for pid, cwd, command in _live_processes():
+        if _is_within(cwd, [str(root)]):
+            found.append(f"process {pid} still runs in {cwd}: {command}")
+    return found
+
+
+def _is_within(candidate: str, roots: Sequence[str]) -> bool:
+    """Report whether a path is one of the roots or inside one of them."""
+    for root in roots:
+        if not root:
+            continue
+        if candidate == root or candidate.startswith(root.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _live_processes() -> list[tuple[str, str, str]]:
+    """Return ``(pid, working directory, command line)`` for every live process.
+
+    The working directory has the kernel's ``(deleted)`` suffix stripped, so a
+    process running in a directory that no longer exists is still matched by the
+    path it was in when the run was torn down.
+    """
+    found: list[tuple[str, str, str]] = []
     for entry in sorted(Path("/proc").iterdir()):
         if not entry.name.isdigit():
             continue
         try:
-            cwd = os.readlink(entry / "cwd")
+            raw = os.readlink(entry / "cwd")
         except (OSError, PermissionError):
             continue
-        if cwd == resolved or cwd.startswith(resolved.rstrip("/") + "/"):
-            command = _command_line(entry)
-            found.append(f"process {entry.name} still runs in {cwd}: {command}")
+        if raw.endswith(" (deleted)"):
+            raw = raw[: -len(" (deleted)")]
+        found.append((entry.name, raw, _command_line(entry)))
     return found
+
+
+def processes_in_scopes(roots: Sequence[str]) -> list[tuple[str, str, str]]:
+    """Return every live process running in, or naming, one of ``roots``.
+
+    Both signals matter. A server whose directory was already removed still
+    reports that directory through ``/proc``, but a process that was started
+    with a path argument rather than a working directory only names the run's
+    directory on its command line.
+    """
+    return [
+        (pid, cwd, command)
+        for pid, cwd, command in _live_processes()
+        if _is_within(cwd, roots) or any(root and root in command for root in roots)
+    ]
 
 
 def _command_line(entry: Path) -> str:
@@ -292,6 +341,15 @@ def _sessions_with_prefix(prefix: str) -> list[str]:
 
 def _compose_projects_with_prefix(prefix: str) -> list[str]:
     """Return every live compose project carrying the run's prefix."""
+    return [
+        f"compose project survived cleanup: {name}"
+        for name in _compose_projects()
+        if name.startswith(prefix)
+    ]
+
+
+def _compose_projects() -> list[str]:
+    """Return the name of every compose project Docker knows about."""
     result = subprocess.run(
         ["docker", "compose", "ls", "--all", "--format", "json"],
         check=False,
@@ -299,18 +357,86 @@ def _compose_projects_with_prefix(prefix: str) -> list[str]:
         text=True,
     )
     if result.returncode:
-        return [f"could not list compose projects: {result.stderr.strip()}"]
+        return []
     import json
 
     try:
         projects = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
-        return [f"compose project listing was not JSON: {result.stdout.strip()!r}"]
+        return []
     return [
-        f"compose project survived cleanup: {entry.get('Name')}"
+        str(entry.get("Name"))
         for entry in projects
-        if isinstance(entry, dict) and str(entry.get("Name", "")).startswith(prefix)
+        if isinstance(entry, dict) and entry.get("Name")
     ]
+
+
+def stale_run_roots(run_prefix: str) -> list[str]:
+    """Return every run directory this harness has ever named, live or not.
+
+    A directory whose run was killed before its teardown is still on disk, and a
+    process whose directory was already removed still reports that path, so a
+    sweep has to look for both: the directories that exist, and the paths that
+    live processes still claim.
+    """
+    roots = [
+        str(path)
+        for path in Path(TEMP_ROOT).glob(f"{RUN_DIRECTORY_PREFIX}*")
+        if path.is_dir()
+    ]
+    for _pid, cwd, command in _live_processes():
+        for candidate in (cwd, *command.split()):
+            if candidate.startswith(str(Path(TEMP_ROOT) / RUN_DIRECTORY_PREFIX)):
+                if candidate not in roots:
+                    roots.append(candidate)
+    return roots
+
+
+def sweep_stale(run_prefix: str, compose_file: Path) -> list[str]:
+    """Remove everything a previous, interrupted run of this harness left behind.
+
+    Teardown is the normal path, but it cannot run when the harness is killed
+    from outside: a SIGKILL, a host reboot, or a Docker restart takes the trap
+    with it. This runs at the start of every run and reclaims what such a run
+    left, so an interrupted run cannot accumulate processes, sessions, compose
+    projects, or directories that outlive it.
+
+    It is deliberately prefix-driven rather than known-run-driven, because the
+    thing being reclaimed is by definition a run this harness does not have a
+    record of.
+    """
+    problems: list[str] = []
+    roots = stale_run_roots(run_prefix)
+    for pid, cwd, command in processes_in_scopes(roots):
+        problems.extend(_kill_process(int(pid), f"stale process in {cwd} ({command})"))
+    for name in _sessions_with_prefix(run_prefix):
+        session = name.split(": ", 1)[-1]
+        problems.extend(_kill_session(session))
+    for project in _compose_projects():
+        if project.startswith(run_prefix):
+            problems.extend(_compose(project, compose_file, "down", "-v", "--remove-orphans"))
+    for name in _volumes_with_prefix(run_prefix):
+        problems.extend(_remove_volume(name.split(": ", 1)[-1]))
+    for root in roots:
+        if Path(root).is_dir():
+            shutil.rmtree(root, ignore_errors=True)
+            if Path(root).is_dir():
+                problems.append(f"stale run directory survived the sweep: {root}")
+    return problems
+
+
+def _remove_volume(name: str) -> list[str]:
+    """Remove one docker volume, reporting a refusal rather than hiding it."""
+    result = subprocess.run(
+        ["docker", "volume", "rm", name],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode and "no such volume" not in result.stderr:
+        return [f"could not remove docker volume {name}: {result.stderr.strip()}"]
+    return []
 
 
 def _volumes_with_prefix(prefix: str) -> list[str]:
@@ -376,7 +502,11 @@ __all__ = [
     "COMPOSE_TIMEOUT_SECONDS",
     "CleanupError",
     "LEAK_PREFIX",
+    "RUN_DIRECTORY_PREFIX",
     "RunScope",
     "install_trap",
     "make_root",
+    "processes_in_scopes",
+    "stale_run_roots",
+    "sweep_stale",
 ]

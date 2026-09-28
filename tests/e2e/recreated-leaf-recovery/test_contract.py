@@ -363,17 +363,15 @@ def test_a_wait_needs_no_elapsed_time_to_succeed():
     assert time.monotonic() - started < 5.0
 
 
-def test_a_stability_wait_needs_the_value_to_hold():
-    assert (
-        waiter.await_stable(
-            lambda: 3,
-            description="the count",
-            stable_for=0.1,
-            timeout=10.0,
-            poll_interval=0.01,
-        )
-        == 3
-    )
+def test_there_is_no_quiescence_wait_to_misuse():
+    """A count that stopped moving is not evidence, so no such wait exists.
+
+    Every count in this acceptance is read after the agent's own record that
+    its invocation finished. If a wait-for-quiescence helper ever comes back, a
+    duplicate could land after its window and pass silently.
+    """
+    assert not hasattr(waiter, "await_stable")
+    assert not hasattr(waiter, "await_boundary_stable")
 
 
 # --------------------------------------------------------------------------
@@ -670,3 +668,109 @@ def test_a_compose_project_and_a_session_together_leave_nothing_behind(scope):
     assert scope.teardown() == []
     assert scope.leaks() == []
     scope.require_clean()
+
+
+# --------------------------------------------------------------------------
+# The interrupted-run contract
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
+def test_a_sweep_reclaims_a_run_that_was_killed_before_its_teardown():
+    """A run killed from outside is reclaimed by the next run's sweep.
+
+    This is the leak a SIGKILL, a host reboot, or a Docker restart produces: the
+    trap never ran, so the run's server is reparented, its session and compose
+    project and directory are still there, and nothing that only consults the
+    scope's own records can see any of it. The sweep is prefix-driven for
+    exactly that reason.
+    """
+    import secrets
+
+    prefix = f"{cl.LEAK_PREFIX}aborted-{secrets.token_hex(4)}-"
+    root = cl.make_root("/tmp")
+    process = subprocess.Popen(
+        ["sleep", "600"], cwd=root, start_new_session=True
+    )
+    session = f"{prefix}session"
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", session, "-n", "probe", "sleep", "600"],
+        check=True,
+    )
+    # No scope is created and no teardown is ever called: this run is aborted.
+    try:
+        assert cl.stale_run_roots(prefix) != []
+        assert any(
+            pid == str(process.pid)
+            for pid, _cwd, _command in cl.processes_in_scopes([str(root)])
+        )
+        assert cl.sweep_stale(prefix, _compose_file()) == []
+    finally:
+        if cl._process_alive(process.pid):
+            process.terminate()
+            process.wait(timeout=30)
+        subprocess.run(
+            ["tmux", "kill-session", "-t", session], check=False, capture_output=True
+        )
+        import shutil
+
+        shutil.rmtree(root, ignore_errors=True)
+
+    assert not cl._process_alive(process.pid)
+    assert not cl._session_exists(session)
+    assert not root.exists()
+    assert cl.processes_in_scopes([str(root)]) == []
+
+
+def test_the_leak_check_sees_a_process_whose_directory_is_already_gone():
+    """A survivor in a deleted run directory is still a survivor.
+
+    The kernel reports a removed working directory with ``(deleted)`` appended,
+    which is precisely the state a leaked server is left in once teardown has
+    removed the directory. Without stripping that suffix the check reports clean
+    while the process is still running.
+    """
+    import shutil
+
+    root = cl.make_root("/tmp")
+    process = subprocess.Popen(["sleep", "600"], cwd=root, start_new_session=True)
+    try:
+        shutil.rmtree(root, ignore_errors=True)
+        reported = cl._live_processes()
+        mine = [entry for entry in reported if entry[0] == str(process.pid)]
+        assert mine, "the process did not report its removed working directory"
+        assert mine[0][1] == str(root), mine[0][1]
+        assert not mine[0][1].endswith(" (deleted)")
+        found = cl._processes_under(root)
+        assert any(str(process.pid) in item for item in found), found
+    finally:
+        process.terminate()
+        process.wait(timeout=30)
+
+
+def test_the_scope_tracks_a_process_that_runs_in_its_own_session():
+    """A child in its own session is still the scope's to kill.
+
+    ``start_new_session=True`` detaches a child into its own session and process
+    group, which is what lets it be signalled without touching the harness. It
+    also means nothing about parentage identifies it afterwards, so the scope has
+    to hold the pid itself and the leak check has to find it by its directory.
+    """
+    scope = cl.RunScope(run_id=f"contract-{os.getpid()}", root=cl.make_root("/tmp"))
+    process = scope.track_process(
+        subprocess.Popen(["sleep", "600"], cwd=scope.root, start_new_session=True),
+        "detached probe",
+    )
+    assert os.getpgid(process.pid) == process.pid, "the probe is not its own group"
+    assert any(
+        pid == str(process.pid)
+        for pid, _cwd, _command in cl._live_processes()
+    )
+    assert scope.teardown() == []
+    assert not cl._process_alive(process.pid)
+    assert scope.leaks() == []
+
+
+def _compose_file() -> Path:
+    """Return the shared disposable Forgejo template."""
+    return PROJECT_ROOT / "tests" / "e2e" / "lib" / "forgejo" / "docker-compose.yml"

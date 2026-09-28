@@ -45,7 +45,7 @@ from project import (
     Project,
 )
 from tl_loop.client.transport import ServerError, TransportError
-from waiter import await_boundary, await_stable
+from waiter import await_boundary
 
 
 class ScenarioError(RuntimeError):
@@ -74,8 +74,30 @@ PUBLICATION_TIMEOUT_SECONDS = 180.0
 #: Bounded wait for a refusal to reach the ledger.
 REFUSAL_TIMEOUT_SECONDS = 90.0
 
-#: How long a pull-request count must hold steady to count as settled.
-SETTLE_SECONDS = 4.0
+#: The live project handle, so a probe that recreates the session can hand the
+#: updated handle back to the walk even when it later fails. The resume probe
+#: replaces the server, and every later item has to run against the new one.
+_live_project: Project | None = None
+
+
+def current_project() -> Project:
+    """Return the project handle that the running server is attached to."""
+    if _live_project is None:
+        raise ScenarioError("no project has been started in this process")
+    return _live_project
+
+
+def set_live_project(project: Project) -> Project:
+    """Record the project handle the running server is attached to."""
+    global _live_project
+    _live_project = project
+    return project
+
+
+#: The events the deterministic agent writes when an invocation finishes. One is
+#: written per invocation that runs to completion, which is what makes a count
+#: of finished invocations a terminal boundary rather than a snapshot.
+TERMINAL_AGENT_EVENTS = ("leaf_finished", "leaf_idle")
 
 
 def intent(name: str) -> str:
@@ -84,12 +106,12 @@ def intent(name: str) -> str:
 
 
 def leaf_evidence_path(project: Project) -> Path:
-    """Return the file the deterministic leaf records its publication in."""
+    """Return the file the deterministic agent records its lifecycle in."""
     return project.repo / ".exo" / "e2e-1111-leaf-evidence.jsonl"
 
 
-def leaf_publications(project: Project) -> list[dict[str, Any]]:
-    """Return every publication the deterministic leaf durably recorded."""
+def agent_records(project: Project, event: str) -> list[dict[str, Any]]:
+    """Return every record the deterministic agent wrote for one event."""
     path = leaf_evidence_path(project)
     if not path.is_file():
         return []
@@ -101,9 +123,57 @@ def leaf_publications(project: Project) -> list[dict[str, Any]]:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("event") == "leaf_published":
+        if isinstance(value, dict) and value.get("event") == event:
             records.append(value)
     return records
+
+
+def finished_invocations(project: Project, branch: str) -> list[dict[str, Any]]:
+    """Return the agent records proving every invocation on a branch has ended."""
+    return [
+        record
+        for record in agent_records(project, "leaf_finished")
+        + agent_records(project, "leaf_idle")
+        if record.get("branch") == branch
+    ]
+
+
+def await_agent_settled(
+    project: Project, branch: str, *, minimum: int = 1
+) -> list[dict[str, Any]]:
+    """Wait until every spawned agent on a branch has recorded that it finished.
+
+    This is the terminal boundary every count in this acceptance is read after.
+    The agent writes its record when its invocation completes, so a branch whose
+    authoritative spawn count equals its finished-record count has nothing still
+    in flight. A second spawn would make the two counts differ and be caught,
+    rather than arriving after a window and passing unnoticed.
+    """
+    spawns = ev.authoritative_spawns(project.ledger(), branch=branch)
+    finished = finished_invocations(project, branch)
+    if spawns and len(spawns) == len(finished) and len(finished) >= minimum:
+        return finished
+    return await_boundary(
+        lambda: _settled(project, branch, minimum),
+        description=f"every agent on {branch} to record that it finished",
+        timeout=PUBLICATION_TIMEOUT_SECONDS,
+    )
+
+
+def _settled(
+    project: Project, branch: str, minimum: int
+) -> list[dict[str, Any]] | None:
+    """Return the finished records once they account for every spawn, else None."""
+    spawns = ev.authoritative_spawns(project.ledger(), branch=branch)
+    finished = finished_invocations(project, branch)
+    if spawns and len(spawns) == len(finished) and len(finished) >= minimum:
+        return finished
+    return None
+
+
+def leaf_publications(project: Project) -> list[dict[str, Any]]:
+    """Return every publication the deterministic leaf durably recorded."""
+    return agent_records(project, "leaf_published")
 
 
 def open_pulls(fixture: forgejo.Instance) -> list[dict[str, Any]]:
@@ -135,17 +205,38 @@ def dispatch_leaf(
 ) -> tuple[Any, str]:
     """Dispatch one leaf through the shipped controller tool surface.
 
-    The intent id is returned because it is the durable handle every later
-    proof keys on, so a wait can name the attempt it is waiting for instead of
+    The intent id is returned because it is the durable handle every later proof
+    keys on, so a wait can name the attempt it is waiting for instead of
     counting rows that earlier attempts also wrote.
+
+    A leaf the server actually spawned is released here, once the spawn call has
+    returned. The server confirms the new window is live as part of returning, so
+    releasing afterwards is a consequence of an observed boundary rather than a
+    guess about how long the confirmation takes.
     """
     attempt = str(kwargs.pop("intent_id", None) or intent(name))
-    return (
-        project.effects().spawn_leaf(
-            name=name, task=task, intent_id=attempt, agent_type=LEAF_HARNESS, **kwargs
-        ),
-        attempt,
+    agent = f"{name}-{LEAF_HARNESS}"
+    pj.arm_release(project, agent)
+    result = project.effects().spawn_leaf(
+        name=name, task=task, intent_id=attempt, agent_type=LEAF_HARNESS, **kwargs
     )
+    if ev.is_success(result.raw):
+        pj.release_agent(project, agent)
+    return result, attempt
+
+
+def resume_pr(project: Project, pr_number: int, task: str) -> Any:
+    """Resume an open pull request through the shipped tool surface.
+
+    A resumed owner is released the same way a spawned one is: the route
+    re-confirms the owner's window is live before it returns, so releasing after
+    it returns is a consequence of that confirmation.
+    """
+    pj.arm_release(project, LEAF_AGENT)
+    result = project.effects().resume_pr(pr_number=pr_number, task=task)
+    if ev.is_success(result.raw):
+        pj.release_agent(project, LEAF_AGENT)
+    return result
 
 
 def _authoritative_spawn(
@@ -175,30 +266,50 @@ def await_publication(
 ) -> dict[str, Any]:
     """Wait for the leaf to commit, push, and file exactly one open PR.
 
-    The boundary is the forge's own record, cross-checked against the leaf's
-    durable publication record, so neither side alone can pass: a stale ledger
-    row cannot open a pull request, and an unrelated pull request cannot be
-    attributed to this leaf.
+    The terminal boundary is the leaf's own record that its invocation finished,
+    cross-checked against the forge's record of the pull request and the
+    server's ledger row for the publication. All three are written before the
+    agent records that it is done, so nothing that would open a second pull
+    request can still be in flight when the count is taken. No duration is
+    involved: a count that has merely stopped moving is not evidence.
     """
-    recorded = await_boundary(
-        lambda: leaf_publications(project) or None,
-        description=f"the deterministic leaf to publish {branch}",
-        timeout=PUBLICATION_TIMEOUT_SECONDS,
-    )
-    pulls = await_stable(
-        lambda: pulls_on_branch(fixture, branch),
-        description=f"pull requests on {branch} to hold steady",
-        stable_for=SETTLE_SECONDS,
-        timeout=PUBLICATION_TIMEOUT_SECONDS,
-    )
+    await_agent_settled(project, branch)
+    recorded = [record for record in leaf_publications(project) if record["branch"] == branch]
     require(
         len(recorded) == 1,
-        f"the leaf published more than once: {json.dumps(recorded)[:2000]}",
+        f"the leaf published more than once on {branch}: "
+        f"{json.dumps(recorded)[:2000]}",
     )
+    published = ev.publications(project.ledger(), branch=branch)
+    # One publication writes both a ``pr.filed`` and a ``pr.published`` row, so
+    # the publication is counted by the pull request it produced rather than by
+    # the rows it wrote.
+    published_numbers = {
+        (event.get("data") or {}).get("pr_number") for event in published
+    }
+    filed = [event for event in published if event["type"] == "pr.filed"]
+    confirmed = [event for event in published if event["type"] == "pr.published"]
+    require(
+        len(filed) == 1 and len(confirmed) == 1,
+        f"the server recorded {len(filed)} filed and {len(confirmed)} confirmed "
+        f"publications on {branch}, expected one of each: "
+        f"{json.dumps(published, default=str)[:1500]}",
+    )
+    require(
+        len(published_numbers) == 1 and None not in published_numbers,
+        f"the publications on {branch} name more than one pull request: "
+        f"{published_numbers!r}",
+    )
+    pulls = pulls_on_branch(fixture, branch)
     require(
         len(pulls) == 1,
         f"expected exactly one open pull request on {branch}, got {len(pulls)}: "
         f"{json.dumps(pulls, default=str)[:2000]}",
+    )
+    require(
+        pulls[0].get("number") in published_numbers,
+        f"the open pull request on {branch} is not the one the server recorded: "
+        f"forge={pulls[0].get('number')!r} ledger={published_numbers!r}",
     )
     pull = pulls[0]
     require(
@@ -307,7 +418,7 @@ def t2_recreate_preserves_branch(project: Project) -> dict[str, Any]:
         project.process.poll() is not None,
         f"the acceptance's own server process {pid} survived close()",
     )
-    recreated = pj.recreate_session(project.run, project.port)
+    recreated = set_live_project(pj.recreate_session(project.run, project.port))
     after_head = ev.head_of(recreated.repo, LEAF_BRANCH)
     require(
         after_head == before["head"],
@@ -664,7 +775,7 @@ def t6_recreate_is_idempotent(project: Project, expected_head: str) -> dict[str,
     ]
     creations_before = _recorded_creations(project)
     project.close()
-    recreated = pj.recreate_session(project.run, project.port)
+    recreated = set_live_project(pj.recreate_session(project.run, project.port))
 
     head = ev.head_of(recreated.repo, LEAF_BRANCH)
     require(
@@ -1005,22 +1116,19 @@ def t7_expected_agent_resume(
     ``resume_pr`` is the shipped surface that resolves a pull request's exact
     owning agent and re-dispatches that agent rather than a new one. This probe
     drives it against a session it recreates itself, so the owner being resumed
-    is a genuinely recreated leaf.
+    is a genuinely recreated leaf, and the agent it starts blocks on a release
+    file the harness only creates after the route returns. The agent is
+    therefore provably live for the whole of the route's own readiness check.
 
-    What it asserts is the fail-closed contract this actor can reach. The
-    shipped route re-checks that the resumed owner's tmux target is live before
-    it reports success, and this deterministic actor does not satisfy that check
-    after its session has been recreated, so the route refuses. The refusal is
-    accepted only when it names that readiness confirmation, and only when the
-    leaf is left exactly as it was: one identity, one worktree, the same head,
-    and one open pull request. A resume that reported success, or that refused
-    for some other reason, or that forked the leaf into a second identity,
-    worktree, head, or pull request, fails this item.
+    The positive contract is what it asserts: the resume is confirmed, the same
+    owner is re-dispatched under a new invocation, the identity, the worktree,
+    the branch, the head, and the one open pull request all survive it, and the
+    leaf is given the pull request's context rather than starting blind.
 
-    The positive resume, where the route confirms the resume and the leaf
-    continues its pull request, is not exercised here. It needs a leaf whose
-    tmux target is live again after the session is recreated, which is a
-    property of the agent runtime rather than of this acceptance's actor.
+    If the route refuses, this item fails and the evidence carries the exact
+    refusal together with every input the shipped liveness check reads, so the
+    refusal is attributable to the product rather than to this harness. Nothing
+    here works around the refusal.
     """
     identities_before = ev.agent_identities(project.repo, LEAF_AGENT)
     worktrees_before = ev.worktrees_for_branch(project.repo, LEAF_BRANCH)
@@ -1030,69 +1138,169 @@ def t7_expected_agent_resume(
         len(pulls_before) == 1,
         f"the preserved pull request is not singular: {len(pulls_before)}",
     )
+    invocation_before = ev.agent_invocation(project.repo, LEAF_AGENT)
+    require(
+        isinstance(invocation_before, dict)
+        and isinstance(invocation_before.get("invocation_id"), str),
+        f"the leaf has no recorded invocation to resume from: {invocation_before!r}",
+    )
 
     project.close()
     recreated = pj.recreate_session(project.run, project.port)
-    require(
-        ev.head_of(recreated.repo, LEAF_BRANCH) == head_before,
-        "the resume's own recreate moved the preserved head",
-    )
-    result = recreated.effects().resume_pr(
-        pr_number=pr_number,
-        task="Continue the preserved branch after the session was recreated",
-    )
+    set_live_project(recreated)
     project.run, project.process, project.client = (
         recreated.run,
         recreated.process,
         recreated.client,
     )
     require(
-        not ev.is_success(result.raw),
-        f"the expected-agent resume reported success for an owner whose target "
-        f"is not live after the recreate: {result.raw!r}",
+        ev.head_of(recreated.repo, LEAF_BRANCH) == head_before,
+        "the resume's own recreate moved the preserved head",
     )
-    refusal = str(result.error or result.raw)
+    result = resume_pr(
+        recreated,
+        pr_number,
+        "Continue the preserved branch after the session was recreated",
+    )
+    if not ev.is_success(result.raw):
+        raise ScenarioError(
+            "the expected-agent resume was refused: "
+            f"{str(result.error or result.raw)[:300]}; liveness inputs: "
+            f"{json.dumps(_liveness_inputs(recreated), sort_keys=True)[:900]}; "
+            f"the agent is live and waiting on a release the harness only writes "
+            f"after this route returns, so the readiness check had a live actor"
+        )
+    resumed = await_boundary(
+        lambda: ev.typed(recreated.ledger(), "agent.resumed") or None,
+        description="the resume's own durable record",
+        timeout=PUBLICATION_TIMEOUT_SECONDS,
+    )
     require(
-        "readiness confirmation" in refusal,
-        f"the resume was refused for a reason this acceptance does not claim "
-        f"to prove: {refusal!r}",
+        len(resumed) == 1,
+        f"the resume was recorded {len(resumed)} times: "
+        f"{json.dumps(resumed, default=str)[:1500]}",
+    )
+    invocation_after = ev.agent_invocation(recreated.repo, LEAF_AGENT)
+    require(
+        isinstance(invocation_after, dict)
+        and invocation_after.get("invocation_id") != invocation_before["invocation_id"],
+        f"the resume did not start a new invocation: before="
+        f"{invocation_before['invocation_id']!r} after={invocation_after!r}",
+    )
+    require(
+        invocation_after.get("trigger") == "resume_pr",
+        f"the new invocation does not name the resume as its trigger: "
+        f"{invocation_after!r}",
     )
     require(
         ev.agent_identities(recreated.repo, LEAF_AGENT) == identities_before,
-        "the refused resume replaced the leaf's identity",
+        "the resume replaced the leaf's identity",
     )
     require(
         ev.worktrees_for_branch(recreated.repo, LEAF_BRANCH) == worktrees_before,
-        f"the refused resume changed the leaf worktree set: "
-        f"before={worktrees_before!r} "
+        f"the resume changed the leaf worktree set: before={worktrees_before!r} "
         f"after={ev.worktrees_for_branch(recreated.repo, LEAF_BRANCH)!r}",
     )
     require(
         ev.head_of(recreated.repo, LEAF_BRANCH) == head_before,
-        f"the refused resume moved the preserved head from {head_before} to "
+        f"the resume moved the preserved head from {head_before} to "
         f"{ev.head_of(recreated.repo, LEAF_BRANCH)}",
     )
-    pulls_after = await_stable(
-        lambda: pulls_on_branch(fixture, LEAF_BRANCH),
-        description=f"pull requests on {LEAF_BRANCH} to hold steady after the resume",
-        stable_for=SETTLE_SECONDS,
+    pulls_after = await_boundary(
+        lambda: _pulls_when_settled(recreated, fixture, LEAF_BRANCH),
+        description=f"the pull requests on {LEAF_BRANCH} after the resume",
         timeout=PUBLICATION_TIMEOUT_SECONDS,
     )
     require(
         len(pulls_after) == 1,
-        f"the refused resume changed the open pull requests on {LEAF_BRANCH}: "
+        f"the resume changed the open pull requests on {LEAF_BRANCH}: "
         f"before={len(pulls_before)} after={len(pulls_after)}",
+    )
+    require(
+        published_context_available(recreated, LEAF_BRANCH),
+        "the resume did not restore the pull request's context for the leaf",
     )
     return {
         "pr_number": pr_number,
         "owner": LEAF_AGENT,
-        "fails_closed": True,
-        "refusal": refusal[:300],
+        "confirmed": True,
+        "resumed_records": len(resumed),
+        "invocation_before": invocation_before["invocation_id"],
+        "invocation_after": invocation_after.get("invocation_id"),
+        "invocation_trigger": invocation_after.get("trigger"),
         "identity_reused": True,
         "head": head_before,
         "worktrees": len(worktrees_before),
         "open_pull_requests": len(pulls_after),
+        "pr_context_restored": True,
     }
+
+
+def published_context_available(project: Project, branch: str) -> bool:
+    """Report whether the server still has the publication the leaf owns.
+
+    A resume that hands the leaf a task saying nothing about the pull request it
+    owns is how a second pull request gets filed, so the acceptance requires the
+    publication registry to still name this branch's pull request after the
+    resume.
+    """
+    heads = ev.published_heads(project.repo, LEAF_AGENT)
+    return any(head.get("head_branch") == branch for head in heads)
+
+
+def _liveness_inputs(project: Project) -> dict[str, Any]:
+    """Return what the shipped liveness check reads about an owner.
+
+    ``routing_liveness`` decides in this order: an ``exited_at`` marker, then
+    whether the invocation record is live, then an ``exit_code`` marker, then
+    the recorded routing, then the tmux window and pane. This returns each of
+    those, plus tmux's own listing in the exact format the shipped probe reads,
+    so a refusal is attributable to the product rather than to this harness.
+    """
+    agent_dir = project.repo / ".exo" / "agents" / LEAF_AGENT
+    invocation = ev.agent_invocation(project.repo, LEAF_AGENT)
+    routing = ev.read_json_if_present(agent_dir / "routing.json")
+    window = routing.get("window_id") if isinstance(routing, Mapping) else None
+    return {
+        "exited_at_present": (agent_dir / "exited_at").exists(),
+        "exit_code_present": (agent_dir / "exit_code").exists(),
+        "invocation_status": invocation.get("status") if invocation else None,
+        "invocation_ended_at": invocation.get("ended_at") if invocation else None,
+        "invocation_trigger": invocation.get("trigger") if invocation else None,
+        "routing_window": window,
+        "tmux_panes_for_window": _tmux_panes(project.session, window),
+    }
+
+
+def _tmux_panes(session: str, window: Any) -> list[str]:
+    """Return tmux's own rows for one window, in the shipped check's format.
+
+    The shipped probe reads exactly this listing and requires a row whose
+    session name matches the server's configured session, so recording it shows
+    whether the probe would find a live pane for that window.
+    """
+    result = subprocess.run(
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_dead}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        return [f"tmux list-panes failed: {result.stderr.strip()}"]
+    rows = result.stdout.splitlines()
+    if not session:
+        return rows
+    return [
+        line
+        for line in rows
+        if line.split("\t")[:2] == [session, str(window)]
+    ]
 
 
 def t7_unowned_resume_fails_closed(project: Project) -> dict[str, Any]:
@@ -1108,9 +1316,10 @@ def t7_unowned_resume_fails_closed(project: Project) -> dict[str, Any]:
     before = len(ev.authoritative_spawns(project.ledger()))
     refusal: str | None = None
     try:
-        result = project.effects().resume_pr(
-            pr_number=unowned_pr_number,
-            task="Resume a pull request this project does not own",
+        result = resume_pr(
+            project,
+            unowned_pr_number,
+            "Resume a pull request this project does not own",
         )
     except ServerError as failure:
         refusal = failure.body
@@ -1143,19 +1352,29 @@ def t7_unowned_resume_fails_closed(project: Project) -> dict[str, Any]:
 def t7(project: Project, fixture: forgejo.Instance, pr_number: int) -> dict[str, Any]:
     """Run every fail-closed shape the issue names and report each outcome.
 
-    The expected-agent resume runs first, against the leaf exactly as the
-    recreate left it. The later probes deliberately remove branches and
-    worktrees the leaf does not own, and they would leave the owner in a state
-    the acceptance is not claiming to have proved.
+    The four refusals that need no pull request run first, and the resume of an
+    unowned pull request next, so that everything this item can prove is proved
+    and recorded before the positive resume is attempted. The positive resume
+    runs last, against a session it recreates itself, because it is the only
+    probe that changes the leaf's own state; if it fails, the failure carries
+    what the earlier probes established rather than nothing.
     """
-    return {
-        "expected_agent_resume": t7_expected_agent_resume(project, fixture, pr_number),
-        "unowned_resume": t7_unowned_resume_fails_closed(project),
+    proved: dict[str, Any] = {
         "branch_checked_out_elsewhere": t7_branch_checked_out_elsewhere(project),
         "unregistered_residue_path": t7_unregistered_residue(project),
         "local_remote_divergence": t7_local_remote_divergence(project),
         "concurrent_create_race": t7_concurrent_create_race(project),
+        "unowned_resume": t7_unowned_resume_fails_closed(project),
     }
+    try:
+        proved["expected_agent_resume"] = t7_expected_agent_resume(
+            project, fixture, pr_number
+        )
+    except ScenarioError as error:
+        raise ScenarioError(
+            f"{error}; probes that did pass: {sorted(proved)!r}"
+        ) from error
+    return proved
 
 
 # --------------------------------------------------------------------------
@@ -1323,24 +1542,40 @@ def t9_retryable_refusal_reconciles(project: Project) -> dict[str, Any]:
         ev.is_success(redrive.raw),
         f"the re-drive after the lock was released failed: {redrive.raw!r}",
     )
-    spawns_after = await_stable(
-        lambda: len(_authoritative_spawn(project, redrive_intent)),
-        description=f"the re-drive's authoritative spawns for {branch} to settle",
-        stable_for=SETTLE_SECONDS,
-        timeout=PUBLICATION_TIMEOUT_SECONDS,
+    spawns_after = await_agent_settled(project, branch)
+    require(
+        len(spawns_after) == 1,
+        f"the re-drive produced {len(spawns_after)} authoritative spawns, "
+        f"expected one",
     )
     require(
-        spawns_after == 1,
-        f"the re-drive produced {spawns_after} authoritative spawns, expected one",
+        len(_authoritative_spawn(project, redrive_intent)) == 1,
+        f"the re-drive's own intent {redrive_intent} did not spawn exactly one "
+        f"leaf: {_authoritative_spawn(project, redrive_intent)!r}",
     )
     return {
         "code": refusal.code,
         "retryable": True,
         "created_nothing_while_refused": True,
-        "authoritative_spawns_after_redrive": spawns_after,
+        "authoritative_spawns_after_redrive": len(spawns_after),
         "intent_id": redrive_intent,
         "reconciled": True,
     }
+
+
+def _pulls_when_settled(
+    project: Project, fixture: forgejo.Instance, branch: str
+) -> list[dict[str, Any]]:
+    """Return the branch's open pull requests once no agent on it is in flight.
+
+    The count is only taken after the agent's own finished record, so a pull
+    request a second invocation might still open cannot be missed.
+    """
+    spawns = ev.authoritative_spawns(project.ledger(), branch=branch)
+    finished = finished_invocations(project, branch)
+    if spawns and len(spawns) == len(finished):
+        return pulls_on_branch(fixture, branch)
+    return []
 
 
 def t9_terminal_conflict_fails_closed(project: Project) -> dict[str, Any]:

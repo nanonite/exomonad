@@ -62,6 +62,7 @@ class Report:
     evidence: dict[str, Any] = field(default_factory=dict)
     leaks: list[str] = field(default_factory=list)
     cleanup_problems: list[str] = field(default_factory=list)
+    sweep_problems: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -69,24 +70,36 @@ class Report:
             all(self.results.get(item) == "PASS" for item in ITEMS)
             and not self.leaks
             and not self.cleanup_problems
+            and not self.sweep_problems
         )
 
     def emit(self) -> None:
-        """Print one line per T-item, then any leak, then the verdict."""
+        """Print one line per T-item, then any leak, then the verdict.
+
+        An item the run never reached is reported as ``SKIP`` rather than
+        ``FAIL``: the walk stops at the first failure, and calling an item that
+        was never attempted a failure would misreport what the run established.
+        """
         for item in ITEMS:
-            status = self.results.get(item, "FAIL")
+            status = self.results.get(item, "SKIP")
             detail = json.dumps(self.evidence.get(item, {}), sort_keys=True, default=str)
             print(f"{status} {item} {detail[:700]}")
         for problem in self.cleanup_problems:
             print(f"FAIL CLEANUP {problem}")
+        for problem in self.sweep_problems:
+            print(f"FAIL SWEEP {problem}")
         for leak in self.leaks:
             print(f"FAIL LEAK {leak}")
         passed_items = sum(1 for item in ITEMS if self.results.get(item) == "PASS")
+        failed_items = sum(1 for item in ITEMS if self.results.get(item) == "FAIL")
+        skipped_items = sum(1 for item in ITEMS if item not in self.results)
         verdict = "PASS" if self.passed else "FAIL"
         print(
             f"{verdict} recreated-leaf-recovery: {passed_items}/{len(ITEMS)} items "
-            f"passed, {len(self.leaks)} leaks, "
-            f"{len(self.cleanup_problems)} cleanup problems"
+            f"passed, {failed_items} failed, {skipped_items} not reached, "
+            f"{len(self.leaks)} leaks, "
+            f"{len(self.cleanup_problems)} cleanup problems, "
+            f"{len(self.sweep_problems)} sweep problems"
         )
 
 
@@ -165,7 +178,9 @@ class Walk:
         )
 
     def _t7(self) -> Any:
-        return sc.t7(self.project, self.instance, self.publication["pr_number"])
+        outcome = sc.t7(self.project, self.instance, self.publication["pr_number"])
+        self.project = sc.current_project()
+        return outcome
 
     def _t8(self) -> Any:
         return sc.t8_sink_does_not_create_planned_dir(self.project)
@@ -178,12 +193,19 @@ class Walk:
 
 
 def walk(scope: cl.RunScope, instance: fj.Instance) -> Walk:
-    """Run every T-item, stopping at the first that fails."""
+    """Run every T-item, continuing past a failure.
+
+    The items are independent, so one failing item must not hide the verdict of
+    the ones after it: a run that stops at the first failure would report the
+    rest as unknown when in fact they were still provable. Every item is
+    attempted, each reports its own verdict, and the run's status is the
+    conjunction of all of them.
+    """
     database = chainlink_db.create(scope.root)
     seeded = chainlink_db.seed(database)
     run = pj.new_run(scope, instance, database, leaf_branches=[pj.LEAF_BRANCH])
     walk_state = Walk(scope, instance)
-    walk_state.project = pj.start(run)
+    walk_state.project = sc.set_live_project(pj.start(run))
     walk_state.evidence["seeded_issues"] = list(seeded)
     walk_state.evidence["chainlink_database"] = str(database)
     for item, step in walk_state.steps():
@@ -195,7 +217,7 @@ def walk(scope: cl.RunScope, instance: fj.Instance) -> Walk:
                 "error": f"{type(error).__name__}: {error}"
             }
             print(f"FAIL {item} {json.dumps(walk_state.evidence[item])[:700]}", flush=True)
-            return walk_state
+            continue
         walk_state.results[item] = "PASS"
         walk_state.evidence[item] = result
         print(
@@ -227,6 +249,16 @@ def main() -> int:
 
     cl.install_trap(scope)
     try:
+        # A previous run that was killed from outside -- a SIGKILL, a host
+        # reboot, a Docker restart -- never got to tear itself down. Reclaim
+        # what such a run left before starting this one, so an interrupted run
+        # cannot accumulate a process, a session, a compose project, or a
+        # directory that outlives it.
+        swept = cl.sweep_stale(cl.LEAK_PREFIX, fj.template_path(PROJECT_ROOT))
+        report.sweep_problems = swept
+        report.evidence["swept_before_run"] = swept
+        if swept:
+            print(f"FAIL SWEEP {json.dumps(swept)[:700]}", flush=True)
         instance = fj.provision(scope, PROJECT_ROOT, identifier)
         report.evidence["forgejo"] = {
             "compose_project": instance.project,
