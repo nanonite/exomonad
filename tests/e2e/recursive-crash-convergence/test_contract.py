@@ -931,6 +931,7 @@ def test_every_leg_names_its_items_and_its_own_valid_plan() -> None:
     import driver
     import scenario
     from run_prefix import CHILD_SUB_TL, LEGS
+
     from tl_loop.plan_validation import validate_plan_document
 
     assert tuple(driver.ITEMS_BY_LEG) == LEGS
@@ -957,3 +958,37 @@ def test_every_leg_names_its_items_and_its_own_valid_plan() -> None:
     assert scenario._leaf_branch("child") == f"main.{CHILD_SUB_TL}.{scenario.LEAF_SLICE}-codex"
     assert scenario._leaf_branch("recreate") == f"main.{scenario.LEAF_SLICE}-codex"
     assert scenario._leaf_branch("control") == scenario._leaf_branch("recreate")
+
+
+def test_the_spawned_reviewer_leaves_this_runs_approval_to_the_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The acceptance posts its own approval, so its stand-in must not post one.
+
+    The shipped controller spawns its reviewer as soon as a slice reaches
+    review, and that reviewer resolves through this harness's shim; if it
+    submitted too, the run would hold two approvals for one head and the
+    acceptance's "exactly one" would be its own doing.
+    """
+    monkeypatch.setenv("EXOMONAD_REVIEW_OWNED_BY_HARNESS", "1")
+    monkeypatch.setattr(sys, "argv", ["leaf_publication_agent.py", "Review PR #7: task"])
+
+    def forbid_submission(pr_number: int) -> bool:
+        raise AssertionError(f"the stand-in submitted an approval for PR #{pr_number}")
+
+    monkeypatch.setattr(leaf_publication_agent, "review_assigned_pr", forbid_submission)
+    assert leaf_publication_agent.main() == 0
+
+
+def test_the_reviewer_stand_in_still_approves_a_run_that_owns_no_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run that does not opt out keeps the reviewer actor's own approval."""
+    monkeypatch.delenv("EXOMONAD_REVIEW_OWNED_BY_HARNESS", raising=False)
+    monkeypatch.setattr(sys, "argv", ["leaf_publication_agent.py", "Review PR #7: task"])
+    submitted: list[int] = []
+    monkeypatch.setattr(
+        leaf_publication_agent, "review_assigned_pr", lambda n: submitted.append(n)
+    )
+    assert leaf_publication_agent.main() == 0
+    assert submitted == [7]

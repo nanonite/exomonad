@@ -232,6 +232,20 @@ def _review_already_submitted(
     return False
 
 
+def _review_owned_by_harness() -> bool:
+    """Whether this run's harness, rather than the spawned reviewer, approves.
+
+    The #1117 acceptance posts the reviewer's approval itself (its `review`
+    item), because it has no model to review with. The shipped controller still
+    spawns its reviewer as soon as a slice reaches review, and that stand-in
+    resolves through the same shim -- so if it also submitted, the run would
+    hold two approvals for one head and the acceptance's "exactly one" would
+    be the harness's own doing. The spawn itself is still exercised; only the
+    duplicate submission is left to the harness that owns this run's reviews.
+    """
+    return os.environ.get("EXOMONAD_REVIEW_OWNED_BY_HARNESS", "").strip() == "1"
+
+
 def review_assigned_pr(pr_number: int) -> bool:
     """Submit one authoritative approval for the exact assigned PR head."""
     forgejo_url = _required_environment(
@@ -307,6 +321,8 @@ def main() -> int:
     try:
         review_number = _review_pr_number(sys.argv[1:])
         if review_number is not None:
+            if _review_owned_by_harness():
+                return 0
             review_assigned_pr(review_number)
         elif not publish_leaf():
             time.sleep(300)

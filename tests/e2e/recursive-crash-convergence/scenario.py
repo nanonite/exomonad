@@ -243,6 +243,11 @@ def _write_agent_shim(project: Project) -> None:
             "#!/bin/sh\n"
             f"export EXOMONAD_SOCKET={shlex.quote(str(project.repo / '.exo' / 'server.sock'))}\n"
             f"export EXOMONAD_1057_LEAF_BRANCHES={shlex.quote(project.leaf_branch)}\n"
+            "# This run's approval comes from the acceptance's own `review` item:\n"
+            "# a spawned reviewer resolving through this shim would post a second\n"
+            "# approval for the same head. The spawn still happens; only the\n"
+            "# duplicate submission belongs to the harness.\n"
+            "export EXOMONAD_REVIEW_OWNED_BY_HARNESS=1\n"
             f"exec {shlex.quote(str(CONTROLLER_INTERPRETER))} "
             f"{shlex.quote(str(LEAF_ACTOR))} \"$@\"\n",
             encoding="utf-8",
