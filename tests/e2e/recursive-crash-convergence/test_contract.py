@@ -1029,7 +1029,7 @@ def test_the_restart_path_targets_the_runs_own_tmux_server(
     def record(socket: object, *arguments: str) -> None:
         calls.append((tuple(arguments), Path(str(socket))))  # type: ignore[arg-type]
 
-    monkeypatch.setattr(scenario.tmuxio, "tmux", record)
+    monkeypatch.setattr(f"{scenario.tmuxio.__name__}.tmux", record)
     project = object.__new__(scenario.Project)
     project.scope = _Scope()  # type: ignore[attr-defined]
     project.session = "exo-e2e-1117-deadbeef"
