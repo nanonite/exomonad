@@ -75,7 +75,7 @@
           "pr_number": 42,
           "head_sha": "head-a",
           "head_branch": "main.stage-a.child-leaf",
-          "base_branch": "main",
+          "base_branch": "main.stage-a",
           "invocation_id": "child-invocation"
         }
       },

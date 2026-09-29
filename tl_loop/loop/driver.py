@@ -824,6 +824,7 @@ class TLLoopConfig:
     parent_branch: str | None = None
     parent_run_id: str | None = None
     parent_agent_id: str | None = None
+    parent_generation_id: str | None = None
     depth: int = 0
     max_depth: int = 3
     plan_revision: int = 1
@@ -913,6 +914,7 @@ class TLLoopConfig:
         _optional_text(self.parent_branch, "parent_branch")
         _optional_text(self.parent_run_id, "parent_run_id")
         _optional_text(self.parent_agent_id, "parent_agent_id")
+        _optional_text(self.parent_generation_id, "parent_generation_id")
         if self.worktree is not None:
             _require_text(str(self.worktree), "worktree")
         _optional_text(self.requested_model, "requested_model")
@@ -1290,7 +1292,9 @@ def run_tl_loop(
         if selected.session_mode is not None:
             root_state["session_mode"] = selected.session_mode
         if epoch_enabled:
-            root_state["controller_epoch"] = _controller_epoch(store.root_dir, run_id)
+            root_state["controller_epoch"] = _controller_epoch(
+                store.root_dir, run_id, selected.parent_generation_id
+            )
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
     if state.reducer_version != REDUCER_VERSION:
@@ -1326,7 +1330,9 @@ def run_tl_loop(
     if state.session_mode is None and selected.session_mode is not None:
         state = store.set_session_mode(selected.session_mode)
     if epoch_enabled:
-        current_controller_epoch = _controller_epoch(store.root_dir, run_id)
+        current_controller_epoch = _controller_epoch(
+            store.root_dir, run_id, selected.parent_generation_id
+        )
         if state.controller_epoch is None or (
             selected.session_mode == "continue"
             and state.controller_epoch != current_controller_epoch
@@ -3481,15 +3487,27 @@ def _execute_direct_reviewer_intent(
             ),
             effects_log,
         )
-    except EffectFailed:
+    except EffectFailed as error:
         refreshed = store.load()
-        _checkpoint_slice_action(
+        rejected = _checkpoint_slice_action(
             store,
             refreshed,
             current.id,
             replace(action, phase=ActionPhase.REJECTED),
         )
-        raise
+        if not _rejected_because_pr_closed(error):
+            raise
+        # The pull request was closed while its reviewer was being dispatched.
+        # That is an authoritative observation with its own park cause
+        # (`PR_CLOSED_UNMERGED`), not a controller failure, so the run stays
+        # alive and the PR-state heartbeat classifies it and parks the slice
+        # exactly once. Re-raising here failed the whole run instead, and for a
+        # nested child that took the parent's sub-TL slice down with it, so the
+        # leaf was never parked and never escalated. The action stays journaled
+        # as rejected, so the attempt remains auditable.
+        return _apply_convergence(
+            rejected, tracker, store, config, effects, effects_log
+        )
     except BaseException as error:
         refreshed = store.load()
         unknown = _checkpoint_slice_action(
@@ -3531,6 +3549,19 @@ def _execute_direct_reviewer_intent(
     return _checkpoint_slice_action(
         store, refreshed, current.id, updated.action, slice_state=updated
     )
+
+
+def _rejected_because_pr_closed(error: BaseException) -> bool:
+    """Whether a refused effect is the forge reporting a closed, unmerged PR.
+
+    The server refuses a reviewer spawn on a PR that is no longer open and
+    unmerged, and names the reason in the error. This is the same marker-based
+    recognition the ordered-exit classifier already uses, and it is deliberately
+    narrow: only the closed-unmerged refusal is an observation the run should
+    wait for, and every other refusal still fails the run exactly as before.
+    """
+    message = str(error).lower()
+    return "not open and unmerged" in message and "pr #" in message
 
 
 def _review_contract_for_slice(current: SliceState) -> ReviewContract:
@@ -11032,6 +11063,20 @@ def _plan_consumes_events(plan: WorkPlan | Mapping[str, object]) -> bool:
     return bool(plan.get("workers") or plan.get("leaves") or plan.get("sub_tls"))
 
 
+def _parent_generation_id(store: RunStore) -> str | None:
+    """The generation a child inherits, or None when the parent has no state yet.
+
+    A child run's generation must differ from its predecessor's when the parent
+    is recreated, and the parent's own ``generation_id`` is what changes. A
+    parent with no checkpoint yet carries no generation, so the child mints from
+    its own scope name exactly as it always did; that keeps provisioning a
+    child before the parent state exists working unchanged.
+    """
+    if not store.path.exists():
+        return None
+    return store.load().generation_id
+
+
 def _child_config(
     config: TLLoopConfig,
     task: SubTLTask,
@@ -11056,6 +11101,7 @@ def _child_config(
         parent_branch=config.branch,
         parent_run_id=store.run_id,
         parent_agent_id=config.agent_id or store.run_id,
+        parent_generation_id=_parent_generation_id(store),
         agent_id=task.agent_id or task.name,
         working_dir=worktree,
         depth=config.depth + 1,
@@ -11286,8 +11332,25 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
     )
 
 
-def _controller_epoch(root_dir: Path, run_id: str) -> str:
-    """Read the init-owned epoch marker, with a deterministic first-run value."""
+def _controller_epoch(
+    root_dir: Path, run_id: str, parent_generation_id: str | None = None
+) -> str:
+    """Read the init-owned epoch marker, with a deterministic first-run value.
+
+    A nested run is never ``init``-launched, so its first epoch is minted here
+    rather than by the operator. Seeding that from ``run_id`` alone made the
+    value a function of the *name* rather than of the run: a nested run's marker
+    lives inside its parent run directory, which a confirmed recreate replaces
+    wholesale, so the recreated child re-minted the identical epoch. Identical
+    epochs mean an identical ``generation_id``, which means an identical
+    dispatch intent identity -- and the predecessor generation's ``agent.spawned``
+    row then confirmed the recreated dispatch with the *dead* invocation. That
+    bound the pre-recreate publication instead of the current one, so a leaf
+    dispatched under a child sub-TL never progressed past ``spawned``.
+
+    Seeding from the parent generation distinguishes the two: the parent's
+    generation changes on a recreate, so its child inherits a new one.
+    """
     marker = Path(root_dir) / f"{run_id}.controller-epoch"
     try:
         value = marker.read_text(encoding="utf-8").strip()
@@ -11295,7 +11358,10 @@ def _controller_epoch(root_dir: Path, run_id: str) -> str:
         value = ""
     if value:
         return value
-    value = hashlib.sha256(f"controller:{run_id}".encode()).hexdigest()[:32]
+    seed = f"controller:{run_id}"
+    if parent_generation_id:
+        seed = f"{seed}:{parent_generation_id}"
+    value = hashlib.sha256(seed.encode()).hexdigest()[:32]
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(value + "\n", encoding="utf-8")
@@ -13337,6 +13403,16 @@ def _initial_slices(
     nested = selected.parent_branch is not None
     current_run = run_id or selected.run_id
     owner_worktree = _effective_worktree(selected, state_root, current_run)
+    # A child of *this* run is dispatched off ``selected.branch`` and files its
+    # pull request against that same branch: the sub-TL spawn boundary records
+    # ``base_ref=config.branch`` for the slice it confirms, and a sub-TL slice is
+    # declared with ``selected.branch`` below. ``selected.parent_branch`` is one
+    # level further up -- it is the branch *this* run files against -- so naming
+    # it here made every nested worker's and leaf's publication fail the binder's
+    # base-branch identity check. A leaf dispatched by a child sub-TL then bound
+    # no publication, recorded no handoff, and could never be reconciled into a
+    # park when its PR was closed.
+    child_base_ref = selected.branch if nested else None
     result: dict[str, dict[str, object]] = {}
     for worker in plan.workers:
         result[worker.name] = _initial_slice_record(
@@ -13346,7 +13422,7 @@ def _initial_slices(
             worker.agent_type,
             derive_child_branch(selected.branch, worker.name) if nested else None,
             str(derive_child_worktree(owner_worktree, worker.name)) if nested else None,
-            selected.parent_branch if nested else None,
+            child_base_ref,
             config=selected,
             task_timeout_seconds=worker.task_timeout_seconds,
             task_timeout_declared=worker.task_timeout_declared,
@@ -13362,7 +13438,7 @@ def _initial_slices(
             leaf.agent_type,
             derive_child_branch(selected.branch, leaf.name) if nested else None,
             str(derive_child_worktree(owner_worktree, leaf.name)) if nested else None,
-            selected.parent_branch if nested else None,
+            child_base_ref,
             config=selected,
             task_timeout_seconds=leaf.task_timeout_seconds,
             task_timeout_declared=leaf.task_timeout_declared,

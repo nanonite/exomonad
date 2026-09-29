@@ -60,7 +60,13 @@ RECREATED_INVOCATION = "inv-recreated-1"
 RECREATED_EPOCH = "fd510ebdd318dec7c78d56df90ea9627"
 PREDECESSOR_EPOCH = "1111aaaa2222bbbb3333cccc4444dddd"
 HEAD_BRANCH = "main.recreate-stage.recreated-leaf"
-BASE_BRANCH = "main"
+# A child scope's leaf is dispatched from, and files its pull request against,
+# its own run's branch -- the branch the shipped spawn path derives from -- and
+# not against the branch one level further up. ``resolve_base_branch`` in the
+# production `file_pr` effect derives the base from the head branch's parent,
+# so `main.recreate-stage.recreated-leaf` is published into
+# `main.recreate-stage`.
+BASE_BRANCH = "main.recreate-stage"
 HEAD_101 = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4"
 HEAD_102 = "b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5"
 

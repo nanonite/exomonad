@@ -601,10 +601,29 @@ class Scenario:
             token=self.project.instance.author.token,
             payload={"state": "closed"},
         )
+
+        # The run records its escalation intent in two durable phases: the
+        # `requested` phase is written *before* the issue is created, and the
+        # `created` phase carries the issue id once the run's own database holds
+        # it. That split is what makes a crash between the two recoverable, so
+        # an intent file appearing proves only that the run wanted an
+        # escalation. The boundary therefore waits for a *completed* one. The
+        # exactly-once assertions below still read every intent, so a second
+        # one is still caught.
+        def completed_escalation() -> list[dict[str, Any]] | None:
+            completed = [
+                record
+                for record in self._escalation_records()
+                if type(record.get("issue_id")) is int and record["issue_id"] > 0
+            ]
+            return completed or None
+
         try:
             await_boundary(
-                lambda: self._escalation_records() or None,
-                description=f"an escalation intent for the closed PR #{self.pr_b}",
+                completed_escalation,
+                description=(
+                    f"a completed escalation intent for the closed PR #{self.pr_b}"
+                ),
                 timeout=300.0,
             )
         except Timeout as error:

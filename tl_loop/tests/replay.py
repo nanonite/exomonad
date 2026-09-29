@@ -193,6 +193,7 @@ def replay_fixture(
         spec.get("child_events"),
         child_event_transform=child_event_transform,
     )
+    _seed_controller_epochs(root_dir, spec)
     events = _events(spec["events"])
     if event_transform is not None:
         events = list(event_transform(events))
@@ -428,6 +429,37 @@ def _events(value: object) -> list[EventEnvelope]:
     if not isinstance(value, list):
         raise TypeError("fixture.events must be an array")
     return [project(cast(dict[str, object], item)) for item in value]
+
+
+def _seed_controller_epochs(root_dir: Path, spec: Mapping[str, object]) -> None:
+    """Pin every replayed run's controller epoch to the one the fixture commits.
+
+    ``exomonad init`` owns the root run's epoch marker, so a replay that does
+    not write one would have the driver mint a name-derived value instead. A
+    nested run is never init-launched, so its epoch is always driver-minted --
+    and since #1141 that mint is seeded from the parent generation rather than
+    from the scope name, so a replay cannot predict it. Writing the committed
+    marker for the root *and* for each child scope is what makes these replays
+    assert the fixture's own epoch instead of a hash of a run's name.
+
+    The child marker lives beside the child checkpoint, inside the parent run
+    directory, because that is where the child's own ``_controller_epoch`` call
+    looks for it.
+    """
+    epoch = spec.get("controller_epoch")
+    if not isinstance(epoch, str) or not epoch:
+        return
+    run_id = _string(spec.get("run_id"), "run_id")
+    run_dir = Path(root_dir) / run_id
+    markers = [Path(root_dir) / f"{run_id}.controller-epoch"]
+    child_events = spec.get("child_events")
+    if isinstance(child_events, Mapping):
+        markers.extend(
+            run_dir / f"{scope}.controller-epoch" for scope in child_events
+        )
+    for marker in markers:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(epoch + "\n", encoding="utf-8")
 
 
 def _plan_with_replay_sources(

@@ -88,7 +88,7 @@
           "pr_number": 101,
           "head_sha": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
           "head_branch": "main.recreate-stage.recreated-leaf",
-          "base_branch": "main",
+          "base_branch": "main.recreate-stage",
           "invocation_id": "inv-predecessor-1"
         }
       },
@@ -112,7 +112,7 @@
           "pr_number": 102,
           "head_sha": "b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5",
           "head_branch": "main.recreate-stage.recreated-leaf",
-          "base_branch": "main",
+          "base_branch": "main.recreate-stage",
           "invocation_id": "inv-recreated-1"
         }
       },
@@ -136,7 +136,7 @@
           "pr_number": 103,
           "head_sha": "b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5",
           "head_branch": "main.recreate-stage.recreated-leaf",
-          "base_branch": "main",
+          "base_branch": "main.recreate-stage",
           "invocation_id": "inv-recreated-1"
         }
       },
@@ -160,7 +160,7 @@
           "pr_number": 102,
           "head_sha": "c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6",
           "head_branch": "main.recreate-stage.recreated-leaf",
-          "base_branch": "main",
+          "base_branch": "main.recreate-stage",
           "invocation_id": "inv-recreated-1"
         }
       },
@@ -237,7 +237,7 @@
     {
       "case": "base-branch",
       "row": "synthetic-pr-102-filed-300",
-      "patch": {"data": {"base_branch": "main.recreate-stage"}}
+      "patch": {"data": {"base_branch": "main"}}
     },
     {
       "case": "slice-identity",
