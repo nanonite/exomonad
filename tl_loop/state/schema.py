@@ -475,6 +475,7 @@ RUN_KEYS = frozenset(
         "state_version",
         "reducer_version",
         "controller_epoch",
+        "generation_id",
         "session_mode",
         "reviewer_max_rounds",
         "reviewer_max_rounds_source",
@@ -1024,6 +1025,13 @@ class RunState:
     state_version: int = 0
     reducer_version: int = 1
     controller_epoch: str | None = None
+    #: The identity of the run generation this state was created in: the
+    #: controller epoch as it stood when the run was created. `controller_epoch`
+    #: still rotates on every `exomonad init`, `--continue` included; this is
+    #: written once and never rewritten, which is what lets a recreated
+    #: generation mint a dispatch intent no predecessor row can claim while an
+    #: in-flight attempt keeps the intent it was dispatched with.
+    generation_id: str | None = None
     session_mode: SessionMode | None = None
     # These two fields are one coupled snapshot. Both absent is the supported
     # pre-policy legacy form; otherwise validation admits only producer pairs.
@@ -1066,6 +1074,7 @@ def validate(doc: object) -> None:
     _nullable_non_negative_int(root, "state_version", "run", errors)
     _nullable_positive_int(root, "reducer_version", "run", errors)
     _nullable_string(root, "controller_epoch", "run", errors)
+    _nullable_string(root, "generation_id", "run", errors)
     if root.get("session_mode") is not None:
         _enum_value(root, "session_mode", "run", SessionMode, errors)
     _validate_review_policy_snapshot(root, "run", errors)

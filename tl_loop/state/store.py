@@ -1012,6 +1012,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "state_version",
         "reducer_version",
         "controller_epoch",
+        "generation_id",
         "session_mode",
         "reviewer_max_rounds",
         "reviewer_max_rounds_source",
@@ -1038,6 +1039,15 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
             document[key] = _encode_fsm(value)
         else:
             document[key] = copy.deepcopy(value)
+    if document.get("generation_id") is None:
+        # A run's generation is the epoch it was created under. It is written
+        # once, here, and never rewritten: `exomonad init` mints a fresh
+        # controller epoch on every launch -- `--continue` included -- and a
+        # dispatch intent that named the live epoch would change for an attempt
+        # that is still in flight.
+        created_under = document.get("controller_epoch")
+        if isinstance(created_under, str) and created_under:
+            document["generation_id"] = created_under
     if isinstance(document.get("plan_manifest"), dict):
         manifest = PlanManifest.from_document(document["plan_manifest"])
         document["slices"] = _activate_manifest_nodes(document.get("slices"), manifest)
@@ -1879,6 +1889,7 @@ def _decode(document: dict[str, object]) -> RunState:
         state_version=cast(int, document.get("state_version", 0)),
         reducer_version=cast(int, document.get("reducer_version", REDUCER_VERSION)),
         controller_epoch=cast(str | None, document.get("controller_epoch")),
+        generation_id=cast(str | None, document.get("generation_id")),
         reviewer_max_rounds=cast(int | None, document.get("reviewer_max_rounds")),
         reviewer_max_rounds_source=(
             ReviewPolicySource(cast(str, document["reviewer_max_rounds_source"]))

@@ -281,15 +281,22 @@ newly added field cannot be dropped by a hand-copied reconstruction:
   identifier, so both routing dimensions of a reconstruction read that value.
 
 The intent identity itself is
-`sha256(f"{run_id}:{slice}:{attempt}:{controller_epoch}")`. The epoch is part
-of it because `agent.spawned` is the only row that can confirm a dispatch and
-it carries the intent and nothing else that separates two generations, while a
-new run starts its cursor at the beginning of the ledger it shares with the run
-it replaced. Two generations of one run, slice, and attempt would otherwise
-mint one intent: the recreated controller would confirm its dispatch from the
-predecessor's spawn row and bind every publication it filed to an invocation
-that no longer owns the slice. The epoch is stable across `--continue` and
-changes across `--recreate`, which is the boundary the identity has to hold.
+`sha256(f"{run_id}:{slice}:{attempt}:{generation_id}")`, where `generation_id`
+is the controller epoch **as it stood when the run state was created**: written
+once into `run.json`, never rewritten. It is part of the identity because
+`agent.spawned` is the only row that can confirm a dispatch and it carries the
+intent and nothing else that separates two generations, while a new run starts
+its cursor at the beginning of the ledger it shares with the run it replaced.
+Two generations of one run, slice, and attempt would otherwise mint one intent:
+the recreated controller would confirm its dispatch from the predecessor's
+spawn row and bind every publication it filed to an invocation that no longer
+owns the slice. `controller_epoch` cannot play this role: `exomonad init` mints
+a fresh one on every launch, `--continue` included, and the driver adopts it
+into run state, so an attempt still in flight would be re-minted a different
+intent across a restart. The generation changes exactly where a new run state is
+created -- `--start`, `--recreate`, a first run -- and nowhere else; a state
+created before the field existed falls back to the empty generation, which is
+stable for that state and distinct from any state that carries one.
 
 `dispatch_generation` has exactly one meaning: the per-slice dispatch attempt
 counter under the current controller epoch. It is minted with the intent,

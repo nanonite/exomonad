@@ -11204,15 +11204,22 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
     # Keep the public intent stable for legacy event readers. The controller
     # epoch and generation are part of the persisted dispatch payload and
     # journal key, so a recreated controller cannot adopt the old observation.
-    # The epoch has to be part of the identity itself: `agent.spawned` is the
-    # only row that can confirm a dispatch, and it carries the intent and
-    # nothing else that tells two generations apart while a new run re-reads
-    # the shared ledger from its start. Without the epoch, the same run id,
-    # slice, and attempt mint one identical intent in both generations, and the
-    # predecessor's spawn row confirms the recreated dispatch with the
-    # predecessor's owner. The epoch is stable across `--continue` and changes
-    # across `--recreate`, which is exactly the boundary this has to hold.
-    identity = f"{state.run_id}:{name}:{attempt}:{state.controller_epoch or ''}"
+    # The identity also names the run *generation* this state was created in:
+    # `agent.spawned` is the only row that can confirm a dispatch, it carries
+    # the intent and nothing else that tells two generations apart, and a new
+    # run re-reads the shared ledger from its start. Without a generation in
+    # the identity the same run id, slice and attempt mint one intent in both
+    # generations, and the predecessor's spawn row confirms the recreated
+    # dispatch with the predecessor's owner.
+    #
+    # The generation is written once, when the run state is created, and never
+    # rewritten -- unlike `controller_epoch`, which `exomonad init` re-mints on
+    # every launch (`--continue` included) and the driver adopts, so naming the
+    # live epoch would re-mint a different intent for an attempt that is still
+    # in flight. A state that predates the field falls back to the empty
+    # generation: stable for that state, and distinct from any state that has
+    # one.
+    identity = f"{state.run_id}:{name}:{attempt}:{state.generation_id or ''}"
     intent_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
     started_at = time.time() if config.active else 0.0
     return DispatchAttempt(

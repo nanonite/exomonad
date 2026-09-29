@@ -112,6 +112,7 @@ from tl_loop.state.schema import (
     ActionState,
     BudgetLedger,
     FSMState,
+    RunState,
     GateState,
     GateStatus,
     HandoffEvidence,
@@ -225,66 +226,99 @@ def test_dispatch_correlation_rejects_historical_epoch_and_stale_generation(
     assert correlate_dispatch_event(state, current_event).classification == DISPATCH_CORRELATED
 
 
-def test_a_recreated_dispatch_is_confirmed_only_by_its_own_spawn_row(
+def test_the_dispatch_intent_follows_the_run_generation_not_the_live_epoch(
     tmp_path: Path,
 ) -> None:
-    """A predecessor generation's ``agent.spawned`` never owns the new dispatch.
+    """One attempt keeps one intent across a restart; a new generation does not.
 
-    A recreated run starts its event cursor at the beginning of the ledger it
-    shares with the generation it replaced, and ``agent.spawned`` carries the
-    intent and nothing else that tells the generations apart. If both minted
-    one intent, the predecessor's row would confirm the recreated slice with
-    the predecessor's invocation, and every publication the new dispatch filed
-    would be refused against an identity that no longer owns the slice.
+    `exomonad init` mints a fresh controller epoch on every launch,
+    `--continue` included, and the driver adopts it into run state. The intent
+    identity is therefore taken from the run *generation* the state was created
+    under: minting for the same run, slice and attempt after a restart has to
+    land on the intent the first launch produced, so the `tl.dispatch_intended`
+    row and the `agent.spawned` row that confirms it agree -- while a recreated
+    run state must mint an intent no predecessor row can claim, which is what
+    keeps a predecessor's owner off the new dispatch.
     """
-    run_id = "recreated-dispatch-confirmation"
+    run_id = "generation-scoped-intent"
     plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "task"}]})
-    create(
-        run_id,
-        {
-            "controller_epoch": "epoch-new",
-            "slices": _initial_slices(plan, TLLoopConfig(), tmp_path, run_id),
-        },
-        root_dir=tmp_path,
-    )
-    state = RunStore(run_id, tmp_path).load()
-    recreated = _new_dispatch_attempt(state, "leaf-a", TLLoopConfig())
-    predecessor = _new_dispatch_attempt(
-        replace(state, controller_epoch="epoch-old"), "leaf-a", TLLoopConfig()
-    )
-    assert recreated.intent_id != predecessor.intent_id
 
-    current = replace(
-        state.slices["leaf-a"],
+    def generation(epoch: str) -> RunState:
+        """One run state created under ``epoch``, as ``--start``/``--recreate`` do."""
+        root = tmp_path / epoch
+        root.mkdir()
+        create(
+            run_id,
+            {
+                "controller_epoch": epoch,
+                "slices": _initial_slices(plan, TLLoopConfig(), root, run_id),
+            },
+            root_dir=root,
+        )
+        return RunStore(run_id, root).load()
+
+    created = generation("epoch-created-under")
+    attempt = _new_dispatch_attempt(created, "leaf-a", TLLoopConfig())
+
+    # --continue: init re-mints the epoch and the driver adopts it, but the
+    # generation this state was created under does not move with it, so the
+    # identity of that attempt does not move either.
+    restarted = replace(created, controller_epoch="epoch-after-continue")
+    assert restarted.generation_id == "epoch-created-under"
+    assert restarted.controller_epoch != created.controller_epoch
+    assert (
+        _new_dispatch_attempt(restarted, "leaf-a", TLLoopConfig()).intent_id
+        == attempt.intent_id
+    )
+
+    # The attempt persists exactly as `_prepare_spawn` persists it, and the row
+    # the first launch produced confirms it -- once: after the confirmation the
+    # slice has left the dispatching statuses, so the same row delivered again
+    # changes nothing.
+    in_flight = replace(
+        created.slices["leaf-a"],
         status=SliceStatus.DISPATCHING,
         attempts=1,
-        dispatch_intent_id=recreated.intent_id,
-        dispatch_generation=recreated.dispatch_generation,
+        dispatch_intent_id=attempt.intent_id,
+        dispatch_generation=attempt.dispatch_generation,
     )
-    slices = {"leaf-a": current}
-
-    stale = replace(
-        _canonical_event(
-            11, "agent.spawned", "leaf-a", run_id, intent_id=predecessor.intent_id
-        ),
-        invocation_id="inv-predecessor",
+    slices = {"leaf-a": in_flight}
+    spawn_row = replace(
+        _canonical_event(11, "agent.spawned", "leaf-a", run_id, intent_id=attempt.intent_id),
+        invocation_id="inv-original",
     )
+    confirmed = _confirm_dispatch_event(
+        slices, slices, spawn_row, "leaf-a", 11, "epoch-after-continue"
+    )
+    assert confirmed["leaf-a"].dispatch_intent_id == attempt.intent_id
+    assert confirmed["leaf-a"].dispatch_invocation_id == "inv-original"
+    assert confirmed["leaf-a"].dispatch_authoritative_event_seq == 11
+    assert confirmed["leaf-a"].status is SliceStatus.SPAWNED
     assert (
-        _confirm_dispatch_event(slices, slices, stale, "leaf-a", 11, "epoch-new")
-        == slices
+        _confirm_dispatch_event(
+            confirmed, confirmed, spawn_row, "leaf-a", 11, "epoch-after-continue"
+        )
+        == confirmed
     )
 
-    own = replace(
-        _canonical_event(
-            55, "agent.spawned", "leaf-a", run_id, intent_id=recreated.intent_id
-        ),
-        invocation_id="inv-recreated",
+    # --recreate: a new run state, so a new generation, so a different intent
+    # -- and the predecessor's row can no longer confirm anything.
+    recreated_state = generation("epoch-recreated")
+    assert recreated_state.generation_id == "epoch-recreated"
+    recreated_attempt = _new_dispatch_attempt(recreated_state, "leaf-a", TLLoopConfig())
+    assert recreated_attempt.intent_id != attempt.intent_id
+    pending = replace(in_flight, dispatch_intent_id=recreated_attempt.intent_id)
+    assert (
+        _confirm_dispatch_event(
+            {"leaf-a": pending},
+            {"leaf-a": pending},
+            spawn_row,
+            "leaf-a",
+            11,
+            "epoch-recreated",
+        )
+        == {"leaf-a": pending}
     )
-    confirmed = _confirm_dispatch_event(slices, slices, own, "leaf-a", 55, "epoch-new")
-    confirmed_slice = confirmed["leaf-a"]
-    assert confirmed_slice.dispatch_invocation_id == "inv-recreated"
-    assert confirmed_slice.dispatch_authoritative_event_seq == 55
-    assert confirmed_slice.status is SliceStatus.SPAWNED
 
 
 def test_continue_adopts_the_new_controller_reconciliation_epoch(tmp_path: Path) -> None:
