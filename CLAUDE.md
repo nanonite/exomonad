@@ -756,7 +756,8 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 A test that runs the shipped server needs a real forge and leaves processes
 behind. Both are run-scoped, and both are owned by the test, never shared. This
 is the standard for real-server integration tests;
-`tests/e2e/recreated-leaf-recovery/` is the reference implementation.
+`tests/e2e/recreated-leaf-recovery/` is the reference implementation and
+`tests/e2e/recursive-crash-convergence/` is the second harness built on it.
 
 **A test owns its Forgejo.** The shared template is
 `tests/e2e/lib/forgejo/docker-compose.yml` — a template, not a running instance.
@@ -796,7 +797,7 @@ it runs on every exit path. It removes:
 | compose projects | by name, including the project-scoped volume |
 | the run's directory | `mktemp -d`, never a fixed path, so two runs cannot collide |
 
-Three rules follow from the leaks this replaced:
+Four rules follow from the leaks this replaced:
 
 - **A child process must start in its own process group.** A child that inherits
   the harness's group makes a group signal a self-inflicted kill, so teardown
@@ -814,6 +815,17 @@ Three rules follow from the leaks this replaced:
   a leaked server is left in once teardown has removed the directory. That suffix
   is stripped before the path is compared, or the check reports clean while the
   process is still running.
+
+- **Every tmux call names its own server.** tmux resolves the server from the
+  inherited `TMUX` variable *before* it reads `TMUX_TMPDIR` or a `-S` flag, so a
+  bare `tmux` run from inside a pane talks to whichever server owns that pane —
+  which is how a harness whose docstring claimed the operator's sessions were
+  unreachable ended up killing them. Every call goes through
+  `e2e_harness/tmuxio.py`, which passes `-S` with an absolute socket inside the
+  run's directory and strips `TMUX`/`TMUX_PANE`; `child_env()` gives every
+  child the same stripped environment with `TMUX_TMPDIR` on the run's
+  directory, which is where the shipped binary's own bare calls land. A
+  contract test fails the build on a call that bypasses it.
 
 **Teardown cannot be the only reclamation path.** A SIGKILL, a host reboot, or a
 Docker restart takes the trap with it, so a run that was killed from outside

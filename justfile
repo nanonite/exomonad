@@ -136,9 +136,11 @@ tl-loop-merge-convergence-e2e-3x:
         just tl-loop-merge-convergence-e2e
     done
 
-# Run the critical #1057 crash/restart matrix against dedicated real Forgejo
-# infrastructure. The script rejects the mock API and fails closed when the
-# acceptance environment is absent.
+# Run the recreated-publication acceptance (chainlink #1117): publish PR A,
+# confirm the recreate, dispatch again, publish PR B, and prove the run never
+# adopted A. Each item prints one PASS/FAIL line with the durable evidence it
+# used. The run provisions its own Forgejo, its own Chainlink database, and its
+# own tmux server, takes no operator input, and fails if anything leaks.
 tl-loop-recursive-crash-convergence-e2e:
     nix develop --command cargo build -p exomonad
     just wasm devswarm
