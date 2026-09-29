@@ -203,6 +203,16 @@ integrity error resolves it. Repeated heartbeats must be safe to run because
 terminal slices are no longer polled and unchanged PR observations produce no
 new synthetic event.
 
+Classifications must not depend on a default being spelled out. A watcher
+snapshot answers in protobuf, where a boolean or string with no value simply
+isn't there, so `_pr_terminal_cause` and `reconcile_slice` read "a closed PR
+that does not prove it was merged" (`merged is not True`) rather than "a closed
+PR that spells out `false`", and a review observation with no submission time
+is normalized to none before it reaches `ReviewValidationObservation`, whose
+contract takes a non-empty timestamp or none. An unclassifiable snapshot must
+never raise: a `ValueError` from a validation contract takes the controller
+down mid-run, and the slice it left behind parks nowhere.
+
 ## Ledger-backed event projection
 
 The immutable ledger at `.exo/ledger/segments/` is the TL loop's event storage
@@ -269,6 +279,17 @@ newly added field cannot be dropped by a hand-copied reconstruction:
   has no attempt, so it fails closed instead of inventing one. The persisted
   boundary records the resolved agent type rather than the qualified harness
   identifier, so both routing dimensions of a reconstruction read that value.
+
+The intent identity itself is
+`sha256(f"{run_id}:{slice}:{attempt}:{controller_epoch}")`. The epoch is part
+of it because `agent.spawned` is the only row that can confirm a dispatch and
+it carries the intent and nothing else that separates two generations, while a
+new run starts its cursor at the beginning of the ledger it shares with the run
+it replaced. Two generations of one run, slice, and attempt would otherwise
+mint one intent: the recreated controller would confirm its dispatch from the
+predecessor's spawn row and bind every publication it filed to an invocation
+that no longer owns the slice. The epoch is stable across `--continue` and
+changes across `--recreate`, which is the boundary the identity has to hold.
 
 `dispatch_generation` has exactly one meaning: the per-slice dispatch attempt
 counter under the current controller epoch. It is minted with the intent,

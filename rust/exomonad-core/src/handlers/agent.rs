@@ -1294,6 +1294,11 @@ impl<
             if !req.intent_id.trim().is_empty() {
                 payload["intent_id"] = serde_json::json!(req.intent_id);
             }
+            if let Some(invocation_id) =
+                spawned_invocation_id(self.ctx.project_dir(), result.agent_name.as_str()).await
+            {
+                payload["invocation_id"] = serde_json::json!(invocation_id);
+            }
             let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &payload);
         }
 
@@ -1458,17 +1463,19 @@ impl<
             "[event] agent.spawned"
         );
         if let Some(log) = self.ctx.event_log() {
-            let _ = log.append(
-                "agent.spawned",
-                ctx.agent_name.as_ref(),
-                &serde_json::json!({
-                    "child_agent": agent_info.id, "agent_type": format!("{:?}", options.agent_type), "spawn_type": "subtree",
-                    "branch": agent_info.branch_name,
-                    "model": model,
-                    "effort": effort,
-                    "topology": topology,
-                }),
-            );
+            let mut payload = serde_json::json!({
+                "child_agent": agent_info.id, "agent_type": format!("{:?}", options.agent_type), "spawn_type": "subtree",
+                "branch": agent_info.branch_name,
+                "model": model,
+                "effort": effort,
+                "topology": topology,
+            });
+            if let Some(invocation_id) =
+                spawned_invocation_id(self.ctx.project_dir(), result.agent_name.as_str()).await
+            {
+                payload["invocation_id"] = serde_json::json!(invocation_id);
+            }
+            let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &payload);
         }
 
         capture_memory(
@@ -2443,6 +2450,11 @@ impl<
             });
             if !req.intent_id.trim().is_empty() {
                 payload["intent_id"] = serde_json::json!(req.intent_id);
+            }
+            if let Some(invocation_id) =
+                spawned_invocation_id(self.ctx.project_dir(), result.agent_name.as_str()).await
+            {
+                payload["invocation_id"] = serde_json::json!(invocation_id);
             }
             let _ = log.append("agent.spawned", ctx.agent_name.as_ref(), &payload);
         }
@@ -4408,6 +4420,22 @@ fn spawn_result_to_proto(
     }
 }
 
+/// The durable invocation a spawn just started for the new agent, if any.
+///
+/// `agent.spawned` is the controller's dispatch confirmation boundary: the
+/// controller records the invocation that row proves, and every publication
+/// that slice later files is bound to exactly that identity. The record is
+/// read from the same place `file_pr` reads it, so the spawn row and the
+/// publication row can only ever name one invocation; when no record exists
+/// the field is omitted rather than guessed, which leaves the controller
+/// refusing to bind anything to a dispatch it cannot prove.
+async fn spawned_invocation_id(project_dir: &Path, agent_name: &str) -> Option<String> {
+    let agent_dir = project_dir.join(".exo").join("agents").join(agent_name);
+    crate::services::agent_control::read_invocation_conservatively(&agent_dir)
+        .await
+        .map(|record| record.invocation_id)
+}
+
 fn worker_result_to_proto(
     name: &str,
     result: &crate::services::agent_control::SpawnResult,
@@ -5388,6 +5416,25 @@ mod tests {
             .expect("handler emits authoritative spawn event");
         assert_eq!(spawned.event.data["child_agent"], "worker-codex");
         assert_eq!(spawned.event.data["intent_id"], "intent-live-handler");
+        // The dispatch confirmation boundary has to name the durable invocation
+        // it proves: the controller records that identity on the slice, and
+        // every publication the slice files is bound back to it. A spawn row
+        // without it confirms a dispatch whose publications can never bind.
+        let invocation_record = std::fs::read_to_string(
+            project_dir.join(".exo/agents/worker-codex/invocation.json"),
+        )
+        .expect("spawn persists a durable invocation record");
+        let record: serde_json::Value =
+            serde_json::from_str(&invocation_record).expect("invocation record is JSON");
+        let invocation_id = record
+            .get("invocation_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("invocation record names its invocation");
+        assert_eq!(
+            spawned.event.data["invocation_id"].as_str(),
+            Some(invocation_id),
+            "agent.spawned must carry the invocation that owns this dispatch"
+        );
 
         let _ = Command::new("tmux")
             .args(["-L", &tmux_socket, "kill-session", "-t", &session])

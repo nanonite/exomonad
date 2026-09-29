@@ -50,6 +50,7 @@ from tl_loop.loop.driver import (
     _apply_reconciliation_observations,
     _bind_publication_evidence,
     _child_recovery_projection,
+    _confirm_dispatch_event,
     _dispatch_payload,
     _event_belongs_to_plan,
     _execute_direct_reviewer_intent,
@@ -57,6 +58,7 @@ from tl_loop.loop.driver import (
     _integrate_one_candidate,
     _merge_result_is_authoritative,
     _migrate_audit_marked_quarantine,
+    _new_dispatch_attempt,
     _ordered_child_complete,
     _publication_from_watcher,
     _reconcile_pending_merge_entry,
@@ -221,6 +223,68 @@ def test_dispatch_correlation_rejects_historical_epoch_and_stale_generation(
         data={**base.data, "controller_epoch": "epoch-new", "dispatch_generation": 2},
     )
     assert correlate_dispatch_event(state, current_event).classification == DISPATCH_CORRELATED
+
+
+def test_a_recreated_dispatch_is_confirmed_only_by_its_own_spawn_row(
+    tmp_path: Path,
+) -> None:
+    """A predecessor generation's ``agent.spawned`` never owns the new dispatch.
+
+    A recreated run starts its event cursor at the beginning of the ledger it
+    shares with the generation it replaced, and ``agent.spawned`` carries the
+    intent and nothing else that tells the generations apart. If both minted
+    one intent, the predecessor's row would confirm the recreated slice with
+    the predecessor's invocation, and every publication the new dispatch filed
+    would be refused against an identity that no longer owns the slice.
+    """
+    run_id = "recreated-dispatch-confirmation"
+    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "task"}]})
+    create(
+        run_id,
+        {
+            "controller_epoch": "epoch-new",
+            "slices": _initial_slices(plan, TLLoopConfig(), tmp_path, run_id),
+        },
+        root_dir=tmp_path,
+    )
+    state = RunStore(run_id, tmp_path).load()
+    recreated = _new_dispatch_attempt(state, "leaf-a", TLLoopConfig())
+    predecessor = _new_dispatch_attempt(
+        replace(state, controller_epoch="epoch-old"), "leaf-a", TLLoopConfig()
+    )
+    assert recreated.intent_id != predecessor.intent_id
+
+    current = replace(
+        state.slices["leaf-a"],
+        status=SliceStatus.DISPATCHING,
+        attempts=1,
+        dispatch_intent_id=recreated.intent_id,
+        dispatch_generation=recreated.dispatch_generation,
+    )
+    slices = {"leaf-a": current}
+
+    stale = replace(
+        _canonical_event(
+            11, "agent.spawned", "leaf-a", run_id, intent_id=predecessor.intent_id
+        ),
+        invocation_id="inv-predecessor",
+    )
+    assert (
+        _confirm_dispatch_event(slices, slices, stale, "leaf-a", 11, "epoch-new")
+        == slices
+    )
+
+    own = replace(
+        _canonical_event(
+            55, "agent.spawned", "leaf-a", run_id, intent_id=recreated.intent_id
+        ),
+        invocation_id="inv-recreated",
+    )
+    confirmed = _confirm_dispatch_event(slices, slices, own, "leaf-a", 55, "epoch-new")
+    confirmed_slice = confirmed["leaf-a"]
+    assert confirmed_slice.dispatch_invocation_id == "inv-recreated"
+    assert confirmed_slice.dispatch_authoritative_event_seq == 55
+    assert confirmed_slice.status is SliceStatus.SPAWNED
 
 
 def test_continue_adopts_the_new_controller_reconciliation_epoch(tmp_path: Path) -> None:
@@ -5128,8 +5192,11 @@ def _event(
     return project(cast(dict[str, object], raw))
 
 
-def _dispatch_intent(run_id: str, slug: str) -> str:
-    return hashlib.sha256(f"{run_id}:{slug}:1".encode()).hexdigest()[:32]
+def _dispatch_intent(run_id: str, slug: str, epoch: str | None = None) -> str:
+    """Mirror `_new_dispatch_attempt`'s attempt-1 identity for one controller epoch."""
+    if epoch is None:
+        epoch = hashlib.sha256(f"controller:{run_id}".encode()).hexdigest()[:32]
+    return hashlib.sha256(f"{run_id}:{slug}:1:{epoch}".encode()).hexdigest()[:32]
 
 
 @pytest.mark.parametrize(

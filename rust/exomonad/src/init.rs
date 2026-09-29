@@ -2132,6 +2132,26 @@ async fn destroy_recreate_resources(
         }
         validated_leaves.push(branch);
     }
+    // Preserve every leaf's unmerged commits before any ref is deleted. A
+    // leaf's base branch is itself owned by this run -- a child sub-TL's
+    // branch -- so disposing that worktree first leaves `base..head`
+    // unresolvable and the bundle cannot be derived. Preservation is
+    // idempotent: the per-leaf disposal below verifies and reuses the bundle
+    // this pass creates, so nothing here pre-empts its gates.
+    for branch in &validated_leaves {
+        let observation = observe_leaf_branch(project_dir, branch)?;
+        ensure_leaf_unchanged(branch, &observation)?;
+        if observation.local_head.is_none() && observation.remote_head.is_none() {
+            continue;
+        }
+        let _ = preserve_leaf_unmerged_commits(
+            project_dir,
+            &branch.remote_name,
+            &branch.base_branch,
+            &branch.branch,
+            &branch.head_sha,
+        )?;
+    }
     // Close published PRs before removing local ownership. Each closure
     // re-verifies that the live Forgejo PR still matches the recorded
     // publication, so a stale record can never close an unrelated PR. If

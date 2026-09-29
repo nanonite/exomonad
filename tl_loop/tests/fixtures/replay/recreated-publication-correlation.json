@@ -13,7 +13,7 @@
   "dispatch_provenance": {
     "child_scope": "recreate-stage",
     "slice_id": "recreated-leaf",
-    "intent_id": "ffec2635a1c70770eb09d8549b5b5e4c",
+    "intent_id": "63cc7fa80037d3ab8ed3f28a8ba1a285",
     "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
     "dispatch_generation": 1
   },
@@ -58,13 +58,13 @@
           "child_agent": "recreated-leaf-opencode",
           "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
           "dispatch_generation": 1,
-          "intent_id": "ffec2635a1c70770eb09d8549b5b5e4c",
+          "intent_id": "63cc7fa80037d3ab8ed3f28a8ba1a285",
           "shadow_event": {
             "kind": "child_spawned",
             "slug": "recreated-leaf",
             "branch": "main.recreate-stage.recreated-leaf",
             "agent_type": "codex/gpt-luna",
-            "intent_id": "ffec2635a1c70770eb09d8549b5b5e4c"
+            "intent_id": "63cc7fa80037d3ab8ed3f28a8ba1a285"
           }
         }
       },

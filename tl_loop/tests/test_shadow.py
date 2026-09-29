@@ -401,5 +401,8 @@ def _event(run_seq: int, shadow_kind: str, slug: str = "child-a") -> EventEnvelo
     return project(cast(dict[str, object], raw))
 
 
-def _dispatch_intent(run_id: str, slug: str) -> str:
-    return hashlib.sha256(f"{run_id}:{slug}:1".encode()).hexdigest()[:32]
+def _dispatch_intent(run_id: str, slug: str, epoch: str | None = None) -> str:
+    """Mirror `_new_dispatch_attempt`'s attempt-1 identity for one controller epoch."""
+    if epoch is None:
+        epoch = hashlib.sha256(f"controller:{run_id}".encode()).hexdigest()[:32]
+    return hashlib.sha256(f"{run_id}:{slug}:1:{epoch}".encode()).hexdigest()[:32]

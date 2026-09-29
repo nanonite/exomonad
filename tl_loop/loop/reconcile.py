@@ -1124,7 +1124,9 @@ def reconcile_slice(
         watcher is not None
         and watcher.found is True
         and pr_state == "closed"
-        and watcher.merged is False
+        # proto3 sends a boolean as its default, so a PR that was never
+        # merged carries no `merged` key rather than a literal false.
+        and watcher.merged is not True
     )
     head_unreachable = (
         watcher is not None and watcher.found is True and watcher.head_reachable is False

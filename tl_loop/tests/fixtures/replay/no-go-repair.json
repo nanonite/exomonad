@@ -41,7 +41,7 @@
           "slug": "worker-a",
           "branch": "main.worker-a",
           "agent_type": "codex/gpt-luna",
-          "intent_id": "d6867fbe6a01815cb5381a063cd2d408"
+          "intent_id": "6f971e1b447b495f8118e0738c8f68da"
         }
       }
     },
@@ -63,7 +63,7 @@
           "slug": "leaf-a",
           "branch": "main.leaf-a",
           "agent_type": "codex/gpt-luna",
-          "intent_id": "057b9fa9ed5e6b7bc43c5e52d6afbb7e"
+          "intent_id": "baa5be8476c300949806f49122d01ee2"
         }
       }
     },

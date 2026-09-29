@@ -7396,11 +7396,18 @@ def _replay_watcher_review_if_needed(
         reviewer_agent_id=reviewer_agent_id,
         verdict=Verdict.GO if kind == "approved" else Verdict.NO_GO,
         observed_at=observed_at,
+        # A proto string answers as empty when it has no value, and the
+        # observation contract takes a non-empty timestamp or none. Normalizing
+        # here keeps a snapshot with no submission time from raising inside the
+        # reducer, where it would take the controller down.
         submitted_at=(
-            current.review_evidence.submitted_at
-            if current.review_evidence is not None
-            and current.review_evidence.review_id == watcher.review_id
-            else watcher.review_submitted_at
+            (
+                current.review_evidence.submitted_at
+                if current.review_evidence is not None
+                and current.review_evidence.review_id == watcher.review_id
+                else watcher.review_submitted_at
+            )
+            or None
         ),
     )
     disposition = review_validation_disposition(
@@ -11197,7 +11204,15 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
     # Keep the public intent stable for legacy event readers. The controller
     # epoch and generation are part of the persisted dispatch payload and
     # journal key, so a recreated controller cannot adopt the old observation.
-    identity = f"{state.run_id}:{name}:{attempt}"
+    # The epoch has to be part of the identity itself: `agent.spawned` is the
+    # only row that can confirm a dispatch, and it carries the intent and
+    # nothing else that tells two generations apart while a new run re-reads
+    # the shared ledger from its start. Without the epoch, the same run id,
+    # slice, and attempt mint one identical intent in both generations, and the
+    # predecessor's spawn row confirms the recreated dispatch with the
+    # predecessor's owner. The epoch is stable across `--continue` and changes
+    # across `--recreate`, which is exactly the boundary this has to hold.
+    identity = f"{state.run_id}:{name}:{attempt}:{state.controller_epoch or ''}"
     intent_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
     started_at = time.time() if config.active else 0.0
     return DispatchAttempt(

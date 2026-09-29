@@ -217,9 +217,16 @@ def _write_spawn_failed(
     segment.write_text(json.dumps(event) + "\n", encoding="utf-8")
 
 
-def _intent_id(run_id: str, attempt: int) -> str:
-    """Mirror the controller's deterministic per-attempt dispatch intent."""
-    return hashlib.sha256(f"{run_id}:leaf-a:{attempt}".encode()).hexdigest()[:32]
+def _controller_epoch(run_id: str) -> str:
+    """The epoch `_controller_epoch` derives for a run that has no marker."""
+    return hashlib.sha256(f"controller:{run_id}".encode()).hexdigest()[:32]
+
+
+def _intent_id(run_id: str, attempt: int, epoch: str | None = None) -> str:
+    """Mirror `_new_dispatch_attempt`'s identity for this run's controller epoch."""
+    if epoch is None:
+        epoch = _controller_epoch(run_id)
+    return hashlib.sha256(f"{run_id}:leaf-a:{attempt}:{epoch}".encode()).hexdigest()[:32]
 
 
 def _plan() -> WorkPlan:

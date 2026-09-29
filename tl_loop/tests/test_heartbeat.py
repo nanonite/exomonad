@@ -38,6 +38,7 @@ class HeartbeatTransport:
     report_missing_agents: bool = False
     pr_state: str = "open"
     merged: bool = False
+    omit_merged: bool = False
     head_reachable: bool = True
     publication_ownership_verified: bool | None = None
     publication_ownership_error: str = ""
@@ -97,13 +98,14 @@ class HeartbeatTransport:
                 "ci_status": "success",
                 "found": True,
                 "pr_state": self.pr_state,
-                "merged": self.merged,
                 "head_reachable": self.head_reachable,
                 "evidence_error": (
                     "pr_head_unreachable: object missing" if not self.head_reachable else ""
                 ),
                 "publication_ownership_verified": self.publication_ownership_verified,
             }
+            if not self.omit_merged:
+                result["merged"] = self.merged
             if not self.omit_ownership_error:
                 result["publication_ownership_error"] = (
                     self.publication_ownership_error
@@ -325,6 +327,35 @@ def test_heartbeat_parks_closed_unmerged_pr(tmp_path: Path) -> None:
     assert parked.park_cause is ParkCause.PR_CLOSED_UNMERGED
     assert result.parked_slice_ids == ("slice-a",)
     assert result.events[0].kind == "pr.closed_unmerged"
+
+
+def test_heartbeat_parks_a_closed_pr_whose_merge_is_not_spelled_out(
+    tmp_path: Path,
+) -> None:
+    """A proto3 boolean answers without a key when it is false.
+
+    Requiring the literal `false` made every closed, unmerged PR
+    unclassifiable: the heartbeat polled it for ever and never parked.
+    """
+    store, state = _state(
+        tmp_path,
+        status="in_review",
+        heartbeat_at=0.0,
+        pr_number=42,
+        reviewed_head="head-new",
+    )
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport(pr_state="closed", omit_merged=True)),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    parked = result.state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.PR_CLOSED_UNMERGED
 
 
 def test_heartbeat_parks_unreachable_pr_head_without_raising(tmp_path: Path) -> None:

@@ -868,7 +868,11 @@ def _pr_terminal_cause(payload: WatcherObservation | JsonMapping) -> ParkCause |
     ):
         return ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED
     pr_state = payload.pr_state
-    if isinstance(pr_state, str) and pr_state.lower() == "closed" and payload.merged is False:
+    # A proto3 boolean arrives as its default when false, so an unmerged PR
+    # answers with no `merged` key at all. Requiring the literal `false` made
+    # every closed PR that was never merged unclassifiable, and the slice was
+    # never parked on it.
+    if isinstance(pr_state, str) and pr_state.lower() == "closed" and payload.merged is not True:
         return ParkCause.PR_CLOSED_UNMERGED
     if payload.head_reachable is False:
         return ParkCause.PR_HEAD_UNREACHABLE
