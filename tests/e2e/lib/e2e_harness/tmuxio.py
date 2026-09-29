@@ -63,8 +63,14 @@ def ensure(socket: Path) -> Path:
     still exits 0, which would let ``check=True`` pass while nothing was ever
     started. Creating the directory first is what makes the exit status mean
     what it says.
+
+    It is created mode 0700 because tmux refuses a socket directory with wider
+    permissions -- it holds a socket that authorises whoever can reach it --
+    and reports that as a failed ``new-session``.
     """
-    Path(socket).parent.mkdir(parents=True, exist_ok=True)
+    directory = Path(socket).parent
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
     return socket
 
 
