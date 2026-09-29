@@ -149,6 +149,31 @@ releases or re-dispatches anything by itself. A later exhaustion of the same
 slice re-arms the same name as a fresh `pending` occurrence, so every refusal
 needs a new human decision.
 
+## Dispatch exhaustion is isolated to the exhausted slice (#1134)
+
+Naming a gate per slice only matters if a run can actually reach a second
+exhaustion, and before #1134 it could not: the first exhaustion moved the run to
+`tl_failed` and returned out of the dispatch loop, so sibling slices never
+dispatched and the per-slice names were reachable only by driving the failure
+recorder directly. The decided policy is to **isolate** the failure: a slice that
+exhausts its dispatch retries is parked, its own gate is opened, and the run
+**holds** behind that gate instead of stopping.
+
+Holding is not stopping. The dispatch pass continues, because a refusal that
+proves one branch is unspawnable proves nothing about an independent sibling's
+branch, and withholding that sibling would strand work on a decision the operator
+was never asked about. Two slices exhausting in one run therefore produce two
+pending gates and two `tl.gate_opened` events, and a terminal ownership conflict
+isolates identically without spending a retry. The run still ends on the failed
+terminal phase with every gate pending, so the hold is durable: a restart
+observes the same parked slices and the same unanswered questions, and
+re-announces nothing.
+
+The isolation is deliberately narrow. A failed phase that no open per-slice
+dispatch gate explains is not a hold, and the dispatch pass still stops at it,
+because a failure nobody is going to answer is not a reason to issue more
+children.
+
 A checkpoint written before per-slice naming holds one run-global
 `tl-dispatch-failed` or `tl-dispatch-ownership-conflict` gate. The controller
 migrates it on startup, before it reads or reports any gate, instead of renaming

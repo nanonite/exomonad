@@ -280,6 +280,11 @@ LOGGER = logging.getLogger(__name__)
 #: exactly as ``tl-ordered-child-recovery-<child>`` is scoped to its child. A run's
 #: gate list is shared by every slice, so a run-global name lets a second
 #: exhaustion reuse the first's gate and emit no ``tl.gate_opened`` at all.
+#:
+#: The scope is also what isolates the failure: because one refusal parks one
+#: slice and opens one gate, the run *holds* behind those gates rather than
+#: *stopping*, so the rest of the dispatch pass still runs. See
+#: ``_held_by_dispatch_park``.
 DISPATCH_FAILURE_GATE_PREFIX = "tl-dispatch-failed-"
 DISPATCH_OWNERSHIP_CONFLICT_GATE_PREFIX = "tl-dispatch-ownership-conflict-"
 #: The pre-#1119 run-global names. Nothing creates them any more; they exist only
@@ -1407,9 +1412,19 @@ def _clear_resolved_migration_gate(
 
 
 def _failure_phase(state: RunState, reason: str) -> PhaseValue:
-    """Build a failure value in the active FSM domain."""
+    """Build a failure value in the active FSM domain.
+
+    A run that is already failed stays failed, keeping the reason it failed
+    with. The scope reducer has no ``FailureRecorded`` arm out of a terminal
+    phase, and a second slice's dispatch park is the same run-level hold as the
+    first rather than a second failure: the run holds behind its open gates
+    until the operator answers them, so the parked slice and its gate are the
+    only new durable facts.
+    """
     phase = state.recursive_fsm
     if phase is not None:
+        if isinstance(phase, RecursiveTLFailed):
+            return TLFailed(phase.reason)
         return scope_transition(phase, ScopeFailureRecorded(reason))
     return TLFailed(reason)
 
@@ -8247,6 +8262,42 @@ def _retry_boundary_due(current: SliceState, config: TLLoopConfig) -> bool:
     return scheduled <= _wall_clock(config)
 
 
+def _held_by_dispatch_park(state: RunState) -> bool:
+    """Whether the run's failure is an unanswered per-slice dispatch gate.
+
+    The hold is read from the durable parks and gates rather than from the
+    phase alone, because a failed phase cannot say *which* slice the operator
+    still owes an answer. A slice parked on its own dispatch failure whose own
+    named gate is still pending is exactly the state a held run waits on, and
+    it is what makes "one refusal, one question" true for a whole run.
+    """
+    return any(
+        slice_state.status is SliceStatus.DISPATCH_FAILED
+        and slice_state.park_cause is ParkCause.DISPATCH_FAILED
+        and any(
+            gate.name == _dispatch_failure_gate_name(slice_state.id, slice_state.dispatch_error_code)
+            and gate.status is GateStatus.PENDING
+            for gate in state.gates
+        )
+        for slice_state in state.slices.values()
+    )
+
+
+def _dispatch_pass_stops(state: RunState) -> bool:
+    """Whether a failed phase ends the whole dispatch pass instead of one slice.
+
+    One slice exhausting its dispatch retries is scoped to that slice: it
+    parks, it opens its own gate, and the run *holds* behind the operator's
+    answer rather than stopping. Holding must not starve the siblings the
+    refusal says nothing about, so the pass keeps dispatching them and each
+    exhausted sibling opens its own gate. A failed phase that no open dispatch
+    park explains is an unrelated failure and still stops the pass at once.
+    """
+    if state.fsm.phase is not TLPhase.TLFailed:
+        return False
+    return not _held_by_dispatch_park(state)
+
+
 def _dispatch_children(
     plan: WorkPlan,
     state: RunState,
@@ -8294,7 +8345,7 @@ def _dispatch_children(
         state = _record_dispatch_result(
             store, state, worker.name, attempt, result, config, effects, effects_log
         )
-        if state.fsm.phase is TLPhase.TLFailed:
+        if _dispatch_pass_stops(state):
             return state
     for leaf in plan.leaves:
         if not _dispatch_candidate(leaf.name, state, config):
@@ -8343,7 +8394,7 @@ def _dispatch_children(
         state = _record_dispatch_result(
             store, state, leaf.name, attempt, result, config, effects, effects_log
         )
-        if state.fsm.phase is TLPhase.TLFailed:
+        if _dispatch_pass_stops(state):
             return state
     updated = store.load() if config.policy is not None else state
     _emit_slice_status_changes(

@@ -178,7 +178,10 @@ re-driven. Every other code, including an unrecorded one, is terminal: a
 opens `tl-dispatch-failed-<slice>`. Both gates are scoped to the slice whose
 dispatch stopped, so a second parked slice opens its own gate and its own
 `tl.gate_opened`, and answering one slice's gate leaves every other slice's
-question standing. A checkpoint written before per-slice naming has its pending
+question standing. The scope also isolates the failure: the exhausted slice is
+parked and the run holds behind its open gate, so siblings the refusal says
+nothing about still dispatch in the same pass and each one that exhausts opens
+its own gate. A checkpoint written before per-slice naming has its pending
 run-global `tl-dispatch-failed` / `tl-dispatch-ownership-conflict` gate migrated
 onto the single slice parked on `dispatch_failed`; if exactly one such slice does
 not exist the controller fails closed and names them instead of guessing. A

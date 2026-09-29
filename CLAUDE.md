@@ -977,7 +977,14 @@ runtime never recorded, is terminal:
 gates are scoped to the slice, the way `tl-ordered-child-recovery-<child>` is
 scoped to its child: one exhaustion is one pending gate and one
 `tl.gate_opened`, so a second parked slice cannot hide behind the first one's
-answered gate, and answering one slice's gate never resolves another's. A
+answered gate, and answering one slice's gate never resolves another's. The
+scope also **isolates** the failure (#1134): the exhausted slice is parked and
+the run *holds* behind its open gate rather than stopping, so siblings that
+refusal says nothing about still dispatch in the same pass and each one that
+exhausts opens its own gate. The run still ends on the failed terminal phase
+with every gate pending, so a restart re-enters the hold and re-announces
+nothing; a failed phase that no open per-slice dispatch gate explains is not a
+hold and still stops the dispatch pass immediately. A
 checkpoint written before per-slice naming has its pending run-global
 `tl-dispatch-failed` / `tl-dispatch-ownership-conflict` gate migrated onto the
 single slice parked on `dispatch_failed`, preserving its pending status; an

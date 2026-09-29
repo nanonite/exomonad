@@ -422,6 +422,19 @@ conflict gate. Answering one slice's gate records that slice's decision and
 leaves every other gate pending; it never releases or re-dispatches anything by
 itself.
 
+That per-slice scope is also what **isolates** the failure (#1134). A slice that
+exhausts its dispatch retries is parked and the run **holds** behind that slice's
+open gate — holding is not stopping. The dispatch pass keeps going: siblings the
+refusal says nothing about still dispatch in the same pass, each exhausted
+sibling opens its own gate, and a terminal ownership conflict isolates the same
+way without spending a retry. So two slices exhausting in one run produce two
+pending gates and two `tl.gate_opened` events, which is the whole point of the
+scope. The run still ends on the failed terminal phase with every gate pending,
+so the hold is durable across a restart and a restart re-announces nothing. Any
+failed phase that no open per-slice dispatch gate explains is **not** a hold and
+still stops the dispatch pass at once — isolation is scoped to dispatch
+exhaustion and no wider.
+
 A checkpoint written before per-slice naming holds one run-global
 `tl-dispatch-failed` or `tl-dispatch-ownership-conflict` gate. It is migrated,
 never renamed by assumption: the slice parked on `DISPATCH_FAILED` with
