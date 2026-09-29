@@ -1041,13 +1041,21 @@ def main() -> int:
             "owner": instance.owner,
             "repo": instance.repo,
         }
-        database = chainlink_db.create(root)
-        SEED_ISSUE_IDS.extend(chainlink_db.seed(database, SEED_ISSUES))
-        report.evidence["chainlink_database"] = str(database)
-        report.evidence["seeded_issues"] = list(SEED_ISSUE_IDS)
+        # The database has to be the one `exomonad init` anchors this run's
+        # session to -- `<project>/.chainlink`, the path `build_spawn_env`
+        # gives every spawned agent -- and the project does not exist until
+        # the scenario clones it. So the path is known before bootstrap, the
+        # file is created straight after it, and the escalation the controller
+        # writes lands in the database this acceptance reads.
+        repo = scope.root / "repo"
+        database = chainlink_db.database_path_for(repo)
         project = bootstrap(
             scope, instance, database, session=scope.session_prefix, leg=arguments.leg
         )
+        database = chainlink_db.create(root, project_dir=repo)
+        SEED_ISSUE_IDS.extend(chainlink_db.seed(database, SEED_ISSUES))
+        report.evidence["chainlink_database"] = str(database)
+        report.evidence["seeded_issues"] = list(SEED_ISSUE_IDS)
         state = walk(project, arguments.leg)
         report.results = state.results
         report.evidence.update(state.evidence)

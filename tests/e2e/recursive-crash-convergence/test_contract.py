@@ -992,3 +992,23 @@ def test_the_reviewer_stand_in_still_approves_a_run_that_owns_no_review(
     )
     assert leaf_publication_agent.main() == 0
     assert submitted == [7]
+
+
+def test_the_database_is_created_where_the_shipped_controller_is_anchored(
+    tmp_path: Path,
+) -> None:
+    """`exomonad init` anchors CHAINLINK_DB to `<project>/.chainlink`.
+
+    That is where `build_spawn_env` points every spawned agent too, so a run
+    that keeps its database anywhere else reads a file its own escalations
+    never touch -- and if the anchored directory does not exist, the
+    controller dies inside `park()` before it can park anything.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    database = runner.chainlink_db.create(tmp_path, project_dir=repo)
+
+    assert database == repo / ".chainlink" / "issues.db"
+    assert database == runner.chainlink_db.database_path_for(repo)
+    assert runner.chainlink_db.project_dir(database) == repo
+    assert database.is_file()

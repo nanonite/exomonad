@@ -2,9 +2,16 @@
 
 The acceptance creates a fresh database inside its own disposable project with
 ``chainlink init`` and seeds exactly the issue state the scenario needs. No
-existing database is copied or read: the server and the controller both receive
-this path through the ``CHAINLINK_DB`` the run exports, and the file is removed
-with the project. The operator's own database is never touched.
+existing database is copied or read, and the operator's own database is never
+touched.
+
+Where it is created is not free. ``exomonad init`` anchors ``CHAINLINK_DB`` to
+``<project>/.chainlink`` for every window it starts, and ``build_spawn_env``
+does the same for every spawned agent, so a database anywhere else is one the
+controller never writes an escalation to -- and, if that directory does not
+exist, one whose absence kills the controller mid-park. An acceptance whose
+controller runs through ``exomonad init`` therefore creates its database at
+``database_path_for(project)``, which is the path the shipped binary resolves.
 """
 
 from __future__ import annotations
@@ -41,7 +48,19 @@ def _chainlink(
     return result.stdout
 
 
-def create(root: Path) -> Path:
+def database_path_for(project: Path) -> Path:
+    """The database the shipped controller resolves for one project.
+
+    ``exomonad init`` sets ``CHAINLINK_DB`` to ``<project>/.chainlink`` for the
+    session it starts, and ``build_spawn_env`` sets the same value for every
+    agent it spawns: the project-root database is the canonical one. An
+    acceptance that keeps its database anywhere else reads a file its own
+    escalations never touch.
+    """
+    return project / ".chainlink" / "issues.db"
+
+
+def create(root: Path, *, project_dir: Path | None = None) -> Path:
     """Create the run's Chainlink database inside the disposable project.
 
     ``chainlink init`` is run *inside* the project directory it creates, so
@@ -49,10 +68,15 @@ def create(root: Path) -> Path:
     under the run's own directory and disappears with it. Running it anywhere
     else would let a first run initialize a database in a directory that outlives
     the run, which is exactly the shared state this layout exists to avoid.
+
+    ``project_dir`` names the project the database belongs to; it defaults to
+    the run's own chainlink project directory, and an acceptance whose
+    controller resolves ``<project>/.chainlink`` passes its repository instead
+    (see :func:`database_path_for`).
     """
-    project = project_dir_for(root)
+    project = project_dir if project_dir is not None else project_dir_for(root)
     project.mkdir(parents=True, exist_ok=True)
-    database = project / ".chainlink" / "issues.db"
+    database = database_path_for(project)
     _chainlink(
         "init",
         "--no-hooks",
@@ -153,6 +177,7 @@ __all__ = [
     "database_files",
     "issue_state",
     "project_dir",
+    "database_path_for",
     "project_dir_for",
     "remove",
     "seed",
