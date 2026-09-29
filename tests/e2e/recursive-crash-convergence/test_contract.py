@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import leaf_publication_agent
 import runner  # inserts PROJECT_ROOT and ordered-recursive onto sys.path
+import scenario
 import e2e_harness.tmuxio as tmuxio
 import fixture
 import real_server_transport as real
@@ -1012,3 +1013,33 @@ def test_the_database_is_created_where_the_shipped_controller_is_anchored(
     assert database == runner.chainlink_db.database_path_for(repo)
     assert runner.chainlink_db.project_dir(database) == repo
     assert database.is_file()
+
+
+def test_the_restart_path_targets_the_runs_own_tmux_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`exactly_once_escalation` restarts through this, so it must reach this run.
+
+    The run's own socket and session are what keep a restart from touching the
+    operator's tmux server; a name it does not have is a crash at the one point
+    the item is trying to exercise.
+    """
+    calls: list[tuple[str, Path]] = []
+
+    def record(socket: object, *arguments: str) -> None:
+        calls.append((tuple(arguments), Path(str(socket))))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(scenario.tmuxio, "tmux", record)
+    project = object.__new__(scenario.Project)
+    project.scope = _Scope()  # type: ignore[attr-defined]
+    project.session = "exo-e2e-1117-deadbeef"
+
+    project.stop_for_restart()  # type: ignore[attr-defined]
+
+    assert calls == [
+        (("kill-session", "-t", "exo-e2e-1117-deadbeef"), Path("/run/scoped/tmux-1000/default"))
+    ]
+
+
+class _Scope:
+    tmux_socket = Path("/run/scoped/tmux-1000/default")

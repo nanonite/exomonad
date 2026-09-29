@@ -104,7 +104,7 @@ class Project:
         session is killed through the run's own socket, so it can only ever
         reach this run's server.
         """
-        tmuxio.tmux(self.run.scope.tmux_socket, "kill-session", "-t", self.run.session)
+        tmuxio.tmux(self.scope.tmux_socket, "kill-session", "-t", self.session)
 
     def ledger(self) -> list[dict[str, Any]]:
         """Read every committed ledger record for this project."""
