@@ -94,6 +94,18 @@ class Project:
     def ledger_path(self) -> Path:
         return self.repo / ".exo" / "ledger" / "segments"
 
+    def stop_for_restart(self) -> None:
+        """Stop the run's tmux session, and so its server and controller.
+
+        This is what restarting means here: the session and the processes in it
+        are gone while the project, its repository, its ledger, and its
+        checkpoint survive, so the next ``init`` starts a server and a
+        controller against durable state rather than against nothing. The
+        session is killed through the run's own socket, so it can only ever
+        reach this run's server.
+        """
+        tmuxio.tmux(self.run.scope.tmux_socket, "kill-session", "-t", self.run.session)
+
     def ledger(self) -> list[dict[str, Any]]:
         """Read every committed ledger record for this project."""
         events: list[dict[str, Any]] = []

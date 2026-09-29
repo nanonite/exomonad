@@ -52,11 +52,11 @@ ITEMS = (
     "publish_pr_b",
     "no_adoption_of_pr_a",
     "no_orphaned_branches",
-    "exactly_once_escalation",
     "no_terminal_failure",
-    "leaf_handoff",
     "review",
     "ci",
+    "leaf_handoff",
+    "exactly_once_escalation",
 )
 
 #: Everything the acceptance can fail with. A run that fails for any other
@@ -149,11 +149,11 @@ class Scenario:
             ("publish_pr_b", self.publish_pr_b),
             ("no_adoption_of_pr_a", self.no_adoption_of_pr_a),
             ("no_orphaned_branches", self.no_orphaned_branches),
-            ("exactly_once_escalation", self.exactly_once_escalation),
             ("no_terminal_failure", self.no_terminal_failure),
-            ("leaf_handoff", self.leaf_handoff),
             ("review", self.review),
             ("ci", self.ci),
+            ("leaf_handoff", self.leaf_handoff),
+            ("exactly_once_escalation", self.exactly_once_escalation),
         ]
 
     # -- helpers ----------------------------------------------------------
@@ -435,49 +435,210 @@ class Scenario:
             "orphaned": orphaned,
         }
 
-    def exactly_once_escalation(self) -> dict[str, Any]:
-        """The seeded issues and the run's escalations are each counted once."""
-        intents = sorted(
-            (self.project.active_run()).glob("escalations/intent-*.json")
+    def _escalation_records(self) -> list[dict[str, Any]]:
+        directory = self.project.active_run() / "escalations"
+        if not directory.is_dir():
+            return []
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(directory.glob("intent-*.json"))
+        ]
+
+    def _leaf_slice(self) -> dict[str, Any]:
+        checkpoint = json.loads(
+            (self.project.active_run() / "run.json").read_text(encoding="utf-8")
         )
-        records = [json.loads(p.read_text(encoding="utf-8")) for p in intents]
-        keys = {
-            (
-                record.get("slice_id"),
-                record.get("cause"),
-                record.get("attempt"),
+        state = (checkpoint.get("slices") or {}).get(LEAF_SLICE)
+        if not isinstance(state, MappingLike):
+            raise ScenarioError(
+                f"the active run has no {LEAF_SLICE!r} slice: "
+                f"{sorted((checkpoint.get('slices') or {}))!r}"
             )
-            for record in records
-        }
-        require(
-            len(keys) == len(records),
-            f"the run recorded a duplicate escalation: {records!r}",
-        )
-        issue_ids = [r.get("issue_id") for r in records if r.get("issue_id")]
-        require(
-            len(set(issue_ids)) == len(issue_ids),
-            f"one Chainlink issue was used for two escalations: {issue_ids!r}",
-        )
-        seeded = set(SEED_ISSUE_IDS)
+        return dict(state)
+
+    def _park_rows(self) -> list[dict[str, Any]]:
+        return self.project.typed("tl.slice_parked")
+
+    def _database_issues(self) -> tuple[list[dict[str, Any]], set[int]]:
         listed = chainlink_db._chainlink(
             "list", "--json", database=self.project.database
         )
         rows = json.loads(listed)
         rows = rows if isinstance(rows, list) else rows.get("issues", [])
-        identifiers = {
-            row.get("id") for row in rows if isinstance(row, MappingLike)
+        issues = [row for row in rows if isinstance(row, MappingLike)]
+        return issues, {row.get("id") for row in issues}
+
+    def _escalation_diagnostic(self) -> str:
+        """Describe everything an escalation could have been recorded in."""
+        checkpoint = json.loads(
+            (self.project.active_run() / "run.json").read_text(encoding="utf-8")
+        )
+        slices = {
+            name: {
+                key: state.get(key)
+                for key in (
+                    "status",
+                    "pr_number",
+                    "head_sha",
+                    "reviewed_head",
+                    "verdict",
+                    "publication",
+                    "handoff",
+                    "park_cause",
+                    "park_issue_id",
+                    "dispatch_agent_id",
+                )
+                if key in state
+            }
+            for name, state in (checkpoint.get("slices") or {}).items()
+            if isinstance(state, MappingLike)
         }
-        unexpected = identifiers - seeded - set(issue_ids)
+        polls = len(self.project.typed("watcher.poll_cycle"))
+        return (
+            f"intents={self._escalation_records()!r} "
+            f"parks={[ (p.get('data') or {}) for p in self._park_rows() ]!r} "
+            f"phase={(checkpoint.get('fsm') or {}).get('phase')!r} "
+            f"watcher_polls={polls} slices={json.dumps(slices, sort_keys=True, default=str)}"
+        )
+
+    def exactly_once_escalation(self) -> dict[str, Any]:
+        """One escalation for one park, and never a second.
+
+        The #1112 defect was a *duplicated* escalation, so proving "at most
+        once" is not enough: this drives a real one. The leaf's PR is closed on
+        the forge, which is an observation only the watcher can make and the
+        controller can reconcile into a park. The park must produce exactly one
+        escalation intent and exactly one new Chainlink issue in the run's own
+        database, and a restart that reconciles the same observation again must
+        produce neither a second intent nor a second issue.
+        """
+        require(self.pr_b is not None, "PR B was never published")
+        records = self._escalation_records()
+        require(
+            not records,
+            f"the run had already escalated before the park was induced: {records!r}",
+        )
+        seeded = set(SEED_ISSUE_IDS)
+
+        # The watcher only reconciles a closed PR it can attribute to this
+        # slice, which needs the controller's own publication binding first.
+        try:
+            await_boundary(
+                lambda: (
+                    self._leaf_slice()
+                    if self._leaf_slice().get("pr_number") == self.pr_b
+                    else None
+                ),
+                description="the controller binding PR B to its slice",
+                timeout=600.0,
+            )
+        except (Timeout, ScenarioError) as error:
+            raise ScenarioError(
+                f"the controller never bound PR {self.pr_b} to its slice, so a "
+                f"closed PR could not be reconciled; {self._escalation_diagnostic()}"
+            ) from error
+
+        fj.api(
+            "PATCH",
+            f"{self.project.instance.repository_api_url()}/pulls/{self.pr_b}",
+            token=self.project.instance.author.token,
+            payload={"state": "closed"},
+        )
+        try:
+            await_boundary(
+                lambda: self._escalation_records() or None,
+                description=f"an escalation intent for the closed PR #{self.pr_b}",
+                timeout=300.0,
+            )
+        except Timeout as error:
+            raise ScenarioError(
+                f"closing PR #{self.pr_b} did not drive an escalation through "
+                f"the shipped path; {self._escalation_diagnostic()}"
+            ) from error
+
+        records = self._escalation_records()
+        require(
+            len(records) == 1,
+            f"one park produced {len(records)} escalation intents: {records!r}",
+        )
+        intent = records[0]
+        require(
+            type(intent.get("issue_id")) is int and intent.get("issue_id") > 0,
+            f"the escalation intent carries no issue id: {intent!r}",
+        )
+        issues, identifiers = self._database_issues()
+        require(
+            identifiers == seeded | {intent["issue_id"]},
+            f"the run's database does not hold its seeded issues plus exactly one "
+            f"escalation: seeded={sorted(seeded)} escalation={intent['issue_id']} "
+            f"found={sorted(x for x in identifiers if x)}",
+        )
+        created = next(row for row in issues if row.get("id") == intent["issue_id"])
+        require(
+            created.get("title") == intent.get("title"),
+            f"the issue created is not the one the intent names: "
+            f"intent={intent.get('title')!r} issue={created.get('title')!r}",
+        )
+
+        parks_before = len(self._park_rows())
+        self.project.stop_for_restart()
+        output = run_init(self.project, "--continue")
+        require_attach_failure(output, ("--continue",))
+        try:
+            await_boundary(
+                lambda: (len(self._park_rows()) > parks_before) or None,
+                description="the restarted controller parking the same slice again",
+                timeout=300.0,
+            )
+        except Timeout as error:
+            raise ScenarioError(
+                f"after restarting, the controller did not reconcile the closed "
+                f"PR again; {self._escalation_diagnostic()}"
+            ) from error
+
+        after = self._escalation_records()
+        require(
+            len(after) == 1,
+            f"a second reconciliation created another escalation intent: {after!r}",
+        )
+        issues_after, identifiers_after = self._database_issues()
+        require(
+            identifiers_after == identifiers,
+            f"the restart created another Chainlink issue: "
+            f"before={sorted(x for x in identifiers if x)} "
+            f"after={sorted(x for x in identifiers_after if x)}",
+        )
+        keys = {
+            (record.get("slice_id"), record.get("cause"), record.get("attempt"))
+            for record in after
+        }
+        require(
+            len(keys) == len(after),
+            f"the run recorded a duplicate escalation: {after!r}",
+        )
+        issue_ids = [record.get("issue_id") for record in after if record.get("issue_id")]
+        require(
+            len(set(issue_ids)) == len(issue_ids),
+            f"one Chainlink issue was used for two escalations: {issue_ids!r}",
+        )
+        unexpected = identifiers_after - seeded - set(issue_ids)
         require(
             not unexpected,
             f"the disposable database holds issues this run did not create: "
             f"{sorted(x for x in unexpected if x)}",
         )
         return {
-            "escalations": len(records),
-            "escalation_issue_ids": sorted(issue_ids),
+            "cause": intent.get("cause"),
+            "slice_id": intent.get("slice_id"),
+            "attempt": intent.get("attempt"),
+            "escalations_before_restart": len(records),
+            "escalations_after_restart": len(after),
+            "escalation_issue_ids": issue_ids,
+            "parks_before_restart": parks_before,
+            "parks_after_restart": len(self._park_rows()),
             "seeded_issues": sorted(seeded),
-            "database_issues": sorted(x for x in identifiers if x),
+            "database_issues": sorted(x for x in identifiers_after if x),
+            "issues_after_restart": len(issues_after),
         }
 
     def no_terminal_failure(self) -> dict[str, Any]:
@@ -492,38 +653,95 @@ class Scenario:
         )
         return {"phase": phase, "terminal_failure": False}
 
-    def leaf_handoff(self) -> dict[str, Any]:
-        """The active run carries handoff evidence for the leaf it owns."""
-        require(self.pr_b is not None, "PR B was never published")
-        handoffs: list[Any] = []
+    def _handoff_diagnostic(self) -> str:
+        """Describe every place a handoff could have been recorded.
+
+        A failing handoff assertion is a claim about the product, so the
+        failure carries what was actually there: each active slice's own
+        publication fields, and the ledger's rows for the events that would
+        carry a handoff.
+        """
+        slices: dict[str, Any] = {}
         for document in self._active_documents():
-            handoffs.extend(_collect_field(document, "handoff"))
-        numbers = sorted(
-            {
-                h.get("pr_number")
-                for h in handoffs
-                if isinstance(h, MappingLike) and h.get("pr_number")
-            }
-        )
-        registry = {
-            entry.get("pr_number")
-            for entry in self._published_registry()
-            if type(entry.get("pr_number")) is int
-        }
-        filed = {
-            e.get("data", {}).get("pr_number")
-            for e in self.project.typed("pr.filed")
-            if type(e.get("data", {}).get("pr_number")) is int
-        }
+            for name, state in (document.get("slices") or {}).items():
+                if not isinstance(state, MappingLike):
+                    continue
+                slices[name] = {
+                    key: value
+                    for key, value in sorted(state.items())
+                    if key
+                    in {
+                        "status",
+                        "pr_number",
+                        "head_sha",
+                        "handoff",
+                        "publication",
+                        "dispatch_agent_id",
+                        "dispatch_intent_id",
+                        "invocation_id",
+                        "reviewed_head",
+                        "verdict",
+                    }
+                }
+        counts: dict[str, int] = {}
+        for event in self.project.ledger():
+            event_type = str(event.get("type"))
+            if (
+                "handoff" in event_type
+                or event_type.startswith("pr.")
+                or event_type.startswith("tl.review")
+            ):
+                counts[event_type] = counts.get(event_type, 0) + 1
+        events = counts
+        return f"slices={json.dumps(slices, sort_keys=True, default=str)[:1500]} events={events}"
+
+    def leaf_handoff(self) -> dict[str, Any]:
+        """The controller recorded a durable handoff of PR B to the run.
+
+        This is asserted against the controller's own record and nothing else.
+        The publication registry and the ledger's `pr.filed` row prove a
+        publication exists; they do not prove the controller took the leaf's
+        handoff of it, which is the property this item is about.
+        """
+        require(self.pr_b is not None, "PR B was never published")
+
+        def handoff_for_pr_b() -> list[dict[str, Any]] | None:
+            records = [
+                record
+                for document in self._active_documents()
+                for record in _collect_field(document, "handoff")
+            ]
+            return [r for r in records if r.get("pr_number") == self.pr_b] or None
+
+        # The controller reduces the publication asynchronously, so this waits
+        # for its own record instead of reading once and calling a snapshot the
+        # answer. A record that never arrives is the finding.
+        try:
+            matching = await_boundary(
+                handoff_for_pr_b,
+                description=f"a controller handoff of PR #{self.pr_b}",
+                timeout=600.0,
+            )
+        except Timeout as error:
+            raise ScenarioError(
+                f"the controller recorded no handoff of PR #{self.pr_b} to the "
+                f"run; {self._handoff_diagnostic()}"
+            ) from error
+        handoff = matching[0]
         require(
-            self.pr_b in numbers or (self.pr_b in registry and self.pr_b in filed),
-            f"the leaf handed no publication of PR #{self.pr_b} to the run: "
-            f"handoff={numbers!r} registry={sorted(registry)} filed={sorted(filed)}",
+            handoff.get("head_sha") == self.pr_b_head,
+            f"the handoff of PR #{self.pr_b} names head "
+            f"{handoff.get('head_sha')!r}, not {self.pr_b_head}: {handoff!r}",
+        )
+        invocation = handoff.get("invocation_id") or handoff.get("invocation")
+        require(
+            isinstance(invocation, str) and invocation,
+            f"the handoff of PR #{self.pr_b} carries no invocation: {handoff!r}",
         )
         return {
-            "handoff_pr_numbers": numbers,
-            "registry_pr_numbers": sorted(registry),
-            "filed_pr_numbers": sorted(filed),
+            "pr_number": handoff.get("pr_number"),
+            "head_sha": handoff.get("head_sha"),
+            "invocation": invocation,
             "leaf": LEAF_SLICE,
         }
 
@@ -536,22 +754,72 @@ class Scenario:
             token=self.project.instance.reviewer.token,
             payload={"event": "APPROVED", "commit_id": self.pr_b_head},
         )
+        reviews = fj.api(
+            "GET",
+            f"{self.project.instance.repository_api_url()}/pulls/{self.pr_b}/reviews",
+            token=self.project.instance.author.token,
+        )
+        if not isinstance(reviews, list):
+            raise ScenarioError(f"review listing is not an array: {reviews!r}")
+        approvals = [
+            review
+            for review in reviews
+            if isinstance(review, MappingLike)
+            and review.get("state") == "APPROVED"
+        ]
+        require(
+            len(approvals) == 1,
+            f"expected exactly one approval on PR #{self.pr_b}, found {approvals!r}",
+        )
+        approval = approvals[0]
+        require(
+            (approval.get("user") or {}).get("login")
+            == self.project.instance.reviewer.username,
+            f"the approval on PR #{self.pr_b} is not by the reviewer account: "
+            f"{approval.get('user')!r}",
+        )
+        require(
+            approval.get("commit_id") == self.pr_b_head,
+            f"the approval on PR #{self.pr_b} is bound to commit "
+            f"{approval.get('commit_id')!r}, not PR B's head {self.pr_b_head}",
+        )
         recorded = await_boundary(
             lambda: next(
                 (
                     e
                     for e in self.project.typed("pr.review")
-                    if e.get("data", {}).get("pr_number") == self.pr_b
+                    if e.get("data", {}).get("kind") == "approved"
+                    and e.get("data", {}).get("pr_number") == self.pr_b
                 ),
                 None,
             ),
-            description=f"a pr.review row for PR #{self.pr_b}",
+            description=f"the watcher's approved row for PR #{self.pr_b}",
             timeout=180.0,
+        )
+        data = recorded.get("data") or {}
+        require(
+            data.get("verdict") == "approved",
+            f"the watcher recorded no approved verdict for PR #{self.pr_b}: {data!r}",
+        )
+        require(
+            data.get("head_sha") == self.pr_b_head
+            and data.get("review_head_sha") == self.pr_b_head,
+            f"the watcher's approval for PR #{self.pr_b} is not bound to its head "
+            f"{self.pr_b_head}: {data!r}",
+        )
+        require(
+            approval.get("id") is not None and data.get("review_id") == approval.get("id"),
+            f"the watcher's approval does not name the forge's review: "
+            f"review_id={data.get('review_id')!r} forge={approval.get('id')!r}",
         )
         return {
             "pr_number": self.pr_b,
-            "review_state": recorded.get("data", {}).get("review_state"),
-            "review_rows": len(self.project.typed("pr.review")),
+            "head_sha": data.get("head_sha"),
+            "verdict": data.get("verdict"),
+            "review_id": data.get("review_id"),
+            "reviewer": self.project.instance.reviewer.username,
+            "reviewer_agent_id": data.get("reviewer_agent_id"),
+            "reviewer_identity_unresolved": data.get("reviewer_identity_unresolved"),
         }
 
     def ci(self) -> dict[str, Any]:
