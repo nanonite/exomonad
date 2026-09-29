@@ -24,6 +24,7 @@ sys.path.insert(0, str(ORDERED_DIR))
 sys.path.insert(0, str(LIB_DIR))
 
 import e2e_harness.chainlink_db as chainlink_db  # noqa: E402
+import e2e_harness.cleanup as cl  # noqa: E402
 import real_server_transport as real  # noqa: E402
 from boundaries import CRASH_BOUNDARIES, CrashBoundary, validate_matrix
 from controller import controller, resume, wait_for_crash
@@ -440,8 +441,12 @@ def run_matrix() -> dict[str, Any]:
     operation_totals: dict[str, int] = {}
     for repetition in range(1, _server_repetitions() + 1):
         for boundary in CRASH_BOUNDARIES:
+            # `dir` is pinned: a case directory holds the server's Unix
+            # socket, and `tempfile` would otherwise honour a caller's TMPDIR,
+            # which can be long enough that the socket path does not fit.
             with tempfile.TemporaryDirectory(
-                prefix=f"exomonad-1057-run{repetition}-{boundary.name}-{boundary.point}-"
+                prefix=f"exomonad-1057-run{repetition}-{boundary.name}-{boundary.point}-",
+                dir=cl.TEMP_ROOT,
             ) as raw:
                 root = Path(raw)
                 repo, _, _ = real.clone_external_fixture(root)

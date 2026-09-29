@@ -3154,7 +3154,11 @@ def run_waiting_supervision_probe(root: Path) -> None:
 
 def main() -> None:
     project_root = PROJECT_ROOT
-    with tempfile.TemporaryDirectory(prefix="exomonad-ordered-server-") as temporary:
+    # Pinned to /tmp: the directory holds the server's Unix socket, and TMPDIR
+    # can be long enough that the socket path does not fit.
+    with tempfile.TemporaryDirectory(
+        prefix="exomonad-ordered-server-", dir="/tmp"
+    ) as temporary:
         root = Path(temporary)
         repo, remote, branch = create_fixture(root)
         mock, forgejo_url = start_mock(root, project_root, remote)

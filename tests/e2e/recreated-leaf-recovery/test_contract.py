@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -1095,7 +1096,7 @@ def test_the_legacy_tmux_exemptions_are_still_real() -> None:
 
 
 @pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
-def test_teardown_cannot_reach_a_tmux_server_outside_the_run(tmp_path: Path) -> None:
+def test_teardown_cannot_reach_a_tmux_server_outside_the_run() -> None:
     """A run started from inside a pane must not stop that pane's server.
 
     The outer server here stands in for the operator's: its socket is put in
@@ -1104,8 +1105,10 @@ def test_teardown_cannot_reach_a_tmux_server_outside_the_run(tmp_path: Path) -> 
     only the run's own server, which is why the run's session is gone
     afterwards while the outer session is still there.
     """
-    outer_root = tmp_path / "outer"
-    outer_root.mkdir()
+    # Not ``tmp_path``: the outer server's socket has to fit in ``sun_path``,
+    # and ``tmp_path`` descends from ``TMPDIR``, which a caller may have made
+    # long enough that no socket path fits under it.
+    outer_root = tmuxio.short_root()
     outer_socket = tmuxio.socket_path(outer_root)
     outer_session = "exo-e2e-outer-server-guard"
     tmuxio.tmux(
@@ -1169,5 +1172,118 @@ def test_teardown_cannot_reach_a_tmux_server_outside_the_run(tmp_path: Path) -> 
         else:
             os.environ["TMUX"] = previous
         tmuxio.tmux(outer_socket, "kill-server")
+        shutil.rmtree(outer_root, ignore_errors=True)
         shutil.rmtree(stale_root, ignore_errors=True)
         shutil.rmtree(scope.root, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Socket paths and TMPDIR
+# --------------------------------------------------------------------------
+
+
+def _long_tmpdir(label: str) -> Path:
+    """Return a TMPDIR over 90 characters, created under ``/tmp``.
+
+    This is the shape that broke the harness: a caller whose ``TMPDIR`` is long
+    enough that ``tempfile.gettempdir()`` -- and therefore pytest's ``tmp_path``
+    -- hands out roots no Unix socket fits under.
+    """
+    path = Path("/tmp") / (f"exo-e2e-longtmpdir-{label}-{os.getpid()}-" + "x" * 70)
+    path.mkdir(parents=True, exist_ok=True)
+    assert len(str(path)) > 90, str(path)
+    return path
+
+
+def test_a_long_tmpdir_cannot_produce_an_unbindable_socket() -> None:
+    """A caller's TMPDIR never decides whether a socket fits.
+
+    ``sun_path`` is 107 bytes, so a root handed out by ``tempfile`` under a long
+    ``TMPDIR`` -- the lead's shell had ``TMPDIR=/home/goya/agent-workspace/
+    exomonad`` -- yields a socket path the kernel refuses to bind, and the
+    failure surfaces as ``OSError: AF_UNIX path too long`` from whichever end
+    gets there first. The harness's own roots are pinned to ``/tmp`` instead, so
+    this asserts both halves: the inherited root is refused at construction,
+    and the harness's roots fit regardless of what ``TMPDIR`` says.
+    """
+    long_base = _long_tmpdir("refuse")
+    monkey_root: Path | None = None
+    previous = os.environ.get("TMPDIR")
+    try:
+        os.environ["TMPDIR"] = str(long_base)
+        # What tempfile -- and therefore pytest's tmp_path -- hands a caller.
+        # `tempfile` caches its answer, so the cache is pointed at the long
+        # directory rather than trusting the variable to have been read.
+        previous_tempdir = tempfile.tempdir
+        tempfile.tempdir = str(long_base)
+        try:
+            monkey_root = Path(tempfile.mkdtemp())
+        finally:
+            tempfile.tempdir = previous_tempdir
+        with pytest.raises(tmuxio.TmuxError, match="kernel allows"):
+            tmuxio.socket_path(monkey_root)
+
+        # The harness's own roots ignore TMPDIR and still fit.
+        run_root = cl.make_root("/tmp", PREFIX)
+        short_root = tmuxio.short_root()
+        for root in (run_root, short_root):
+            socket = tmuxio.socket_path(root)
+            assert len(str(socket).encode("utf-8")) <= tmuxio.MAX_SOCKET_PATH_BYTES
+            tmuxio.ensure(socket)
+            assert socket.parent.is_dir()
+            shutil.rmtree(root, ignore_errors=True)
+    finally:
+        if previous is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous
+        if monkey_root is not None:
+            shutil.rmtree(monkey_root, ignore_errors=True)
+        shutil.rmtree(long_base, ignore_errors=True)
+
+
+@pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
+def test_a_server_starts_under_a_long_tmpdir() -> None:
+    """A real server binds under a TMPDIR long enough to break an inherited root.
+
+    The path-length guard is only worth having if the socket it protects is
+    still usable, so a session is really started on a root created with TMPDIR
+    set to a 90-plus character directory, and really stopped again.
+    """
+    long_base = _long_tmpdir("serve")
+    previous = os.environ.get("TMPDIR")
+    root: Path | None = None
+    scope: Any = None
+    try:
+        os.environ["TMPDIR"] = str(long_base)
+        root = cl.make_root("/tmp", PREFIX)
+        scope = cl.RunScope(
+            run_id=f"longtmp{os.getpid()}", root=root, prefix=PREFIX
+        )
+        session = scope.track_session(scope.session_prefix)
+        tmuxio.tmux(
+            scope.tmux_socket,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-n",
+            "probe",
+            "sleep",
+            "600",
+            check=True,
+        )
+        assert tmuxio.server_alive(scope.tmux_socket)
+        assert scope.teardown() == []
+        assert scope.leaks() == []
+    finally:
+        if previous is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous
+        if scope is not None:
+            scope.keep = False
+            scope.teardown()
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(long_base, ignore_errors=True)

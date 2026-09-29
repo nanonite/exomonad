@@ -25,12 +25,25 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Mapping
 
 #: The default socket name tmux uses under a ``TMUX_TMPDIR``.
 SOCKET_NAME = "default"
+
+#: Where a short root is created when the caller has none of its own.
+SHORT_ROOT_BASE = "/tmp"
+
+#: The prefix a short root carries, so it stays attributable to this harness.
+SHORT_ROOT_PREFIX = "exo-e2e-sock-"
+
+#: The length of ``sockaddr_un.sun_path`` on Linux, excluding its terminating
+#: NUL. A Unix socket whose path is longer cannot be bound or connected at all,
+#: and the failure arrives as ``OSError: AF_UNIX path too long`` from whichever
+#: end gets there first.
+MAX_SOCKET_PATH_BYTES = 107
 
 #: Bounded wait for a tmux command to answer. tmux answers promptly unless its
 #: server is wedged, so this only bounds a hang.
@@ -51,8 +64,36 @@ def socket_path(root: Path) -> Path:
     lives at ``$TMUX_TMPDIR/tmux-<uid>/<name>``. Mirroring it exactly is what
     lets a harness that passes ``-S`` and a shipped binary that does not meet
     on the same server.
+
+    The length is checked here rather than at bind time: ``sun_path`` is 108
+    bytes, so a root inherited from a long ``TMPDIR`` produces a path tmux
+    cannot bind, and it fails far from the value that caused it. Refusing at
+    construction keeps the diagnosis next to the input.
     """
-    return Path(root) / f"tmux-{os.getuid()}" / SOCKET_NAME
+    return _fit(Path(root) / f"tmux-{os.getuid()}" / SOCKET_NAME)
+
+
+def short_root(prefix: str = SHORT_ROOT_PREFIX) -> Path:
+    """Create a root short enough for a Unix socket, ignoring ``TMPDIR``.
+
+    ``tempfile`` honours ``TMPDIR``, and a caller's ``TMPDIR`` can be long
+    enough that nothing socket-shaped fits underneath it. A socket root is
+    therefore created under ``/tmp`` explicitly, with ``mkdtemp``'s own random
+    suffix keeping two callers apart, and is the caller's to remove.
+    """
+    directory = Path(tempfile.mkdtemp(dir=SHORT_ROOT_BASE, prefix=prefix))
+    return _fit(directory)
+
+
+def _fit(path: Path) -> Path:
+    """Refuse a socket path the kernel could not bind."""
+    length = len(str(path).encode("utf-8"))
+    if length > MAX_SOCKET_PATH_BYTES:
+        raise TmuxError(
+            f"socket path is {length} bytes and the kernel allows "
+            f"{MAX_SOCKET_PATH_BYTES}: {path}"
+        )
+    return path
 
 
 def ensure(socket: Path) -> Path:
@@ -169,6 +210,9 @@ def kill_server(socket: Path) -> list[str]:
 
 __all__ = [
     "COMMAND_TIMEOUT_SECONDS",
+    "MAX_SOCKET_PATH_BYTES",
+    "SHORT_ROOT_BASE",
+    "SHORT_ROOT_PREFIX",
     "SOCKET_NAME",
     "STOP_TIMEOUT_SECONDS",
     "TmuxError",
@@ -176,6 +220,7 @@ __all__ = [
     "ensure",
     "kill_server",
     "server_alive",
+    "short_root",
     "socket_path",
     "tmux",
 ]

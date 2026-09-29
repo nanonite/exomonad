@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import http.server
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import leaf_publication_agent
 import runner  # inserts PROJECT_ROOT and ordered-recursive onto sys.path
+import e2e_harness.tmuxio as tmuxio
 import fixture
 import real_server_transport as real
 from boundaries import (
@@ -257,8 +259,15 @@ def test_leaf_publication_actor_is_limited_to_recursive_leaf_branches(
 
 
 def test_leaf_publication_uses_the_explicit_root_socket(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The actor talks to the root socket, on a root short enough to bind.
+
+    The root is not ``tmp_path``: a Unix socket path is at most 107 bytes, and
+    ``tmp_path`` descends from ``TMPDIR``, which a caller may have made long
+    enough that nothing socket-shaped fits. A short root under ``/tmp`` is used
+    instead and removed whatever the test does.
+    """
     requests: list[tuple[str, bytes]] = []
 
     class UnixHTTPHandler(http.server.BaseHTTPRequestHandler):
@@ -278,8 +287,10 @@ def test_leaf_publication_uses_the_explicit_root_socket(
     class UnixHTTPServer(socketserver.UnixStreamServer):
         allow_reuse_address = True
 
-    socket_path = tmp_path / "root" / ".exo" / "server.sock"
+    root = tmuxio.short_root()
+    socket_path = root / "root" / ".exo" / "server.sock"
     socket_path.parent.mkdir(parents=True)
+    assert len(str(socket_path).encode("utf-8")) <= tmuxio.MAX_SOCKET_PATH_BYTES
     server = UnixHTTPServer(str(socket_path), UnixHTTPHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -299,6 +310,7 @@ def test_leaf_publication_uses_the_explicit_root_socket(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+        shutil.rmtree(root, ignore_errors=True)
     assert len(requests) == 1
     path, body = requests[0]
     assert path == "/agents/tl/nested-output/tools/call"

@@ -1065,7 +1065,11 @@ def _find_exomonad() -> Path:
 
 def main() -> int:
     exomonad = _find_exomonad()
-    with tempfile.TemporaryDirectory(prefix="exomonad-ordered-recovery-") as temporary:
+    # Pinned to /tmp: the directory holds the server's Unix socket, and TMPDIR
+    # can be long enough that the socket path does not fit.
+    with tempfile.TemporaryDirectory(
+        prefix="exomonad-ordered-recovery-", dir="/tmp"
+    ) as temporary:
         root = Path(temporary)
         evidence: dict[str, Any] = {}
         try:
