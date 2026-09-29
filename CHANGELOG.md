@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Make tl_loop gate names with '/' answerable through the HTTP control route (#1133)
 - Fail loudly on an over-long tmux_session instead of silently truncating it (#1131)
 - Bind a leaf dispatched under a child sub-TL: it never progresses past spawned (#1141)
 - Recreated dispatch never progresses past spawned: no handoff, reviews not applied, closed PR never parks (#1137)
