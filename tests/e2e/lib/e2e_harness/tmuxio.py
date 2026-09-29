@@ -96,12 +96,18 @@ def tmux(
     *arguments: str,
     check: bool = False,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one tmux command against the server named by ``socket``.
 
     The command is always run with ``TMUX`` and ``TMUX_PANE`` removed, so the
     ``-S`` flag is the only thing that decides which server answers -- even when
     this harness itself is running inside a pane.
+
+    ``env`` is the caller's own environment for this command and nothing more:
+    it is what ``child_env`` builds the run's environment from, so a caller that
+    starts the server can put the run's ``PATH`` and database on it. Whatever it
+    carries, ``TMUX`` and ``TMUX_PANE`` are stripped from the result.
     """
     if shutil.which("tmux") is None:
         raise TmuxError("tmux is not installed")
@@ -112,7 +118,7 @@ def tmux(
         ensure(socket)
     result = subprocess.run(
         ["tmux", "-S", str(socket), *arguments],
-        env=child_env(_socket_root(socket)),
+        env=child_env(_socket_root(socket), env),
         text=True,
         capture_output=True,
         check=False,
