@@ -33,7 +33,7 @@ import e2e_harness.chainlink_db as chainlink_db  # noqa: E402
 import e2e_harness.cleanup as cl  # noqa: E402
 import e2e_harness.forgejo_stack as fj  # noqa: E402
 from e2e_harness.waiter import Timeout, await_boundary  # noqa: E402
-from run_prefix import LEAF_SLICE, PREFIX, SEED_ISSUES  # noqa: E402
+from run_prefix import LEAF_SLICE, LEGS, PREFIX, SEED_ISSUES  # noqa: E402
 from scenario import (  # noqa: E402
     Project,
     ScenarioError,
@@ -59,6 +59,28 @@ ITEMS = (
     "exactly_once_escalation",
 )
 
+#: The control leg (#1138 step 3): the same checks against a plain dispatch,
+#: with no recreate and no second publication. The items that only describe a
+#: recreate are not part of it, and every item it does run asserts on the one
+#: PR that dispatch published.
+CONTROL_ITEMS = (
+    "publish_pr_a",
+    "no_orphaned_branches",
+    "no_terminal_failure",
+    "review",
+    "ci",
+    "leaf_handoff",
+    "exactly_once_escalation",
+)
+
+#: The items each leg runs. ``child`` is the #1112 shape: the same recreate
+#: scenario with the leaf under a child sub-TL (#1138 step 4).
+ITEMS_BY_LEG = {
+    "recreate": ITEMS,
+    "control": CONTROL_ITEMS,
+    "child": ITEMS,
+}
+
 #: Everything the acceptance can fail with. A run that fails for any other
 #: reason is a harness fault, not a verdict, so it is reported as such.
 ACCEPTANCE_FAILURES = (
@@ -80,11 +102,12 @@ class Report:
     leaks: list[str] = field(default_factory=list)
     cleanup_problems: list[str] = field(default_factory=list)
     sweep_problems: list[str] = field(default_factory=list)
+    items: tuple[str, ...] = ITEMS
 
     @property
     def passed(self) -> bool:
         return (
-            all(self.results.get(item) == "PASS" for item in ITEMS)
+            all(self.results.get(item) == "PASS" for item in self.items)
             and not self.leaks
             and not self.cleanup_problems
             and not self.sweep_problems
@@ -92,7 +115,7 @@ class Report:
 
     def emit(self) -> None:
         """Print one line per item, then any leak, then the verdict."""
-        for item in ITEMS:
+        for item in self.items:
             status = self.results.get(item, "SKIP")
             detail = json.dumps(self.evidence.get(item, {}), sort_keys=True, default=str)
             print(f"{status} {item} {detail[:4000]}")
@@ -102,12 +125,12 @@ class Report:
             print(f"FAIL SWEEP {problem}")
         for leak in self.leaks:
             print(f"FAIL LEAK {leak}")
-        passed = sum(1 for item in ITEMS if self.results.get(item) == "PASS")
-        failed = sum(1 for item in ITEMS if self.results.get(item) == "FAIL")
-        skipped = sum(1 for item in ITEMS if item not in self.results)
+        passed = sum(1 for item in self.items if self.results.get(item) == "PASS")
+        failed = sum(1 for item in self.items if self.results.get(item) == "FAIL")
+        skipped = sum(1 for item in self.items if item not in self.results)
         verdict = "PASS" if self.passed else "FAIL"
         print(
-            f"{verdict} recursive-crash-convergence: {passed}/{len(ITEMS)} items "
+            f"{verdict} recursive-crash-convergence: {passed}/{len(self.items)} items "
             f"passed, {failed} failed, {skipped} not reached, "
             f"{len(self.leaks)} leaks, "
             f"{len(self.cleanup_problems)} cleanup problems, "
@@ -130,8 +153,10 @@ def run_id() -> str:
 class Scenario:
     """The items in order, each keeping what the later ones assert on."""
 
-    def __init__(self, project: Project) -> None:
+    def __init__(self, project: Project, leg: str = "recreate") -> None:
         self.project = project
+        self.leg = leg
+        self.items = ITEMS_BY_LEG[leg]
         self.results: dict[str, str] = {}
         self.evidence: dict[str, Any] = {}
         self.pr_a: int | None = None
@@ -142,7 +167,7 @@ class Scenario:
         self.controller_epoch: str | None = None
 
     def steps(self) -> list[tuple[str, Callable[[], Any]]]:
-        return [
+        selected = [
             ("publish_pr_a", self.publish_pr_a),
             ("confirmed_recreate", self.confirmed_recreate),
             ("new_dispatch", self.new_dispatch),
@@ -155,6 +180,7 @@ class Scenario:
             ("leaf_handoff", self.leaf_handoff),
             ("exactly_once_escalation", self.exactly_once_escalation),
         ]
+        return [step for step in selected if step[0] in self.items]
 
     # -- helpers ----------------------------------------------------------
 
@@ -257,6 +283,11 @@ class Scenario:
         self.pr_a = int(pull["number"])
         self.pr_a_head = self._head_of(pull)
         self.controller_epoch = self._epoch()
+        if self.leg == "control":
+            # The control leg never recreates, so the dispatch's own PR is the
+            # one every later check asserts on.
+            self.pr_b = self.pr_a
+            self.pr_b_head = self.pr_a_head
         filed = self.project.typed("pr.filed")
         require(
             any(e.get("data", {}).get("pr_number") == self.pr_a for e in filed),
@@ -436,25 +467,51 @@ class Scenario:
         }
 
     def _escalation_records(self) -> list[dict[str, Any]]:
-        directory = self.project.active_run() / "escalations"
-        if not directory.is_dir():
-            return []
-        return [
-            json.loads(path.read_text(encoding="utf-8"))
-            for path in sorted(directory.glob("intent-*.json"))
-        ]
+        """Every escalation intent the active run forest holds.
+
+        The intent is written by whichever run owns the parked slice, which is
+        the child's own directory when the leaf lives under a child sub-TL.
+        """
+        records: list[dict[str, Any]] = []
+        for directory in sorted(self._active_run_dirs()):
+            escalation = directory / "escalations"
+            if not escalation.is_dir():
+                continue
+            records.extend(
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted(escalation.glob("intent-*.json"))
+            )
+        return records
+
+    def _active_run_dirs(self) -> list[Path]:
+        """Return every run directory of the active forest, archives excluded."""
+        tl_root = self.project.repo / ".exo" / "tl-loop"
+        archives = {a.name for a in self.project.archives()}
+        directories: list[Path] = []
+        for run_json in sorted(tl_root.rglob("run.json")):
+            relative = run_json.relative_to(tl_root)
+            if len(relative.parts) > 1 and relative.parts[0] in archives:
+                continue
+            directories.append(run_json.parent)
+        return directories
 
     def _leaf_slice(self) -> dict[str, Any]:
-        checkpoint = json.loads(
-            (self.project.active_run() / "run.json").read_text(encoding="utf-8")
+        """The leaf's slice, wherever in the active forest it is persisted.
+
+        A leaf dispatched under a child sub-TL keeps its state in the child's
+        own checkpoint, so an assertion about the leaf has to read the whole
+        active forest rather than the root document alone.
+        """
+        found: set[str] = set()
+        for document in self._active_documents():
+            state = (document.get("slices") or {}).get(LEAF_SLICE)
+            if isinstance(state, MappingLike):
+                return dict(state)
+            found.update((document.get("slices") or {}).keys())
+        raise ScenarioError(
+            f"no active checkpoint holds the {LEAF_SLICE!r} slice: "
+            f"{sorted(found)!r}"
         )
-        state = (checkpoint.get("slices") or {}).get(LEAF_SLICE)
-        if not isinstance(state, MappingLike):
-            raise ScenarioError(
-                f"the active run has no {LEAF_SLICE!r} slice: "
-                f"{sorted((checkpoint.get('slices') or {}))!r}"
-            )
-        return dict(state)
 
     def _park_rows(self) -> list[dict[str, Any]]:
         return self.project.typed("tl.slice_parked")
@@ -916,14 +973,14 @@ def subprocess_run(command: list[str]) -> str:
     return completed.stdout
 
 
-def walk(project: Project) -> Scenario:
-    """Run every item, continuing past a failure.
+def walk(project: Project, leg: str = "recreate") -> Scenario:
+    """Run every item of this leg, continuing past a failure.
 
     One failing item must not hide the verdict of the ones after it: the items
     are independent, so every item is attempted, each reports its own verdict,
     and the run's status is the conjunction of all of them.
     """
-    state = Scenario(project)
+    state = Scenario(project, leg)
     for item, step in state.steps():
         try:
             result = step()
@@ -949,15 +1006,23 @@ def main() -> int:
         action="store_true",
         help="leave this run's Forgejo, session, and directory for inspection",
     )
+    parser.add_argument(
+        "--leg",
+        choices=LEGS,
+        default="recreate",
+        help="which acceptance shape to run (default: recreate)",
+    )
     arguments = parser.parse_args()
+    items = ITEMS_BY_LEG[arguments.leg]
 
     identifier = run_id()
     root = cl.make_root(cl.TEMP_ROOT, PREFIX)
     scope = cl.RunScope(
         run_id=identifier, root=root, prefix=PREFIX, keep=arguments.keep
     )
-    report = Report()
+    report = Report(items=items)
     report.evidence["run_id"] = identifier
+    report.evidence["leg"] = arguments.leg
     report.evidence["run_directory"] = str(root)
     keep = arguments.keep
     instance: fj.Instance | None = None
@@ -980,8 +1045,10 @@ def main() -> int:
         SEED_ISSUE_IDS.extend(chainlink_db.seed(database, SEED_ISSUES))
         report.evidence["chainlink_database"] = str(database)
         report.evidence["seeded_issues"] = list(SEED_ISSUE_IDS)
-        project = bootstrap(scope, instance, database, session=scope.session_prefix)
-        state = walk(project)
+        project = bootstrap(
+            scope, instance, database, session=scope.session_prefix, leg=arguments.leg
+        )
+        state = walk(project, arguments.leg)
         report.results = state.results
         report.evidence.update(state.evidence)
     except ACCEPTANCE_FAILURES as error:

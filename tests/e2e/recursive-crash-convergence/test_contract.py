@@ -918,3 +918,42 @@ def test_resume_trace_rejects_a_missing_file(tmp_path: Path) -> None:
             boundary="publication",
             point="before",
         )
+
+
+def test_every_leg_names_its_items_and_its_own_valid_plan() -> None:
+    """Each leg is one acceptance shape: its own items, its own plan document.
+
+    ``recreate`` is the #1117 scenario, ``control`` the same dispatch with no
+    recreate (#1138 step 3), and ``child`` the #1112 shape with the leaf under
+    a child sub-TL (#1138 step 4). A leg that silently ran another leg's items,
+    or a plan the shipped preflight would refuse, is not the shape it claims.
+    """
+    import driver
+    import scenario
+    from run_prefix import CHILD_SUB_TL, LEGS
+    from tl_loop.plan_validation import validate_plan_document
+
+    assert tuple(driver.ITEMS_BY_LEG) == LEGS
+    for leg in LEGS:
+        items = driver.ITEMS_BY_LEG[leg]
+        assert items, f"{leg} runs no items"
+        assert set(items) <= set(driver.ITEMS), f"{leg} names an unknown item"
+    recreate_only = {
+        "confirmed_recreate",
+        "new_dispatch",
+        "publish_pr_b",
+        "no_adoption_of_pr_a",
+    }
+    assert not recreate_only & set(driver.ITEMS_BY_LEG["control"])
+    assert recreate_only <= set(driver.ITEMS_BY_LEG["child"])
+
+    for leg in LEGS:
+        document = scenario._plan_document(leg)
+        assert validate_plan_document(document)["run_id"] == "root"
+    child_leaves = scenario._plan_document("child")["plan"]["sub_tls"][0]["plan"]["leaves"]
+    assert [leaf["name"] for leaf in child_leaves] == [scenario.LEAF_SLICE]
+    # The shipped spawn path derives a leaf branch from its owning scope, so
+    # the child leg's leaf hangs off the child sub-TL's branch, not off main.
+    assert scenario._leaf_branch("child") == f"main.{CHILD_SUB_TL}.{scenario.LEAF_SLICE}-codex"
+    assert scenario._leaf_branch("recreate") == f"main.{scenario.LEAF_SLICE}-codex"
+    assert scenario._leaf_branch("control") == scenario._leaf_branch("recreate")

@@ -21,6 +21,14 @@ RUN_DIRECTORY_PREFIX = PREFIX
 #: them.
 LEAF_SLICE = "out"
 
+#: The acceptance legs. ``recreate`` is the #1117 scenario unchanged;
+#: ``control`` is the same dispatch with no recreate (the #1138 control);
+#: ``child`` puts the leaf under a child sub-TL, the #1112 shape (#1138 step 4).
+LEGS: tuple[str, ...] = ("recreate", "control", "child")
+
+#: The child sub-TL that owns the leaf in the ``child`` leg.
+CHILD_SUB_TL = "stage"
+
 #: Every issue the scenario is seeded with. Each is created fresh in the
 #: disposable database on every run, so no run depends on another's rows, and
 #: no existing database is read or written.

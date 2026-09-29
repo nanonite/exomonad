@@ -33,7 +33,7 @@ import e2e_harness.forgejo_stack as fj  # noqa: E402
 import e2e_harness.tmuxio as tmuxio  # noqa: E402
 from e2e_harness.waiter import await_boundary  # noqa: E402
 
-from run_prefix import LEAF_SLICE  # noqa: E402
+from run_prefix import CHILD_SUB_TL, LEAF_SLICE, LEGS  # noqa: E402
 
 #: Where the harness reads the shared artifacts from.
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -188,25 +188,41 @@ def _write_config(project: Project) -> None:
     )
 
 
-def _write_plan(project: Project) -> None:
+def _leaf_branch(leg: str) -> str:
+    """Return the branch the shipped spawn path gives this leg's leaf.
+
+    The shipped spawn path derives a leaf branch from its owning scope
+    (``<scope branch>.<slice>-<agent type>``), so the ``child`` leg's leaf
+    hangs off the child sub-TL's branch instead of ``main``.
+    """
+    scope = f"main.{CHILD_SUB_TL}" if leg == "child" else "main"
+    return f"{scope}.{LEAF_SLICE}-codex"
+
+
+def _plan_document(leg: str) -> dict[str, Any]:
+    """Return the closed-key WorkPlan document this leg launches with."""
+    leaf = {"name": LEAF_SLICE, "task": "Publish the recreated publication leaf"}
+    if leg != "child":
+        return {"run_id": "root", "plan": {"leaves": [leaf]}}
+    return {
+        "run_id": "root",
+        "plan": {
+            "sub_tls": [
+                {
+                    "name": CHILD_SUB_TL,
+                    "plan": {"leaves": [leaf]},
+                }
+            ]
+        },
+    }
+
+
+def _write_plan(project: Project, leg: str) -> None:
     """Write the WorkPlan the controller is launched with."""
     plan_dir = project.repo / ".exo" / "tl-loop"
     plan_dir.mkdir(parents=True, exist_ok=True)
     (plan_dir / "plan.json").write_text(
-        json.dumps(
-            {
-                "run_id": "root",
-                "plan": {
-                    "leaves": [
-                        {
-                            "name": LEAF_SLICE,
-                            "task": "Publish the recreated publication leaf",
-                        }
-                    ]
-                },
-            }
-        )
-        + "\n",
+        json.dumps(_plan_document(leg)) + "\n",
         encoding="utf-8",
     )
 
@@ -235,7 +251,11 @@ def _write_agent_shim(project: Project) -> None:
 
 
 def bootstrap(
-    scope: cl.RunScope, instance: fj.Instance, database: Path, session: str
+    scope: cl.RunScope,
+    instance: fj.Instance,
+    database: Path,
+    session: str,
+    leg: str = "recreate",
 ) -> Project:
     """Create the disposable project this scenario runs its server against."""
     repo = scope.root / "repo"
@@ -251,7 +271,7 @@ def bootstrap(
         bin_dir=scope.root / "bin",
         log_dir=scope.root / "logs",
         session=session,
-        leaf_branch=f"main.{LEAF_SLICE}-codex",
+        leaf_branch=_leaf_branch(leg),
         environment=_environment(scope, instance, session, database),
     )
     project.log_dir.mkdir(parents=True, exist_ok=True)
@@ -261,7 +281,7 @@ def bootstrap(
     _write_agent_shim(project)
     _seed_repository(project)
     _write_config(project)
-    _write_plan(project)
+    _write_plan(project, leg)
     return project
 
 
