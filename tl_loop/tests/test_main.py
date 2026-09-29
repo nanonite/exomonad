@@ -17,6 +17,7 @@ from tl_loop.events.queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult
+from tl_loop.state.schema import GateStatus
 from tl_loop.state.store import RunStore, create
 
 
@@ -125,6 +126,88 @@ def test_gate_answer_emits_source_dimension(
             },
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("gate", "decision", "status"),
+    [
+        ("tl-dispatch-failed-feat/auth", True, "approved"),
+        ("tl-dispatch-failed-feat/auth", False, "rejected"),
+        ("tl-post-merge-feat/auth", True, "approved"),
+    ],
+)
+def test_gate_answer_reaches_a_gate_whose_slice_id_contains_a_slash(
+    tmp_path: Path,
+    monkeypatch,
+    gate: str,
+    decision: bool,
+    status: str,
+) -> None:
+    """The CLI is the CLI half of one shared gate-name contract.
+
+    A per-slice gate name embeds the slice id, and a slice id may hold a `/`.
+    The HTTP control route percent-encodes that name into one path level; the
+    CLI is handed the raw name and must reach the same gate, so a slice id with
+    a `/` is answerable through both paths.
+    """
+    transport = RecordingTransport()
+    project_root = tmp_path
+    state_root = project_root / ".exo" / "tl-loop"
+    create("run", {}, root_dir=state_root)
+    store = RunStore("run", state_root)
+    store.set_gate(gate)
+    monkeypatch.setattr(launcher, "TransportClient", lambda project_root: transport)
+
+    launcher._set_gate(
+        argparse.Namespace(
+            project_root=project_root,
+            run_id="run",
+            name=gate,
+            approve=decision,
+            reject=not decision,
+            source="cli",
+        )
+    )
+
+    reloaded = store.load()
+    assert [(entry.name, entry.status.value) for entry in reloaded.gates] == [
+        (gate, status)
+    ]
+    # The recorded decision carries the raw name, so an operator reading the
+    # gate back out of run state sees exactly what they answered.
+    assert transport.calls == [
+        (
+            "emit_controller_event",
+            {
+                "event_type": "tl.gate_answered",
+                "payload": {
+                    "gate_name": gate,
+                    "decision": status,
+                    "source": "cli",
+                },
+            },
+        )
+    ]
+
+
+def test_a_gate_name_containing_a_slash_is_distinct_from_its_encoded_form(
+    tmp_path: Path,
+) -> None:
+    """Encoding is injective: two different gates never answer each other."""
+    state_root = tmp_path / ".exo" / "tl-loop"
+    create("run", {}, root_dir=state_root)
+    store = RunStore("run", state_root)
+    raw = "tl-dispatch-failed-feat/auth"
+    literal = "tl-dispatch-failed-feat%2Fauth"
+    store.set_gate(raw)
+    store.set_gate(literal)
+
+    store.answer_gate(raw, GateStatus.APPROVED)
+
+    assert {entry.name: entry.status.value for entry in store.load().gates} == {
+        raw: "approved",
+        literal: "pending",
+    }
 
 
 def test_accepted_plan_proposal_emits_no_plan_body(

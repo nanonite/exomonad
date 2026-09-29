@@ -6,6 +6,7 @@ use crate::control_plan;
 use crate::control_read_model;
 use crate::control_recovery;
 use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV};
+use exomonad::control_gate_name;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -1215,7 +1216,8 @@ async fn control_answer_gate(
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             let status = match &error {
-                control_gate::GateAnswerError::InvalidIdentifier(_) => {
+                control_gate::GateAnswerError::InvalidIdentifier(_)
+                | control_gate::GateAnswerError::InvalidGateName(_) => {
                     axum::http::StatusCode::BAD_REQUEST
                 }
                 control_gate::GateAnswerError::MissingRun
@@ -2095,10 +2097,7 @@ Run `exomonad recompile` first to build it.",
             "/cleanup",
             post(control_cleanup).layer(DefaultBodyLimit::max(control_cleanup::MAX_REQUEST_BYTES)),
         )
-        .route(
-            "/runs/{run_id}/gates/{gate_name}",
-            post(control_answer_gate),
-        )
+        .route(control_gate_name::ROUTE, post(control_answer_gate))
         .route("/runs/{run_id}/plan/proposals", post(control_propose_plan))
         .route(
             "/runs/{run_id}/slices/{slice_id}/recovery",
@@ -2348,6 +2347,127 @@ mod tests {
             .unwrap();
         let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(document["kind"], "invalid_request");
+    }
+
+    /// The real control route template with a stub that reports what the
+    /// handler receives, so the test observes routing and percent-decoding
+    /// without spawning the Python writer.
+    fn gate_route_router() -> Router {
+        async fn stub(
+            Path((run_id, gate_name)): Path<(String, String)>,
+        ) -> axum::response::Response {
+            let gate_name = match control_gate::validate_gate_name(&gate_name) {
+                Ok(()) => gate_name,
+                Err(error) => {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": error.to_string()})),
+                    )
+                        .into_response()
+                }
+            };
+            Json(serde_json::json!({"run_id": run_id, "gate": gate_name})).into_response()
+        }
+        Router::new()
+            .route(control_gate_name::ROUTE, post(stub))
+            .with_state(())
+    }
+
+    async fn post_gate(uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let response = tower::ServiceExt::oneshot(gate_route_router(), request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let document = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
+        (status, document)
+    }
+
+    #[tokio::test]
+    async fn gate_route_addresses_a_slice_id_containing_a_slash() {
+        // A per-slice gate name embeds its slice id, and a slice id may hold a
+        // `/`. The canonical encoding is the one `control_gate_name::encode`
+        // produces, so the handler sees the raw name the CLI would pass.
+        let gate = "tl-dispatch-failed-feat/auth";
+        let uri = format!("/runs/root/gates/{}", control_gate_name::encode(gate));
+
+        let (status, document) = post_gate(&uri).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(document["gate"], gate);
+        assert_eq!(document["run_id"], "root");
+    }
+
+    #[tokio::test]
+    async fn gate_route_still_addresses_an_ordinary_gate_name() {
+        let (status, document) = post_gate("/runs/root/gates/tl-post-merge-leaf-a").await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(document["gate"], "tl-post-merge-leaf-a");
+    }
+
+    #[tokio::test]
+    async fn every_gate_name_survives_the_encode_decode_round_trip() {
+        // `encode` is the exact inverse of the router's segment decode, so the
+        // HTTP path and the CLI path name the same gate for any name the
+        // writer can record.
+        for gate in [
+            "tl-dispatch-failed-leaf-a",
+            "tl-dispatch-ownership-conflict-leaf-a",
+            "tl-post-merge-leaf-a",
+            "tl-dispatch-failed-feat/auth",
+            "tl-post-merge-a/b/c",
+            "tl-dispatch-failed-feat/%2Fauth",
+            "codex+review#1%",
+            "gate with spaces",
+            "gate?query#fragment",
+            "gate/../..",
+            "gate/.",
+            "ünïcödé/gate",
+        ] {
+            let uri = format!("/runs/root/gates/{}", control_gate_name::encode(gate));
+            let (status, document) = post_gate(&uri).await;
+
+            assert_eq!(status, axum::http::StatusCode::OK, "{gate:?} via {uri}");
+            assert_eq!(document["gate"], gate, "{gate:?} must round trip");
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_route_refuses_a_bare_navigation_gate_name_in_any_encoding() {
+        // A gate name is never used as a path, so it carries no traversal risk,
+        // but the two ambiguous names stay refused so no encoding smuggles one
+        // past a console that pattern-matches on the wire form.
+        for segment in [".", "%2E", "..", "%2E%2E"] {
+            let (status, _) = post_gate(&format!("/runs/root/gates/{segment}")).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{segment} must not answer a gate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unencoded_slash_does_not_match_the_gate_route() {
+        // The route has one `{gate_name}` level, so a raw `/` is a routing
+        // miss, not a silently truncated name. The encoded form is the only
+        // way to address such a gate, which is what makes the encoding
+        // canonical rather than advisory.
+        let (status, _) = post_gate("/runs/root/gates/tl-dispatch-failed-feat/auth").await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
     }
 
     fn message() -> InboxMessageRecord {

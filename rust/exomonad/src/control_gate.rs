@@ -1,5 +1,11 @@
 //! Operator gate answers delegated to the canonical Python TL writer.
+//!
+//! The gate name arrives percent-encoded in one path level and is decoded by the
+//! router before the handler runs; `exomonad::control_gate_name` owns that
+//! encoding. A run id is different: it is a real directory under
+//! `.exo/tl-loop/`, so it stays a single path component.
 
+use exomonad::control_gate_name::{self, GateNameError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -36,6 +42,7 @@ pub struct GateAnswerRequest {
 #[derive(Debug)]
 pub enum GateAnswerError {
     InvalidIdentifier(&'static str),
+    InvalidGateName(GateNameError),
     MissingRun,
     MissingGate,
     CommandFailed(String),
@@ -46,6 +53,7 @@ impl std::fmt::Display for GateAnswerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidIdentifier(kind) => write!(formatter, "invalid {kind} identifier"),
+            Self::InvalidGateName(error) => write!(formatter, "{error}"),
             Self::MissingRun => formatter.write_str("run state not found"),
             Self::MissingGate => formatter.write_str("named gate does not exist"),
             Self::CommandFailed(message) => write!(formatter, "gate answer failed: {message}"),
@@ -62,8 +70,8 @@ pub async fn answer_gate(
     gate_name: &str,
     request: GateAnswerRequest,
 ) -> Result<Value, GateAnswerError> {
-    validate_identifier(run_id, "run")?;
-    validate_identifier(gate_name, "gate")?;
+    validate_run_id(run_id)?;
+    validate_gate_name(gate_name)?;
     let state_path = project_dir
         .join(".exo")
         .join("tl-loop")
@@ -113,7 +121,9 @@ pub async fn answer_gate(
     }))
 }
 
-fn validate_identifier(value: &str, kind: &'static str) -> Result<(), GateAnswerError> {
+/// A run id becomes a directory under `.exo/tl-loop/`, so it must stay one
+/// path component. This is the traversal guard, and it does not relax.
+fn validate_run_id(value: &str) -> Result<(), GateAnswerError> {
     if value.is_empty()
         || value == "."
         || value == ".."
@@ -122,9 +132,20 @@ fn validate_identifier(value: &str, kind: &'static str) -> Result<(), GateAnswer
             .and_then(|name| name.to_str())
             != Some(value)
     {
-        return Err(GateAnswerError::InvalidIdentifier(kind));
+        return Err(GateAnswerError::InvalidIdentifier("run"));
     }
     Ok(())
+}
+
+/// A gate name is an argv value and a JSON key, not a path, so the canonical
+/// encoding admits the `/` a per-slice gate name inherits from its slice id.
+pub fn validate_gate_name(value: &str) -> Result<(), GateAnswerError> {
+    control_gate_name::validate(value).map_err(|error| match error {
+        GateNameError::PathNavigation | GateNameError::Empty => {
+            GateAnswerError::InvalidIdentifier("gate")
+        }
+        other => GateAnswerError::InvalidGateName(other),
+    })
 }
 
 #[cfg(test)]
@@ -140,10 +161,41 @@ mod tests {
     }
 
     #[test]
-    fn gate_identifiers_cannot_escape_the_project() {
+    fn run_ids_cannot_escape_the_project() {
         assert!(matches!(
-            validate_identifier("../outside", "gate"),
+            validate_run_id("../outside"),
+            Err(GateAnswerError::InvalidIdentifier("run"))
+        ));
+        assert!(matches!(
+            validate_run_id("nested/run"),
+            Err(GateAnswerError::InvalidIdentifier("run"))
+        ));
+    }
+
+    #[test]
+    fn a_gate_name_may_embed_a_slice_id_containing_a_slash() {
+        // The gate is addressed through an argv value and a JSON key, never a
+        // path, so a per-slice gate stays answerable when the slice id has a
+        // `/` in it. This is the ordinary CLI spelling.
+        assert!(validate_gate_name("tl-dispatch-failed-feat/auth").is_ok());
+        assert!(validate_gate_name("tl-post-merge-feat/auth").is_ok());
+    }
+
+    #[test]
+    fn a_navigating_gate_name_is_still_refused() {
+        assert!(matches!(
+            validate_gate_name(".."),
             Err(GateAnswerError::InvalidIdentifier("gate"))
+        ));
+        assert!(matches!(
+            validate_gate_name(""),
+            Err(GateAnswerError::InvalidIdentifier("gate"))
+        ));
+        assert!(matches!(
+            validate_gate_name("gate\nname"),
+            Err(GateAnswerError::InvalidGateName(
+                GateNameError::ControlCharacter
+            ))
         ));
     }
 }

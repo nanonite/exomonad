@@ -992,6 +992,36 @@ for why the boundary sits here.
 | `POST` | `/control/runs/{run_id}/gates/{gate_name}` | Answer an **existing** named gate |
 | `POST` | `/control/runs/{run_id}/plan/proposals` | Propose a plan mutation — inert until confirmed |
 
+### A gate name is one percent-encoded path segment
+
+A per-slice gate name embeds its slice id (`tl-dispatch-failed-<slice>`,
+`tl-dispatch-ownership-conflict-<slice>`, `tl-post-merge-<slice>`), and a
+slice id may contain `/`. Since `/` separates levels on the gate route, a gate
+name is carried as exactly one percent-encoded segment
+(`exomonad::control_gate_name`):
+
+- The RFC 3986 unreserved set `A-Z a-z 0-9 - . _ ~` passes through unchanged.
+- Every other byte becomes an uppercase `%XX` triplet, so `/` becomes `%2F`.
+- The router decodes the segment back to the raw name, which is the same string
+  the CLI passes to `gate --name`.
+
+```bash
+# gate: tl-dispatch-failed-feat/auth
+curl --unix-socket .exo/server.sock -H "X-Exomonad-Control-Credential: $EXOMONAD_CONTROL_TOKEN" \
+     -H "Content-Type: application/json" -X POST \
+     http://localhost/control/runs/root/gates/tl-dispatch-failed-feat%2Fauth \
+     --data '{"decision":"approve"}'
+```
+
+An ordinary gate name is unchanged by the encoding, so existing operators and
+consoles keep working. The encoding is injective: a gate literally named
+`tl-dispatch-failed-feat%2Fauth` is `tl-dispatch-failed-feat%252Fauth` on the
+wire, so two gates never answer each other. `.` and `..` are refused in any
+encoding; a `/` inside a name is data, not a traversal, because a gate name is
+matched against recorded gates and is never used as a path. A `run_id` is
+different — it is a real directory under `.exo/tl-loop/`, so it stays a single
+path component.
+
 ### Authority is enforced server-side
 
 Two separate credentials, and they are mutually exclusive per request

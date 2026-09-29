@@ -221,6 +221,41 @@ def test_two_slices_exhausting_retries_open_two_distinct_gates(tmp_path: Path) -
         assert parked.park_cause is ParkCause.DISPATCH_FAILED
 
 
+def test_a_slice_id_containing_a_slash_still_opens_one_answerable_gate(
+    tmp_path: Path,
+) -> None:
+    """A per-slice gate name stays answerable when the slice id has a ``/``.
+
+    The gate name embeds the slice id, so a slice id holding a path separator
+    produces a gate name the HTTP control route cannot write as one path level.
+    The name itself is the operator's handle on the decision, so the gate must
+    still open, be announced, and be answerable -- the control route reaches it
+    through the canonical percent-encoding of the same name.
+    """
+    slice_id = "feat/auth"
+    store = _store_for(tmp_path)
+    state = store.checkpoint(
+        TLPhase.TLDispatching,
+        {slice_id: _dispatching_slice(slice_id, "src/auth.py")},
+        BudgetLedger(tokens=0, wall_seconds=0),
+        0,
+    )
+    config = _config(tmp_path)
+    transport = _transport(tmp_path)
+
+    state = _exhaust(store, state, slice_id, config, EffectClient(transport), BRANCH_EXISTS)
+
+    gate = f"{DISPATCH_FAILURE_GATE_PREFIX}{slice_id}"
+    assert [(entry.name, entry.status) for entry in state.gates] == [(gate, GateStatus.PENDING)]
+    assert [payload["gate_name"] for payload in transport.payloads("tl.gate_opened")] == [gate]
+
+    store.answer_gate(gate, GateStatus.APPROVED)
+
+    assert [(entry.name, entry.status) for entry in store.load().gates] == [
+        (gate, GateStatus.APPROVED)
+    ]
+
+
 def test_answering_one_slices_gate_does_not_resolve_the_other(tmp_path: Path) -> None:
     store, state, _transport = _exhaust_both(tmp_path)
     answered = f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-a"
