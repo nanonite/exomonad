@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Bind a leaf dispatched under a child sub-TL: it never progresses past spawned (#1141)
 - Recreated dispatch never progresses past spawned: no handoff, reviews not applied, closed PR never parks (#1137)
 - Fix recreated run recovery across publication, cleanup, and Chainlink escalation (#1112)
 - Fix deterministic leaf recovery after recreated branch preservation (#1105)
