@@ -9,6 +9,7 @@ import pytest
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.loop import driver as driver_module
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
     EffectIntent,
@@ -232,6 +233,8 @@ class FakeClient:
             error=None,
         )
 
+    issue_create_calls: list[str] = field(default_factory=list)
+
     def chainlink_issue_create(
         self,
         *,
@@ -240,7 +243,8 @@ class FakeClient:
         labels: tuple[str, ...] | None = None,
         priority: str | None = None,
     ) -> ToolResult:
-        del title, description, labels, priority
+        del description, labels, priority
+        self.issue_create_calls.append(title)
         return ToolResult(
             raw={"success": True},
             success=True,
@@ -467,6 +471,52 @@ def test_reconciliation_parks_closed_unmerged_pr_without_resurrecting_slice(tmp_
     assert parked.park_cause.value == "pr_closed_unmerged"
     assert parked.reconciliation["next_action"] == "park_closed_unmerged_pr"
     assert client.spawn_reviewer_calls == []
+    assert store.load().slices["slice-a"].status is SliceStatus.PARKED
+
+
+def test_reconciliation_reconfirms_a_park_it_already_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart re-emits the park its observation still proves -- once.
+
+    That boundary is how a caller knows the restarted controller reconciled the
+    closed PR again. The escalation intent and the issue it names belong to the
+    (slice, cause, attempt) and are reused, so a re-confirmation can add a
+    boundary without adding an issue.
+    """
+    store, state = _load_state(tmp_path)
+    config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
+    closed = {"pr_state": "closed", "publication_invocation_id": None}
+
+    first_client = FakeClient(**closed)
+    first: list[object] = []
+    parked_state = _reconcile_nonterminal_slices(
+        _PLAN, state, config, first_client, store, first
+    )
+    assert len(first_client.issue_create_calls) == 1
+    parked = parked_state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is not None
+    assert len(store.load().slices["slice-a"].park_audit or {}) > 0
+
+    parks: list[object] = []
+    real_park = driver_module.park
+
+    def record_park(slice_state, cause, **kwargs):  # type: ignore[no-untyped-def]
+        parks.append(cause)
+        return real_park(slice_state, cause, **kwargs)
+
+    monkeypatch.setattr(driver_module, "park", record_park)
+    client = FakeClient(**closed)
+    second: list[object] = []
+    _reconcile_nonterminal_slices(
+        _PLAN, store.load(), config, client, store, second
+    )
+
+    # The boundary is re-emitted for the same cause, the slice stays parked,
+    # and the issue the first park created is reused rather than replaced.
+    assert parks == [parked.park_cause]
+    assert client.issue_create_calls == []
     assert store.load().slices["slice-a"].status is SliceStatus.PARKED
 
 

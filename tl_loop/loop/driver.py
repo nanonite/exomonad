@@ -135,7 +135,13 @@ from tl_loop.loop.convergence import (
     ConvergenceTracker,
 )
 from tl_loop.loop.escalate import park
-from tl_loop.loop.heartbeat import HeartbeatConfig, SyntheticHeartbeatEvent, heartbeat_once
+from tl_loop.loop.heartbeat import (
+    HeartbeatConfig,
+    SyntheticHeartbeatEvent,
+    _pr_payload,
+    _pr_terminal_cause,
+    heartbeat_once,
+)
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.loop.review import (
@@ -6794,6 +6800,42 @@ def _heal_stale_reviewer_action(
     return healed if healed != current else None
 
 
+def _reconfirm_park(
+    current: SliceState,
+    watcher: WatcherObservation | Mapping[str, object] | None,
+    state: RunState,
+    store: RunStore,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> SliceState | None:
+    """Re-emit one park whose authoritative observation still proves it.
+
+    A restart has to show that the controller reached the same conclusion it
+    recorded before it stopped, so the boundary is emitted again -- and only
+    that. `park` resolves the escalation intent by (slice, cause, attempt) under
+    a lock and reuses the issue it names, so a re-confirmation can never add a
+    second intent or a second issue. A park whose observation no longer proves
+    it is left exactly as it is: reconciliation never resurrects a parked slice.
+    """
+    if current.park_cause is None or watcher is None:
+        return None
+    cause = _pr_terminal_cause(watcher)
+    if cause is None or cause.value != current.park_cause.value:
+        return None
+    if isinstance(effects, ReadOnlyEffectClient):
+        return None
+    park(
+        current,
+        current.park_cause,
+        store=store,
+        issue_creator=effects,
+        ledger=state.budgets,
+        audit=_pr_payload(watcher),
+    )
+    refreshed = store.load().slices.get(current.id)
+    return refreshed if refreshed is not None else None
+
+
 def _reconcile_nonterminal_slices(
     plan: WorkPlan,
     state: RunState,
@@ -6811,6 +6853,7 @@ def _reconcile_nonterminal_slices(
             SliceStatus.SPAWNED,
             SliceStatus.IN_REVIEW,
             SliceStatus.REPAIRING,
+            SliceStatus.PARKED,
         }
     ]
     if not candidates:
@@ -6866,6 +6909,16 @@ def _reconcile_nonterminal_slices(
             recovered_pr_number = watcher.get("pr_number") if watcher else None
             if isinstance(recovered_pr_number, int) and recovered_pr_number > 0:
                 snapshots[recovered_pr_number] = watcher
+        if current.status is SliceStatus.PARKED:
+            # A parked slice is reconciled only to confirm the park it already
+            # holds; every other derived field is left alone, and a slice whose
+            # observation no longer proves its cause stays parked untouched.
+            reconfirmed = _reconfirm_park(current, watcher, state, store, effects, effects_log)
+            if reconfirmed is not None:
+                updated[current.id] = reconfirmed
+                changed = True
+                current = reconfirmed
+            continue
         owner_id = _agent_for_dispatch_intent(
             agent_listing,
             current.dispatch_intent_id or "",
