@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix recreated run recovery across publication, cleanup, and Chainlink escalation (#1112)
 - Fix deterministic leaf recovery after recreated branch preservation (#1105)
 - Preserve controller epoch and dispatch generation through the policy spawn path (#1120)
 - Scope the dispatch-exhaustion gate per slice (#1119)
@@ -253,6 +254,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add replay and real-server acceptance for recreated publication correlation (#1117)
 - Add non-blocking Codex sandbox capability preflight to exomonad new/init (#1089)
 - Codex bwrap/AppArmor sandbox failure: Phase 1 (AppArmor override) exhausted, falling back to network_access=true / bypass-sandbox (#1085)
 - Add safe operator cleanup for stale ExoMonad resources (#1068)
