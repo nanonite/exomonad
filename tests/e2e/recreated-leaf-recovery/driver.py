@@ -131,9 +131,9 @@ def run_id() -> str:
     never reach each other's state.
 
     The length is bounded because the tmux session name is derived from it and
-    the server keeps only the first 36 characters of that name. A run id that
-    pushed the session name past the limit would make the server look for a
-    name that does not exist, and it would report every agent as dead.
+    the server rejects a session name past its limit at config load. A run id
+    that pushed the session name past the limit would stop the run at startup
+    with a config error naming the length and the file to change.
     """
     return f"e2e1111-{secrets.token_hex(3)}"
 

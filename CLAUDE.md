@@ -286,6 +286,15 @@ python3 scripts/check_tl_loop_archive.py "$HOME/.exo/tl_loop.pyz" --source "$PWD
 default_role = "tl"          # auto-detected from .exo/roles/ if exactly one role exists
 project_dir = "."
 shell_command = "nix develop" # environment wrapper for TL tab + server
+# tmux session name. Optional — defaults to the project directory's own name.
+# Resolution: config.local.toml > config.toml > the directory name. A '.' is
+# rewritten to '_' (tmux forbids dots in session names) and the rewrite is
+# logged. At most 36 characters: a longer name is REJECTED at config load, not
+# truncated, because truncation would leave the server probing a session nobody
+# created and reporting every agent as dead. The error names the value, its
+# length, the limit, and the file to change. `exomonad init --session` is held
+# to the same limit. `exomonad serve` logs the resolved name at startup.
+#   tmux_session = "exomonad"
 wasm_dir = ".exo/wasm"       # project-local (default), override for shared installs
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
 model = "sonnet"             # legacy root-model compatibility; ignored by the programmatic TL
@@ -381,6 +390,8 @@ automatically. Omit the flag to keep today's auto-detect behavior.
 - `config.local.toml` uses `role` (worktree-specific override)
 - Resolution: `local.role > global.default_role`
   - WASM: `wasm_dir` in config > `.exo/wasm/` (project-local)
+  - `tmux_session`: `config.local.toml` > `config.toml` > the project directory
+    name, validated at load (36-character limit, `.` rewritten to `_`)
 
 **TL spawn preflight and Chainlink state:** ExoMonad-owned runtime paths are
 excluded from the source-cleanliness check: `.chainlink/`, `.exo/`, and the

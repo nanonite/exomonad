@@ -110,10 +110,11 @@ def session_name(scope: cl.RunScope) -> str:
 
     The name is the run's own prefix, and it is within the server's
     session-name limit. That limit is why the name carries no extra suffix: the
-    harness creates the tmux session itself, and the server sanitizes the name
-    it reads from the config, so any name the two do not share exactly is a
-    session the server cannot see. ``track_session`` refuses a name that would
-    not survive that sanitization.
+    harness creates the tmux session itself, and the server uses the name it
+    reads from the config exactly, so any name the two do not share is a
+    session the server cannot see. The server rejects an over-long name at
+    config load and rewrites dots to underscores; ``track_session`` refuses a
+    name that would not survive either.
     """
     return scope.track_session(scope.session_prefix)
 

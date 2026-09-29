@@ -1857,6 +1857,7 @@ Run `exomonad recompile` first to build it.",
         wasm_path = %wasm_path.display(),
         role = %role_name,
         event_session_id = %event_session_id,
+        tmux_session = %config.tmux_session,
         "Starting MCP server on Unix domain socket (hot reload enabled)"
     );
 

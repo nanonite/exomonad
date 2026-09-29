@@ -38,20 +38,19 @@ TEMP_ROOT = "/tmp"
 #: The session-name limit the server imposes, mirrored here so a name this
 #: harness creates is never silently different from the one the server uses.
 #:
-#: The server sanitizes ``tmux_session`` exactly once, when it loads the config
-#: (``rust/exomonad/src/config.rs:525`` -> ``sanitize_session_name`` at
-#: ``config.rs:878``), replacing dots with underscores and keeping the first 36
-#: characters. Every consumer then reads that one sanitized value: ``exomonad
-#: init`` creates the session from it (``rust/exomonad/src/init.rs:5734``) and
-#: ``serve`` hands the same value to the agent control service
-#: (``rust/exomonad/src/serve.rs:1830``). Production therefore cannot diverge,
-#: because there is only ever one name.
+#: The server resolves ``tmux_session`` once, when it loads the config
+#: (``resolve_tmux_session`` in ``rust/exomonad/src/config.rs``), rewriting dots
+#: to underscores and rejecting a name over 36 characters instead of shortening
+#: it. Every consumer then reads that one resolved value: ``exomonad init``
+#: creates the session from it and ``serve`` hands the same value to the agent
+#: control service, which logs it at startup. Production therefore cannot
+#: diverge, because there is only ever one name.
 #:
 #: A harness that creates the tmux session itself, rather than through
-#: ``exomonad init``, holds a *different* name from the one the server will use
-#: as soon as the name is longer than 36 characters. The server then looks for
-#: its truncated name, finds no such session, and reports every agent as dead.
-#: This harness creates the session itself, so it has to respect the same limit.
+#: ``exomonad init``, must keep the name inside the limit the server enforces at
+#: config load. The server rejects a longer name outright now, so an over-long
+#: harness name stops the run at startup instead of misnaming a session; this
+#: check keeps the failure in the harness, where the offending name is known.
 SESSION_NAME_MAX_LENGTH = 36
 
 #: Bounded wait for a terminated process to disappear before it is reported.
@@ -99,15 +98,15 @@ class RunScope:
 
         The result is the session name itself and is kept within the server's
         session-name limit, because this harness creates the tmux session rather
-        than asking ``exomonad init`` to, and a name the server would silently
-        truncate is a name the server would look for and not find.
+        than asking ``exomonad init`` to, and a longer name is one the server
+        refuses to load.
         """
         prefix = f"{self.prefix}{self.run_id}"
         if len(prefix) > SESSION_NAME_MAX_LENGTH:
             raise CleanupError(
                 f"run id {self.run_id!r} makes the session name {prefix!r} "
                 f"longer than the server's {SESSION_NAME_MAX_LENGTH}-character "
-                f"session name limit; the server would look for a different name"
+                f"session name limit, which the server rejects at config load"
             )
         return prefix
 
@@ -131,7 +130,7 @@ class RunScope:
             raise CleanupError(
                 f"refusing to track session {session!r}: it is longer than the "
                 f"server's {SESSION_NAME_MAX_LENGTH}-character session name "
-                f"limit, so the server would look for a different name"
+                f"limit, which the server rejects at config load"
             )
         self.sessions.add(session)
         return session

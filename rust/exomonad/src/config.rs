@@ -116,7 +116,37 @@ fn parse_effort_level_env(value: &str) -> Result<Option<EffortLevel>> {
 }
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::debug;
+use tracing::{debug, warn};
+
+/// Longest tmux session name, in characters, that ExoMonad will use.
+///
+/// Enforced at the config-load boundary: a longer name is rejected, never
+/// shortened. Truncation would leave the server's `TmuxIpc` probing a session
+/// that is not the one the configured name refers to, so every
+/// `routing_liveness` check (`window_exists`,
+/// `routing_target_process_alive`) would report every agent dead and read as a
+/// product fault rather than as a naming mistake.
+pub const TMUX_SESSION_MAX_CHARS: usize = 36;
+
+/// Project-relative path of the shared config file.
+const PROJECT_CONFIG_PATH: &str = ".exo/config.toml";
+
+/// Project-relative path of the per-worktree config file.
+const LOCAL_CONFIG_PATH: &str = ".exo/config.local.toml";
+
+/// Which input supplied a tmux session name. Recorded so a rejected name can
+/// say which file has to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionNameSource {
+    /// `.exo/config.local.toml`, which wins over the project file.
+    LocalConfig,
+    /// `.exo/config.toml`.
+    ProjectConfig,
+    /// The project directory's own name, used when neither file sets one.
+    ProjectDirectory,
+    /// The `exomonad init --session` override.
+    CommandLine,
+}
 
 /// External MCP server configuration (HTTP or stdio).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -240,6 +270,9 @@ pub struct RawConfig {
     pub default_role: Option<Role>,
 
     /// Canonical tmux session name for this project.
+    ///
+    /// At most [`TMUX_SESSION_MAX_CHARS`] characters; a longer value is
+    /// rejected when the config is loaded rather than shortened.
     pub tmux_session: Option<String>,
 
     /// TCP port for public webhook and health endpoints.
@@ -366,6 +399,10 @@ pub struct Config {
     pub project_dir: PathBuf,
     pub role: Role,
     /// Canonical tmux session name (required after discovery).
+    ///
+    /// Resolved from `config.local.toml`, then `config.toml`, then the project
+    /// directory's own name, and validated at load: see
+    /// [`TMUX_SESSION_MAX_CHARS`].
     pub tmux_session: String,
     /// TCP port for public webhook and health endpoints.
     pub port: u16,
@@ -475,8 +512,8 @@ impl Config {
     pub fn discover() -> Result<Self> {
         let project_root = find_project_root()?;
 
-        let local_path = project_root.join(".exo/config.local.toml");
-        let global_path = project_root.join(".exo/config.toml");
+        let local_path = project_root.join(LOCAL_CONFIG_PATH);
+        let global_path = project_root.join(PROJECT_CONFIG_PATH);
 
         let local_raw = if local_path.exists() {
             debug!(path = %local_path.display(), "Loaded local config");
@@ -511,18 +548,15 @@ impl Config {
             })
             .unwrap_or_else(|| project_root.clone());
 
-        // Resolve tmux_session: config > directory name
-        let tmux_session = local_raw
-            .tmux_session
-            .or(global_raw.tmux_session)
-            .unwrap_or_else(|| {
-                project_root
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("exomonad")
-                    .to_string()
-            });
-        let tmux_session = sanitize_session_name(tmux_session);
+        // Resolve tmux_session: local config > project config > directory name.
+        // A name over the limit is rejected here, never truncated: a shortened
+        // name would make the server probe a session nobody created.
+        let tmux_session = resolve_tmux_session(
+            local_raw.tmux_session,
+            global_raw.tmux_session,
+            &project_root,
+        )?
+        .name;
 
         // Resolve TCP port: local > global > default.
         let port = local_raw.port.or(global_raw.port).unwrap_or(7433);
@@ -872,11 +906,144 @@ fn detect_role_name(project_dir: &Path) -> Option<String> {
     }
 }
 
-/// Sanitize session name.
-/// - Max 36 characters
-/// - Replace . with _ (dots cause issues)
-fn sanitize_session_name(name: String) -> String {
-    name.replace('.', "_").chars().take(36).collect()
+/// A tmux session name ExoMonad refuses to use.
+///
+/// Reported instead of a shortened name so the configured value, its length,
+/// the limit, and the place that has to change all appear in one error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionNameTooLong {
+    /// The value exactly as configured.
+    pub configured: String,
+    /// Which input supplied the value.
+    pub source: SessionNameSource,
+    /// The file or directory the value was read from.
+    pub origin: PathBuf,
+}
+
+impl SessionNameTooLong {
+    /// Length of the configured value, in characters.
+    pub fn length(&self) -> usize {
+        self.configured.chars().count()
+    }
+
+    /// The limit the value exceeded, in characters.
+    pub fn limit(&self) -> usize {
+        TMUX_SESSION_MAX_CHARS
+    }
+}
+
+impl std::fmt::Display for SessionNameTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let origin = match self.source {
+            SessionNameSource::ProjectDirectory => {
+                format!(
+                    "derived from the project directory name in {}",
+                    self.origin.display()
+                )
+            }
+            SessionNameSource::CommandLine => {
+                format!("passed on the command line as {}", self.origin.display())
+            }
+            _ => format!("configured in {}", self.origin.display()),
+        };
+        write!(
+            f,
+            "tmux_session {:?} is {} characters, longer than the {}-character tmux session \
+             name limit ({}); shorten it. A longer name is rejected here rather than truncated, \
+             because truncation makes the server probe a different session than the configured \
+             name and reports every agent as dead",
+            self.configured,
+            self.length(),
+            self.limit(),
+            origin
+        )
+    }
+}
+
+impl std::error::Error for SessionNameTooLong {}
+
+/// The tmux session name ExoMonad resolved, and the configured value behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSessionName {
+    /// The name every consumer must use, after the documented `.` -> `_` rewrite.
+    pub name: String,
+    /// The value exactly as configured.
+    pub configured: String,
+    /// Which input supplied the value.
+    pub source: SessionNameSource,
+    /// The file or directory the value was read from.
+    pub origin: PathBuf,
+}
+
+/// Validate one configured session name and apply the documented `.` -> `_`
+/// rewrite (tmux forbids dots in session names).
+///
+/// The rewrite preserves length, so only the length is checked. Dots are
+/// rewritten rather than rejected because the project directory name is the
+/// fallback source and a directory may carry one; the rewrite is logged, so it
+/// is never a silent transformation.
+pub fn validate_session_name(
+    configured: String,
+    source: SessionNameSource,
+    origin: PathBuf,
+) -> Result<ResolvedSessionName> {
+    if configured.chars().count() > TMUX_SESSION_MAX_CHARS {
+        return Err(anyhow::Error::new(SessionNameTooLong {
+            configured,
+            source,
+            origin,
+        }));
+    }
+
+    let name = configured.replace('.', "_");
+    if name != configured {
+        warn!(
+            configured = %configured,
+            session = %name,
+            origin = %origin.display(),
+            "Rewrote '.' to '_' in tmux_session; tmux forbids dots in session names"
+        );
+    }
+
+    Ok(ResolvedSessionName {
+        name,
+        configured,
+        source,
+        origin,
+    })
+}
+
+/// Resolve the tmux session name: `config.local.toml` > `config.toml` > the
+/// project directory's own name. Fails closed on a name over the limit.
+fn resolve_tmux_session(
+    local: Option<String>,
+    project: Option<String>,
+    project_root: &Path,
+) -> Result<ResolvedSessionName> {
+    match (local, project) {
+        (Some(name), _) => validate_session_name(
+            name,
+            SessionNameSource::LocalConfig,
+            project_root.join(LOCAL_CONFIG_PATH),
+        ),
+        (None, Some(name)) => validate_session_name(
+            name,
+            SessionNameSource::ProjectConfig,
+            project_root.join(PROJECT_CONFIG_PATH),
+        ),
+        (None, None) => {
+            let name = project_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("exomonad")
+                .to_string();
+            validate_session_name(
+                name,
+                SessionNameSource::ProjectDirectory,
+                project_root.to_path_buf(),
+            )
+        }
+    }
 }
 
 impl Config {
@@ -1096,19 +1263,123 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_session_name() {
-        // Dots replaced with underscores
-        assert_eq!(
-            sanitize_session_name("my.project".to_string()),
-            "my_project"
+    fn test_session_name_at_the_limit_is_accepted_unchanged() {
+        let name = "a".repeat(TMUX_SESSION_MAX_CHARS);
+        let resolved = validate_session_name(
+            name.clone(),
+            SessionNameSource::ProjectConfig,
+            PathBuf::from("/repo/.exo/config.toml"),
+        )
+        .expect("a name exactly at the limit is valid");
+        assert_eq!(resolved.name, name);
+        assert_eq!(resolved.configured, name);
+    }
+
+    #[test]
+    fn test_session_name_over_the_limit_is_rejected_with_the_typed_error() {
+        let name = "a".repeat(TMUX_SESSION_MAX_CHARS + 1);
+        let origin = PathBuf::from("/repo/.exo/config.local.toml");
+        let failure =
+            validate_session_name(name.clone(), SessionNameSource::LocalConfig, origin.clone())
+                .expect_err("a name over the limit must not be shortened");
+
+        let error = failure
+            .downcast_ref::<SessionNameTooLong>()
+            .expect("config load must report the typed session-name error");
+        assert_eq!(error.configured, name);
+        assert_eq!(error.source, SessionNameSource::LocalConfig);
+        assert_eq!(error.origin, origin);
+        assert_eq!(error.length(), TMUX_SESSION_MAX_CHARS + 1);
+        assert_eq!(error.limit(), TMUX_SESSION_MAX_CHARS);
+
+        // The message names the value, its length, the limit, and the file.
+        let message = error.to_string();
+        assert!(
+            message.contains(&name),
+            "message names the value: {message}"
         );
+        assert!(
+            message.contains(&(TMUX_SESSION_MAX_CHARS + 1).to_string()),
+            "message names the length: {message}"
+        );
+        assert!(
+            message.contains(&TMUX_SESSION_MAX_CHARS.to_string()),
+            "message names the limit: {message}"
+        );
+        assert!(
+            message.contains("config.local.toml"),
+            "message names the file: {message}"
+        );
+    }
 
-        // Max 36 characters
-        let long_name = "a".repeat(50);
-        assert_eq!(sanitize_session_name(long_name).len(), 36);
+    #[test]
+    fn test_session_name_rewrite_dots_and_leaves_other_names_alone() {
+        // tmux forbids dots in session names, so they are rewritten — and the
+        // resolved name is reported, never a silent transformation.
+        let resolved = validate_session_name(
+            "my.project".to_string(),
+            SessionNameSource::ProjectConfig,
+            PathBuf::from("/repo/.exo/config.toml"),
+        )
+        .expect("dots are rewritten, not rejected");
+        assert_eq!(resolved.name, "my_project");
+        assert_eq!(resolved.configured, "my.project");
 
-        // Clean name unchanged
-        assert_eq!(sanitize_session_name("exomonad".to_string()), "exomonad");
+        let resolved = validate_session_name(
+            "exomonad".to_string(),
+            SessionNameSource::ProjectConfig,
+            PathBuf::from("/repo/.exo/config.toml"),
+        )
+        .expect("a clean name is valid");
+        assert_eq!(resolved.name, "exomonad");
+
+        // The rewrite is length-preserving, so a dotted name is held to the
+        // same limit as any other.
+        let dotted = format!("{}.x", "a".repeat(TMUX_SESSION_MAX_CHARS - 2));
+        assert!(validate_session_name(
+            dotted,
+            SessionNameSource::ProjectConfig,
+            PathBuf::from("/repo/.exo/config.toml")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_resolve_tmux_session_prefers_local_then_project_then_directory() {
+        let root = PathBuf::from("/repo");
+        let local = resolve_tmux_session(
+            Some("from-local".to_string()),
+            Some("from-project".to_string()),
+            &root,
+        )
+        .expect("local config wins");
+        assert_eq!(local.name, "from-local");
+        assert_eq!(local.source, SessionNameSource::LocalConfig);
+        assert_eq!(local.origin, PathBuf::from("/repo/.exo/config.local.toml"));
+
+        let project = resolve_tmux_session(None, Some("from-project".to_string()), &root)
+            .expect("project config is the fallback");
+        assert_eq!(project.name, "from-project");
+        assert_eq!(project.source, SessionNameSource::ProjectConfig);
+        assert_eq!(project.origin, PathBuf::from("/repo/.exo/config.toml"));
+
+        let directory =
+            resolve_tmux_session(None, None, &root).expect("directory name is the last resort");
+        assert_eq!(directory.name, "repo");
+        assert_eq!(directory.source, SessionNameSource::ProjectDirectory);
+    }
+
+    #[test]
+    fn test_resolve_tmux_session_reports_the_file_that_set_an_over_long_name() {
+        let root = PathBuf::from("/repo");
+        let failure = resolve_tmux_session(None, Some("b".repeat(37)), &root)
+            .expect_err("an over-long project-config name must fail closed");
+        let error = failure
+            .downcast_ref::<SessionNameTooLong>()
+            .expect("typed error");
+        assert_eq!(error.source, SessionNameSource::ProjectConfig);
+        assert!(error.to_string().contains("config.toml"));
+        assert!(!error.to_string().contains("config.local.toml"));
     }
 
     #[test]

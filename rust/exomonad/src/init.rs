@@ -5737,7 +5737,20 @@ pub async fn run(
         }
     }
 
-    let session = session_override.unwrap_or(config.tmux_session.clone());
+    // A `--session` override reaches tmux directly while the server reads
+    // `tmux_session` from config, so an over-long override is a name the server
+    // can never probe. Validate it at the same boundary.
+    let session = match session_override {
+        Some(override_name) => {
+            let validated = crate::config::validate_session_name(
+                override_name,
+                crate::config::SessionNameSource::CommandLine,
+                std::path::PathBuf::from("--session"),
+            )?;
+            validated.name
+        }
+        None => config.tmux_session.clone(),
+    };
     let session_alive = TmuxIpc::has_session(&session).await?;
     let session_transition = if recreate {
         exomonad_core::services::SessionTransition::Recreate
@@ -7107,8 +7120,9 @@ fn log_ignored_effort(role: &str, agent_type: AgentType, effort: &str) {
 mod tests {
     use super::*;
     use crate::config::{
+        validate_session_name, SessionNameSource, SessionNameTooLong,
         DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS, DEFAULT_TL_DISPATCH_RETRY_LIMIT,
-        DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS,
+        DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS, TMUX_SESSION_MAX_CHARS,
     };
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
@@ -7156,6 +7170,32 @@ mod tests {
                 REVIEWER_MAX_ROUNDS_ENV
             ]
         );
+    }
+
+    #[test]
+    fn a_session_override_is_held_to_the_same_limit_as_the_config() {
+        // `--session` creates the session under a name the server never reads,
+        // so an over-long override is refused here rather than accepted into a
+        // session the server cannot probe.
+        let accepted = validate_session_name(
+            "a".repeat(TMUX_SESSION_MAX_CHARS),
+            SessionNameSource::CommandLine,
+            std::path::PathBuf::from("--session"),
+        )
+        .expect("an override exactly at the limit is valid");
+        assert_eq!(accepted.name.len(), TMUX_SESSION_MAX_CHARS);
+
+        let failure = validate_session_name(
+            "a".repeat(TMUX_SESSION_MAX_CHARS + 1),
+            SessionNameSource::CommandLine,
+            std::path::PathBuf::from("--session"),
+        )
+        .expect_err("an over-long override must fail closed");
+        let error = failure
+            .downcast_ref::<SessionNameTooLong>()
+            .expect("the override reports the typed session-name error");
+        assert_eq!(error.source, SessionNameSource::CommandLine);
+        assert!(error.to_string().contains("--session"));
     }
 
     #[test]

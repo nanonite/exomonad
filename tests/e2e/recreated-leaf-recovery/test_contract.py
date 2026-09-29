@@ -387,44 +387,35 @@ def test_there_is_no_quiescence_wait_to_misuse():
 # --------------------------------------------------------------------------
 
 
-def _sanitize_session_name(name: str) -> str:
-    """Mirror the server's own sanitization, as a test oracle.
-
-    This is ``sanitize_session_name`` from ``rust/exomonad/src/config.rs:878``:
-    dots become underscores and the first 36 characters are kept. It is
-    duplicated here only so the test can ask whether the two agree, and the
-    neighbouring test asserts that this mirror still matches the shipped rule.
-    """
-    return name.replace(".", "_")[:36]
-
-
-def test_the_harness_oracle_matches_the_shipped_session_name_rule():
-    """The oracle this file uses is the rule the server actually applies.
-
-    The server sanitizes ``tmux_session`` once, at config load
-    (``rust/exomonad/src/config.rs:525``). If that rule ever changes, the
-    oracle has to change with it or the checks below stop meaning anything, so
-    the rule is read out of the shipped source rather than trusted.
-    """
-    source = (PROJECT_ROOT / "rust/exomonad/src/config.rs").read_text(encoding="utf-8")
-    assert 'name.replace(\'.\', "_").chars().take(36).collect()' in source, (
-        "the shipped session-name rule changed; update _sanitize_session_name"
-    )
-    assert "let tmux_session = sanitize_session_name(tmux_session);" in source, (
-        "the server no longer sanitizes the session name at config load, so the "
-        "harness no longer has to match a truncated name"
-    )
-
-
-def test_every_session_name_the_harness_creates_survives_the_servers_sanitization():
-    """The harness's session name is the name the server will use.
+def test_the_server_still_rejects_a_session_name_it_cannot_use():
+    """The harness names a session the server must accept verbatim.
 
     The harness creates the tmux session itself rather than through
-    ``exomonad init``, so it holds its own name. The server reads the name from
-    the config and sanitizes it. A name longer than 36 characters is silently
-    truncated, the server then looks for a session that does not exist, and
-    every agent is reported dead. This asserts the two names are the same for
-    the names this harness actually produces.
+    ``exomonad init``, so it holds its own name. The server resolves
+    ``tmux_session`` from the config and now fails closed on a name over the
+    limit instead of truncating it — a truncated name left the server probing a
+    session nobody created, and every agent was reported dead. The harness no
+    longer has to mirror a rewrite, but it still has to stay inside the limit.
+    """
+    source = (PROJECT_ROOT / "rust/exomonad/src/config.rs").read_text(encoding="utf-8")
+    assert "chars().take(36)" not in source, (
+        "the server is truncating the session name again; the harness relies on "
+        "config load rejecting an over-long name instead"
+    )
+    assert "pub const TMUX_SESSION_MAX_CHARS: usize = 36;" in source, (
+        "the session-name limit is no longer a named constant the harness can read"
+    )
+    assert "SessionNameTooLong" in source, (
+        "config load no longer reports a typed error naming the over-long value"
+    )
+
+
+def test_every_session_name_the_harness_creates_fits_the_servers_limit():
+    """Every name this harness produces is one the server will accept.
+
+    The server rejects a name over the limit at config load, so a harness name
+    that crossed it would stop the run at startup instead of misnaming a
+    session.
     """
     import driver
 
@@ -433,10 +424,7 @@ def test_every_session_name_the_harness_creates_survives_the_servers_sanitizatio
         scope = cl.RunScope(run_id=run_id, root=cl.make_root("/tmp", PREFIX), prefix=PREFIX)
         try:
             name = pj.session_name(scope)
-            assert _sanitize_session_name(name) == name, (
-                f"the server would look for "
-                f"{_sanitize_session_name(name)!r}, not {name!r}"
-            )
+            assert "." not in name, f"the server rewrites dots in {name!r}"
             assert len(name) <= cl.SESSION_NAME_MAX_LENGTH
         finally:
             shutil.rmtree(scope.root, ignore_errors=True)
