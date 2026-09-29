@@ -2132,26 +2132,6 @@ async fn destroy_recreate_resources(
         }
         validated_leaves.push(branch);
     }
-    // Preserve every leaf's unmerged commits before any ref is deleted. A
-    // leaf's base branch is itself owned by this run -- a child sub-TL's
-    // branch -- so disposing that worktree first leaves `base..head`
-    // unresolvable and the bundle cannot be derived. Preservation is
-    // idempotent: the per-leaf disposal below verifies and reuses the bundle
-    // this pass creates, so nothing here pre-empts its gates.
-    for branch in &validated_leaves {
-        let observation = observe_leaf_branch(project_dir, branch)?;
-        ensure_leaf_unchanged(branch, &observation)?;
-        if observation.local_head.is_none() && observation.remote_head.is_none() {
-            continue;
-        }
-        let _ = preserve_leaf_unmerged_commits(
-            project_dir,
-            &branch.remote_name,
-            &branch.base_branch,
-            &branch.branch,
-            &branch.head_sha,
-        )?;
-    }
     // Close published PRs before removing local ownership. Each closure
     // re-verifies that the live Forgejo PR still matches the recorded
     // publication, so a stale record can never close an unrelated PR. If
@@ -2196,71 +2176,13 @@ async fn destroy_recreate_resources(
                 .with_context(|| format!("failed to close PR #{number}"))?;
         }
     }
-    // Phase two performs disposal only after revalidation and PR closure.
-    for current in &validated {
-        if current.observation.worktree_exists {
-            let path = current.spec.worktree.clone();
-            let git_wt = git_wt.clone();
-            tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path))
-                .await
-                .context("ordered worktree disposal task failed")??;
-        }
-        if git_branch_exists(project_dir, &current.spec.branch)? {
-            let branch_name =
-                exomonad_core::domain::BranchName::try_from_str(&current.spec.branch)?;
-            let git_wt = git_wt.clone();
-            tokio::task::spawn_blocking(move || git_wt.delete_bookmark(&branch_name))
-                .await
-                .context("ordered branch disposal task failed")??;
-        }
-        let agent_dir = project_dir
-            .join(".exo/agents")
-            .join(&current.spec.agent_name);
-        if agent_dir.exists() {
-            std::fs::remove_dir_all(&agent_dir)
-                .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
-        }
-    }
-
-    for path in &plan.worktrees {
-        if ordered_worktrees.contains(path) {
-            continue;
-        }
-        if leaf_worktrees.iter().any(|leaf| same_path(leaf, path)) {
-            continue;
-        }
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|slug| leaf_slugs.contains(slug))
-        {
-            continue;
-        }
-        if path
-            .parent()
-            .is_some_and(|parent| parent.ends_with(".exo/worktrees"))
-        {
-            if let Some(slug) = path.file_name().and_then(|name| name.to_str()) {
-                exomonad_core::services::agent_resources::dispose_agent_resources(
-                    project_dir,
-                    git_wt.clone(),
-                    slug,
-                )
-                .await;
-            }
-        } else {
-            let path_for_git = path.clone();
-            let git_wt = git_wt.clone();
-            tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path_for_git))
-                .await
-                .context("worktree disposal task failed")??;
-            if path.exists() {
-                std::fs::remove_dir_all(path)
-                    .with_context(|| format!("failed to remove {}", path.display()))?;
-            }
-        }
-    }
-    // Dispose issue-owned leaf branches enumerated in the plan. Every leaf is
+    // Dispose issue-owned leaf branches enumerated in the plan. This runs
+    // before the ordered and generic sweeps: a leaf's base branch is itself
+    // owned by this run -- a child sub-TL's branch -- so every `base..head`
+    // check, the bundle derivation and the identity-only reachability proof
+    // alike, has to run while that base still exists. Deleting the parent
+    // first made a leaf with no commits beyond its base unverifiable.
+    // Every leaf is
     // re-observed immediately before each destructive step, then steps run in a
     // fixed, recoverable order: preserve unmerged commits in a verified bundle,
     // delete the exact remote ref with a SHA lease, remove the worktree, delete
@@ -2435,6 +2357,70 @@ async fn destroy_recreate_resources(
             receipt.identity_removed = true;
             receipt.completed_at_millis = current_time_millis() as u64;
             record_recreate_receipt(project_dir, receipt.clone()).await?;
+        }
+    }
+    // Phase two performs disposal only after revalidation and PR closure.
+    for current in &validated {
+        if current.observation.worktree_exists {
+            let path = current.spec.worktree.clone();
+            let git_wt = git_wt.clone();
+            tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path))
+                .await
+                .context("ordered worktree disposal task failed")??;
+        }
+        if git_branch_exists(project_dir, &current.spec.branch)? {
+            let branch_name =
+                exomonad_core::domain::BranchName::try_from_str(&current.spec.branch)?;
+            let git_wt = git_wt.clone();
+            tokio::task::spawn_blocking(move || git_wt.delete_bookmark(&branch_name))
+                .await
+                .context("ordered branch disposal task failed")??;
+        }
+        let agent_dir = project_dir
+            .join(".exo/agents")
+            .join(&current.spec.agent_name);
+        if agent_dir.exists() {
+            std::fs::remove_dir_all(&agent_dir)
+                .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
+        }
+    }
+
+    for path in &plan.worktrees {
+        if ordered_worktrees.contains(path) {
+            continue;
+        }
+        if leaf_worktrees.iter().any(|leaf| same_path(leaf, path)) {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|slug| leaf_slugs.contains(slug))
+        {
+            continue;
+        }
+        if path
+            .parent()
+            .is_some_and(|parent| parent.ends_with(".exo/worktrees"))
+        {
+            if let Some(slug) = path.file_name().and_then(|name| name.to_str()) {
+                exomonad_core::services::agent_resources::dispose_agent_resources(
+                    project_dir,
+                    git_wt.clone(),
+                    slug,
+                )
+                .await;
+            }
+        } else {
+            let path_for_git = path.clone();
+            let git_wt = git_wt.clone();
+            tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path_for_git))
+                .await
+                .context("worktree disposal task failed")??;
+            if path.exists() {
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
         }
     }
     // Publication metadata is removed only once every leaf is provably gone:
@@ -9084,6 +9070,96 @@ mod tests {
         assert!(remote_branch_sha(&project, "origin", "main.leaf")
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn recreate_disposes_a_leaf_with_no_commits_beyond_its_run_owned_base() {
+        // The leaf's base is a run-owned sub-TL branch, and this leaf has no
+        // commit of its own on top of it, so preservation records no bundle:
+        // everything is proved from `base..head`, which means the base has to
+        // still exist when the leaf loop runs. Deleting the sub-TL branch
+        // first -- as the ordered sweep used to -- makes that proof impossible
+        // and the whole recreate refuses.
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("work");
+        let remote = temp.path().join("remote.git");
+        std::fs::create_dir_all(&project).unwrap();
+        let run_in = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_in(
+            temp.path(),
+            &["init", "--bare", "-q", remote.to_str().unwrap()],
+        );
+        run_in(&project, &["init", "-q", "-b", "main"]);
+        run_in(&project, &["config", "user.email", "test@example.invalid"]);
+        run_in(&project, &["config", "user.name", "Test"]);
+        std::fs::write(project.join("seed"), "seed\n").unwrap();
+        run_in(&project, &["add", "seed"]);
+        run_in(&project, &["commit", "-q", "-m", "seed"]);
+        run_in(&project, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_in(&project, &["push", "-q", "origin", "main"]);
+        run_in(&project, &["branch", "main.stage"]);
+        run_in(&project, &["branch", "main.leaf"]);
+        run_in(&project, &["push", "-q", "origin", "main.stage"]);
+        run_in(&project, &["push", "-q", "origin", "main.leaf"]);
+        let head_sha = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "refs/heads/main.leaf"])
+                .current_dir(&project)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        run_in(
+            &project,
+            &["worktree", "add", "-q", ".exo/worktrees/leaf", "main.leaf"],
+        );
+        run_in(&project, &["checkout", "-q", "main"]);
+        write_leaf_identity(
+            &project,
+            "leaf",
+            "main.leaf",
+            &project.join(".exo/worktrees/leaf"),
+        );
+
+        let mut publication = test_leaf_publication("main.leaf", &head_sha);
+        publication.base_branch = "main.stage".to_owned();
+        write_published_head(&project, &publication);
+        let leaves =
+            leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
+                .await
+                .unwrap();
+        assert_eq!(leaves.len(), 1);
+
+        let mut plan = leaf_plan(leaves);
+        plan.ordered_branches = vec![OrderedBranchCleanup {
+            spec: OrderedBranchSpec {
+                branch: "main.stage".to_owned(),
+                parent_branch: "main".to_owned(),
+                agent_name: "stage".to_owned(),
+                slice_id: "stage".to_owned(),
+                identity_worktree: project.join(".exo/agents/stage"),
+                worktree: project.join(".exo/worktrees/stage"),
+            },
+            observation: ordered_test_observation(OrderedIdentityState::Missing, Some(0)),
+            action: OrderedBranchAction::Remove,
+        }];
+
+        destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .expect("a leaf with no commits beyond its run-owned base must dispose");
+
+        assert!(!git_branch_exists(&project, "main.leaf").unwrap());
+        assert!(!git_branch_exists(&project, "main.stage").unwrap());
     }
 
     #[tokio::test]
