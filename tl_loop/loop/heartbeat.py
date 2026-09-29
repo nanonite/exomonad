@@ -353,6 +353,15 @@ def heartbeat_once(
             # integration, or merge state, persist a recovered PR number, nor
             # park the slice or trigger state-changing effects. An explicit
             # unverified verdict still reaches the terminal park path below.
+            # The reason is logged because these events are returned in the run
+            # result and never written to the ledger: a heartbeat that declines
+            # to act on a closed PR has to leave something an operator can read.
+            LOGGER.warning(
+                "[TL loop] heartbeat target=%s pr=%s skipped: %s",
+                slice_state.id,
+                pr_number,
+                _ownership_reason(watcher),
+            )
             events.append(
                 _event(
                     "pr.publication_refused",
@@ -378,6 +387,22 @@ def heartbeat_once(
                 progress = True
             slice_state = current.slices[slice_state.id]
         terminal_cause = _pr_terminal_cause(watcher)
+        if terminal_cause is None:
+            # One line per slice per cycle. The synthetic events a heartbeat
+            # produces are returned in the run result, never written to the
+            # ledger, so without this a run that closes a PR and parks nothing
+            # leaves no trace of the classification it made.
+            ownership, ownership_reason = watcher.ownership_status()
+            LOGGER.info(
+                "[TL loop] heartbeat target=%s pr=%s pr_state=%r merged=%r "
+                "head_reachable=%r ownership=%s",
+                slice_state.id,
+                pr_number,
+                watcher.pr_state,
+                watcher.merged,
+                watcher.head_reachable,
+                ownership_reason or ("verified" if ownership else "unverified"),
+            )
         if terminal_cause is not None:
             if isinstance(effects, ReadOnlyEffectClient):
                 raise HeartbeatError(
@@ -854,6 +879,17 @@ def _reconcile_pr(
     if head_sha and head_sha != slice_state.reviewed_head:
         return slice_transition(slice_state, HeadChanged(head_sha)), "pr.updated"
     return slice_state, "pr.review"
+
+
+def _ownership_reason(watcher: WatcherObservation) -> str:
+    """Why this snapshot cannot be used, in the terms the contract uses."""
+    ownership, reason = watcher.ownership_status()
+    if not ownership:
+        return reason or "publication ownership is unverified"
+    return (
+        "watcher publication does not match the slice's durable dispatch "
+        "(invocation, owner, branch, or head)"
+    )
 
 
 def _pr_payload(payload: WatcherObservation | JsonMapping) -> dict[str, object]:

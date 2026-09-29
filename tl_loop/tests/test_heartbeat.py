@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
@@ -15,9 +16,9 @@ from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
     HeartbeatError,
+    _classify_missing_handoff,
     _poll_workers,
     _result_object,
-    _classify_missing_handoff,
     heartbeat_once,
 )
 from tl_loop.state.schema import (
@@ -1130,3 +1131,40 @@ def _state(
     create("heartbeat-test", root_spec, root_dir=tmp_path)
     store = RunStore("heartbeat-test", root_dir=tmp_path)
     return store, store.load()
+
+
+def test_the_heartbeat_logs_the_classification_it_did_not_act_on(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A heartbeat that declines to park says which observation it read.
+
+    Its synthetic events are returned in the run result and never written to
+    the ledger, so without this line a run that polls a PR forever leaves a
+    caller nothing to read: the classification is the whole reason it neither
+    parked nor escalated.
+    """
+    store, state = _state(
+        tmp_path,
+        status="in_review",
+        heartbeat_at=0.0,
+        pr_number=42,
+        reviewed_head="head-new",
+    )
+    with caplog.at_level(logging.INFO, logger="tl_loop.loop.heartbeat"):
+        heartbeat_once(
+            state,
+            store,
+            EffectClient(
+                HeartbeatTransport(
+                    pr_state="open", publication_ownership_verified=True
+                )
+            ),
+            HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+            now=10.0,
+            project_root=tmp_path,
+        )
+
+    lines = [record.getMessage() for record in caplog.records if "heartbeat target=" in record.getMessage()]
+    assert lines, "the heartbeat classified nothing"
+    assert "pr_state='open'" in lines[0]
+    assert "ownership=verified" in lines[0]
