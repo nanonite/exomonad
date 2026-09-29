@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Recreated dispatch never progresses past spawned: no handoff, reviews not applied, closed PR never parks (#1137)
 - Fix recreated run recovery across publication, cleanup, and Chainlink escalation (#1112)
 - Fix deterministic leaf recovery after recreated branch preservation (#1105)
 - Preserve controller epoch and dispatch generation through the policy spawn path (#1120)
@@ -481,6 +482,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Diagnose the spawned-slice stall with a leaf under a child sub-TL (#1138)
 - Replace Beast-derived identifiers in offline tests and docs with neutral synthetic ones (#1118)
 - Decide: full Codex sandbox bypass vs. containerized per-role isolation (uid_map/userns restricted on this host) (#1087)
 - Investigate bwrap-userns AppArmor profile as alternative to editing unprivileged_userns (#1088)
