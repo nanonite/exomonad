@@ -29,12 +29,22 @@ One remains, and it belongs to the product rather than to the harnesses.
 | #1149: the fixtures and the `exomonad new` scaffold provision a model the account cannot run | The worker gets `400 invalid_request_error` on its first inference and never makes a tool call, so every live Codex scenario stalls for the validator's whole budget and reads as a messaging failure. | **Worked around in the fixtures; the scaffold default is unchanged.** The model is now resolved from the host Codex config, `gpt-luna` is refused outright, and one throwaway `codex exec` proves the account can run the resolved model before `init` starts -- which turned a 600s ambiguous stall into a 5s message naming the model, and surfaced the policy/capability-map mismatch within ninety seconds. The scaffold in `rust/exomonad/src/new.rs` still defaults to `codex/gpt-luna`, which is the part that needs the product fix. |
 | #1148: the controller quarantines the slice's own dispatch confirmation | The slice never leaves `spawned` and the run stays at `tl_running`, so a worker that did its whole job correctly still does not finish. | **Open, and the only blocker.** The action journal ends with `tl.dispatch_event_rejected` (`integrity_conflict` / `intent_mismatch`), and `event-quarantine.json` holds the `agent.spawned` event with `run_id` a UUID where the controller has the literal `root`, and `agent_id` `root` where it expects the slice. The worker is correct: its `send_tmux_message` and `notify_parent` both returned `success: true`, and the task text reached it intact. Needs a product fix; the reproduction is `KEEP_E2E_WORKDIR=1 script -qec ./tests/e2e/codex-messaging/run.sh`, and the quarantine entry is written into every run. |
 
-An earlier revision of this table reported the tmux isolation as reverted
-because it broke the server's socket health check. That was a bug in the
-harness, not the product: `e2e_python_tl_isolate_tmux_server` was called from
-inside `cleanup()`, so it only took effect at teardown. Moved to top level, the
-isolated server starts and `init` reaches "Attaching to session".
-`tests/e2e/python-tl-controller/test_isolation_contract.py` pins that placement.
+The tmux isolation is on by default. An earlier revision had reverted it,
+believing it broke the server's socket health check. That belief was wrong, and
+the check has since separated the two claims:
+
+* The isolation call really was inside `cleanup()`, so it only took effect at
+  teardown. Moved to top level it works, and it is what gives the worker the
+  run's isolated `CODEX_HOME` -- proven live. `codex-messaging` now runs to the
+  validator stage with it on.
+* The socket health check still fails for `chainlink-codex` **with the isolation
+  disabled**, so it was never the isolation's doing. `exomonad serve` creates
+  `.exo/server.sock` and then never becomes healthy inside `init`'s 30s budget.
+  Filed as Chainlink #1150. `codex-messaging` passes the same check on the same
+  host, so it is specific to that scenario.
+
+`tests/e2e/python-tl-controller/test_isolation_contract.py` pins the placement
+either way.
 
 All three migrated scenarios now treat a missing or failing validator result as
 a failure. They previously fell back to `exomonad init`'s exit status, and

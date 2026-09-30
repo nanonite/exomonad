@@ -52,6 +52,43 @@ even if the run otherwise looked healthy.
 | Chainlink ownership | the issue is still open and no `.chainlink/.locks-cache` worktree exists |
 | Durable controller state | `.exo/tl-loop/root/run.json` records the plan slice and `fsm.phase == "tl_done"` |
 
+## Live run, 2026-09-30
+
+Work dir `chainlink-codex.1Ow6ljmW`. First live run of this scenario in its
+migrated form. It does not reach the controller, for a reason that is not this
+scenario's logic.
+
+**Two fixture defects, both found only by running it.** The plan-render guard
+required exactly one `{{CHAINLINK_ISSUE_ID}}` placeholder, while the plan
+references the issue three times on purpose -- once in the task's opening line
+and once per tool call that takes an issue id. The guard refused a correct plan
+with `plan.json must contain exactly one ... placeholder, found 3`. It now
+requires a non-zero count and relies on the unrendered-placeholder check, which
+is the one that actually matters, since it fires unless *every* occurrence was
+substituted. And the shared policy writer's new capability-map entry applies
+here too, so this scenario needed the same `_require_policy_coverage` fix.
+
+**Where it stops.** After the model probe passes, `init` fails at the server
+health check:
+
+```
+ERROR exomonad: exomonad init failed: Server socket exists but health check failed after 30s.
+```
+
+Reproducible four times in four, including with
+`E2E_PYTHON_TL_TMUX_ISOLATION=0`, so it is not the tmux isolation. tmux itself
+is healthy on this host, and `codex-messaging` clears the same check with the same
+isolation and the same Codex home. Filed as Chainlink #1150 with everything
+ruled in and out.
+
+**Observed `run.sh` exit code: 1**, with
+`ERROR: validator wrote no result file ... (init exited 1)`. That is the
+false-pass fix doing its job: before it, this run would have reported success
+while proving nothing at all.
+
+This row is **not** Green. Nothing in the Chainlink ownership assertion has been
+observed yet, because no agent is dispatched.
+
 ## What was removed and why
 
 The retired scenario validated the interactive root TL's own `.codex/config.toml`

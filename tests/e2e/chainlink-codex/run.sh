@@ -195,14 +195,20 @@ import sys
 
 placeholder = "{{CHAINLINK_ISSUE_ID}}"
 plan = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-if plan.count(placeholder) != 1:
-    raise SystemExit(
-        f"plan.json must contain exactly one {placeholder} placeholder, "
-        f"found {plan.count(placeholder)}"
-    )
+# The issue id appears several times on purpose: the task names it in its
+# opening line and then repeats it on each tool call that takes an issue id.
+# Requiring exactly one occurrence refused a correct plan, so the count is only
+# checked for being non-zero -- the check that actually matters is the
+# unrendered-placeholder test below, which fires unless *every* occurrence was
+# substituted.
+if plan.count(placeholder) == 0:
+    raise SystemExit(f"plan.json has no {placeholder} placeholder to render")
 rendered = plan.replace(placeholder, os.environ["ISSUE_ID"])
 if "{{" in rendered or "}}" in rendered:
-    raise SystemExit("rendered plan.json still contains an unrendered placeholder")
+    raise SystemExit(
+        "rendered plan.json still contains an unrendered placeholder: "
+        f"{rendered[rendered.find('{{'):][:60] if '{{' in rendered else rendered[rendered.find('}}'):][:60]}"
+    )
 pathlib.Path(sys.argv[2]).write_text(rendered, encoding="utf-8")
 PY
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' .exo/tl-loop/plan.json \

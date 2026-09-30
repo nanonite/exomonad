@@ -160,3 +160,42 @@ def test_orphan_pr_guard_acknowledges_it_cannot_run() -> None:
     assert "--tl" in head, (
         "orphan-pr-guard/run.sh must name the flag init no longer accepts"
     )
+
+
+def test_chainlink_codex_plan_renders_its_issue_id_everywhere() -> None:
+    """The plan names the issue more than once, and the guard must allow it.
+
+    A guard that required exactly one placeholder refused a correct plan: the
+    task states the issue id in its opening line and repeats it on each tool call
+    that takes one. Found by the 2026-09-30 live run, which died at fixture
+    setup with "must contain exactly one ... placeholder, found 3".
+    """
+    run = (E2E_DIR / "chainlink-codex" / "run.sh").read_text(encoding="utf-8")
+    # Only the embedded renderer counts. The prose around it is allowed to say
+    # "exactly one" in order to explain why that requirement was wrong.
+    renderer = run.split('ISSUE_ID="$ISSUE_ID" python3 -', 1)[1].split("\nPY", 1)[0]
+    code = "\n".join(
+        line for line in renderer.splitlines() if not line.strip().startswith("#")
+    )
+    assert "exactly one" not in code, (
+        "chainlink-codex's plan renderer must not require exactly one "
+        "placeholder; the plan legitimately references the issue id three times"
+    )
+    assert "count(placeholder) == 0" in code, (
+        "the renderer must still require at least one placeholder, or it "
+        "renders a plan with no issue reference and nothing notices"
+    )
+
+    # And the guard that actually matters is still there: nothing may survive
+    # rendering, whatever the count.
+    assert '"{{" in rendered' in code, (
+        "the unrendered-placeholder check is the real safety net and must stay"
+    )
+
+    # The shipped plan must still use the placeholder, or the guard guards
+    # nothing.
+    plan = (E2E_DIR / "chainlink-codex" / "plan.json").read_text(encoding="utf-8")
+    assert plan.count("{{CHAINLINK_ISSUE_ID}}") >= 2, (
+        "the plan is expected to reference the issue id several times; if that "
+        "changed, the guard above should be revisited"
+    )

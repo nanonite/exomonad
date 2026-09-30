@@ -109,13 +109,19 @@ top level before the first `tmux` call and before `exomonad init`.
 
 An earlier revision reverted it: the isolation call had been placed inside
 `cleanup()`, so it took effect only at teardown, and the run kept the host's
-`CODEX_HOME`. Read as "the isolation breaks the server's socket health check",
-that looked like a product problem. It was a placement bug in the harness. With
-the call moved to top level, the isolated server starts, `init` reaches
-"Attaching to session", the controller dispatches its worker, and the worker's
-pane resolves `$CODEX_HOME` to the run's isolated home. Set
-`E2E_PYTHON_TL_TMUX_ISOLATION=0` to reproduce the shared-server leak, which is
-what the A/B below relies on.
+`CODEX_HOME`. That much was a placement bug in the harness, and moving the call
+to top level fixed it -- the worker's pane now resolves `$CODEX_HOME` to the
+run's isolated home, proven live. Set `E2E_PYTHON_TL_TMUX_ISOLATION=0` to
+reproduce the shared-server leak.
+
+What was *not* true of that revision is the diagnosis attached to it. It
+reported that the isolation "broke the server's socket health check".
+`chainlink-codex` fails that check with the isolation disabled too, so the
+isolation was never the cause. `exomonad serve` creates `.exo/server.sock` and
+then never becomes healthy inside `init`'s 30s budget for that scenario, on the
+same host and with the same `codex-messaging` fixture passing. Filed as
+Chainlink #1150. Keep the two separate: the isolation is required and works, and
+the health check is a separate failure it did not cause.
 
 `test_isolation_contract.py` pins the placement (top level, before the first
 `tmux` call, before `init`, after the library is sourced) precisely because a
