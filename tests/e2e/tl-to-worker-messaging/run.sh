@@ -10,6 +10,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -60,11 +62,11 @@ SESSION="e2e-mixed-agent-chain"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
-CODEX_HOME_DIR="$WORK_DIR/codex-home"
 
 echo "  Work dir: $WORK_DIR"
 
 cleanup() {
+    local code=$?
     echo ""
     echo ">>> [Cleanup] Tearing down..."
     tmux kill-session -t "$SESSION" 2>/dev/null || true
@@ -73,6 +75,10 @@ cleanup() {
         echo "  Validator result:"
         sed 's/^/    /' "$RESULT_FILE"
     fi
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
     if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
         echo "  Keeping $WORK_DIR"
     else
@@ -80,14 +86,19 @@ cleanup() {
         echo "  Removed $WORK_DIR"
     fi
     echo ">>> Done."
+    exit "$code"
 }
 trap cleanup EXIT
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
+# Isolate Codex before any ExoMonad process starts. The reviewer here is a real
+# Codex process, so the auth artifacts go with it.
+e2e_isolate_codex_home
+e2e_copy_codex_auth
+
 git init --bare "$REMOTE_DIR" -q
 mkdir -p "$REPO_DIR"
-mkdir -p "$CODEX_HOME_DIR"
 cd "$REPO_DIR"
 git init -q -b main
 git remote add origin "$REMOTE_DIR"
@@ -207,14 +218,7 @@ git add .gitignore .forgejo .exo
 git commit -m "initialize exomonad fixture" -q
 git push -q
 
-if [[ -f "$HOME/.codex/auth.json" ]]; then
-    cp -p "$HOME/.codex/auth.json" "$CODEX_HOME_DIR/auth.json"
-fi
-if [[ -f "$HOME/.codex/installation_id" ]]; then
-    cp -p "$HOME/.codex/installation_id" "$CODEX_HOME_DIR/installation_id"
-fi
-
-cat > "$CODEX_HOME_DIR/config.toml" <<EOF
+cat > "$CODEX_HOME/config.toml" <<EOF
 [projects."$REPO_DIR"]
 trust_level = "trusted"
 
@@ -225,12 +229,12 @@ EOF
 echo "  Repo: $REPO_DIR"
 echo "  Remote: $REMOTE_DIR"
 echo "  Result: $RESULT_FILE"
-echo "  CODEX_HOME: $CODEX_HOME_DIR"
+echo "  CODEX_HOME: $CODEX_HOME"
 
 echo ">>> [Phase 2] Configuring environment..."
 unset FORGEJO_TOKEN
 unset FORGEJO_API_URL
-export CODEX_HOME="$CODEX_HOME_DIR"
+e2e_codex_assert_home_is_run_scoped
 export EXOMONAD_LOG_FORMAT=""
 echo "  GitHub auth unset"
 echo "  Codex config isolated to $CODEX_HOME"

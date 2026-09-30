@@ -9,6 +9,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 SESSION="e2e-claude-teams-$(date +%s)-$$"
 
 log() {
@@ -124,6 +126,13 @@ cleanup() {
     local code=$?
     log "cleanup: killing tmux session ${SESSION}"
     tmux kill-session -t "$SESSION" 2>/dev/null || true
+    # `spawn_agent_type` is pinned to claude here, so this run does not generate
+    # Codex configuration today. The sentinel still runs: it is what catches the
+    # day someone sets that to Codex without isolating first.
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
     if [[ -n "${MOCK_PID:-}" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
         kill "$MOCK_PID" 2>/dev/null || true
         wait "$MOCK_PID" 2>/dev/null || true
@@ -168,6 +177,9 @@ done
 mkdir -p "$HOME/.cache/exomonad-e2e"
 WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/claude-teams.XXXXXXXX")"
 e2e_git_use_fixture_root "$WORK_DIR"
+
+# No live `codex` process runs here, so no auth artifacts are copied.
+e2e_isolate_codex_home
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
 MOCK_LOG="$WORK_DIR/mock-github.log"

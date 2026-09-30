@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 EXOMONAD_BIN="${EXOMONAD_BIN:-$PROJECT_ROOT/target/debug/exomonad}"
 
 for command_name in curl git python3 tmux; do
@@ -25,7 +27,6 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/exomonad-orphan-pr-guard.XXXXXXXX")"
 e2e_git_use_fixture_root "$WORK_DIR"
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
-CODEX_HOME_DIR="$WORK_DIR/codex-home"
 MOCK_LOG="$WORK_DIR/mock.log"
 MOCK_STDERR="$WORK_DIR/mock.stderr"
 INIT_LOG="$WORK_DIR/init.log"
@@ -60,13 +61,26 @@ cleanup() {
     if [[ -f "$INIT_LOG" ]]; then
         tail -80 "$INIT_LOG" || true
     fi
-    rm -rf "$WORK_DIR"
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        status=1
+    fi
+    e2e_codex_remove_isolated_home
+    if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
+        echo "Keeping work dir: $WORK_DIR"
+    else
+        rm -rf "$WORK_DIR"
+    fi
     exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-mkdir -p "$REPO_DIR" "$CODEX_HOME_DIR" "$REPO_DIR/.exo/worktrees"
+# Isolate Codex before any ExoMonad process starts, and seed the two auth
+# artifacts a live `codex` TL needs to reach the model.
+e2e_isolate_codex_home
+e2e_copy_codex_auth
+
+mkdir -p "$REPO_DIR" "$REPO_DIR/.exo/worktrees"
 git init --bare "$REMOTE_DIR" -q
 git init "$REPO_DIR" -q -b main
 git -C "$REPO_DIR" config user.name "Exomonad orphan-PR E2E"
@@ -166,12 +180,12 @@ branch or a second pull request.
 """
 EOF
 
-cat > "$CODEX_HOME_DIR/config.toml" <<EOF
+cat > "$CODEX_HOME/config.toml" <<EOF
 [projects."$REPO_DIR"]
 trust_level = "trusted"
 EOF
 
-export CODEX_HOME="$CODEX_HOME_DIR"
+e2e_codex_assert_home_is_run_scoped
 export FORGEJO_API_URL="$MOCK_URL"
 export FORGEJO_URL="$MOCK_URL"
 export FORGEJO_TOKEN="orphan-pr-e2e-token"

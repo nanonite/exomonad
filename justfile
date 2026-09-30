@@ -590,6 +590,31 @@ check-e2e-codex-messaging:
     bash -n tests/e2e/codex-messaging/run.sh
     bash -n tests/e2e/codex-messaging/validate.sh
 
+# Check the shared Codex-home isolation contract: every harness that can generate
+# Codex configuration points at a per-run home, the host config is only ever
+# read for a checksum, and KEEP_E2E_WORKDIR still preserves isolated state.
+check-e2e-codex-home-isolation:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}"
+    for script in tests/e2e/lib/codex-home.sh tests/e2e/lib/harness.sh tests/e2e/*/run.sh; do
+        bash -n "$script"
+    done
+    {{py}} -m py_compile \
+        tests/e2e/lib/e2e_harness/codex_home.py \
+        tests/e2e/codex-home-isolation/test_contract.py \
+        tests/e2e/recreated-leaf-recovery/project.py \
+        tests/e2e/ordered-recursive/real_server_transport.py \
+        tests/e2e/recursive-crash-convergence/scenario.py
+    {{py}} -m pytest -q tests/e2e/codex-home-isolation/test_contract.py
+    if command -v shellcheck >/dev/null; then
+        # SC1091 (sourced-path resolution) and SC2034 (unused fixture vars) are
+        # pre-existing across these harnesses; this gate is about regressions.
+        shellcheck -S warning -e SC1091,SC2034,SC2164 \
+            tests/e2e/lib/codex-home.sh tests/e2e/lib/harness.sh tests/e2e/*/run.sh
+    else
+        echo "shellcheck not installed; syntax checks only"
+    fi
 
 # Run E2E mixed agent chain test (Claude TL -> OpenCode worker, Codex reviewer config)
 e2e-tl-to-worker-messaging:

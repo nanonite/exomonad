@@ -29,6 +29,7 @@ sys.path.insert(0, str(ORDERED_DIR))
 sys.path.insert(0, str(PROJECT_ROOT / "tests" / "e2e" / "lib"))
 
 import e2e_harness.cleanup as cl  # noqa: E402
+import e2e_harness.codex_home as codex_home  # noqa: E402
 import e2e_harness.forgejo_stack as fj  # noqa: E402
 import e2e_harness.tmuxio as tmuxio  # noqa: E402
 import real_server_transport as real  # noqa: E402
@@ -200,10 +201,12 @@ class Project:
 
         The process is registered with the run scope, so a teardown that never
         reaches here still reclaims it; stopping it here keeps the recreated
-        session from racing the process that held the port.
+        session from racing the process that held the port. The Codex sentinel
+        runs while the run's own directory still exists.
         """
         try:
             real.stop_subprocess(self.process, "acceptance server")
+            codex_home.assert_untouched(self.run.scope.root)
         finally:
             kill_session(self.run.scope.tmux_socket, self.run.session)
 
@@ -373,6 +376,11 @@ def _start_session(run: Run) -> None:
             "CHAINLINK_DB": str(run.chainlink_db),
         },
     )
+    # `spawn_agent_type` is a Codex agent, so the spawn path below will seed hook
+    # trust in the Codex *user* config. Isolate it before the session and the
+    # server exist: a CODEX_HOME set afterwards reaches neither. The agent shim
+    # is a fixture, so no credentials are copied.
+    codex_home.isolate(run.scope.root, environment)
     tmuxio.tmux(
         socket,
         "new-session",
@@ -412,17 +420,21 @@ def _serve(run: Run, port: int, log_name: str) -> Project:
     """Start the real server and block until it answers its own tool route."""
     log = (run.root / log_name).open("w", encoding="utf-8")
     test_path = f"{run.root / 'fake-bin'}:{os.environ.get('PATH', '')}"
+    environment = tmuxio.child_env(
+        run.scope.root,
+        {
+            **os.environ,
+            "PATH": test_path,
+            "CHAINLINK_DB": str(run.chainlink_db),
+        },
+    )
+    # The server seeds hook trust for its Codex agent, so it must resolve the
+    # same isolated home as the tmux session created above.
+    codex_home.isolate(run.scope.root, environment)
     process = subprocess.Popen(
         [str(exomonad_binary()), "serve"],
         cwd=run.repo,
-        env=tmuxio.child_env(
-            run.scope.root,
-            {
-                **os.environ,
-                "PATH": test_path,
-                "CHAINLINK_DB": str(run.chainlink_db),
-            },
-        ),
+        env=environment,
         stdout=log,
         stderr=log,
         text=True,

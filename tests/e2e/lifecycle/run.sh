@@ -9,6 +9,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -64,6 +66,12 @@ cleanup() {
         echo "  Server log tail:"
         tail -n 20 "$SERVER_LOG" | sed 's/^/    /'
     fi
+    # The seeded agents are Codex-shaped, so this run can generate Codex
+    # configuration; the host config must survive it byte-for-byte.
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
     if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
         echo "  Keeping work dir: $WORK_DIR"
     else
@@ -74,6 +82,9 @@ cleanup() {
     exit "$code"
 }
 trap cleanup EXIT
+
+# No live `codex` process runs here, so no auth artifacts are copied.
+e2e_isolate_codex_home
 
 mkdir -p "$REPO_DIR"
 cd "$REPO_DIR"

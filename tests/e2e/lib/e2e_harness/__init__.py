@@ -29,6 +29,12 @@ Modules
     environment, because tmux resolves its server from the inherited ``TMUX``
     before it looks at anything else -- which is how a harness running inside a
     pane can end up stopping somebody else's server.
+``codex_home``
+    The per-run Codex home every run must have before an ExoMonad process
+    starts, because ExoMonad rewrites the Codex *user* config to seed hook
+    trust and that config is the operator's own unless ``CODEX_HOME`` says
+    otherwise. The host file is never copied, modified, or restored; a digest
+    recorded before the run is re-checked at teardown instead.
 
 Importing this package requires ``tests/e2e/lib`` on ``sys.path``::
 
@@ -41,6 +47,7 @@ from __future__ import annotations
 __all__ = [
     "chainlink_db",
     "cleanup",
+    "codex_home",
     "forgejo_stack",
     "waiter",
 ]

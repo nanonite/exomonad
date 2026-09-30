@@ -9,6 +9,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -53,6 +55,9 @@ echo ">>> [Phase 1] Creating temp environment..."
 mkdir -p "$HOME/.cache/exomonad-e2e"
 WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/idle-shutdown.XXXXXXXX")"
 e2e_git_use_fixture_root "$WORK_DIR"
+
+# No live `codex` process runs here, so no auth artifacts are copied.
+e2e_isolate_codex_home
 SESSION="e2e-idle-shutdown"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"
@@ -68,6 +73,12 @@ cleanup() {
         echo "  Validator result:"
         sed 's/^/    /' "$RESULT_FILE"
     fi
+    # `spawn_agent_type` resolves to the Codex default here, so this run can
+    # generate Codex configuration. The host config must survive it byte-for-byte.
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
     if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
         echo "  Keeping work dir: $WORK_DIR"
     else

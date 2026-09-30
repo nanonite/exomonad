@@ -41,6 +41,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "tests" / "e2e" / "lib"))
 
+import e2e_harness.codex_home as codex_home  # noqa: E402
 import e2e_harness.tmuxio as tmuxio  # noqa: E402
 
 #: The marker ``start_server`` leaves so anything that has to stop this run's
@@ -1063,6 +1064,11 @@ def start_server(
     environment = tmuxio.child_env(root, {**os.environ, "PATH": test_path})
     if chainlink_db is not None:
         environment["CHAINLINK_DB"] = str(chainlink_db)
+    # Isolate Codex before the server starts. `spawn_agent_type = "codex"` above
+    # means the spawn path will seed hook trust in the Codex *user* config, and
+    # without a CODEX_HOME of its own that config is the operator's. The
+    # `codex` binary here is a fixture, so no auth artifacts are copied.
+    codex_home.isolate(root, environment)
     marker = repo / TMUX_SOCKET_MARKER
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(f"{socket}\n", encoding="utf-8")
@@ -1128,8 +1134,17 @@ def server_run_id(repo: Path) -> str:
 
 
 def stop_server(process: subprocess.Popen[str], repo: Path, label: str) -> None:
-    """Stop the server and remove the tmux session it owns."""
+    """Stop the server and remove the tmux session it owns.
+
+    Also runs the Codex sentinel. Every acceptance that starts a server through
+    :func:`start_server` tears it down here, so this is the one place the host
+    config is re-checked, and it is checked before anything is deleted.
+    """
     stop_subprocess(process, label)
+    try:
+        codex_home.assert_untouched(repo.parent)
+    except codex_home.CodexHomeError as error:
+        raise HarnessError(f"Codex state leaked out of the run: {error}") from error
     session_path = repo / ".exo" / "e2e-tmux-session"
     try:
         session = session_path.read_text(encoding="utf-8").strip().removesuffix("\\n").strip()
@@ -3187,6 +3202,13 @@ def main() -> None:
                     stop_subprocess(server, "ExoMonad server")
                 except Exception as error:  # noqa: BLE001 - cleanup must continue for every error
                     cleanup_errors.append(str(error))
+            # Sentinel, while the run's own directory still exists: the Codex
+            # user config this run seeded hook trust into must be the isolated
+            # one, and the operator's must be byte-for-byte unchanged.
+            try:
+                codex_home.assert_untouched(root)
+            except codex_home.CodexHomeError as error:
+                cleanup_errors.append(str(error))
             tmuxio.tmux(
                 tmuxio.socket_path(root),
                 "kill-session",

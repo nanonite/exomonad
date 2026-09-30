@@ -8,6 +8,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 
 TIMEOUT_SECONDS="${TL_LOOP_SHADOW_E2E_TIMEOUT_SECONDS:-480}"
 SESSION="e2e-tl-loop-shadow"
@@ -71,6 +73,9 @@ echo ">>> [Phase 1] Creating scratch repository..."
 mkdir -p "${E2E_CACHE_ROOT:-$HOME/.cache/exomonad-e2e}"
 WORK_DIR="$(mktemp -d "${E2E_CACHE_ROOT:-$HOME/.cache/exomonad-e2e}/tl-loop-shadow.XXXXXXXX")"
 e2e_git_use_fixture_root "$WORK_DIR"
+
+# No live `codex` process runs here, so no auth artifacts are copied.
+e2e_isolate_codex_home
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
 ARTIFACT_DIR="$WORK_DIR/artifacts"
@@ -82,12 +87,25 @@ MOCK_URL="http://127.0.0.1:$MOCK_PORT"
 MOCK_PID=""
 
 cleanup() {
+    local code=$?
     tmux kill-session -t "$SESSION" 2>/dev/null || true
     if [[ -n "$MOCK_PID" ]]; then
         kill "$MOCK_PID" 2>/dev/null || true
         wait "$MOCK_PID" 2>/dev/null || true
     fi
-    rm -rf "$WORK_DIR"
+    # `spawn_agent_type` is pinned to claude here, so this run does not generate
+    # Codex configuration today. The sentinel still runs: it is what catches the
+    # day someone sets that to Codex without isolating first.
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
+    if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
+        echo "  Keeping work dir: ${WORK_DIR:-unset}"
+    else
+        rm -rf "$WORK_DIR"
+    fi
+    exit "$code"
 }
 trap cleanup EXIT
 

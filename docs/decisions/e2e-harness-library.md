@@ -18,11 +18,48 @@ Introduce `tests/e2e/lib/harness.sh` as the shared shell harness for current E2E
 
 - preflight checks for `exomonad`, required commands, and WASM guests;
 - short, isolated work dirs under `${E2E_CACHE_ROOT:-$HOME/.cache/exomonad-e2e}`;
-- cleanup with `KEEP_E2E_WORKDIR=1` support;
+- a per-run Codex home beneath the work dir, created and exported by `e2e_create_work_dir` (see below);
+- cleanup with `KEEP_E2E_WORKDIR=1` support, including the Codex sentinel;
 - temp git repository creation;
 - `exomonad new` plus project-local WASM and role installation;
 - basic `.exo/config.toml` generation;
 - local `exomonad serve` launch and socket readiness waiting.
+
+## Codex state isolation
+
+`tests/e2e/lib/codex-home.sh` is the single helper for Codex state, in both a
+shell and a Python form (`tests/e2e/lib/e2e_harness/codex_home.py`).
+
+ExoMonad seeds Codex hook trust by rewriting the Codex *user* config that
+`codex_config::codex_user_config_path()` resolves: `$CODEX_HOME/config.toml` when
+that variable is set, `~/.codex/config.toml` when it is not. So any E2E that
+starts a real ExoMonad process with a Codex agent type performs that write. Two
+properties follow, and both are enforced rather than documented.
+
+**The home is per-run and created before any ExoMonad process starts.**
+`exomonad init` propagates `CODEX_HOME` into the tmux session environment and
+`build_spawn_env` propagates it into every spawned agent's environment, so a
+value exported after those processes are running has isolated nothing.
+`e2e_create_work_dir` therefore calls `e2e_isolate_codex_home`, which makes
+isolation a property of having a work dir rather than something a scenario has
+to remember. A harness that manages its own work dir calls the helper directly.
+
+**The host config is never copied, modified, or restored.** The alternative —
+copy `~/.codex/config.toml` into the run and restore it at teardown — is worse
+than doing nothing, because ExoMonad rewrites the file in place and a restore
+that does not run leaves the operator's config corrupted. Isolation removes the
+need for a restore. Instead the helper records a sha256 of the host config
+before any process starts and re-checks it during teardown; a run that changed it
+fails. The check runs even when `KEEP_E2E_WORKDIR=1` keeps the work dir, because
+the host config is outside it.
+
+Only a harness that starts a *real* `codex` process copies credentials, and only
+the two artifacts a live Codex needs to authenticate: `auth.json` and
+`installation_id`. A harness whose `codex` binary is a fixture copies nothing.
+
+`tests/e2e/codex-home-isolation/test_contract.py` enforces all of this, so a
+harness that drifts back to a private `CODEX_HOME_DIR`, or to touching the host
+config, fails the fast gate instead of being found by a reviewer.
 
 The library is intentionally shell-first. Most existing harnesses are shell scripts, and the high-risk bugs are around process environment and filesystem setup. A Rust harness can still wrap these concepts later, but it should not block removing duplicated shell bootstrap now.
 
@@ -51,4 +88,4 @@ Each migration must keep the old `just e2e-*` target name and add the library it
 
 ## Consequences
 
-E2E setup bugs now have one primary place to fix. Individual tests become smaller and easier to review, while still allowing special cases for fake binaries, companion validators, isolated `CODEX_HOME`, or live tmux sessions.
+E2E setup bugs now have one primary place to fix. Individual tests become smaller and easier to review, while still allowing special cases for fake binaries, companion validators, or live tmux sessions. Codex isolation is no longer a special case: it is part of having a work dir, and the sentinel makes a regression fail the run that caused it.

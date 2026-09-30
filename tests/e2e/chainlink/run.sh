@@ -11,6 +11,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 
 # --- Phase 0: Preconditions ---
 
@@ -84,15 +86,33 @@ e2e_git_use_fixture_root "$WORK_DIR"
 echo "  Work dir: $WORK_DIR"
 
 cleanup() {
+    local code=$?
     echo ""
     echo ">>> [Cleanup] Tearing down..."
     tmux kill-session -t e2e-chainlink 2>/dev/null || true
     echo "  Killed tmux session"
-    rm -rf "$WORK_DIR"
-    echo "  Removed $WORK_DIR"
+    # `spawn_agent_type` is unset here, so it resolves to the Codex default and
+    # the root's `spawn_worker` generates Codex configuration. The host config
+    # must survive that byte-for-byte.
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
+    if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
+        echo "  Keeping work dir: $WORK_DIR"
+    else
+        rm -rf "$WORK_DIR"
+        echo "  Removed $WORK_DIR"
+    fi
     echo ">>> Done."
+    exit "$code"
 }
 trap cleanup EXIT
+
+# The Claude TL spawns a Codex worker here, so credentials do travel with the
+# isolated home.
+e2e_isolate_codex_home
+e2e_copy_codex_auth
 
 # Create bare remote
 REMOTE_DIR="$WORK_DIR/remote.git"

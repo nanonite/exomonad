@@ -6,6 +6,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 SESSION="e2e-review-loop-stuck-$(date +%s)-$$"
 BRANCH="main.review-loop-dev"
 PR_NUMBER=1
@@ -61,6 +63,10 @@ cleanup() {
     if [[ "$code" != "0" ]]; then
         dump_debug
     fi
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
     if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
         log "keeping work dir: ${WORK_DIR:-unset}"
     elif [[ -n "${WORK_DIR:-}" ]]; then
@@ -275,6 +281,12 @@ MOCK_PORT="$(pick_port)"
 SERVER_PORT="$(pick_port)"
 MOCK_URL="http://127.0.0.1:$MOCK_PORT"
 log "work dir: $WORK_DIR"
+
+# The watcher spawns a Codex reviewer below, which seeds hook trust in the Codex
+# user config. Isolate it first: the reviewer here is a fixture pane, so no auth
+# artifacts are copied.
+e2e_isolate_codex_home
+e2e_codex_assert_home_is_run_scoped
 
 git init --bare "$REMOTE_DIR" -q
 mkdir -p "$REPO_DIR"

@@ -29,6 +29,7 @@ from typing import Any, Mapping, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 import e2e_harness.cleanup as cl  # noqa: E402
+import e2e_harness.codex_home as codex_home  # noqa: E402
 import e2e_harness.forgejo_stack as fj  # noqa: E402
 import e2e_harness.tmuxio as tmuxio  # noqa: E402
 from e2e_harness.waiter import await_boundary  # noqa: E402
@@ -304,8 +305,14 @@ def _environment(
     server, and ``TMUX_TMPDIR`` points at the run's directory so they land on
     the run's socket instead. The run's ``PATH`` comes first, which is what
     keeps a disposable repository out of a real agent binary.
+
+    ``CODEX_HOME`` is the run's own, set explicitly rather than left to fall
+    back to the run's fake ``HOME``: the spawn path seeds hook trust in the
+    Codex *user* config, so an unset variable would send that write to whatever
+    ``codex_user_config_path()`` resolves. The ``codex`` binary here is the
+    deterministic actor beside this file, so no auth artifacts are copied.
     """
-    return tmuxio.child_env(
+    environment = tmuxio.child_env(
         scope.root,
         {
             **os.environ,
@@ -315,6 +322,8 @@ def _environment(
             "CHAINLINK_DB": str(database),
         },
     )
+    codex_home.isolate(scope.root, environment)
+    return environment
 
 
 def _seed_repository(project: Project) -> None:

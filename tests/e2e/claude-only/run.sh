@@ -10,6 +10,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 SESSION="e2e-claude-only-$(date +%s)-$$"
 
 log() {
@@ -134,6 +136,13 @@ cleanup() {
     local code=$?
     log "cleanup: killing tmux session ${SESSION}"
     tmux kill-session -t "$SESSION" 2>/dev/null || true
+    # This harness never spawns, so it does not generate Codex configuration.
+    # The sentinel still runs: it is what catches the day it starts spawning
+    # without isolating a Codex home first.
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
     if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
         log "keeping work dir: ${WORK_DIR:-unset}"
     elif [[ -n "${WORK_DIR:-}" ]]; then
@@ -163,6 +172,9 @@ ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm >/dev/null 2>&1 || fail "no WASM 
 mkdir -p "$HOME/.cache/exomonad-e2e"
 WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/claude-only.XXXXXXXX")"
 e2e_git_use_fixture_root "$WORK_DIR"
+
+# No live `codex` process runs here, so no auth artifacts are copied.
+e2e_isolate_codex_home
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
 log "work dir: $WORK_DIR"

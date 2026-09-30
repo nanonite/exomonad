@@ -13,6 +13,8 @@ PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 
 # shellcheck source=git-fixture.sh
 source "$E2E_HARNESS_DIR/git-fixture.sh"
+# shellcheck source=codex-home.sh
+source "$E2E_HARNESS_DIR/codex-home.sh"
 
 E2E_CACHE_ROOT="${E2E_CACHE_ROOT:-$HOME/.cache/exomonad-e2e}"
 E2E_SOCKET_WAIT_ATTEMPTS="${E2E_SOCKET_WAIT_ATTEMPTS:-40}"
@@ -81,6 +83,10 @@ e2e_create_work_dir() {
     export WORK_DIR REPO_DIR SERVER_LOG
     e2e_git_use_fixture_root "$WORK_DIR"
     e2e_log "Work dir: $WORK_DIR"
+    # Isolate Codex here rather than in each scenario: every harness that
+    # reaches this function can generate Codex configuration, and one that
+    # forgets to export CODEX_HOME rewrites the operator's ~/.codex/config.toml.
+    e2e_isolate_codex_home || e2e_fail "failed to isolate CODEX_HOME under $WORK_DIR"
 }
 
 e2e_cleanup() {
@@ -100,6 +106,12 @@ e2e_cleanup() {
         e2e_log "Server log tail:"
         tail -n 20 "$SERVER_LOG" | sed 's/^/    /'
     fi
+    # Sentinel before anything is deleted: prove the run left the host Codex
+    # config byte-for-byte alone while the evidence is still on disk.
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
     if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
         e2e_log "Keeping work dir: ${WORK_DIR:-unset}"
     elif [[ -n "${WORK_DIR:-}" ]]; then

@@ -10,6 +10,8 @@ E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/codex-home.sh
+source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -51,6 +53,7 @@ PHANTOM_DB="$WORK_DIR/phantom-chainlink"
 echo "  Work dir: $WORK_DIR"
 
 cleanup() {
+    local code=$?
     echo ""
     echo ">>> [Cleanup] Tearing down..."
     if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -62,11 +65,25 @@ cleanup() {
         echo "  Server log tail:"
         tail -n 20 "$SERVER_LOG" | sed 's/^/    /'
     fi
-    rm -rf "$WORK_DIR"
-    echo "  Removed $WORK_DIR"
+    # `spawn_agent_type` is unset here, so it resolves to the Codex default and
+    # this run can generate Codex configuration. The host config must survive it.
+    if ! e2e_codex_assert_home_is_run_scoped; then
+        code=1
+    fi
+    e2e_codex_remove_isolated_home
+    if [[ "${KEEP_E2E_WORKDIR:-0}" == "1" ]]; then
+        echo "  Keeping work dir: $WORK_DIR"
+    else
+        rm -rf "$WORK_DIR"
+        echo "  Removed $WORK_DIR"
+    fi
     echo ">>> Done."
+    exit "$code"
 }
 trap cleanup EXIT
+
+# No live `codex` process runs here, so no auth artifacts are copied.
+e2e_isolate_codex_home
 
 mkdir -p "$REPO_DIR"
 cd "$REPO_DIR"
