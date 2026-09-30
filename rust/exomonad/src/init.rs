@@ -2546,12 +2546,8 @@ async fn destroy_recreate_resources(
                     slug,
                 )
                 .await;
-                if !disposal.released_codex_trust() {
-                    anyhow::bail!(
-                        "{label} was permanently disposed but its ExoMonad Codex trust could not \
-                         be released: {}",
-                        disposal.codex_trust.failures.join("; ")
-                    );
+                if let Some(reason) = disposal.failure_reason() {
+                    anyhow::bail!("recreating {label} did not complete: {reason}");
                 }
             }
         } else {

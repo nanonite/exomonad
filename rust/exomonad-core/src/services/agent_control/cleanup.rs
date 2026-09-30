@@ -1247,7 +1247,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn cleanup_agent_retains_codex_trust_when_worktree_removal_fails() {
-        let codex = IsolatedCodex::new();
+        let codex = IsolatedCodex::default();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().to_path_buf();
         let mut services = Services::test();
@@ -1303,7 +1303,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn cleanup_agent_releases_codex_trust_after_removing_every_resource() {
-        let codex = IsolatedCodex::new();
+        let codex = IsolatedCodex::default();
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().to_path_buf();
         let mut services = Services::test();

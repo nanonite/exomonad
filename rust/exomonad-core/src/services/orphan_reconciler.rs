@@ -125,15 +125,11 @@ async fn reconcile_issue_worktrees(
             append_issue_closed_event(event_log, issue_id, &slug, "orphan_reconciler")?;
             let disposal = dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
             info!(issue_id, agent = %slug, "Reconciled closed Chainlink issue for live worktree");
-            // The resources are gone, so a Codex claim that could not be released is a
-            // real leak. Failing the tick surfaces it instead of letting a disposed
-            // agent report as a clean reconciliation.
-            if !disposal.released_codex_trust() {
-                bail!(
-                    "disposed the resources of closed-issue agent {slug} but could not release its \
-                     ExoMonad Codex trust: {}",
-                    disposal.codex_trust.failures.join("; ")
-                );
+            // A partial disposal or an unreleased Codex claim is a real leak, not a
+            // clean reconciliation. Failing the tick surfaces it instead of
+            // reporting a disposed agent whose trust still outlives it.
+            if let Some(reason) = disposal.failure_reason() {
+                bail!("reconciling closed-issue agent {slug} did not complete: {reason}",);
             }
         }
     }

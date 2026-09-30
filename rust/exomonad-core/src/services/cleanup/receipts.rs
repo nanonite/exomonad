@@ -165,6 +165,15 @@ impl VerifiedCleanupService {
                 &entry.status,
                 CleanupReceiptStatus::InProgress | CleanupReceiptStatus::Failed
             ) || !has_deregister_intent(entry)
+                // An identity that is already gone says nothing about the Codex
+                // trust this entry still owes. Reconciling it to `Cleaned` would
+                // erase the record of an unreleased claim and `execute_plan`
+                // would then skip the entry, so the trust would outlive its
+                // owner with nothing left to retry it.
+                || entry
+                    .actions
+                    .iter()
+                    .any(|action| action == CODEX_TRUST_RELEASE_FAILED)
             {
                 continue;
             }

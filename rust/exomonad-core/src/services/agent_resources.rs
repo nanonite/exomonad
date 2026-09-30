@@ -22,8 +22,9 @@ fn reviewer_pr_number(slug: &str) -> Option<u64> {
 /// disposed resources justified.
 ///
 /// A caller that discards this would report plain success for a disposal whose
-/// hook trust is still installed, so the batch is returned rather than logged
-/// and dropped.
+/// hook trust is still installed, or whose resources are still on disk, so both
+/// the removal outcome and the release batch are returned rather than logged and
+/// dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentResourceDisposal {
     /// The Codex trust claims captured before the resources were removed, kept so
@@ -31,12 +32,44 @@ pub struct AgentResourceDisposal {
     pub codex_trust_captured: Vec<CapturedCodexTrust>,
     /// The release outcome for those claims.
     pub codex_trust: CodexTrustReleaseBatch,
+    /// Managed resources that are still on disk because their removal failed.
+    ///
+    /// Non-empty means the disposal is only partial: the agent is still there, so
+    /// its Codex trust is still justified and was deliberately left installed.
+    pub undisposed: Vec<String>,
 }
 
 impl AgentResourceDisposal {
-    /// True when the disposal left no ExoMonad Codex hook trust behind.
+    /// True when every managed resource was proven gone.
+    pub fn is_disposed(&self) -> bool {
+        self.undisposed.is_empty()
+    }
+
+    /// True only when the disposal completed *and* left no hook trust behind.
+    ///
+    /// Both halves matter. A failed removal must not read as a released trust,
+    /// because the agent whose trust would have been released is still running
+    /// with its generated config in place.
     pub fn released_codex_trust(&self) -> bool {
-        self.codex_trust.is_complete()
+        self.is_disposed() && self.codex_trust.is_complete()
+    }
+
+    /// A single operator-facing description of an incomplete disposal.
+    pub fn failure_reason(&self) -> Option<String> {
+        if self.is_disposed() && self.codex_trust.is_complete() {
+            return None;
+        }
+        let mut reasons = Vec::new();
+        if !self.undisposed.is_empty() {
+            reasons.push(format!("still on disk: {}", self.undisposed.join(", ")));
+        }
+        if !self.codex_trust.is_complete() {
+            reasons.push(format!(
+                "ExoMonad Codex trust could not be released: {}",
+                self.codex_trust.failures.join("; ")
+            ));
+        }
+        Some(reasons.join("; "))
     }
 }
 
@@ -46,6 +79,7 @@ pub async fn dispose_agent_resources(
     agent_slug: &str,
 ) -> AgentResourceDisposal {
     let worktree_path = project_dir.join(".exo/worktrees").join(agent_slug);
+    let agent_dir = project_dir.join(".exo/agents").join(agent_slug);
     close_agent_tmux_window(project_dir, agent_slug, &worktree_path).await;
     cleanup_worker_agents_for_parent(project_dir, agent_slug, Some(&worktree_path)).await;
 
@@ -53,7 +87,7 @@ pub async fn dispose_agent_resources(
     // ownership sits inside one of the directories about to be destroyed.
     let codex_trust_captured = codex_lifecycle::capture_codex_trust_for_disposal(&[
         worktree_path.as_path(),
-        project_dir.join(".exo/agents").join(agent_slug).as_path(),
+        agent_dir.as_path(),
     ])
     .unwrap_or_else(|error| {
         warn!(
@@ -65,9 +99,46 @@ pub async fn dispose_agent_resources(
         Vec::new()
     });
 
+    let mut undisposed = Vec::new();
+    if !remove_agent_worktree(agent_slug, &worktree_path, git_wt.clone()).await {
+        undisposed.push(worktree_path.display().to_string());
+    }
+    if !remove_agent_dir(agent_slug, &agent_dir) {
+        undisposed.push(agent_dir.display().to_string());
+    }
+
+    // Only a proven disposal releases the trust. A directory that survived is
+    // still an owner whose generated config Codex loads, so removing its hook
+    // trust would break an agent that was never disposed.
+    let codex_trust = if undisposed.is_empty() {
+        release_captured_trust(agent_slug, codex_trust_captured.clone()).await
+    } else {
+        warn!(
+            agent = agent_slug,
+            undisposed = %undisposed.join(", "),
+            "Disposal is partial, so the ExoMonad Codex trust for this agent is left installed"
+        );
+        CodexTrustReleaseBatch::default()
+    };
+    AgentResourceDisposal {
+        codex_trust_captured,
+        codex_trust,
+        undisposed,
+    }
+}
+
+/// Removes one agent worktree, reporting whether it is proven gone.
+///
+/// A worktree that still exists after the attempt is a failed disposal no matter
+/// what the removal call returned, so absence on disk is the only proof accepted.
+async fn remove_agent_worktree(
+    agent_slug: &str,
+    worktree_path: &Path,
+    git_wt: Arc<GitWorktreeService>,
+) -> bool {
     if worktree_path.exists() {
-        let wt = git_wt.clone();
-        let wt_path = worktree_path.clone();
+        let wt = git_wt;
+        let wt_path = worktree_path.to_path_buf();
         match tokio::task::spawn_blocking(move || wt.remove_workspace(&wt_path)).await {
             Ok(Ok(())) => info!(path = %worktree_path.display(), "Removed agent worktree"),
             Ok(Err(e)) => {
@@ -76,23 +147,35 @@ pub async fn dispose_agent_resources(
             Err(e) => warn!(error = %e, "spawn_blocking failed for worktree removal"),
         }
     }
+    if !worktree_path.exists() {
+        return true;
+    }
+    warn!(
+        agent = agent_slug,
+        path = %worktree_path.display(),
+        "Agent worktree survived removal; treating the disposal as partial"
+    );
+    false
+}
 
-    let agent_dir = project_dir.join(".exo/agents").join(agent_slug);
+/// Removes one agent configuration directory, reporting whether it is gone.
+fn remove_agent_dir(agent_slug: &str, agent_dir: &Path) -> bool {
     if agent_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&agent_dir) {
+        if let Err(e) = std::fs::remove_dir_all(agent_dir) {
             warn!(error = %e, path = %agent_dir.display(), "Failed to remove agent dir (non-fatal)");
         } else {
             info!(path = %agent_dir.display(), "Removed agent dir");
         }
     }
-
-    // The agent's resources are gone, so the Codex trust they justified is no
-    // longer needed.
-    let codex_trust = release_captured_trust(agent_slug, codex_trust_captured.clone()).await;
-    AgentResourceDisposal {
-        codex_trust_captured,
-        codex_trust,
+    if !agent_dir.exists() {
+        return true;
     }
+    warn!(
+        agent = agent_slug,
+        path = %agent_dir.display(),
+        "Agent directory survived removal; treating the disposal as partial"
+    );
+    false
 }
 
 async fn release_captured_trust(
@@ -323,11 +406,11 @@ pub async fn dispose_exited_reviewer_resources(
     for slug in &slugs {
         info!(reviewer = %slug, "Disposing exited reviewer agent");
         let disposal = dispose_agent_resources(project_dir, git_wt.clone(), slug).await;
-        if !disposal.released_codex_trust() {
+        if let Some(reason) = disposal.failure_reason() {
             warn!(
                 reviewer = %slug,
-                failures = %disposal.codex_trust.failures.join("; "),
-                "Reviewer resources were disposed but ExoMonad Codex hook trust survived them"
+                %reason,
+                "Reviewer disposal did not complete; ExoMonad Codex hook trust is left installed"
             );
         }
     }
@@ -339,6 +422,7 @@ mod orphan_cleanup_tests {
     use super::*;
     use crate::services::agent_control::codex_lifecycle::test_support::IsolatedCodex;
     use serial_test::serial;
+    use std::os::unix::fs::PermissionsExt;
 
     fn invocation(status: &str, ended_at: Option<u64>) -> serde_json::Value {
         serde_json::json!({
@@ -361,7 +445,7 @@ mod orphan_cleanup_tests {
     #[tokio::test]
     #[serial]
     async fn orphan_cleanup_releases_only_a_disposed_reviewers_codex_trust() {
-        let codex = IsolatedCodex::new();
+        let codex = IsolatedCodex::default();
         let temp_dir = tempfile::tempdir().unwrap();
         let exited_slug = "review-pr-1-codex";
         let live_slug = "review-pr-2-codex";
@@ -410,12 +494,110 @@ mod orphan_cleanup_tests {
         );
     }
 
+    /// A worktree that survives removal must keep its trust, because the agent it
+    /// belongs to is still on disk and still reading its generated config.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_worktree_removal_keeps_the_codex_trust_installed() {
+        let codex = IsolatedCodex::default();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let slug = "issue-42-leaf-codex";
+        let worktree = temp_dir.path().join(".exo/worktrees").join(slug);
+        tokio::fs::create_dir_all(&worktree).await.unwrap();
+        codex.provision(&worktree, slug);
+        assert_eq!(codex.hook_trust_entries(), 3);
+        // Read-only: `git worktree remove` cannot unlink anything and the manual
+        // `remove_dir_all` fallback cannot either, so the disposal is partial.
+        set_directory_read_only(&worktree);
+
+        let disposal = dispose_agent_resources(
+            temp_dir.path(),
+            Arc::new(GitWorktreeService::new(temp_dir.path().to_path_buf())),
+            slug,
+        )
+        .await;
+
+        set_directory_writable(&worktree);
+        assert!(
+            !disposal.is_disposed(),
+            "the surviving worktree must be reported as undisposed"
+        );
+        assert!(
+            !disposal.released_codex_trust(),
+            "a partial disposal must never read as a released trust: {:?}",
+            disposal
+        );
+        assert!(
+            disposal
+                .failure_reason()
+                .is_some_and(|reason| reason.contains("still on disk")),
+            "the operator must be told what survived: {:?}",
+            disposal.failure_reason()
+        );
+        assert!(
+            worktree.exists(),
+            "the worktree holding the generated config is still there"
+        );
+        assert_eq!(
+            codex.hook_trust_entries(),
+            3,
+            "an owner that was not disposed stays resumable, so its trust must stay"
+        );
+        assert!(
+            disposal.codex_trust.released.is_empty(),
+            "nothing may be released while the owner is still on disk"
+        );
+    }
+
+    /// An agent directory that survives removal must keep its trust too.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_agent_directory_removal_keeps_the_codex_trust_installed() {
+        let codex = IsolatedCodex::default();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let slug = "issue-42-leaf-codex";
+        let agent_dir = temp_dir.path().join(".exo/agents").join(slug);
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        codex.provision(&agent_dir, slug);
+        assert_eq!(codex.hook_trust_entries(), 3);
+        set_directory_read_only(&agent_dir);
+
+        let disposal = dispose_agent_resources(
+            temp_dir.path(),
+            Arc::new(GitWorktreeService::new(temp_dir.path().to_path_buf())),
+            slug,
+        )
+        .await;
+
+        set_directory_writable(&agent_dir);
+        assert!(!disposal.is_disposed());
+        assert!(!disposal.released_codex_trust());
+        assert!(agent_dir.exists());
+        assert_eq!(
+            codex.hook_trust_entries(),
+            3,
+            "a config Codex still loads must keep its trust"
+        );
+    }
+
+    fn set_directory_read_only(path: &Path) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o500);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn set_directory_writable(path: &Path) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
     /// A permanent disposal reports the trust it released, so a caller can never
     /// mistake a partial disposal for a clean one.
     #[tokio::test]
     #[serial]
     async fn disposing_an_agent_reports_the_codex_trust_it_released() {
-        let codex = IsolatedCodex::new();
+        let codex = IsolatedCodex::default();
         let temp_dir = tempfile::tempdir().unwrap();
         let slug = "issue-42-leaf-codex";
         let agent_dir = temp_dir.path().join(".exo/agents").join(slug);
@@ -429,15 +611,17 @@ mod orphan_cleanup_tests {
         )
         .await;
 
-        assert!(
-            disposal.released_codex_trust(),
-            "{:?}",
-            disposal.codex_trust
-        );
+        assert!(disposal.released_codex_trust(), "{disposal:?}");
+        assert!(disposal.is_disposed(), "{disposal:?}");
+        assert!(disposal.failure_reason().is_none());
         assert_eq!(disposal.codex_trust_captured.len(), 1);
         assert_eq!(disposal.codex_trust.released[0].hook_trust.removed.len(), 3);
         assert!(!agent_dir.exists());
-        assert_eq!(codex.hook_trust_entries(), 0);
+        assert_eq!(
+            codex.hook_trust_entries(),
+            0,
+            "a proven disposal must leave no ExoMonad hook trust behind"
+        );
     }
 
     /// An agent that was never a Codex agent has no trust to release, and the
@@ -445,7 +629,7 @@ mod orphan_cleanup_tests {
     #[tokio::test]
     #[serial]
     async fn disposing_a_non_codex_agent_claims_nothing() {
-        let _codex = IsolatedCodex::new();
+        let _codex = IsolatedCodex::default();
         let temp_dir = tempfile::tempdir().unwrap();
         let slug = "issue-42-worker-opencode";
         let agent_dir = temp_dir.path().join(".exo/agents").join(slug);
@@ -458,9 +642,12 @@ mod orphan_cleanup_tests {
         )
         .await;
 
-        assert!(disposal.released_codex_trust());
+        assert!(disposal.released_codex_trust(), "{:?}", disposal);
+        assert!(disposal.is_disposed());
+        assert!(disposal.failure_reason().is_none());
         assert!(disposal.codex_trust_captured.is_empty());
         assert!(disposal.codex_trust.released.is_empty());
+        assert!(disposal.undisposed.is_empty());
         assert!(!agent_dir.exists());
     }
 }

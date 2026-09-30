@@ -164,6 +164,18 @@ impl VerifiedCleanupService {
         // The resources are already proven absent here, so this is the verified
         // disposal point. The claim comes from the resumed receipt: the generated
         // config died with the directory on the interrupted attempt.
+        //
+        // Released *before* deregistration, for the same reason as
+        // `execute_destructive_actions`: a release that fails must leave an entry
+        // that still has deregister intent outstanding. Deregistering first would
+        // let `reconcile_deregistered_entries` rewrite the failed entry to
+        // `Cleaned` on the next run, and the claim would never be replayed.
+        if let Some(entry) = self
+            .release_codex_trust(candidate, receipt, index, &mut actions)
+            .await
+        {
+            return entry;
+        }
         if let Some(entry) = self
             .cleanup_ephemeral_registrations(candidate, receipt, index, &mut actions)
             .await
@@ -180,12 +192,6 @@ impl VerifiedCleanupService {
         }
         actions.retain(|action| action != DEREGISTER_PENDING);
         actions.push("deregister_identity".to_string());
-        if let Some(entry) = self
-            .release_codex_trust(candidate, receipt, index, &mut actions)
-            .await
-        {
-            return entry;
-        }
         let codex_trust = receipt.entries[index].codex_trust.clone();
         let mut entry = receipt_entry(candidate, CleanupReceiptStatus::Cleaned, actions, None);
         entry.codex_trust = codex_trust;

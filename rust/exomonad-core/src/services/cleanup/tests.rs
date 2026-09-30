@@ -30,10 +30,11 @@ use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 /// the trust that has to be pruned on disposal — lives in the worktree the
 /// cleanup is about to remove.
 fn provision_fixture_codex(fixture: &RealCleanupFixture) -> IsolatedCodex {
-    let codex = IsolatedCodex::new();
+    let codex = IsolatedCodex::default();
     codex.provision(&fixture.worktree, fixture.record.agent_name.as_str());
-    assert!(
-        codex.hook_trust_entries() > 0,
+    assert_eq!(
+        codex.hook_trust_entries(),
+        3,
         "provisioning must seed hook trust for the test to be meaningful"
     );
     codex
@@ -1887,9 +1888,14 @@ async fn verified_cleanup_releases_codex_trust_once_every_resource_is_gone() {
         "the claim names the exact generated config it derived keys from"
     );
     assert_eq!(claimed[0].owned_keys.len(), 3);
-    assert!(
-        !codex.hook_trust_entries() > 0,
+    assert_eq!(
+        codex.hook_trust_entries(),
+        0,
         "a permanently disposed agent must leave no ExoMonad hook trust behind"
+    );
+    assert!(
+        codex.hook_trust_keys().is_empty(),
+        "the release must delete the exact keys the claim proved ExoMonad owned"
     );
 }
 
@@ -1903,12 +1909,12 @@ async fn verified_cleanup_keeps_codex_trust_when_the_worktree_cannot_be_removed(
     // Read-only worktree: neither `git worktree remove` nor the manual
     // `remove_dir_all` fallback can unlink anything inside it, so the disposal
     // is not proven and nothing may be pruned.
-    make_directory_read_only(&fixture.worktree);
+    set_directory_read_only(&fixture.worktree);
 
     let receipt = service.run(&request).await.unwrap();
     let entry = &receipt.entries[0];
 
-    make_directory_writable(&fixture.worktree);
+    set_directory_writable(&fixture.worktree);
     assert_eq!(entry.status, CleanupReceiptStatus::Failed, "{entry:?}");
     assert!(
         !entry.actions.contains(&"release_codex_trust".to_string()),
@@ -1917,8 +1923,9 @@ async fn verified_cleanup_keeps_codex_trust_when_the_worktree_cannot_be_removed(
     assert!(entry.codex_trust.is_some(), "the claim stays retryable");
     assert!(fixture.worktree.exists(), "the worktree survived");
     assert!(fixture.agent_dir.exists(), "the agent dir survived");
-    assert!(
-        codex.hook_trust_entries() > 0,
+    assert_eq!(
+        codex.hook_trust_entries(),
+        3,
         "an owner that was not disposed stays resumable, so its trust must stay"
     );
 }
@@ -1945,8 +1952,9 @@ async fn a_refused_cleanup_leaves_its_owner_trusted() {
     assert!(!entry.actions.contains(&"release_codex_trust".to_string()));
     assert!(fixture.worktree.exists());
     assert!(fixture.agent_dir.exists());
-    assert!(
-        codex.hook_trust_entries() > 0,
+    assert_eq!(
+        codex.hook_trust_entries(),
+        3,
         "a retained owner must keep the trust its resume needs"
     );
 }
@@ -1955,7 +1963,7 @@ async fn a_refused_cleanup_leaves_its_owner_trusted() {
 #[serial]
 async fn a_dry_run_previews_codex_trust_release_without_touching_it() {
     let temp = tempfile::tempdir().unwrap();
-    let codex = IsolatedCodex::new();
+    let codex = IsolatedCodex::default();
     let agent_dir = temp.path().join(".exo/agents/stale-codex");
     tokio::fs::create_dir_all(&agent_dir).await.unwrap();
     let mut record = identity(Topology::SharedDir);
@@ -1989,7 +1997,11 @@ async fn a_dry_run_previews_codex_trust_release_without_touching_it() {
         .actions
         .contains(&"release_codex_trust".to_string()));
     assert!(agent_dir.exists());
-    assert!(codex.hook_trust_entries() > 0);
+    assert_eq!(
+        codex.hook_trust_entries(),
+        3,
+        "a dry run must not remove any trust"
+    );
 }
 
 #[tokio::test]
@@ -2002,11 +2014,11 @@ async fn a_retry_finishes_a_failed_codex_trust_release_from_the_receipt() {
     // A Codex home that cannot be written makes the release fail closed after
     // the resources are already gone — the exact partial disposal that must not
     // be reported as success, and must stay retryable.
-    make_directory_read_only(codex.path());
+    set_directory_read_only(codex.path());
 
     let failed = service.run(&request).await.unwrap();
     let entry = &failed.entries[0];
-    make_directory_writable(codex.path());
+    set_directory_writable(codex.path());
 
     assert_eq!(entry.status, CleanupReceiptStatus::Failed, "{entry:?}");
     assert!(!fixture.worktree.exists());
@@ -2014,8 +2026,9 @@ async fn a_retry_finishes_a_failed_codex_trust_release_from_the_receipt() {
     assert!(entry
         .actions
         .contains(&"codex_trust_release_failed".to_string()));
-    assert!(
-        codex.hook_trust_entries() > 0,
+    assert_eq!(
+        codex.hook_trust_entries(),
+        3,
         "the failed release left the trust in place rather than guessing"
     );
     let claim = entry
@@ -2031,22 +2044,23 @@ async fn a_retry_finishes_a_failed_codex_trust_release_from_the_receipt() {
     let entry = &retried.entries[0];
     assert_eq!(entry.status, CleanupReceiptStatus::Cleaned, "{entry:?}");
     assert!(entry.actions.contains(&"release_codex_trust".to_string()));
-    assert!(
-        !codex.hook_trust_entries() > 0,
+    assert_eq!(
+        codex.hook_trust_entries(),
+        0,
         "the retry must finish the release the interrupted attempt left behind"
     );
 
     // And a further retry is a no-op rather than a second release.
     let third = service.run(&request).await.unwrap();
     assert!(third.entries.is_empty(), "a resolved cleanup is complete");
-    assert!(!codex.hook_trust_entries() > 0);
+    assert_eq!(codex.hook_trust_entries(), 0);
 }
 
 #[tokio::test]
 #[serial]
 async fn a_resolver_only_cleanup_releases_the_claim_a_previous_attempt_recorded() {
     let temp = tempfile::tempdir().unwrap();
-    let codex = IsolatedCodex::new();
+    let codex = IsolatedCodex::default();
     let agent_dir = temp.path().join(".exo/agents/stale-codex");
     tokio::fs::create_dir_all(&agent_dir).await.unwrap();
     let record = identity(Topology::SharedDir);
@@ -2096,17 +2110,209 @@ async fn a_resolver_only_cleanup_releases_the_claim_a_previous_attempt_recorded(
     assert!(receipt.entries[0]
         .actions
         .contains(&"release_codex_trust".to_string()));
-    assert!(!codex.hook_trust_entries() > 0);
+    assert_eq!(
+        codex.hook_trust_entries(),
+        0,
+        "the resumed claim must release the trust the deleted config proved"
+    );
     assert!(resolver.get(&record.agent_name).await.is_none());
 }
 
-fn make_directory_read_only(path: &Path) {
+/// A resolver-only retry must not be able to launder a failed trust release into
+/// a clean success.
+///
+/// `reconcile_deregistered_entries` rewrites an entry whose identity is already
+/// gone to `Cleaned`, and `execute_plan` then skips it. That is correct for a
+/// cleanup that finished, and wrong for one whose Codex claim is still owed: the
+/// claim would never be replayed and hook trust would outlive its owner. The
+/// release therefore runs before deregistration, and an entry with an unresolved
+/// claim is excluded from reconciliation.
+#[tokio::test]
+#[serial]
+async fn a_resolver_only_cleanup_with_an_unreleasable_claim_is_retried_not_reconciled() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = IsolatedCodex::default();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    codex.provision(&agent_dir, record.agent_name.as_str());
+
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        None,
+    );
+    let request = CleanupRequest {
+        apply: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&CleanupRequest::default()).await.unwrap();
+    let claim = codex_lifecycle::capture_codex_agent_trust(&agent_dir)
+        .unwrap()
+        .expect("the agent is a provisioned Codex agent");
+    let mut interrupted = in_progress_receipt(&plan, 1);
+    interrupted.operation_id = "codex-claim-retry".to_string();
+    interrupted.entries[0].codex_trust = Some(vec![claim]);
+    service.persist_receipt(&interrupted).await.unwrap();
+    tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+
+    // The Codex home cannot be written, so every release attempt fails closed.
+    set_directory_read_only(codex.path());
+    let first = service.run(&request).await.unwrap();
+    set_directory_writable(codex.path());
+
+    let entry = &first.entries[0];
+    assert_eq!(
+        entry.status,
+        CleanupReceiptStatus::Failed,
+        "an unreleased claim must not read as a clean cleanup: {entry:?}"
+    );
+    assert!(entry
+        .actions
+        .contains(&"codex_trust_release_failed".to_string()));
+    assert!(
+        !entry.actions.contains(&"deregister_identity".to_string()),
+        "the release must run before deregistration, so a failure still has \
+         deregister intent outstanding: {entry:?}"
+    );
+    assert_eq!(
+        codex.hook_trust_entries(),
+        3,
+        "the failed release left the trust in place rather than guessing"
+    );
+    assert!(
+        resolver.get(&record.agent_name).await.is_some(),
+        "the identity must still be registered while the claim is owed"
+    );
+
+    // A second failing run must also stay Failed rather than being reconciled.
+    set_directory_read_only(codex.path());
+    let second = service.run(&request).await.unwrap();
+    set_directory_writable(codex.path());
+    assert_eq!(
+        second.entries[0].status,
+        CleanupReceiptStatus::Failed,
+        "reconciliation must not rewrite an entry that still owes a claim: {:?}",
+        second.entries[0]
+    );
+    assert_eq!(codex.hook_trust_entries(), 3);
+
+    // Once the Codex home is writable again the retry finishes the release.
+    let third = service.run(&request).await.unwrap();
+    let entry = &third.entries[0];
+    assert_eq!(entry.status, CleanupReceiptStatus::Cleaned, "{entry:?}");
+    assert!(entry.actions.contains(&"release_codex_trust".to_string()));
+    assert!(entry.actions.contains(&"deregister_identity".to_string()));
+    assert_eq!(
+        codex.hook_trust_entries(),
+        0,
+        "the retry must release the claim the earlier attempts left owed"
+    );
+    assert!(resolver.get(&record.agent_name).await.is_none());
+}
+
+/// Makes a directory undeletable, so a removal attempt fails.
+///
+/// A read-only directory cannot be unlinked from its parent, so both
+/// `git worktree remove` and the manual `remove_dir_all` fallback fail and the
+/// test observes the partial-disposal path rather than a mocked failure.
+/// `reconcile_deregistered_entries` rewrites an entry whose identity is already
+/// gone to `Cleaned`, and `execute_plan` then skips it.
+///
+/// That is right for a cleanup that finished and wrong for one whose Codex claim
+/// is still owed, so an entry carrying `codex_trust_release_failed` must be
+/// excluded from reconciliation even when its identity is already deregistered —
+/// the ordering fix keeps that combination out of the normal flow, so this
+/// exercises the guard directly against a receipt that already has it.
+#[tokio::test]
+async fn an_entry_owing_a_codex_claim_is_never_reconciled_into_a_clean_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        None,
+    );
+    let request = CleanupRequest {
+        apply: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&request).await.unwrap();
+    let mut interrupted = in_progress_receipt(&plan, 1);
+    interrupted.operation_id = "codex-claim-guarded".to_string();
+    // An identity that is already gone plus a claim that is still owed.
+    interrupted.entries[0].status = CleanupReceiptStatus::Failed;
+    interrupted.entries[0].actions = vec![
+        DEREGISTER_PENDING.to_string(),
+        "codex_trust_release_failed".to_string(),
+    ];
+    interrupted.entries[0].reason = Some("release ExoMonad Codex trust: denied".to_string());
+    interrupted.entries[0].codex_trust = Some(Vec::new());
+    service.persist_receipt(&interrupted).await.unwrap();
+    resolver.deregister(&record.agent_name).await.unwrap();
+    tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+
+    let resumed_plan = service.plan(&request).await.unwrap();
+    let resumed = service
+        .resume_or_create_receipt(&resumed_plan, None, 2)
+        .await
+        .unwrap();
+    let entry = &resumed.entries[0];
+    assert_eq!(
+        entry.status,
+        CleanupReceiptStatus::Failed,
+        "reconciliation must not erase an entry that still owes a Codex claim: {entry:?}"
+    );
+    assert!(
+        entry
+            .actions
+            .contains(&"codex_trust_release_failed".to_string()),
+        "the owed claim must stay visible on the resumed receipt: {entry:?}"
+    );
+    assert!(entry.reason.is_some(), "the failure reason must survive");
+}
+
+/// Makes a directory undeletable, so a removal attempt fails.
+///
+/// A read-only directory cannot be unlinked from its parent, so both
+/// `git worktree remove` and the manual `remove_dir_all` fallback fail and the
+/// test observes the partial-disposal path rather than a mocked failure.
+fn set_directory_read_only(path: &Path) {
     let mut permissions = std::fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o500);
     std::fs::set_permissions(path, permissions).unwrap();
 }
 
-fn make_directory_writable(path: &Path) {
+/// Restores write permission so `TempDir` can clean up.
+fn set_directory_writable(path: &Path) {
     let mut permissions = std::fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(path, permissions).unwrap();

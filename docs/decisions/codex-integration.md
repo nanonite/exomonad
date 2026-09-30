@@ -88,12 +88,17 @@ The generated config that proves ownership lives inside the very directory a per
 
 A `CapturedCodexTrust` is serializable and is the retry evidence for a release that could not finish. The verified cleanup service persists it in `CleanupReceiptEntry::codex_trust` before the first removal, and the recreate path persists it in `RecreateCleanupReceiptEntry::pending_codex_trust`, so an interrupted or failed disposal finishes the release on its next run instead of losing the claim with the worktree. A release that cannot finish fails the cleanup entry rather than reporting plain success.
 
+Two ordering rules keep a failed release from being laundered into a clean success:
+
+- The release runs *before* the identity is deregistered. Deregistering first lets `reconcile_deregistered_entries` rewrite the failed entry to `Cleaned` on the next run — its identity is already gone — and `execute_plan` then skips it, so the claim is never replayed. As a second line of defence, reconciliation skips any entry still carrying `codex_trust_release_failed`.
+- A disposal releases trust only when its resources are *proven* gone. Absence on disk is the only accepted proof: a removal call that failed, or a directory that survived, leaves the agent in place with its generated config, so its trust stays installed. `AgentResourceDisposal` reports the surviving paths, so a caller cannot read a partial disposal as a released trust.
+
 Every permanent disposal path follows that order:
 
 | Site | Claim is recorded in | Release is reported by |
 | --- | --- | --- |
 | Verified cleanup and verified orphan cleanup (`services::cleanup`) | the cleanup receipt entry, before the first removal | a `Cleaned`/`Failed` entry with `release_codex_trust` or `codex_trust_release_failed` |
-| Reviewer, leaf and child-worker disposal (`services::agent_resources`) | memory, for the caller's own reporting | `AgentResourceDisposal::codex_trust`, plus a reconciler tick that fails |
+| Reviewer, leaf and child-worker disposal (`services::agent_resources`) | memory, for the caller's own reporting | `AgentResourceDisposal::failure_reason`, plus a reconciler tick that fails |
 | `AgentControlService::cleanup_agent` | memory | an `Err` — partial disposal is never a success |
 | `exomonad init --recreate` | the per-leaf recreate receipt | `release_codex_trust` as the leaf's last ordered step, or a retryable failure |
 | `exomonad revert` | memory | a revert warning naming the claim that could not be released |

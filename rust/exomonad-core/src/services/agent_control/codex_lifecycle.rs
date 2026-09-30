@@ -485,6 +485,11 @@ pub mod test_support {
     use super::*;
 
     /// A disposable Codex home plus the provisioning call tests use to seed it.
+    ///
+    /// There is deliberately no `Default`: the whole value of this type is the
+    /// environment it installs, so a default-constructed copy would have to skip
+    /// the isolation and silently assert against the operator's real Codex trust.
+    #[must_use = "an IsolatedCodex only isolates CODEX_HOME while it is alive"]
     pub struct IsolatedCodex {
         home: tempfile::TempDir,
     }
@@ -558,6 +563,17 @@ pub mod test_support {
     impl Drop for IsolatedCodex {
         fn drop(&mut self) {
             std::env::remove_var("CODEX_HOME");
+        }
+    }
+
+    /// An `IsolatedCodex` is what `Default` means here.
+    ///
+    /// A `Default` that skipped the isolation would leave a test asserting
+    /// against the operator's real Codex trust, so it installs the same throwaway
+    /// home `new` does.
+    impl Default for IsolatedCodex {
+        fn default() -> Self {
+            Self::new()
         }
     }
 }
