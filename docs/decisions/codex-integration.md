@@ -48,6 +48,20 @@ trusted_hash = "sha256:..."
 
 The user config update is protected by a sidecar flock in `CODEX_HOME` and written atomically, so parallel Codex spawns do not lose trust entries. Legacy ExoMonad global hook blocks are stripped from the user config to avoid duplicate hook execution.
 
+### Hook Trust Removal
+
+Removal (`uninstall_codex_hook_trust`) is the exact inverse of installation. ExoMonad can only delete trust records it can still prove it owns:
+
+- Candidate keys are derived from the generated `<worktree>/.codex/config.toml` itself — `{config path}:{event label}:0:0` for `pre_tool_use`, `post_tool_use`, and `stop` — so a sibling worktree, a different handler index, or a path that merely shares a prefix is never a candidate. ExoMonad never deletes by path prefix.
+- An exact candidate is deleted only when its recorded `trusted_hash` equals the hash ExoMonad generates from that generated config today. A drifted hash means the hook was edited after installation, so the record is user state and is preserved.
+- Records ExoMonad cannot parse are preserved and reported with a reason, never silently rewritten. Unrelated keys are not even inspected, so they survive up to the `toml::to_string_pretty` writer contract installation already uses.
+- Removal runs through the same `.exomonad-config.lock` sidecar flock and the same atomic writer as installation, so an install and an uninstall can never interleave. Removal is idempotent.
+- When a removal empties `[hooks.state]`, the now-empty `hooks` scaffolding ExoMonad just emptied is pruned rather than left as two header-only tables. A state table that still holds anything keeps both headers.
+
+Removal fails closed: a missing or non-ExoMonad generated config, an unparseable user config, or a `[hooks.state]` that is not a table returns an actionable error and leaves the user config byte-for-byte unchanged. ExoMonad returns a `HookTrustRemoval` report so callers can report what was removed *and* what was deliberately preserved.
+
+Removal is never triggered by process exit. Dormant `resume_pr` owners keep their trust; removal belongs to verified permanent resource disposal and to explicit operator-initiated maintenance.
+
 These shell hooks forward Codex events to the existing ExoMonad server over the Unix-domain socket. The server normalizes Codex hook stdin into ExoMonad's internal `HookInput`, calls the Haskell WASM hook handler, then formats the result back into Codex hook stdout semantics.
 
 ## Codex-Fugu (removed)
