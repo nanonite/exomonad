@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Add symmetric removal of ExoMonad Codex hook trust (#1123)
 - Isolate Codex state in every end-to-end harness (#1122)
 - Make tl_loop gate names with '/' answerable through the HTTP control route (#1133)
 - Fail loudly on an over-long tmux_session instead of silently truncating it (#1131)
