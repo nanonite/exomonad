@@ -106,6 +106,95 @@ PY
 # scaffold, and the relationship is asserted by the contract tests. This is a
 # property of the shipped selector, not a choice these scenarios make about how
 # much to spend: the run still stops at the budget its plan declares.
+# Report a fixture-setup failure the same way the assertions do, so a run that
+# cannot even start says why instead of failing somewhere downstream with a
+# symptom.
+e2e_python_tl_fail() {
+    printf '  FAIL: %s\n' "$1" >&2
+    return 1
+}
+
+e2e_python_tl_codex_model() {
+    # The model these fixtures provision their Codex worker with.
+    #
+    # The harness policy key is `codex/<model>`, and the controller splits it
+    # into agent type plus model, which becomes `model = ...` in the generated
+    # child config. So the key is what decides which model the worker asks for.
+    #
+    # It must therefore be a model the account can actually run. `gpt-luna`, the
+    # name in the `exomonad new` scaffold, is not one of them for a ChatGPT
+    # login: the worker gets
+    #
+    #   400 invalid_request_error: The 'gpt-luna' model is not supported when
+    #   using Codex with a ChatGPT account.
+    #
+    # before its first inference, so it never reaches a tool call. The default
+    # is read from the host Codex config -- the same place the operator's own
+    # working `codex` invocation gets its model -- so the fixtures follow the
+    # account instead of hard-coding a name that can rot. Chainlink #1149.
+    local host_config model
+    if [[ -n "${E2E_CODEX_MODEL:-}" ]]; then
+        model="$E2E_CODEX_MODEL"
+    else
+        host_config="${CODEX_HOST_CONFIG:-$HOME/.codex/config.toml}"
+        if [[ ! -f "$host_config" ]]; then
+            e2e_python_tl_fail "cannot resolve a Codex model: no host config at $host_config. Set E2E_CODEX_MODEL to a model your account can run."
+            return 1
+        fi
+        model="$(sed -n 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$host_config" | head -1)"
+        if [[ -z "$model" ]]; then
+            e2e_python_tl_fail "cannot resolve a Codex model: $host_config sets no top-level model. Set E2E_CODEX_MODEL to a model your account can run."
+            return 1
+        fi
+    fi
+
+    if [[ "$model" == "gpt-luna" ]]; then
+        e2e_python_tl_fail "the model 'gpt-luna' comes from the exomonad new scaffold and is rejected by a ChatGPT-account Codex login (400 invalid_request_error). Set E2E_CODEX_MODEL to a model your account can run. See Chainlink #1149."
+        return 1
+    fi
+    printf '%s' "$model"
+}
+
+# The harness identifier the fixture's policy and capability map both name.
+#
+# `agent_type/model`, because that is the shape the controller splits
+# (`parse_harness_identifier`): the model half becomes `model = ...` in the
+# generated child config, and the whole string is the key both
+# `harness_policy.toml` and `harness_capability.toml` are written in.
+e2e_python_tl_harness() {
+    printf 'codex/%s' "$(e2e_python_tl_codex_model)"
+}
+
+# Prove the account can run the model before the run starts.
+#
+# A model rejection surfaces inside the worker's rollout as a `task_complete`
+# carrying a 400, after the controller has already dispatched, provisioned and
+# booted the worker. Nothing in the harness notices for the validator's whole
+# 600s budget, so the run looks like a `notify_parent` stall and sends whoever
+# reads it to the wrong bug. One throwaway turn here turns a ten-minute
+# ambiguity into a five-second message.
+e2e_python_tl_assert_codex_model_runnable() {
+    local model="$1"
+    local output status
+    set +e
+    output="$(cd "$2" 2>/dev/null || cd "$HOME"; \
+        CODEX_HOME="${CODEX_HOME:?}" timeout 120 codex exec \
+            --model "$model" --skip-git-repo-check \
+            "Reply with the single word OK." 2>&1)"
+    status=$?
+    set -e
+
+    if [[ "$output" == *"not supported when using Codex"* ]]; then
+        e2e_python_tl_fail "the account cannot run model '$model': $(printf '%s' "$output" | grep -oE "The '[^']*' model is not supported[^\\\\\"]*" | head -1). Set E2E_CODEX_MODEL to a model your account can run. See Chainlink #1149."
+        return 1
+    fi
+    if (( status != 0 )); then
+        e2e_python_tl_fail "codex could not run model '$model' (exit $status): $(printf '%s' "$output" | tail -2 | tr '\n' ' ' | cut -c1-200)"
+        return 1
+    fi
+    printf '  OK: account can run model %s\n' "$model"
+}
+
 e2e_python_tl_write_harness_policy() {
     local repo_dir="$1"
     local plan_path="$2"
@@ -114,7 +203,28 @@ e2e_python_tl_write_harness_policy() {
     # Four times the run budget: comfortably above the conservative attribution
     # above while still a finite ceiling, and derived rather than magic.
     ceiling=$((run_tokens * 4))
+    # The harness is resolved once and used for both files the controller reads.
+    # They have to agree: `_require_policy_coverage` (tl_loop/select/capability.py)
+    # rejects a run whose policy allows a harness the capability map has no entry
+    # for, so writing the policy without the matching rating fails preflight with
+    # `missing capability entry for codex/<model>`. Keeping the two writes in one
+    # function is what makes that impossible to half-do.
+    local harness
+    harness="$(e2e_python_tl_harness)" || return 1
     mkdir -p "$repo_dir/.exo"
+
+    cat > "$repo_dir/.exo/harness_capability.toml" <<EOF
+# Fixture capability ratings for the Python TL controller scenarios.
+#
+# One entry per harness the policy allows. \`_require_policy_coverage\` requires
+# the policy's allowlists to be a subset of these keys, so this file and
+# harness_policy.toml must be written together with the same resolved harness.
+
+[capabilities]
+# Basis: the account-resolved Codex worker model; these fixtures dispatch
+# bounded, single-slice plans, which is what a standard rating is for.
+"$harness" = "standard"
+EOF
 
     cat > "$repo_dir/.exo/harness_policy.toml" <<EOF
 # Fixture harness policy for the Python TL controller scenarios.
@@ -123,23 +233,27 @@ e2e_python_tl_write_harness_policy() {
 # until it has recorded per-role spend, so each role ceiling is set above the
 # run's declared token budget. See tests/e2e/lib/python-tl.sh for the full
 # explanation; the run still stops at the budget its plan declares.
+#
+# The harness is resolved from the account rather than hard-coded. See
+# e2e_python_tl_codex_model.
+
 
 [roles.tl]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
+allow = ["$harness"]
+cost_rank = { "$harness" = 1 }
 token_budget = $ceiling
 escalate_after_attempts = 1
 
 [roles.worker]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
+allow = ["$harness"]
+cost_rank = { "$harness" = 1 }
 token_budget = $ceiling
-per_harness_budget = { "codex/gpt-luna" = $ceiling }
+per_harness_budget = { "$harness" = $ceiling }
 escalate_after_attempts = 1
 
 [roles.reviewer]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
+allow = ["$harness"]
+cost_rank = { "$harness" = 1 }
 token_budget = $ceiling
 escalate_after_attempts = 1
 EOF

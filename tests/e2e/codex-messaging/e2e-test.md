@@ -59,6 +59,54 @@ its interactive root TL.
 | Messaging | `message.delivery` records a successful `agent_inbox_tmux` injection to the peer, and a successful `notify_parent` delivery to `root` |
 | Durable controller state | `.exo/tl-loop/root/run.json` records the plan slice and `fsm.phase == "tl_done"` |
 
+## Live run, 2026-09-30
+
+Work dir `codex-messaging.q8sxs0Ek`. This is the first live run of this
+scenario in its migrated form, and it is where the migrated fixtures stopped
+being theoretical.
+
+**The worker does its whole job correctly.** The worker's Codex rollout holds 47
+events and four tool calls, in the order the plan asked for:
+
+```
+CALL  exec  await new Promise(r => setTimeout(r, 30000));   -> delay-complete, 30.0s
+CALL  exec  tools.mcp__exomonad__send_tmux_message({recipient: codex-messaging-peer, ...})
+      OUTPUT {"delivery_method":"tmux_stdin","success":true}
+CALL  exec  tools.mcp__exomonad__notify_parent({status: "success", ...})
+      OUTPUT {"success":true}
+```
+
+The task text reached the worker intact -- user message 2, 5271 characters,
+carrying both tool instructions. So the peer is reachable, the worker's MCP
+identity routes, and `send_tmux_message` reports a successful `tmux_stdin`
+delivery.
+
+**The run still does not finish, and the reason is the controller's side.** The
+slice stays `spawned` and `fsm.phase` stays `tl_running` even though both tools
+returned success. The action journal names why:
+
+```
+tl.dispatch_event_rejected
+  classification: integrity_conflict
+  correlation_reason: intent_mismatch
+```
+
+and `event-quarantine.json` holds the quarantined `agent.spawned` event with
+`run_id` a UUID where the controller has the literal `root`, and `agent_id`
+`root` where it expects the slice. Filed as Chainlink #1148.
+
+**Observed `run.sh` exit codes.** A run with no result file exits non-zero, which
+is the false-pass fix doing its job: `ERROR: validator wrote no result file at
+... (init exited 1)` followed by `RUNSH_EXIT=1`. An earlier attempt at the same
+scenario, with the scaffold's `gpt-luna` still in the policy, was caught by
+preflight inside 90 seconds with `missing capability entry for
+codex/gpt-5.6-luna` -- see `python-tl-worker-notify/e2e-test.md` for the model
+defect behind it.
+
+This row is **not** Green: the messaging and role assertions above are proven,
+but the run does not reach `tl_done`, so the durable-controller-state row is not
+yet satisfied.
+
 ## What was removed and why
 
 The retired scenario drove `exomonad init` into an interactive Codex root TL

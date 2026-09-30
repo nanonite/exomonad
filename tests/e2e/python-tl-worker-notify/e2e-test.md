@@ -122,8 +122,62 @@ what the A/B below relies on.
 call inside `cleanup()` is invisible at runtime -- the run still prints
 `Work dir:` and still creates the `tmux/` directory, at teardown.
 
-**The blocked `notify_parent`.** This is the one assertion the live run still
-fails, and it is a product defect rather than a harness one.
+### What actually stalled that run
+
+The 2026-09-30 run was recorded as a `notify_parent` defect. That was wrong,
+and the run's own artefacts say so. The worker's Codex rollout holds **nine
+events** and ends **5.4 seconds** in:
+
+```
+task_complete.error = {"message": "{\"type\":\"error\",\"status\":400,
+  \"error\":{\"type\":\"invalid_request_error\",
+  \"message\":\"The 'gpt-luna' model is not supported when using Codex with a
+  ChatGPT account.\"}}"}
+```
+
+There are **zero tool calls**. The worker never attempted `notify_parent`, so it
+could not have succeeded, and the controller was never the thing under
+observation.
+
+The model comes from `exomonad new`'s scaffold: both `harness_policy.toml` and
+`harness_capability.toml` are keyed `codex/gpt-luna`, and the controller splits
+that key into agent type plus model, which becomes `model = ...` in the
+generated child config. A ChatGPT-account Codex login cannot run it. Every model
+probed against this account is rejected the same way -- `gpt-luna`,
+`gpt-5-codex`, `gpt-5`, `gpt-5-mini` and `o3` all return that identical 400 --
+so this is not one bad name. Filed as Chainlink #1149.
+
+### What the fixtures do about it
+
+`e2e_python_tl_codex_model` resolves the model from the host Codex config --
+the same place the operator's own working `codex` invocation gets its model, so
+the fixtures follow the account instead of hard-coding a name that rots.
+`E2E_CODEX_MODEL` overrides it, and resolving `gpt-luna` fails outright.
+
+`e2e_python_tl_assert_codex_model_runnable` then spends one throwaway turn
+proving the account can run it, **before** `exomonad init` starts. That is the
+fix that matters, because a model rejection is otherwise invisible: it surfaces
+inside the worker's rollout, after dispatch and provisioning, and nothing
+notices for the validator's whole 600s budget. So the run reads as a messaging
+stall and sends whoever reads it to the wrong bug. The 09-30 run was sent to the
+wrong bug exactly that way.
+
+The policy writer also emits the matching `harness_capability.toml` entry now.
+`_require_policy_coverage` (`tl_loop/select/capability.py`) rejects a policy
+whose allowlist the capability map does not cover, so a fixture that rewrites
+only the policy fails preflight with `missing capability entry for
+codex/<model>`. That second defect was found by the probe's run, ninety seconds
+in, where it would previously have cost another ten-minute stall.
+
+### What is left, once the model works
+
+With a runnable model the worker's turn completes and **both MCP tools return
+success** -- see the `codex-messaging` evidence below. The remaining blocker is
+on the controller's side, and the run's action journal names it: the controller
+quarantines its own `agent.spawned` event as `integrity_conflict` /
+`intent_mismatch`, because the agent-reported `run_id` is a UUID where the
+controller has the literal `root`, so the slice never leaves `spawned`. Filed as
+Chainlink #1148, with the quarantine entry quoted there.
 
 ### Live run, 2026-09-30 (isolation correctly placed)
 
