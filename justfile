@@ -612,9 +612,9 @@ check-e2e-python-tl-controller:
                 tests/e2e/python-tl-worker-notify/plan.json; do
         {{py}} -c 'import json, sys; json.load(open(sys.argv[1]))' "$plan"
     done
-    {{py}} -m py_compile tests/e2e/python-tl-controller/test_contract.py \
-        tests/e2e/python-tl-controller/test_plan_contract.py \
-        tests/e2e/python-tl-controller/test_fixture_config_contract.py
+    for contract in tests/e2e/python-tl-controller/test_*.py; do
+        {{py}} -m py_compile "$contract"
+    done
     {{py}} -m pytest -q tests/e2e/python-tl-controller
     if command -v shellcheck >/dev/null; then
         shellcheck -S warning -e SC1091,SC2034,SC2164 \

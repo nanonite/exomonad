@@ -176,7 +176,9 @@ def _write_config(project: Project) -> None:
                 f'tmux_session = "{project.session}"',
                 "yolo = true",
                 "poll_interval = 1",
-                'root_agent_type = "codex"',
+                # `root_agent_type` is deliberately absent: init always starts
+                # the Python TL controller, which consumes the plan written
+                # below, so there is no root Codex agent to configure.
                 'spawn_agent_type = "codex"',
                 'reviewer_agent_type = "codex"',
                 f'forgejo_url = "{project.instance.base_url}"',

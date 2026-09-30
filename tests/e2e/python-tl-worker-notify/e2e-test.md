@@ -43,7 +43,9 @@ Two properties of that chain are the reason this scenario exists:
 | Delivery | the notification marker is recorded, `message.delivery` shows a successful `agent_inbox_tmux` injection to the `root` recipient, and the marker is visible in the controller's `TL` window |
 | CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home |
 | Isolated Codex home | project trust + the three hook-trust entries for the worker config live in `$CODEX_HOME/config.toml`; teardown proves the host config is byte-for-byte unchanged |
-| Hook trust | the shared `# BEGIN EXOMONAD CODEX HOOKS` block and `<worker config>:pre_tool_use:0:0` state are present in the isolated home |
+| Hook commands | the generated `<agent dir>/.codex/config.toml` carries the `pre-tool-use`, `post-tool-use`, and `stop` hook commands; `install_codex_hook_trust` derives its trust entries from exactly those three |
+| Hook trust | `[hooks.state."<worker config>:<event>:0:0"]` with a `trusted_hash` for each event, plus `[projects."<agent dir>"] trust_level = "trusted"`, are present in the isolated home |
+| Retired shape absent | the isolated home does **not** carry a `# BEGIN EXOMONAD CODEX HOOKS` block. That writer was removed in 8934378f (#210); `trust_codex_project` strips such a block on every write, and `provisioning_writes_hook_commands_into_the_config_not_the_user_config` pins that against live product output |
 | MCP tools + role config | the worker config declares `mcp-stdio --role worker --name <agent>`, `hooks = true`, `approval_policy = "never"`, and the Codex **Worker** Agent Protocol |
 | No retired root model | neither `.codex/config.toml` nor `.exo/agents/root/.codex/config.toml` is generated |
 | Durable controller state | `.exo/tl-loop/root/run.json` records the plan slice and `fsm.phase == "tl_done"` |
@@ -101,19 +103,38 @@ already in `init.rs` is defeated by the ordering.
 
 Giving the run its own tmux server (`TMUX_TMPDIR` under `WORK_DIR`, the
 isolation `tests/e2e/lib/e2e_harness/tmuxio.py` gives the Python acceptances)
-does remove the foreign environment -- a live run then produced a populated
-`$CODEX_HOME/config.toml` and a Codex session writing only into the isolated
-home. It was reverted because in this environment the ExoMonad server then
-failed `init`'s socket health check and the controller was never reached, so
-trading a correct Codex home for a dead server is not a fix. The regression was
-confirmed by A/B: with the isolation disabled the server starts and `init`
-reaches "Attaching to session".
+removes the foreign environment. **The harness now does this by default**, via
+`e2e_python_tl_isolate_tmux_server` in `tests/e2e/lib/python-tl.sh`, exported at
+top level before the first `tmux` call and before `exomonad init`.
+
+An earlier revision reverted it: the isolation call had been placed inside
+`cleanup()`, so it took effect only at teardown, and the run kept the host's
+`CODEX_HOME`. Read as "the isolation breaks the server's socket health check",
+that looked like a product problem. It was a placement bug in the harness. With
+the call moved to top level, the isolated server starts, `init` reaches
+"Attaching to session", the controller dispatches its worker, and the worker's
+pane resolves `$CODEX_HOME` to the run's isolated home. Set
+`E2E_PYTHON_TL_TMUX_ISOLATION=0` to reproduce the shared-server leak, which is
+what the A/B below relies on.
+
+`test_isolation_contract.py` pins the placement (top level, before the first
+`tmux` call, before `init`, after the library is sourced) precisely because a
+call inside `cleanup()` is invisible at runtime -- the run still prints
+`Work dir:` and still creates the `tmux/` directory, at teardown.
 
 **The blocked `notify_parent`.** The worker is dispatched, provisioned, and
 boots a real Codex session with the correct task text; what is unproven in this
 revision is the last hop, the worker actually calling `notify_parent` and the
-controller durably reaching `tl_done`. The validator already reports which leg
-failed, so the next run's result is unambiguous.
+controller durably reaching `tl_done`. The 2026-09-30 live run with the
+isolation correctly placed reached `tl_running` with the worker spawned and
+`$CODEX_HOME` isolated, then stalled: no `notify_parent` event, no terminal
+state, `active_slices=1` and no progress for 1084s. The validator reported
+`worker notify_parent event recorded timed out after 600s`.
+
+A missing or failing validator result is now a hard failure of the scenario.
+`run.sh` used to fall back to `exomonad init`'s exit status, and `init` exits 0
+as soon as it attaches the session -- so that run reported success while proving
+nothing. `test_isolation_contract.py` pins that too.
 
 Because of the two blockers above this row is **not** marked Green.
 

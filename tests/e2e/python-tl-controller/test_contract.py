@@ -739,9 +739,11 @@ def test_retired_scenario_name_is_gone_from_the_repository() -> None:
     stale: list[str] = []
     for path in _recipe_and_doc_files():
         if path in {
-            # The scenario's own documentation explains the rename, and this
-            # file is the check that names the retired identifier at all.
+            # The scenario's own documentation and the migration inventory both
+            # explain the rename, and this file is the check that names the
+            # retired identifier at all.
             scenario_dir("python-tl-worker-notify") / "e2e-test.md",
+            E2E_DIR / "CODEX-TL-MIGRATION.md",
             Path(__file__).resolve(),
         }:
             continue
