@@ -592,9 +592,11 @@ check-e2e-codex-messaging:
     bash -n tests/e2e/codex-messaging/validate.sh
 
 # Check the Codex E2E scenarios are expressed in terms of the Python TL
-# controller: a shipped plan.json, no interactive Codex root TL, and validator
-# assertions on the durable controller checkpoint, CODEX_HOME propagation, and
-# Codex trust in the isolated home. No server, no tmux, no codex binary.
+# controller: a shipped plan.json, no interactive Codex root TL, fixture configs
+# that actually parse, plan slices that match the controller's own slice keys,
+# and validator assertions on the durable controller checkpoint, CODEX_HOME
+# propagation, and Codex trust in the isolated home. No server, no tmux, no
+# codex binary.
 check-e2e-python-tl-controller:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -610,8 +612,10 @@ check-e2e-python-tl-controller:
                 tests/e2e/python-tl-worker-notify/plan.json; do
         {{py}} -c 'import json, sys; json.load(open(sys.argv[1]))' "$plan"
     done
-    {{py}} -m py_compile tests/e2e/python-tl-controller/test_contract.py
-    {{py}} -m pytest -q tests/e2e/python-tl-controller/test_contract.py
+    {{py}} -m py_compile tests/e2e/python-tl-controller/test_contract.py \
+        tests/e2e/python-tl-controller/test_plan_contract.py \
+        tests/e2e/python-tl-controller/test_fixture_config_contract.py
+    {{py}} -m pytest -q tests/e2e/python-tl-controller
     if command -v shellcheck >/dev/null; then
         shellcheck -S warning -e SC1091,SC2034,SC2164 \
             tests/e2e/lib/python-tl.sh \

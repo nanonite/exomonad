@@ -25,6 +25,15 @@
 #      that was exported before any ExoMonad process started, which is also
 #      what proves CODEX_HOME reached the tmux session and every spawned pane.
 #
+# These expectations are transcribed from a real provisioned run, and the same
+# shape is pinned against live product output by
+# `codex_lifecycle::provisioning_writes_hook_commands_into_the_config_not_the_user_config`.
+# A previous version of this file asserted a global ExoMonad hooks block in the
+# Codex user config; that writer was removed in 8934378f (#210), so the
+# assertion failed every live run. A helper that encodes a shape the product
+# does not write is worse than no assertion at all, because it turns a working
+# run red and reads as a product defect.
+#
 # Source this file from a scenario's `run.sh`/`validate.sh` rather than
 # restating the checks: the checks are only meaningful together, because each
 # one rules out a specific way the migration could silently regress.
@@ -33,6 +42,155 @@ if [[ -n "${E2E_PYTHON_TL_HELPER_LOADED:-}" ]]; then
     return 0
 fi
 E2E_PYTHON_TL_HELPER_LOADED=1
+
+# The run's declared token budget, from the shipped plan.
+e2e_python_tl_plan_token_budget() {
+    local plan_path="$1"
+
+    python3 - "$plan_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+print(int(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["budgets"]["tokens"]))
+PY
+}
+
+# Write a harness policy whose role ceilings sit above the run's token budget.
+#
+# The controller's selector conservatively attributes a role's whole share of
+# the run budget to that role whenever no per-role spend has been recorded yet
+# (`tl_loop/select/agent_type.py::_spent`, the `BudgetLedger` branch), so the
+# first dispatch of a run fits only when
+# `budgets.tokens + estimated_cost <= roles.<role>.token_budget`. With
+# `exomonad new`'s scaffold (worker ceiling 120000) and any plan declaring a
+# 120000-token run, that is false and the slice parks with `over_budget` before
+# an agent is ever spawned.
+#
+# The ceiling is therefore derived from the plan rather than left to the
+# scaffold, and the relationship is asserted by the contract tests. This is a
+# property of the shipped selector, not a choice these scenarios make about how
+# much to spend: the run still stops at the budget its plan declares.
+e2e_python_tl_write_harness_policy() {
+    local repo_dir="$1"
+    local plan_path="$2"
+    local run_tokens ceiling
+    run_tokens="$(e2e_python_tl_plan_token_budget "$plan_path")"
+    # Four times the run budget: comfortably above the conservative attribution
+    # above while still a finite ceiling, and derived rather than magic.
+    ceiling=$((run_tokens * 4))
+    mkdir -p "$repo_dir/.exo"
+
+    cat > "$repo_dir/.exo/harness_policy.toml" <<EOF
+# Fixture harness policy for the Python TL controller scenarios.
+#
+# The controller attributes a role's whole share of the run budget to that role
+# until it has recorded per-role spend, so each role ceiling is set above the
+# run's declared token budget. See tests/e2e/lib/python-tl.sh for the full
+# explanation; the run still stops at the budget its plan declares.
+
+[roles.tl]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = $ceiling
+escalate_after_attempts = 1
+
+[roles.worker]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = $ceiling
+per_harness_budget = { "codex/gpt-luna" = $ceiling }
+escalate_after_attempts = 1
+
+[roles.reviewer]
+allow = ["codex/gpt-luna"]
+cost_rank = { "codex/gpt-luna" = 1 }
+token_budget = $ceiling
+escalate_after_attempts = 1
+EOF
+    printf '  OK: harness policy written with role ceilings of %s (run budget %s)\n' \
+        "$ceiling" "$run_tokens"
+}
+
+# Give the fixture a remote the controller can resolve, and a push target that
+# actually works.
+#
+# `repository_identity` refuses a local-path remote
+# (`rust/exomonad-core/src/services/repo.rs`: "Remote is a local path"), and the
+# controller resolves identity during startup, so a bare local `origin` stops
+# the run before a child is dispatched. The retired interactive-root scenarios
+# never started a controller and never had to satisfy this.
+#
+# So `origin` carries an HTTP URL for identity resolution while pushes go to a
+# local bare repository, which keeps the scenario hermetic and local-only: no
+# Forgejo, no credentials, no network. This is the same split
+# `tests/e2e/one-shot-lifecycle/run.sh` uses.
+e2e_python_tl_configure_remote() {
+    local repo_dir="$1"
+    local bare_remote="$2"
+    local slug="$3"
+    local base_branch="${4:-main}"
+
+    git -C "$repo_dir" remote remove origin >/dev/null 2>&1 || true
+    git -C "$repo_dir" remote add origin "http://127.0.0.1:1/e2e/$slug"
+    git -C "$repo_dir" remote set-url --push origin "$bare_remote"
+    git -C "$repo_dir" push -q -u origin "$base_branch"
+}
+
+# Create the fixture's Chainlink database before the controller starts.
+#
+# The controller opens the project's Chainlink database during startup, not
+# lazily: without one it exits with `unable to open database file` and
+# `exomonad init` reports the TL window exiting before startup completed. The
+# retired interactive-root scenarios never started a controller, so none of them
+# needed a database, and this is the failure that only a live run surfaces.
+#
+# Must run before `e2e_python_tl_commit_scaffold`, so the files `chainlink init`
+# creates (`.claude/` hooks, `.chainlink/rules/`) are committed rather than
+# leaving the worktree dirty for `spawn_worker` to refuse.
+e2e_python_tl_init_chainlink() {
+    local repo_dir="$1"
+
+    if ! (cd "$repo_dir" && CHAINLINK_DB="$repo_dir/.chainlink" chainlink init >/dev/null 2>&1); then
+        printf 'ERROR: chainlink init failed in %s\n' "$repo_dir" >&2
+        return 1
+    fi
+    if [[ ! -d "$repo_dir/.chainlink" ]]; then
+        printf 'ERROR: chainlink init created no .chainlink directory in %s\n' "$repo_dir" >&2
+        return 1
+    fi
+    printf '  OK: Chainlink database initialised at %s/.chainlink\n' "$repo_dir"
+}
+
+# Plan slice names for a scenario's shipped plan.json.
+#
+# These are the `plan.json` `workers`/`leaves` names, which is what the
+# controller keys `run.json`'s `slices` by. They are deliberately *not* the
+# agent identities: `_initial_slices` keys on the plan name, while the agent
+# identity adds the harness suffix (`<plan name>-codex`) and is only used for
+# the agent directory. Reading the plan is what keeps a validator from
+# asserting one and finding the other.
+e2e_python_tl_plan_slices() {
+    local plan_path="$1"
+
+    python3 - "$plan_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["plan"]
+for section in ("workers", "leaves", "sub_tls"):
+    for entry in plan.get(section) or ():
+        print(entry["name"])
+PY
+}
+
+# The Codex agent identity the controller dispatches a plan slice under.
+e2e_python_tl_agent_identity() {
+    local slice_name="$1"
+    local harness="${2:-codex}"
+    printf '%s-%s\n' "$slice_name" "$harness"
+}
 
 # Make a freshly scaffolded fixture dispatchable, and commit it.
 #
@@ -182,6 +340,24 @@ e2e_python_tl_assert_codex_child_config() {
     grep -Fq "$protocol_marker" "$config" \
         || { printf '  FAIL: %s config missing protocol marker %s\n' "$label" "$protocol_marker" >&2; return 1; }
 
+    # The hook commands live in the generated config, not in the Codex user
+    # config. `render_codex_config` emits one per event, and
+    # `install_codex_hook_trust` derives its trust entries from exactly these
+    # three, so asserting them here is what makes the trust assertion in
+    # `e2e_python_tl_assert_codex_trust` meaningful.
+    #
+    # The command is rendered with the absolute path of the running `exomonad`
+    # binary, so only the stable tail is matched -- a bare `exomonad hook ...`
+    # pattern would fail on every host that does not build to `target/debug`.
+    local event
+    for event in pre-tool-use post-tool-use stop; do
+        grep -Fq "hook $event --runtime codex" "$config" \
+            || {
+                printf '  FAIL: %s config missing the %s hook command\n' "$label" "$event" >&2
+                return 1
+            }
+    done
+
     # The MCP identity is the last check, so its exit status must be the
     # function's: without an explicit `return` the following `printf` would
     # overwrite a failed assertion with success.
@@ -214,42 +390,92 @@ PY
 #
 # Args: <codex-home> <child-config>
 #
-# The hook-trust key is the child's own generated config path, so finding
-# `<config>:pre_tool_use:0:0` under the isolated home proves three things at
-# once: the lifecycle wrote the config, it computed trust from those exact
-# bytes, and it wrote that trust to the CODEX_HOME this run exported -- which
-# is the only way Codex in the spawned pane can load the hooks without the
-# "hooks need review" gate.
+# What the product actually writes, and therefore what is asserted here:
+#
+#   * `provision_codex_agent` renders the hook commands into the *generated
+#     child config* (`<agent_dir>/.codex/config.toml`).
+#   * `trust_codex_project` writes `[projects."<agent_dir>"] trust_level =
+#     "trusted"` into the Codex user config, and strips any legacy
+#     `# BEGIN EXOMONAD CODEX HOOKS` block it finds there.
+#   * `install_codex_hook_trust` writes one
+#     `[hooks.state."<child config>:<event>:0:0"] trusted_hash = ...` per hook
+#     event into the same user config, keyed by the generated config's path.
+#
+# The hook-trust key being the child's own config path is what makes this
+# meaningful: it proves trust was computed from the bytes just written and
+# recorded in the CODEX_HOME this run exported, which is the only way Codex in
+# the spawned pane loads those hooks without the "hooks need review" gate.
+#
+# There is deliberately no assertion for hook *commands* in the user config.
+# A global hooks block used to live there and was removed in 8934378f (#210);
+# asserting it would fail every run against a shape the product no longer
+# writes, and a reappearing block is itself a defect -- so its absence is
+# asserted instead.
 e2e_python_tl_assert_codex_trust() {
     local codex_home="$1"
     local child_config="$2"
     local user_config="$codex_home/config.toml"
+    local agent_dir
+    agent_dir="$(dirname "$(dirname "$child_config")")"
 
     if [[ ! -f "$user_config" ]]; then
         printf '  FAIL: isolated Codex user config missing at %s\n' "$user_config" >&2
         return 1
     fi
 
-    grep -Fq '# BEGIN EXOMONAD CODEX HOOKS' "$user_config" \
-        || { printf '  FAIL: %s missing the ExoMonad hooks block\n' "$user_config" >&2; return 1; }
-    grep -Fq 'exomonad hook pre-tool-use --runtime codex' "$user_config" \
-        || { printf '  FAIL: %s missing the PreToolUse hook command\n' "$user_config" >&2; return 1; }
-    grep -Fq 'exomonad hook post-tool-use --runtime codex' "$user_config" \
-        || { printf '  FAIL: %s missing the PostToolUse hook command\n' "$user_config" >&2; return 1; }
-    grep -Fq 'exomonad hook stop --runtime codex' "$user_config" \
-        || { printf '  FAIL: %s missing the Stop hook command\n' "$user_config" >&2; return 1; }
-    grep -Fq "$child_config:pre_tool_use:0:0" "$user_config" \
-        || { printf '  FAIL: %s has no trusted hook state for %s\n' "$user_config" "$child_config" >&2; return 1; }
+    # The three hook events `render_codex_config` emits, and therefore the three
+    # trust entries `install_codex_hook_trust` derives from them.
+    local event
+    for event in pre_tool_use post_tool_use stop; do
+        grep -Fq "[hooks.state.\"$child_config:$event:0:0\"]" "$user_config" \
+            || {
+                printf '  FAIL: %s has no trusted hook state for %s:%s\n' \
+                    "$user_config" "$child_config" "$event" >&2
+                return 1
+            }
+    done
+
+    # A trust entry without a hash proves nothing: Codex keys the trust decision
+    # on the hash, so an entry without one is not a trusted entry.
+    python3 - "$user_config" "$child_config" <<'PY' || return 1
+import sys
+import tomllib
+
+user_config, child_config = sys.argv[1:3]
+with open(user_config, "rb") as handle:
+    config = tomllib.load(handle)
+
+state = config.get("hooks", {}).get("state", {})
+for event in ("pre_tool_use", "post_tool_use", "stop"):
+    entry = state.get(f"{child_config}:{event}:0:0")
+    if not isinstance(entry, dict) or not entry.get("trusted_hash"):
+        raise SystemExit(
+            f"  FAIL: {user_config} has no trusted_hash for {child_config}:{event}:0:0"
+        )
+PY
 
     # Project trust is keyed by the directory the agent runs in, not by the
     # config file, so a child with project trust but no hook trust (or the
     # reverse) is a partial lifecycle write.
-    local agent_dir
-    agent_dir="$(dirname "$(dirname "$child_config")")"
     grep -Fq "[projects.\"$agent_dir\"]" "$user_config" \
-        || { printf '  FAIL: %s has no project trust for %s\n' "$user_config" "$agent_dir" >&2; return 1; }
+        || {
+            printf '  FAIL: %s has no project trust for %s\n' "$user_config" "$agent_dir" >&2
+            return 1
+        }
     grep -Fq 'trust_level = "trusted"' "$user_config" \
-        || { printf '  FAIL: %s does not mark the child project trusted\n' "$user_config" >&2; return 1; }
+        || {
+            printf '  FAIL: %s does not mark the child project trusted\n' "$user_config" >&2
+            return 1
+        }
+
+    # The retired global hooks block. `trust_codex_project` strips it on every
+    # write, so finding one means the user config was edited by a superseded
+    # path and Codex would load hooks ExoMonad never hashed.
+    if grep -Fq '# BEGIN EXOMONAD CODEX HOOKS' "$user_config"; then
+        printf '  FAIL: %s still carries the retired global ExoMonad hooks block\n' \
+            "$user_config" >&2
+        return 1
+    fi
 
     printf '  OK: Codex project + hook trust in %s\n' "$codex_home"
 }
@@ -261,15 +487,30 @@ e2e_python_tl_assert_codex_trust() {
 # to `~/.codex` and the run edits the operator's config. Asserting the session
 # value is therefore a propagation test, not a restatement of the isolation
 # helper.
+#
+# `tmux show-environment` prints `NAME=value`, and prefixes the name with `-`
+# when the variable is *unset* in the session. Both are stripped here: comparing
+# the whole line to the bare path fails against a correctly propagated session,
+# and an unset variable has to be a failure rather than an empty match.
 e2e_python_tl_assert_session_codex_home() {
     local session="$1"
     local expected="$2"
-    local actual
-    actual="$(tmux show-environment -t "$session" CODEX_HOME 2>/dev/null | tail -n 1)"
+    local line value
+    line="$(tmux show-environment -t "$session" CODEX_HOME 2>/dev/null | tail -n 1)"
 
-    if [[ "$actual" != "$expected" ]]; then
+    if [[ -z "$line" ]]; then
+        printf '  FAIL: tmux session %s has no CODEX_HOME entry\n' "$session" >&2
+        return 1
+    fi
+    if [[ "${line:0:1}" == "-" ]]; then
+        printf '  FAIL: tmux session %s has CODEX_HOME explicitly unset\n' "$session" >&2
+        return 1
+    fi
+    value="${line#CODEX_HOME=}"
+
+    if [[ "$value" != "$expected" ]]; then
         printf '  FAIL: tmux session %s CODEX_HOME is %s, expected %s\n' \
-            "$session" "${actual:-unset}" "$expected" >&2
+            "$session" "$value" "$expected" >&2
         return 1
     fi
     printf '  OK: CODEX_HOME propagated into tmux session %s\n' "$session"
