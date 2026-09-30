@@ -43,7 +43,9 @@ even if the run otherwise looked healthy.
 |---|---|
 | CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home |
 | Isolated Codex home | project trust + the three hook-trust entries for the worker config live in `$CODEX_HOME/config.toml`; teardown proves the host config is byte-for-byte unchanged |
-| Hook trust | the shared `# BEGIN EXOMONAD CODEX HOOKS` block and `<worker config>:pre_tool_use:0:0` state are present in the isolated home |
+| Hook commands | the generated `<agent dir>/.codex/config.toml` carries the `pre-tool-use`, `post-tool-use`, and `stop` hook commands; `install_codex_hook_trust` derives its trust entries from exactly those three |
+| Hook trust | `[hooks.state."<worker config>:<event>:0:0"]` with a `trusted_hash` for each event, plus `[projects."<agent dir>"] trust_level = "trusted"`, are present in the isolated home |
+| Retired shape absent | the isolated home does **not** carry a `# BEGIN EXOMONAD CODEX HOOKS` block. That writer was removed in 8934378f (#210) and `trust_codex_project` strips such a block on every write, so finding one means a superseded code path edited the file and Codex would load hooks ExoMonad never hashed |
 | MCP tools + role config | the worker config declares `mcp-stdio --role worker --name <agent>`, `hooks = true`, `approval_policy = "never"`, and the Codex **Worker** Agent Protocol |
 | No retired root model | neither `.codex/config.toml` nor `.exo/agents/root/.codex/config.toml` is generated |
 | Chainlink role workflow | the comment landed on the issue, the session ended, and the completion notification was delivered |

@@ -51,7 +51,9 @@ its interactive root TL.
 |---|---|
 | CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home |
 | Isolated Codex home | project trust + the three hook-trust entries for each Codex agent live in `$CODEX_HOME/config.toml`, and teardown proves the host config is byte-for-byte unchanged |
-| Hook trust | the shared `# BEGIN EXOMONAD CODEX HOOKS` block and `<agent config>:pre_tool_use:0:0` state are present in the isolated home |
+| Hook commands | the generated `<agent dir>/.codex/config.toml` carries the `pre-tool-use`, `post-tool-use`, and `stop` hook commands; `install_codex_hook_trust` derives its trust entries from exactly those three |
+| Hook trust | `[hooks.state."<agent config>:<event>:0:0"]` with a `trusted_hash` for each event, plus `[projects."<agent dir>"] trust_level = "trusted"`, are present in the isolated home |
+| Retired shape absent | the isolated home does **not** carry a `# BEGIN EXOMONAD CODEX HOOKS` block; see `python-tl-worker-notify/e2e-test.md` and the note in `tests/e2e/lib/python-tl.sh` |
 | MCP tools + role config | the worker declares `mcp-stdio --role worker --name codex-messaging-sender-codex`; the peer declares `mcp-stdio --role worker --name codex-messaging-peer`; both carry `hooks = true`, `approval_policy = "never"`, and the Codex **Worker** Agent Protocol |
 | No retired root model | neither `.codex/config.toml` nor `.exo/agents/root/.codex/config.toml` is generated |
 | Messaging | `message.delivery` records a successful `agent_inbox_tmux` injection to the peer, and a successful `notify_parent` delivery to `root` |

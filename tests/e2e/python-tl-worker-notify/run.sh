@@ -95,6 +95,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Own tmux server for this run, so the server's captured environment is this
+# run's. This has to happen before the first `tmux` call below, and before
+# `exomonad init` starts its server. See the helper for why CODEX_HOME
+# depends on it.
+e2e_python_tl_isolate_tmux_server "$WORK_DIR"
+
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 # Isolate Codex before any ExoMonad process starts, and seed the two auth
@@ -205,11 +211,21 @@ set +e
 INIT_STATUS=$?
 set -e
 
-if [[ -f "$RESULT_FILE" ]]; then
-    if grep -Fxq "Failures: 0" "$RESULT_FILE"; then
-        exit 0
-    fi
+# The validator's verdict is the only thing that decides this scenario. `init`
+# exits 0 as soon as it attaches the session, long before the controller reaches
+# a terminal state, so falling back to INIT_STATUS when the result file is
+# absent would report a pass for a run that proved nothing. A missing result
+# file is itself a failure: the validator never reported.
+if [[ ! -f "$RESULT_FILE" ]]; then
+    printf 'ERROR: validator wrote no result file at %s (init exited %d)\n' \
+        "$RESULT_FILE" "$INIT_STATUS" >&2
     exit 1
 fi
 
-exit "$INIT_STATUS"
+if ! grep -Fxq "Failures: 0" "$RESULT_FILE"; then
+    printf 'ERROR: validator reported failures:\n' >&2
+    sed 's/^/  /' "$RESULT_FILE" >&2
+    exit 1
+fi
+
+exit 0

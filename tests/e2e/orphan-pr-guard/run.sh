@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# SUPERSEDED -- targets the retired interactive Codex root TL. See
+# tests/e2e/CODEX-TL-MIGRATION.md.
+#
+# This scenario cannot run against the shipped binary, for three reasons that are
+# all in the harness rather than in the environment:
+#
+#   1. it passes `exomonad init --tl codex`, and `init` has no `--tl` flag
+#      (`rust/exomonad/tests/cli.rs` asserts `init --help` does not contain it);
+#   2. it hands `init` a natural-language `initial_prompt`, and
+#      `write_tl_loop_plan` now rejects anything that is not a JSON `WorkPlan`;
+#   3. it relies on an interactive root TL calling `resume_pr` on an existing
+#      orphan pull request, which a `plan.json` cannot express -- a plan declares
+#      new work, while `resume_pr` is the controller's review-repair path for a
+#      slice the controller itself owns.
+#
+# It is left in place, opt-in and outside every gate, so the boundary it was
+# written to probe stays documented. Re-expressing orphan-PR resume under the
+# Python controller is a separate piece of work; the `--tl` flag and the
+# natural-language prompt are the two bits that prove it cannot run as written.
+#
 # Opt-in live smoke only. The correctness boundary is the deterministic host,
 # service, and WASM coverage from #563 and #564.
 

@@ -43,6 +43,41 @@ if [[ -n "${E2E_PYTHON_TL_HELPER_LOADED:-}" ]]; then
 fi
 E2E_PYTHON_TL_HELPER_LOADED=1
 
+# Point this run at its own tmux server, so the server's captured environment is
+# this run's.
+#
+# `exomonad init` creates the tmux session -- and therefore its first window --
+# before it propagates CODEX_HOME into the session environment
+# (`new_session` at rust/exomonad/src/init.rs, then `set-environment` about a
+# hundred lines later). When a tmux server is already running, which is the normal
+# case for a host with more than one workspace, the new session attaches to it,
+# so the window `init` renames to `Server` and runs `exomonad serve` in keeps the
+# *existing* server's captured CODEX_HOME. The session environment then reads
+# correctly, so `tmux show-environment` passes, while the server and every agent
+# it spawns resolve a different Codex home and seed no hook trust.
+#
+# The mitigation already in `init.rs` describes this failure and is defeated only
+# by the ordering. Giving the run its own server removes the foreign environment
+# entirely: the server starts from this harness's environment and the first
+# window inherits it like every later window. This is the same isolation
+# `tests/e2e/lib/e2e_harness/tmuxio.py` gives the Python acceptances through
+# `TMUX_TMPDIR`.
+#
+# Must run before the first `tmux` call in the script, and before `init`; every
+# `tmux` call in the run inherits TMUX_TMPDIR, so harness cleanup and the
+# validator companion all reach this one server.
+e2e_python_tl_isolate_tmux_server() {
+    local work_dir="$1"
+
+    if [[ "${E2E_PYTHON_TL_TMUX_ISOLATION:-1}" == "0" ]]; then
+        printf '  SKIP: tmux server isolation disabled by E2E_PYTHON_TL_TMUX_ISOLATION=0\n'
+        return 0
+    fi
+    export TMUX_TMPDIR="$work_dir/tmux"
+    mkdir -p "$TMUX_TMPDIR"
+    printf '  OK: tmux server isolated to %s\n' "$TMUX_TMPDIR"
+}
+
 # The run's declared token budget, from the shipped plan.
 e2e_python_tl_plan_token_budget() {
     local plan_path="$1"
