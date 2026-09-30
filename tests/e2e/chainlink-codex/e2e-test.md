@@ -1,45 +1,79 @@
-# E2E Chainlink Codex Test Mode - Root TL Protocol
+# E2E Chainlink Codex — Python TL controller dispatches the Chainlink worker
 
-This is an automated E2E test. Execute the steps below immediately on your first turn. Do not research, browse files, or do unrelated work.
+`exomonad init` does not launch an interactive Codex root TL. The project's root
+controller is `tl_loop`, a bounded Python process that consumes
+`.exo/tl-loop/plan.json` and dispatches Codex children through the ExoMonad MCP
+tools. This scenario is the Chainlink half of the Codex suite under that
+architecture.
 
-You are the root TL in Chainlink Codex test mode. The validator process observes generated Codex configs, Chainlink state, tmux delivery logs, and `.exo/logs`.
-This test is local-only. GitHub auth is intentionally unset. Do not run gh auth status or use gh pr commands.
+## The chain under test
 
-## Do This Now
+```text
+harness (operator)  -> chainlink issue create "E2E chainlink codex worker"   # the issue owner
+plan.json (harness-authored, embeds the issue id)
+  -> Python TL controller (TL window, pane 0)
+       -> spawn_worker chainlink-codex-worker-codex
+            worker: chainlink_session_start
+            worker: chainlink_session_work <issue>
+            worker: chainlink_issue_comment <issue> [CHAINLINK-CODEX-WORKER-COMMENT] ...
+            worker: chainlink_session_end  [CHAINLINK-CODEX-WORKER-DONE] ...
+            worker: notify_parent success
+       -> terminal slice success -> phase `tl_done`
+```
 
-1. Call the ExoMonad chainlink_issue_create MCP tool with:
-   - title: E2E chainlink codex worker
-   - priority: low
-   - labels: e2e,chainlink,codex
-2. Save the returned issue ID.
-3. Spawn exactly one Codex dev leaf with the ExoMonad spawn_codex MCP tool.
-4. Stop and idle after the dev leaf is spawned.
+## Why the issue is created by the harness
 
-## spawn_codex Spec
+The retired scenario had the interactive Codex root TL call
+`chainlink_issue_create` and then `chainlink_issue_close`. Under the shipped
+architecture there is no model in the root position: the Python controller
+never calls a Chainlink tool, and the Chainlink tool matrix
+(`docs/architecture/agent-system.md`) grants `chainlink_issue_create` and
+`chainlink_issue_close` to `root`/`tl` only — never to a worker.
 
-Spawn one Codex dev leaf:
+So the ownership assertion inverts, and becomes stronger. The harness plays the
+role of the human operator that owns the issue; the dispatched Codex worker may
+only *read and comment* on it and may only own a session. The validator proves
+the worker did **not** close the issue and did **not** create a Chainlink lock
+worktree. A worker that closed the issue would be a role-boundary violation
+even if the run otherwise looked healthy.
 
-- branch_name: chainlink-codex-dev
-- task:
+## What the validator asserts
 
-You are a Codex dev leaf in the Chainlink Codex E2E test. Do exactly these steps. The root must include the returned issue ID in this task:
+| Property | How |
+|---|---|
+| CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home |
+| Isolated Codex home | project trust + the three hook-trust entries for the worker config live in `$CODEX_HOME/config.toml`; teardown proves the host config is byte-for-byte unchanged |
+| Hook trust | the shared `# BEGIN EXOMONAD CODEX HOOKS` block and `<worker config>:pre_tool_use:0:0` state are present in the isolated home |
+| MCP tools + role config | the worker config declares `mcp-stdio --role worker --name <agent>`, `hooks = true`, `approval_policy = "never"`, and the Codex **Worker** Agent Protocol |
+| No retired root model | neither `.codex/config.toml` nor `.exo/agents/root/.codex/config.toml` is generated |
+| Chainlink role workflow | the comment landed on the issue, the session ended, and the completion notification was delivered |
+| Chainlink ownership | the issue is still open and no `.chainlink/.locks-cache` worktree exists |
+| Durable controller state | `.exo/tl-loop/root/run.json` records the plan slice and `fsm.phase == "tl_done"` |
 
-1. Call the ExoMonad chainlink_session_status MCP tool.
-2. Call the ExoMonad chainlink_session_start MCP tool.
-3. Call the ExoMonad chainlink_session_work MCP tool with the issue ID supplied in this task.
-4. Call the ExoMonad chainlink_issue_comment MCP tool with that issue ID and this exact message: [CHAINLINK-CODEX-WORKER-COMMENT] Codex worker comment recorded.
-5. Call the ExoMonad chainlink_session_end MCP tool with notes: [CHAINLINK-CODEX-WORKER-DONE] Codex worker session complete.
-6. Call notify_parent with success and this exact message: [CHAINLINK-CODEX-WORKER-DONE] issue ready for root close.
-7. Stop.
+## What was removed and why
 
-5. After the dev leaf success notification, call the ExoMonad chainlink_issue_close MCP tool with the issue ID and summary: [CHAINLINK-CODEX-TL-CLOSE] Codex root close complete.
-6. Stop and idle.
+The retired scenario validated the interactive root TL's own `.codex/config.toml`
+against the "ExoMonad Root TL Protocol" marker, and asserted that the root TL
+closed the issue. Normal Python-controller startup provisions no Codex agent in
+the project root, and the controller holds no Chainlink authority, so both
+assertions described a model the product no longer ships. See
+`python_controller_startup_generates_no_codex_root_tl_config` in
+`rust/exomonad/src/init.rs`.
 
-## Hard Rules
+The retained role-scoped session workflow also drops `chainlink_session_status`,
+which the worker role does not have, and keeps the four calls the matrix grants
+`worker`: `chainlink_session_start`, `chainlink_session_work`,
+`chainlink_issue_comment`, and `chainlink_session_end`.
 
-1. Do not create a team; Codex uses tmux routing, not Claude Teams.
-2. Do not run `gh` commands.
-3. Do not create commits, branches, PRs, or files yourself.
-4. Do not use tools other than the requested ExoMonad MCP tools.
-5. Spawn exactly one Codex dev leaf.
-6. Do not do the dev leaf work yourself.
+## Running it
+
+```bash
+just e2e-chainlink-codex          # live run: needs a real `codex` binary
+just check-e2e-chainlink-codex    # static: bash syntax only
+just check-e2e-python-tl-controller  # the migration contract, no Codex needed
+```
+
+Live runs authenticate a real `codex` against the model, so `run.sh` copies the
+documented auth artifacts into the isolated home. Keep `KEEP_E2E_WORKDIR=1` to
+inspect the generated config, the isolated Codex home, the controller
+checkpoint, and the fixture's Chainlink database after a failure.

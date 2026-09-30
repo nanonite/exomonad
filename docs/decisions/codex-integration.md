@@ -240,6 +240,7 @@ ExoMonad does not inject an auth token or provider-specific environment variable
 - `rust/exomonad-core/src/services/agent_control/internal.rs`
 - `rust/exomonad/src/init.rs`
 - `tests/e2e/codex-messaging/validate.sh`
+- `tests/e2e/lib/python-tl.sh`
 - `haskell/wasm-guest/src/ExoMonad/Guest/Tools/SpawnCodex.hs`
 - `docs/decisions/codex-hook-wire-format.md`
 

@@ -67,8 +67,8 @@ BESPOKE_HARNESSES = (
     "codex-reviewer-sandbox/run.sh",
     "lifecycle/run.sh",
     "orphan-pr-guard/run.sh",
+    "python-tl-worker-notify/run.sh",
     "review-loop-stuck/run.sh",
-    "subtl-worker-notify/run.sh",
     "tl-to-worker-messaging/run.sh",
 )
 
@@ -82,7 +82,7 @@ LIVE_CODEX_HARNESSES = (
     "chainlink",
     "codex-messaging",
     "orphan-pr-guard",
-    "subtl-worker-notify",
+    "python-tl-worker-notify",
     "tl-to-worker-messaging",
 )
 

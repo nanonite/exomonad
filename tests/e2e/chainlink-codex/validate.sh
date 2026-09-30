@@ -1,13 +1,76 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TIMEOUT_SECONDS="${CHAINLINK_CODEX_E2E_TIMEOUT_SECONDS:-480}"
-POLL_SECONDS=5
+# Validator for the Python-TL-driven Chainlink Codex scenario.
+#
+# The Chainlink issue belongs to the harness, not to the dispatched worker: the
+# Python controller holds no Chainlink authority and the worker role is granted
+# neither `chainlink_issue_create` nor `chainlink_issue_close`. So the ownership
+# assertions are negative by design -- the worker comments on the issue and owns
+# a session for it, and the issue is still open afterwards.
+#
+# `--assert-comment <repo> <id>` and `--assert-issue-open <repo> <id>` are
+# re-entry points: a `wait_for` probe runs in a subshell, so the Chainlink reads
+# have to be restartable on their own rather than closing over this shell's
+# locals.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # shellcheck source=../lib/git-fixture.sh
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
+# shellcheck source=../lib/python-tl.sh
+source "$PROJECT_ROOT/tests/e2e/lib/python-tl.sh"
+
+COMMENT_MARKER="[CHAINLINK-CODEX-WORKER-COMMENT]"
+
+# Read the fixture's issue once, as JSON. `--db` is passed explicitly so the
+# assertion never depends on an inherited CHAINLINK_DB from the operator's
+# shell; a validator pointed at the wrong database would pass vacuously.
+issue_document() {
+    chainlink --db "$REPO_DIR/.chainlink" --json issue show "$1" 2>/dev/null
+}
+
+issue_status_is_open() {
+    issue_document "$1" | python3 -c \
+        'import json, sys; raise SystemExit(0 if json.load(sys.stdin)["status"] == "open" else 1)'
+}
+
+issue_has_comment() {
+    issue_document "$1" | python3 -c '
+import json
+import sys
+
+marker = sys.argv[1]
+comments = json.load(sys.stdin).get("comments", [])
+raise SystemExit(0 if any(marker in str(c.get("content", "")) for c in comments) else 1)
+' "$COMMENT_MARKER"
+}
+
+case "${1:-}" in
+    --assert-comment)
+        REPO_DIR="${2:?repo dir required}"
+        issue_has_comment "${3:?issue id required}"
+        exit $?
+        ;;
+    --assert-issue-open)
+        REPO_DIR="${2:?repo dir required}"
+        issue_status_is_open "${3:?issue id required}"
+        exit $?
+        ;;
+esac
+
+REPO_DIR="${1:?repo dir required}"
+SESSION="${2:?tmux session required}"
+RESULT_FILE="${3:?result file required}"
+CODEX_HOME="${4:?isolated codex home required}"
+ISSUE_ID="${5:?chainlink issue id required}"
+
+TIMEOUT_SECONDS="${CHAINLINK_CODEX_E2E_TIMEOUT_SECONDS:-600}"
+POLL_SECONDS=5
+TL_WINDOW="TL"
+WORKER_AGENT="chainlink-codex-worker-codex"
+DONE_MARKER="[CHAINLINK-CODEX-WORKER-DONE]"
+WORKER_PROTOCOL="ExoMonad Worker Agent Protocol"
 
 failures=()
 
@@ -26,7 +89,7 @@ wait_for() {
     local deadline=$((SECONDS + TIMEOUT_SECONDS))
 
     while (( SECONDS < deadline )); do
-        if (eval "$command"); then
+        if bash -c "$command"; then
             log "OK: $label"
             return 0
         fi
@@ -37,145 +100,81 @@ wait_for() {
     return 1
 }
 
-config_has_role() {
-    local config="$1"
-    local expected_role="$2"
-
-    python3 - "$config" "$expected_role" <<'PY'
-import sys
-import tomllib
-
-config_path, expected_role = sys.argv[1:3]
-with open(config_path, "rb") as config_file:
-    config = tomllib.load(config_file)
-
-args = config.get("mcp_servers", {}).get("exomonad", {}).get("args", [])
-try:
-    role = args[args.index("--role") + 1]
-except (ValueError, IndexError):
-    raise SystemExit(1)
-
-raise SystemExit(0 if role == expected_role else 1)
-PY
+check() {
+    local label="$1"
+    shift
+    if "$@"; then
+        log "OK: $label"
+    else
+        record_failure "$label"
+    fi
 }
 
-config_has_mcp_arg() {
-    local config="$1"
-    local expected_role="$2"
-    local expected_name="$3"
-
-    python3 - "$config" "$expected_role" "$expected_name" <<'PY'
-import sys
-import tomllib
-
-config_path, expected_role, expected_name = sys.argv[1:4]
-with open(config_path, "rb") as config_file:
-    config = tomllib.load(config_file)
-
-args = config.get("mcp_servers", {}).get("exomonad", {}).get("args", [])
-expected = ["mcp-stdio", "--role", expected_role, "--name", expected_name]
-raise SystemExit(0 if args == expected else 1)
-PY
+worker_config() {
+    printf '%s/.exo/agents/%s/.codex/config.toml\n' "$REPO_DIR" "$WORKER_AGENT"
 }
 
-find_worktree_config_by_role() {
-    local role="$1"
-    find "$REPO_DIR/.exo/worktrees" -path '*/.codex/config.toml' -print 2>/dev/null \
-        | while IFS= read -r config; do
-            if config_has_role "$config" "$role"; then
-                printf '%s\n' "$config"
-                break
-            fi
-        done
+# Chainlink agents run this scenario's issue in the fixture's own worktree, not
+# in a shared lock checkout. A lock worktree would mean the dispatched worker
+# escaped its own worktree, so its absence is an ownership assertion.
+# shellcheck disable=SC2329  # invoked through check(), which forwards via "$@"
+no_chainlink_lock_worktree() {
+    if git -C "$REPO_DIR" worktree list --porcelain | grep -Fq '.chainlink/.locks-cache'; then
+        return 1
+    fi
+    [[ ! -e "$REPO_DIR/.chainlink/.locks-cache" ]]
 }
 
-find_agent_config_by_role() {
-    local role="$1"
-    find "$REPO_DIR/.exo/agents" -path '*/.codex/config.toml' -print 2>/dev/null \
-        | while IFS= read -r config; do
-            if config_has_role "$config" "$role"; then
-                printf '%s\n' "$config"
-                break
-            fi
-        done
-}
-
-if [[ "${1:-}" == "--find-dev" ]]; then
-    REPO_DIR="${2:?repo dir required}"
-    find_worktree_config_by_role dev
-    exit 0
-fi
-
-REPO_DIR="${1:?repo dir required}"
-SESSION="${2:?tmux session required}"
-RESULT_FILE="${3:?result file required}"
 e2e_git_use_fixture_root "$REPO_DIR"
 
-validate_codex_config() {
-    local label="$1"
-    local config="$2"
-    local role="$3"
-    local agent_name="$4"
-    local instruction_marker="$5"
-
-    grep -Fq 'approval_policy = "never"' "$config" \
-        || record_failure "$label config missing approval_policy"
-    grep -Fq 'hooks = true' "$config" \
-        || record_failure "$label config missing hooks feature"
-    grep -Fq '"mcp-stdio"' "$config" \
-        || record_failure "$label config missing mcp-stdio"
-    config_has_mcp_arg "$config" "$role" "$agent_name" \
-        || record_failure "$label config missing MCP identity role=$role name=$agent_name"
-    grep -Fq "$instruction_marker" "$config" \
-        || record_failure "$label config missing instruction marker"
-
-    [[ ! -f "$(dirname "$config")/hooks.json" ]] \
-        || record_failure "$label should not have per-agent hooks.json"
-}
-
-validate_shared_codex_hooks() {
-    local config="${CODEX_HOME:?CODEX_HOME required}/config.toml"
-
-    grep -Fq '# BEGIN EXOMONAD CODEX HOOKS' "$config" \
-        || record_failure "shared Codex config missing ExoMonad hooks block"
-    grep -Fq 'exomonad hook pre-tool-use --runtime codex' "$config" \
-        || record_failure "shared Codex hooks missing PreToolUse command"
-    grep -Fq 'exomonad hook post-tool-use --runtime codex' "$config" \
-        || record_failure "shared Codex hooks missing PostToolUse command"
-    grep -Fq 'exomonad hook stop --runtime codex' "$config" \
-        || record_failure "shared Codex hooks missing Stop command"
-    grep -Fq "$config:pre_tool_use:0:0" "$config" \
-        || record_failure "shared Codex hooks missing trusted PreToolUse state"
-}
-
 main() {
-    wait_for "shared Codex hook config exists" "[[ -f '${CODEX_HOME:?CODEX_HOME required}/config.toml' ]] && grep -q 'BEGIN EXOMONAD CODEX HOOKS' '${CODEX_HOME:?CODEX_HOME required}/config.toml'"
-    validate_shared_codex_hooks
+    # --- The controller, not an interactive Codex root TL ---
+    wait_for "Python TL controller window exists" \
+        "tmux list-windows -t '$SESSION' -F '#{window_name}' 2>/dev/null | grep -Fxq '$TL_WINDOW'"
+    wait_for "TL plan was consumed into a controller checkpoint" \
+        "test -f '$(e2e_python_tl_run_state "$REPO_DIR")'"
+    check "no retired interactive Codex root TL config" \
+        e2e_python_tl_assert_no_codex_root_tl "$REPO_DIR"
+    check "CODEX_HOME propagated into the tmux session" \
+        e2e_python_tl_assert_session_codex_home "$SESSION" "$CODEX_HOME"
 
-    wait_for "root Codex config exists" "[[ -f '$REPO_DIR/.codex/config.toml' ]]"
-    validate_codex_config "root" "$REPO_DIR/.codex/config.toml" "root" "root" "ExoMonad Root TL Protocol"
+    # --- The dispatched Codex child ---
+    wait_for "Codex worker config exists" "test -f '$(worker_config)'"
+    check "Codex worker config is role-correct" \
+        e2e_python_tl_assert_codex_child_config \
+        "$(worker_config)" "chainlink worker" "worker" "$WORKER_AGENT" "$WORKER_PROTOCOL"
+    check "Codex worker trust is in the isolated home" \
+        e2e_python_tl_assert_codex_trust "$CODEX_HOME" "$(worker_config)"
 
+    # --- Chainlink role workflow on a foreign issue ---
+    wait_for "worker Chainlink comment landed on the issue" \
+        "bash '$0' --assert-comment '$REPO_DIR' '$ISSUE_ID'"
+    wait_for "worker Chainlink session completion recorded" \
+        "grep -R '$DONE_MARKER' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
+    wait_for "worker notify_parent reached the controller" \
+        "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep '\"recipient\":\"root\"' | grep '\"outcome\":\"success\"' | grep -q ."
 
-    wait_for "Codex dev leaf worktree config exists" "[[ -n \"\$(bash '$0' --find-dev '$REPO_DIR')\" ]]"
-    dev_config="$(find_worktree_config_by_role dev || true)"
-    if [[ -z "$dev_config" ]]; then
-        record_failure "could not locate dev leaf config after wait"
-    else
-        dev_agent="$(basename "$(dirname "$(dirname "$dev_config")")")"
-        validate_codex_config "dev leaf" "$dev_config" "dev" "$dev_agent" "Dev Agent Protocol"
-    fi
+    # --- Chainlink ownership: the worker did not take the issue over ---
+    # Checked after the workflow above, so a worker that closed the issue on its
+    # way out is caught rather than being masked by the issue's initial state.
+    check "Chainlink issue is still open" \
+        bash "$0" --assert-issue-open "$REPO_DIR" "$ISSUE_ID"
+    check "no Chainlink lock worktree was created" no_chainlink_lock_worktree
 
-    wait_for "dev leaf Chainlink comment recorded" "grep -R 'CHAINLINK-CODEX-WORKER-COMMENT' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q . || (cd '$REPO_DIR' && chainlink list --json --status all | grep -Fq 'CHAINLINK-CODEX-WORKER-COMMENT')"
-    wait_for "dev leaf Chainlink issue closed" "cd '$REPO_DIR' && chainlink list --json --status closed | grep -Fq 'E2E chainlink codex worker'"
-    wait_for "dev leaf session completion notification recorded" "grep -R 'CHAINLINK-CODEX-WORKER-DONE' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
-    wait_for "root Chainlink issue close recorded" "grep -R 'CHAINLINK-CODEX-TL-CLOSE' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q . || (cd '$REPO_DIR' && chainlink list --json --status closed | grep -Fq 'E2E chainlink codex worker')"
-    wait_for "dev leaf notify_parent tmux delivery succeeded" "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep 'chainlink-codex-dev-codex' | grep 'main' | grep 'tmux_routing' | grep 'outcome=\"success\"' | grep -q ."
-    wait_for "Chainlink lock worktree not created" "cd '$REPO_DIR' && ! git worktree list --porcelain | grep -Fq '.chainlink/.locks-cache' && [[ ! -e '$REPO_DIR/.chainlink/.locks-cache' ]]"
+    # --- Durable controller state ---
+    wait_for "controller reached a terminal phase" \
+        "python3 -c \"import json, sys; sys.exit(0 if json.load(open('$(e2e_python_tl_run_state "$REPO_DIR")'))['fsm']['phase'] in ('tl_done', 'tl_parked', 'tl_failed') else 1)\""
+    check "plan slice is present in the checkpoint" \
+        e2e_python_tl_assert_slices "$REPO_DIR" "$WORKER_AGENT"
+    check "controller reached the expected terminal phase" \
+        e2e_python_tl_assert_phase "$REPO_DIR" "tl_done"
 
     {
         printf 'Chainlink Codex E2E validation completed at %s\n' "$(date -Iseconds)"
         printf 'Session: %s\n' "$SESSION"
         printf 'Repo: %s\n' "$REPO_DIR"
+        printf 'Codex home: %s\n' "$CODEX_HOME"
+        printf 'Issue: #%s\n' "$ISSUE_ID"
         printf 'Failures: %s\n' "${#failures[@]}"
         for failure in "${failures[@]}"; do
             printf -- '- %s\n' "$failure"

@@ -12,11 +12,12 @@ that no longer represent the review source of truth.
 | `messaging/` | Keep for now | The companion is the message recipient under test; replacing it needs a dedicated non-LLM inbox observer so the test still covers live delivery to a companion. |
 | `hook-rewrite/` | Keep for now | The companion validates OpenCode hook rewriting from the fixture output. It is not polling overwritten review state, but should be migrated to a process validator under the broader harness redesign. |
 | `codex-messaging/` | No LLM testrunner | Uses a process validator companion (`codex-messaging-validator`). |
+| `python-tl-worker-notify/` | No LLM testrunner | Uses a process validator companion (`python-tl-worker-notify-validator`). Renamed from the sub-TL worker notify scenario under Chainlink #1127, when the driving agent became the Python TL controller. |
 | `opencode-tl/` | Keep for now | The companion is the direct `send_message` target used to validate OpenCode-to-Teams delivery. |
 | `opencode-worker/` | Keep for now | The companion observes worker completion and message routing. It should be converted with the other legacy Claude testrunners. |
 | `chainlink/` | Keep for now | The companion validates the MCP tool result through Chainlink CLI and CHANGELOG state. |
 | `chainlink-close/` | Keep for now | The companion validates issue close behavior and generated CHANGELOG state. |
-| `chainlink-codex/` | No LLM testrunner | Uses a process validator companion (`chainlink-codex-validator`). |
+| `chainlink-codex/` | No LLM testrunner | Uses a process validator companion (`chainlink-codex-validator`). The companion is unchanged by Chainlink #1127; the harness it belongs to is now driven by `plan.json` instead of an interactive Codex root TL. |
 | `chainlink-timer-role-scope/` | No LLM testrunner | Uses a shell validator recipe, not an LLM companion. |
 
 ## Follow-up

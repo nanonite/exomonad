@@ -1,0 +1,15 @@
+{
+  "run_id": "root",
+  "budgets": { "tokens": 120000, "wall_seconds": 1800 },
+  "plan": {
+    "workers": [
+      {
+        "name": "python-tl-worker-notify-worker",
+        "agent_type": "codex",
+        "task": "You are a Codex worker dispatched by the ExoMonad Python TL controller for the worker notify E2E. Do exactly these steps, in order.\n\n1. Call the ExoMonad `notify_parent` MCP tool with status `success` and this exact message: [PYTHON-TL-WORKER-NOTIFY] Codex worker notify_parent reached the Python TL controller.\n2. Stop.\n\nDo not inspect files, run shell commands, search the repository, or ask for permission."
+      }
+    ],
+    "leaves": [],
+    "sub_tls": []
+  }
+}

@@ -2,10 +2,15 @@
 set -euo pipefail
 
 # E2E Chainlink Codex Test
-# Validates root Codex + Codex dev leaf Chainlink MCP flow:
-#   root creates the issue
-#   dev leaf marks session work, comments, ends session
-#   root closes the issue after dev leaf notify_parent
+# The Python TL controller consumes .exo/tl-loop/plan.json and dispatches one
+# Codex worker. The worker runs the Chainlink session workflow that the worker
+# role is granted (session_start, session_work, issue_comment, session_end) on
+# an issue it does not own, then notifies the controller.
+#
+# There is no interactive Codex root TL and no TL prompt: root_agent_type is
+# ignored by init and initial_prompt, if set, must be a JSON WorkPlan. The
+# issue owner is the harness, because the controller holds no Chainlink
+# authority and the worker role cannot create or close issues.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -14,6 +19,8 @@ PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
 # shellcheck source=../lib/codex-home.sh
 source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
+# shellcheck source=../lib/python-tl.sh
+source "$PROJECT_ROOT/tests/e2e/lib/python-tl.sh"
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -29,15 +36,17 @@ else
 fi
 echo "  exomonad: $EXOMONAD_BIN"
 
-for cmd in codex chainlink tmux git python3; do
-    if ! command -v "$cmd" &>/dev/null; then
-        echo "ERROR: $cmd not found in PATH."
-        exit 1
-    fi
-done
+if ! command -v codex &>/dev/null; then
+    echo "ERROR: codex binary not found in PATH."
+    exit 1
+fi
 echo "  codex: $(command -v codex)"
+
+if ! command -v chainlink &>/dev/null; then
+    echo "ERROR: chainlink binary not found in PATH."
+    exit 1
+fi
 echo "  chainlink: $(command -v chainlink)"
-echo "  tmux, git, python3: OK"
 
 if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm &>/dev/null; then
     echo "ERROR: No WASM plugins found in $PROJECT_ROOT/.exo/wasm/. Run 'just wasm-all'."
@@ -45,14 +54,18 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
 
-for tool in chainlink_issue_create chainlink_session_status chainlink_session_start chainlink_session_work chainlink_issue_comment chainlink_session_end chainlink_issue_close spawn_codex; do
-    if grep -q "$tool" "$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm" 2>/dev/null; then
-        echo "  MCP tool '$tool': FOUND"
-    else
-        echo "ERROR: MCP tool '$tool' missing from WASM binary."
+for cmd in tmux git python3; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: $cmd not found in PATH."
         exit 1
     fi
 done
+echo "  tmux, git, python3: OK"
+
+python3 -c "import tomllib" 2>/dev/null || {
+    echo "ERROR: python3 tomllib not available (need Python 3.11+)."
+    exit 1
+}
 
 echo ">>> [Phase 1] Creating temp environment..."
 
@@ -63,6 +76,9 @@ SESSION="e2e-chainlink-codex"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
+ISSUE_TITLE="E2E chainlink codex worker"
+CHAINLINK_DB="$REPO_DIR/.chainlink"
+export CHAINLINK_DB
 
 echo "  Work dir: $WORK_DIR"
 
@@ -120,11 +136,6 @@ if ! "$EXOMONAD_BIN" new 2>&1 | sed 's/^/  /'; then
     exit 1
 fi
 
-if ! chainlink init 2>&1 | sed 's/^/  /'; then
-    echo "ERROR: chainlink init failed during E2E setup."
-    exit 1
-fi
-
 mkdir -p .exo/wasm
 for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
     ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
@@ -134,41 +145,66 @@ if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
     cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
 fi
 
-ROOT_PROMPT="$(python3 - "$SCRIPT_DIR/e2e-test.md" <<'PY'
+# The harness is the issue owner. The controller holds no Chainlink authority
+# and the worker role is granted neither create nor close, so the dispatched
+# Codex child can only comment on and own a session for this issue.
+chainlink init >/dev/null 2>&1 || {
+    echo "ERROR: 'chainlink init' failed during E2E setup."
+    exit 1
+}
+# `issue create` prints the id on stdout rather than JSON, so parse that. Only
+# one call, or the fixture would end up with a second stray issue.
+ISSUE_ID="$(chainlink issue create "$ISSUE_TITLE" -p low -l e2e -l chainlink -l codex \
+    | sed -n 's/.*#\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+if [[ -z "${ISSUE_ID:-}" ]]; then
+    echo "ERROR: could not determine the Chainlink issue id."
+    exit 1
+fi
+echo "  Chainlink issue: #$ISSUE_ID ($ISSUE_TITLE)"
+
+# The controller's only input is plan.json, and the worker's task has to name
+# the issue it is allowed to work on, so the single placeholder is rendered
+# with the id the harness just created.
+mkdir -p .exo/tl-loop
+ISSUE_ID="$ISSUE_ID" python3 - "$SCRIPT_DIR/plan.json" .exo/tl-loop/plan.json <<'PY'
+import os
 import pathlib
 import sys
 
-value = pathlib.Path(sys.argv[1]).read_text()
-print(value.replace('"""', '\\"\\"\\"'))
+placeholder = "{{CHAINLINK_ISSUE_ID}}"
+plan = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+if plan.count(placeholder) != 1:
+    raise SystemExit(
+        f"plan.json must contain exactly one {placeholder} placeholder, "
+        f"found {plan.count(placeholder)}"
+    )
+rendered = plan.replace(placeholder, os.environ["ISSUE_ID"])
+if "{{" in rendered or "}}" in rendered:
+    raise SystemExit("rendered plan.json still contains an unrendered placeholder")
+pathlib.Path(sys.argv[2]).write_text(rendered, encoding="utf-8")
 PY
-)"
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' .exo/tl-loop/plan.json \
+    || { echo "ERROR: rendered plan.json is not valid JSON."; exit 1; }
 
 cat > .exo/config.toml <<EOF
 default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
 tmux_session = "$SESSION"
-root_agent_type = "codex"
 spawn_agent_type = "codex"
 yolo = true
 poll_interval = 5
-initial_prompt = """
-$ROOT_PROMPT
-"""
 
 [[companions]]
 name = "chainlink-codex-validator"
 agent_type = "process"
-command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE'"
+command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE' '$CODEX_HOME' '$ISSUE_ID'"
 EOF
 
-cat > "$CODEX_HOME/config.toml" <<EOF
-[projects."$REPO_DIR"]
-trust_level = "trusted"
-
-[projects."$REPO_DIR/.exo/worktrees/chainlink-codex-dev-codex"]
-trust_level = "trusted"
-EOF
+# `spawn_worker` refuses a dirty worktree, and `init` writes `.mcp.json` and
+# `.claude/rules/exomonad.md` after this point. Ignore and commit them so the
+# controller can actually dispatch its first worker.
+e2e_python_tl_commit_scaffold "$REPO_DIR" "Configure Chainlink Codex fixture for the Python TL controller"
 
 echo "  Repo: $REPO_DIR"
 echo "  Remote: $REMOTE_DIR"
@@ -180,7 +216,7 @@ unset FORGEJO_TOKEN
 unset FORGEJO_API_URL
 e2e_codex_assert_home_is_run_scoped
 export EXOMONAD_LOG_FORMAT=""
-echo "  GitHub auth unset"
+echo "  Forgejo auth unset"
 echo "  Codex config isolated to $CODEX_HOME"
 
 echo ">>> [Phase 3] Launching exomonad init..."
@@ -189,11 +225,14 @@ echo "============================================"
 echo "  E2E Chainlink Codex Test Ready"
 echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
+echo "  Issue: #$ISSUE_ID"
 echo ""
 echo "  Chain under test:"
-echo "    Codex root -> chainlink_issue_create + spawn_codex"
-echo "    Codex dev leaf -> session_work + comment + session_end"
-echo "    Codex dev leaf -> notify_parent, then root closes issue"
+echo "    harness (operator) owns the Chainlink issue"
+echo "    Python TL controller -> Codex worker"
+echo "    worker Chainlink session workflow on a foreign issue"
+echo "    worker notify_parent -> controller"
+echo "    the issue must still be open afterwards"
 echo "============================================"
 echo ""
 

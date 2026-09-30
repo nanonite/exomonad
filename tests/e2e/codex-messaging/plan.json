@@ -1,0 +1,15 @@
+{
+  "run_id": "root",
+  "budgets": { "tokens": 120000, "wall_seconds": 1800 },
+  "plan": {
+    "workers": [
+      {
+        "name": "codex-messaging-sender",
+        "agent_type": "codex",
+        "task": "You are a Codex worker dispatched by the ExoMonad Python TL controller for the Codex messaging E2E. You have one peer Codex agent: the companion `codex-messaging-peer`. Do exactly these steps, in order.\n\n1. Wait 30 seconds so the controller can finish dispatching and the peer companion window can come up. Do not inspect files, run shell commands, search the repository, or ask for permission.\n2. Call the ExoMonad `send_tmux_message` MCP tool with recipient `codex-messaging-peer`, summary `Codex worker to Codex peer tmux messaging E2E`, and this exact content: [CODEX-MSG-WORKER-TO-PEER] Codex worker to Codex peer tmux delivery test. You are now seeing the injected message. Do not inspect files, run shell commands, search the repository, or ask for permission.\n3. If that call reports a failure, wait 10 seconds and retry it. Give up after three attempts.\n4. Call the ExoMonad `notify_parent` MCP tool with status `success` and this exact message: [CODEX-MSG-SENDER-DONE] Codex worker delivered the tmux message to its peer and reported to the Python TL controller.\n5. Stop."
+      }
+    ],
+    "leaves": [],
+    "sub_tls": []
+  }
+}
