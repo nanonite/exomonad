@@ -275,6 +275,25 @@ without remote deletion requires only --allow-no-pr. Dirty no-PR cleanup
 additionally requires --discard-dirty, and remote deletion still requires its
 own explicit confirmation.
 
+Codex hook trust for a worktree that no longer exists is a separate concern, and
+a separate command. When an ExoMonad worktree is deleted, or an e2e run's cache
+directory is thrown away, its `[hooks.state]` entries outlive it in the Codex
+user config. `exomonad codex-prune-trust` inspects that residue and reclaims
+only what it can prove it wrote — exact key shape, absent config, and a digest
+it recomputes for an attested ExoMonad binary. It is a dry run unless --apply is
+supplied, and it is never run from init or spawn:
+
+```bash
+exomonad codex-prune-trust                                    # dry run, prints the plan and every gate reason
+exomonad codex-prune-trust --apply                            # remove only the proven entries
+exomonad codex-prune-trust --expect-binary /old/install/bin/exomonad  # attest a build that no longer exists
+exomonad codex-prune-trust --user-config <path>               # inspect a different Codex home
+```
+
+Entries it cannot account for are preserved and reported rather than guessed
+at. See [Codex Integration](docs/decisions/codex-integration.md) for the
+evidence rules and the deleted-worktree and old-e2e-cache recovery paths.
+
 Afterwards, the run is measurable rather than merely reviewable. The controller's own decisions — gates opened and answered, slices parked and why, merge decisions, RLM judgment retries — land in the same append-only ledger as agent and PR activity:
 
 ```bash

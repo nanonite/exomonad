@@ -79,6 +79,49 @@ ExoMonad retains project trust until it records ownership of the entry at instal
 
 Removal is never triggered by process exit. Dormant `resume_pr` owners keep their trust; removal belongs to verified permanent resource disposal and to explicit operator-initiated maintenance.
 
+### Historical Trust Residue Is Reclaimed By Proof, Not By Sweep
+
+Live removal needs the generated config to recompute its hashes, so it cannot help once a worktree is gone. Deleting `.exo/worktrees/<name>` by hand, an e2e run whose cache directory was thrown away, or a `git worktree remove` all leave `[hooks.state]` entries behind whose config no longer exists. Those entries still make Codex trust a hook that can no longer run, and they accumulate.
+
+`exomonad codex-prune-trust` is how an operator reclaims them. It is an explicit maintenance command, not part of any lifecycle: `init` and `spawn` never call it, so a running ExoMonad never removes trust on its own initiative. A dry run is the default and prints the plan; nothing is written without `--apply`.
+
+Ownership is re-proved, never inferred from a path pattern. An entry is a candidate only when all of these hold:
+
+- **ExoMonad's exact key shape.** `<absolute generated config path>:<event label>:0:0`, where the event label is one of `pre_tool_use`, `post_tool_use`, or `stop`, the handler indexes are the `0:0` ExoMonad always writes, and the path is exactly `<agent dir>/.codex/config.toml`. A `.codex/config.toml` suffix alone proves nothing; the suffix only narrows what is even considered. A key with a different event label, a different handler index, a different filename, or a relative path is not a candidate at all and is counted, never inspected.
+- **The config is gone.** Nothing exists at that path — file, directory, or symlink, checked with `symlink_metadata` so a dangling symlink counts as present. A config that is still there is live trust whose owner can still be recomputed from the config itself, so it is gated and the operator is pointed at the live removal path.
+- **A recomputed digest match.** The recorded `trusted_hash` equals the digest `canonical_hook_trust_hashes` produces today for one of the explicitly attested ExoMonad binaries, for the event the key names. That digest is a SHA-256 over ExoMonad's own canonical serialization of `<binary> hook <event> --runtime codex`, so it can only have been written by ExoMonad rendering exactly that binary. The binary path is hashed verbatim, so a different spelling of the same installation is different evidence.
+
+The attested binaries are the running ExoMonad plus any `--expect-binary` paths. The path is part of the hashed command, so a residue left by a build that no longer exists on disk needs its old path attested explicitly; without it the entry is gated with `NoAttestedBinary` rather than guessed at. `canonical_hook_trust_hashes` and the generated-config template are pinned together by a test, so the reduced renderer maintenance uses cannot drift from the config installation actually writes.
+
+Everything that fails a gate is preserved and reported with its reason: an unreadable record, a record carrying fields beyond `trusted_hash`, a digest that is not a lowercase `sha256:` hex digest, a config that still exists, or a digest no attested binary reproduces. `UnreadableRecord` and `ExtraRecordFields` are the ambiguous cases — a record ExoMonad cannot account for field-by-field is not a record it will delete on a guess.
+
+The apply reuses the live removal primitive with the plan's proven keys, so it runs under the same `.exomonad-config.lock` sidecar flock and atomic writer, re-checks each digest under that lock, and prunes the empty `[hooks.state]` only when it emptied the table itself. Unrelated keys, unrelated projects, and the operator's own hooks survive up to the existing `toml::to_string_pretty` writer contract. Repeating a completed run is a byte-identical no-op.
+
+It is deliberately not part of `exomonad clean`. `clean` is scoped to one project's managed agent resources and runs through the authenticated control API; the residue this command reclaims lives in a Codex *user* config that no project server owns — the operator's own `~/.codex/config.toml`, or a `CODEX_HOME` an e2e run left behind.
+
+#### Recovery: deleted ExoMonad worktrees
+
+The worktree is gone but the trust entry remains. The config path in the key is what ExoMonad needs to have generated the digest, and that path is already in the key, so:
+
+```bash
+exomonad codex-prune-trust                                   # dry run, prints the plan
+exomonad codex-prune-trust --apply                           # remove what it proved
+```
+
+If nothing is provable, the digest names a build that is no longer installed. Attest that build's path — any path that was spelled into its generated hook command — and re-run:
+
+```bash
+exomonad codex-prune-trust --expect-binary /old/install/bin/exomonad
+```
+
+Inspect a different Codex home with `--user-config <path>`.
+
+#### Recovery: old e2e cache paths
+
+Before `tests/e2e/lib/codex-home.sh` isolated `CODEX_HOME` per run, e2e runs seeded the *host* `~/.codex/config.toml` with entries naming their throwaway work directories under `~/.cache/exomonad-e2e/<run>/…`. Those directories are usually gone, so the entries are ordinary historical residue and the commands above reclaim them. This is the one case where the attested binary is usually an older build than the one running, since the entries predate isolation.
+
+Current runs do not produce this residue: `e2e_isolate_codex_home` points `CODEX_HOME` at the run's own directory before any ExoMonad process starts, and `e2e_codex_assert_host_config_unchanged` proves by digest that the host config is untouched. A harness that exports a `CODEX_HOME` outside its work dir fails `e2e_codex_assert_home_is_run_scoped`, so an unisolated run cannot silently recur.
+
 ### Disposal Claims the Trust Before It Destroys the Proof
 
 The generated config that proves ownership lives inside the very directory a permanent disposal destroys, so verified disposal is a two-step contract in `codex_lifecycle`:
@@ -192,6 +235,7 @@ ExoMonad does not inject an auth token or provider-specific environment variable
 ## Related Code
 
 - `rust/exomonad-core/src/codex_config.rs`
+- `rust/exomonad-core/src/codex_trust_maintenance.rs`
 - `rust/exomonad-core/src/services/agent_control/codex_lifecycle.rs`
 - `rust/exomonad-core/src/services/agent_control/internal.rs`
 - `rust/exomonad/src/init.rs`

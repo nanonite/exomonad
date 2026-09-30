@@ -378,12 +378,12 @@ fn remove_owned_candidate(
 }
 
 /// What a `[hooks.state]` entry claims, without judging whether ExoMonad owns it.
-enum RecordedHookTrust {
+pub(crate) enum RecordedHookTrust {
     Hash(String),
     Unreadable(String),
 }
 
-fn recorded_hook_trust(entry: &toml::Value) -> RecordedHookTrust {
+pub(crate) fn recorded_hook_trust(entry: &toml::Value) -> RecordedHookTrust {
     let Some(table) = entry.as_table() else {
         return RecordedHookTrust::Unreadable(format!(
             "entry is {} instead of a table with a trusted_hash string",
@@ -579,6 +579,105 @@ fn escape_toml_quoted_key(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// One Codex hook ExoMonad generates.
+///
+/// A single table drives every place that has to agree about the three events
+/// ExoMonad seeds trust for: the generated config template, the hook specs the
+/// `trusted_hash` is computed from, and the historical-residue key parser. Two
+/// lists that could drift would let maintenance prune keys installation never
+/// wrote, so they are one list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CodexHookEvent {
+    /// The `[hooks.<event_name>]` table ExoMonad writes into a generated config.
+    pub(crate) event_name: &'static str,
+    /// The label Codex uses inside a `[hooks.state]` key for this event.
+    pub(crate) event_label: &'static str,
+    /// The hook subcommand ExoMonad renders into the generated command.
+    pub(crate) command: &'static str,
+    /// The matcher group ExoMonad writes, or `None` when it writes no matcher.
+    pub(crate) matcher: Option<&'static str>,
+}
+
+pub(crate) const CODEX_HOOKS: [CodexHookEvent; 3] = [
+    CodexHookEvent {
+        event_name: "PreToolUse",
+        event_label: "pre_tool_use",
+        command: "pre-tool-use",
+        matcher: Some("*"),
+    },
+    CodexHookEvent {
+        event_name: "PostToolUse",
+        event_label: "post_tool_use",
+        command: "post-tool-use",
+        matcher: Some("*"),
+    },
+    CodexHookEvent {
+        event_name: "Stop",
+        event_label: "stop",
+        command: "stop",
+        matcher: None,
+    },
+];
+
+/// One event's `trusted_hash` ExoMonad generates for a config rendered around a
+/// specific `exomonad` binary, independent of which project config it wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct CanonicalHookTrustHash {
+    /// The `[hooks.state]` key event label this hash belongs to.
+    pub event_label: String,
+    /// The `sha256:…` digest ExoMonad writes for that event.
+    pub trusted_hash: String,
+}
+
+/// The `trusted_hash` ExoMonad generates today for each of its three hook
+/// events, for a config rendered around `exomonad_binary`.
+///
+/// This is the proof an operator needs when the generated config is *gone*: the
+/// recorded digest is ExoMonad's own canonical serialization of
+/// `<binary> hook <event> --runtime codex`, so a `[hooks.state]` entry whose
+/// `trusted_hash` equals one of these values could only have been written by
+/// ExoMonad rendering that binary. The binary path is compared as spelled —
+/// it goes into the hashed command verbatim, so `/usr/local/bin/exomonad` and
+/// `/usr/local/./bin/exomonad` are different evidence.
+pub fn canonical_hook_trust_hashes(
+    exomonad_binary: &Path,
+) -> std::io::Result<Vec<CanonicalHookTrustHash>> {
+    let config = canonical_hook_config(exomonad_binary);
+    codex_hook_specs(&config)?
+        .iter()
+        .map(|spec| {
+            Ok(CanonicalHookTrustHash {
+                event_label: spec.event_label.to_string(),
+                trusted_hash: compute_codex_hook_hash(spec)?,
+            })
+        })
+        .collect()
+}
+
+/// The generated hook block alone, for `exomonad_binary`.
+///
+/// A hook trust hash covers the hook specs and nothing else, so reproducing
+/// just the hook tables is enough to recompute it. The
+/// `canonical_hook_trust_hashes_agree_with_the_generated_config` test pins this
+/// renderer to [`CODEX_CONFIG_TEMPLATE`], which is what actually gets written.
+fn canonical_hook_config(exomonad_binary: &Path) -> String {
+    let exomonad_binary = exomonad_binary.display().to_string();
+    let command_prefix = crate::util::shell_quote(&exomonad_binary);
+    let mut config = String::new();
+    for event in CODEX_HOOKS {
+        config.push_str(&format!("[[hooks.{}]]\n", event.event_name));
+        if let Some(matcher) = event.matcher {
+            config.push_str(&format!("matcher = \"{matcher}\"\n"));
+        }
+        config.push_str(&format!(
+            "[[hooks.{}.hooks]]\ntype = \"command\"\ncommand = \"{command_prefix} hook {} \
+             --runtime codex\"\ntimeout = {CODEX_HOOK_TIMEOUT_SEC}\nasync = false\n",
+            event.event_name, event.command
+        ));
+    }
+    config
+}
+
 #[derive(Debug)]
 struct CodexHookSpec {
     event_label: &'static str,
@@ -621,14 +720,10 @@ enum HookHandlerConfig {
 
 fn codex_hook_specs(config: &str) -> std::io::Result<Vec<CodexHookSpec>> {
     let root: toml::Value = toml::from_str(config).map_err(to_io_invalid_data)?;
-    [
-        ("PreToolUse", "pre_tool_use"),
-        ("PostToolUse", "post_tool_use"),
-        ("Stop", "stop"),
-    ]
-    .into_iter()
-    .map(|(event_name, event_label)| codex_hook_spec(&root, event_name, event_label))
-    .collect()
+    CODEX_HOOKS
+        .iter()
+        .map(|event| codex_hook_spec(&root, event.event_name, event.event_label))
+        .collect()
 }
 
 fn codex_hook_spec(
@@ -725,7 +820,7 @@ fn canonical_json(value: Value) -> Value {
     }
 }
 
-fn parse_user_config(existing: &str) -> std::io::Result<toml::Value> {
+pub(crate) fn parse_user_config(existing: &str) -> std::io::Result<toml::Value> {
     if existing.trim().is_empty() {
         Ok(toml::Value::Table(toml::map::Map::new()))
     } else {
@@ -762,7 +857,7 @@ fn ensure_table(value: &mut toml::Value) -> &mut toml::map::Map<String, toml::Va
 /// would destroy configuration ExoMonad cannot interpret. A `hooks` value that
 /// is not a table at all (for example `[[hooks.Stop]]` groups) simply has no
 /// state table, so it is left alone rather than treated as an error.
-fn hooks_state_table_for_removal<'a>(
+pub(crate) fn hooks_state_table_for_removal<'a>(
     user_config_path: &Path,
     root: &'a mut toml::Value,
 ) -> std::io::Result<Option<&'a mut toml::map::Map<String, toml::Value>>> {
@@ -1538,6 +1633,56 @@ mod tests {
             )])),
         );
         std::fs::write(user_config_path, toml::to_string_pretty(&parsed).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn canonical_hook_trust_hashes_match_the_digests_a_generated_config_installs() {
+        // The historical-residue proof recomputes digests from the hooks alone.
+        // If the template and that reduced renderer ever drift, maintenance would
+        // prove entries ExoMonad never wrote, so they are pinned together here.
+        let config_path = Path::new("/tmp/exomonad-canonical/repo/.codex/config.toml");
+        let config = render_codex_config(
+            "worker-1-codex",
+            "dev",
+            "Use ExoMonad tools.",
+            None,
+            &HashMap::new(),
+            test_exomonad_binary(),
+            test_project_root(),
+        );
+
+        let canonical = canonical_hook_trust_hashes(test_exomonad_binary())
+            .expect("canonical digests recompute");
+        let installed =
+            owned_hook_trust_keys_for_config(config_path, &config).expect("owned keys derive");
+
+        assert_eq!(canonical.len(), installed.len());
+        for hash in &canonical {
+            let suffix = format!(":{}:0:0", hash.event_label);
+            let installed = installed
+                .iter()
+                .find(|owned| owned.key.ends_with(&suffix))
+                .unwrap_or_else(|| panic!("{} is installed", hash.event_label));
+            assert_eq!(installed.trusted_hash, hash.trusted_hash);
+        }
+    }
+
+    #[test]
+    fn a_canonical_digest_differs_per_exomonad_binary_path() {
+        // The attested path is hashed verbatim, so a proof can never be
+        // satisfied by a different spelling of the same installation.
+        let installed = canonical_hook_trust_hashes(test_exomonad_binary()).unwrap();
+        let other = canonical_hook_trust_hashes(Path::new("/opt/other/bin/exomonad")).unwrap();
+
+        assert_ne!(installed[0].trusted_hash, other[0].trusted_hash);
+        assert_eq!(
+            installed
+                .iter()
+                .map(|hash| hash.event_label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pre_tool_use", "post_tool_use", "stop"],
+            "one digest per event ExoMonad seeds, in the canonical order"
+        );
     }
 
     #[test]

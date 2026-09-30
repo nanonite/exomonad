@@ -8,6 +8,7 @@
 
 mod app_state;
 mod clean;
+mod codex_prune_trust;
 mod control;
 mod control_cleanup;
 mod control_gate;
@@ -63,6 +64,14 @@ struct Cli {
 enum Commands {
     /// Inspect or safely clean stale managed-agent resources through the server.
     Clean(clean::CleanArgs),
+
+    /// Inspect and reclaim historical ExoMonad Codex hook trust residue.
+    ///
+    /// A dry run by default: it lists the exact `[hooks.state]` keys whose
+    /// ownership it can re-prove against an attested ExoMonad binary, and every
+    /// entry it refuses to claim with the reason. Nothing is written without
+    /// `--apply`. Never run from init or spawn.
+    CodexPruneTrust(codex_prune_trust::CodexPruneTrustArgs),
 
     /// Handle a Claude Code hook event (thin HTTP client → server)
     Hook {
@@ -538,6 +547,10 @@ async fn main() -> Result<()> {
 
         Commands::Clean(args) => {
             return clean::run(args).await;
+        }
+
+        Commands::CodexPruneTrust(args) => {
+            return codex_prune_trust::run(args);
         }
 
         Commands::Init {
