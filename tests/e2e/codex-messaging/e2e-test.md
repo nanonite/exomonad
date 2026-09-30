@@ -49,7 +49,7 @@ its interactive root TL.
 
 | Property | How |
 |---|---|
-| CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home |
+| CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home. The run also gets its own tmux server (`e2e_python_tl_isolate_tmux_server`, on by default), because `exomonad init` propagates `CODEX_HOME` only *after* creating the session's first window, so a shared server would hand the worker the host's Codex home. See `python-tl-worker-notify/e2e-test.md` |
 | Isolated Codex home | project trust + the three hook-trust entries for each Codex agent live in `$CODEX_HOME/config.toml`, and teardown proves the host config is byte-for-byte unchanged |
 | Hook commands | the generated `<agent dir>/.codex/config.toml` carries the `pre-tool-use`, `post-tool-use`, and `stop` hook commands; `install_codex_hook_trust` derives its trust entries from exactly those three |
 | Hook trust | `[hooks.state."<agent config>:<event>:0:0"]` with a `trusted_hash` for each event, plus `[projects."<agent dir>"] trust_level = "trusted"`, are present in the isolated home |

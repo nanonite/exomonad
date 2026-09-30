@@ -122,19 +122,60 @@ what the A/B below relies on.
 call inside `cleanup()` is invisible at runtime -- the run still prints
 `Work dir:` and still creates the `tmux/` directory, at teardown.
 
-**The blocked `notify_parent`.** The worker is dispatched, provisioned, and
-boots a real Codex session with the correct task text; what is unproven in this
-revision is the last hop, the worker actually calling `notify_parent` and the
-controller durably reaching `tl_done`. The 2026-09-30 live run with the
-isolation correctly placed reached `tl_running` with the worker spawned and
-`$CODEX_HOME` isolated, then stalled: no `notify_parent` event, no terminal
-state, `active_slices=1` and no progress for 1084s. The validator reported
-`worker notify_parent event recorded timed out after 600s`.
+**The blocked `notify_parent`.** This is the one assertion the live run still
+fails, and it is a product defect rather than a harness one.
 
-A missing or failing validator result is now a hard failure of the scenario.
+### Live run, 2026-09-30 (isolation correctly placed)
+
+`KEEP_E2E_WORKDIR=1 script -qec ./tests/e2e/python-tl-worker-notify/run.sh`,
+work dir `python-tl-worker-notify.t1rzxiYm`. `init` reached "Attaching to
+session"; the controller loaded `plan.json`, selected the harness, dispatched
+the worker, and wrote a role-correct child config carrying all three hook
+commands. The validator recorded:
+
+```
+OK: Python TL controller window exists
+OK: controller window holds the controller plus a dispatched worker pane
+OK: TL plan was consumed into a controller checkpoint
+OK: no interactive Codex root TL config was generated
+OK: CODEX_HOME propagated into tmux session e2e-python-tl-worker-notify
+OK: worker routing metadata exists
+OK: worker Codex config exists
+OK: Codex worker config is role-correct
+OK: Codex project + hook trust in .../codex-home
+OK: Codex worker trust is in the isolated home
+FAIL: worker notify_parent event recorded timed out after 600s
+```
+
+The two trust assertions are the point, and they now pass against real product
+output rather than a fixture. Inspecting the run's own isolated home:
+
+* three `[hooks.state."<worker config>:<event>:0:0"]` entries with a
+  `trusted_hash`, for `pre_tool_use`, `post_tool_use` and `stop`;
+* `[projects."<agent dir>"]` with `trust_level = "trusted"`;
+* no occurrence of the retired `# BEGIN EXOMONAD CODEX HOOKS` block;
+* the live `codex` process in the worker's pane carried
+  `CODEX_HOME=<work dir>/codex-home`, not the host's.
+
+So provisioning, the child config, the trust write and the environment
+propagation are all demonstrated. The run then stalls: the slice stays `spawned`,
+`fsm.phase` stays `tl_running`, `active_slices=1`, and no progress is made. The
+worker boots a real Codex session with the correct task text and never calls
+`notify_parent`, so the controller never durably reaches `tl_done`. That is the
+remaining blocker. Filed as Chainlink #1148; the harness already provides the
+reproduction and needs no change.
+
+The `CODEX_HOME` ordering that the isolation works around is filed separately as
+Chainlink #1147.
+
+### A failing run can no longer report success
+
+A missing or failing validator result is a hard failure of the scenario.
 `run.sh` used to fall back to `exomonad init`'s exit status, and `init` exits 0
-as soon as it attaches the session -- so that run reported success while proving
-nothing. `test_isolation_contract.py` pins that too.
+as soon as it attaches the session -- so a run that failed three assertions,
+printed no verdict, and left the controller at `tl_running` still exited 0. The
+verdict block now exits non-zero when the result file is absent and again when it
+reports any failure. `test_isolation_contract.py` pins both.
 
 Because of the two blockers above this row is **not** marked Green.
 
