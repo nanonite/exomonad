@@ -367,6 +367,7 @@ mod tests {
                     actions: Vec::new(),
                     reason: None,
                     dirty_evidence: None,
+                    codex_trust: None,
                 },
                 CleanupReceiptEntry {
                     candidate_id: "cleaned-id".to_string(),
@@ -380,6 +381,7 @@ mod tests {
                     actions: Vec::new(),
                     reason: None,
                     dirty_evidence: None,
+                    codex_trust: None,
                 },
                 CleanupReceiptEntry {
                     candidate_id: "refused-id".to_string(),
@@ -393,6 +395,7 @@ mod tests {
                     actions: Vec::new(),
                     reason: Some("agent is still live".to_string()),
                     dirty_evidence: None,
+                    codex_trust: None,
                 },
                 CleanupReceiptEntry {
                     candidate_id: "skipped-id".to_string(),
@@ -406,6 +409,7 @@ mod tests {
                     actions: Vec::new(),
                     reason: Some("worktree is dirty".to_string()),
                     dirty_evidence: None,
+                    codex_trust: None,
                 },
             ],
         }

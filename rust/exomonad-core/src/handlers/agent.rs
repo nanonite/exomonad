@@ -4823,6 +4823,7 @@ mod tests {
                 actions: vec!["remove_worktree".to_string()],
                 reason: None,
                 dirty_evidence: None,
+                codex_trust: None,
             }],
         };
 
@@ -4873,6 +4874,7 @@ mod tests {
                 actions: vec!["delete_remote_branch".to_string()],
                 reason: None,
                 dirty_evidence: None,
+                codex_trust: None,
             }],
         };
 
@@ -5420,10 +5422,9 @@ mod tests {
         // it proves: the controller records that identity on the slice, and
         // every publication the slice files is bound back to it. A spawn row
         // without it confirms a dispatch whose publications can never bind.
-        let invocation_record = std::fs::read_to_string(
-            project_dir.join(".exo/agents/worker-codex/invocation.json"),
-        )
-        .expect("spawn persists a durable invocation record");
+        let invocation_record =
+            std::fs::read_to_string(project_dir.join(".exo/agents/worker-codex/invocation.json"))
+                .expect("spawn persists a durable invocation record");
         let record: serde_json::Value =
             serde_json::from_str(&invocation_record).expect("invocation record is JSON");
         let invocation_id = record

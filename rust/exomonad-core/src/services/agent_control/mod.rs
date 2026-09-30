@@ -12,8 +12,11 @@ pub mod invocation;
 mod spawn;
 
 pub use codex_lifecycle::{
-    codex_role_instructions, provision_codex_agent, release_codex_agent_trust, CodexAgentSpec,
-    CodexTrustRelease, ProvisionedCodexAgent, RetainedProjectTrust,
+    capture_codex_agent_trust, capture_codex_trust_for_disposal, codex_generated_config_path,
+    codex_role_instructions, has_generated_codex_config, provision_codex_agent,
+    release_captured_codex_trust, release_captured_codex_trusts, release_codex_agent_trust,
+    CapturedCodexTrust, CodexAgentSpec, CodexTrustRelease, CodexTrustReleaseBatch,
+    ProvisionedCodexAgent, RetainedProjectTrust,
 };
 pub use invocation::{
     finish_invocation, finish_invocation_and_tombstone,

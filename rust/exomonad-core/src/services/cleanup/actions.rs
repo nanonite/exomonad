@@ -2,9 +2,12 @@ use super::service::VerifiedCleanupService;
 use super::support::*;
 use super::types::*;
 use crate::domain::AgentName;
+use crate::services::agent_control::{
+    capture_codex_trust_for_disposal, release_captured_codex_trusts, CapturedCodexTrust,
+};
 use crate::services::agent_resolver::AgentIdentityRecord;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
 impl VerifiedCleanupService {
@@ -27,6 +30,13 @@ impl VerifiedCleanupService {
         if candidate.delete_remote_branch {
             authorization_actions.push("delete_remote_branch_override".to_string());
         }
+        // Claimed before anything is removed: the generated `.codex/config.toml`
+        // that proves which `[hooks.state]` keys are ExoMonad's lives inside the
+        // worktree or agent directory this cleanup is about to destroy. Recording
+        // it here makes the very first receipt of the run carry the claim, so the
+        // release can be retried from evidence after the config that justified it
+        // is gone.
+        claim_codex_trust_for_candidate(candidate, &mut authorization_actions, receipt, index);
         authorization_actions.sort();
         authorization_actions.dedup();
         if let Some(entry) = self
@@ -61,6 +71,17 @@ impl VerifiedCleanupService {
         {
             return entry;
         }
+        // The worktree and the agent directory are both provably gone, so this is
+        // a permanent disposal and the hook trust they justified must go too. It
+        // runs before deregistration on purpose: a release that fails has to
+        // leave the entry `Failed` with a retryable claim, not a deregistered
+        // entry that a later run would reconcile into a clean success.
+        if let Some(entry) = self
+            .release_codex_trust(candidate, receipt, index, &mut actions)
+            .await
+        {
+            return entry;
+        }
         if let Some(entry) = self
             .cleanup_ephemeral_registrations(candidate, receipt, index, &mut actions)
             .await
@@ -74,8 +95,10 @@ impl VerifiedCleanupService {
             return entry;
         }
         let branch = receipt.entries[index].branch.clone();
+        let codex_trust = receipt.entries[index].codex_trust.clone();
         let mut entry = receipt_entry(candidate, CleanupReceiptStatus::Cleaned, actions, None);
         entry.branch = branch;
+        entry.codex_trust = codex_trust;
         entry
     }
 
@@ -138,6 +161,9 @@ impl VerifiedCleanupService {
         {
             return entry;
         }
+        // The resources are already proven absent here, so this is the verified
+        // disposal point. The claim comes from the resumed receipt: the generated
+        // config died with the directory on the interrupted attempt.
         if let Some(entry) = self
             .cleanup_ephemeral_registrations(candidate, receipt, index, &mut actions)
             .await
@@ -155,12 +181,68 @@ impl VerifiedCleanupService {
         actions.retain(|action| action != DEREGISTER_PENDING);
         actions.push("deregister_identity".to_string());
         if let Some(entry) = self
-            .persist_action_or_failure(candidate, receipt, index, &actions)
+            .release_codex_trust(candidate, receipt, index, &mut actions)
             .await
         {
             return entry;
         }
-        receipt_entry(candidate, CleanupReceiptStatus::Cleaned, actions, None)
+        let codex_trust = receipt.entries[index].codex_trust.clone();
+        let mut entry = receipt_entry(candidate, CleanupReceiptStatus::Cleaned, actions, None);
+        entry.codex_trust = codex_trust;
+        entry
+    }
+
+    /// Releases the ExoMonad Codex hook trust claimed for this candidate.
+    ///
+    /// Called only from the point where the worktree and the agent directory are
+    /// both provably gone. A release that cannot finish fails the entry instead
+    /// of reporting plain success, and the claim stays in the receipt so the next
+    /// attempt can retry it — the trust keys ExoMonad owns are already proven, so
+    /// there is nothing left to re-derive once the generated config is gone.
+    ///
+    /// The action is recorded on the caller's list rather than persisted here:
+    /// the caller writes the next progress record, and the claim that makes a
+    /// retry possible was persisted before the first removal.
+    async fn release_codex_trust(
+        &self,
+        candidate: &CleanupCandidate,
+        receipt: &mut CleanupReceipt,
+        index: usize,
+        actions: &mut Vec<String>,
+    ) -> Option<CleanupReceiptEntry> {
+        let Some(captured) = receipt.entries[index]
+            .codex_trust
+            .clone()
+            .filter(|claims| !claims.is_empty())
+        else {
+            actions.push(CODEX_TRUST_ABSENT.to_string());
+            return None;
+        };
+        let batch = release_trust_claims(captured).await;
+        for release in &batch.released {
+            tracing::info!(
+                candidate = %candidate.agent_name,
+                config = %release.hook_trust,
+                "Released ExoMonad Codex trust for a permanently disposed agent"
+            );
+        }
+        if batch.is_complete() {
+            actions.push(RELEASE_CODEX_TRUST.to_string());
+            return None;
+        }
+        actions.push(CODEX_TRUST_RELEASE_FAILED.to_string());
+        // The failure entry has to name the action that failed and keep the
+        // claim that makes the retry possible.
+        receipt.entries[index].actions = actions.clone();
+        Some(failed(
+            candidate,
+            receipt,
+            index,
+            format!(
+                "release ExoMonad Codex trust: {}",
+                batch.failures.join("; ")
+            ),
+        ))
     }
 
     async fn remove_worktree(
@@ -384,6 +466,65 @@ async fn path_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).await.is_ok()
 }
 
+/// Records the ExoMonad Codex hook trust this cleanup owns, before the first
+/// removal, onto the caller's action list and the receipt entry.
+///
+/// A claim that cannot be proven is recorded as such and the disposal continues:
+/// a hand-written `.codex/config.toml` must not be able to block a legitimate
+/// cleanup, and the Codex user config is never edited on a guess.
+fn claim_codex_trust_for_candidate(
+    candidate: &CleanupCandidate,
+    actions: &mut Vec<String>,
+    receipt: &mut CleanupReceipt,
+    index: usize,
+) {
+    match capture_trust_claims(codex_configured_dirs(candidate)) {
+        Ok(claims) if claims.is_empty() => actions.push(CODEX_TRUST_ABSENT.to_string()),
+        Ok(claims) => {
+            actions.push(CAPTURE_CODEX_TRUST.to_string());
+            receipt.entries[index].codex_trust = Some(claims);
+        }
+        Err(error) => {
+            tracing::warn!(
+                candidate = %candidate.agent_name,
+                %error,
+                "Could not claim the ExoMonad Codex hook trust for this candidate; disposal \
+                 continues and the Codex user config is left untouched"
+            );
+            actions.push(CODEX_TRUST_CAPTURE_FAILED.to_string());
+        }
+    }
+}
+
+/// Claims the ExoMonad Codex hook trust for the directories that hold a
+/// generated config.
+///
+/// Synchronous on purpose: it runs on the single-threaded critical section that
+/// records this cleanup's authorization, and it reads at most one small
+/// generated config per candidate directory.
+fn capture_trust_claims(dirs: Vec<PathBuf>) -> std::io::Result<Vec<CapturedCodexTrust>> {
+    if dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    capture_codex_trust_for_disposal(&refs)
+}
+
+/// Releases captured Codex trust off the async runtime, because the release
+/// takes an exclusive lock on the Codex user config.
+async fn release_trust_claims(
+    captured: Vec<CapturedCodexTrust>,
+) -> crate::services::agent_control::CodexTrustReleaseBatch {
+    tokio::task::spawn_blocking(move || release_captured_codex_trusts(&captured))
+        .await
+        .unwrap_or_else(
+            |error| crate::services::agent_control::CodexTrustReleaseBatch {
+                released: Vec::new(),
+                failures: vec![format!("Codex trust release task failed: {error}")],
+            },
+        )
+}
+
 fn failed(
     candidate: &CleanupCandidate,
     receipt: &CleanupReceipt,
@@ -397,6 +538,9 @@ fn failed(
         Some(reason.into()),
     );
     entry.branch = receipt.entries[index].branch.clone();
+    // The captured claim is the retry evidence for a failed release, so a
+    // failure must never drop it.
+    entry.codex_trust = receipt.entries[index].codex_trust.clone();
     entry
 }
 

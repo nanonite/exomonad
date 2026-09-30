@@ -1,4 +1,6 @@
+use super::support::{codex_trust_candidate_dirs, RELEASE_CODEX_TRUST};
 use super::types::*;
+use crate::services::agent_control::has_generated_codex_config;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -24,6 +26,7 @@ pub(super) fn receipt_entry(
         actions,
         reason,
         dirty_evidence: candidate.dirty_evidence.clone(),
+        codex_trust: None,
     }
 }
 
@@ -63,6 +66,7 @@ fn dry_run_entry(candidate: &CleanupCandidate) -> CleanupReceiptEntry {
         if !candidate.resolver_only {
             actions.push("remove_agent_directory".to_string());
         }
+        append_codex_trust_preview(&mut actions, candidate);
         actions.push("deregister_identity".to_string());
         actions
     } else {
@@ -90,6 +94,22 @@ fn append_branch_preview(actions: &mut Vec<String>, branch: Option<&CleanupBranc
     }
     if matches!(branch.remote.status, CleanupBranchActionStatus::WouldDelete) {
         actions.push("would_delete_remote_branch".to_string());
+    }
+}
+
+/// Previews the Codex trust release a dry run will perform.
+///
+/// Only a candidate that actually holds a generated Codex config gets the
+/// preview, so a dry run never implies trust cleanup for a non-Codex agent.
+fn append_codex_trust_preview(actions: &mut Vec<String>, candidate: &CleanupCandidate) {
+    if candidate.resolver_only {
+        return;
+    }
+    if codex_trust_candidate_dirs(candidate)
+        .iter()
+        .any(|dir| has_generated_codex_config(dir))
+    {
+        actions.push(RELEASE_CODEX_TRUST.to_string());
     }
 }
 

@@ -8,7 +8,9 @@ use exomonad_core::services::runtime_manifest::{
     PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
 };
 use exomonad_core::services::{
-    agent_control::{read_invocation_conservatively, InvocationRecord},
+    agent_control::{
+        codex_lifecycle, read_invocation_conservatively, CapturedCodexTrust, InvocationRecord,
+    },
     pr_registry::{
         invocation_succession_reaches_current, read_published_heads,
         remove_published_heads_for_prs, PublishedHead,
@@ -1606,6 +1608,16 @@ struct RecreateCleanupReceiptEntry {
     local_branch_deleted: bool,
     identity_removed: bool,
     completed_at_millis: u64,
+    /// The ExoMonad Codex hook trust this disposal claimed before it removed the
+    /// leaf's worktree.
+    ///
+    /// The generated `.codex/config.toml` that proves ownership lives inside that
+    /// worktree, so the claim is recorded first and kept here: a release that
+    /// fails, or a disposal interrupted before it ran, is retried from this
+    /// evidence instead of leaving hook trust behind for a branch that no longer
+    /// exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_codex_trust: Vec<CapturedCodexTrust>,
 }
 
 impl RecreateCleanupReceiptEntry {
@@ -1636,6 +1648,7 @@ impl RecreateCleanupReceiptEntry {
             local_branch_deleted: false,
             identity_removed: false,
             completed_at_millis: 0,
+            pending_codex_trust: Vec::new(),
         }
     }
 }
@@ -1701,13 +1714,100 @@ async fn record_recreate_receipt(
             &entry.branch,
             &entry.head_sha,
             entry.pr_number,
-            &entry.remote_name,
+            entry.remote_name.as_str(),
         )
     }) {
         Some(existing) => *existing = entry,
         None => entries.push(entry),
     }
     write_recreate_receipts(project_dir, &entries).await
+}
+
+/// Every directory that could hold one disposed agent's generated Codex config.
+///
+/// A leaf and a reviewer run in their worktree; a worker and a companion run in
+/// `.exo/agents/<name>`. Both are offered to the capture so no shape is missed.
+fn codex_trust_dirs(worktree: Option<&Path>, agent_dir: Option<&Path>) -> Vec<PathBuf> {
+    [worktree, agent_dir]
+        .into_iter()
+        .flatten()
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// Claims the ExoMonad Codex hook trust for the directories about to be removed.
+///
+/// Must run before the first removal: the generated `.codex/config.toml` that
+/// proves which `[hooks.state]` keys belong to ExoMonad lives inside one of them.
+fn claim_codex_trust(dirs: &[PathBuf], context: &str) -> Result<Vec<CapturedCodexTrust>> {
+    if dirs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    codex_lifecycle::capture_codex_trust_for_disposal(&refs).with_context(|| {
+        format!(
+            "failed to claim the ExoMonad Codex trust for {context}; the Codex user config is \
+             left untouched"
+        )
+    })
+}
+
+/// Releases a claim taken by [`claim_codex_trust`] after a permanent disposal.
+///
+/// Fails the disposal when a claim cannot be released: the resources are gone, so
+/// reporting plain success would hide hook trust that outlived its owner.
+fn release_claimed_codex_trust(context: &str, claimed: &[CapturedCodexTrust]) -> Result<()> {
+    let batch = codex_lifecycle::release_captured_codex_trusts(claimed);
+    for release in &batch.released {
+        info!(context, config = %release.hook_trust, "Released ExoMonad Codex trust for a permanently disposed agent");
+    }
+    if !batch.is_complete() {
+        anyhow::bail!(
+            "{context} was permanently disposed but its ExoMonad Codex trust could not be \
+             released: {}",
+            batch.failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// Releases the Codex trust a leaf disposal claimed, then clears the claim.
+///
+/// The claim stays in the receipt until the release succeeds, so an interrupted
+/// or failed disposal retries the release from that evidence on the next run
+/// instead of losing it with the worktree.
+async fn release_recreate_codex_trust(
+    project_dir: &Path,
+    receipt: &mut RecreateCleanupReceiptEntry,
+) -> Result<()> {
+    if receipt.pending_codex_trust.is_empty() {
+        return Ok(());
+    }
+    let claimed = receipt.pending_codex_trust.clone();
+    if let Err(error) = release_claimed_codex_trust(&receipt.branch, &claimed) {
+        push_recreate_action(receipt, "codex_trust_release_failed");
+        receipt.completed_at_millis = current_time_millis() as u64;
+        record_recreate_receipt(project_dir, receipt.clone())
+            .await
+            .context("failed to persist the pending Codex trust claim for a retry")?;
+        return Err(error).with_context(|| {
+            format!(
+                "the claim is recorded in {} and the next recreate run will retry it",
+                recreate_receipts_path(project_dir).display()
+            )
+        });
+    }
+    receipt.pending_codex_trust.clear();
+    push_recreate_action(receipt, "release_codex_trust");
+    receipt.completed_at_millis = current_time_millis() as u64;
+    record_recreate_receipt(project_dir, receipt.clone()).await
+}
+
+/// Appends a disposal step to the ordered action log at most once.
+fn push_recreate_action(receipt: &mut RecreateCleanupReceiptEntry, action: &str) {
+    if !receipt.actions.iter().any(|recorded| recorded == action) {
+        receipt.actions.push(action.to_owned());
+    }
 }
 
 fn verify_pr_association(
@@ -2302,6 +2402,30 @@ async fn destroy_recreate_resources(
             receipt.completed_at_millis = current_time_millis() as u64;
             record_recreate_receipt(project_dir, receipt.clone()).await?;
         }
+        // Codex trust: claimed before the worktree, which holds the generated
+        // `.codex/config.toml` that proves ownership, is removed. The claim is
+        // recorded in the receipt so an interrupted disposal can still release
+        // it on the next run, when nothing is left to re-derive it from.
+        {
+            let observation = observe_leaf_branch(project_dir, branch)?;
+            ensure_leaf_unchanged(branch, &observation)?;
+            let agent_dir = branch
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|agent| !agent.is_empty())
+                .map(|agent| project_dir.join(".exo/agents").join(agent));
+            let claimed = claim_codex_trust(
+                &codex_trust_dirs(observation.worktree.as_deref(), agent_dir.as_deref()),
+                &branch.branch,
+            )?;
+            if !claimed.is_empty() {
+                receipt.pending_codex_trust = claimed;
+                push_recreate_action(&mut receipt, "capture_codex_trust");
+                receipt.completed_at_millis = current_time_millis() as u64;
+                record_recreate_receipt(project_dir, receipt.clone()).await?;
+            }
+        }
         // Worktree: always reconcile against the observed worktree so one that
         // reappeared after a receipt is removed again.
         {
@@ -2358,9 +2482,22 @@ async fn destroy_recreate_resources(
             receipt.completed_at_millis = current_time_millis() as u64;
             record_recreate_receipt(project_dir, receipt.clone()).await?;
         }
+        // Codex trust: no ref, no worktree and no identity directory are left, so
+        // this leaf is permanently destroyed and the hook trust its generated
+        // config justified must go with it.
+        release_recreate_codex_trust(project_dir, &mut receipt).await?;
     }
     // Phase two performs disposal only after revalidation and PR closure.
     for current in &validated {
+        let agent_dir = project_dir
+            .join(".exo/agents")
+            .join(&current.spec.agent_name);
+        // Claimed before the first removal and released after the last, so a
+        // failed removal leaves both the owner and its Codex trust in place.
+        let claimed_codex_trust = claim_codex_trust(
+            &codex_trust_dirs(Some(&current.spec.worktree), Some(&agent_dir)),
+            &current.spec.branch,
+        )?;
         if current.observation.worktree_exists {
             let path = current.spec.worktree.clone();
             let git_wt = git_wt.clone();
@@ -2376,13 +2513,11 @@ async fn destroy_recreate_resources(
                 .await
                 .context("ordered branch disposal task failed")??;
         }
-        let agent_dir = project_dir
-            .join(".exo/agents")
-            .join(&current.spec.agent_name);
         if agent_dir.exists() {
             std::fs::remove_dir_all(&agent_dir)
                 .with_context(|| format!("failed to remove {}", agent_dir.display()))?;
         }
+        release_claimed_codex_trust(&current.spec.branch, &claimed_codex_trust)?;
     }
 
     for path in &plan.worktrees {
@@ -2404,14 +2539,27 @@ async fn destroy_recreate_resources(
             .is_some_and(|parent| parent.ends_with(".exo/worktrees"))
         {
             if let Some(slug) = path.file_name().and_then(|name| name.to_str()) {
-                exomonad_core::services::agent_resources::dispose_agent_resources(
+                let label = format!("worktree {slug}");
+                let disposal = exomonad_core::services::agent_resources::dispose_agent_resources(
                     project_dir,
                     git_wt.clone(),
                     slug,
                 )
                 .await;
+                if !disposal.released_codex_trust() {
+                    anyhow::bail!(
+                        "{label} was permanently disposed but its ExoMonad Codex trust could not \
+                         be released: {}",
+                        disposal.codex_trust.failures.join("; ")
+                    );
+                }
             }
         } else {
+            // A companion or non-`.exo/worktrees` tree: claim its Codex trust
+            // before the worktree goes, release it once the tree is gone.
+            let label = path.display().to_string();
+            let claimed_codex_trust =
+                claim_codex_trust(&codex_trust_dirs(Some(path), None), &label)?;
             let path_for_git = path.clone();
             let git_wt = git_wt.clone();
             tokio::task::spawn_blocking(move || git_wt.remove_workspace(&path_for_git))
@@ -2421,6 +2569,7 @@ async fn destroy_recreate_resources(
                 std::fs::remove_dir_all(path)
                     .with_context(|| format!("failed to remove {}", path.display()))?;
             }
+            release_claimed_codex_trust(&label, &claimed_codex_trust)?;
         }
     }
     // Publication metadata is removed only once every leaf is provably gone:
@@ -7472,6 +7621,7 @@ mod tests {
                 actions: Vec::new(),
                 reason: None,
                 dirty_evidence: None,
+                codex_trust: None,
             }],
         };
         let suggestion = clean::continue_suggestion(&receipt).unwrap();
@@ -9217,6 +9367,96 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn recreate_releases_codex_trust_only_after_the_leaf_is_destroyed() {
+        let codex_home = tempfile::tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", codex_home.path());
+        let codex_user_config = codex_home.path().join("config.toml");
+        let hook_trust_entries = || {
+            let raw = std::fs::read_to_string(&codex_user_config).unwrap_or_default();
+            toml::from_str::<toml::Value>(&raw)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .get("hooks")
+                        .and_then(|hooks| hooks.get("state"))
+                        .and_then(toml::Value::as_table)
+                        .map(|state| state.len())
+                })
+                .unwrap_or(0)
+        };
+
+        let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
+        let worktree = project.join(".exo/worktrees/leaf");
+        // A Codex leaf keeps its generated config — and therefore the trust that
+        // has to be pruned — inside the worktree recreate is about to destroy.
+        let extra_mcp_servers: HashMap<String, Value> = HashMap::new();
+        codex_lifecycle::provision_codex_agent(
+            &exomonad_core::services::agent_control::CodexAgentSpec {
+                agent_dir: &worktree,
+                agent_name: "leaf",
+                role: "dev",
+                role_context: Some("SENTINEL ROLE CONTEXT"),
+                model: None,
+                effort: None,
+                extra_mcp_servers: &extra_mcp_servers,
+                exomonad_binary: Path::new("/usr/local/bin/exomonad"),
+            },
+        )
+        .unwrap();
+        assert_eq!(hook_trust_entries(), 3, "the leaf starts trusted");
+        // The generated config is a runtime artifact, not leaf work: exclude it
+        // so the recreate's dirty-worktree gate judges the leaf's own commits.
+        let excludes = project.join("recreate-test.excludes");
+        std::fs::write(&excludes, ".codex/\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["config", "core.excludesFile", excludes.to_str().unwrap()])
+            .current_dir(&worktree)
+            .status()
+            .unwrap()
+            .success());
+
+        let publication = test_leaf_publication("main.leaf", &head_sha);
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
+        let plan = leaf_plan(leaves);
+
+        destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap();
+
+        assert!(!worktree.exists(), "the leaf worktree is destroyed");
+        assert_eq!(
+            hook_trust_entries(),
+            0,
+            "a destroyed leaf must leave no ExoMonad hook trust behind"
+        );
+        let receipts = read_recreate_receipts(&project).await.unwrap();
+        let receipt = receipts
+            .iter()
+            .find(|entry| entry.branch == "main.leaf")
+            .expect("leaf receipt must be persisted");
+        assert_eq!(
+            receipt.actions.last().map(String::as_str),
+            Some("release_codex_trust"),
+            "the release is the last ordered step, after identity removal: {:?}",
+            receipt.actions
+        );
+        assert!(
+            receipt.pending_codex_trust.is_empty(),
+            "a resolved claim is cleared so a retry cannot repeat it"
+        );
+
+        // Idempotent retry: a second recreate must not fail on released trust.
+        destroy_recreate_resources(&project, &Config::default(), &plan, false)
+            .await
+            .unwrap();
+        assert_eq!(hook_trust_entries(), 0);
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[tokio::test]
     async fn recreate_leaf_cleanup_refuses_dirty_worktree_without_generic_sweep() {
         let (_temp, project, _remote, head_sha) = setup_leaf_fixture();
         let publication = test_leaf_publication("main.leaf", &head_sha);
@@ -9486,6 +9726,7 @@ mod tests {
             local_branch_deleted: false,
             identity_removed: false,
             completed_at_millis: 0,
+            pending_codex_trust: Vec::new(),
         }
     }
 

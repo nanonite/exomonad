@@ -190,10 +190,16 @@ pub fn install_codex_hook_trust(
 
 /// One `[hooks.state]` key ExoMonad generated for a project config, paired with
 /// the `trusted_hash` ExoMonad generates for it right now.
-#[derive(Debug)]
-struct OwnedHookTrustKey {
-    key: String,
-    trusted_hash: String,
+///
+/// Serializable so a disposal path can *capture* the keys it owns before the
+/// generated config is removed, persist them as retry evidence, and still
+/// release exactly those keys after the config that proved ownership is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct OwnedHookTrustKey {
+    /// The exact `[hooks.state]` key ExoMonad wrote.
+    pub key: String,
+    /// The `trusted_hash` ExoMonad generated for that key.
+    pub trusted_hash: String,
 }
 
 /// The outcome of [`uninstall_codex_hook_trust`], so a caller can report what
@@ -262,23 +268,58 @@ pub fn uninstall_codex_hook_trust(
     user_config_path: &Path,
     worktree_config_path: &Path,
 ) -> std::io::Result<HookTrustRemoval> {
-    let owned = owned_hook_trust_keys(worktree_config_path)?;
+    let owned = read_owned_hook_trust_keys(worktree_config_path)?;
+    uninstall_captured_codex_hook_trust(user_config_path, &owned)
+}
+
+/// Removes the hook trust described by keys that were captured *before* the
+/// generated config was deleted.
+///
+/// This is the disposal-time entry point. Removal itself is unchanged — an
+/// exact candidate is still deleted only when its recorded `trusted_hash`
+/// equals the captured ExoMonad hash, and a drifted or malformed record is
+/// still preserved and reported — but the candidate keys come from a capture
+/// rather than from the file, so trust can be released after the agent
+/// directory that held the generated config is provably gone.
+///
+/// An empty `owned` set is a successful no-op: there was no ExoMonad hook trust
+/// to remove. The user config is left byte-identical in that case.
+pub fn uninstall_captured_codex_hook_trust(
+    user_config_path: &Path,
+    owned: &[OwnedHookTrustKey],
+) -> std::io::Result<HookTrustRemoval> {
+    if owned.is_empty() {
+        return Ok(HookTrustRemoval::default());
+    }
     update_codex_user_config(user_config_path, |existing| {
         let mut root = parse_user_config(existing)?;
-        let report = remove_owned_hook_trust(user_config_path, &mut root, &owned)?;
+        let report = remove_owned_hook_trust(user_config_path, &mut root, owned)?;
         toml::to_string_pretty(&root)
             .map(|next| (next, report))
             .map_err(to_io_invalid_data)
     })
 }
 
-/// The exact `[hooks.state]` keys ExoMonad generated for `worktree_config_path`,
-/// each paired with the hash ExoMonad generates for it now.
-fn owned_hook_trust_keys(worktree_config_path: &Path) -> std::io::Result<Vec<OwnedHookTrustKey>> {
-    let config = std::fs::read_to_string(worktree_config_path)
-        .map_err(|error| unreadable_generated_config(worktree_config_path, error))?;
-    let hook_specs = codex_hook_specs(&config)?;
-    let key_source = worktree_config_path.display().to_string();
+/// The exact `[hooks.state]` keys and hashes ExoMonad owns for the generated
+/// config at `config_path`, read from disk right now.
+pub fn read_owned_hook_trust_keys(config_path: &Path) -> std::io::Result<Vec<OwnedHookTrustKey>> {
+    let config = std::fs::read_to_string(config_path)
+        .map_err(|error| unreadable_generated_config(config_path, error))?;
+    owned_hook_trust_keys_for_config(config_path, &config)
+}
+
+/// The exact `[hooks.state]` keys and hashes ExoMonad owns for a generated
+/// config, derived from the config *text* rather than from the file on disk.
+///
+/// `config_path` is still the identity of the keys — it is the `[hooks.state]`
+/// key source — so a caller can capture ownership before it removes the file
+/// and release exactly the same keys afterwards.
+pub fn owned_hook_trust_keys_for_config(
+    config_path: &Path,
+    config: &str,
+) -> std::io::Result<Vec<OwnedHookTrustKey>> {
+    let hook_specs = codex_hook_specs(config)?;
+    let key_source = config_path.display().to_string();
     hook_specs
         .iter()
         .map(|spec| {
@@ -435,7 +476,7 @@ impl std::fmt::Display for PreservedHookTrust {
     }
 }
 
-fn plural(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+pub(crate) fn plural(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
     if count == 1 {
         singular
     } else {
@@ -1859,6 +1900,96 @@ mod tests {
             seeded,
             "a failed removal leaves the user config byte-for-byte unchanged"
         );
+    }
+
+    #[test]
+    fn uninstall_captured_codex_hook_trust_removes_captured_keys_without_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_config_path = dir.path().join("codex-home/config.toml");
+        let worktree_config_path = generated_worktree_config_path(dir.path());
+        write_generated_codex_config(&worktree_config_path);
+        install_codex_hook_trust(&user_config_path, &worktree_config_path).unwrap();
+
+        // The disposal contract: the keys are read while the config still
+        // exists, and the config is then destroyed with the agent directory.
+        let captured =
+            read_owned_hook_trust_keys(&worktree_config_path).expect("keys are derivable");
+        std::fs::remove_file(&worktree_config_path).unwrap();
+
+        let removal = uninstall_captured_codex_hook_trust(&user_config_path, &captured).unwrap();
+
+        assert_eq!(removal.removed.len(), 3);
+        assert!(removal.preserved.is_empty());
+        assert_eq!(
+            read_user_config(&user_config_path)
+                .get("hooks")
+                .and_then(|hooks| hooks.get("state")),
+            None,
+            "the captured removal leaves no ExoMonad hook trust behind"
+        );
+    }
+
+    #[test]
+    fn uninstall_captured_codex_hook_trust_is_a_byte_identical_no_op_for_an_empty_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_config_path = dir.path().join("codex-home/config.toml");
+        let seeded = "model = \"gpt-5.5\"\n\n[hooks]\nstop = true\n";
+        std::fs::create_dir_all(user_config_path.parent().unwrap()).unwrap();
+        std::fs::write(&user_config_path, seeded).unwrap();
+
+        let removal = uninstall_captured_codex_hook_trust(&user_config_path, &[]).unwrap();
+
+        assert_eq!(removal, HookTrustRemoval::default());
+        assert_eq!(
+            std::fs::read_to_string(&user_config_path).unwrap(),
+            seeded,
+            "nothing was claimed, so nothing may be rewritten"
+        );
+    }
+
+    #[test]
+    fn captured_keys_never_claim_a_record_whose_hash_drifted() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_config_path = dir.path().join("codex-home/config.toml");
+        let worktree_config_path = generated_worktree_config_path(dir.path());
+        write_generated_codex_config(&worktree_config_path);
+        install_codex_hook_trust(&user_config_path, &worktree_config_path).unwrap();
+        let captured = read_owned_hook_trust_keys(&worktree_config_path).unwrap();
+        seed_user_config(
+            &user_config_path,
+            &captured
+                .iter()
+                .map(|key| (key.key.clone(), hash_entry("sha256:hand-edited")))
+                .collect::<Vec<_>>(),
+        );
+
+        let removal = uninstall_captured_codex_hook_trust(&user_config_path, &captured).unwrap();
+
+        assert_eq!(removal.preserved.len(), 3);
+        assert!(
+            removal
+                .preserved
+                .iter()
+                .all(|entry| matches!(entry.reason, HookTrustPreserveReason::HashMismatch { .. })),
+            "a captured claim must still refuse a hash it did not generate"
+        );
+    }
+
+    #[test]
+    fn owned_hook_trust_keys_for_config_derives_keys_from_text_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree_config_path = generated_worktree_config_path(dir.path());
+        write_generated_codex_config(&worktree_config_path);
+        let config = std::fs::read_to_string(&worktree_config_path).unwrap();
+
+        let from_text = owned_hook_trust_keys_for_config(&worktree_config_path, &config).unwrap();
+        let from_disk = read_owned_hook_trust_keys(&worktree_config_path).unwrap();
+
+        assert_eq!(from_text, from_disk);
+        assert_eq!(from_text.len(), 3);
+        assert!(from_text.iter().all(|key| key
+            .key
+            .starts_with(&worktree_config_path.display().to_string())));
     }
 
     #[test]

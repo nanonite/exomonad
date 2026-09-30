@@ -1,4 +1,7 @@
 use crate::domain::RoutingInfo;
+use crate::services::agent_control::codex_lifecycle::{
+    self, CapturedCodexTrust, CodexTrustReleaseBatch,
+};
 use crate::services::agent_control::read_invocation;
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::tmux_ipc::TmuxIpc;
@@ -15,14 +18,52 @@ fn reviewer_pr_number(slug: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// What one permanent agent disposal did with the ExoMonad Codex trust the
+/// disposed resources justified.
+///
+/// A caller that discards this would report plain success for a disposal whose
+/// hook trust is still installed, so the batch is returned rather than logged
+/// and dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentResourceDisposal {
+    /// The Codex trust claims captured before the resources were removed, kept so
+    /// a caller that cannot retry immediately still holds the evidence.
+    pub codex_trust_captured: Vec<CapturedCodexTrust>,
+    /// The release outcome for those claims.
+    pub codex_trust: CodexTrustReleaseBatch,
+}
+
+impl AgentResourceDisposal {
+    /// True when the disposal left no ExoMonad Codex hook trust behind.
+    pub fn released_codex_trust(&self) -> bool {
+        self.codex_trust.is_complete()
+    }
+}
+
 pub async fn dispose_agent_resources(
     project_dir: &Path,
     git_wt: Arc<GitWorktreeService>,
     agent_slug: &str,
-) {
+) -> AgentResourceDisposal {
     let worktree_path = project_dir.join(".exo/worktrees").join(agent_slug);
     close_agent_tmux_window(project_dir, agent_slug, &worktree_path).await;
     cleanup_worker_agents_for_parent(project_dir, agent_slug, Some(&worktree_path)).await;
+
+    // Claim the Codex trust before removal: the generated config that proves
+    // ownership sits inside one of the directories about to be destroyed.
+    let codex_trust_captured = codex_lifecycle::capture_codex_trust_for_disposal(&[
+        worktree_path.as_path(),
+        project_dir.join(".exo/agents").join(agent_slug).as_path(),
+    ])
+    .unwrap_or_else(|error| {
+        warn!(
+            agent = agent_slug,
+            %error,
+            "Could not claim the ExoMonad Codex trust for this agent; disposal continues and the \
+             Codex user config is left untouched"
+        );
+        Vec::new()
+    });
 
     if worktree_path.exists() {
         let wt = git_wt.clone();
@@ -44,6 +85,47 @@ pub async fn dispose_agent_resources(
             info!(path = %agent_dir.display(), "Removed agent dir");
         }
     }
+
+    // The agent's resources are gone, so the Codex trust they justified is no
+    // longer needed.
+    let codex_trust = release_captured_trust(agent_slug, codex_trust_captured.clone()).await;
+    AgentResourceDisposal {
+        codex_trust_captured,
+        codex_trust,
+    }
+}
+
+async fn release_captured_trust(
+    agent_slug: &str,
+    captured: Vec<CapturedCodexTrust>,
+) -> CodexTrustReleaseBatch {
+    if captured.is_empty() {
+        return CodexTrustReleaseBatch::default();
+    }
+    let batch = tokio::task::spawn_blocking(move || {
+        codex_lifecycle::release_captured_codex_trusts(&captured)
+    })
+    .await
+    .unwrap_or_else(|error| CodexTrustReleaseBatch {
+        released: Vec::new(),
+        failures: vec![format!("Codex trust release task failed: {error}")],
+    });
+    for release in &batch.released {
+        info!(
+            agent = agent_slug,
+            config = %release.hook_trust,
+            "Released ExoMonad Codex trust for a permanently disposed agent"
+        );
+    }
+    if !batch.is_complete() {
+        warn!(
+            agent = agent_slug,
+            failures = %batch.failures.join("; "),
+            "Agent resources were disposed but ExoMonad Codex hook trust survived; release it \
+             before retrying so the claim is not lost"
+        );
+    }
+    batch
 }
 
 fn agent_routing_dirs(project_dir: &Path, agent_slug: &str, worktree_path: &Path) -> Vec<PathBuf> {
@@ -128,10 +210,25 @@ async fn cleanup_worker_agents_in_dir(agents_dir: &Path, parent_slug: &str) {
             }
         }
 
+        // Claimed before the removal: the generated Codex config that proves
+        // ownership is inside the directory being destroyed.
+        let child_trust = codex_lifecycle::capture_codex_trust_for_disposal(&[agent_dir.as_path()])
+            .unwrap_or_else(|error| {
+                warn!(
+                    path = %agent_dir.display(),
+                    %error,
+                    "Could not claim the ExoMonad Codex trust for this child worker; the Codex user \
+                     config is left untouched"
+                );
+                Vec::new()
+            });
         if let Err(e) = tokio::fs::remove_dir_all(&agent_dir).await {
             warn!(path = %agent_dir.display(), error = %e, "Failed to remove child worker config dir (non-fatal)");
         } else {
             info!(path = %agent_dir.display(), "Removed child worker config dir");
+            // A child worker is permanently disposed once its config dir is gone,
+            // so the Codex trust it needed is no longer justified.
+            release_captured_trust(&agent_dir.display().to_string(), child_trust).await;
         }
     }
 }
@@ -225,9 +322,147 @@ pub async fn dispose_exited_reviewer_resources(
     slugs.sort();
     for slug in &slugs {
         info!(reviewer = %slug, "Disposing exited reviewer agent");
-        dispose_agent_resources(project_dir, git_wt.clone(), slug).await;
+        let disposal = dispose_agent_resources(project_dir, git_wt.clone(), slug).await;
+        if !disposal.released_codex_trust() {
+            warn!(
+                reviewer = %slug,
+                failures = %disposal.codex_trust.failures.join("; "),
+                "Reviewer resources were disposed but ExoMonad Codex hook trust survived them"
+            );
+        }
     }
     slugs
+}
+
+#[cfg(test)]
+mod orphan_cleanup_tests {
+    use super::*;
+    use crate::services::agent_control::codex_lifecycle::test_support::IsolatedCodex;
+    use serial_test::serial;
+
+    fn invocation(status: &str, ended_at: Option<u64>) -> serde_json::Value {
+        serde_json::json!({
+            "invocation_id": status,
+            "runtime": "codex",
+            "trigger": "review",
+            "routing": {"window_id": null, "pane_id": null, "parent_tab": null},
+            "started_at": 1,
+            "ended_at": ended_at,
+            "status": status,
+            "exit_code": 0,
+            "pr_number": 1,
+            "head_sha": "abc123",
+            "generation": 1
+        })
+    }
+
+    /// A dormant reviewer is still resumable, so its Codex trust must survive
+    /// the reconciler even though its sibling was disposed.
+    #[tokio::test]
+    #[serial]
+    async fn orphan_cleanup_releases_only_a_disposed_reviewers_codex_trust() {
+        let codex = IsolatedCodex::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let exited_slug = "review-pr-1-codex";
+        let live_slug = "review-pr-2-codex";
+        let exited_dir = temp_dir.path().join(".exo/agents").join(exited_slug);
+        let live_dir = temp_dir.path().join(".exo/agents").join(live_slug);
+        tokio::fs::create_dir_all(&exited_dir).await.unwrap();
+        tokio::fs::create_dir_all(&live_dir).await.unwrap();
+        codex.provision_for_role(&exited_dir, exited_slug, "reviewer");
+        codex.provision_for_role(&live_dir, live_slug, "reviewer");
+        assert_eq!(codex.hook_trust_entries(), 6, "both reviewers are trusted");
+
+        tokio::fs::write(
+            exited_dir.join("invocation.json"),
+            serde_json::to_vec(&invocation("exited", Some(2))).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            live_dir.join("invocation.json"),
+            serde_json::to_vec(&invocation("running", None)).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let cleaned = dispose_exited_reviewer_resources(
+            temp_dir.path(),
+            Arc::new(GitWorktreeService::new(temp_dir.path().to_path_buf())),
+        )
+        .await;
+
+        assert_eq!(cleaned, vec![exited_slug]);
+        assert!(!exited_dir.exists(), "the exited reviewer is disposed");
+        assert!(live_dir.exists(), "the live reviewer is untouched");
+        assert_eq!(
+            codex.hook_trust_entries(),
+            3,
+            "only the disposed reviewer's hook trust may be removed"
+        );
+        let live_config = live_dir.join(".codex/config.toml").display().to_string();
+        assert!(
+            codex
+                .hook_trust_keys()
+                .iter()
+                .all(|key| key.starts_with(&live_config)),
+            "the dormant reviewer keeps every trust record it was provisioned with"
+        );
+    }
+
+    /// A permanent disposal reports the trust it released, so a caller can never
+    /// mistake a partial disposal for a clean one.
+    #[tokio::test]
+    #[serial]
+    async fn disposing_an_agent_reports_the_codex_trust_it_released() {
+        let codex = IsolatedCodex::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let slug = "issue-42-leaf-codex";
+        let agent_dir = temp_dir.path().join(".exo/agents").join(slug);
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        codex.provision(&agent_dir, "issue-42-leaf-codex");
+
+        let disposal = dispose_agent_resources(
+            temp_dir.path(),
+            Arc::new(GitWorktreeService::new(temp_dir.path().to_path_buf())),
+            slug,
+        )
+        .await;
+
+        assert!(
+            disposal.released_codex_trust(),
+            "{:?}",
+            disposal.codex_trust
+        );
+        assert_eq!(disposal.codex_trust_captured.len(), 1);
+        assert_eq!(disposal.codex_trust.released[0].hook_trust.removed.len(), 3);
+        assert!(!agent_dir.exists());
+        assert_eq!(codex.hook_trust_entries(), 0);
+    }
+
+    /// An agent that was never a Codex agent has no trust to release, and the
+    /// disposal must not reach into the Codex user config looking for some.
+    #[tokio::test]
+    #[serial]
+    async fn disposing_a_non_codex_agent_claims_nothing() {
+        let _codex = IsolatedCodex::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let slug = "issue-42-worker-opencode";
+        let agent_dir = temp_dir.path().join(".exo/agents").join(slug);
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+
+        let disposal = dispose_agent_resources(
+            temp_dir.path(),
+            Arc::new(GitWorktreeService::new(temp_dir.path().to_path_buf())),
+            slug,
+        )
+        .await;
+
+        assert!(disposal.released_codex_trust());
+        assert!(disposal.codex_trust_captured.is_empty());
+        assert!(disposal.codex_trust.released.is_empty());
+        assert!(!agent_dir.exists());
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use super::codex_lifecycle;
 use super::*;
 
 impl<
@@ -225,6 +226,14 @@ impl<
                 self.worktree_base.join(internal_name.as_str())
             }
         };
+        // Claim the ExoMonad Codex hook trust before anything is removed: a
+        // Codex agent's generated `.codex/config.toml` lives inside the worktree
+        // it runs in or the shared agent directory, and it is the only proof of
+        // which `[hooks.state]` keys belong to ExoMonad.
+        let codex_trust = codex_lifecycle::capture_codex_trust_for_disposal(&[
+            worktree_path.as_path(),
+            agent_config_dir.as_path(),
+        ])?;
         if worktree_path.exists() {
             let git_wt = self.git_wt().clone();
             let path = worktree_path.clone();
@@ -257,6 +266,32 @@ impl<
                 ));
             }
             info!(path = %agent_config_dir.display(), "Removed per-agent config dir");
+        }
+
+        // Both managed resources are now provably gone, so this is a permanent
+        // disposal and the Codex trust it justified is no longer needed. A
+        // failed release is an error, never a silent success: the agent is gone
+        // but ExoMonad hook trust survives it.
+        let batch = tokio::task::spawn_blocking(move || {
+            codex_lifecycle::release_captured_codex_trusts(&codex_trust)
+        })
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("Codex trust release task failed for {identifier}: {error}")
+        })?;
+        for release in &batch.released {
+            info!(
+                identifier,
+                config = %release.hook_trust,
+                "Released ExoMonad Codex trust for a permanently disposed agent"
+            );
+        }
+        if !batch.is_complete() {
+            return Err(anyhow::anyhow!(
+                "agent {identifier} was disposed but its ExoMonad Codex trust could not be \
+                 released: {}",
+                batch.failures.join("; ")
+            ));
         }
 
         // Deregister identity from resolver
@@ -767,6 +802,7 @@ pub(crate) async fn cleanup_unregistered_worktree_residue(
 mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch, Slug};
+    use crate::services::agent_control::codex_lifecycle::test_support::IsolatedCodex;
     use crate::services::agent_control::{AgentType, Topology};
     use crate::services::agent_resolver::{AgentIdentityRecord, AgentResolver};
     use crate::services::git_worktree::GitWorktreeService;
@@ -1206,6 +1242,110 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(residue.exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cleanup_agent_retains_codex_trust_when_worktree_removal_fails() {
+        let codex = IsolatedCodex::new();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().to_path_buf();
+        let mut services = Services::test();
+        services.project_dir = project.clone();
+        let resolver = Arc::new(AgentResolver::load(project.clone()).await);
+        services.agent_resolver = resolver.clone();
+        services.git_wt = Arc::new(GitWorktreeService::new(project.clone()));
+        let service = AgentControlService::new(Arc::new(services));
+        let agent_name = AgentName::try_from_str("stale-codex").unwrap();
+        let record = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::try_from_str("stale").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.stale").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: ".exo/worktrees/stale".into(),
+            display_name: "🤖 stale-codex".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: false,
+            slice_id: None,
+        };
+        resolver.register(record).await.unwrap();
+
+        let worktree = project.join(".exo/worktrees/stale");
+        tokio::fs::create_dir_all(&worktree).await.unwrap();
+        tokio::fs::write(worktree.join("residual"), "must remain")
+            .await
+            .unwrap();
+        codex.provision(&worktree, agent_name.as_str());
+        assert_eq!(codex.hook_trust_entries(), 3);
+        tokio::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o555))
+            .await
+            .unwrap();
+
+        let error = service
+            .cleanup_agent(agent_name.as_str())
+            .await
+            .expect_err("failed worktree removal must stop teardown");
+
+        assert!(error.to_string().contains("failed to remove git worktree"));
+        assert_eq!(
+            codex.hook_trust_entries(),
+            3,
+            "an owner that was not disposed stays resumable, so its Codex trust must stay"
+        );
+        tokio::fs::set_permissions(&worktree, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cleanup_agent_releases_codex_trust_after_removing_every_resource() {
+        let codex = IsolatedCodex::new();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().to_path_buf();
+        let mut services = Services::test();
+        services.project_dir = project.clone();
+        let resolver = Arc::new(AgentResolver::load(project.clone()).await);
+        services.agent_resolver = resolver.clone();
+        services.git_wt = Arc::new(GitWorktreeService::new(project.clone()));
+        let service = AgentControlService::new(Arc::new(services));
+        let agent_name = AgentName::try_from_str("stale-codex").unwrap();
+        let record = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::try_from_str("stale").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.stale").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: ".exo/worktrees/stale".into(),
+            display_name: "🤖 stale-codex".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: false,
+            slice_id: None,
+        };
+        resolver.register(record).await.unwrap();
+        let agent_dir = project.join(".exo/agents/stale-codex");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        // A worktree agent keeps its generated Codex config in the worktree it
+        // runs in, so that is where the trust has to be claimed from.
+        let worktree = project.join(".exo/worktrees/stale");
+        tokio::fs::create_dir_all(&worktree).await.unwrap();
+        codex.provision(&worktree, agent_name.as_str());
+        assert_eq!(codex.hook_trust_entries(), 3);
+
+        service.cleanup_agent(agent_name.as_str()).await.unwrap();
+
+        assert!(!worktree.exists(), "the worktree is removed");
+        assert!(!agent_dir.exists(), "the agent config dir is removed");
+        assert_eq!(
+            codex.hook_trust_entries(),
+            0,
+            "a disposed agent must leave no ExoMonad hook trust behind"
+        );
     }
 
     #[tokio::test]

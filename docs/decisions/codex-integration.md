@@ -79,6 +79,27 @@ ExoMonad retains project trust until it records ownership of the entry at instal
 
 Removal is never triggered by process exit. Dormant `resume_pr` owners keep their trust; removal belongs to verified permanent resource disposal and to explicit operator-initiated maintenance.
 
+### Disposal Claims the Trust Before It Destroys the Proof
+
+The generated config that proves ownership lives inside the very directory a permanent disposal destroys, so verified disposal is a two-step contract in `codex_lifecycle`:
+
+1. `capture_codex_agent_trust` (or `capture_codex_trust_for_disposal` over every directory that could hold one) reads the generated config and derives the exact `[hooks.state]` keys and hashes ExoMonad owns, *before* the first removal. `read_owned_hook_trust_keys` fails closed on a config ExoMonad did not generate, so a hand-written config can never be mistaken for ExoMonad residue.
+2. `release_captured_codex_trust` (or `release_captured_codex_trusts` for a batch) removes exactly those keys *after* the worktree and agent directory are provably gone. Removal is unchanged — a recorded hash that no longer matches the captured one is still user state and is preserved — but the candidate keys come from the claim, so the config that justified them no longer has to exist.
+
+A `CapturedCodexTrust` is serializable and is the retry evidence for a release that could not finish. The verified cleanup service persists it in `CleanupReceiptEntry::codex_trust` before the first removal, and the recreate path persists it in `RecreateCleanupReceiptEntry::pending_codex_trust`, so an interrupted or failed disposal finishes the release on its next run instead of losing the claim with the worktree. A release that cannot finish fails the cleanup entry rather than reporting plain success.
+
+Every permanent disposal path follows that order:
+
+| Site | Claim is recorded in | Release is reported by |
+| --- | --- | --- |
+| Verified cleanup and verified orphan cleanup (`services::cleanup`) | the cleanup receipt entry, before the first removal | a `Cleaned`/`Failed` entry with `release_codex_trust` or `codex_trust_release_failed` |
+| Reviewer, leaf and child-worker disposal (`services::agent_resources`) | memory, for the caller's own reporting | `AgentResourceDisposal::codex_trust`, plus a reconciler tick that fails |
+| `AgentControlService::cleanup_agent` | memory | an `Err` — partial disposal is never a success |
+| `exomonad init --recreate` | the per-leaf recreate receipt | `release_codex_trust` as the leaf's last ordered step, or a retryable failure |
+| `exomonad revert` | memory | a revert warning naming the claim that could not be released |
+
+Dormant and retained owners are untouched by all of them: a refused cleanup, a dry run, a live reviewer, and an agent directory revert does not dispose keep every trust record they were provisioned with.
+
 These shell hooks forward Codex events to the existing ExoMonad server over the Unix-domain socket. The server normalizes Codex hook stdin into ExoMonad's internal `HookInput`, calls the Haskell WASM hook handler, then formats the result back into Codex hook stdout semantics.
 
 ## Codex-Fugu (removed)

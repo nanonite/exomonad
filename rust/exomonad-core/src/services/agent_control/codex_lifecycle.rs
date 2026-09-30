@@ -16,19 +16,32 @@
 //!
 //! Removal is never triggered by process exit. Dormant `resume_pr` owners keep
 //! their trust; removal belongs to verified permanent resource disposal
-//! (chainlink #1124), which is the only caller [`release_codex_agent_trust`]
-//! is allowed to have.
+//! (chainlink #1124).
+//!
+//! Verified disposal is a two-step contract, because the generated config that
+//! proves ExoMonad owns a `[hooks.state]` entry is itself inside the directory
+//! being destroyed. [`capture_codex_agent_trust`] reads that config and derives
+//! the exact keys ExoMonad owns *before* any removal, and
+//! [`release_captured_codex_trust`] removes exactly those keys *after* the
+//! worktree and agent directory are provably gone. A disposal path that keeps
+//! only the directory can still capture; a disposal path that has already
+//! destroyed the config still holds the keys it captured.
+//!
+//! [`release_codex_agent_trust`] is the one-shot direction: it re-reads the
+//! generated config at release time and fails closed once that config is gone,
+//! so it is for an agent whose resources are still present.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::spawn::{
     CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_RUNTIME_NOTES,
     CODEX_WORKER_INSTRUCTIONS,
 };
-use crate::codex_config::{self, HookTrustRemoval};
+use crate::codex_config::{self, HookTrustRemoval, OwnedHookTrustKey};
 
 /// Roles whose Codex instructions are the TL protocol rather than a dev, worker,
 /// or reviewer protocol.
@@ -82,7 +95,7 @@ impl ProvisionedCodexAgent {
     pub fn for_agent_dir(agent_dir: impl Into<PathBuf>) -> Self {
         let agent_dir = agent_dir.into();
         Self {
-            config_path: agent_dir.join(".codex").join("config.toml"),
+            config_path: codex_generated_config_path(&agent_dir),
             user_config_path: codex_config::codex_user_config_path(),
             agent_dir,
         }
@@ -92,6 +105,24 @@ impl ProvisionedCodexAgent {
     pub fn project_trust_key(&self) -> String {
         self.agent_dir.display().to_string()
     }
+}
+
+/// The one generated Codex config path for an agent directory.
+///
+/// A disposal path must resolve this path *before* it removes the directory:
+/// the path is the identity of every `[hooks.state]` key ExoMonad seeded, so
+/// losing it loses the ability to prove which entries are its own.
+pub fn codex_generated_config_path(agent_dir: &Path) -> PathBuf {
+    agent_dir.join(".codex").join("config.toml")
+}
+
+/// Whether an agent directory holds a generated Codex config right now.
+///
+/// A cheap, non-failing check for previews and for "this agent was never a
+/// Codex agent" decisions. It never claims ownership: only
+/// [`capture_codex_agent_trust`] does.
+pub fn has_generated_codex_config(agent_dir: &Path) -> bool {
+    codex_generated_config_path(agent_dir).is_file()
 }
 
 /// Project trust ExoMonad kept instead of deleting, and why.
@@ -189,7 +220,7 @@ pub fn provision_codex_agent(spec: &CodexAgentSpec<'_>) -> std::io::Result<Provi
         spec.exomonad_binary,
         spec.agent_dir,
     );
-    let config_path = codex_dir.join("config.toml");
+    let config_path = codex_generated_config_path(spec.agent_dir);
     std::fs::write(&config_path, config)?;
 
     // `.codex/hooks.json` is the pre-config.toml hook layout. Leaving it beside
@@ -234,22 +265,301 @@ pub fn provision_codex_agent(spec: &CodexAgentSpec<'_>) -> std::io::Result<Provi
 pub fn release_codex_agent_trust(
     provisioned: &ProvisionedCodexAgent,
 ) -> std::io::Result<CodexTrustRelease> {
-    let project_trust = RetainedProjectTrust {
-        user_config_path: provisioned.user_config_path.clone(),
-        project_key: provisioned.project_trust_key(),
-    };
+    let project_trust =
+        retained_project_trust(&provisioned.user_config_path, &provisioned.agent_dir);
     let Some(user_config_path) = provisioned.user_config_path.as_deref() else {
         return Ok(CodexTrustRelease {
             hook_trust: HookTrustRemoval::default(),
             project_trust,
         });
     };
+    // Reads the generated config at release time, so it fails closed once that
+    // config is gone. Disposal paths that removed the config first use
+    // [`capture_codex_agent_trust`] plus [`release_captured_codex_trust`].
     let hook_trust =
         codex_config::uninstall_codex_hook_trust(user_config_path, &provisioned.config_path)?;
     Ok(CodexTrustRelease {
         hook_trust,
         project_trust,
     })
+}
+
+fn retained_project_trust(
+    user_config_path: &Option<PathBuf>,
+    agent_dir: &Path,
+) -> RetainedProjectTrust {
+    RetainedProjectTrust {
+        user_config_path: user_config_path.clone(),
+        project_key: agent_dir.display().to_string(),
+    }
+}
+
+/// A captured claim on the Codex trust ExoMonad installed for one agent,
+/// derived *before* the agent's resources are destroyed.
+///
+/// This is the durable evidence a verified disposal path carries from
+/// "the generated config still exists" to "the worktree and agent directory are
+/// provably gone": the exact config path, the Codex home that was seeded, and
+/// the `[hooks.state]` keys with the hashes ExoMonad generated for them.
+/// Persisting a claim and replaying it later removes exactly the same keys the
+/// capture proved ExoMonad owned, with the same hash-drift protection, even
+/// though the config that justified them no longer exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedCodexTrust {
+    /// The agent directory the trust was granted for; also the `[projects."…"]`
+    /// key ExoMonad keeps rather than deletes.
+    pub agent_dir: PathBuf,
+    /// The exact generated `<agent_dir>/.codex/config.toml` the keys derive from.
+    pub config_path: PathBuf,
+    /// The Codex user config the trust was seeded into, or `None` when no Codex
+    /// home could be resolved at capture time.
+    pub user_config_path: Option<PathBuf>,
+    /// The exact `[hooks.state]` keys and hashes ExoMonad owns.
+    pub owned_keys: Vec<OwnedHookTrustKey>,
+}
+
+impl std::fmt::Display for CapturedCodexTrust {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex trust captured for {} ({} owned [hooks.state] {} in {})",
+            self.agent_dir.display(),
+            self.owned_keys.len(),
+            crate::codex_config::plural(self.owned_keys.len(), "key", "keys"),
+            match &self.user_config_path {
+                Some(path) => path.display().to_string(),
+                None => "no Codex home".to_string(),
+            }
+        )
+    }
+}
+
+/// Captures the Codex trust ExoMonad installed for one agent directory.
+///
+/// Returns `Ok(None)` when the agent directory holds no generated Codex config,
+/// which is the normal answer for a non-Codex agent and for a disposal path that
+/// already removed the directory on an earlier attempt. Fails closed when the
+/// config exists but cannot be read or holds no ExoMonad hooks: an unreadable
+/// claim is never silently downgraded to "nothing to release".
+///
+/// Must be called *before* the directory is removed.
+pub fn capture_codex_agent_trust(agent_dir: &Path) -> std::io::Result<Option<CapturedCodexTrust>> {
+    let config_path = codex_generated_config_path(agent_dir);
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let owned_keys = codex_config::read_owned_hook_trust_keys(&config_path)?;
+    Ok(Some(CapturedCodexTrust {
+        agent_dir: agent_dir.to_path_buf(),
+        config_path,
+        user_config_path: codex_config::codex_user_config_path(),
+        owned_keys,
+    }))
+}
+
+/// Captures the Codex trust for every directory that could hold one managed
+/// agent's generated config, in a stable order.
+///
+/// A worktree agent keeps its config in the worktree and a worker keeps it in
+/// the shared `.exo/agents/<name>` directory, so a disposal path passes both.
+/// Directories that hold no generated config contribute nothing, and a directory
+/// repeated by the caller is captured once.
+pub fn capture_codex_trust_for_disposal(
+    agent_dirs: &[&Path],
+) -> std::io::Result<Vec<CapturedCodexTrust>> {
+    let mut captured: Vec<CapturedCodexTrust> = Vec::new();
+    for agent_dir in agent_dirs {
+        let Some(claim) = capture_codex_agent_trust(agent_dir)? else {
+            continue;
+        };
+        if captured
+            .iter()
+            .any(|existing| existing.config_path == claim.config_path)
+        {
+            continue;
+        }
+        captured.push(claim);
+    }
+    captured.sort_by(|left, right| left.config_path.cmp(&right.config_path));
+    Ok(captured)
+}
+
+/// Removes the hook trust a [`CapturedCodexTrust`] proves ExoMonad owns, and
+/// reports the project trust it deliberately keeps.
+///
+/// Safe to call after the agent directory is gone: the candidate keys and their
+/// hashes were captured from the generated config, so nothing is guessed. A
+/// recorded hash that no longer matches the captured one is user state and is
+/// preserved and reported, exactly as in the live-config path.
+pub fn release_captured_codex_trust(
+    captured: &CapturedCodexTrust,
+) -> std::io::Result<CodexTrustRelease> {
+    let project_trust = retained_project_trust(&captured.user_config_path, &captured.agent_dir);
+    let Some(user_config_path) = captured.user_config_path.as_deref() else {
+        return Ok(CodexTrustRelease {
+            hook_trust: HookTrustRemoval::default(),
+            project_trust,
+        });
+    };
+    let hook_trust =
+        codex_config::uninstall_captured_codex_hook_trust(user_config_path, &captured.owned_keys)?;
+    Ok(CodexTrustRelease {
+        hook_trust,
+        project_trust,
+    })
+}
+
+/// The outcome of releasing every claim one disposal site captured.
+///
+/// A disposal site must not report plain success when a release failed: the
+/// agent's resources are gone but ExoMonad hook trust survives them, which is
+/// exactly the partial disposal an operator has to be able to see and retry.
+/// [`CodexTrustReleaseBatch::is_complete`] is that check.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexTrustReleaseBatch {
+    /// Claims whose hook trust was released.
+    pub released: Vec<CodexTrustRelease>,
+    /// One actionable message per claim whose release failed.
+    pub failures: Vec<String>,
+}
+
+impl CodexTrustReleaseBatch {
+    /// True when every captured claim was released.
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    /// The claims that still hold ExoMonad hook trust, so a caller can persist
+    /// them and retry.
+    pub fn failures(&self) -> &[String] {
+        &self.failures
+    }
+}
+
+impl std::fmt::Display for CodexTrustReleaseBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "released Codex trust for {} Codex agent{}; {}",
+            self.released.len(),
+            crate::codex_config::plural(self.released.len(), "", "s"),
+            if self.failures.is_empty() {
+                "no failures".to_string()
+            } else {
+                format!(
+                    "{} unresolved: {}",
+                    self.failures.len(),
+                    self.failures.join("; ")
+                )
+            }
+        )
+    }
+}
+
+/// Releases every captured claim, collecting failures instead of stopping at
+/// the first one.
+///
+/// Releasing all of them maximizes how much trust is reclaimed from a partially
+/// disposed agent set; the failures are reported so the unresolved claims stay
+/// retryable evidence instead of becoming silent residue.
+pub fn release_captured_codex_trusts(captured: &[CapturedCodexTrust]) -> CodexTrustReleaseBatch {
+    let mut batch = CodexTrustReleaseBatch::default();
+    for claim in captured {
+        match release_captured_codex_trust(claim) {
+            Ok(release) => batch.released.push(release),
+            Err(error) => batch
+                .failures
+                .push(format!("{}: {error}", claim.config_path.display())),
+        }
+    }
+    batch
+}
+
+/// Test-only isolation for the Codex user config the trust tests assert on.
+///
+/// The `[hooks.state]` table these tests inspect *is* the operator's real Codex
+/// trust, so every one of them has to point `CODEX_HOME` at a throwaway home
+/// and clear it again afterwards.
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+
+    /// A disposable Codex home plus the provisioning call tests use to seed it.
+    pub struct IsolatedCodex {
+        home: tempfile::TempDir,
+    }
+
+    impl IsolatedCodex {
+        /// Points `CODEX_HOME` at a fresh directory for the life of this value.
+        pub fn new() -> Self {
+            let home = tempfile::tempdir().expect("a disposable Codex home");
+            std::env::set_var("CODEX_HOME", home.path());
+            Self { home }
+        }
+
+        pub fn path(&self) -> &Path {
+            self.home.path()
+        }
+
+        /// Provisions Codex trust for `agent_dir` exactly as spawning the agent
+        /// would, so the test starts from the state a real owner is in.
+        pub fn provision(&self, agent_dir: &Path, agent_name: &str) {
+            self.provision_for_role(agent_dir, agent_name, "dev");
+        }
+
+        pub fn provision_for_role(&self, agent_dir: &Path, agent_name: &str, role: &str) {
+            let extra_mcp_servers = HashMap::new();
+            provision_codex_agent(&CodexAgentSpec {
+                agent_dir,
+                agent_name,
+                role,
+                role_context: Some("SENTINEL ROLE CONTEXT"),
+                model: None,
+                effort: None,
+                extra_mcp_servers: &extra_mcp_servers,
+                exomonad_binary: Path::new("/usr/local/bin/exomonad"),
+            })
+            .expect("the Codex agent is provisioned");
+        }
+
+        /// The number of `[hooks.state]` entries currently installed.
+        pub fn hook_trust_entries(&self) -> usize {
+            let raw =
+                std::fs::read_to_string(self.home.path().join("config.toml")).unwrap_or_default();
+            toml::from_str::<toml::Value>(&raw)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .get("hooks")
+                        .and_then(|hooks| hooks.get("state"))
+                        .and_then(toml::Value::as_table)
+                        .map(toml::map::Map::len)
+                })
+                .unwrap_or(0)
+        }
+
+        /// The `[hooks.state]` keys currently installed, in order.
+        pub fn hook_trust_keys(&self) -> Vec<String> {
+            let raw =
+                std::fs::read_to_string(self.home.path().join("config.toml")).unwrap_or_default();
+            toml::from_str::<toml::Value>(&raw)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .get("hooks")
+                        .and_then(|hooks| hooks.get("state"))
+                        .and_then(toml::Value::as_table)
+                        .map(|state| state.keys().cloned().collect())
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    impl Drop for IsolatedCodex {
+        fn drop(&mut self) {
+            std::env::remove_var("CODEX_HOME");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +780,198 @@ mod tests {
         assert!(second.hook_trust.removed.is_empty());
         assert_eq!(first.project_trust, second.project_trust);
         std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn capture_then_release_works_after_the_agent_directory_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = isolated_codex_home(root.path());
+        let agent_dir = root.path().join("issue-42-leaf-codex");
+        let extra = HashMap::new();
+        let spec = test_spec(&agent_dir, "dev", &extra);
+        let provisioned = provision_codex_agent(&spec).unwrap();
+
+        let captured = capture_codex_agent_trust(&agent_dir)
+            .unwrap()
+            .expect("a provisioned Codex agent must be claimable");
+        assert_eq!(captured.config_path, provisioned.config_path);
+        assert_eq!(captured.owned_keys.len(), 3);
+
+        // The whole point of the claim: the generated config that proved
+        // ownership is destroyed with the directory, and the release still
+        // removes exactly the keys that config justified.
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+        assert!(!captured.config_path.exists());
+        let batch = release_captured_codex_trusts(std::slice::from_ref(&captured));
+
+        assert!(batch.is_complete(), "{batch}");
+        assert_eq!(batch.released.len(), 1);
+        assert_eq!(batch.released[0].hook_trust.removed.len(), 3);
+        assert!(user_config(&codex_home).get("hooks").is_none());
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn capture_reports_nothing_for_a_directory_with_no_generated_config() {
+        let root = tempfile::tempdir().unwrap();
+        isolated_codex_home(root.path());
+        let agent_dir = root.path().join("issue-42-worker-opencode");
+        std::fs::create_dir_all(agent_dir.join(".exo")).unwrap();
+
+        assert_eq!(capture_codex_agent_trust(&agent_dir).unwrap(), None);
+        assert!(
+            capture_codex_trust_for_disposal(&[&agent_dir, &root.path().join("gone")])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!has_generated_codex_config(&agent_dir));
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn capture_fails_closed_on_a_generated_config_without_exomonad_hooks() {
+        let root = tempfile::tempdir().unwrap();
+        isolated_codex_home(root.path());
+        let agent_dir = root.path().join("issue-42-leaf-codex");
+        let extra = HashMap::new();
+        let spec = test_spec(&agent_dir, "dev", &extra);
+        provision_codex_agent(&spec).unwrap();
+
+        // A hand-written Codex config proves nothing about ownership, so the
+        // claim must fail rather than claim the whole `[hooks.state]` table.
+        std::fs::write(
+            agent_dir.join(".codex/config.toml"),
+            "model = \"gpt-5.2-codex\"\n",
+        )
+        .unwrap();
+        let error = capture_codex_agent_trust(&agent_dir).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn a_captured_claim_survives_a_round_trip_through_the_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = isolated_codex_home(root.path());
+        let agent_dir = root.path().join("issue-42-leaf-codex");
+        let extra = HashMap::new();
+        let spec = test_spec(&agent_dir, "dev", &extra);
+        provision_codex_agent(&spec).unwrap();
+
+        let captured = capture_codex_agent_trust(&agent_dir).unwrap().unwrap();
+        // A retry in a later process reads the claim back from durable evidence
+        // rather than re-deriving it from a config that no longer exists.
+        let restored: CapturedCodexTrust =
+            serde_json::from_str(&serde_json::to_string(&captured).unwrap()).unwrap();
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+        let release = release_captured_codex_trust(&restored).unwrap();
+
+        assert_eq!(release.hook_trust.removed.len(), 3);
+        assert!(user_config(&codex_home).get("hooks").is_none());
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn releasing_a_captured_claim_twice_removes_nothing_the_second_time() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = isolated_codex_home(root.path());
+        let agent_dir = root.path().join("issue-42-leaf-codex");
+        let extra = HashMap::new();
+        let spec = test_spec(&agent_dir, "dev", &extra);
+        provision_codex_agent(&spec).unwrap();
+        let captured = capture_codex_agent_trust(&agent_dir).unwrap().unwrap();
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+
+        let first = release_captured_codex_trusts(std::slice::from_ref(&captured));
+        let after_first = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+        let second = release_captured_codex_trusts(std::slice::from_ref(&captured));
+
+        assert!(first.is_complete());
+        assert!(
+            second.is_complete(),
+            "a retry must not fail on already-released trust"
+        );
+        assert_eq!(second.released[0].hook_trust.removed.len(), 0);
+        assert_eq!(
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            after_first,
+            "a repeated release must leave the Codex user config untouched"
+        );
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn a_captured_release_preserves_hook_trust_the_user_changed_after_the_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = isolated_codex_home(root.path());
+        let agent_dir = root.path().join("issue-42-leaf-codex");
+        let extra = HashMap::new();
+        let spec = test_spec(&agent_dir, "dev", &extra);
+        provision_codex_agent(&spec).unwrap();
+        let captured = capture_codex_agent_trust(&agent_dir).unwrap().unwrap();
+
+        // The claim is not a licence to delete: a hash the user changed after
+        // the capture no longer matches the ExoMonad-generated one.
+        let user_config_path = codex_home.join("config.toml");
+        let drifted = std::fs::read_to_string(&user_config_path)
+            .unwrap()
+            .replace("sha256:", "sha256:0");
+        std::fs::write(&user_config_path, drifted).unwrap();
+
+        let release = release_captured_codex_trust(&captured).unwrap();
+
+        assert!(release.hook_trust.removed.is_empty());
+        assert_eq!(release.hook_trust.preserved.len(), 3);
+        assert!(user_config(&codex_home)
+            .get("hooks")
+            .and_then(|hooks| hooks.get("state"))
+            .is_some());
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn one_unreleasable_claim_does_not_hide_the_claims_that_did_release() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = isolated_codex_home(root.path());
+        let releasable = root.path().join("issue-42-leaf-codex");
+        let unreleasable = root.path().join("issue-43-leaf-codex");
+        let extra = HashMap::new();
+        provision_codex_agent(&test_spec(&releasable, "dev", &extra)).unwrap();
+        provision_codex_agent(&test_spec(&unreleasable, "dev", &extra)).unwrap();
+        let claims = capture_codex_trust_for_disposal(&[&releasable, &unreleasable]).unwrap();
+        assert_eq!(claims.len(), 2);
+
+        // A user config that is not parseable TOML makes every release fail
+        // closed, and the batch must say so for all of them.
+        std::fs::write(codex_home.join("config.toml"), "this is not = = toml\n").unwrap();
+        let batch = release_captured_codex_trusts(&claims);
+
+        assert!(!batch.is_complete());
+        assert_eq!(batch.failures.len(), 2, "{}", batch);
+        assert!(batch.to_string().contains("unresolved"));
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    fn the_generated_config_path_is_the_one_provisioning_writes() {
+        let agent_dir = Path::new("/repo/.exo/worktrees/issue-42-leaf-codex");
+
+        assert_eq!(
+            codex_generated_config_path(agent_dir),
+            agent_dir.join(".codex/config.toml")
+        );
+        assert_eq!(
+            ProvisionedCodexAgent::for_agent_dir(agent_dir).config_path,
+            codex_generated_config_path(agent_dir)
+        );
     }
 
     #[test]

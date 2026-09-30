@@ -27,12 +27,14 @@ impl VerifiedCleanupService {
             }
             let actions = in_progress_actions(&receipt.entries[index]);
             let historical_identity = receipt.entries[index].identity_snapshot.clone();
+            let historical_codex_trust = receipt.entries[index].codex_trust.clone();
             let mut in_progress =
                 receipt_entry(candidate, CleanupReceiptStatus::InProgress, actions, None);
             let historical_branch = receipt.entries[index].branch.clone();
             in_progress.identity_snapshot =
                 historical_identity.or_else(|| candidate.identity.clone());
             in_progress.branch = historical_branch.or_else(|| candidate.branch.clone());
+            in_progress.codex_trust = historical_codex_trust;
             normalize_local_opt_in(&mut in_progress, candidate);
             normalize_remote_opt_in(&mut in_progress, candidate);
             receipt.entries[index] = in_progress;
@@ -62,6 +64,7 @@ impl VerifiedCleanupService {
         actions: &[String],
     ) -> Result<()> {
         let branch = receipt.entries[index].branch.clone();
+        let codex_trust = receipt.entries[index].codex_trust.clone();
         receipt.entries[index] = receipt_entry(
             candidate,
             CleanupReceiptStatus::InProgress,
@@ -69,6 +72,9 @@ impl VerifiedCleanupService {
             None,
         );
         receipt.entries[index].branch = branch.or_else(|| candidate.branch.clone());
+        // The captured claim is retry evidence, so it outlives every progress
+        // record that rebuilds the entry.
+        receipt.entries[index].codex_trust = codex_trust;
         self.persist_receipt(receipt).await
     }
 }

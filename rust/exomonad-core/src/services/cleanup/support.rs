@@ -9,6 +9,7 @@ pub(super) use super::receipt_support::{
 };
 use super::types::*;
 use crate::domain::BranchName;
+use crate::services::agent_control::has_generated_codex_config;
 use crate::services::agent_resolver::AgentIdentityRecord;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,45 @@ use tokio::process::Command;
 
 pub(super) const DEREGISTER_PENDING: &str = "deregister_identity_pending";
 pub(super) const PROGRESS_PERSISTENCE_FAILURE: &str = "persist cleanup progress";
+/// Recorded when the cleanup claimed the ExoMonad Codex hook trust it owns,
+/// before removing the resources that trust belonged to.
+pub(super) const CAPTURE_CODEX_TRUST: &str = "capture_codex_trust";
+/// Recorded once the captured Codex trust has been removed from the Codex user
+/// config.
+pub(super) const RELEASE_CODEX_TRUST: &str = "release_codex_trust";
+/// Recorded when a candidate held no generated Codex config, so no trust existed
+/// to release and none was invented.
+pub(super) const CODEX_TRUST_ABSENT: &str = "codex_trust_already_absent";
+/// Recorded when a generated Codex config was present but ExoMonad could not
+/// prove it owns its hook trust. Disposal continues; nothing is removed from the
+/// Codex user config on a guess.
+pub(super) const CODEX_TRUST_CAPTURE_FAILED: &str = "codex_trust_capture_failed";
+/// Recorded when a captured Codex claim could not be released. The claim itself
+/// stays in `CleanupReceiptEntry::codex_trust` so a retry can finish the job.
+pub(super) const CODEX_TRUST_RELEASE_FAILED: &str = "codex_trust_release_failed";
+
+/// Every directory that could hold one candidate's generated Codex config.
+///
+/// A worktree agent keeps its config in the worktree it runs in; a worker keeps
+/// it in the shared `.exo/agents/<name>` directory. Both are passed to the
+/// capture so neither shape is missed.
+pub(super) fn codex_trust_candidate_dirs(candidate: &CleanupCandidate) -> Vec<PathBuf> {
+    let mut dirs = vec![candidate.agent_dir.clone()];
+    if let Some(worktree) = &candidate.worktree_path {
+        if *worktree != candidate.agent_dir {
+            dirs.push(worktree.clone());
+        }
+    }
+    dirs
+}
+
+/// The candidate directories that hold a generated Codex config right now.
+pub(super) fn codex_configured_dirs(candidate: &CleanupCandidate) -> Vec<PathBuf> {
+    codex_trust_candidate_dirs(candidate)
+        .into_iter()
+        .filter(|dir| has_generated_codex_config(dir))
+        .collect()
+}
 
 pub(super) fn refused_with_progress(
     candidate: &CleanupCandidate,
@@ -48,6 +88,7 @@ pub(super) fn refused_with_progress(
         .dirty_evidence
         .clone()
         .or_else(|| candidate.dirty_evidence.clone());
+    entry.codex_trust = previous.codex_trust.clone();
     entry
 }
 

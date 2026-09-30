@@ -2,9 +2,10 @@ use super::service::VerifiedCleanupService;
 use super::support::*;
 use super::types::*;
 use crate::domain::{AgentName, BirthBranch, ClaudeSessionUuid, RoutingInfo, Slug, TeamName};
+use crate::services::agent_control::codex_lifecycle::test_support::IsolatedCodex;
 use crate::services::agent_control::{
-    finish_invocation, start_invocation, AgentResolver, AgentType, InvocationStatus,
-    InvocationTrigger, Topology,
+    codex_lifecycle, finish_invocation, start_invocation, AgentResolver, AgentType,
+    InvocationStatus, InvocationTrigger, Topology,
 };
 use crate::services::agent_resolver::AgentIdentityRecord;
 use crate::services::event_log::EventLog;
@@ -15,12 +16,40 @@ use crate::services::repo::RepositoryIdentity;
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::services::tmux_ipc::{TmuxIpc, WindowId};
 use crate::services::{ForgejoClient, Services};
+use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
+
+/// The ExoMonad Codex trust a `real_cleanup_fixture` leaf is provisioned with.
+///
+/// The leaf runs Codex in its worktree, so the generated config — and therefore
+/// the trust that has to be pruned on disposal — lives in the worktree the
+/// cleanup is about to remove.
+fn provision_fixture_codex(fixture: &RealCleanupFixture) -> IsolatedCodex {
+    let codex = IsolatedCodex::new();
+    codex.provision(&fixture.worktree, fixture.record.agent_name.as_str());
+    assert!(
+        codex.hook_trust_entries() > 0,
+        "provisioning must seed hook trust for the test to be meaningful"
+    );
+    codex
+}
+
+fn confirmed_abandonment(record: &AgentIdentityRecord) -> CleanupRequest {
+    CleanupRequest {
+        target: Some(record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        allow_no_pr: true,
+        discard_dirty: true,
+        reason: Some("confirmed abandoned dirty work".to_string()),
+        ..CleanupRequest::default()
+    }
+}
 
 fn identity(topology: Topology) -> AgentIdentityRecord {
     AgentIdentityRecord {
@@ -1826,6 +1855,261 @@ async fn dirty_no_pr_cleanup_recovers_after_receipt_failure() {
         .get(&fixture.record.agent_name)
         .await
         .is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn verified_cleanup_releases_codex_trust_once_every_resource_is_gone() {
+    let fixture = real_cleanup_fixture().await;
+    let codex = provision_fixture_codex(&fixture);
+    let service = fixture.services.cleanup_service();
+    let request = confirmed_abandonment(&fixture.record);
+
+    let receipt = service.run(&request).await.unwrap();
+    let entry = &receipt.entries[0];
+
+    assert_eq!(entry.status, CleanupReceiptStatus::Cleaned, "{entry:?}");
+    assert!(!fixture.worktree.exists(), "the worktree must be gone");
+    assert!(!fixture.agent_dir.exists(), "the agent dir must be gone");
+    assert!(
+        entry.actions.contains(&"capture_codex_trust".to_string()),
+        "the claim is recorded before disposal: {entry:?}"
+    );
+    assert!(entry.actions.contains(&"release_codex_trust".to_string()));
+    let claimed = entry
+        .codex_trust
+        .as_ref()
+        .expect("the receipt keeps the claim it acted on");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(
+        claimed[0].config_path,
+        fixture.worktree.join(".codex/config.toml"),
+        "the claim names the exact generated config it derived keys from"
+    );
+    assert_eq!(claimed[0].owned_keys.len(), 3);
+    assert!(
+        !codex.hook_trust_entries() > 0,
+        "a permanently disposed agent must leave no ExoMonad hook trust behind"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn verified_cleanup_keeps_codex_trust_when_the_worktree_cannot_be_removed() {
+    let fixture = real_cleanup_fixture().await;
+    let codex = provision_fixture_codex(&fixture);
+    let service = fixture.services.cleanup_service();
+    let request = confirmed_abandonment(&fixture.record);
+    // Read-only worktree: neither `git worktree remove` nor the manual
+    // `remove_dir_all` fallback can unlink anything inside it, so the disposal
+    // is not proven and nothing may be pruned.
+    make_directory_read_only(&fixture.worktree);
+
+    let receipt = service.run(&request).await.unwrap();
+    let entry = &receipt.entries[0];
+
+    make_directory_writable(&fixture.worktree);
+    assert_eq!(entry.status, CleanupReceiptStatus::Failed, "{entry:?}");
+    assert!(
+        !entry.actions.contains(&"release_codex_trust".to_string()),
+        "trust must not be pruned before disposal is proven: {entry:?}"
+    );
+    assert!(entry.codex_trust.is_some(), "the claim stays retryable");
+    assert!(fixture.worktree.exists(), "the worktree survived");
+    assert!(fixture.agent_dir.exists(), "the agent dir survived");
+    assert!(
+        codex.hook_trust_entries() > 0,
+        "an owner that was not disposed stays resumable, so its trust must stay"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_refused_cleanup_leaves_its_owner_trusted() {
+    let fixture = real_cleanup_fixture().await;
+    let codex = provision_fixture_codex(&fixture);
+    let service = fixture.services.cleanup_service();
+    // No `allow_no_pr` and no `discard_dirty`, so the candidate is refused and
+    // nothing is disposed: this is the dormant-owner case `resume_pr` relies on.
+    let request = CleanupRequest {
+        target: Some(fixture.record.agent_name.to_string()),
+        sweep: false,
+        apply: true,
+        ..CleanupRequest::default()
+    };
+
+    let receipt = service.run(&request).await.unwrap();
+    let entry = &receipt.entries[0];
+
+    assert_eq!(entry.status, CleanupReceiptStatus::Refused, "{entry:?}");
+    assert!(!entry.actions.contains(&"release_codex_trust".to_string()));
+    assert!(fixture.worktree.exists());
+    assert!(fixture.agent_dir.exists());
+    assert!(
+        codex.hook_trust_entries() > 0,
+        "a retained owner must keep the trust its resume needs"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_dry_run_previews_codex_trust_release_without_touching_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = IsolatedCodex::new();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let mut record = identity(Topology::SharedDir);
+    record.working_dir = PathBuf::from(".");
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    // A worker-shaped Codex agent: the generated config lives in the shared
+    // agent directory, so that is where the claim comes from.
+    codex.provision(&agent_dir, record.agent_name.as_str());
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        Arc::new(AgentResolver::load(temp.path().to_path_buf()).await),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        None,
+    );
+
+    let receipt = service.run(&CleanupRequest::default()).await.unwrap();
+
+    assert!(receipt.dry_run);
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::WouldClean);
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"release_codex_trust".to_string()));
+    assert!(agent_dir.exists());
+    assert!(codex.hook_trust_entries() > 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_retry_finishes_a_failed_codex_trust_release_from_the_receipt() {
+    let fixture = real_cleanup_fixture().await;
+    let codex = provision_fixture_codex(&fixture);
+    let service = fixture.services.cleanup_service();
+    let request = confirmed_abandonment(&fixture.record);
+    // A Codex home that cannot be written makes the release fail closed after
+    // the resources are already gone — the exact partial disposal that must not
+    // be reported as success, and must stay retryable.
+    make_directory_read_only(codex.path());
+
+    let failed = service.run(&request).await.unwrap();
+    let entry = &failed.entries[0];
+    make_directory_writable(codex.path());
+
+    assert_eq!(entry.status, CleanupReceiptStatus::Failed, "{entry:?}");
+    assert!(!fixture.worktree.exists());
+    assert!(!fixture.agent_dir.exists());
+    assert!(entry
+        .actions
+        .contains(&"codex_trust_release_failed".to_string()));
+    assert!(
+        codex.hook_trust_entries() > 0,
+        "the failed release left the trust in place rather than guessing"
+    );
+    let claim = entry
+        .codex_trust
+        .clone()
+        .expect("a failed release keeps the claim that makes a retry possible");
+    assert_eq!(claim[0].owned_keys.len(), 3);
+
+    // The retry cannot re-derive the claim — the generated config died with the
+    // worktree — so it has to come from the receipt.
+    let retried = service.run(&request).await.unwrap();
+    assert_eq!(retried.operation_id, failed.operation_id);
+    let entry = &retried.entries[0];
+    assert_eq!(entry.status, CleanupReceiptStatus::Cleaned, "{entry:?}");
+    assert!(entry.actions.contains(&"release_codex_trust".to_string()));
+    assert!(
+        !codex.hook_trust_entries() > 0,
+        "the retry must finish the release the interrupted attempt left behind"
+    );
+
+    // And a further retry is a no-op rather than a second release.
+    let third = service.run(&request).await.unwrap();
+    assert!(third.entries.is_empty(), "a resolved cleanup is complete");
+    assert!(!codex.hook_trust_entries() > 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_resolver_only_cleanup_releases_the_claim_a_previous_attempt_recorded() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = IsolatedCodex::new();
+    let agent_dir = temp.path().join(".exo/agents/stale-codex");
+    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+    let record = identity(Topology::SharedDir);
+    tokio::fs::write(
+        agent_dir.join("identity.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(agent_dir.join("exited_at"), "1")
+        .await
+        .unwrap();
+    // A worker-shaped Codex agent: its generated config lives in the shared
+    // agent directory, so that is where the trust has to be claimed from.
+    codex.provision(&agent_dir, record.agent_name.as_str());
+
+    let resolver = Arc::new(AgentResolver::load(temp.path().to_path_buf()).await);
+    let service = VerifiedCleanupService::new(
+        temp.path(),
+        resolver.clone(),
+        Arc::new(GitWorktreeService::new(temp.path().to_path_buf())),
+        None,
+        Arc::new(MutexRegistry::new()),
+        None,
+    );
+    let request = CleanupRequest {
+        apply: true,
+        ..CleanupRequest::default()
+    };
+    let plan = service.plan(&CleanupRequest::default()).await.unwrap();
+    let claim = codex_lifecycle::capture_codex_agent_trust(&agent_dir)
+        .unwrap()
+        .expect("the agent is a provisioned Codex agent");
+    let mut interrupted = in_progress_receipt(&plan, 1);
+    interrupted.operation_id = "codex-claim-resume".to_string();
+    interrupted.entries[0].codex_trust = Some(vec![claim]);
+    service.persist_receipt(&interrupted).await.unwrap();
+
+    // The interrupted attempt already removed the directory, so this run is
+    // resolver-only: the generated config is gone and the claim is all that is
+    // left to release from.
+    tokio::fs::remove_dir_all(&agent_dir).await.unwrap();
+    let receipt = service.run(&request).await.unwrap();
+
+    assert_eq!(receipt.operation_id, "codex-claim-resume");
+    assert_eq!(receipt.entries[0].status, CleanupReceiptStatus::Cleaned);
+    assert!(receipt.entries[0]
+        .actions
+        .contains(&"release_codex_trust".to_string()));
+    assert!(!codex.hook_trust_entries() > 0);
+    assert!(resolver.get(&record.agent_name).await.is_none());
+}
+
+fn make_directory_read_only(path: &Path) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o500);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+fn make_directory_writable(path: &Path) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions).unwrap();
 }
 
 #[tokio::test]

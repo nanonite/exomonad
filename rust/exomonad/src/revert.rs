@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use exomonad::config::Config;
-use exomonad_core::services::{tmux_ipc::TmuxIpc, AgentType};
+use exomonad_core::services::{
+    agent_control::{codex_lifecycle, CapturedCodexTrust},
+    tmux_ipc::TmuxIpc,
+    AgentType,
+};
 use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -64,7 +68,54 @@ async fn run_with_report(
     Ok(())
 }
 
+/// Claims the ExoMonad Codex hook trust an about-to-be-reverted directory holds.
+///
+/// Must run *before* the revert removes the generated `.codex/config.toml`:
+/// that config is the only proof of which `[hooks.state]` keys ExoMonad owns, so
+/// a capture after the removal would have nothing left to prove ownership with.
+fn claim_reverted_codex_trust(
+    report: &mut RevertReport,
+    dirs: &[PathBuf],
+    label: &str,
+) -> Vec<CapturedCodexTrust> {
+    let refs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    match codex_lifecycle::capture_codex_trust_for_disposal(&refs) {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            report.warn(format!(
+                "failed to claim the ExoMonad Codex trust for {label}: {error}; the Codex user \
+                 config is left untouched"
+            ));
+            Vec::new()
+        }
+    }
+}
+
+/// Releases a claim taken by [`claim_reverted_codex_trust`].
+///
+/// A release that cannot finish is a warning rather than a silent success: the
+/// init artifacts are gone, so hook trust would otherwise outlive the agent with
+/// nothing reporting it.
+fn release_reverted_codex_trust(
+    report: &mut RevertReport,
+    claimed: &[CapturedCodexTrust],
+    label: &str,
+) {
+    if claimed.is_empty() {
+        return;
+    }
+    let batch = codex_lifecycle::release_captured_codex_trusts(claimed);
+    if !batch.is_complete() {
+        report.warn(format!(
+            "{label} was reverted but its ExoMonad Codex trust could not be released: {}",
+            batch.failures.join("; ")
+        ));
+    }
+}
+
 async fn remove_root_artifacts(project_dir: &Path, report: &mut RevertReport) {
+    let claimed =
+        claim_reverted_codex_trust(report, &[project_dir.to_path_buf()], "the project root");
     for path in [
         ".mcp.json",
         ".claude/settings.local.json",
@@ -76,24 +127,32 @@ async fn remove_root_artifacts(project_dir: &Path, report: &mut RevertReport) {
     ] {
         remove_file_if_exists(&project_dir.join(path), report).await;
     }
+    release_reverted_codex_trust(report, &claimed, "the project root");
 }
 
 async fn remove_companion_artifacts(config: &Config, report: &mut RevertReport) {
     for companion in &config.companions {
+        let agent_dir = config.project_dir.join(".exo/agents").join(&companion.name);
+        let label = format!("companion {}", companion.name);
+        let claimed = claim_reverted_codex_trust(report, std::slice::from_ref(&agent_dir), &label);
         let agent_type = companion.agent_type.unwrap_or(AgentType::Claude);
         if agent_type == AgentType::Claude {
             remove_companion_worktree(&config.project_dir, &companion.name, report).await;
         }
 
-        let agent_dir = config.project_dir.join(".exo/agents").join(&companion.name);
         for file_name in [
             "routing.json",
             "settings.json",
             "opencode.json",
             ".birth_branch",
+            // A Codex companion's generated config is an init artifact like any
+            // other: leaving it behind would keep Codex re-reading a config for a
+            // companion this revert just removed.
+            ".codex/config.toml",
         ] {
             remove_file_if_exists(&agent_dir.join(file_name), report).await;
         }
+        release_reverted_codex_trust(report, &claimed, &label);
     }
 }
 
@@ -238,6 +297,110 @@ mod tests {
             forgejo_ssh_port: None,
             reviewer: ReviewerConfig::default(),
         }
+    }
+
+    /// The ExoMonad Codex hook trust recorded in an isolated Codex home.
+    fn hook_trust_entries(codex_home: &Path) -> usize {
+        let raw = std::fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
+        toml::from_str::<toml::Value>(&raw)
+            .ok()
+            .and_then(|config| {
+                config
+                    .get("hooks")
+                    .and_then(|hooks| hooks.get("state"))
+                    .and_then(toml::Value::as_table)
+                    .map(|state| state.len())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Provisions Codex trust for one agent directory through the same lifecycle
+    /// every ExoMonad Codex agent uses.
+    fn provision_codex(codex_home: &Path, agent_dir: &Path, agent_name: &str, role: &str) {
+        std::env::set_var("CODEX_HOME", codex_home);
+        let extra_mcp_servers: HashMap<String, serde_json::Value> = HashMap::new();
+        exomonad_core::services::agent_control::provision_codex_agent(
+            &exomonad_core::services::agent_control::CodexAgentSpec {
+                agent_dir,
+                agent_name,
+                role,
+                role_context: Some("SENTINEL ROLE CONTEXT"),
+                model: None,
+                effort: None,
+                extra_mcp_servers: &extra_mcp_servers,
+                exomonad_binary: Path::new("/usr/local/bin/exomonad"),
+            },
+        )
+        .expect("the Codex agent is provisioned");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn revert_removes_the_codex_config_and_the_trust_it_justified() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let config = test_config(project_dir.clone());
+        let root_config = project_dir.join(".codex/config.toml");
+        let companion_dir = project_dir.join(".exo/agents/buddy");
+        for path in [
+            root_config.clone(),
+            companion_dir.join(".codex/config.toml"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(companion_dir.join("routing.json"), "init artifact").unwrap();
+        provision_codex(codex_home.path(), &project_dir, "root", "dev");
+        provision_codex(codex_home.path(), &companion_dir, "buddy", "worker");
+        assert_eq!(
+            hook_trust_entries(codex_home.path()),
+            6,
+            "the root config and the companion each carry three trust records"
+        );
+
+        let mut report = RevertReport::default();
+        run_with_report(&config, false, &mut report).await.unwrap();
+
+        assert!(!root_config.exists(), "revert removes the generated config");
+        assert!(!companion_dir.join(".codex/config.toml").exists());
+        assert_eq!(
+            hook_trust_entries(codex_home.path()),
+            0,
+            "a reverted agent's hook trust must not outlive it"
+        );
+        assert!(
+            report.warnings.is_empty(),
+            "reverting a trusted Codex agent is not a partial failure: {:?}",
+            report.warnings
+        );
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn revert_keeps_the_trust_of_agents_it_did_not_remove() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let config = test_config(project_dir.clone());
+        // A dormant owner's agent directory: revert has no reason to touch it, so
+        // it must stay resumable with its trust intact.
+        let dormant = project_dir.join(".exo/agents/dormant-codex");
+        std::fs::create_dir_all(&dormant).unwrap();
+        provision_codex(codex_home.path(), &dormant, "dormant-codex", "dev");
+        assert_eq!(hook_trust_entries(codex_home.path()), 3);
+
+        let mut report = RevertReport::default();
+        run_with_report(&config, false, &mut report).await.unwrap();
+
+        assert!(dormant.exists());
+        assert!(dormant.join(".codex/config.toml").exists());
+        assert_eq!(
+            hook_trust_entries(codex_home.path()),
+            3,
+            "an owner revert did not dispose must keep its trust"
+        );
+        std::env::remove_var("CODEX_HOME");
     }
 
     #[tokio::test]

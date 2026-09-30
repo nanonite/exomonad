@@ -8,7 +8,7 @@ use crate::services::agent_resources::{
 };
 use crate::services::git_worktree::GitWorktreeService;
 use crate::services::EventLog;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,8 +123,18 @@ async fn reconcile_issue_worktrees(
         }
         if chainlink_issue_is_closed(project_dir, issue_id).await? {
             append_issue_closed_event(event_log, issue_id, &slug, "orphan_reconciler")?;
-            dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
+            let disposal = dispose_agent_resources(project_dir, git_wt.clone(), &slug).await;
             info!(issue_id, agent = %slug, "Reconciled closed Chainlink issue for live worktree");
+            // The resources are gone, so a Codex claim that could not be released is a
+            // real leak. Failing the tick surfaces it instead of letting a disposed
+            // agent report as a clean reconciliation.
+            if !disposal.released_codex_trust() {
+                bail!(
+                    "disposed the resources of closed-issue agent {slug} but could not release its \
+                     ExoMonad Codex trust: {}",
+                    disposal.codex_trust.failures.join("; ")
+                );
+            }
         }
     }
     Ok(())

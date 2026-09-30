@@ -1,5 +1,6 @@
 //! Shared request, plan, candidate, and receipt types for verified cleanup.
 
+use crate::services::agent_control::CapturedCodexTrust;
 use crate::services::agent_resolver::AgentIdentityRecord;
 use crate::services::forgejo::ForgejoPullRequest;
 use crate::services::repo::RepositoryIdentity;
@@ -361,6 +362,17 @@ pub struct CleanupReceiptEntry {
     /// Dirty-state manifest captured before an authorized discard.
     #[serde(default)]
     pub dirty_evidence: Option<CleanupDirtyEvidence>,
+    /// The ExoMonad Codex hook trust this cleanup claimed before it removed the
+    /// agent's worktree or directory.
+    ///
+    /// Captured up front because the generated `.codex/config.toml` that proves
+    /// ownership is itself inside the directory being destroyed. Persisting the
+    /// claim is what lets a retry finish releasing trust after the config that
+    /// justified it is gone, so a failed release stays retryable evidence
+    /// instead of becoming permanent residue. Kept in the receipt after a
+    /// successful release too, as the audit record of what was removed.
+    #[serde(default)]
+    pub codex_trust: Option<Vec<CapturedCodexTrust>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
