@@ -49,7 +49,7 @@ its interactive root TL.
 
 | Property | How |
 |---|---|
-| CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home |
+| CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home. The run also gets its own tmux server (`e2e_python_tl_isolate_tmux_server`, on by default), because `exomonad init` propagates `CODEX_HOME` only *after* creating the session's first window, so a shared server would hand the worker the host's Codex home. See `python-tl-worker-notify/e2e-test.md` |
 | Isolated Codex home | project trust + the three hook-trust entries for each Codex agent live in `$CODEX_HOME/config.toml`, and teardown proves the host config is byte-for-byte unchanged |
 | Hook commands | the generated `<agent dir>/.codex/config.toml` carries the `pre-tool-use`, `post-tool-use`, and `stop` hook commands; `install_codex_hook_trust` derives its trust entries from exactly those three |
 | Hook trust | `[hooks.state."<agent config>:<event>:0:0"]` with a `trusted_hash` for each event, plus `[projects."<agent dir>"] trust_level = "trusted"`, are present in the isolated home |
@@ -58,6 +58,91 @@ its interactive root TL.
 | No retired root model | neither `.codex/config.toml` nor `.exo/agents/root/.codex/config.toml` is generated |
 | Messaging | `message.delivery` records a successful `agent_inbox_tmux` injection to the peer, and a successful `notify_parent` delivery to `root` |
 | Durable controller state | `.exo/tl-loop/root/run.json` records the plan slice and `fsm.phase == "tl_done"` |
+
+## Live run, 2026-09-30
+
+Work dir `codex-messaging.q8sxs0Ek`. This is the first live run of this
+scenario in its migrated form, and it is where the migrated fixtures stopped
+being theoretical.
+
+**The worker does its whole job correctly.** The worker's Codex rollout holds 47
+events and four tool calls, in the order the plan asked for:
+
+```
+CALL  exec  await new Promise(r => setTimeout(r, 30000));   -> delay-complete, 30.0s
+CALL  exec  tools.mcp__exomonad__send_tmux_message({recipient: codex-messaging-peer, ...})
+      OUTPUT {"delivery_method":"tmux_stdin","success":true}
+CALL  exec  tools.mcp__exomonad__notify_parent({status: "success", ...})
+      OUTPUT {"success":true}
+```
+
+The task text reached the worker intact -- user message 2, 5271 characters,
+carrying both tool instructions. So the peer is reachable, the worker's MCP
+identity routes, and `send_tmux_message` reports a successful `tmux_stdin`
+delivery.
+
+**The run still does not finish, and the reason is the controller's side.** The
+slice stays `spawned` and `fsm.phase` stays `tl_running` even though both tools
+returned success. The action journal names why:
+
+```
+tl.dispatch_event_rejected
+  classification: integrity_conflict
+  correlation_reason: intent_mismatch
+```
+
+and `event-quarantine.json` holds the quarantined `agent.spawned` event with
+`run_id` a UUID where the controller has the literal `root`, and `agent_id`
+`root` where it expects the slice. Filed as Chainlink #1148.
+
+**Observed `run.sh` exit codes.** A run with no result file exits non-zero, which
+is the false-pass fix doing its job: `ERROR: validator wrote no result file at
+... (init exited 1)` followed by `RUNSH_EXIT=1`. An earlier attempt at the same
+scenario, with the scaffold's `gpt-luna` still in the policy, was caught by
+preflight inside 90 seconds with `missing capability entry for
+codex/gpt-5.6-luna` -- see `python-tl-worker-notify/e2e-test.md` for the model
+defect behind it.
+
+This row is **not** Green: the messaging and role assertions above are proven,
+but the run does not reach `tl_done`, so the durable-controller-state row is not
+yet satisfied.
+
+### Later runs on another host, same date
+
+Two further runs of this scenario on a different host never got past the server
+health check, so they add nothing to the messaging evidence and are recorded
+here only so the row is not read as more settled than it is. Work dirs
+`codex-messaging.d2RDU06h` and `codex-messaging.iFGVZpeS`:
+
+```
+OK: account can run model gpt-5.6-luna          <- the #1149 preflight, both runs
+OK: harness policy written with role ceilings of 480000 (run budget 120000)
+INFO exomonad::serve: WASM plugins ready for root role
+INFO exomonad::serve: Binding MCP Unix domain socket .../.exo/server.sock
+ERROR exomonad: exomonad init failed: Server socket exists but health check
+  failed after 30s.
+ERROR: validator wrote no result file at .../validation-result.txt (init exited 1)
+RUNSH_EXIT=1
+```
+
+`d2RDU06h` used the host's installed `exomonad`, which is 44 commits behind
+`main`, so it could have been a stale-binary artifact. `iFGVZpeS` was re-run
+with a binary built from this branch's `main` (`5abc8d90`) and failed
+identically, which rules that out. Both runs wrote
+`allow = ["codex/gpt-5.6-luna"]` into `harness_policy.toml` and the matching
+`"codex/gpt-5.6-luna" = "standard"` into `harness_capability.toml`, so the
+account-resolved harness reached the controller's config on both.
+
+The blocker is the `is_healthy` probe over the UDS
+(`rust/exomonad/src/uds_client.rs`), not the isolation and not the model. Filed
+as Chainlink #1150. Note that this host also runs a long-lived `exomonad serve`
+holding the webhook port `0.0.0.0:7433`; that is a plausible contributor and is
+explicitly **unconfirmed**.
+
+Because `init` never returned, no worker was dispatched, no Codex rollout
+exists, and `event-quarantine.json` was never written on this host. So this
+scenario's own copy of the #1148 evidence above is the reference branch's run,
+not a run reproduced here.
 
 ## What was removed and why
 
