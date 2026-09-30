@@ -416,7 +416,7 @@ impl<
                 .to_string(),
         );
 
-        // Propagate CODEX_HOME to every spawned codex pane. install_codex_hook_trust
+        // Propagate CODEX_HOME to every spawned codex pane. The Codex lifecycle
         // seeds [hooks.state] entries in `$CODEX_HOME/config.toml`; without this
         // pass-through, spawned codex agents fall back to ~/.codex and see the hooks
         // as untrusted, firing "3 hooks need review" (chainlink #259). The init.rs
@@ -1274,6 +1274,13 @@ impl<
         Ok(())
     }
 
+    /// Provision the Codex configuration for one agent through the single
+    /// lifecycle contract shared by leaves, workers, reviewers, and companions.
+    ///
+    /// Renders `<dir>/.codex/config.toml`, grants Codex project trust, and
+    /// installs the matching hook trust. Nothing else may write a Codex config:
+    /// a config written outside the lifecycle has no trust state, so Codex
+    /// fires "3 hooks need review" on first tool use.
     pub(crate) async fn write_codex_config_files(
         &self,
         dir: &Path,
@@ -1282,57 +1289,27 @@ impl<
         model: Option<&str>,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
     ) -> Result<()> {
-        let codex_dir = dir.join(".codex");
-        fs::create_dir_all(&codex_dir).await?;
-
         let role_context = self.runtime_role_context(role)?;
-        let instructions = match role.as_str() {
-            "tl" | "root" => {
-                format!("{role_context}\n\n{}", super::spawn::CODEX_TL_RUNTIME_NOTES)
-            }
-            "worker" => format!(
-                "{}\n\n{role_context}",
-                super::spawn::CODEX_WORKER_INSTRUCTIONS
-            ),
-            "reviewer" => {
-                format!(
-                    "{}\n\n{role_context}",
-                    super::spawn::CODEX_REVIEWER_INSTRUCTIONS
-                )
-            }
-            _ => format!("{}\n\n{role_context}", super::spawn::CODEX_DEV_INSTRUCTIONS),
-        };
-        let configured_effort = self.effort_for_role(role.as_str());
-        let config = crate::codex_config::render_codex_config_with_effort(
-            agent_name.as_str(),
-            role.as_str(),
-            &instructions,
+        let exomonad_binary = crate::util::find_exomonad_binary();
+        let spec = codex_lifecycle::CodexAgentSpec {
+            agent_dir: dir,
+            agent_name: agent_name.as_str(),
+            role: role.as_str(),
+            role_context: Some(&role_context),
             model,
-            configured_effort,
+            effort: self.effort_for_role(role.as_str()),
             extra_mcp_servers,
-            &crate::util::find_exomonad_binary(),
-            dir,
+            exomonad_binary: &exomonad_binary,
+        };
+        let provisioned = codex_lifecycle::provision_codex_agent(&spec)
+            .with_context(|| format!("Failed to provision Codex config in {}", dir.display()))?;
+        info!(
+            agent_dir = %dir.display(),
+            role = %role.as_str(),
+            path = %provisioned.config_path.display(),
+            codex_user_config = ?provisioned.user_config_path,
+            "Provisioned .codex/config.toml and Codex trust for Codex agent"
         );
-        let codex_config_path = codex_dir.join("config.toml");
-        fs::write(&codex_config_path, config).await?;
-
-        if let Some(config_path) = crate::codex_config::codex_user_config_path() {
-            crate::codex_config::trust_codex_project(&config_path, dir).with_context(|| {
-                format!("Failed to trust Codex project in {}", config_path.display())
-            })?;
-            crate::codex_config::install_codex_hook_trust(&config_path, &codex_config_path)
-                .with_context(|| {
-                    format!("Failed to trust Codex hooks in {}", config_path.display())
-                })?;
-            info!(path = %config_path.display(), "Marked Codex agent worktree as trusted");
-        } else {
-            warn!("Could not determine Codex home; worktree may not be trusted automatically");
-        }
-        let legacy_hooks_path = codex_dir.join("hooks.json");
-        if legacy_hooks_path.exists() {
-            fs::remove_file(&legacy_hooks_path).await?;
-        }
-        info!(agent_dir = %dir.display(), role = %role.as_str(), "Wrote .codex/config.toml for Codex agent");
         Ok(())
     }
 
@@ -2002,6 +1979,103 @@ mod tests {
         std::env::remove_var("CODEX_HOME");
     }
 
+    /// Asserts the trust state one Codex config write must leave behind: the
+    /// project trust entry plus one `[hooks.state]` entry per rendered hook.
+    fn assert_codex_trust_matches_config(codex_home: &Path, agent_dir: &Path) {
+        let user_config_path = codex_home.join("config.toml");
+        let raw = std::fs::read_to_string(&user_config_path).unwrap();
+        let user: toml::Value = toml::from_str(&raw).expect("valid Codex user config TOML");
+        let project = agent_dir.display().to_string();
+        assert_eq!(
+            user["projects"][&project]["trust_level"].as_str(),
+            Some("trusted"),
+            "one config write must leave matching Codex project trust for {project}"
+        );
+        let config_path = agent_dir.join(".codex/config.toml");
+        let key_source = config_path.display().to_string();
+        for event in ["pre_tool_use", "post_tool_use", "stop"] {
+            let key = format!("{key_source}:{event}:0:0");
+            let hash = user["hooks"]["state"][&key]["trusted_hash"]
+                .as_str()
+                .unwrap_or_else(|| panic!("hook trust for {event} was seeded under {key}"));
+            assert!(hash.starts_with("sha256:"), "{key} recorded {hash}");
+        }
+    }
+
+    /// Every Codex agent shape leaves, workers, and reviewers are spawned as
+    /// must leave identical trust state for the same rendered config.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn every_spawned_codex_role_leaves_matching_trust_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let codex_home = project_dir.join("codex-home");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let service = AgentControlService::new(test_services(project_dir.clone()));
+        let extra = HashMap::new();
+
+        for role in ["dev", "worker", "reviewer"] {
+            let agent_dir = project_dir.join(format!("issue-1-{role}-codex"));
+            let role = crate::domain::Role::from(role);
+            service
+                .write_codex_config_files(
+                    &agent_dir,
+                    &role,
+                    &AgentName::try_from_str(&format!("issue-1-{role}-codex"))
+                        .expect("generated agent name is non-empty"),
+                    None,
+                    &extra,
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                agent_dir.join(".codex/config.toml").exists(),
+                "role {role} wrote no Codex config"
+            );
+            assert_codex_trust_matches_config(&codex_home, &agent_dir);
+        }
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    /// A dormant `resume_pr` owner is not disposed: its trust must survive a
+    /// lifecycle call that only writes the config again.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reprovisioning_a_dormant_owner_keeps_its_trust() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let codex_home = project_dir.join("codex-home");
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let service = AgentControlService::new(test_services(project_dir.clone()));
+        let agent_dir = project_dir.join("issue-1-leaf-codex");
+        let agent_name =
+            AgentName::try_from_str("issue-1-leaf-codex").expect("literal is non-empty");
+        let role = crate::domain::Role::dev();
+        let extra = HashMap::new();
+
+        service
+            .write_codex_config_files(&agent_dir, &role, &agent_name, None, &extra)
+            .await
+            .unwrap();
+        let after_first = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+
+        // Same owner, re-provisioned (spawn path re-entry). Removal is never
+        // triggered by this, and the trust the owner resumed on stays intact.
+        service
+            .write_codex_config_files(&agent_dir, &role, &agent_name, None, &extra)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            after_first,
+            std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
+            "re-provisioning a dormant owner must not disturb its trust state"
+        );
+        assert_codex_trust_matches_config(&codex_home, &agent_dir);
+        std::env::remove_var("CODEX_HOME");
+    }
+
     #[tokio::test]
     async fn test_create_socket_symlink() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2245,8 +2319,8 @@ mod tests {
     #[serial_test::serial]
     fn test_common_spawn_env_codex_home_propagated() {
         // Sibling to the CHAINLINK_DB test — confirms CODEX_HOME flows through the
-        // shell-prefix env path so spawned codex agents see install_codex_hook_trust's
-        // seeded [hooks.state] entries instead of falling back to ~/.codex.
+        // shell-prefix env path so spawned codex agents see the seeded
+        // [hooks.state] entries instead of falling back to ~/.codex.
         // #[serial] required because this test mutates CODEX_HOME, which other env-mutating
         // tests in this module also touch (test_codex_*_config_uses_*_instructions).
         let project_dir = PathBuf::from("/tmp/exo-test-project");
@@ -2270,7 +2344,7 @@ mod tests {
             env_set.get("CODEX_HOME").map(String::as_str),
             Some("/tmp/exo-test-codex-home"),
             "CODEX_HOME must be propagated into the spawn env so spawned codex panes \
-             see the same hook-trust DB that install_codex_hook_trust seeded \
+             see the same hook-trust DB the Codex lifecycle seeded \
              (chainlink #259)"
         );
         assert!(

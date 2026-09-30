@@ -48,6 +48,14 @@ trusted_hash = "sha256:..."
 
 The user config update is protected by a sidecar flock in `CODEX_HOME` and written atomically, so parallel Codex spawns do not lose trust entries. Legacy ExoMonad global hook blocks are stripped from the user config to avoid duplicate hook execution.
 
+### One Lifecycle For Every Agent Shape
+
+`services::agent_control::codex_lifecycle` is the single writer of `.codex/config.toml` and the single seeder of Codex trust. `provision_codex_agent` renders the config, writes it, removes a stale `.codex/hooks.json`, grants project trust, and installs hook trust computed from the config bytes it just wrote — one call always leaves matching trust state.
+
+Every supported Codex agent shape routes through it: leaves and reviewers via `AgentControlService::write_codex_config_files`, workers via `spawn_worker`, and Codex companions via `init::write_codex_companion_config`. `codex_role_instructions` is the single role-to-protocol mapping, so a companion and a spawned agent of the same role receive identical instructions. The companion path previously wrote its config and stopped, leaving companions with no project trust and no hook trust for their whole life; that is the bug this centralization fixed.
+
+There is no interactive Codex root TL configuration. The TL window runs the Python TL controller, which consumes `.exo/tl-loop/plan.json` and dispatches Codex children; normal Python-controller startup provisions no Codex agent in the project root.
+
 ### Hook Trust Removal
 
 Removal (`uninstall_codex_hook_trust`) is the exact inverse of installation. ExoMonad can only delete trust records it can still prove it owns:
@@ -59,6 +67,15 @@ Removal (`uninstall_codex_hook_trust`) is the exact inverse of installation. Exo
 - When a removal empties `[hooks.state]`, the now-empty `hooks` scaffolding ExoMonad just emptied is pruned rather than left as two header-only tables. A state table that still holds anything keeps both headers.
 
 Removal fails closed: a missing or non-ExoMonad generated config, an unparseable user config, or a `[hooks.state]` that is not a table returns an actionable error and leaves the user config byte-for-byte unchanged. ExoMonad returns a `HookTrustRemoval` report so callers can report what was removed *and* what was deliberately preserved.
+
+### Project Trust Is Never Deleted
+
+Removal removes hook trust only. Project trust is retained and reported as `RetainedProjectTrust`, because the two records have different provenance:
+
+- Hook trust carries a `trusted_hash` ExoMonad can recompute from the generated config, so it can prove a record is its own before deleting it.
+- `[projects."<dir>"] trust_level = "trusted"` is a bare path-to-trust-level pair. A project the operator trusted by hand is indistinguishable from one ExoMonad created, so deleting it would destroy user state on a guess.
+
+ExoMonad retains project trust until it records ownership of the entry at install time. `release_codex_agent_trust` returns which entry it kept so disposal can report it rather than silently leaving it behind.
 
 Removal is never triggered by process exit. Dormant `resume_pr` owners keep their trust; removal belongs to verified permanent resource disposal and to explicit operator-initiated maintenance.
 
@@ -149,6 +166,7 @@ ExoMonad does not inject an auth token or provider-specific environment variable
 ## Related Code
 
 - `rust/exomonad-core/src/codex_config.rs`
+- `rust/exomonad-core/src/services/agent_control/codex_lifecycle.rs`
 - `rust/exomonad-core/src/services/agent_control/internal.rs`
 - `rust/exomonad/src/init.rs`
 - `tests/e2e/codex-messaging/validate.sh`

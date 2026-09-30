@@ -6,10 +6,15 @@
 //! - ListAgents: Discover from tmux windows (source of truth for running agents)
 
 mod cleanup;
+pub mod codex_lifecycle;
 mod internal;
 pub mod invocation;
 mod spawn;
 
+pub use codex_lifecycle::{
+    codex_role_instructions, provision_codex_agent, release_codex_agent_trust, CodexAgentSpec,
+    CodexTrustRelease, ProvisionedCodexAgent, RetainedProjectTrust,
+};
 pub use invocation::{
     finish_invocation, finish_invocation_and_tombstone,
     finish_invocation_and_tombstone_with_context, read_invocation, read_invocation_conservatively,

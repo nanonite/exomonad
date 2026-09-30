@@ -2443,23 +2443,6 @@ const TL_CONTROLLER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const EXOMONAD_BUILD_GIT_COMMIT: &str = env!("EXOMONAD_BUILD_GIT_COMMIT");
 const EXOMONAD_TL_LOOP_GIT_COMMIT: &str = env!("EXOMONAD_TL_LOOP_GIT_COMMIT");
 
-fn read_root_tl_protocol(cwd: &Path, wasm_name: &str) -> Option<String> {
-    exomonad_core::services::agent_control::load_role_context(cwd, wasm_name, "root")
-}
-
-fn codex_root_instructions(cwd: &Path, wasm_name: &str) -> String {
-    read_root_tl_protocol(cwd, wasm_name)
-        .map(|protocol| {
-            format!(
-                "{protocol}\n\n{}",
-                exomonad_core::services::agent_control::CODEX_TL_RUNTIME_NOTES
-            )
-        })
-        .unwrap_or_else(|| {
-            exomonad_core::services::agent_control::CODEX_TL_RUNTIME_NOTES.to_string()
-        })
-}
-
 fn watcher_dashboard_command(cwd: &Path) -> Result<String> {
     let watcher_log_dir = cwd.join(".exo/logs");
     let watcher_log_path = watcher_log_dir.join("watcher.log");
@@ -3896,38 +3879,59 @@ fn extra_mcp_servers_to_json(
         .collect()
 }
 
+/// Provisions a Codex companion's configuration through the same lifecycle
+/// contract every spawned Codex agent uses.
+///
+/// The companion used to write `.codex/config.toml` and stop there, which left
+/// Codex with no project trust and no hook trust: its first tool use fired
+/// "3 hooks need review" and the agent's hooks stayed untrusted for the life of
+/// the companion. Routing companions through
+/// [`codex_lifecycle::provision_codex_agent`] makes one config write produce
+/// matching project and hook trust, exactly as it does for leaves, workers, and
+/// reviewers.
 fn write_codex_companion_config(
     config: &Config,
-    dir: &Path,
+    project_dir: &Path,
+    agent_dir: &Path,
     name: &str,
     role: &str,
     model: Option<&str>,
 ) -> Result<()> {
-    let codex_dir = dir.join(".codex");
-    std::fs::create_dir_all(&codex_dir)?;
-    let root_instructions;
-    let instructions = match role {
-        "tl" | "root" => {
-            root_instructions = codex_root_instructions(dir, &config.wasm_name);
-            &root_instructions
-        }
-        "worker" => exomonad_core::services::agent_control::CODEX_WORKER_INSTRUCTIONS,
-        "reviewer" => exomonad_core::services::agent_control::CODEX_REVIEWER_INSTRUCTIONS,
-        _ => exomonad_core::services::agent_control::CODEX_DEV_INSTRUCTIONS,
-    };
     let extra_mcp_servers = extra_mcp_servers_to_json(&config.extra_mcp_servers)?;
     let configured_effort = config.worker_effort_level.level.to_string();
-    let rendered = exomonad_core::codex_config::render_codex_config_with_effort(
-        name,
+    // Role context lives in the project, not in the companion's agent dir, so a
+    // companion is configured from the same context a spawned agent of the same
+    // role would receive.
+    let role_context = exomonad_core::services::agent_control::load_role_context(
+        project_dir,
+        &config.wasm_name,
         role,
-        instructions,
-        model,
-        Some(&configured_effort),
-        &extra_mcp_servers,
-        &exomonad_core::find_exomonad_binary(),
-        dir,
     );
-    std::fs::write(codex_dir.join("config.toml"), rendered)?;
+    let exomonad_binary = exomonad_core::find_exomonad_binary();
+    let spec = exomonad_core::services::agent_control::CodexAgentSpec {
+        agent_dir,
+        agent_name: name,
+        role,
+        role_context: role_context.as_deref(),
+        model,
+        effort: Some(&configured_effort),
+        extra_mcp_servers: &extra_mcp_servers,
+        exomonad_binary: &exomonad_binary,
+    };
+    let provisioned = exomonad_core::services::agent_control::provision_codex_agent(&spec)
+        .with_context(|| {
+            format!(
+                "failed to provision Codex config in {}",
+                agent_dir.display()
+            )
+        })?;
+    info!(
+        name = %name,
+        role = %role,
+        path = %provisioned.config_path.display(),
+        codex_user_config = ?provisioned.user_config_path,
+        "Provisioned Codex companion config and Codex trust"
+    );
     Ok(())
 }
 
@@ -6099,7 +6103,10 @@ pub async fn run(
         .status();
 
     // Propagate CODEX_HOME into the tmux session env so Codex panes see the
-    // same hook-trust DB that init's install_codex_hook_trust just seeded.
+    // same hook-trust DB the agent lifecycle seeded for each Codex agent. init
+    // provisions no Codex agent of its own — the TL window runs the Python TL
+    // controller — so the entries that matter are the ones
+    // services::agent_control::codex_lifecycle wrote for companions and leaves.
     // Without this, when tmux server is already running from another session
     // (e.g., a parallel workspace), the new session attaches to that server
     // and inherits the server's captured env — NOT the env exported by the
@@ -6494,6 +6501,7 @@ pub async fn run(
             std::os::unix::fs::symlink(cwd.join(".exo/server.sock"), &socket_target)?;
             write_codex_companion_config(
                 &config,
+                &cwd,
                 &agent_dir,
                 &companion.name,
                 &companion.role,
@@ -7133,19 +7141,142 @@ mod tests {
 
     #[test]
     fn codex_protocol_delivery_is_prompt_independent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".exo/roles/sentinel/context");
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("root.md"), "SENTINEL ROOT PROTOCOL").unwrap();
-
-        for initial_prompt in [None, Some("task-only initial prompt")] {
-            let instructions = codex_root_instructions(tmp.path(), "sentinel");
-            assert!(instructions.contains("SENTINEL ROOT PROTOCOL"));
-            assert!(instructions.contains("Codex Runtime Notes"));
-            if let Some(prompt) = initial_prompt {
-                assert!(!instructions.contains(prompt));
-            }
+        for role in ["dev", "worker", "reviewer", "tl"] {
+            let protocol = exomonad_core::services::agent_control::codex_role_instructions(
+                role,
+                Some("SENTINEL ROOT PROTOCOL"),
+            );
+            assert!(protocol.contains("SENTINEL ROOT PROTOCOL"), "role {role}");
+            assert!(protocol.contains("ExoMonad"), "role {role}");
+            assert!(!protocol.contains("task-only initial prompt"));
         }
+    }
+
+    /// The Python TL controller is the project's root controller. It consumes
+    /// `.exo/tl-loop/plan.json` and dispatches children, so normal startup must
+    /// not generate an interactive Codex root TL configuration in the project
+    /// root — there is no Codex root agent to configure.
+    #[test]
+    fn python_controller_startup_generates_no_codex_root_tl_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+
+        // The only init-owned writer of a Codex config is the companion path.
+        // With no companions configured, nothing provisions a Codex agent.
+        let config = Config {
+            companions: Vec::new(),
+            root_agent_type: AgentType::Codex,
+            ..Config::default()
+        };
+        write_tl_loop_identity(project_dir, "main").unwrap();
+        append_init_invocation_log(
+            project_dir,
+            &config,
+            &["exomonad".to_string(), "init".to_string()],
+            SessionMode::Continue,
+        )
+        .unwrap();
+
+        assert!(
+            !project_dir.join(".codex/config.toml").exists(),
+            "the Python TL controller must not be given a Codex root configuration"
+        );
+        assert!(
+            !project_dir
+                .join(".exo/agents/root/.codex/config.toml")
+                .exists(),
+            "the root TL identity must not be given a Codex configuration"
+        );
+    }
+
+    fn codex_companion_config(
+        role: &str,
+        codex_home: &std::path::Path,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path();
+        std::env::set_var("CODEX_HOME", codex_home);
+        let role_dir = project_dir.join(".exo/roles/sentinel/context");
+        std::fs::create_dir_all(&role_dir).unwrap();
+        std::fs::write(role_dir.join(format!("{role}.md")), "SENTINEL ROLE CONTEXT").unwrap();
+
+        let agent_dir = project_dir.join(format!(".exo/agents/companion-{role}"));
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let config = Config {
+            wasm_name: "sentinel".to_string(),
+            ..Config::default()
+        };
+        write_codex_companion_config(
+            &config,
+            project_dir,
+            &agent_dir,
+            &format!("companion-{role}"),
+            role,
+            None,
+        )
+        .unwrap();
+        (tmp, agent_dir)
+    }
+
+    /// The companion path used to write `.codex/config.toml` and stop, leaving
+    /// the companion's Codex project and hooks untrusted for its whole life.
+    #[test]
+    #[serial_test::serial]
+    fn codex_companion_config_creates_matching_trust_state() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let home = codex_home.path().to_path_buf();
+        for role in ["dev", "worker", "reviewer"] {
+            let (tmp, agent_dir) = codex_companion_config(role, &home);
+            let config_path = agent_dir.join(".codex/config.toml");
+            assert!(config_path.exists(), "role {role} wrote no Codex config");
+
+            let user: toml::Value = toml::from_str(
+                &std::fs::read_to_string(home.join("config.toml")).expect("user config written"),
+            )
+            .expect("valid Codex user config TOML");
+            let project = agent_dir.display().to_string();
+            assert_eq!(
+                user["projects"][&project]["trust_level"].as_str(),
+                Some("trusted"),
+                "role {role} companion must be a trusted Codex project"
+            );
+            let key_source = config_path.display().to_string();
+            for event in ["pre_tool_use", "post_tool_use", "stop"] {
+                let key = format!("{key_source}:{event}:0:0");
+                assert!(
+                    user["hooks"]["state"][&key]["trusted_hash"]
+                        .as_str()
+                        .is_some_and(|hash| hash.starts_with("sha256:")),
+                    "role {role} companion is missing hook trust under {key}"
+                );
+            }
+            drop(tmp);
+        }
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    /// A companion receives the same role protocol and role context a spawned
+    /// agent of that role receives, because both go through one lifecycle.
+    #[test]
+    #[serial_test::serial]
+    fn codex_companion_uses_the_shared_role_instructions() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let home = codex_home.path().to_path_buf();
+        let (_tmp, agent_dir) = codex_companion_config("worker", &home);
+        let parsed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(agent_dir.join(".codex/config.toml")).unwrap())
+                .expect("valid Codex config TOML");
+        let instructions = parsed["developer_instructions"]
+            .as_str()
+            .expect("developer instructions are rendered");
+
+        let expected = exomonad_core::services::agent_control::codex_role_instructions(
+            "worker",
+            Some("SENTINEL ROLE CONTEXT"),
+        );
+        assert_eq!(instructions.trim(), expected.trim());
+        assert!(instructions.contains("SENTINEL ROLE CONTEXT"));
+        std::env::remove_var("CODEX_HOME");
     }
 
     #[test]
@@ -9142,7 +9273,10 @@ mod tests {
         std::fs::write(project.join("seed"), "seed\n").unwrap();
         run_in(&project, &["add", "seed"]);
         run_in(&project, &["commit", "-q", "-m", "seed"]);
-        run_in(&project, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_in(
+            &project,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
         run_in(&project, &["push", "-q", "origin", "main"]);
         run_in(&project, &["branch", "main.stage"]);
         run_in(&project, &["branch", "main.leaf"]);
@@ -9174,10 +9308,9 @@ mod tests {
         let mut publication = test_leaf_publication("main.leaf", &head_sha);
         publication.base_branch = "main.stage".to_owned();
         write_published_head(&project, &publication);
-        let leaves =
-            leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
-                .await
-                .unwrap();
+        let leaves = leaf_branch_cleanups(&project, &[publication], &[], &HashSet::new(), None)
+            .await
+            .unwrap();
         assert_eq!(leaves.len(), 1);
 
         let mut plan = leaf_plan(leaves);

@@ -59,5 +59,6 @@ assert_cmd = "2.0"
 duct = { workspace = true }
 exomonad-test-support = { path = "../exomonad-test-support", version = "0.1.0" }
 predicates = "3.0"
+serial_test = "3.1"
 serde_yaml = "0.9"
 tower = "0.5"

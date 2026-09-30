@@ -198,7 +198,7 @@ struct OwnedHookTrustKey {
 
 /// The outcome of [`uninstall_codex_hook_trust`], so a caller can report what
 /// was deleted and — more importantly — everything left behind and why.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HookTrustRemoval {
     /// How many exact keys ExoMonad derived from the generated config and
     /// looked for. Entries that were already absent are not errors.
@@ -214,14 +214,14 @@ pub struct HookTrustRemoval {
 }
 
 /// A hook-trust entry ExoMonad deliberately refused to delete.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreservedHookTrust {
     pub key: String,
     pub reason: HookTrustPreserveReason,
 }
 
 /// Why ExoMonad left a `[hooks.state]` entry in place.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookTrustPreserveReason {
     /// The key is one ExoMonad would own, but the recorded `trusted_hash` no
     /// longer matches the hash ExoMonad generates from the generated config
