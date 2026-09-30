@@ -660,6 +660,61 @@ mod tests {
         std::env::remove_var("CODEX_HOME");
     }
 
+    /// Hook commands live in the generated per-agent config, never in the Codex
+    /// user config.
+    ///
+    /// A global `# BEGIN EXOMONAD CODEX HOOKS` block used to be written to the
+    /// user config and was removed in 8934378f (#210); `trust_codex_project`
+    /// now strips such a block on every write. Two E2E validators assert this
+    /// exact shape against a real provisioned run, so the contract is pinned
+    /// here against real output: if the renderer stopped emitting a hook
+    /// command, or the user config started carrying one again, that E2E would
+    /// fail for a reason nothing in Rust would have explained.
+    #[test]
+    #[serial]
+    fn provisioning_writes_hook_commands_into_the_config_not_the_user_config() {
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = isolated_codex_home(root.path());
+        let agent_dir = root.path().join("issue-42-leaf-codex");
+        let extra = HashMap::new();
+
+        let provisioned = provision_codex_agent(&test_spec(&agent_dir, "worker", &extra)).unwrap();
+
+        let generated = std::fs::read_to_string(&provisioned.config_path)
+            .expect("generated config was written");
+        let user = std::fs::read_to_string(codex_home.join("config.toml"))
+            .expect("Codex user config was written");
+
+        for command in [
+            "hook pre-tool-use --runtime codex",
+            "hook post-tool-use --runtime codex",
+            "hook stop --runtime codex",
+        ] {
+            assert!(
+                generated.contains(command),
+                "the generated config must carry the `{command}` hook command; \
+                 install_codex_hook_trust derives its trust entries from these"
+            );
+            assert!(
+                !user.contains(command),
+                "the Codex user config must not carry `{command}`; hook commands \
+                 belong to the generated config, and a copy here is one Codex \
+                 would load without matching trust"
+            );
+        }
+
+        assert!(
+            !user.contains("# BEGIN EXOMONAD CODEX HOOKS"),
+            "the retired global hooks block must stay absent; trust_codex_project \
+             strips it on every write and nothing may reintroduce it"
+        );
+        assert!(
+            user.contains("[hooks.state."),
+            "the user config is where hook trust is recorded"
+        );
+        std::env::remove_var("CODEX_HOME");
+    }
+
     #[test]
     #[serial]
     fn every_supported_role_provisions_the_same_trust_contract() {

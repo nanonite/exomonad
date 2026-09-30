@@ -106,7 +106,9 @@ git init --bare "$REMOTE_DIR" -q
 mkdir -p "$REPO_DIR"
 cd "$REPO_DIR"
 git init -q -b main
-git remote add origin "$REMOTE_DIR"
+# `origin` is an HTTP URL because the controller resolves repository identity at
+# startup and refuses a local-path remote; pushes still go to the local bare
+# repository, so the scenario stays hermetic and local-only.
 git config user.name "Exomonad E2E"
 git config user.email "e2e@example.com"
 
@@ -117,7 +119,7 @@ This repository is created by tests/e2e/python-tl-worker-notify/run.sh.
 EOF
 git add README.md
 git commit -m "initial commit" -q
-git push -u origin main -q
+e2e_python_tl_configure_remote "$REPO_DIR" "$REMOTE_DIR" "python-tl-worker-notify"
 
 if ! "$EXOMONAD_BIN" new 2>&1 | sed 's/^/  /'; then
     echo "ERROR: 'exomonad new' failed during E2E setup."
@@ -132,6 +134,17 @@ if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
     rm -rf .exo/roles
     cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
 fi
+
+# The controller opens the project's Chainlink database during startup, so it
+# must exist before `init` starts the TL window.
+e2e_python_tl_init_chainlink "$REPO_DIR"
+
+# `exomonad new` scaffolds a 120000-token worker ceiling. The controller
+# attributes a role's whole share of the run budget to that role until it has
+# recorded per-role spend, so a plan whose run budget meets the scaffolded
+# ceiling parks its only slice with `over_budget` before dispatching anything.
+# Derive the ceilings from the plan instead.
+e2e_python_tl_write_harness_policy "$REPO_DIR" "$SCRIPT_DIR/plan.json"
 
 # The controller's only input is plan.json. Copy the scenario plan verbatim so
 # the plan the validator reads is the plan in version control.

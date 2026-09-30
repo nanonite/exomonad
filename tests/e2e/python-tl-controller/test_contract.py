@@ -31,9 +31,15 @@ Covered:
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
+import time
+import tempfile
 import tomllib
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -132,35 +138,77 @@ def test_shared_helper_does_not_pin_a_pane_index() -> None:
 # both directions: the case that must pass, and the near-miss that must fail.
 
 
+# The two templates below are transcribed from a real provisioned run, not
+# invented. The Codex user config carries *only* hook-trust state and project
+# trust; the hook commands live in the generated per-agent config. A user config
+# that carried hook commands would be the retired global-hooks-block shape,
+# removed in 8934378f (#210) and stripped by `trust_codex_project`.
+#
+# `codex_lifecycle::provisioning_writes_hook_commands_into_the_config_not_the_user_config`
+# pins this against live product output, so a future change to either writer
+# fails there first rather than silently invalidating these fixtures.
 WORKER_CONFIG = """\
-model = "gpt-luna"
 approval_policy = "never"
+default_permissions = "worker"
 developer_instructions = \"\"\"
 # ExoMonad Worker Agent Protocol
-
-body
+<...instructions...>
 \"\"\"
 
 [features]
 hooks = true
 
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "<EXOMONAD> hook pre-tool-use --runtime codex"
+timeout = 600
+async = false
+
+[[hooks.PostToolUse]]
+matcher = "*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "<EXOMONAD> hook post-tool-use --runtime codex"
+timeout = 600
+async = false
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "<EXOMONAD> hook stop --runtime codex"
+timeout = 600
+async = false
+
 [mcp_servers.exomonad]
+args = [
+    "mcp-stdio",
+    "--role",
+    "worker",
+    "--name",
+    "w1-codex",
+]
 command = "exomonad"
-args = ["mcp-stdio", "--role", "worker", "--name", "w1-codex"]
+
+[permissions.worker]
+network_access = false
+sandbox_mode = "workspace-write"
+writable_roots = ["."]
 """
 
 USER_CONFIG_TEMPLATE = """\
-# BEGIN EXOMONAD CODEX HOOKS
-[[hooks.PreToolUse]]
-command = "exomonad hook pre-tool-use --runtime codex"
-[[hooks.PostToolUse]]
-command = "exomonad hook post-tool-use --runtime codex"
-[[hooks.Stop]]
-command = "exomonad hook stop --runtime codex"
-# END EXOMONAD CODEX HOOKS
+[hooks.state."{config}:post_tool_use:0:0"]
+trusted_hash = "sha256:c5a18ddf565ce43e5e80abbd1fbc83b5bc63baa00b41ab1fbda8fa28908c97b7"
 
 [hooks.state."{config}:pre_tool_use:0:0"]
-trusted_hash = "abc"
+trusted_hash = "sha256:8fe27ce648b4ce15340ee42b18ff182a57d864d761c981c02bbcdaa7c3c07d9e"
+
+[hooks.state."{config}:stop:0:0"]
+trusted_hash = "sha256:b5575139d846260464bce4fc2a55b8e18253f1d0eef44ba185fd7104ba810703"
 
 [projects."{agent_dir}"]
 trust_level = "trusted"
@@ -250,6 +298,41 @@ def test_codex_child_config_assertion_rejects_a_role_mismatch(
     assert (result.returncode != 0) is must_fail, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    "event", ["pre-tool-use", "post-tool-use", "stop"]
+)
+def test_codex_child_config_assertion_requires_every_hook_command(
+    fixture: dict[str, Path], event: str
+) -> None:
+    """The generated config must carry all three hook commands.
+
+    ``install_codex_hook_trust`` derives one trust entry per hook event from this
+    file, so a config missing a command would produce a child whose hook trust
+    and hooks do not correspond. A missing command is invisible to every other
+    assertion here, which is why it is checked on its own.
+    """
+    original = read(fixture["config"])
+    fixture["config"].write_text(
+        original.replace(f"hook {event} --runtime codex", "hook absent"),
+        encoding="utf-8",
+    )
+    result = call_helper(
+        fixture,
+        "e2e_python_tl_assert_codex_child_config",
+        fixture["config"], "w1", "worker", "w1-codex",
+        "ExoMonad Worker Agent Protocol",
+    )
+    assert result.returncode != 0, f"a config without the {event} hook must be rejected"
+
+    fixture["config"].write_text(original, encoding="utf-8")
+    assert call_helper(
+        fixture,
+        "e2e_python_tl_assert_codex_child_config",
+        fixture["config"], "w1", "worker", "w1-codex",
+        "ExoMonad Worker Agent Protocol",
+    ).returncode == 0
+
+
 def test_codex_child_config_assertion_rejects_a_missing_config(tmp_path: Path) -> None:
     result = call_helper(
         {"config": tmp_path / "absent" / "config.toml"},
@@ -282,28 +365,143 @@ def test_codex_trust_assertion_rejects_a_half_written_lifecycle(
             fixture["codex_home"], fixture["config"],
         )
 
+    original = read(fixture["user_config"])
     assert check().returncode == 0
 
-    # Hook trust present, project trust missing: a partial lifecycle write.
+    def with_replacement(old: str, new: str) -> None:
+        assert old in original, f"fixture no longer contains {old!r}"
+        fixture["user_config"].write_text(original.replace(old, new), encoding="utf-8")
+
+    # Project trust missing: a partial lifecycle write. Hook trust alone does not
+    # make the project trusted, and project trust alone does not trust the hooks.
+    with_replacement('trust_level = "trusted"', 'trust_level = "no"')
+    assert check().returncode != 0
+
+    # Trust recorded against a different config: the state does not describe
+    # this child, so the child is running with untrusted hooks.
+    with_replacement(":pre_tool_use:0:0", ":pre_tool_use:0:1")
+    assert check().returncode != 0
+
+    # A trust entry with no hash: Codex keys the trust decision on the hash, so
+    # an entry without one is not a trusted entry.
+    with_replacement(
+        'trusted_hash = "sha256:8fe27ce648b4ce15340ee42b18ff182a57d864d761c981c02bbcdaa7c3c07d9e"',
+        'note = "no hash"',
+    )
+    assert check().returncode != 0
+
+    # The retired global hooks block reappearing in the user config. This is the
+    # shape removed in 8934378f (#210); `trust_codex_project` strips it on every
+    # write, so finding one means a superseded code path edited this file and
+    # Codex would load hooks ExoMonad never hashed.
     fixture["user_config"].write_text(
-        read(fixture["user_config"]).replace('trust_level = "trusted"', 'trust_level = "no"'),
+        "# BEGIN EXOMONAD CODEX HOOKS\n"
+        '[[hooks.PreToolUse]]\ncommand = "/usr/local/bin/exomonad hook pre-tool-use --runtime codex"\n'
+        "# END EXOMONAD CODEX HOOKS\n" + original,
         encoding="utf-8",
     )
     assert check().returncode != 0
 
-    # Trust for a different config: the state does not describe this child.
-    fixture["user_config"].write_text(
-        read(fixture["user_config"]).replace(":pre_tool_use:0:0", ":pre_tool_use:0:1"),
-        encoding="utf-8",
-    )
-    assert check().returncode != 0
+    # Back to the real shape, to prove the failures above were the mutations and
+    # not a fixture that stopped satisfying the assertion.
+    fixture["user_config"].write_text(original, encoding="utf-8")
+    assert check().returncode == 0
 
-    # The shared hooks block gone: the config is one Codex will not load.
-    fixture["user_config"].write_text(
-        read(fixture["user_config"]).replace("BEGIN EXOMONAD CODEX HOOKS", "REMOVED"),
-        encoding="utf-8",
+
+@pytest.fixture
+def tmux_session() -> Iterator[str]:
+    """A real tmux session, so the propagation assertion is tested for real.
+
+    `tmux show-environment` prints `NAME=value`, and prefixes the name with `-`
+    when the variable is unset in the session. An assertion that compared the
+    whole line to the bare path therefore failed against a correctly propagated
+    session -- which is what a live run showed.
+    """
+    if shutil.which("tmux") is None:
+        pytest.skip("tmux is not available")
+    name = f"python-tl-contract-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", name, "-n", "W", "sleep 60"],
+        check=True, capture_output=True,
     )
-    assert check().returncode != 0
+    try:
+        yield name
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
+
+
+def assert_from_inside_a_pane(session: str, *args: object) -> int:
+    """Run the helper in a pane of `session` and return its exit code.
+
+    A validator is a process companion, so it runs inside a pane. Driving it
+    that way also means the assertion sees the same `tmux` reachability the live
+    scenario does.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        result_file = Path(tmp) / "rc"
+        script = Path(tmp) / "probe.sh"
+        script.write_text(
+            f'#!/usr/bin/env bash\nsource "{SHARED_HELPER}"\n"$@"\n'
+            f'printf "%s" "$?" > "{result_file}"\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        subprocess.run(
+            ["tmux", "new-window", "-t", session, "-n", "probe", "-d",
+             "bash", str(script), "e2e_python_tl_assert_session_codex_home",
+             session, *[str(a) for a in args]],
+            check=True, capture_output=True,
+        )
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if result_file.is_file():
+                return int(result_file.read_text(encoding="utf-8") or 1)
+            time.sleep(0.2)
+        raise AssertionError(f"the probe window never reported: {args}")
+
+
+def test_session_codex_home_assertion_accepts_a_propagated_value(
+    tmux_session: str,
+) -> None:
+    """The `NAME=value` form tmux actually prints must be accepted."""
+    home = "/tmp/python-tl-expected-codex-home"
+    subprocess.run(
+        ["tmux", "set-environment", "-t", tmux_session, "CODEX_HOME", home],
+        check=True, capture_output=True,
+    )
+    printed = subprocess.run(
+        ["tmux", "show-environment", "-t", tmux_session, "CODEX_HOME"],
+        text=True, capture_output=True, check=True,
+    ).stdout.strip()
+    assert printed == f"CODEX_HOME={home}", (
+        "this test is only meaningful while tmux prints NAME=value"
+    )
+    assert assert_from_inside_a_pane(tmux_session, home) == 0
+
+
+def test_session_codex_home_assertion_rejects_an_absent_value(tmux_session: str) -> None:
+    """A session that never received CODEX_HOME must fail, not match vacuously."""
+    assert assert_from_inside_a_pane(tmux_session, "/tmp/expected") != 0
+
+
+def test_session_codex_home_assertion_rejects_an_explicitly_unset_value(
+    tmux_session: str,
+) -> None:
+    """tmux marks an unset variable with a leading `-`; that is not a value."""
+    subprocess.run(
+        ["tmux", "set-environment", "-t", tmux_session, "-u", "CODEX_HOME"],
+        check=True, capture_output=True,
+    )
+    assert assert_from_inside_a_pane(tmux_session, "/tmp/expected") != 0
+
+
+def test_session_codex_home_assertion_rejects_a_wrong_value(tmux_session: str) -> None:
+    """A propagated-but-different home is a leak and must fail."""
+    subprocess.run(
+        ["tmux", "set-environment", "-t", tmux_session, "CODEX_HOME", "/tmp/somewhere-else"],
+        check=True, capture_output=True,
+    )
+    assert assert_from_inside_a_pane(tmux_session, "/tmp/expected") != 0
 
 
 def test_session_codex_home_assertion_rejects_a_missing_propagation() -> None:
@@ -704,3 +902,4 @@ def test_tl_loop_policy_fixture_still_validates() -> None:
         path = PROJECT_ROOT / ".exo" / name
         assert path.is_file(), f".exo/{name} must exist"
         tomllib.loads(read(path))
+

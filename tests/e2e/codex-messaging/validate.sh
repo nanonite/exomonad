@@ -16,8 +16,6 @@ CODEX_HOME="${4:?isolated codex home required}"
 TIMEOUT_SECONDS="${CODEX_MESSAGING_E2E_TIMEOUT_SECONDS:-600}"
 POLL_SECONDS=5
 TL_WINDOW="TL"
-WORKER_AGENT="codex-messaging-sender-codex"
-PEER_AGENT="codex-messaging-peer"
 SEND_MARKER="[CODEX-MSG-WORKER-TO-PEER]"
 NOTIFY_MARKER="[CODEX-MSG-SENDER-DONE]"
 WORKER_PROTOCOL="ExoMonad Worker Agent Protocol"
@@ -26,6 +24,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # shellcheck source=../lib/python-tl.sh
 source "$PROJECT_ROOT/tests/e2e/lib/python-tl.sh"
+
+# The plan slice name is what the controller keys `run.json`'s `slices` by; the
+# agent identity adds the harness suffix and names the agent directory. Deriving
+# both from the shipped plan keeps the two from being confused for each other.
+PLAN_SLICE="$(e2e_python_tl_plan_slices "$SCRIPT_DIR/plan.json")"
+WORKER_AGENT="$(e2e_python_tl_agent_identity "$PLAN_SLICE")"
+# The peer is a companion declared in .exo/config.toml, not a plan slice,
+# so its agent identity is exactly its configured name.
+PEER_AGENT="codex-messaging-peer"
 
 failures=()
 
@@ -113,7 +120,7 @@ main() {
     wait_for "controller reached a terminal phase" \
         "python3 -c \"import json, sys; sys.exit(0 if json.load(open('$(e2e_python_tl_run_state "$REPO_DIR")'))['fsm']['phase'] in ('tl_done', 'tl_parked', 'tl_failed') else 1)\""
     check "plan slice is present in the checkpoint" \
-        e2e_python_tl_assert_slices "$REPO_DIR" "$WORKER_AGENT"
+        e2e_python_tl_assert_slices "$REPO_DIR" "$PLAN_SLICE"
     check "controller reached the expected terminal phase" \
         e2e_python_tl_assert_phase "$REPO_DIR" "tl_done"
 
