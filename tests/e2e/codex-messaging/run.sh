@@ -2,7 +2,14 @@
 set -euo pipefail
 
 # E2E Codex Messaging Test
-# Validates Codex send_tmux_message and notify_parent delivery through tmux routing.
+# The Python TL controller consumes .exo/tl-loop/plan.json and dispatches two
+# Codex workers. The sender reaches its sibling with send_tmux_message; the
+# receiver reports back to the controller with notify_parent. Both children must
+# get a role-correct Codex config and trusted hooks in the isolated CODEX_HOME,
+# and the run must reach a durable terminal phase.
+#
+# There is no interactive Codex root TL and no TL prompt: root_agent_type is
+# ignored by init and initial_prompt, if set, must be a JSON WorkPlan.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -11,6 +18,8 @@ PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
 # shellcheck source=../lib/codex-home.sh
 source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
+# shellcheck source=../lib/python-tl.sh
+source "$PROJECT_ROOT/tests/e2e/lib/python-tl.sh"
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -45,6 +54,11 @@ for cmd in tmux git python3; do
     fi
 done
 echo "  tmux, git, python3: OK"
+
+python3 -c "import tomllib" 2>/dev/null || {
+    echo "ERROR: python3 tomllib not available (need Python 3.11+)."
+    exit 1
+}
 
 echo ">>> [Phase 1] Creating temp environment..."
 
@@ -121,41 +135,43 @@ if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
     cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
 fi
 
-ROOT_PROMPT="$(python3 - "$SCRIPT_DIR/e2e-test.md" <<'PY'
-import pathlib
-import sys
-
-value = pathlib.Path(sys.argv[1]).read_text()
-print(value.replace('"""', '\\"\\"\\"'))
-PY
-)"
+# The controller's only input is plan.json. Copy the scenario plan verbatim so
+# the plan the validator reads is the plan in version control.
+mkdir -p .exo/tl-loop
+cp "$SCRIPT_DIR/plan.json" .exo/tl-loop/plan.json
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' .exo/tl-loop/plan.json \
+    || { echo "ERROR: plan.json is not valid JSON."; exit 1; }
 
 cat > .exo/config.toml <<EOF
 default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
 tmux_session = "$SESSION"
-root_agent_type = "codex"
 spawn_agent_type = "codex"
 yolo = true
 poll_interval = 5
-initial_prompt = """
-$ROOT_PROMPT
-"""
+
+# The peer the dispatched worker messages. A companion is the only agent shape
+# that already exists when the controller dispatches, and unlike a second
+# worker it is addressable: process companions get no routing.json, so they
+# cannot receive a tmux message at all. Declaring it a Codex companion also
+# puts it through the same provisioning lifecycle as a dispatched child.
+[[companions]]
+name = "codex-messaging-peer"
+agent_type = "codex"
+role = "worker"
+task = "You are the peer Codex agent in the Codex messaging E2E. When a tmux-injected message containing [CODEX-MSG-WORKER-TO-PEER] arrives in your pane, call the ExoMonad \`notify_parent\` MCP tool with status \`success\` and this exact message: [CODEX-MSG-PEER-RECEIVED] Codex peer received the dispatched worker's tmux message. Then stop. Do not inspect files, run shell commands, search the repository, or ask for permission."
 
 [[companions]]
 name = "codex-messaging-validator"
 agent_type = "process"
-command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE'"
+command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE' '$CODEX_HOME'"
 EOF
 
-cat > "$CODEX_HOME/config.toml" <<EOF
-[projects."$REPO_DIR"]
-trust_level = "trusted"
-
-[projects."$REPO_DIR/.exo/worktrees/codex-messaging-dev-codex"]
-trust_level = "trusted"
-EOF
+# `spawn_worker` refuses a dirty worktree, and `init` writes `.mcp.json` and
+# `.claude/rules/exomonad.md` after this point. Ignore and commit them so the
+# controller can actually dispatch its first worker.
+e2e_python_tl_commit_scaffold "$REPO_DIR" "Configure Codex messaging fixture for the Python TL controller"
 
 echo "  Repo: $REPO_DIR"
 echo "  Remote: $REMOTE_DIR"
@@ -167,7 +183,7 @@ unset FORGEJO_TOKEN
 unset FORGEJO_API_URL
 e2e_codex_assert_home_is_run_scoped
 export EXOMONAD_LOG_FORMAT=""
-echo "  GitHub auth unset"
+echo "  Forgejo auth unset"
 echo "  Codex config isolated to $CODEX_HOME"
 
 echo ">>> [Phase 3] Launching exomonad init..."
@@ -178,9 +194,9 @@ echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""
 echo "  Chain under test:"
-echo "    Codex root -> Codex dev leaf"
-echo "    Codex root send_tmux_message -> Codex dev leaf"
-echo "    Codex dev notify_parent -> root via tmux"
+echo "    Python TL controller -> Codex worker (sender)"
+echo "    Codex worker send_tmux_message -> Codex companion peer"
+echo "    Codex worker notify_parent -> controller"
 echo "============================================"
 echo ""
 

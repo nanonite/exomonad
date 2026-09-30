@@ -2,8 +2,17 @@
 set -euo pipefail
 
 # E2E Worker Notify Test
-# Validates worker notify_parent delivery into the root pane 0 while a worker
-# pane is active, covering the tmux pane-pinning fix.
+# The Python TL controller consumes .exo/tl-loop/plan.json and dispatches one
+# Codex worker into a pane of its own TL window. The worker's notify_parent must
+# reach the controller's window, the child must get a role-correct Codex config
+# with trusted hooks in the isolated CODEX_HOME, and the run must reach a durable
+# terminal phase.
+#
+# There is no interactive Codex root TL and no TL prompt: root_agent_type is
+# ignored by init and initial_prompt, if set, must be a JSON WorkPlan.
+#
+# Renamed from the sub-TL worker notify scenario: there is no sub-TL in the
+# shipped architecture, the root controller is the Python process.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -12,6 +21,8 @@ PROJECT_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
 source "$PROJECT_ROOT/tests/e2e/lib/git-fixture.sh"
 # shellcheck source=../lib/codex-home.sh
 source "$PROJECT_ROOT/tests/e2e/lib/codex-home.sh"
+# shellcheck source=../lib/python-tl.sh
+source "$PROJECT_ROOT/tests/e2e/lib/python-tl.sh"
 
 echo ">>> [Phase 0] Checking preconditions..."
 
@@ -42,12 +53,17 @@ if [[ ! -d "$PROJECT_ROOT/.exo/wasm" ]] || ! ls "$PROJECT_ROOT/.exo/wasm/"wasm-g
 fi
 echo "  WASM: $(ls "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm)"
 
+python3 -c "import tomllib" 2>/dev/null || {
+    echo "ERROR: python3 tomllib not available (need Python 3.11+)."
+    exit 1
+}
+
 echo ">>> [Phase 1] Creating temp environment..."
 
 mkdir -p "$HOME/.cache/exomonad-e2e"
-WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/subtl-worker-notify.XXXXXXXX")"
+WORK_DIR="$(mktemp -d "$HOME/.cache/exomonad-e2e/python-tl-worker-notify.XXXXXXXX")"
 e2e_git_use_fixture_root "$WORK_DIR"
-SESSION="e2e-subtl-worker-notify"
+SESSION="e2e-python-tl-worker-notify"
 RESULT_FILE="$WORK_DIR/validation-result.txt"
 REMOTE_DIR="$WORK_DIR/remote.git"
 REPO_DIR="$WORK_DIR/repo"
@@ -95,9 +111,9 @@ git config user.name "Exomonad E2E"
 git config user.email "e2e@example.com"
 
 cat > README.md <<'EOF'
-# Sub-TL Worker Notify E2E Fixture
+# Python TL Worker Notify E2E Fixture
 
-This repository is created by tests/e2e/subtl-worker-notify/run.sh.
+This repository is created by tests/e2e/python-tl-worker-notify/run.sh.
 EOF
 git add README.md
 git commit -m "initial commit" -q
@@ -117,41 +133,32 @@ if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
     cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
 fi
 
-ROOT_PROMPT="$(python3 - "$SCRIPT_DIR/e2e-test.md" <<'PY'
-import pathlib
-import sys
-
-value = pathlib.Path(sys.argv[1]).read_text()
-print(value.replace('"""', '\"\"\"'))
-PY
-)"
+# The controller's only input is plan.json. Copy the scenario plan verbatim so
+# the plan the validator reads is the plan in version control.
+mkdir -p .exo/tl-loop
+cp "$SCRIPT_DIR/plan.json" .exo/tl-loop/plan.json
+python3 -c 'import json,sys; json.load(open(sys.argv[1]))' .exo/tl-loop/plan.json \
+    || { echo "ERROR: plan.json is not valid JSON."; exit 1; }
 
 cat > .exo/config.toml <<EOF
 default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
 tmux_session = "$SESSION"
-root_agent_type = "codex"
 spawn_agent_type = "codex"
 yolo = true
 poll_interval = 5
-initial_prompt = """
-$ROOT_PROMPT
-"""
 
 [[companions]]
-name = "subtl-worker-notify-validator"
+name = "python-tl-worker-notify-validator"
 agent_type = "process"
-command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE'"
+command = "$SCRIPT_DIR/validate.sh '$REPO_DIR' '$SESSION' '$RESULT_FILE' '$CODEX_HOME'"
 EOF
 
-cat > "$CODEX_HOME/config.toml" <<EOF
-[projects."$REPO_DIR"]
-trust_level = "trusted"
-
-[projects."$REPO_DIR/.exo/agents/subtl-worker-notify-worker-codex"]
-trust_level = "trusted"
-EOF
+# `spawn_worker` refuses a dirty worktree, and `init` writes `.mcp.json` and
+# `.claude/rules/exomonad.md` after this point. Ignore and commit them so the
+# controller can actually dispatch its first worker.
+e2e_python_tl_commit_scaffold "$REPO_DIR" "Configure worker notify fixture for the Python TL controller"
 
 echo "  Repo: $REPO_DIR"
 echo "  Remote: $REMOTE_DIR"
@@ -174,8 +181,9 @@ echo "  Session: $SESSION"
 echo "  Work dir: $REPO_DIR"
 echo ""
 echo "  Chain under test:"
-echo "    Codex root -> Codex worker pane"
-echo "    Codex worker notify_parent -> root pane 0"
+echo "    Python TL controller (TL window, pane 0)"
+echo "    controller -> Codex worker pane in the same window"
+echo "    Codex worker notify_parent -> controller"
 echo "============================================"
 echo ""
 

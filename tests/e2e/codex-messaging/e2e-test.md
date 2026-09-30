@@ -1,34 +1,88 @@
-# E2E Codex Messaging Test Mode - Root TL Protocol
+# E2E Codex Messaging — Python TL controller dispatches a Codex worker
 
-This is an automated E2E test. Execute the steps below immediately on your first turn. Do not research, browse files, or do unrelated work.
+`exomonad init` does not launch an interactive Codex root TL. The project's root
+controller is `tl_loop`, a bounded Python process that consumes
+`.exo/tl-loop/plan.json` and dispatches Codex children through the ExoMonad MCP
+tools. This scenario is the messaging half of the Codex suite under that
+architecture, and it is driven by the plan in [`plan.json`](./plan.json) — there
+is no TL prompt to feed and no root agent to read one.
 
-You are the root TL in Codex messaging test mode. The validator process observes tmux, generated Codex configs, and `.exo/logs`.
-This test is local-only. GitHub auth is intentionally unset. Do not run gh auth status or use gh pr commands.
+## The chain under test
 
-## Do This Now
+```text
+.exo/config.toml  -> Codex companion `codex-messaging-peer` (spawned by init)
+plan.json         -> Python TL controller (TL window, pane 0)
+                        -> spawn_worker codex-messaging-sender-codex
+                             |   (pane in the controller's own TL window)
+                             |
+                             +-- send_tmux_message --> codex-messaging-peer
+                             +-- notify_parent ----> controller (recipient `root`, tab `TL`)
+                        -> terminal slice success -> phase `tl_done`
+```
 
-1. Spawn exactly one Codex dev leaf with the ExoMonad spawn_codex MCP tool.
-2. After the dev leaf is spawned, use the ExoMonad send_tmux_message MCP tool with recipient codex-messaging-dev-codex and the message marker below.
-3. Stop and idle after the direct message is sent.
+Both legs are still Codex-to-Codex tmux traffic, but neither originates in an
+interactive TL agent, because there is no interactive TL agent any more. The
+worker reports up to the controller through `notify_parent`, which resolves the
+`root` recipient to the `TL` window that hosts the controller.
 
-## spawn_codex Spec
+## Why the peer is a companion and not a second worker
 
-Spawn one Codex dev leaf:
+`spawn_worker` refuses to dispatch while another worker is alive in the same
+parent window — workers are sequential by design
+(`docs/decisions/agent-lifecycle-invariants.md` § Worker sequentiality, enforced
+by `active_worker_for_parent_tab`). A plan with two `workers` entries would have
+its second dispatch refused, which parks the slice rather than exercising
+messaging, so the scenario would assert a park instead of a delivery.
 
-- branch_name: codex-messaging-dev
-- task:
+The peer therefore has to be an agent that already exists when the controller
+dispatches. A companion is the only such shape that is *addressable*: `init`
+writes `routing.json` for agent companions but `continue`s without one for
+`process` companions, and a recipient with no routing file is not deliverable.
+Declaring the peer a **Codex** companion also puts it through
+`provision_codex_agent`, the same lifecycle a dispatched child uses, so the
+scenario covers companion and child configuration from one place.
 
-You are a Codex dev leaf in the Codex messaging E2E test. Do exactly these steps:
+The cost is one extra model session, which is what the retired scenario spent on
+its interactive root TL.
 
-1. Wait briefly for a direct message from the root containing [CODEX-MSG-ROOT-TO-DEV].
-2. Use the ExoMonad notify_parent MCP tool with status='success' and message='[CODEX-MSG-DEV-NOTIFY] Codex dev messaging notification complete.'
-3. Stop.
+## What the validator asserts
 
-## Hard Rules
+| Property | How |
+|---|---|
+| CODEX_HOME propagation | `tmux show-environment` reports the isolated per-run home |
+| Isolated Codex home | project trust + the three hook-trust entries for each Codex agent live in `$CODEX_HOME/config.toml`, and teardown proves the host config is byte-for-byte unchanged |
+| Hook trust | the shared `# BEGIN EXOMONAD CODEX HOOKS` block and `<agent config>:pre_tool_use:0:0` state are present in the isolated home |
+| MCP tools + role config | the worker declares `mcp-stdio --role worker --name codex-messaging-sender-codex`; the peer declares `mcp-stdio --role worker --name codex-messaging-peer`; both carry `hooks = true`, `approval_policy = "never"`, and the Codex **Worker** Agent Protocol |
+| No retired root model | neither `.codex/config.toml` nor `.exo/agents/root/.codex/config.toml` is generated |
+| Messaging | `message.delivery` records a successful `agent_inbox_tmux` injection to the peer, and a successful `notify_parent` delivery to `root` |
+| Durable controller state | `.exo/tl-loop/root/run.json` records the plan slice and `fsm.phase == "tl_done"` |
 
-1. Do not run `gh` commands.
-2. Do not create commits, branches, PRs, or files yourself.
-3. Do not use tools other than the requested ExoMonad MCP tools.
-4. Spawn exactly one Codex dev leaf and then stop.
-5. Do not spawn a placeholder leaf or do the leaf work yourself.
-6. Do not do the TL or dev leaf work yourself.
+## What was removed and why
+
+The retired scenario drove `exomonad init` into an interactive Codex root TL
+and validated that TL's own `.codex/config.toml` (approval policy, `mcp-stdio`,
+and an "ExoMonad Root TL Protocol" marker). Normal Python-controller startup
+provisions no Codex agent in the project root at all, so that config is never
+generated and asserting it would have pinned a model the product no longer
+ships. See `python_controller_startup_generates_no_codex_root_tl_config` in
+`rust/exomonad/src/init.rs`.
+
+The old validator also asserted `agent.message_sent` with `success=true` for a
+`send_tmux_message` call. `agent.message_sent` is emitted by `send_message`,
+not by `send_tmux_message`; the observable record for a tmux send is
+`message.delivery` with `method = "agent_inbox_tmux"`, which is what this
+validator now asserts. It also matched `tmux_routing`, which is only logged on
+a *failed* routing, so the old "delivery succeeded" probe could not have passed.
+
+## Running it
+
+```bash
+just e2e-codex-messaging          # live run: needs a real `codex` binary
+just check-e2e-codex-messaging   # static: bash syntax only
+just check-e2e-python-tl-controller  # the migration contract, no Codex needed
+```
+
+Live runs authenticate a real `codex` against the model, so `run.sh` copies the
+documented auth artifacts into the isolated home. Keep `KEEP_E2E_WORKDIR=1` to
+inspect the generated configs, the isolated Codex home, and the controller
+checkpoint after a failure.

@@ -581,7 +581,8 @@ e2e-opencode-worker:
 e2e-codex-hook-parity:
     nix develop --command cargo nextest run -p exomonad-core --lib codex_hook_hash_matches_installed_codex_cli --run-ignored ignored-only --no-capture
 
-# Run E2E Codex messaging test (send_tmux_message + notify_parent delivery)
+# Run E2E Codex messaging test (the Python TL controller dispatches a Codex
+# worker that messages a Codex companion peer and reports back)
 e2e-codex-messaging:
     ./tests/e2e/codex-messaging/run.sh
 
@@ -590,6 +591,37 @@ check-e2e-codex-messaging:
     bash -n tests/e2e/codex-messaging/run.sh
     bash -n tests/e2e/codex-messaging/validate.sh
 
+# Check the Codex E2E scenarios are expressed in terms of the Python TL
+# controller: a shipped plan.json, no interactive Codex root TL, and validator
+# assertions on the durable controller checkpoint, CODEX_HOME propagation, and
+# Codex trust in the isolated home. No server, no tmux, no codex binary.
+check-e2e-python-tl-controller:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}"
+    for script in tests/e2e/lib/python-tl.sh \
+                  tests/e2e/codex-messaging/run.sh tests/e2e/codex-messaging/validate.sh \
+                  tests/e2e/chainlink-codex/run.sh tests/e2e/chainlink-codex/validate.sh \
+                  tests/e2e/python-tl-worker-notify/run.sh tests/e2e/python-tl-worker-notify/validate.sh; do
+        bash -n "$script"
+    done
+    for plan in tests/e2e/codex-messaging/plan.json \
+                tests/e2e/chainlink-codex/plan.json \
+                tests/e2e/python-tl-worker-notify/plan.json; do
+        {{py}} -c 'import json, sys; json.load(open(sys.argv[1]))' "$plan"
+    done
+    {{py}} -m py_compile tests/e2e/python-tl-controller/test_contract.py
+    {{py}} -m pytest -q tests/e2e/python-tl-controller/test_contract.py
+    if command -v shellcheck >/dev/null; then
+        shellcheck -S warning -e SC1091,SC2034,SC2164 \
+            tests/e2e/lib/python-tl.sh \
+            tests/e2e/codex-messaging/run.sh tests/e2e/codex-messaging/validate.sh \
+            tests/e2e/chainlink-codex/run.sh tests/e2e/chainlink-codex/validate.sh \
+            tests/e2e/python-tl-worker-notify/run.sh tests/e2e/python-tl-worker-notify/validate.sh
+    else
+        echo "shellcheck not installed; syntax checks only"
+    fi
+
 # Check the shared Codex-home isolation contract: every harness that can generate
 # Codex configuration points at a per-run home, the host config is only ever
 # read for a checksum, and KEEP_E2E_WORKDIR still preserves isolated state.
@@ -597,7 +629,8 @@ check-e2e-codex-home-isolation:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{justfile_directory()}}"
-    for script in tests/e2e/lib/codex-home.sh tests/e2e/lib/harness.sh tests/e2e/*/run.sh; do
+    for script in tests/e2e/lib/codex-home.sh tests/e2e/lib/harness.sh \
+                  tests/e2e/lib/python-tl.sh tests/e2e/*/run.sh; do
         bash -n "$script"
     done
     {{py}} -m py_compile \
@@ -611,7 +644,7 @@ check-e2e-codex-home-isolation:
         # SC1091 (sourced-path resolution) and SC2034 (unused fixture vars) are
         # pre-existing across these harnesses; this gate is about regressions.
         shellcheck -S warning -e SC1091,SC2034,SC2164 \
-            tests/e2e/lib/codex-home.sh tests/e2e/lib/harness.sh tests/e2e/*/run.sh
+            tests/e2e/lib/codex-home.sh tests/e2e/lib/harness.sh tests/e2e/lib/python-tl.sh tests/e2e/*/run.sh
     else
         echo "shellcheck not installed; syntax checks only"
     fi
@@ -625,21 +658,24 @@ check-e2e-tl-to-worker-messaging:
     bash -n tests/e2e/tl-to-worker-messaging/run.sh
     bash -n tests/e2e/tl-to-worker-messaging/validate.sh
 
-# Run E2E worker notify_parent pane-pinning test
-e2e-subtl-worker-notify:
-    ./tests/e2e/subtl-worker-notify/run.sh
+# Run E2E worker notify_parent test (the Python TL controller dispatches a Codex
+# worker into its own window and receives notify_parent there)
+e2e-python-tl-worker-notify:
+    ./tests/e2e/python-tl-worker-notify/run.sh
 
 # Check E2E worker notify harness scripts without launching Codex/tmux
-check-e2e-subtl-worker-notify:
-    bash -n tests/e2e/subtl-worker-notify/run.sh
-    bash -n tests/e2e/subtl-worker-notify/validate.sh
+check-e2e-python-tl-worker-notify:
+    bash -n tests/e2e/python-tl-worker-notify/run.sh
+    bash -n tests/e2e/python-tl-worker-notify/validate.sh
 
 
 # Run E2E chainlink issue create test (chainlink_issue_create MCP tool via ProcessRun)
 e2e-chainlink:
     ./tests/e2e/chainlink/run.sh
 
-# Run E2E Chainlink Codex flow test (root Codex + direct dev leaf Chainlink MCP flow)
+# Run E2E Chainlink Codex flow test (the Python TL controller dispatches a Codex
+# worker that runs the role-scoped Chainlink session workflow on an issue owned
+# by the harness)
 e2e-chainlink-codex:
     ./tests/e2e/chainlink-codex/run.sh
 
