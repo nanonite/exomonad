@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Prune Codex trust during verified permanent resource disposal (#1124)
 - Centralize Codex configuration trust for every agent lifecycle (#1126)
 - Add symmetric removal of ExoMonad Codex hook trust (#1123)
 - Isolate Codex state in every end-to-end harness (#1122)
