@@ -317,6 +317,32 @@ DIRECT_SCOPE_DRAIN_STEP_LIMIT = 64
 DISPATCHING_STATUSES = frozenset({SliceStatus.DISPATCHING, SliceStatus.DISPATCH_UNCONFIRMED})
 #: Statuses whose next effect is a fresh spawn attempt, not an observation.
 REDRIVEN_DISPATCH_STATUSES = frozenset({SliceStatus.DISPATCH_RETRY_SCHEDULED})
+#: Kinds whose ownership is decided by the persisted alias resolver rather than
+#: by a slice-shaped field on the row itself.
+#:
+#: A dispatched child reports under its runtime agent id (``<slice>-codex``),
+#: which is recorded on the slice as ``dispatch_agent_id`` and is not a plan
+#: slug. So ``agent.completed`` and ``agent.notify_parent`` -- the two rows a
+#: worker emits when it finishes -- carry no ``slice_id``, ``slug``,
+#: ``child_agent`` or ``intent_id`` at all, and were dropped before the decoder
+#: could turn them into a ``ChildCompleted``. That is why a successful
+#: ``notify_parent`` never advanced the slice and the run stayed ``tl_running``
+#: in #1148. The resolver proves the same exact-match ownership the PR kinds
+#: already rely on: every alias must name one slice in the plan, or nothing is
+#: accepted.
+OWNERSHIP_RESOLVED_KINDS = frozenset(
+    {
+        EventKind.PR_FILED,
+        EventKind.PR_UPDATED,
+        EventKind.PR_REVIEW,
+        EventKind.COPILOT_REVIEW,
+        EventKind.CI_STATUS_CHANGED,
+        EventKind.AGENT_SPAWNED,
+        EventKind.AGENT_SPAWN_FAILED,
+        EventKind.AGENT_COMPLETED,
+        EventKind.AGENT_NOTIFY_PARENT,
+    }
+)
 REMOTE_ADVANCE_FAILURE_MARKERS = (
     "force-with-lease",
     "stale info",
@@ -2753,6 +2779,12 @@ def _run_loop(
             and event_slice_id is not None
         ):
             fsm_event = replace(fsm_event, slice_id=event_slice_id)
+        # The decoder reads the row's ``agent_id`` to name the child, so a
+        # worker row decodes to its runtime agent id. The FSM barrier is keyed
+        # by slice, and the resolver above has already proven which slice this
+        # row belongs to, so the child is renamed before the transition rather
+        # than raising an illegal transition against an unknown child.
+        fsm_event = _retarget_child_event(fsm_event, event_slice_id)
         if event.kind is EventKind.AGENT_TASK_BLOCKED:
             state = _record_task_blocked_recovery(
                 event,
@@ -12921,11 +12953,7 @@ def _event_belongs_to_plan(
         if isinstance(value, Mapping):
             slug = value.get("slug")
             return slug is None or slug in expected
-    if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW, EventKind.CI_STATUS_CHANGED}:
-        if state is None:
-            return False
-        return resolve_event_slice(event, state, allowed_ids=expected).resolved
-    if event.kind in {EventKind.PR_FILED, EventKind.PR_UPDATED}:
+    if event.kind in OWNERSHIP_RESOLVED_KINDS:
         if state is None:
             return False
         return resolve_event_slice(event, state, allowed_ids=expected).resolved
@@ -12945,6 +12973,28 @@ def _event_belongs_to_plan(
         if isinstance(value, str) and value in expected:
             return True
     return False
+
+
+def _retarget_child_event(fsm_event: TLEvent, slice_id: str | None) -> TLEvent:
+    """Name the resolved slice instead of the row's runtime agent id.
+
+    A dispatched worker reports under the agent id the server minted
+    (``<slice>-codex``), so the decoder produces ``ChildCompleted``/``ChildFailed``
+    for that id. The scope barrier and the slice map are both keyed by slice, so
+    an event still naming the agent id raises ``IllegalTransition`` ("names a
+    child outside the active barrier") and would otherwise abort the loop.
+
+    Only the ownership already proven by the resolver is applied, and only when
+    the row named no slice of its own: an event whose slug is already a slice
+    id is left exactly as decoded.
+    """
+    if slice_id is None:
+        return fsm_event
+    if isinstance(fsm_event, (ChildCompleted, ChildFailed)):
+        return replace(fsm_event, slug=slice_id)
+    if isinstance(fsm_event, PRMerged):
+        return replace(fsm_event, slug=slice_id)
+    return fsm_event
 
 
 def _event_slice_id(event: EventEnvelope, state: RunState) -> str | None:
@@ -13261,7 +13311,14 @@ def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool
             RecursiveTLParked,
         ),
     ):
-        return isinstance(event, AllChildrenDone)
+        if isinstance(event, AllChildrenDone):
+            return True
+        # A worker emits both ``agent.completed`` and ``agent.notify_parent``
+        # for one finished child, so the second terminal row arrives after the
+        # barrier already advanced. No child is active in a phase that has left
+        # running, so a child-terminal row here repeats a settled decision
+        # rather than making a new one.
+        return isinstance(event, (ChildCompleted, ChildFailed, PRMerged))
     if isinstance(phase, RecursiveTLRunning):
         active = set(active_child_ids(phase))
         if isinstance(event, ChildSpawned):

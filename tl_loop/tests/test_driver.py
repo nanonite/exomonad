@@ -476,6 +476,191 @@ def test_a_nested_child_scope_classifies_its_own_duplicate_the_same_way(
     assert crossed.reason == "dispatch_agent_mismatch"
 
 
+def _notify_parent_row(
+    run_id: str,
+    *,
+    run_seq: int,
+    agent_id: str,
+    status: str = "success",
+) -> EventEnvelope:
+    """One ``agent.notify_parent`` row shaped exactly as the server writes it.
+
+    A real Codex worker's report carries no ``slice_id``, ``slug``,
+    ``child_agent`` or ``intent_id``: the only link back to the dispatched slice
+    is ``agent_id``, which names the runtime agent the server minted. That is
+    what the codex-messaging run of #1148 emitted at run_seq 35/36.
+    """
+    return project(
+        cast(
+            dict[str, object],
+            {
+                "schema_version": 1,
+                "event_id": f"notify-{run_seq}",
+                "id": f"notify-{run_seq}",
+                "event_time": "2026-09-30T16:23:01Z",
+                "observed_at": "2026-09-30T16:23:01Z",
+                "run_seq": run_seq,
+                "type": "agent.notify_parent",
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "session_id": "session-1",
+                "invocation_id": "inv-1",
+                "generation": 1,
+                "lifecycle_state": "emitted",
+                "data": {
+                    "head_sha": None,
+                    "head_sha_finding": (
+                        "not_available_without_verified_pr_context"
+                    ),
+                    "message": "the worker finished its task",
+                    "parent": "root",
+                    "source": "agent",
+                    "status": status,
+                },
+            },
+        )
+    )
+
+
+def _worker_transport() -> RecordingTransport:
+    """A transport that answers the root-scope finalization and watcher calls.
+
+    A worker that files no PR leaves the root branch already fast-forwarded and
+    the publication registry with no record for its slice, so the run can reach
+    ``tl_done`` on real evidence rather than parking on watcher evidence a
+    unit test would otherwise have to invent.
+    """
+    transport = RecordingTransport()
+    original = transport.call_tool
+
+    def call_tool(
+        role: str, name: str, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        if tool_name == "resolve_live_pr_for_slice":
+            return {"success": True, "result": {"resolution": "never_published"}}
+        if tool_name == "root_branch_finalize":
+            return {
+                "success": True,
+                "result": {
+                    "branch": "main",
+                    "fast_forward": True,
+                    "local_head_sha": "a" * 40,
+                    "remote_head_sha": "a" * 40,
+                    "ancestry_proof": "fast-forward",
+                },
+            }
+        return original(role, name, tool_name, arguments)
+
+    transport.call_tool = call_tool  # type: ignore[method-assign]
+    return transport
+
+
+def test_a_worker_notify_parent_reaches_tl_done_through_its_runtime_agent_id(
+    tmp_path: Path,
+) -> None:
+    """The corrected premise of #1148: a reported completion must be applied.
+
+    The worker runs, calls ``notify_parent``, and the tool reports success, yet
+    the controller must reach ``tl_done``. Its row names only the runtime agent
+    id, so ownership has to come from the ``dispatch_agent_id`` the slice
+    persisted at dispatch, and the decoded child has to be retargeted to the
+    slice the recursive barrier is keyed by. Without both, the row is filtered
+    before the decoder and the run stays ``tl_running`` forever.
+    """
+    run_id = "notify-parent-run"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    case = _confirmed_worker(tmp_path, run_id=run_id)
+    store = RunStore(run_id, tmp_path)
+    manifest = build_plan_manifest(
+        {"workers": [{"name": "worker-a", "task": "task"}]},
+        scope_id=run_id,
+    )
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("worker-a",)),
+        case.state.slices,
+        case.state.budgets,
+        8,
+        plan_manifest=manifest,
+    )
+    source = SyntheticQueue(
+        [_notify_parent_row(run_id, run_seq=35, agent_id="worker-a-codex")]
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        cast(Any, source),
+        EffectClient(_worker_transport()),
+        config=replace(
+            _config(),
+            run_id=run_id,
+            ledger_run_id=run_id,
+            repository_identity=None,
+            keep_alive_on_waiting=False,
+            max_parallel_slices=None,
+            policy=None,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert result.diagnostics["rejected"] == 0
+    # The report is consumed as authoritative progress, not filtered away.
+    assert result.diagnostics["last_authoritative_event_seq"] == 35
+    assert [(t.event_seq, t.after) for t in result.transitions] == [
+        (35, TLPhase.TLAllMerged)
+    ]
+    assert store.quarantined_events() == ()
+
+
+def test_a_notify_parent_from_a_foreign_runtime_agent_is_still_refused(
+    tmp_path: Path,
+) -> None:
+    """Ownership stays proven: another agent's report advances nothing."""
+    run_id = "notify-parent-foreign-run"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    case = _confirmed_worker(tmp_path, run_id=run_id)
+    store = RunStore(run_id, tmp_path)
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("worker-a",)),
+        case.state.slices,
+        case.state.budgets,
+        8,
+        plan_manifest=build_plan_manifest(
+            {"workers": [{"name": "worker-a", "task": "task"}]},
+            scope_id=run_id,
+        ),
+    )
+    foreign = _notify_parent_row(
+        run_id, run_seq=35, agent_id="some-other-agent-codex"
+    )
+    assert not _event_belongs_to_plan(foreign, set(case.state.slices), case.state)
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([foreign]),
+        EffectClient(_worker_transport()),
+        config=replace(
+            _config(),
+            run_id=run_id,
+            ledger_run_id=run_id,
+            repository_identity=None,
+            keep_alive_on_waiting=False,
+            max_parallel_slices=None,
+            policy=None,
+        ),
+        root_dir=tmp_path,
+    )
+
+    # The run never completes and the slice is never released: the report was
+    # never treated as authoritative progress.
+    assert result.final_state.fsm.phase is not TLPhase.TLDone
+    assert result.final_state.slices["worker-a"].status is SliceStatus.SPAWNED
+    assert result.diagnostics["last_authoritative_event_seq"] is None
+    assert result.transitions == ()
+
+
 def test_a_duplicate_confirmation_advances_the_cursor_without_quarantine(
     tmp_path: Path,
 ) -> None:
