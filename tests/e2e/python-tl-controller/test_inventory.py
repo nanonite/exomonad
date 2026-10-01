@@ -219,3 +219,42 @@ def test_chainlink_codex_does_not_claim_the_default_webhook_port() -> None:
         "scenario contends for the default webhook port and a leaked server "
         "from any earlier run stops it at init's socket health check (#1150)"
     )
+
+
+def test_chainlink_codex_config_heredoc_has_no_command_substitutions() -> None:
+    """Nothing in the config heredoc may be a backtick.
+
+    The delimiter is unquoted so `$SESSION` and the companion's arguments expand
+    -- which also makes every backtick a command substitution. Backticking words
+    in a prose comment is the natural way to write that comment, and it silently
+    deletes them: the comment this file's own `port = 0` rationale is attached to
+    reached the generated `.exo/config.toml` with its words stripped out, so the
+    documentation never reached the file it documents.
+
+    Worse, the substitution *runs*. `init` resolves to `/usr/sbin/init`, a symlink
+    to systemd, so backticking it executed systemd during fixture setup on every
+    run. And a backticked word that prints anything -- `serve`, `codex`,
+    `git` are all commonly installed -- has its output spliced un-commented into
+    the middle of the file the controller parses, failing the run at a TOML parse
+    error with nothing to say why.
+
+    A backslash-escaped backtick is not a substitution: it is the documented
+    escape hatch for a genuine literal one, and it renders correctly. So the pin
+    is on *unescaped* backticks, which are the ones that run. `codex-messaging`
+    carries the same defect in its own comment block and is owned by #1152; this
+    pin covers the scenario this slice owns.
+    """
+    run = (E2E_DIR / "chainlink-codex" / "run.sh").read_text(encoding="utf-8")
+    config = run.split("cat > .exo/config.toml <<EOF", 1)[1].split("\nEOF", 1)[0]
+    offenders = [
+        line for line in config.splitlines() if re.search(r"(?<!\\)`", line)
+    ]
+    assert not offenders, (
+        "chainlink-codex writes .exo/config.toml through an UNQUOTED heredoc, so "
+        "an unescaped backtick is a command substitution, not punctuation. These "
+        "lines would run their contents as commands and lose the backticked "
+        "words:\n  "
+        + "\n  ".join(offenders)
+        + "\nWrite the words plainly, or escape the backtick as \\` if you truly "
+        "need a literal one."
+    )

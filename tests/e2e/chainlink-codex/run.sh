@@ -224,14 +224,22 @@ spawn_agent_type = "codex"
 yolo = true
 poll_interval = 5
 
-# `port = 0` takes an ephemeral port for the public webhook/health listener, which
+# No backticks anywhere in this heredoc. The delimiter is unquoted so $SESSION,
+# $SCRIPT_DIR and the companion's arguments expand, which also makes every
+# backtick a command substitution: the ones this comment used to carry were
+# resolved as commands, so the rationale reached this file with its words
+# stripped out (and init, a common word to backtick, resolved to systemd). A
+# substituted word that printed anything would be spliced un-commented into the
+# middle of the file the controller parses. Write plain words, or escape as \`.
+#
+# port = 0 takes an ephemeral port for the public webhook/health listener, which
 # this scenario never uses -- it pushes nothing and receives nothing. Without it
-# `serve` defaults to 7433, and a server left behind by any earlier run still
+# serve defaults to 7433, and a server left behind by any earlier run still
 # holds 7433, so this run binds the UDS, loses the TCP bind, exits 1 and leaves a
-# dead socket for `init` to wait out its full 30s health budget on. Every other
-# e2e server scenario here sets a port for the same reason (`claude-only`,
-# `claude-teams-inbox`, `codex-reviewer-sandbox`). The two product defects behind
-# that -- `serve` is never reaped, and the leftover socket turns a fast failure
+# dead socket for init's health check to wait out its full 30s budget on. Every
+# other e2e server scenario here sets a port for the same reason (claude-only,
+# claude-teams-inbox, codex-reviewer-sandbox). The two product defects behind
+# that -- serve is never reaped, and the leftover socket turns a fast failure
 # into a 30s wait -- are Chainlink #1150 and are not fixed by this.
 
 [[companions]]
