@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Update Codex end-to-end scenarios for the Python TL controller (#1127)
 - Migrate the Python TL worker-notify scenario to the Python TL controller (#1154)
 - Migrate the Chainlink Codex scenario to the Python TL controller (#1153)
 - Migrate the Codex messaging scenario to the Python TL controller (#1152)
