@@ -717,6 +717,162 @@ def test_migrated_harness_commits_the_scaffold_before_dispatch(name: str) -> Non
     assert commit < init, f"{name} must commit the scaffold before launching exomonad init"
 
 
+#: Scenarios whose marker probe is pinned by the check below. Each migration
+#: slice moves its own scenario across when it fixes its own validators, so this
+#: stays a subset rather than a rewrite of the other two; `PENDING_MARKER_FIX`
+#: records which and why, and fails if the two ever drift apart.
+MARKER_FIXED = ("chainlink-codex",)
+PENDING_MARKER_FIX = ("codex-messaging", "python-tl-worker-notify")
+
+
+def bracketed_markers(validate: str) -> dict[str, str]:
+    """Shell variables holding a `[...]` marker, mapped to the literal.
+
+    Follows the indirection the validators actually use -- `DONE_MARKER` is
+    assigned the marker once and then referenced as `$DONE_MARKER` inside the
+    probe -- so the check is about the pattern grep finally receives, not about
+    where the literal happens to sit.
+    """
+    return {
+        var: marker
+        for var, marker in re.findall(r"^(\w*MARKER)=\"(\[[^\"]+\])\"", validate, re.M)
+    }
+
+
+@pytest.mark.parametrize("name", MARKER_FIXED)
+def test_migrated_validator_greps_bracketed_markers_as_fixed_strings(name: str) -> None:
+    """A `[...]` marker must reach grep as a literal, not a bracket expression.
+
+    The validators look for markers like `[CHAINLINK-CODEX-WORKER-DONE]` in
+    `.exo/logs`. In a basic regular expression the brackets open a bracket
+    expression, so the `-` characters inside become ranges and GNU grep rejects
+    the whole pattern:
+
+        $ grep '[CHAINLINK-CODEX-WORKER-DONE]' log
+        grep: Invalid range end          # exit 2, never matches
+
+    The probe can then never succeed, so `wait_for` burns its whole budget and
+    reports a timeout for a marker the worker did write. The 2026-09-30 live run
+    of chainlink-codex lost 600s to exactly this while the worker's
+    `chainlink_session_end` notes sat in the log carrying the marker.
+
+    Nothing but a live run surfaces it: a grep that always fails looks like a
+    slow agent, and the probe redirects stderr, so the error is discarded.
+    """
+    validate = read(scenario_dir(name) / "validate.sh")
+    markers = bracketed_markers(validate)
+    assert markers, f"{name}: expected at least one bracketed marker to pin"
+
+    for var, marker in markers.items():
+        # Every grep that reads this variable must be a fixed-string grep. Flags
+        # are read per letter because grep bundles them: `-RF` sets both.
+        for line in (l for l in validate.splitlines() if f"${var}" in l and "grep" in l):
+            flags = re.search(r"\bgrep\s+((?:-{1,2}\w+\s+)+)", line)
+            assert flags, f"{name}: could not read the grep flags on: {line.strip()!r}"
+            letters = set("".join(flags.group(1).split()).lstrip("-"))
+            assert "F" in letters, (
+                f"{name}: {var}={marker} is a bracket expression when grep reads it "
+                f"as a pattern; the probe can never succeed, so wait_for turns a "
+                f"satisfied assertion into a 600s timeout. Use grep -F:\n"
+                f"  {line.strip()}"
+            )
+
+
+def test_the_marker_fix_coverage_is_accounted_for() -> None:
+    """Every migrated scenario is either fixed or explicitly still pending.
+
+    Without this, a scenario could be dropped from `MARKER_FIXED` to silence a
+    red test and the only trace would be a shorter tuple. The end state of the
+    migration is `PENDING_MARKER_FIX` empty, and this test is what says so.
+    """
+    fixed, pending = set(MARKER_FIXED), set(PENDING_MARKER_FIX)
+    assert not fixed & pending, f"a scenario cannot be both: {fixed & pending}"
+    assert fixed | pending == set(MIGRATED), (
+        f"MARKER_FIXED {sorted(fixed)} plus PENDING_MARKER_FIX {sorted(pending)} must "
+        f"be an exact partition of MIGRATED {sorted(MIGRATED)}; a scenario may not "
+        f"be dropped from both to silence a failure"
+    )
+
+
+#: Scenarios whose validator is pinned by the `set -e` check below. Same
+#: subset/pin arrangement as `MARKER_FIXED` above.
+SET_E_FIXED = ("chainlink-codex",)
+PENDING_SET_E_FIX = ("codex-messaging", "python-tl-worker-notify")
+
+
+def assertion_helpers_return_zero(validate: str) -> list[str]:
+    """Assertion wrappers that can abort the validator by returning non-zero.
+
+    Looks for `return 1` in `wait_for`/`check`, which is what a bare call under
+    `set -e` turns into an early exit.
+    """
+    offenders = []
+    for name in ("wait_for", "check"):
+        body = re.search(rf"^{name}\(\) \{{(.*?)^\}}", validate, re.M | re.S)
+        assert body is not None, f"expected a {name}() helper"
+        if re.search(r"^\s*return 1\s*$", body.group(1), re.M):
+            offenders.append(name)
+    return offenders
+
+
+@pytest.mark.parametrize("name", SET_E_FIXED)
+def test_migrated_validator_survives_a_failing_assertion(name: str) -> None:
+    """A failing assertion must not abort the validator before it reports.
+
+    The validators run under `set -euo pipefail` and call their assertion
+    helpers as bare statements, so a helper that returns non-zero on failure
+    exits the script at the *first* failed assertion -- skipping every later
+    assertion and, critically, never writing `$RESULT_FILE`.
+
+    The result file is the scenario's entire output: `run.sh` reads
+    `Failures: N` from it, and reports `validator wrote no result file` when it
+    is absent. So a validator that dies on its first failure reports the
+    opposite of what happened -- in the 2026-09-30 live run it discarded twelve
+    assertions that had already passed along with the one that failed, and
+    `run.sh` blamed the missing file rather than naming the real failure.
+
+    The fix is that the helpers return 0 and let the recorded failure count
+    decide. This asserts that, and that a timeout is still recorded as a
+    failure, so the check cannot be satisfied by making the helpers silent.
+    """
+    validate = read(scenario_dir(name) / "validate.sh")
+    offenders = assertion_helpers_return_zero(validate)
+    assert not offenders, (
+        f"{name}: {', '.join(offenders)} returns 1 on failure, so under `set -e` a "
+        f"failing assertion aborts the validator before it writes $RESULT_FILE. "
+        f"Return 0 and let the recorded failure count decide."
+    )
+
+    # ...and the failure still has to be recorded, or the helper returns 0 in a
+    # way that makes a broken assertion look like a pass.
+    wait_for = re.search(r"^wait_for\(\) \{(.*?)^\}", validate, re.M | re.S).group(1)
+    assert "record_failure" in wait_for, (
+        f"{name}: a wait_for that times out must still record the failure; "
+        f"returning 0 is only correct because the count decides the verdict"
+    )
+
+    # The verdict the whole thing exists to produce must be written
+    # unconditionally, after the assertions rather than inside one of them.
+    assert re.search(r"Failures: %s", validate), (
+        f"{name}: the validator must still write a Failures count"
+    )
+    assert re.search(r'\} > "\$RESULT_FILE"', validate), (
+        f"{name}: the verdict must be written to $RESULT_FILE; run.sh reads it "
+        f"and treats its absence as the scenario failing"
+    )
+
+
+def test_the_set_e_fix_coverage_is_accounted_for() -> None:
+    """Every migrated scenario is either fixed or explicitly still pending."""
+    fixed, pending = set(SET_E_FIXED), set(PENDING_SET_E_FIX)
+    assert not fixed & pending, f"a scenario cannot be both: {fixed & pending}"
+    assert fixed | pending == set(MIGRATED), (
+        f"SET_E_FIXED {sorted(fixed)} plus PENDING_SET_E_FIX {sorted(pending)} must "
+        f"be an exact partition of MIGRATED {sorted(MIGRATED)}; a scenario may not "
+        f"be dropped from both to silence a failure"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The rename
 # ---------------------------------------------------------------------------

@@ -160,3 +160,62 @@ def test_orphan_pr_guard_acknowledges_it_cannot_run() -> None:
     assert "--tl" in head, (
         "orphan-pr-guard/run.sh must name the flag init no longer accepts"
     )
+
+
+def test_chainlink_codex_plan_renders_its_issue_id_everywhere() -> None:
+    """The plan names the issue more than once, and the guard must allow it.
+
+    A guard that required exactly one placeholder refused a correct plan: the
+    task states the issue id in its opening line and repeats it on each tool call
+    that takes one. Found by the 2026-09-30 live run, which died at fixture
+    setup with "must contain exactly one ... placeholder, found 3".
+    """
+    run = (E2E_DIR / "chainlink-codex" / "run.sh").read_text(encoding="utf-8")
+    # Only the embedded renderer counts. The prose around it is allowed to say
+    # "exactly one" in order to explain why that requirement was wrong.
+    renderer = run.split('ISSUE_ID="$ISSUE_ID" python3 -', 1)[1].split("\nPY", 1)[0]
+    code = "\n".join(
+        line for line in renderer.splitlines() if not line.strip().startswith("#")
+    )
+    assert "exactly one" not in code, (
+        "chainlink-codex's plan renderer must not require exactly one "
+        "placeholder; the plan legitimately references the issue id three times"
+    )
+    assert "count(placeholder) == 0" in code, (
+        "the renderer must still require at least one placeholder, or it "
+        "renders a plan with no issue reference and nothing notices"
+    )
+
+    # And the guard that actually matters is still there: nothing may survive
+    # rendering, whatever the count.
+    assert '"{{" in rendered' in code, (
+        "the unrendered-placeholder check is the real safety net and must stay"
+    )
+
+    # The shipped plan must still use the placeholder, or the guard guards
+    # nothing.
+    plan = (E2E_DIR / "chainlink-codex" / "plan.json").read_text(encoding="utf-8")
+    assert plan.count("{{CHAINLINK_ISSUE_ID}}") >= 2, (
+        "the plan is expected to reference the issue id several times; if that "
+        "changed, the guard above should be revisited"
+    )
+
+
+def test_chainlink_codex_does_not_claim_the_default_webhook_port() -> None:
+    """The fixture must not contend for 7433, or one run's server breaks the next.
+
+    `serve` is never reaped, so a server from an earlier run keeps holding the
+    default `0.0.0.0:7433`. A fixture that sets no `port` then binds the UDS,
+    loses the TCP bind, exits 1, and leaves a dead socket for `init`'s 30s health
+    check to wait out -- which is how the 2026-09-30 runs of this scenario died
+    before dispatch. Chainlink #1150 files the two product defects; the harness
+    side of it is not claiming a fixed port. Every other e2e server scenario in
+    the tree sets one (`claude-only` and `claude-teams-inbox` use `port = 0`).
+    """
+    run = (E2E_DIR / "chainlink-codex" / "run.sh").read_text(encoding="utf-8")
+    config = run.split("cat > .exo/config.toml <<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert re.search(r"^port = 0$", config, re.MULTILINE), (
+        "chainlink-codex's fixture config must set `port = 0`; without it this "
+        "scenario contends for the default webhook port and a leaked server "
+        "from any earlier run stops it at init's socket health check (#1150)"
+    )

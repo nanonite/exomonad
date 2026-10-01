@@ -210,14 +210,33 @@ def test_chainlink_task_uses_the_role_scoped_workflow() -> None:
     This is the positive half of the preflight: the four Chainlink calls the
     worker is granted, and the completion notification, are all named. A task
     that quietly dropped one would leave the validator waiting on a marker no
-    agent ever writes.
+    agent ever writes -- which is a 600s timeout per assertion rather than a
+    failure anyone can read.
+
+    The four are named explicitly rather than counted, so a plan rewritten to
+    name some other subset of the worker's Chainlink tools fails here instead of
+    quietly changing what the scenario proves.
     """
     plan = json.loads((E2E_DIR / name / "plan.json").read_text())
     granted = role_tools("worker")
+    expected_chainlink = {
+        "chainlink_session_start",
+        "chainlink_session_work",
+        "chainlink_issue_comment",
+        "chainlink_session_end",
+    }
     for entry in plan["plan"]["workers"]:
         named = set(_BACKTICKED_TOOL.findall(entry["task"]))
         chainlink_tools = {t for t in named if t.startswith("chainlink_")}
-        assert chainlink_tools, f"{name}: the plan must drive a Chainlink tool"
+        assert chainlink_tools == expected_chainlink, (
+            f"{name}: the plan for {entry['name']!r} must name exactly "
+            f"{sorted(expected_chainlink)}, found {sorted(chainlink_tools)}"
+        )
         assert chainlink_tools <= granted, (
             f"{name}: {sorted(chainlink_tools - granted)} are not worker tools"
+        )
+        assert "notify_parent" in named, (
+            f"{name}: the plan for {entry['name']!r} must name notify_parent; "
+            "without it the controller never learns the worker finished and the "
+            "run parks in `spawned`"
         )

@@ -164,6 +164,13 @@ e2e_python_tl_init_chainlink "$REPO_DIR"
 # Derive the ceilings from the plan instead.
 e2e_python_tl_write_harness_policy "$REPO_DIR" "$SCRIPT_DIR/plan.json"
 
+# Prove the account can run the model this fixture just provisioned, before the
+# controller starts. A rejected model surfaces only inside the worker's rollout
+# as a 400 on its first inference, after dispatch and provisioning, and nothing
+# notices for the validator's whole budget -- so without this the run looks like
+# a notify_parent stall. Chainlink #1149.
+e2e_python_tl_assert_codex_model_runnable "$(e2e_python_tl_codex_model)" "$REPO_DIR"
+
 # The harness is the issue owner. The controller holds no Chainlink authority
 # and the worker role is granted neither create nor close, so the dispatched
 # Codex child can only comment on and own a session for this issue.
@@ -178,8 +185,8 @@ fi
 echo "  Chainlink issue: #$ISSUE_ID ($ISSUE_TITLE)"
 
 # The controller's only input is plan.json, and the worker's task has to name
-# the issue it is allowed to work on, so the single placeholder is rendered
-# with the id the harness just created.
+# the issue it is allowed to work on, so every placeholder is rendered with the
+# id the harness just created.
 mkdir -p .exo/tl-loop
 ISSUE_ID="$ISSUE_ID" python3 - "$SCRIPT_DIR/plan.json" .exo/tl-loop/plan.json <<'PY'
 import os
@@ -188,14 +195,20 @@ import sys
 
 placeholder = "{{CHAINLINK_ISSUE_ID}}"
 plan = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-if plan.count(placeholder) != 1:
-    raise SystemExit(
-        f"plan.json must contain exactly one {placeholder} placeholder, "
-        f"found {plan.count(placeholder)}"
-    )
+# The issue id appears several times on purpose: the task names it in its
+# opening line and then repeats it on each tool call that takes an issue id.
+# Requiring exactly one occurrence refused a correct plan, so the count is only
+# checked for being non-zero -- the check that actually matters is the
+# unrendered-placeholder test below, which fires unless *every* occurrence was
+# substituted.
+if plan.count(placeholder) == 0:
+    raise SystemExit(f"plan.json has no {placeholder} placeholder to render")
 rendered = plan.replace(placeholder, os.environ["ISSUE_ID"])
 if "{{" in rendered or "}}" in rendered:
-    raise SystemExit("rendered plan.json still contains an unrendered placeholder")
+    raise SystemExit(
+        "rendered plan.json still contains an unrendered placeholder: "
+        f"{rendered[rendered.find('{{'):][:60] if '{{' in rendered else rendered[rendered.find('}}'):][:60]}"
+    )
 pathlib.Path(sys.argv[2]).write_text(rendered, encoding="utf-8")
 PY
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' .exo/tl-loop/plan.json \
@@ -206,9 +219,20 @@ default_role = "devswarm"
 wasm_name = "devswarm"
 shell_command = "bash"
 tmux_session = "$SESSION"
+port = 0
 spawn_agent_type = "codex"
 yolo = true
 poll_interval = 5
+
+# `port = 0` takes an ephemeral port for the public webhook/health listener, which
+# this scenario never uses -- it pushes nothing and receives nothing. Without it
+# `serve` defaults to 7433, and a server left behind by any earlier run still
+# holds 7433, so this run binds the UDS, loses the TCP bind, exits 1 and leaves a
+# dead socket for `init` to wait out its full 30s health budget on. Every other
+# e2e server scenario here sets a port for the same reason (`claude-only`,
+# `claude-teams-inbox`, `codex-reviewer-sandbox`). The two product defects behind
+# that -- `serve` is never reaped, and the leftover socket turns a fast failure
+# into a 30s wait -- are Chainlink #1150 and are not fixed by this.
 
 [[companions]]
 name = "chainlink-codex-validator"

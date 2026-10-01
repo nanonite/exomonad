@@ -88,6 +88,21 @@ record_failure() {
     log "FAIL: $*"
 }
 
+# `wait_for` returns 0 even when it times out, and that is deliberate.
+#
+# This file runs under `set -euo pipefail`, and the callers are bare statements,
+# so a non-zero return aborts the whole validator at the first timed-out
+# assertion -- before the durable-state checks, before the summary, and above all
+# before `$RESULT_FILE` is written. `run.sh` then reports `validator wrote no
+# result file`, which is the *opposite* of what happened: the validator had
+# already recorded real failures, and every one of them was discarded. The
+# 2026-09-30 live run lost twelve passing assertions and a named failure this
+# way.
+#
+# The failure is already recorded by `record_failure`, and `run.sh` keys on the
+# `Failures: N` line rather than on the exit status, so returning 0 loses
+# nothing and lets the remaining assertions run and report. A timed-out
+# assertion still fails the scenario, through the count.
 wait_for() {
     local label="$1"
     local command="$2"
@@ -102,9 +117,13 @@ wait_for() {
     done
 
     record_failure "$label timed out after ${TIMEOUT_SECONDS}s"
-    return 1
+    return 0
 }
 
+# Same reasoning as `wait_for`, and the same original defect: `record_failure`
+# ends in `log`, which returns 0, so this function returns 0 either way. Kept
+# explicit because the invariant is the whole point -- a failing assertion must
+# never abort the validator before it writes its verdict.
 check() {
     local label="$1"
     shift
@@ -113,6 +132,7 @@ check() {
     else
         record_failure "$label"
     fi
+    return 0
 }
 
 worker_config() {
@@ -154,8 +174,18 @@ main() {
     # --- Chainlink role workflow on a foreign issue ---
     wait_for "worker Chainlink comment landed on the issue" \
         "bash '$0' --assert-comment '$REPO_DIR' '$ISSUE_ID'"
+    # `-F` on the marker grep, and only there. `DONE_MARKER` is
+    # `[CHAINLINK-CODEX-WORKER-DONE]`, and in a basic regular expression the
+    # brackets are a bracket expression over `CHAINLINK-CODEX-WORKER-DONE`, whose
+    # `-` characters are ranges. GNU grep rejects the whole pattern with
+    # `Invalid range end` and exits 2, so the probe can never succeed: the
+    # assertion timed out after its full 600s in the 2026-09-30 live run even
+    # though the worker's `chainlink_session_end` notes carry the marker in
+    # `.exo/logs`. The same defect is in `codex-messaging` and
+    # `python-tl-worker-notify`; those belong to #1152 and #1154, and are
+    # tracked as `PENDING_MARKER_FIX` in `test_contract.py`.
     wait_for "worker Chainlink session completion recorded" \
-        "grep -R '$DONE_MARKER' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
+        "grep -RF '$DONE_MARKER' '$REPO_DIR/.exo/logs' 2>/dev/null | grep -q ."
     wait_for "worker notify_parent reached the controller" \
         "grep -R 'message.delivery' '$REPO_DIR/.exo/logs' 2>/dev/null | grep '\"recipient\":\"root\"' | grep '\"outcome\":\"success\"' | grep -q ."
 

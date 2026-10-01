@@ -42,11 +42,11 @@ SCENARIOS = ("codex-messaging", "chainlink-codex", "python-tl-worker-notify")
 #: each migration slice, so a scenario's name moves from `PENDING_PROBE` to
 #: `PROBE_WIRED` when its own slice lands the call.
 #:
-#: Naming the pending pair keeps the gap visible instead of quietly dropping two
-#: scenarios out of the parametrization: `test_the_probe_coverage_is_accounted_for`
+#: Naming the pending scenario keeps the gap visible instead of quietly dropping
+#: it out of the parametrization: `test_the_probe_coverage_is_accounted_for`
 #: fails unless the two lists are an exact partition of `SCENARIOS`.
-PROBE_WIRED = ("codex-messaging",)
-PENDING_PROBE = ("chainlink-codex", "python-tl-worker-notify")
+PROBE_WIRED = ("codex-messaging", "chainlink-codex")
+PENDING_PROBE = ("python-tl-worker-notify",)
 
 #: The model in `exomonad new`'s scaffold. A ChatGPT-account Codex login
 #: rejects it, so a fixture that provisions it produces a worker that never takes
