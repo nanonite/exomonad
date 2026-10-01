@@ -135,10 +135,17 @@ Reproduced against the preserved second run, same inputs, only the fix reverted:
 which is what `run.sh` already keys on. The timeout is still recorded as a
 failure, so the fix cannot be satisfied by making the helpers silent.
 `test_contract.py::test_migrated_validator_survives_a_failing_assertion` pins it.
-**`codex-messaging` and `python-tl-worker-notify` have all three defects** —
-the marker grep, the `set -e` abort, and the plan guard is chainlink-only — and
-are not fixed here. That is `PENDING_MARKER_FIX` and `PENDING_SET_E_FIX` in
-`test_contract.py`, owned by #1152 and #1154.
+**`codex-messaging` still carries both shared defects** — the marker grep and the
+`set -e` abort; the third, the plan guard, was chainlink-only — and they are not
+fixed here. That is `PENDING_MARKER_FIX` and `PENDING_SET_E_FIX` in
+`test_contract.py`, owned by #1152.
+
+`python-tl-worker-notify` carried both of them too, and its own migration (#1154)
+has since fixed them; it is in `MARKER_FIXED` and `SET_E_FIXED`. Its live run also
+found a third defect the other two do not have — a `wait_for` probe named as an
+unexported shell function, which `bash -c` can never resolve — so that shape is
+now pinned for every migrated scenario by
+`test_contract.py::test_no_wait_for_probe_is_an_unreachable_shell_function`.
 
 ### What still blocks it
 

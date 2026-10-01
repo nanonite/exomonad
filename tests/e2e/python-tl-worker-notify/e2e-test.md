@@ -144,23 +144,32 @@ Because of the blocker above this row is **not** marked Green.
 
 ## Live run, 2026-09-30 (work dir `python-tl-worker-notify.kT0YrtMB`)
 
-This run is the evidence behind the three fixes above. Ten assertions pass
-against real product output, including the two that had never been observed:
+This run is the evidence behind the three fixes above. Eleven validator
+assertions pass against real product output, including the two that had never
+been observed. These are the validator's own `[python-tl-worker-notify-validator]
+OK:` lines, in the order it printed them:
 
 ```
 OK: Python TL controller window exists
 OK: TL plan was consumed into a controller checkpoint
-OK: no interactive Codex root TL config was generated
+OK: no retired interactive Codex root TL config
 OK: CODEX_HOME propagated into the tmux session
 OK: worker routing metadata exists
 OK: worker Codex config exists
 OK: Codex worker config is role-correct
-OK: Codex project + hook trust in .../codex-home
 OK: Codex worker trust is in the isolated home
 OK: controller window holds the controller plus a dispatched worker pane
 OK: worker notify_parent event recorded
 OK: worker notify_parent tmux delivery succeeded
 ```
+
+Three of those assertions are `check` calls whose helper prints its own `OK:`
+line as well, so the raw log interleaves a dozen-plus lines for eleven
+assertions: `no interactive Codex root TL config was generated`,
+`CODEX_HOME propagated into tmux session e2e-python-tl-worker-notify`, and
+`Codex project + hook trust in .../codex-home` are the helpers' output, and each
+is followed by the validator's own line for the assertion it belongs to. The
+block above is the validator's lines only, so the count and the block agree.
 
 The last two are new, and they are the ones that matter. The run's own
 `.exo/logs/python-tl-worker-notify-worker-codex.jsonl` holds the worker's
