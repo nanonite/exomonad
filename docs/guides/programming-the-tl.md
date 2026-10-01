@@ -879,7 +879,136 @@ carry dependencies.
 
 Until that is plumbed through, `sub_tls` is the supported way to express
 ordering, at the cost of a stage boundary where a finer dependency edge would
-do.
+do. Plan authoring refuses a proposal that declares leaf `depends_on` rather
+than dropping the edge and dispatching a dependent slice early
+(`PlanAuthoringUnsupported`).
+
+---
+
+## Letting the model propose the plan
+
+`plan.json` is authority: a human writes it, and the controller dispatches from
+it. Plan authoring is a separate, narrower input — a **request** — that the
+model may answer with a proposal. It is deliberately not a plan document.
+
+```python
+from tl_loop.plan_validation import validate_plan_document
+from tl_loop.rlm import (
+    PlanAuthoringInput,
+    acceptance_gate_name,
+    author_plan,
+    install_accepted_plan,
+    open_acceptance_gate,
+    resolve_authoring_model_choice,
+)
+from tl_loop.select.policy import load_policy
+from tl_loop.state.store import RunStore
+
+# The authoring request. It rejects `leaves`, `workers`, `sub_tls`, and
+# `plan` outright: a proposal must never be mistaken for a declaration.
+request = PlanAuthoringInput.from_mapping(
+    {
+        "task": "Split the refresh-rotation work into owned slices",
+        "read_first": ["rust/exomonad-core/src/handlers/auth.rs"],
+        "constraints": ["keep the harness policy decisions out of the plan"],
+        "base_ref": "main",
+    }
+)
+
+# The model is resolved from harness_policy.toml, never from the request.
+choice = resolve_authoring_model_choice(load_policy(), backend=backend)
+
+proposal = author_plan(request, model_choice=choice, run_id="root")
+
+store = RunStore("root", ".exo/tl-loop")
+open_acceptance_gate(store, proposal)
+print(acceptance_gate_name(proposal))
+```
+
+What the boundary guarantees:
+
+| Property | How |
+|---|---|
+| Tools empty | The judgment is the existing stateless `decompose` call; `RlmRequest.tools == ()` and no `EffectClient` is constructed |
+| Bounded | At most three attempts; a schema, ownership, or cycle violation is fed back as `validation_feedback` and the final failure raises `DecompositionParked` |
+| Policy-owned model | Harness and model come from the role's allowlist and the spend is charged against the same role budget; a model-qualified allowlist entry pins the model |
+| Validated | Each `SliceSpec` becomes a leaf, then the whole document passes the same `validate_plan_document` closed-key validator `plan.json` uses, and `build_plan_manifest` produces the declaration |
+| Inert | The proposal is recorded durably with its bounded audit, and becomes authority only through the acceptance gate |
+
+The RLM gains nothing. It cannot read the filesystem, run a shell, touch git,
+spawn, call MCP, or dispatch an effect, and the authoring request deliberately
+withholds the harness request and budgets so the judgment cannot reason about
+authority it does not hold.
+
+### Acceptance is a human gate bound to one digest
+
+The gate name is derived from the proposal's manifest digest, so approving one
+proposal never approves a different one.
+
+```python
+from tl_loop.state.schema import GateStatus
+
+open_acceptance_gate(store, proposal)          # PENDING, durable
+store.answer_gate(acceptance_gate_name(proposal), GateStatus.APPROVED)
+state = install_accepted_plan(store, proposal)  # now the manifest
+```
+
+Before approval, `require_acceptance` and `install_accepted_plan` both raise
+`PlanAcceptanceRequired`; a rejection raises `PlanRejected` and is terminal.
+Because the gate lives in run state, a restart before acceptance still has no
+authority and a restart after acceptance keeps exactly the accepted digest.
+Installation goes through `set_plan_manifest` with dispatched nodes protected,
+so a continuation cannot rewrite ownership that already ran.
+
+### The operator surface
+
+`plan-authoring` reads the durable record, so a second process finishes the
+flow without re-running the judgment:
+
+```bash
+# What was proposed, what it needs, and the bounded audit record.
+python3 ~/.exo/tl_loop.pyz plan-authoring --project-root . --run-id root
+
+# Answer the named gate, then install the recorded proposal.
+python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root \
+  --name plan-acceptance-<digest prefix> --approve
+python3 ~/.exo/tl_loop.pyz plan-authoring --project-root . --run-id root --install
+```
+
+`--install` without an approved gate exits non-zero and dispatches nothing.
+
+### What is persisted
+
+Only the validated plan identity and a bounded judgment audit record, in
+`.exo/tl-loop/<run_id>/plan-authoring.json`:
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "root",
+  "plan_digest": "<manifest sha256>",
+  "gate_name": "plan-acceptance-<digest prefix>",
+  "status": "pending",
+  "owned_branch": "main",
+  "document": { "run_id": "root", "plan": { "leaves": [] } },
+  "audit": {
+    "judgment": "decompose",
+    "model": "gpt-luna",
+    "attempts": 2,
+    "tokens": 418,
+    "failures": 1,
+    "violations": ["output.slices[0]: required key is missing"]
+  }
+}
+```
+
+The record is a sidecar, not run state: it grants no authority on its own, and
+the accepted identity reaches run state only through `set_plan_manifest`. On
+read, the stored document is re-validated and re-hashed against the recorded
+digest — the digest the gate is named after — so a hand-edited body cannot
+borrow an approval. The audit carries only scalar dimensions and truncated
+validation reasons; the model's prose, the request, and the plan body never
+enter it.
 
 ---
 
@@ -1104,6 +1233,11 @@ instruction moves real work.
 Agent-authored text in the read model is tagged `observation_only` and is never
 presented to the judgment as instruction. That provenance envelope is the
 prompt-injection boundary.
+
+The same boundary holds for plan authoring: the model may *propose* a typed
+plan through bounded judgment, but only a validated and explicitly accepted
+proposal becomes execution authority. See
+[Letting the model propose the plan](#letting-the-model-propose-the-plan).
 
 ---
 

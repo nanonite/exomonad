@@ -46,9 +46,16 @@ from tl_loop.plan_validation import (
     validate_plan_proposal,
 )
 from tl_loop.preflight import PreflightError, run_preflight
+from tl_loop.rlm.plan_acceptance import (
+    gate_status_of,
+    install_accepted_plan,
+    proposal_summary,
+    recorded_plan,
+)
 from tl_loop.select.capability import load_capability
 from tl_loop.select.model import load_model_catalog
 from tl_loop.select.policy import load_policy
+from tl_loop.state.plan_manifest import PlanManifest
 from tl_loop.state.read_model import project_read_model
 from tl_loop.state.schema import GateStatus, RunState
 from tl_loop.state.store import CorruptCheckpoint, RunStore
@@ -74,6 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "run",
         "status",
         "gate",
+        "plan-authoring",
         "abandon",
         "redispatch",
         "plan-proposal",
@@ -103,6 +111,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_status(args)
         elif args.command == "plan-proposal":
             _print_plan_proposal(args)
+        elif args.command == "plan-authoring":
+            _plan_authoring(args)
         elif args.command == "preflight":
             run_preflight(
                 args.project_root,
@@ -229,6 +239,21 @@ def _parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     gate.set_defaults(command="gate")
+
+    plan_authoring = subcommands.add_parser(
+        "plan-authoring",
+        help="inspect or install one model-authored plan proposal",
+    )
+    _add_project_options(plan_authoring)
+    plan_authoring.add_argument(
+        "--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID)
+    )
+    plan_authoring.add_argument(
+        "--install",
+        action="store_true",
+        help="install the recorded proposal once its acceptance gate is approved",
+    )
+    plan_authoring.set_defaults(command="plan-authoring")
 
     abandon = subcommands.add_parser(
         "abandon", help="operator-authorize abandonment of one live slice attempt"
@@ -628,6 +653,28 @@ def _plan_from_document(document: Mapping[str, object]) -> WorkPlan:
         return WorkPlan.from_mapping(value)
     except (TypeError, ValueError) as error:
         raise LauncherError(f"invalid WorkPlan: {error}") from error
+
+
+def _plan_authoring(args: argparse.Namespace) -> None:
+    """Show the recorded proposal, or install it once a human approved it."""
+    project_root = args.project_root.expanduser().resolve()
+    store = RunStore(args.run_id, project_root / ".exo" / "tl-loop")
+    proposal = recorded_plan(store, args.run_id)
+    if proposal is None:
+        raise LauncherError(
+            f"no plan-authoring proposal is recorded for run {args.run_id!r}"
+        )
+    if not args.install:
+        summary = proposal_summary(
+            proposal, status=gate_status_of(store.load(), proposal)
+        )
+        print(json.dumps(summary, sort_keys=True))
+        return
+    state = install_accepted_plan(store, proposal)
+    summary = proposal_summary(proposal, status=gate_status_of(state, proposal))
+    summary["installed"] = True
+    summary["manifest_digest"] = cast(str, cast(PlanManifest, state.plan_manifest).digest)
+    print(json.dumps(summary, sort_keys=True))
 
 
 def _print_plan_proposal(args: argparse.Namespace) -> None:

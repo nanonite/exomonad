@@ -113,7 +113,7 @@ from .schema import (
 )
 from .serialization import dumps as dumps_json
 from .serialization import to_jsonable
-from .write import apply
+from .write import apply, publish
 
 DEFAULT_ROOT = Path(".exo/tl-loop")
 RootSpec: TypeAlias = Mapping[str, object]
@@ -427,6 +427,39 @@ class RunStore:
     def load(self) -> RunState:
         """Load and verify this run's checkpoint."""
         return load(self.path)
+
+    @property
+    def plan_authoring_path(self) -> Path:
+        """Return the durable record of one validated plan-authoring proposal.
+
+        The record is a sidecar rather than run state: it is not a lifecycle
+        phase, it never grants authority on its own, and the accepted plan
+        identity reaches run state only through ``set_plan_manifest`` once a
+        human has approved the matching gate.
+        """
+        return self.run_dir / "plan-authoring.json"
+
+    def record_plan_authoring(self, record: Mapping[str, object]) -> None:
+        """Replace the durable plan-authoring record for this run."""
+        normalized = to_jsonable(record)
+        if not isinstance(normalized, dict):
+            raise TypeError("plan-authoring record must be an object")
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        publish(self.plan_authoring_path, normalized)
+
+    def plan_authoring_record(self) -> Mapping[str, object] | None:
+        """Read the recorded plan-authoring proposal, or None when absent."""
+        try:
+            payload = json.loads(self.plan_authoring_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise CorruptCheckpoint(f"plan-authoring record is unreadable: {error}") from error
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise CorruptCheckpoint(f"plan-authoring record is invalid JSON: {error}") from error
+        if not isinstance(payload, dict):
+            raise CorruptCheckpoint("plan-authoring record must be a JSON object")
+        return MappingProxyType(payload)
 
     @property
     def exit_reason_path(self) -> Path:
