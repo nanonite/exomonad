@@ -126,7 +126,8 @@
       ],
       "verdict": "NO-GO",
       "verdict_at": "<timestamp>",
-      "worktree": null
+      "worktree": null,
+      "resolved_harness": "codex/gpt-luna"
     },
     "worker-a": {
       "agent_type": "codex/gpt-luna",
@@ -157,7 +158,8 @@
         "controller"
       ],
       "verdict": null,
-      "worktree": null
+      "worktree": null,
+      "resolved_harness": "codex/gpt-luna"
     }
   },
   "version": 4

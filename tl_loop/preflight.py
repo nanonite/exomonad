@@ -191,10 +191,20 @@ def _validate_plan_spawn_routes(document: object, path: Path) -> None:
                     continue
                 route = entry.get("agent_type")
                 if route is not None:
-                    try:
-                        parse_harness_identifier(route)
-                    except ValueError as error:
-                        errors.append(f"{path}:{location}.{kind}[{index}].agent_type: {error}")
+                    if kind == "sub_tls":
+                        errors.append(
+                            f"{path}:{location}.sub_tls[{index}].agent_type: a sub-TL is a "
+                            "nested controller process, not a model session, so it cannot "
+                            "request a harness; declare the request on the workers and "
+                            "leaves of its nested plan"
+                        )
+                    else:
+                        try:
+                            parse_harness_identifier(route)
+                        except ValueError as error:
+                            errors.append(
+                                f"{path}:{location}.{kind}[{index}].agent_type: {error}"
+                            )
                 nested = entry.get("plan")
                 if isinstance(nested, Mapping):
                     visit(nested, f"{location}.{kind}[{index}].plan")

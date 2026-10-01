@@ -39,7 +39,7 @@
     {
       "operation": "chainlink_issue_create",
       "arguments": {
-        "description": "Slice worker-a is parked for human action. Cause: retries_exhausted. Audit: {\"attempts\": 0, \"harness\": null, \"ledger\": {\"charges\": [], \"harness_reserved\": {}, \"harness_spent\": {}, \"role_reserved\": {}, \"role_spent\": {}, \"tokens\": 0, \"wall_seconds\": 0}, \"model\": null, \"verdict\": null}",
+        "description": "Slice worker-a is parked for human action. Cause: retries_exhausted. Audit: {\"attempts\": 0, \"harness\": null, \"ledger\": {\"charges\": [], \"harness_reserved\": {}, \"harness_spent\": {}, \"role_reserved\": {}, \"role_spent\": {}, \"tokens\": 0, \"wall_seconds\": 0}, \"model\": null, \"requested_harness\": null, \"resolved_harness\": null, \"verdict\": null}",
         "labels": [
           "needs-human"
         ],

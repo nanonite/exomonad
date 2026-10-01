@@ -82,7 +82,12 @@ class SliceReadModel:
     paths: tuple[str, ...]
     depends_on: tuple[str, ...]
     base_ref: str | None
+    #: The resolved protocol agent type actually dispatched for this slice.
     agent_type: str | None
+    #: The harness ``plan.json`` requested, verbatim, or ``None``.
+    requested_harness: str | None
+    #: The qualified harness policy selection resolved, or ``None``.
+    resolved_harness: str | None
     model: str | None
     branch: str | None
     worktree: str | None
@@ -126,6 +131,8 @@ class SliceReadModel:
             "depends_on": list(self.depends_on),
             "base_ref": self.base_ref,
             "agent_type": self.agent_type,
+            "requested_harness": self.requested_harness,
+            "resolved_harness": self.resolved_harness,
             "model": self.model,
             "branch": self.branch,
             "worktree": self.worktree,
@@ -873,6 +880,8 @@ def _slice_model(state: SliceState, events: Mapping[str, EventEnvelope]) -> Slic
         depends_on=tuple(state.depends_on),
         base_ref=state.base_ref,
         agent_type=state.agent_type,
+        requested_harness=state.requested_harness,
+        resolved_harness=state.resolved_harness,
         model=state.model,
         branch=state.branch,
         worktree=state.worktree,

@@ -1404,6 +1404,10 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["review_patch_digests"] = dict(value.review_patch_digests)
         if value.review_contract is not None:
             record["review_contract"] = copy.deepcopy(dict(value.review_contract))
+        if value.requested_harness is not None:
+            record["requested_harness"] = value.requested_harness
+        if value.resolved_harness is not None:
+            record["resolved_harness"] = value.resolved_harness
         if value.verdict_at is not None:
             record["verdict_at"] = value.verdict_at
         if value.review_evidence is not None:
@@ -1576,7 +1580,12 @@ def _pending_manifest_slice(node: ManifestNode) -> dict[str, object]:
         "depends_on": [],
         "base_ref": None,
         "test_plan": ["controller"],
-        "agent_type": node.agent_type,
+        # The declared request is persisted as itself and the resolved route
+        # stays unset until a dispatch resolves one, so a pending slice can
+        # never report a plan request as the harness that actually ran.
+        "agent_type": None,
+        "requested_harness": node.agent_type,
+        "resolved_harness": None,
         "model": None,
         "branch": node.owned_branch,
         "worktree": node.worktree,
@@ -2419,6 +2428,8 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         base_ref=cast(str | None, value["base_ref"]),
         test_plan=tuple(cast(list[str], value["test_plan"])),
         agent_type=cast(str | None, value["agent_type"]),
+        requested_harness=cast(str | None, value.get("requested_harness")),
+        resolved_harness=cast(str | None, value.get("resolved_harness")),
         model=cast(str | None, value["model"]),
         branch=cast(str | None, value["branch"]),
         worktree=cast(str | None, value["worktree"]),

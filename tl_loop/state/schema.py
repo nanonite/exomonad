@@ -124,6 +124,11 @@ class ParkCause(str, Enum):
     RETRIES_EXHAUSTED = "retries_exhausted"
     BUDGET_EXHAUSTED = "budget_exhausted"
     NO_CAPABLE_HARNESS = "no_capable_harness"
+    #: A plan requested a harness the role's policy allowlist does not approve.
+    HARNESS_REQUEST_NOT_ALLOWED = "harness_request_not_allowed"
+    #: A plan requested a harness policy escalation has already taken out of
+    #: rotation, so the request and the escalation rule disagree.
+    HARNESS_REQUEST_SUPERSEDED = "harness_request_superseded"
     SCHEDULE_DEADLOCK = "schedule_deadlock"
     REVIEW_STUCK = "review_stuck"
     REVIEW_ROUNDS_EXHAUSTED = "review_rounds_exhausted"
@@ -583,6 +588,8 @@ SLICE_KEYS = frozenset(
         "base_ref",
         "test_plan",
         "agent_type",
+        "requested_harness",
+        "resolved_harness",
         "model",
         "branch",
         "worktree",
@@ -669,6 +676,10 @@ PARK_AUDIT_KEYS = frozenset(
         "attempts",
         "verdict",
         "harness",
+        # The two harness dimensions are persisted apart so a park audit can
+        # say what the plan requested next to what policy actually resolved.
+        "requested_harness",
+        "resolved_harness",
         "model",
         "ledger",
         "from_harness",
@@ -821,6 +832,17 @@ class SliceState:
     reviewed_head: str | None
     attempts: int
     verdict: Verdict | None
+    #: The harness identifier ``plan.json`` requested for this slice, verbatim.
+    #:
+    #: It is written once when the slice is declared and never rewritten by a
+    #: dispatch, so ``agent_type`` can carry the *resolved* route alone and an
+    #: audit can still say what was asked for. It is ``None`` for a sub-TL,
+    #: which is a nested controller process rather than a model session.
+    requested_harness: str | None = None
+    #: The qualified ``agent_type/model`` identifier policy selection actually
+    #: ran. ``None`` until a dispatch resolves one, which is what keeps a plan
+    #: request from being mistaken for an executed route on replay.
+    resolved_harness: str | None = None
     review_findings: Mapping[str, tuple[Mapping[str, str], ...]] = field(default_factory=dict)
     review_patch_digests: Mapping[str, str] = field(default_factory=dict)
     review_contract: Mapping[str, object] | None = None
@@ -1413,7 +1435,16 @@ def _validate_slice(
     _string_list(value, "paths", path, errors, allow_empty=False)
     _string_list(value, "depends_on", path, errors, allow_empty=True)
     _string_list(value, "test_plan", path, errors, allow_empty=True)
-    for key in ("base_ref", "agent_type", "model", "branch", "worktree", "reviewed_head"):
+    for key in (
+        "base_ref",
+        "agent_type",
+        "requested_harness",
+        "resolved_harness",
+        "model",
+        "branch",
+        "worktree",
+        "reviewed_head",
+    ):
         _nullable_string(value, key, path, errors)
     _nullable_string(value, "manifest_node_id", path, errors)
     _nullable_positive_int(value, "manifest_revision", path, errors)

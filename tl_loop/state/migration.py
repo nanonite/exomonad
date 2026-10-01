@@ -200,6 +200,8 @@ def _migrate_slices(value: object) -> list[str]:
             ("test_plan", []),
             ("base_ref", None),
             ("agent_type", None),
+            ("requested_harness", None),
+            ("resolved_harness", None),
             ("model", None),
             ("branch", None),
             ("worktree", None),
@@ -216,6 +218,7 @@ def _migrate_slices(value: object) -> list[str]:
             if key not in raw:
                 raw[key] = copy.deepcopy(default)
                 changes.append(f"{slice_id}.{key}")
+        _split_legacy_harness(slice_id, raw, changes)
         if raw.get("verdict") is not None and "review_validation_required" not in raw:
             raw["review_validation_required"] = True
             changes.append(f"{slice_id}.review_validation_required")
@@ -227,6 +230,43 @@ def _migrate_slices(value: object) -> list[str]:
             )
             changes.append(f"{slice_id}.status=dispatch_unconfirmed")
     return changes
+
+
+def _split_legacy_harness(slice_id: str, raw: dict[str, object], changes: list[str]) -> None:
+    """Split a legacy slice's single harness value into its two real meanings.
+
+    Before the request/resolved split a checkpoint recorded one ``agent_type``
+    per slice, and which fact it held is decided by the slice's own dispatch
+    boundary rather than guessed:
+
+    * a slice that never recorded a dispatch still holds the plan's *request*,
+      because nothing overwrote it -- it becomes ``requested_harness`` and
+      ``agent_type``/``resolved_harness`` stay unset;
+    * a slice that recorded a dispatch was overwritten with the *resolved* route
+      by the dispatch itself, so it keeps ``agent_type`` and its
+      ``resolved_harness`` stays unset. The pre-split route was recorded
+      unqualified, so no qualified identifier is invented for it, and the
+      request it came from is genuinely unrecoverable -- recorded as such.
+
+    A value that cannot be placed in either field by that rule is refused: the
+    value is dropped rather than asserted as a request or a resolution, and the
+    change is listed in the migration report so the loss is auditable.
+    """
+    recorded = raw.get("agent_type")
+    if recorded is None:
+        return
+    if _has_spawn_evidence(raw):
+        raw["resolved_harness"] = None
+        changes.append(f"{slice_id}.requested_harness=unrecoverable")
+        return
+    if not isinstance(recorded, str) or not recorded:
+        raw["agent_type"] = None
+        changes.append(f"{slice_id}.agent_type=refused")
+        return
+    raw["requested_harness"] = recorded
+    raw["agent_type"] = None
+    raw["resolved_harness"] = None
+    changes.append(f"{slice_id}.requested_harness")
 
 
 def _has_spawn_evidence(value: dict[str, object]) -> bool:

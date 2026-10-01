@@ -175,9 +175,15 @@ from tl_loop.ordered import (
 )
 from tl_loop.rlm.adjudicate import adjudicate_review
 from tl_loop.rlm.repair import RepairError, RepairHandoff, compose_repair
-from tl_loop.select.agent_type import parse_harness_identifier, select_agent_type, selection_failure
+from tl_loop.select.agent_type import (
+    SelectionFailure,
+    parse_harness_identifier,
+    select_agent_type,
+    selection_failure,
+)
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.classify import Difficulty
+from tl_loop.select.harness import HarnessRoute
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
@@ -522,6 +528,9 @@ class DispatchAttempt:
     harness: str
     agent_type: str = ""
     model: str | None = None
+    #: The harness identifier the plan requested, carried so a dispatch record
+    #: can name both the request and the route it resolved to.
+    requested_harness: str | None = None
     attempt: int = 0
     controller_epoch: str | None = None
     #: The per-slice dispatch attempt counter under the current controller epoch.
@@ -540,7 +549,14 @@ class DispatchAttempt:
     #: floor its intent was issued at.
     ledger_floor: int = 0
 
-    def routed(self, *, harness: str, agent_type: str, model: str | None) -> DispatchAttempt:
+    def routed(
+        self,
+        *,
+        harness: str,
+        agent_type: str,
+        model: str | None,
+        requested_harness: str | None = None,
+    ) -> DispatchAttempt:
         """Return this attempt with the selected harness route attached.
 
         The policy path resolves the harness after the intent is minted. The
@@ -548,8 +564,29 @@ class DispatchAttempt:
         floor, and the controller epoch and dispatch generation the correlation
         reads are carried by ``replace``, so selecting a harness can never
         record an attempt with incomplete provenance.
+
+        ``requested_harness`` is written only when the attempt carries no
+        request yet, so re-routing an attempt never erases what the plan asked
+        for.
         """
-        return replace(self, harness=harness, agent_type=agent_type, model=model)
+        return replace(
+            self,
+            harness=harness,
+            agent_type=agent_type,
+            model=model,
+            requested_harness=self.requested_harness or requested_harness,
+        )
+
+    @classmethod
+    def requested(cls, route: HarnessRoute) -> DispatchAttempt:
+        """Build an identity-free route carrier for a validated plan request.
+
+        Only :func:`_resolve_direct_request` uses this, and only for a run with
+        no policy bound, where there is no intent identity to attach to yet. The
+        intent that eventually persists carries the same fields, so this is a
+        staging value rather than a second source of dispatch provenance.
+        """
+        return cls("", 0.0, route.harness, agent_type=route.agent_type, model=route.model)
 
     @classmethod
     def recorded_for(
@@ -562,9 +599,10 @@ class DispatchAttempt:
         new field cannot be dropped by a second hand-written construction. The
         controller epoch is the current run's epoch, which is the epoch the
         correlation admits; the generation and ledger floor are the ones the
-        persisted intent was recorded with. The slice records the resolved
-        agent type and not the qualified harness identifier a policy selection
-        chose, so both routing dimensions read that one recorded value.
+        persisted intent was recorded with. The slice persists the qualified
+        harness the policy resolved and the protocol agent type separately, so
+        each dimension reads its own value and a request can never be mistaken
+        for the route that ran.
 
         A slice that records no intent has no attempt to rebuild, and
         reconstruction fails closed rather than inventing one.
@@ -579,9 +617,10 @@ class DispatchAttempt:
         return cls(
             intent_id=slice_state.dispatch_intent_id,
             started_at=slice_state.dispatch_started_at,
-            harness=slice_state.agent_type or "",
+            harness=slice_state.resolved_harness or slice_state.agent_type or "",
             agent_type=slice_state.agent_type or "",
             model=slice_state.model,
+            requested_harness=slice_state.requested_harness,
             attempt=max(1, slice_state.attempts),
             controller_epoch=controller_epoch,
             dispatch_generation=slice_state.dispatch_generation,
@@ -789,7 +828,6 @@ class SubTLTask:
     plan: WorkPlan | Mapping[str, object]
     source: EventQueue | None = None
     effects: EffectClient | ReadOnlyEffectClient | None = None
-    agent_type: str | None = None
     worktree: str | Path | None = None
     agent_id: str | None = None
     order: int = 1
@@ -802,7 +840,6 @@ class SubTLTask:
         _require_text(self.name, "sub-TL name")
         if not isinstance(self.plan, (WorkPlan, Mapping)):
             raise TypeError("sub-TL plan must be a WorkPlan or object")
-        _optional_text(self.agent_type, "sub-TL agent_type")
         _optional_text(self.agent_id, "sub-TL agent_id")
         if self.worktree is not None:
             _require_text(str(self.worktree), "sub-TL worktree")
@@ -8007,6 +8044,8 @@ def _dispatch_payload(
         payload["harness"] = attempt.harness
     if attempt.agent_type:
         payload["agent_type"] = attempt.agent_type
+    if attempt.requested_harness:
+        payload["requested_harness"] = attempt.requested_harness
     if attempt.model:
         payload["model"] = attempt.model
     return payload
@@ -8034,16 +8073,29 @@ def _dispatch_retry_payload(
     return payload
 
 
-def _spawn_route(
-    attempt: DispatchAttempt, fallback_harness: str | None
-) -> tuple[str | None, str | None]:
-    """Return protocol fields while preserving the qualified audit identity."""
-    if attempt.agent_type:
-        return attempt.agent_type, attempt.model
-    if not fallback_harness:
-        return None, None
-    route = parse_harness_identifier(fallback_harness)
-    return route.agent_type, route.model
+def _spawn_route(attempt: DispatchAttempt) -> tuple[str | None, str | None]:
+    """Return the protocol fields this attempt was actually dispatched with.
+
+    Only a resolved attempt carries a route. A policy run resolves the harness
+    in :func:`_prepare_spawn`; the direct no-policy run resolves the plan's
+    own request once, in :func:`_resolve_direct_request`, so the plan value is
+    still parsed and validated rather than forwarded unexamined.
+    """
+    return (attempt.agent_type or None), attempt.model
+
+
+def _resolve_direct_request(request: str | None) -> DispatchAttempt | None:
+    """Validate a plan request for a run with no harness policy bound.
+
+    Without a policy there is no allowlist, capability map, or budget to bind a
+    request to, so this is the *only* place such a request is accepted. It is
+    parsed by the same ``parse_harness_identifier`` preflight uses, which is
+    what keeps an unsupported agent type out of the spawn arguments.
+    """
+    if request is None:
+        return None
+    route = parse_harness_identifier(request)
+    return DispatchAttempt.requested(route)
 
 
 def _confirm_dispatch_event(
@@ -8499,7 +8551,11 @@ def _dispatch_children(
         _record_spawn_request(worker.name, attempt, config, effects, effects_log)
         runtime_name = config.dispatch_names.get(worker.name, worker.name)
         worker_args: dict[str, object] = {"name": runtime_name, "task": worker.task}
-        agent_type, model = _spawn_route(attempt, worker.agent_type)
+        # The resolved route is authoritative. A plan request reaches the wire
+        # only because the selector honored it, so a slice can never be
+        # dispatched with an unvalidated plan value when policy resolved a
+        # different harness.
+        agent_type, model = _spawn_route(attempt)
         _optional_argument(worker_args, "agent_type", agent_type)
         _optional_argument(worker_args, "model", model)
         try:
@@ -8539,7 +8595,7 @@ def _dispatch_children(
         runtime_name = config.dispatch_names.get(leaf.name, leaf.name)
         leaf_args: dict[str, object] = {"name": runtime_name, "task": leaf.task}
         _optional_argument(leaf_args, "intent_id", attempt.intent_id)
-        agent_type, model = _spawn_route(attempt, leaf.agent_type)
+        agent_type, model = _spawn_route(attempt)
         _optional_argument(leaf_args, "agent_type", agent_type)
         _optional_argument(leaf_args, "model", model)
         for name, value in (
@@ -11393,6 +11449,38 @@ def _already_dispatched(name: str, state: RunState) -> bool:
     return current is not None and current.status is not SliceStatus.PENDING
 
 
+#: Every ``SelectionFailure`` that can park a slice, and the typed cause it parks
+#: with. A refused request and an exhausted budget are different operator actions,
+#: so they are different causes rather than one generic "no harness" park.
+_SELECTION_PARK_CAUSES: MappingProxyType = MappingProxyType(
+    {
+        SelectionFailure.OVER_BUDGET: ParkCause.BUDGET_EXHAUSTED,
+        SelectionFailure.NO_CAPABLE_HARNESS: ParkCause.NO_CAPABLE_HARNESS,
+        SelectionFailure.REQUEST_NOT_ALLOWED: ParkCause.HARNESS_REQUEST_NOT_ALLOWED,
+        SelectionFailure.REQUEST_NOT_CAPABLE: ParkCause.NO_CAPABLE_HARNESS,
+        SelectionFailure.REQUEST_SUPERSEDED_BY_ESCALATION: (
+            ParkCause.HARNESS_REQUEST_SUPERSEDED
+        ),
+    }
+)
+
+
+def _selection_refusal(
+    failure: SelectionFailure,
+    requested: str | None,
+    role: str,
+    policy: HarnessPolicy,
+) -> str:
+    """Explain one refusal in the operator's terms, naming the request."""
+    if requested is None:
+        return f"{failure.value}: no {role} harness is both capable and within budget"
+    allowed = ", ".join(policy.roles[role].allow) if role in policy.roles else "<no role policy>"
+    return (
+        f"{failure.value}: requested harness {requested!r} is not selectable for role "
+        f"{role!r}; policy allows {allowed}"
+    )
+
+
 def _prepare_spawn(
     name: str,
     state: RunState,
@@ -11406,9 +11494,19 @@ def _prepare_spawn(
         current = state.slices.get(name)
         if current is None:
             raise TLLoopError(f"dispatch slice {name!r} is missing from run state")
+        direct = _resolve_direct_request(current.requested_harness)
+        if direct is not None:
+            intent = intent.routed(
+                harness=direct.harness,
+                agent_type=direct.agent_type,
+                model=direct.model,
+                requested_harness=current.requested_harness,
+            )
         updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCHING))
         updated = replace(
             updated,
+            agent_type=intent.agent_type or None,
+            resolved_harness=intent.harness or None,
             attempts=current.attempts + 1,
             dispatch_intent_id=intent.intent_id,
             dispatch_started_at=intent.started_at,
@@ -11436,6 +11534,7 @@ def _prepare_spawn(
     if slice_state is None:
         raise TLLoopError(f"selector slice {name!r} is missing from run state")
     capabilities = config.capabilities or load_capability()
+    requested = slice_state.requested_harness
     choice = select_agent_type(
         slice_state,
         config.role,
@@ -11443,15 +11542,18 @@ def _prepare_spawn(
         config.policy,
         capabilities,
         config.learned_policy,
+        requested_harness=requested,
     )
     if choice is None:
         failure = selection_failure(
-            slice_state, config.role, state.budgets, config.policy, capabilities
+            slice_state,
+            config.role,
+            state.budgets,
+            config.policy,
+            capabilities,
+            requested_harness=requested,
         )
-        cause = {
-            "over_budget": ParkCause.BUDGET_EXHAUSTED,
-            "no_capable_harness": ParkCause.NO_CAPABLE_HARNESS,
-        }.get(failure.value)
+        cause = _SELECTION_PARK_CAUSES.get(failure)
         if cause is None:
             raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}")
         if config.active:
@@ -11462,6 +11564,7 @@ def _prepare_spawn(
                 store=store,
                 issue_creator=live,
                 ledger=state.budgets,
+                audit={"reason": _selection_refusal(failure, requested, config.role, config.policy)},
             )
         raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}; slice parked")
     route = parse_harness_identifier(choice.harness)
@@ -11486,6 +11589,7 @@ def _prepare_spawn(
         harness=choice.harness,
         agent_type=route.agent_type,
         model=model_id,
+        requested_harness=requested,
     )
 
     def record_spawn(document: dict[str, object]) -> dict[str, object]:
@@ -11500,6 +11604,11 @@ def _prepare_spawn(
             {
                 "status": dispatched.status.value,
                 "agent_type": route.agent_type,
+                # The resolved route and the plan request are persisted as two
+                # independent facts. A reader can tell a request that policy
+                # narrowed from one it honored verbatim, and a restart replays
+                # the request rather than mistaking it for the executed route.
+                "resolved_harness": choice.harness,
                 "model": model_id,
                 "attempts": slice_state.attempts + 1,
                 "dispatch_intent_id": intent.intent_id,
@@ -13460,7 +13569,6 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
                 "name": task.name,
                 "order": task.order,
                 "task": f"sub-TL {task.name}",
-                "agent_type": task.agent_type,
                 "worktree": str(task.worktree) if task.worktree is not None else None,
                 "integration": _manifest_integration(task.integration),
                 "plan": _manifest_plan(child_plan),
@@ -13579,7 +13687,6 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                 SubTLTask(
                     name=node.name,
                     plan=_work_plan_from_manifest(child),
-                    agent_type=node.agent_type,
                     worktree=node.worktree,
                     order=node.order,
                     integration=_integration_contract(node.integration_contract),
@@ -13704,11 +13811,14 @@ def _initial_slices(
             review_contract=review_contract.as_mapping(),
         )
     for task in plan.sub_tls:
+        # A sub-TL slice records no harness request: the child is a controller
+        # process, and the harnesses it runs are chosen inside its own nested
+        # plan's workers and leaves.
         result[task.name] = _initial_slice_record(
             task.name,
             (f"tl-loop/{task.name}",),
             ("controller",),
-            task.agent_type,
+            None,
             derive_child_branch(selected.branch, _child_controller_name(task)),
             str(_sub_tl_worktree(selected, state_root, current_run, task)),
             selected.branch,
@@ -13792,6 +13902,13 @@ def _initial_slice_record(
     task_timeout_declared: bool = False,
     review_contract: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    """Build one pending slice record, keeping the plan request separate.
+
+    ``agent_type`` here is the request ``plan.json`` declared, never an executed
+    route. It is persisted as ``requested_harness`` so ``agent_type`` and
+    ``resolved_harness`` can mean "the route this run actually dispatched" and
+    stay free for the selector to fill in.
+    """
     resolved_timeout, timeout_source = _resolve_task_timeout(
         config or TLLoopConfig(), task_timeout_seconds, task_timeout_declared
     )
@@ -13802,7 +13919,9 @@ def _initial_slice_record(
         "depends_on": [],
         "base_ref": base_ref,
         "test_plan": list(test_plan),
-        "agent_type": agent_type,
+        "agent_type": None,
+        "requested_harness": agent_type,
+        "resolved_harness": None,
         "model": None,
         "branch": branch,
         "worktree": worktree,
@@ -13901,6 +14020,10 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         return value
     if not isinstance(value, Mapping):
         raise TypeError("sub-TL task must be an object")
+    # ``agent_type`` is absent on purpose. A sub-TL runs as a nested controller
+    # process rather than a model session, so a harness request on one was never
+    # a truthful field; rejecting it here is what makes an older plan fail
+    # closed instead of quietly running with a request that was never honored.
     allowed = {
         "name",
         "plan",
@@ -13909,7 +14032,6 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         "sub_tls",
         "source",
         "effects",
-        "agent_type",
         "worktree",
         "agent_id",
         "order",
@@ -13931,16 +14053,17 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
     return SubTLTask(
         _required_text(value, "name", "sub-TL"),
         plan,
-        cast(EventQueue | None, value.get("source")),
-        cast(EffectClient | ReadOnlyEffectClient | None, value.get("effects")),
-        _optional_string(value, "agent_type", "sub-TL"),
-        cast(str | Path | None, value.get("worktree")),
-        _optional_string(value, "agent_id", "sub-TL"),
-        _positive_order(value.get("order", 1), f"{path}.order"),
-        integration,
-        "order" in value,
-        _optional_timeout(value.get("task_timeout_seconds"), f"{path}.task_timeout_seconds"),
-        "task_timeout_seconds" in value,
+        source=cast(EventQueue | None, value.get("source")),
+        effects=cast(EffectClient | ReadOnlyEffectClient | None, value.get("effects")),
+        worktree=cast(str | Path | None, value.get("worktree")),
+        agent_id=_optional_string(value, "agent_id", "sub-TL"),
+        order=_positive_order(value.get("order", 1), f"{path}.order"),
+        integration=integration,
+        order_explicit="order" in value,
+        task_timeout_seconds=_optional_timeout(
+            value.get("task_timeout_seconds"), f"{path}.task_timeout_seconds"
+        ),
+        task_timeout_declared="task_timeout_seconds" in value,
     )
 
 

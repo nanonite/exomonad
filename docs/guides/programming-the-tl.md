@@ -309,7 +309,7 @@ The workhorse. One leaf owns one branch, one worktree, one PR.
 |-------|----------|--------|
 | `name` | yes | Agent name and branch segment |
 | `task` | yes | The assignment, passed verbatim after any continuation context |
-| `agent_type` | no | Explicit harness override; otherwise the selector picks from the allowlist |
+| `agent_type` | no | A policy-bound harness **request**. Omitted means the selector picks from the allowlist |
 | `boundary` | no | **Becomes the slice's owned `paths`.** Overlapping boundaries between non-terminal slices are a schema error |
 | `verify` | no | **Becomes the slice's `test_plan`** (falls back to `steps`) |
 | `done_criteria` | no | Becomes TL-owned reviewer acceptance criteria |
@@ -324,6 +324,36 @@ The TL composes reviewer acceptance criteria from the run-state `test_plan`,
 plan-level `verify` and `boundary`, owned paths, and `done_criteria`. The PR
 body may document the work, but it is not the authoritative source for review
 acceptance.
+
+#### `agent_type` is a request, not an override
+
+`agent_type` on a worker or leaf names the harness you want *policy-bound*.
+It narrows the selector's candidate set to the harnesses
+`.exo/harness_policy.toml` already approves for the role; it never widens that
+approval, and the capability map and the role and per-harness token budgets
+still apply to the narrowed set. A bare agent type (`codex`) selects among the
+approved entries of that agent type, which keeps the model choice in policy
+instead of in the plan; a model-qualified value (`codex/gpt-luna`) must name an
+allowed entry exactly.
+
+The request is either honored or refused, never silently replaced:
+
+| Situation | Slice parks with |
+|-----------|------------------|
+| Request names nothing the role's allowlist approves | `harness_request_not_allowed` |
+| Approved harness is not rated for the classified difficulty | `no_capable_harness` |
+| Approved harness has no budget left | `budget_exhausted` |
+| Policy escalation already took the requested harness out of rotation | `harness_request_superseded` |
+
+Each parks with a human-readable gate and names the request and the allowlist,
+so a refusal is an operator decision rather than a silent downgrade to a
+different harness.
+
+Status output keeps the two dimensions apart: `requested_harness` is your
+declared request, `resolved_harness` is the qualified `agent_type/model`
+policy actually dispatched, and `agent_type` is the protocol field sent on the
+wire. A restart replays the request from `requested_harness`, so a replay can
+never mistake a request for the route that ran.
 
 ### `workers` — ephemeral, no branch, no PR
 
@@ -357,9 +387,15 @@ serializes integration.
 ```
 
 Accepted keys: `name`, `plan` (or inline `workers`/`leaves`/`sub_tls`),
-`agent_type`, `worktree`, `agent_id`, positive `order`, and optional
-`integration`. Missing `order` is backward-compatible shorthand for order 1;
-zero and negative values are invalid.
+`worktree`, `agent_id`, positive `order`, and optional `integration`. Missing
+`order` is backward-compatible shorthand for order 1; zero and negative values
+are invalid.
+
+A sub-TL has **no** `agent_type`. It is a nested controller process, not a
+model session, so a harness request on one was never a truthful field. Declare
+the request on the workers and leaves of its nested plan instead. A plan that
+still sets `sub_tls[].agent_type` is rejected as an unknown key rather than
+silently ignored.
 
 ```json
 {

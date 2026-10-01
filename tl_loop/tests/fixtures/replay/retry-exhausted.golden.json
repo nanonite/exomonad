@@ -75,6 +75,8 @@
           "wall_seconds": 0
         },
         "model": null,
+        "requested_harness": null,
+        "resolved_harness": null,
         "verdict": null
       },
       "park_cause": "retries_exhausted",

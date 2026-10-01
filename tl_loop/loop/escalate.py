@@ -470,6 +470,8 @@ def _build_audit(
         "attempts": slice.attempts,
         "verdict": slice.verdict.value if slice.verdict is not None else None,
         "harness": slice.agent_type,
+        "requested_harness": slice.requested_harness,
+        "resolved_harness": slice.resolved_harness,
         "model": slice.model,
         "ledger": _ledger_snapshot(ledger),
     }

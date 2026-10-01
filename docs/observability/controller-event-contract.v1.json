@@ -62,6 +62,7 @@
         "error",
         "harness",
         "agent_type",
+        "requested_harness",
         "model",
         "controller_epoch",
         "dispatch_generation"
@@ -77,6 +78,7 @@
         "error",
         "harness",
         "agent_type",
+        "requested_harness",
         "model",
         "controller_epoch",
         "dispatch_generation"
@@ -92,6 +94,7 @@
         "error",
         "harness",
         "agent_type",
+        "requested_harness",
         "model",
         "controller_epoch",
         "dispatch_generation"
@@ -107,6 +110,7 @@
         "error",
         "harness",
         "agent_type",
+        "requested_harness",
         "model",
         "controller_epoch",
         "dispatch_generation"
@@ -122,6 +126,7 @@
         "error",
         "harness",
         "agent_type",
+        "requested_harness",
         "model",
         "controller_epoch",
         "dispatch_generation",
@@ -140,6 +145,7 @@
         "error",
         "harness",
         "agent_type",
+        "requested_harness",
         "model",
         "controller_epoch",
         "dispatch_generation"
@@ -155,6 +161,7 @@
         "error",
         "harness",
         "agent_type",
+        "requested_harness",
         "model",
         "controller_epoch",
         "dispatch_generation"
@@ -170,6 +177,7 @@
         "error",
         "harness",
         "agent_type",
+        "requested_harness",
         "model",
         "controller_epoch",
         "dispatch_generation"

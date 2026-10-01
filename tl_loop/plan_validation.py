@@ -28,6 +28,11 @@ _TASK_KEYS = {
             "task_timeout_seconds",
         }
     ),
+    # A sub-TL is a nested controller process, not a model session, so it has
+    # no harness to request. Its own workers and leaves declare their requests
+    # inside its nested plan. ``agent_type`` is absent here on purpose: an older
+    # plan that set one is rejected as an unknown key rather than silently
+    # ignored, which is what makes the removal a migration and not a no-op.
     "sub_tls": frozenset(
         {
             "name",
@@ -35,7 +40,6 @@ _TASK_KEYS = {
             "workers",
             "leaves",
             "sub_tls",
-            "agent_type",
             "worktree",
             "agent_id",
             "order",
