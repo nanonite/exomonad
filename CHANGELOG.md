@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Make plan agent type requests policy-bound and effective (#1128)
 - Fix a dispatched Codex worker that never calls notify_parent (#1148)
 - Update Codex end-to-end scenarios for the Python TL controller (#1127)
 - Migrate the Python TL worker-notify scenario to the Python TL controller (#1154)
