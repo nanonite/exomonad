@@ -1605,12 +1605,18 @@ def _extend_legacy_manifest(manifest: PlanManifest, document: Mapping[str, objec
 
 
 def _pending_manifest_slice(node: ManifestNode) -> dict[str, object]:
-    """Build the inert runtime record for a newly declared manifest node."""
+    """Build the inert runtime record for a newly declared manifest node.
+
+    The record carries the node's declared dependency edges rather than an
+    empty list. Dispatch reads the slice record while restart reads the
+    manifest, so a record that dropped the edges would dispatch a newly
+    declared dependent before the prerequisite it names has merged.
+    """
     return {
         "id": node.name,
         "status": SliceStatus.PENDING.value,
         "paths": list(node.boundary or (f"tl-loop/{node.name}",)),
-        "depends_on": [],
+        "depends_on": list(node.depends_on),
         "base_ref": None,
         "test_plan": ["controller"],
         # The declared request is persisted as itself and the resolved route

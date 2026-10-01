@@ -38,9 +38,9 @@ from tl_loop.rlm.plan_acceptance import (
 from tl_loop.rlm.plan_authoring import (
     AuthoredPlan,
     PlanAuthoringError,
+    build_authoring_manifest,
     PlanAuthoringInput,
     PlanAuthoringInputError,
-    PlanAuthoringUnsupported,
     author_plan,
     authoring_root_spec,
     judgment_audit,
@@ -95,6 +95,23 @@ def _choice(
         store=RlmCallStore(),
         context_length=context_length,
         max_attempts=max_attempts,
+    )
+
+
+def _spec(slice_id: str, path: str, *, depends_on: tuple[str, ...] = ()) -> SliceSpec:
+    """Build one validated slice record for the adapter under test."""
+    raw = _slice(slice_id, path, depends_on=list(depends_on))
+    return SliceSpec(
+        id=cast(str, raw["id"]),
+        title=cast(str, raw["title"]),
+        paths=tuple(cast(list[str], raw["paths"])),
+        depends_on=depends_on,
+        base_ref=cast(str, raw["base_ref"]),
+        test_plan=tuple(cast(list[str], raw["test_plan"])),
+        steps=tuple(cast(list[str], raw["steps"])),
+        verify=tuple(cast(list[str], raw["verify"])),
+        boundary=tuple(cast(list[str], raw["boundary"])),
+        done_criteria=tuple(cast(list[str], raw["done_criteria"])),
     )
 
 
@@ -475,23 +492,27 @@ def test_overlapping_owned_paths_are_rejected_before_a_plan_exists() -> None:
     assert [node.name for node in plan.manifest.nodes] == ["api", "tests"]
 
 
-def test_undeclared_dependencies_are_refused_by_the_adapter() -> None:
+def test_declared_dependencies_reach_the_executable_plan() -> None:
     slices = (
-        SliceSpec(
-            id="api",
-            title="Implement api",
-            paths=("src/api.py",),
-            depends_on=("tests",),
-            base_ref="main",
-            test_plan=("just tl-loop-test",),
-            steps=("Implement api",),
-            verify=("just tl-loop-lint",),
-            boundary=("Do not edit unrelated paths",),
-            done_criteria=("api is complete",),
-        ),
+        _spec("tests", "src/tests.py"),
+        _spec("api", "src/api.py", depends_on=("tests",)),
     )
 
-    with pytest.raises(PlanAuthoringUnsupported, match="dependency edges"):
+    document = slices_to_plan_document(slices, run_id="root")
+
+    leaves = cast(list[dict[str, object]], document["plan"]["leaves"])  # type: ignore[index]
+    assert [leaf.get("depends_on", []) for leaf in leaves] == [[], ["tests"]]
+    manifest = build_authoring_manifest(document, run_id="root", owned_branch="main")
+    assert {node.name: node.depends_on for node in manifest.nodes} == {
+        "tests": (),
+        "api": ("tests",),
+    }
+
+
+def test_dependency_on_an_undeclared_sibling_is_refused_by_the_adapter() -> None:
+    slices = (_spec("api", "src/api.py", depends_on=("tests",)),)
+
+    with pytest.raises(PlanAuthoringError, match="unknown sibling"):
         slices_to_plan_document(slices, run_id="root")
 
 

@@ -656,6 +656,32 @@ Sequential dependent stages:
 }
 ~~~
 
+A direct-leaf dependency chain, with no stage boundary:
+
+~~~json
+{
+  "run_id": "root",
+  "budgets": { "tokens": 200000, "wall_seconds": 7200 },
+  "plan": {
+    "leaves": [
+      {
+        "name": "rotation",
+        "task": "Implement access-token rotation.",
+        "boundary": ["src/auth/rotation.rs"],
+        "verify": ["cargo test -p auth rotation"]
+      },
+      {
+        "name": "rotation-docs",
+        "task": "Document the merged rotation behavior.",
+        "boundary": ["docs/auth/**"],
+        "depends_on": ["rotation"],
+        "verify": ["just docs-lint"]
+      }
+    ]
+  }
+}
+~~~
+
 ### Recursive integration and recovery
 
 Each completed child publishes one aggregate candidate owned by the direct
@@ -786,13 +812,41 @@ actually shipped.
 
 ### The mechanism
 
-Top-level leaves in one plan are dispatched **in parallel with no ordering**. A
-plan-level `depends_on` field does not exist — see the gap note below. Ordering
-comes from numeric `order` values on direct sibling `sub_tls` entries.
+Two ordering mechanisms exist, and they answer different questions.
 
-Use order 1 for implementation and order 2 for documentation. Same-order
-sub-TLs are concurrent; different orders wait for all child completion and
-serialized aggregate integration before advancing.
+Numeric `order` on direct sibling `sub_tls` entries is **staged**: use order 1
+for implementation and order 2 for documentation. Same-order sub-TLs are
+concurrent; different orders wait for all child completion and serialized
+aggregate integration before advancing. A stage boundary is a barrier across
+every slice it contains.
+
+`depends_on` between sibling leaves of the **same** scope is a **finer edge**: it
+names one prerequisite and releases only the dependent. Use it when two leaves
+must land in a known order without paying for a stage boundary.
+
+An edge is a dispatch precondition, not a preference. A dependent leaf is not
+spawned until its prerequisite reaches `merged` in the base branch the dependent
+is dispatched against, and the controller refuses the dispatch rather than
+reordering it.
+
+Rules an edge follows:
+
+- **Only leaves.** An edge may not name a worker or a sub-TL, because neither
+  merges into a dependent's base. `order` remains the sub-TL contract.
+- **Same scope only.** An edge names a direct sibling leaf of the same `plan`.
+  Each sub-TL resolves its own leaves' edges inside its own nested plan.
+- **No inference.** Edges come only from an explicit `depends_on`. Overlapping
+  `boundary` globs and list position are never read as ordering.
+- **Declared once, enforced always.** The edges are part of the immutable plan
+  manifest and each slice record, so they survive a restart. A revision may
+  rewire a leaf that has not dispatched yet and may not touch one that has.
+- **A cycle, a self edge, a repeated target, or an unknown name is rejected**
+  when the plan is validated, before anything dispatches.
+
+See "Ordered plan examples" for a complete plan that uses an edge.
+
+The example below uses `sub_tls` because the docs leaf must wait for *all*
+implementation work, which is what a stage expresses.
 
 ```json
 {
@@ -868,20 +922,17 @@ event vocabulary) and a handler in `.exo/lib/` returns an `EventAction`. See
 Prefer the sub-TL form when the documentation is part of the planned work.
 Reach for the handler only when the trigger is genuinely external to the plan.
 
-### Known gap: no plan-level `depends_on`
+### When a prerequisite cannot merge
 
-`RunState` slices carry `depends_on`, the schema validates it for cycles and
-unknown IDs, and `tl_loop/loop/schedule.py` schedules on it. But
-`WorkPlan.LeafTask` has no `depends_on` field and `_initial_slice_record` in
-`tl_loop/loop/driver.py` hard-codes `"depends_on": []`, so a hand-authored
-`plan.json` cannot express a DAG. Only `decompose`-produced `SliceSpec` records
-carry dependencies.
+A dependent whose prerequisite can no longer merge is blocked, not left waiting.
+`failed` and `blocked` are terminal, so the dependent's edge can never be
+satisfied; the controller records the slice as `blocked` with `blocked_by` naming
+the prerequisite that ended it, emits `tl.dependency_blocked`, and carries that
+forward through the dependent's own dependents.
 
-Until that is plumbed through, `sub_tls` is the supported way to express
-ordering, at the cost of a stage boundary where a finer dependency edge would
-do. Plan authoring refuses a proposal that declares leaf `depends_on` rather
-than dropping the edge and dispatching a dependent slice early
-(`PlanAuthoringUnsupported`).
+A `parked` or `dispatch_failed` prerequisite is different. Those are operator
+gates: the operator may still answer, so the dependent stays `pending` and waits
+rather than being blocked on a question that has not been asked yet.
 
 ---
 

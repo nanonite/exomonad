@@ -18,7 +18,7 @@ def test_ordered_plan_examples_validate_against_the_plan_schema() -> None:
     )[0]
     examples = re.findall(r"~~~json\n(.*?)\n~~~", examples_section, flags=re.DOTALL)
 
-    assert len(examples) == 4
+    assert len(examples) == 5
     for example in examples:
         validated = validate_plan_document(json.loads(example))
         assert validated["plan"]

@@ -19,6 +19,12 @@ from tl_loop.state.slice_transition import SliceStatusChanged, slice_transition
 SliceCollection: TypeAlias = Mapping[str, SliceState] | Iterable[SliceState]
 _LIVE_STATUSES = frozenset({SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING})
 
+#: Statuses a slice can never leave. A dependency in one of these can no longer
+#: merge, so no dependent it names can ever satisfy its precondition.
+#: ``dispatch_failed`` is deliberately absent: a refused spawn holds an
+#: operator gate the operator may still answer, exactly like ``parked``.
+_FAILED_STATUSES = frozenset({SliceStatus.FAILED, SliceStatus.BLOCKED})
+
 
 class ScheduleError(RuntimeError):
     """Base error for a schedule that cannot make safe progress."""
@@ -65,7 +71,18 @@ def ready(slices: SliceCollection, max_parallel_slices: int | None = None) -> li
         if capacity is not None and len(selected) >= capacity:
             break
     if not selected and not occupied and pending and not eligible:
-        raise ScheduleDeadlock({state.id: _unsatisfied(state, by_id) for state in pending})
+        # A pending graph with no live and no dependency-ready slice is only a
+        # deadlock when at least one pending slice can never progress. A pending
+        # slice waiting on a live or human-gated prerequisite is an ordinary
+        # wait, and parking it would report an operator problem that does not
+        # exist.
+        dead = {
+            state.id: _unsatisfied(state, by_id)
+            for state in pending
+            if unsatisfiable_dependencies(by_id, state.id)
+        }
+        if dead:
+            raise ScheduleDeadlock(dead)
     return selected
 
 
@@ -182,6 +199,38 @@ def propagate_abandonment(
     return updated
 
 
+def withhold_unsatisfiable_dependents(
+    slices: SliceCollection,
+) -> dict[str, SliceState]:
+    """Terminally block dependents of a prerequisite that can never merge.
+
+    A pending slice whose transitive dependency closure contains a slice in a
+    status it can never leave can never satisfy its own precondition, so it is
+    blocked with ``blocked_by`` naming the immediate prerequisite on the walk
+    to that status. The operator therefore reads the edge that actually blocked
+    the slice rather than a transitive summary.
+
+    A live or human-gated prerequisite is untouched: the operator may still
+    answer the gate, so the dependent stays pending and waits. Only slices this
+    call actually changes are returned, which keeps the caller's durable write
+    limited to a real transition.
+    """
+    by_id = _index(slices)
+    updated = dict(by_id)
+    for state in by_id.values():
+        if state.status is not SliceStatus.PENDING:
+            continue
+        blockers = unsatisfiable_dependencies(by_id, state.id)
+        if not blockers:
+            continue
+        updated[state.id] = replace(
+            slice_transition(state, SliceStatusChanged(SliceStatus.BLOCKED)),
+            blocked_by=blockers[0],
+            suspended_dependency=None,
+        )
+    return updated
+
+
 def _index(slices: SliceCollection) -> dict[str, SliceState]:
     if isinstance(slices, Mapping):
         return dict(slices)
@@ -191,6 +240,62 @@ def _index(slices: SliceCollection) -> dict[str, SliceState]:
             raise ValueError(f"duplicate slice id {state.id!r}")
         result[state.id] = state
     return result
+
+
+def dependencies_satisfied(slices: SliceCollection, slice_id: str) -> bool:
+    """Whether every declared dependency of ``slice_id`` has merged.
+
+    ``MERGED`` is the only status that satisfies an edge: it is the one
+    terminal state in which the prerequisite's work is actually integrated into
+    the base branch the dependent will be dispatched against. ``PARKED`` and a
+    live slice do not satisfy an edge either, but they are not failures — the
+    operator may still answer the gate — so the dependent simply waits rather
+    than being blocked.
+    """
+    by_id = _index(slices)
+    state = by_id.get(slice_id)
+    if state is None:
+        return False
+    return not _unsatisfied(state, by_id)
+
+
+def unsatisfiable_dependencies(
+    slices: SliceCollection, slice_id: str
+) -> tuple[str, ...]:
+    """Return the unmet dependencies of ``slice_id`` that can never resolve.
+
+    A dependency whose slice is absent, or sits in a status it can never leave,
+    can no longer merge, so the edge is permanently unsatisfiable. A dependency
+    that is merely live or human-gated is absent from this result: it is still
+    a wait, not a dead end.
+    """
+    by_id = _index(slices)
+    state = by_id.get(slice_id)
+    if state is None:
+        return ()
+    return tuple(
+        dependency
+        for dependency in _unsatisfied(state, by_id)
+        if _can_never_merge(dependency, by_id, frozenset())
+    )
+
+
+def _can_never_merge(
+    slice_id: str, by_id: Mapping[str, SliceState], visiting: frozenset[str]
+) -> bool:
+    if slice_id in visiting:
+        # A cycle can never be broken by any future merge, so it is a dead end
+        # rather than a wait.
+        return True
+    candidate = by_id.get(slice_id)
+    if candidate is None:
+        return True
+    if candidate.status in _FAILED_STATUSES:
+        return True
+    nested = visiting | {slice_id}
+    return any(
+        _can_never_merge(dependency, by_id, nested) for dependency in candidate.depends_on
+    )
 
 
 def _unsatisfied(state: SliceState, by_id: Mapping[str, SliceState]) -> tuple[str, ...]:
@@ -216,8 +321,11 @@ __all__ = [
     "SuspendedDependencyState",
     "WaitReason",
     "active_count",
+    "dependencies_satisfied",
     "propagate_abandonment",
     "ready",
     "restore_dependents",
     "suspend_dependents",
+    "unsatisfiable_dependencies",
+    "withhold_unsatisfiable_dependents",
 ]

@@ -7,6 +7,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
+from tl_loop.plan_dependencies import (
+    DEPENDABLE_CHILD_KIND,
+    DependencyValidationError,
+    validate_leaf_dependencies,
+)
+
 from .serialization import dumps
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -40,6 +46,7 @@ MANIFEST_NODE_KEYS = frozenset(
         "task",
         "agent_type",
         "boundary",
+        "depends_on",
         "owned_branch",
         "parent_integration_target",
         "worktree",
@@ -70,6 +77,11 @@ class ManifestNode:
     owned_branch: str
     parent_integration_target: str | None
     worktree: str | None
+    #: Same-scope leaves this node must wait for. Empty is a DAG root. The edge
+    #: set is part of ``identity()``, so a revision cannot rewrite an edge of an
+    #: already-dispatched node and a persisted manifest survives restart without
+    #: re-reading the plan that produced it.
+    depends_on: tuple[str, ...] = ()
     declaration: Mapping[str, object] = field(default_factory=dict)
     integration_contract: Mapping[str, object] = field(default_factory=dict)
     child_manifest_digest: str | None = None
@@ -98,6 +110,16 @@ class ManifestNode:
             raise ManifestError("manifest node boundary must contain non-empty strings")
         if len(set(self.boundary)) != len(self.boundary):
             raise ManifestError("manifest node boundary must be unique")
+        object.__setattr__(self, "depends_on", tuple(self.depends_on))
+        object.__setattr__(self, "boundary", tuple(self.boundary))
+        if any(not isinstance(name, str) or not name for name in self.depends_on):
+            raise ManifestError("manifest node depends_on must contain non-empty strings")
+        if len(set(self.depends_on)) != len(self.depends_on):
+            raise ManifestError("manifest node depends_on must be unique")
+        if self.depends_on and self.kind != DEPENDABLE_CHILD_KIND:
+            raise ManifestError("only a leaf manifest node may declare depends_on")
+        if self.name in self.depends_on:
+            raise ManifestError(f"manifest node {self.node_id!r} depends_on itself")
         contract = _json_mapping(self.integration_contract, "manifest integration contract")
         object.__setattr__(self, "declaration", _freeze_mapping(declaration))
         object.__setattr__(self, "integration_contract", _freeze_mapping(contract))
@@ -119,14 +141,22 @@ class ManifestNode:
             self.owned_branch,
             self.parent_integration_target,
             self.worktree,
+            self.depends_on,
             tuple(sorted(self.declaration.items())),
             tuple(sorted(self.integration_contract.items())),
             self.child_manifest_digest,
         )
 
     def to_document(self) -> dict[str, object]:
-        """Serialize the node with deterministic list representations."""
-        return {
+        """Serialize the node with deterministic list representations.
+
+        ``depends_on`` is written only when the node declares an edge. A scope
+        with no edges therefore serializes byte-for-byte as it did before the
+        field existed, so a manifest persisted by an earlier controller still
+        matches its recorded digest and an in-flight run resumes instead of
+        failing to decode its own declaration.
+        """
+        document: dict[str, object] = {
             "node_id": self.node_id,
             "parent_id": self.parent_id,
             "kind": self.kind,
@@ -139,6 +169,11 @@ class ManifestNode:
             "owned_branch": self.owned_branch,
             "parent_integration_target": self.parent_integration_target,
             "worktree": self.worktree,
+        }
+        if self.depends_on:
+            document["depends_on"] = list(self.depends_on)
+        return {
+            **document,
             "declaration": _thaw_json(self.declaration),
             "integration_contract": _thaw_json(self.integration_contract),
             "child_manifest_digest": self.child_manifest_digest,
@@ -155,6 +190,9 @@ class ManifestNode:
         boundary = value.get("boundary", ())
         if not isinstance(boundary, Sequence) or isinstance(boundary, (str, bytes)):
             raise ManifestError("manifest node boundary must be an array")
+        depends_on = value.get("depends_on", ())
+        if not isinstance(depends_on, Sequence) or isinstance(depends_on, (str, bytes)):
+            raise ManifestError("manifest node depends_on must be an array")
         contract = value.get("integration_contract", {})
         if not isinstance(contract, Mapping):
             raise ManifestError("manifest node integration_contract must be an object")
@@ -171,6 +209,7 @@ class ManifestNode:
             task=_required_value(value, "task"),
             agent_type=_optional_text(value.get("agent_type"), "agent_type"),
             boundary=tuple(_require_text(item, "boundary item") for item in boundary),
+            depends_on=tuple(_require_text(item, "depends_on item") for item in depends_on),
             owned_branch=_required_value(value, "owned_branch"),
             parent_integration_target=_optional_text(
                 value.get("parent_integration_target"), "parent_integration_target"
@@ -230,6 +269,7 @@ class PlanManifest:
             raise ManifestError("manifest node parent does not match scope")
         if tuple(self.source_order) != ids:
             raise ManifestError("manifest source_order must match node source order")
+        _validate_dependency_edges(nodes)
         stages = _normalize_stages(self.ordered_stages, ids, nodes)
         child_digests = _json_mapping(self.child_manifest_digests, "child manifest digests")
         raw_children = self.child_manifests
@@ -399,6 +439,7 @@ def build_plan_manifest(
             boundary = raw.get("boundary", ()) if kind == "leaf" else ()
             if not isinstance(boundary, Sequence) or isinstance(boundary, (str, bytes)):
                 raise ManifestError(f"manifest boundary for {name!r} must be an array")
+            depends_on = _declared_depends_on(raw, kind=kind, name=name)
             branch = str(raw.get("branch") or f"{owned_branch}.{name}")
             worktree = raw.get("worktree")
             child_digest: str | None = None
@@ -432,6 +473,7 @@ def build_plan_manifest(
                 owned_branch=branch,
                 parent_integration_target=owned_branch,
                 worktree=_optional_text(worktree, "worktree"),
+                depends_on=tuple(depends_on),
                 declaration=_node_declaration(raw, kind),
                 integration_contract=_integration_contract(raw.get("integration")),
                 child_manifest_digest=child_digest,
@@ -564,6 +606,25 @@ def validate_manifest_revision(
             raise ManifestError(f"manifest revision mutates protected node {node_id!r}")
 
 
+def _validate_dependency_edges(nodes: Sequence[ManifestNode]) -> None:
+    """Prove one scope's persisted edges are a same-scope leaf DAG.
+
+    The manifest is the durable authority, so it re-proves what the plan
+    validator proved rather than trusting the caller: an edge must name a leaf
+    node of *this* scope, and the edges must be acyclic. A legacy scope has no
+    edges at all and passes through unchanged.
+    """
+    edges = {node.name: node.depends_on for node in nodes if node.depends_on}
+    if not edges:
+        return
+    leaves = {node.name for node in nodes if node.kind == DEPENDABLE_CHILD_KIND}
+    others = {node.name for node in nodes if node.kind != DEPENDABLE_CHILD_KIND}
+    try:
+        validate_leaf_dependencies(edges, leaf_names=leaves, other_names=others)
+    except DependencyValidationError as error:
+        raise ManifestError(str(error)) from error
+
+
 def _normalize_stages(
     stages: tuple[tuple[int, tuple[str, ...]], ...],
     node_ids: tuple[str, ...],
@@ -588,6 +649,27 @@ def _normalize_stages(
     }:
         raise ManifestError("every sub-TL must belong to exactly one manifest stage")
     return tuple(normalized)
+
+
+def _declared_depends_on(raw: Mapping[str, object], *, kind: str, name: str) -> Sequence[str]:
+    """Read one node's declared edges, refusing an edge on an unmergeable kind.
+
+    Only a leaf merges, so only a leaf edge can be satisfied. A worker or
+    sub-TL that declares one is rejected here rather than having the key
+    dropped: silently discarding it would produce a manifest that reads as if
+    no ordering had ever been asked for, and dispatch the dependent early.
+    """
+    if kind != DEPENDABLE_CHILD_KIND:
+        if "depends_on" in raw:
+            raise ManifestError(
+                f"manifest {kind} {name!r} cannot declare depends_on; only a "
+                f"{DEPENDABLE_CHILD_KIND} merges and can satisfy a dependency"
+            )
+        return ()
+    depends_on = raw.get("depends_on", ())
+    if not isinstance(depends_on, Sequence) or isinstance(depends_on, (str, bytes)):
+        raise ManifestError(f"manifest depends_on for {name!r} must be an array")
+    return tuple(_require_text(item, "depends_on item") for item in depends_on)
 
 
 def _ordered_from_nodes(nodes: Sequence[ManifestNode]) -> tuple[tuple[int, tuple[str, ...]], ...]:

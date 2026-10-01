@@ -60,10 +60,6 @@ class PlanAuthoringInputError(PlanAuthoringError):
     """The plan-authoring input document is not a closed authoring request."""
 
 
-class PlanAuthoringUnsupported(PlanAuthoringError):
-    """The proposal declares something the executable plan cannot express."""
-
-
 @dataclass(frozen=True)
 class PlanAuthoringInput:
     """A human-authored request for a plan, distinct from ``plan.json``."""
@@ -263,10 +259,7 @@ def slices_to_plan_document(
     ``test_plan`` from the leaf's ``verify`` list, and an authored test plan is
     authority-bearing: dropping it would let a slice declare itself verified.
     """
-    _reject_unexpressible_dependencies(slices)
-    leaves: list[JsonObject] = [
-        _leaf(spec, agent_type=agent_type) for spec in slices
-    ]
+    leaves: list[JsonObject] = [_leaf(spec, agent_type=agent_type) for spec in slices]
     document: JsonObject = {"run_id": run_id, "plan": {"leaves": cast(JsonValue, leaves)}}
     if budgets:
         document["budgets"] = cast(JsonValue, dict(budgets))
@@ -311,6 +304,8 @@ def _leaf(spec: SliceSpec, *, agent_type: str | None) -> JsonObject:
         "verify": [item for item in verification],
         "done_criteria": [item for item in spec.done_criteria],
     }
+    if spec.depends_on:
+        leaf["depends_on"] = [item for item in spec.depends_on]
     if agent_type is not None:
         leaf["agent_type"] = agent_type
     return leaf
@@ -318,23 +313,6 @@ def _leaf(spec: SliceSpec, *, agent_type: str | None) -> JsonObject:
 
 def _merged_verification(spec: SliceSpec) -> tuple[str, ...]:
     return tuple(dict.fromkeys((*spec.test_plan, *spec.verify)))
-
-
-def _reject_unexpressible_dependencies(slices: Sequence[SliceSpec]) -> None:
-    """Refuse dependency edges the executable plan cannot carry today.
-
-    ``WorkPlan.LeafTask`` has no ``depends_on`` field, so authoring a
-    dependency edge would silently drop an ordering the judgment believed it
-    had declared. Refusing keeps the proposal from becoming a plan that
-    dispatches a dependent slice before its dependency.
-    """
-    blocked = [spec.id for spec in slices if spec.depends_on]
-    if blocked:
-        raise PlanAuthoringUnsupported(
-            "direct leaf dependency edges are not part of the executable plan "
-            "contract; express the ordering with ordered sub_tls stages or "
-            "remove depends_on from: " + ", ".join(sorted(blocked))
-        )
 
 
 def _validate_harness_request(
@@ -454,7 +432,6 @@ __all__ = [
     "PlanAuthoringError",
     "PlanAuthoringInput",
     "PlanAuthoringInputError",
-    "PlanAuthoringUnsupported",
     "author_plan",
     "authoring_root_spec",
     "build_authoring_manifest",

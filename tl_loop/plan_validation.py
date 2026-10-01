@@ -25,6 +25,7 @@ _TASK_KEYS = {
             "steps",
             "verify",
             "done_criteria",
+            "depends_on",
             "task_timeout_seconds",
         }
     ),

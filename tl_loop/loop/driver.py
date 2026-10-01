@@ -159,7 +159,13 @@ from tl_loop.loop.review import (
     verify_integration,
     verify_review,
 )
-from tl_loop.loop.schedule import ScheduleDeadlock, ready, suspend_dependents
+from tl_loop.loop.schedule import (
+    ScheduleDeadlock,
+    dependencies_satisfied,
+    ready,
+    suspend_dependents,
+    withhold_unsatisfiable_dependents,
+)
 from tl_loop.ordered import (
     AggregateCandidate,
     ChildRecoverySummary,
@@ -173,6 +179,7 @@ from tl_loop.ordered import (
     SubTLLifecycle,
     transition_integration,
 )
+from tl_loop.plan_dependencies import validate_leaf_dependencies
 from tl_loop.rlm.adjudicate import adjudicate_review
 from tl_loop.rlm.repair import RepairError, RepairHandoff, compose_repair
 from tl_loop.select.agent_type import (
@@ -760,6 +767,9 @@ class LeafTask:
     steps: tuple[str, ...] = ()
     verify: tuple[str, ...] = ()
     done_criteria: tuple[str, ...] = ()
+    #: Sibling leaves in this scope that must be merged before this one is
+    #: dispatched. Empty means this leaf is a root of the scope's DAG.
+    depends_on: tuple[str, ...] = ()
     task_timeout_seconds: float | None = None
     task_timeout_declared: bool = False
 
@@ -775,6 +785,7 @@ class LeafTask:
             ("steps", self.steps),
             ("verify", self.verify),
             ("done_criteria", self.done_criteria),
+            ("depends_on", self.depends_on),
         ):
             _text_tuple(values, f"leaf {field_name}")
 
@@ -795,6 +806,14 @@ class WorkPlan:
         )
         if len(names) != len(set(names)):
             raise ValueError("worker and leaf names must be unique")
+        leaf_names = {task.name for task in self.leaves}
+        validate_leaf_dependencies(
+            {task.name: task.depends_on for task in self.leaves if task.depends_on},
+            leaf_names=leaf_names,
+            # A worker never merges and a sub-TL carries its own staged order, so
+            # an edge naming either is a rejected plan rather than a lost edge.
+            other_names=set(names) - leaf_names,
+        )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object], *, path: str = "plan") -> WorkPlan:
@@ -1294,18 +1313,22 @@ def run_tl_loop(
                 protected = {
                     slice_state.manifest_node_id
                     for slice_state in existing_state.slices.values()
-                    if slice_state.status not in {SliceStatus.PENDING, SliceStatus.READY}
+                    if slice_state.status not in _UNDISPATCHED_STATUSES
                     and slice_state.manifest_node_id is not None
                 }
                 generated = _initial_slices(supplied_plan, selected, root_dir, run_id)
-                initial_slices = {
-                    **dict(existing_state.slices),
-                    **{
-                        name: value
-                        for name, value in generated.items()
-                        if name not in existing_state.slices
+                initial_slices = _rebind_dependency_edges(
+                    {
+                        **dict(existing_state.slices),
+                        **{
+                            name: value
+                            for name, value in generated.items()
+                            if name not in existing_state.slices
+                        },
                     },
-                }
+                    existing_state.slices,
+                    candidate,
+                )
                 try:
                     existing_state = store.set_plan_manifest(
                         candidate,
@@ -3000,7 +3023,7 @@ def _run_loop(
             after_tag.value,
         )
         phase = next_phase
-        if config.policy is not None and config.max_parallel_slices is not None:
+        if _reopens_dispatch_pass(plan, config):
             state = _dispatch_children(plan, state, config, effects, effects_log, store)
         state = _apply_convergence(state, convergence, store, config, effects, effects_log)
         if _is_terminal_phase(phase):
@@ -8542,6 +8565,7 @@ def _dispatch_children(
     store: RunStore,
 ) -> RunState:
     live = cast(EffectClient, effects) if config.active else None
+    state = _block_unsatisfiable_dependents(state, config, effects, effects_log, store)
     before_slices = state.slices
     for worker in plan.workers:
         if not _dispatch_candidate(worker.name, state, config):
@@ -8643,6 +8667,56 @@ def _dispatch_children(
         effects,
         effects_log,
     )
+    return updated
+
+
+def _block_unsatisfiable_dependents(
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    """Record a durable block for every leaf whose prerequisite can never merge.
+
+    Without this the dependent would sit pending behind a prerequisite that no
+    longer exists as an outcome, and the run would wait on an operator question
+    that has no answer. Blocking before the dispatch pass means the pass never
+    considers the slice, and the status change is durable across a restart
+    because it lands in the same checkpoint as every other slice transition.
+    """
+    blocked = withhold_unsatisfiable_dependents(state.slices)
+    changed = {
+        slice_id: current
+        for slice_id, current in blocked.items()
+        if current != state.slices.get(slice_id)
+    }
+    if not changed:
+        return state
+    updated = store.checkpoint(
+        _phase_from_state(state),
+        blocked,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    for slice_id in sorted(changed):
+        _record_controller_event(
+            slice_id,
+            "tl.dependency_blocked",
+            {
+                "slice_id": slice_id,
+                "depends_on": list(changed[slice_id].depends_on),
+                "blocked_by": changed[slice_id].blocked_by,
+                "reason": "a declared dependency can no longer merge",
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    _emit_slice_status_changes(state.slices, changed, config, effects, effects_log)
     return updated
 
 
@@ -11436,12 +11510,48 @@ def _park_schedule_deadlock(
     )
 
 
+def _reopens_dispatch_pass(plan: WorkPlan, config: TLLoopConfig) -> bool:
+    """Whether one consumed event may open a fresh dispatch pass.
+
+    A policy-owned width ceiling already makes dispatch a per-event decision,
+    because a completion frees a slot another pending slice may take. A plan
+    with declared dependency edges needs the same per-event re-evaluation for a
+    different reason: a dependent becomes dispatchable only once its
+    prerequisite merges, which is exactly the event that was just consumed. A
+    plan with neither shape keeps its single up-front dispatch pass.
+    """
+    if config.policy is not None and config.max_parallel_slices is not None:
+        return True
+    return any(leaf.depends_on for leaf in plan.leaves)
+
+
 def _can_dispatch(name: str, state: RunState, config: TLLoopConfig) -> bool:
+    if not dependencies_satisfied(state.slices, name):
+        return False
     if config.policy is None or config.max_parallel_slices is None:
         return True
     return name in {
         slice_state.id for slice_state in ready(state.slices, config.max_parallel_slices)
     }
+
+
+#: Statuses that prove no dispatch has acted on a slice's declared dependency
+#: edges yet. A slice outside this set has left the queue, so a manifest
+#: revision may not rewire it.
+_UNDISPATCHED_STATUSES = frozenset({SliceStatus.PENDING, SliceStatus.READY})
+
+
+def _recorded_dependencies(value: Mapping[str, object]) -> list[str]:
+    """Read the edges one durable slice record currently carries.
+
+    This only compares a record against the manifest; the record's own shape is
+    proven by the state schema, so an absent or unusable value simply reads as
+    "no recorded edge" rather than raising here.
+    """
+    raw = value.get("depends_on", ())
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return []
+    return [item for item in raw if isinstance(item, str)]
 
 
 def _already_dispatched(name: str, state: RunState) -> bool:
@@ -13673,6 +13783,7 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                     steps=_manifest_texts(declaration, "steps"),
                     verify=_manifest_texts(declaration, "verify"),
                     done_criteria=_manifest_texts(declaration, "done_criteria"),
+                    depends_on=node.depends_on,
                     task_timeout_seconds=_manifest_timeout(declaration),
                     task_timeout_declared="task_timeout_seconds" in declaration,
                 )
@@ -13738,6 +13849,42 @@ def _manifest_integration(contract: IntegrationContract) -> Mapping[str, object]
         "aggregate_repair_owner": contract.aggregate_repair_owner.value,
         "merge_strategy": contract.merge_strategy,
     }
+
+
+def _rebind_dependency_edges(
+    slices: Mapping[str, Mapping[str, object]],
+    previous: Mapping[str, SliceState],
+    manifest: PlanManifest,
+) -> dict[str, Mapping[str, object]]:
+    """Align never-dispatched slice edges with a revised manifest.
+
+    A revision may add nodes and may rewire a leaf that has not dispatched,
+    because nothing has acted on its old edge yet. A slice that *has* left
+    ``PENDING``/``READY`` is left exactly as it was: the manifest revision check
+    already refuses to change a protected node's identity, and overwriting the
+    record here would silently rewrite an edge the controller has acted on.
+
+    A record with no node in this scope is left alone as well. A legacy
+    checkpoint carries slices the manifest does not declare, and those records
+    already hold whatever ordering their own writer gave them.
+
+    The two records must agree after the write, because a restart reads the
+    manifest while dispatch reads the slice record.
+    """
+    by_name = {node.name: node.depends_on for node in manifest.nodes}
+    rebound: dict[str, Mapping[str, object]] = {}
+    for slice_id, value in slices.items():
+        if slice_id not in by_name:
+            rebound[slice_id] = value
+            continue
+        current = previous.get(slice_id)
+        dispatched = current is not None and current.status not in _UNDISPATCHED_STATUSES
+        declared = list(by_name[slice_id])
+        if dispatched or _recorded_dependencies(value) == declared:
+            rebound[slice_id] = value
+            continue
+        rebound[slice_id] = {**value, "depends_on": declared}
+    return rebound
 
 
 def _bind_initial_slices(
@@ -13809,6 +13956,7 @@ def _initial_slices(
             task_timeout_seconds=leaf.task_timeout_seconds,
             task_timeout_declared=leaf.task_timeout_declared,
             review_contract=review_contract.as_mapping(),
+            depends_on=leaf.depends_on,
         )
     for task in plan.sub_tls:
         # A sub-TL slice records no harness request: the child is a controller
@@ -13901,6 +14049,7 @@ def _initial_slice_record(
     task_timeout_seconds: float | None = None,
     task_timeout_declared: bool = False,
     review_contract: Mapping[str, object] | None = None,
+    depends_on: Sequence[str] = (),
 ) -> dict[str, object]:
     """Build one pending slice record, keeping the plan request separate.
 
@@ -13916,7 +14065,7 @@ def _initial_slice_record(
         "id": name,
         "status": SliceStatus.PENDING.value,
         "paths": list(paths),
-        "depends_on": [],
+        "depends_on": list(depends_on),
         "base_ref": base_ref,
         "test_plan": list(test_plan),
         "agent_type": None,
@@ -14198,6 +14347,7 @@ def _leaf(value: object) -> LeafTask:
         steps=_string_tuple(value.get("steps", ()), "leaf steps"),
         verify=_string_tuple(value.get("verify", ()), "leaf verify"),
         done_criteria=_string_tuple(value.get("done_criteria", ()), "leaf done_criteria"),
+        depends_on=_string_tuple(value.get("depends_on", ()), "leaf depends_on"),
         task_timeout_seconds=_optional_timeout(
             value.get("task_timeout_seconds"), "leaf.task_timeout_seconds"
         ),
