@@ -269,6 +269,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Add direct leaf dependency scheduling to plan manifests (#1130)
 - Add bounded plan authoring through typed TL decomposition (#1129)
 - Add safe maintenance pruning for historical Codex trust residue (#1125)
 - Add replay and real-server acceptance for recreated publication correlation (#1117)
