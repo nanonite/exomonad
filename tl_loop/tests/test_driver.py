@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -30,6 +30,7 @@ from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
 from tl_loop.loop.driver import (
+    DISPATCH_ALREADY_CONFIRMED,
     DISPATCH_CORRELATED,
     DISPATCH_HISTORICAL_AUDIT,
     DISPATCH_INTEGRITY_CONFLICT,
@@ -106,6 +107,7 @@ from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
+from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -224,6 +226,309 @@ def test_dispatch_correlation_rejects_historical_epoch_and_stale_generation(
         data={**base.data, "controller_epoch": "epoch-new", "dispatch_generation": 2},
     )
     assert correlate_dispatch_event(state, current_event).classification == DISPATCH_CORRELATED
+
+
+@dataclass(frozen=True)
+class DuplicateConfirmationCase:
+    """A confirmed slice plus the second spawn row for the same intent."""
+
+    state: RunState
+    intent_id: str
+    controller_epoch: str
+
+
+def _confirmed_worker(root: Path, *, run_id: str = "dispatch-duplicate-run") -> DuplicateConfirmationCase:
+    """A slice the controller has already confirmed at generation 1.
+
+    This is the durable shape the codex-messaging run parked in: the slice is
+    ``spawned``, it records the confirmation's authoritative sequence, and its
+    dispatch generation is the one the second row must name.
+    """
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    create(
+        run_id,
+        {
+            "slices": _initial_slices(plan, TLLoopConfig(), root, run_id),
+        },
+        root_dir=root,
+    )
+    intent_id = _dispatch_intent(run_id, "worker-a")
+    state = RunStore(run_id, root).load()
+    confirmed = replace(
+        state.slices["worker-a"],
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_intent_id=intent_id,
+        dispatch_generation=1,
+        dispatch_agent_id="worker-a-codex",
+        dispatch_authoritative_event_seq=8,
+    )
+    state = replace(
+        state,
+        controller_epoch="epoch-current",
+        slices={"worker-a": confirmed},
+    )
+    return DuplicateConfirmationCase(state, intent_id, "epoch-current")
+
+
+def _spawn_row(
+    run_id: str,
+    *,
+    run_seq: int,
+    data: dict[str, object],
+    agent_id: str = "root",
+) -> EventEnvelope:
+    """One ``agent.spawned`` ledger row projected the way the server writes it."""
+    return project(
+        cast(
+            dict[str, object],
+            {
+                "schema_version": 1,
+                "event_id": f"spawned-{run_seq}",
+                "id": f"spawned-{run_seq}",
+                "event_time": "2026-09-30T16:22:12Z",
+                "observed_at": "2026-09-30T16:22:12Z",
+                "run_seq": run_seq,
+                "type": "agent.spawned",
+                # The server attributes the spawn to the dispatching agent, so
+                # agent_id is the controller's own identity, not the slice.
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "session_id": "session-1",
+                "invocation_id": None,
+                "generation": None,
+                "lifecycle_state": "emitted",
+                "data": data,
+            },
+        )
+    )
+
+
+def test_the_second_spawn_row_for_a_live_intent_is_a_duplicate_not_a_conflict(
+    tmp_path: Path,
+) -> None:
+    """The server writes two spawn rows for one dispatch; the second is ours.
+
+    #1148 parked the worker at ``spawned`` because the controller quarantined
+    its own dispatch record -- the row carrying ``slug`` and ``task_summary``
+    rather than ``child_agent`` -- as ``integrity_conflict``/``intent_mismatch``.
+    The slice had already left the dispatching statuses because the controller
+    confirmed the dispatch itself, so the intent no longer looked pending.
+    """
+    case = _confirmed_worker(tmp_path)
+    duplicate = _spawn_row(
+        "dispatch-duplicate-run",
+        run_seq=10,
+        data={
+            "agent_type": "worker",
+            "intent_id": case.intent_id,
+            "slug": "worker-a",
+            "task_summary": "do the thing",
+        },
+    )
+
+    correlation = correlate_dispatch_event(case.state, duplicate)
+
+    assert correlation.classification == DISPATCH_ALREADY_CONFIRMED
+    assert correlation.slice_id == "worker-a"
+
+    # The other row of the same dispatch names the runtime agent id instead of
+    # the slice id, and is a duplicate for the same reason.
+    registration = correlate_dispatch_event(
+        case.state,
+        _spawn_row(
+            "dispatch-duplicate-run",
+            run_seq=8,
+            data={
+                "agent_type": "codex",
+                "child_agent": "worker-a-codex",
+                "intent_id": case.intent_id,
+                "spawn_type": "worker",
+            },
+        ),
+    )
+    assert registration.classification == DISPATCH_ALREADY_CONFIRMED
+    # The guard still refuses a generation that is not the persisted one.
+    stale = replace(
+        duplicate,
+        data={**duplicate.data, "dispatch_generation": 2},
+    )
+    assert correlate_dispatch_event(case.state, stale).classification == (
+        DISPATCH_INTEGRITY_CONFLICT
+    )
+
+
+def test_a_duplicate_confirmation_is_refused_across_epoch_generation_and_intent(
+    tmp_path: Path,
+) -> None:
+    """Recognising a duplicate never widens what the correlation accepts."""
+    case = _confirmed_worker(tmp_path)
+    duplicate = _spawn_row(
+        "dispatch-duplicate-run",
+        run_seq=10,
+        data={
+            "agent_type": "worker",
+            "intent_id": case.intent_id,
+            "slug": "worker-a",
+        },
+    )
+
+    historical = correlate_dispatch_event(
+        case.state,
+        replace(duplicate, data={**duplicate.data, "controller_epoch": "epoch-old"}),
+    )
+    assert historical.classification == DISPATCH_HISTORICAL_AUDIT
+    assert historical.slice_id == "worker-a"
+
+    # No generation, no epoch, and the intent still names its one owner.
+    accepted = correlate_dispatch_event(case.state, duplicate)
+    assert accepted.classification == DISPATCH_ALREADY_CONFIRMED
+
+    # A foreign intent proves no ownership at all and stays a conflict.
+    unowned = correlate_dispatch_event(
+        case.state,
+        replace(duplicate, data={**duplicate.data, "intent_id": "someone-elses-intent"}),
+    )
+    assert unowned.classification == DISPATCH_INTEGRITY_CONFLICT
+    assert unowned.reason == "intent_mismatch"
+
+    # A row naming somebody else's child is not a duplicate, whatever its
+    # intent says: the intent alone must never authorise a foreign
+    # confirmation.
+    for key, foreign_agent in (("child_agent", "other-slice-codex"), ("slug", "other-slice")):
+        crossed = correlate_dispatch_event(
+            case.state,
+            replace(duplicate, data={**duplicate.data, key: foreign_agent}),
+        )
+        assert crossed.classification == DISPATCH_INTEGRITY_CONFLICT
+        assert crossed.reason == "dispatch_agent_mismatch"
+
+    # An intent no slice records is not a duplicate of anything.
+    unrecorded = correlate_dispatch_event(
+        case.state,
+        replace(duplicate, data={"agent_type": "worker"}),
+    )
+    assert unrecorded.classification == DISPATCH_INTEGRITY_CONFLICT
+
+    # A slice still awaiting its confirmation is confirmed, not deduplicated.
+    pending = replace(case.state, slices={"worker-a": replace(
+        case.state.slices["worker-a"],
+        status=SliceStatus.DISPATCH_UNCONFIRMED,
+        dispatch_authoritative_event_seq=None,
+    )})
+    assert correlate_dispatch_event(pending, duplicate).classification == (
+        DISPATCH_CORRELATED
+    )
+
+
+def test_a_nested_child_scope_classifies_its_own_duplicate_the_same_way(
+    tmp_path: Path,
+) -> None:
+    """A sub-TL slice's confirmation is duplicated the same way a leaf's is.
+
+    A nested child records ``sub_tl_started`` rather than ``agent.spawned`` as
+    its boundary, and its owner is the child controller's own agent id. The
+    duplicate rule reads the owner's recorded intent, agent and authoritative
+    sequence rather than the boundary name, so it does not depend on which kind
+    of slice confirmed -- while still refusing another child's agent.
+    """
+    run_id = "nested-duplicate-run"
+    child_plan = WorkPlan(workers=(WorkerTask("grandchild", "do the thing"),))
+    plan = WorkPlan(sub_tls=(SubTLTask("child-a", child_plan, order=1),))
+    create(run_id, {"slices": _initial_slices(plan, TLLoopConfig(), tmp_path, run_id)}, root_dir=tmp_path)
+    state = RunStore(run_id, tmp_path).load()
+    intent_id = hashlib.sha256(
+        f"{run_id}:child-a:{state.slices['child-a'].attempts + 1}".encode()
+    ).hexdigest()[:32]
+    nested = replace(
+        state,
+        slices={
+            "child-a": replace(
+                state.slices["child-a"],
+                status=SliceStatus.SPAWNED,
+                dispatch_intent_id=intent_id,
+                dispatch_started_at=1.0,
+                dispatch_last_boundary="sub_tl_started",
+                dispatch_agent_id="child-a-tl",
+                dispatch_authoritative_event_seq=4,
+                dispatch_generation=0,
+            )
+        },
+    )
+
+    for data in (
+        {"intent_id": intent_id, "slug": "child-a"},
+        {"intent_id": intent_id, "child_agent": "child-a-tl"},
+    ):
+        assert correlate_dispatch_event(
+            nested, _spawn_row(run_id, run_seq=20, data=data)
+        ).classification == DISPATCH_ALREADY_CONFIRMED
+
+    crossed = correlate_dispatch_event(
+        nested,
+        _spawn_row(
+            run_id,
+            run_seq=21,
+            data={"intent_id": intent_id, "child_agent": "a-different-tl"},
+        ),
+    )
+    assert crossed.classification == DISPATCH_INTEGRITY_CONFLICT
+    assert crossed.reason == "dispatch_agent_mismatch"
+
+
+def test_a_duplicate_confirmation_advances_the_cursor_without_quarantine(
+    tmp_path: Path,
+) -> None:
+    """The loop absorbs the duplicate row instead of parking it forever."""
+    run_id = "dispatch-duplicate-run"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    case = _confirmed_worker(tmp_path, run_id=run_id)
+    store = RunStore(run_id, tmp_path)
+    # Persist the confirmed slice so the loop resumes from the parked shape:
+    # one spawned worker, one waiting barrier, cursor at the first confirmation.
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("worker-a",)),
+        case.state.slices,
+        case.state.budgets,
+        8,
+        plan_manifest=build_plan_manifest(
+            {"workers": [{"name": "worker-a", "task": "task"}]},
+            scope_id=run_id,
+        ),
+    )
+    duplicate = _spawn_row(
+        run_id,
+        run_seq=10,
+        data={
+            "agent_type": "worker",
+            "intent_id": case.intent_id,
+            "slug": "worker-a",
+        },
+    )
+    source = SyntheticQueue([duplicate])
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        cast(Any, source),
+        EffectClient(RecordingTransport()),
+        config=replace(
+            _config(),
+            run_id=run_id,
+            ledger_run_id=run_id,
+            keep_alive_on_waiting=False,
+            max_parallel_slices=None,
+            policy=None,
+        ),
+        root_dir=tmp_path,
+    )
+
+    assert result.cursor >= 10
+    assert store.quarantined_events() == ()
+    assert result.diagnostics["duplicate_confirmations"] == 1
+    assert result.diagnostics["rejected"] == 0
+    # The slice is untouched: a duplicate is not a second status change.
+    assert result.final_state.slices["worker-a"].status is SliceStatus.SPAWNED
 
 
 def test_the_dispatch_intent_follows_the_run_generation_not_the_live_epoch(

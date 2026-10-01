@@ -575,6 +575,17 @@ class DispatchCorrelation:
 DISPATCH_CORRELATED = "correlated"
 DISPATCH_HISTORICAL_AUDIT = "historical_audit"
 DISPATCH_INTEGRITY_CONFLICT = "integrity_conflict"
+#: The spawn row names an intent this run already recorded a confirmation for.
+#: One dispatch writes two such rows -- the child registration carries
+#: ``child_agent`` and the dispatch record carries ``slug``/``task_summary`` --
+#: and the controller may observe either, or both, for the same intent. The
+#: second one carries no new fact, so it is acknowledged without an FSM
+#: transition instead of being quarantined as an integrity conflict.
+DISPATCH_ALREADY_CONFIRMED = "already_confirmed"
+#: The boundary a slice records once it has taken a spawn confirmation. Paired
+#: with a recorded authoritative sequence this is the durable proof that a
+#: duplicate confirmation is a duplicate and not a first confirmation.
+DISPATCH_CONFIRMED_BOUNDARY = "agent.spawned"
 
 
 @dataclass
@@ -588,6 +599,7 @@ class EventDiagnostics:
     filtered: int = 0
     correlated: int = 0
     rejected: int = 0
+    duplicate_confirmations: int = 0
     last_event_seq: int | None = None
     last_authoritative_event_seq: int | None = None
     last_observed_progress_at: float | None = None
@@ -634,6 +646,7 @@ class EventDiagnostics:
             "filtered": self.filtered,
             "correlated": self.correlated,
             "rejected": self.rejected,
+            "duplicate_confirmations": self.duplicate_confirmations,
             "last_event_seq": self.last_event_seq,
             "last_authoritative_event_seq": self.last_authoritative_event_seq,
             "last_observed_progress_at": self.last_observed_progress_at,
@@ -2613,6 +2626,18 @@ def _run_loop(
         # child identity; shadowed replay records use the normal decoder path.
         if event.kind is EventKind.AGENT_SPAWNED:
             correlation = correlate_dispatch_event(state, event)
+            if correlation.classification == DISPATCH_ALREADY_CONFIRMED:
+                state = _absorb_duplicate_spawn_confirmation(
+                    store,
+                    state,
+                    event,
+                    correlation,
+                    phase,
+                    source,
+                    replaying,
+                    diagnostics,
+                )
+                continue
             if correlation.classification != DISPATCH_CORRELATED:
                 diagnostics.filtered += 1
                 diagnostics.rejected += 1
@@ -8017,13 +8042,46 @@ def _confirm_dispatch_event(
         slice_id: replace(
             slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED)),
             park_cause=None,
-            dispatch_last_boundary="agent.spawned",
+            dispatch_last_boundary=DISPATCH_CONFIRMED_BOUNDARY,
             dispatch_error=None,
             dispatch_agent_id=agent_id,
             dispatch_invocation_id=event.invocation_id,
             dispatch_authoritative_event_seq=event_seq,
         ),
     }
+
+
+def _absorb_duplicate_spawn_confirmation(
+    store: RunStore,
+    state: RunState,
+    event: EventEnvelope,
+    correlation: DispatchCorrelation,
+    phase: PhaseValue,
+    source: EventQueue,
+    replaying: bool,
+    diagnostics: EventDiagnostics,
+) -> RunState:
+    """Acknowledge a second spawn row for an already-recorded dispatch.
+
+    A refused duplicate stays in the quarantine file and re-enters replay on
+    every poll, which is how a live confirmation turned into a permanent
+    conflict in #1148. Recognising it here advances the cursor and drops the
+    pending row, so no slice status is written and no FSM transition runs.
+    """
+    diagnostics.filtered += 1
+    diagnostics.duplicate_confirmations += 1
+    LOGGER.info(
+        "Acknowledging duplicate agent.spawned for an already-confirmed dispatch "
+        "slice_id=%s event_seq=%s intent_id=%s",
+        correlation.slice_id,
+        event.run_seq,
+        _event_dispatch_intent_id(event),
+    )
+    _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
+    if not replaying:
+        diagnostics.acknowledged += 1
+    _release_replayed_event(store, event, replaying)
+    return store.load()
 
 
 def _event_dispatch_intent_id(event: EventEnvelope) -> str | None:
@@ -8098,6 +8156,17 @@ def correlate_dispatch_event(state: RunState, event: EventEnvelope) -> DispatchC
     can never confirm a current dispatch or charge a new owner. A matching
     epoch with a stale generation is an integrity conflict, not evidence of
     a new worker.
+
+    One dispatch emits more than one spawn row for the same intent: the
+    controller records its own confirmation from the accepted spawn, and the
+    server separately writes the child registration (``child_agent``) and the
+    dispatch record (``slug``/``task_summary``) under the *parent's*
+    ``agent_id``. So the second row for a live intent arrives after the slice
+    has left the dispatching statuses and is a duplicate, not a conflict. It
+    is classified as ``already_confirmed`` so the loop can acknowledge it
+    without an FSM transition. Every other mismatch -- an intent no slice
+    records, an ambiguous intent, a stale epoch, or a stale dispatch
+    generation -- still refuses exactly as before.
     """
     if not _is_spawn_confirmation_event(event):
         return DispatchCorrelation(DISPATCH_CORRELATED)
@@ -8126,6 +8195,9 @@ def correlate_dispatch_event(state: RunState, event: EventEnvelope) -> DispatchC
                 "dispatch_generation_mismatch",
             )
         return DispatchCorrelation(DISPATCH_CORRELATED, candidate.id)
+    duplicate = _correlate_duplicate_confirmation(state, event, intent_id, event_epoch)
+    if duplicate is not None:
+        return duplicate
     hint = _event_slice_hint(event)
     current = state.slices.get(hint) if hint is not None else None
     if current is not None and event_epoch is not None and event_epoch != state.controller_epoch:
@@ -8135,6 +8207,85 @@ def correlate_dispatch_event(state: RunState, event: EventEnvelope) -> DispatchC
             "controller_epoch_mismatch",
         )
     return DispatchCorrelation(DISPATCH_INTEGRITY_CONFLICT, hint, "intent_mismatch")
+
+
+def _correlate_duplicate_confirmation(
+    state: RunState,
+    event: EventEnvelope,
+    intent_id: str | None,
+    event_epoch: str | None,
+) -> DispatchCorrelation | None:
+    """Classify a second spawn row for an intent this run already confirmed.
+
+    A duplicate is proven, not inferred: the intent must name exactly one slice,
+    that slice must have left the dispatching statuses, it must already carry
+    the authoritative sequence of a recorded confirmation, and every child
+    identity the row names must be one the owner already recorded. An intent
+    that no slice records, that several slices claim, or that arrives naming
+    somebody else's child proves nothing and is left to the caller's refusal
+    path.
+
+    The epoch and dispatch generation are still checked against the owner, so a
+    duplicate row that names an earlier attempt or an earlier controller is
+    refused with the same reason a first confirmation would be.
+    """
+    if intent_id is None:
+        return None
+    owners = [
+        slice_state
+        for slice_state in state.slices.values()
+        if slice_state.dispatch_intent_id == intent_id
+    ]
+    if len(owners) != 1:
+        return None
+    owner = owners[0]
+    if owner.status in DISPATCHING_STATUSES:
+        return None
+    if owner.dispatch_authoritative_event_seq is None:
+        return None
+    if not _named_child_matches_owner(event, owner):
+        return DispatchCorrelation(
+            DISPATCH_INTEGRITY_CONFLICT,
+            owner.id,
+            "dispatch_agent_mismatch",
+        )
+    if event_epoch is not None and event_epoch != state.controller_epoch:
+        return DispatchCorrelation(
+            DISPATCH_HISTORICAL_AUDIT,
+            owner.id,
+            "controller_epoch_mismatch",
+        )
+    event_generation = _event_dispatch_generation(event)
+    if event_generation is not None and event_generation != owner.dispatch_generation:
+        return DispatchCorrelation(
+            DISPATCH_INTEGRITY_CONFLICT,
+            owner.id,
+            "dispatch_generation_mismatch",
+        )
+    return DispatchCorrelation(
+        DISPATCH_ALREADY_CONFIRMED,
+        owner.id,
+        "dispatch_already_confirmed",
+    )
+
+
+def _named_child_matches_owner(event: EventEnvelope, owner: SliceState) -> bool:
+    """Require every child identity the row names to be the owner's.
+
+    The two spawn rows for one dispatch differ in shape: the child
+    registration carries ``child_agent`` (the runtime agent id the server
+    minted) and the dispatch record carries ``slug`` (the slice id). Both name
+    the same owner, so each is accepted only when it equals the slice id or the
+    ``dispatch_agent_id`` that owner already persisted. A row that names some
+    other child is not a duplicate of this dispatch, however well its intent
+    matches, so an intent alone can never authorise a foreign confirmation.
+    """
+    permitted = {owner.id, owner.dispatch_agent_id}
+    for key in ("child_agent", "slug", "agent_id", "dispatch_agent_id"):
+        value = event.data.get(key)
+        if isinstance(value, str) and value and value not in permitted:
+            return False
+    return True
 
 
 def _dispatch_confirmation_matches(
