@@ -721,8 +721,8 @@ def test_migrated_harness_commits_the_scaffold_before_dispatch(name: str) -> Non
 #: slice moves its own scenario across when it fixes its own validators, so this
 #: stays a subset rather than a rewrite of the other two; `PENDING_MARKER_FIX`
 #: records which and why, and fails if the two ever drift apart.
-MARKER_FIXED = ("chainlink-codex",)
-PENDING_MARKER_FIX = ("codex-messaging", "python-tl-worker-notify")
+MARKER_FIXED = ("chainlink-codex", "python-tl-worker-notify")
+PENDING_MARKER_FIX = ("codex-messaging",)
 
 
 def bracketed_markers(validate: str) -> dict[str, str]:
@@ -796,8 +796,8 @@ def test_the_marker_fix_coverage_is_accounted_for() -> None:
 
 #: Scenarios whose validator is pinned by the `set -e` check below. Same
 #: subset/pin arrangement as `MARKER_FIXED` above.
-SET_E_FIXED = ("chainlink-codex",)
-PENDING_SET_E_FIX = ("codex-messaging", "python-tl-worker-notify")
+SET_E_FIXED = ("chainlink-codex", "python-tl-worker-notify")
+PENDING_SET_E_FIX = ("codex-messaging",)
 
 
 def assertion_helpers_return_zero(validate: str) -> list[str]:
@@ -871,6 +871,53 @@ def test_the_set_e_fix_coverage_is_accounted_for() -> None:
         f"be an exact partition of MIGRATED {sorted(MIGRATED)}; a scenario may not "
         f"be dropped from both to silence a failure"
     )
+
+
+def test_no_wait_for_probe_is_an_unreachable_shell_function() -> None:
+    """A `wait_for` probe must be reachable from the shell it runs in.
+
+    `wait_for` evaluates its probe with `bash -c`, which starts a *fresh* shell.
+    That shell inherits exported variables but not unexported shell functions, so
+    a probe given as the bare name of a function defined in the validator can
+    only ever fail with `command not found` -- exit 127, never a match.
+
+    Nothing catches that at runtime except the symptom, and the symptom is
+    indistinguishable from a slow agent: the probe burns its whole budget and
+    reports a timeout for a property that holds. In the 2026-09-30 live run of
+    `python-tl-worker-notify` the assertion spent its entire 600s printing
+    `marker_reached_controller_window: command not found`, while the same run's
+    `.exo/logs` held the notification marker and two successful
+    `message.delivery` records.
+
+    So every probe has to be something `bash -c` can resolve on its own: a
+    command string, or a re-invocation of the validator by path.
+    """
+    for name in MIGRATED:
+        validate = read(scenario_dir(name) / "validate.sh")
+        # Probes are the second argument to wait_for: either a bare word on the
+        # same line, or a quoted string continued onto the next.
+        probes = re.findall(
+            r'wait_for\s+"[^"]*"\s+(?:"([^"]*)"|([^\s\\][^\n]*?))\s*(?:\\)?$',
+            validate,
+            re.M,
+        )
+        for quoted, bare in probes:
+            probe = (quoted or bare).strip()
+            if not probe or probe.startswith("bash "):
+                continue
+            # A bare word that names a shell function defined in this file is the
+            # defect: `bash -c` cannot see it.
+            defined = re.search(
+                rf"^{re.escape(probe)}\(\) \{{", validate, re.M
+            )
+            assert not defined, (
+                f"{name}: wait_for probe {probe!r} names a function defined in "
+                f"validate.sh, but wait_for runs it under `bash -c`, a fresh shell "
+                f"that cannot see unexported functions. It can only ever exit 127, "
+                f"so the assertion times out even when the property holds. Call it "
+                f"through a re-entry point instead:\n"
+                f'  wait_for "label" "bash \'$0\' --assert-something \'$SESSION\'"'
+            )
 
 
 # ---------------------------------------------------------------------------

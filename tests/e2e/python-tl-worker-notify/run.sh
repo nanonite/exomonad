@@ -152,6 +152,13 @@ e2e_python_tl_init_chainlink "$REPO_DIR"
 # Derive the ceilings from the plan instead.
 e2e_python_tl_write_harness_policy "$REPO_DIR" "$SCRIPT_DIR/plan.json"
 
+# Prove the account can run the model this fixture just provisioned, before the
+# controller starts. A rejected model surfaces only inside the worker's rollout
+# as a 400 on its first inference, after dispatch and provisioning, and nothing
+# notices for the validator's whole budget -- so without this the run looks like
+# a notify_parent stall. Chainlink #1149.
+e2e_python_tl_assert_codex_model_runnable "$(e2e_python_tl_codex_model)" "$REPO_DIR"
+
 # The controller's only input is plan.json. Copy the scenario plan verbatim so
 # the plan the validator reads is the plan in version control.
 mkdir -p .exo/tl-loop

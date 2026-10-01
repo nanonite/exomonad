@@ -109,34 +109,150 @@ top level before the first `tmux` call and before `exomonad init`.
 
 An earlier revision reverted it: the isolation call had been placed inside
 `cleanup()`, so it took effect only at teardown, and the run kept the host's
-`CODEX_HOME`. Read as "the isolation breaks the server's socket health check",
-that looked like a product problem. It was a placement bug in the harness. With
-the call moved to top level, the isolated server starts, `init` reaches
-"Attaching to session", the controller dispatches its worker, and the worker's
-pane resolves `$CODEX_HOME` to the run's isolated home. Set
-`E2E_PYTHON_TL_TMUX_ISOLATION=0` to reproduce the shared-server leak, which is
-what the A/B below relies on.
+`CODEX_HOME`. That much was a placement bug in the harness, and moving the call
+to top level fixed it -- the worker's pane now resolves `$CODEX_HOME` to the run's
+isolated home, proven live. Set `E2E_PYTHON_TL_TMUX_ISOLATION=0` to reproduce the
+shared-server leak.
+
+What was *not* true of that revision is the diagnosis attached to it. It reported
+that the isolation "broke the server's socket health check". That claim does not
+hold: `chainlink-codex` fails the same check with the isolation disabled, so the
+isolation was never the cause. This scenario's own 2026-09-30 run cleared the
+health check and dispatched with the isolation on. Keep the two separate -- the
+isolation is required and works, and the health check is a separate failure
+(#1150) that it did not cause.
 
 `test_isolation_contract.py` pins the placement (top level, before the first
 `tmux` call, before `init`, after the library is sourced) precisely because a
 call inside `cleanup()` is invisible at runtime -- the run still prints
 `Work dir:` and still creates the `tmux/` directory, at teardown.
 
-**The blocked `notify_parent`.** The worker is dispatched, provisioned, and
-boots a real Codex session with the correct task text; what is unproven in this
-revision is the last hop, the worker actually calling `notify_parent` and the
-controller durably reaching `tl_done`. The 2026-09-30 live run with the
-isolation correctly placed reached `tl_running` with the worker spawned and
-`$CODEX_HOME` isolated, then stalled: no `notify_parent` event, no terminal
-state, `active_slices=1` and no progress for 1084s. The validator reported
-`worker notify_parent event recorded timed out after 600s`.
+**The blocked `notify_parent`.** The worker is dispatched, provisioned, and boots
+a real Codex session with the correct task text. An earlier revision recorded the
+last hop as unproven, from a run that stalled with no `notify_parent` event and
+`worker notify_parent event recorded timed out after 600s`. That reading was
+wrong, and the run's own artefacts say so. See the live-run section below: the
+worker does call `notify_parent`, it succeeds, and the notification is delivered
+to the controller's window. What does not happen is the controller *advancing*.
 
-A missing or failing validator result is now a hard failure of the scenario.
+A missing or failing validator result is a hard failure of the scenario.
 `run.sh` used to fall back to `exomonad init`'s exit status, and `init` exits 0
 as soon as it attaches the session -- so that run reported success while proving
 nothing. `test_isolation_contract.py` pins that too.
 
-Because of the two blockers above this row is **not** marked Green.
+Because of the blocker above this row is **not** marked Green.
+
+## Live run, 2026-09-30 (work dir `python-tl-worker-notify.kT0YrtMB`)
+
+This run is the evidence behind the three fixes above. Ten assertions pass
+against real product output, including the two that had never been observed:
+
+```
+OK: Python TL controller window exists
+OK: TL plan was consumed into a controller checkpoint
+OK: no interactive Codex root TL config was generated
+OK: CODEX_HOME propagated into the tmux session
+OK: worker routing metadata exists
+OK: worker Codex config exists
+OK: Codex worker config is role-correct
+OK: Codex project + hook trust in .../codex-home
+OK: Codex worker trust is in the isolated home
+OK: controller window holds the controller plus a dispatched worker pane
+OK: worker notify_parent event recorded
+OK: worker notify_parent tmux delivery succeeded
+```
+
+The last two are new, and they are the ones that matter. The run's own
+`.exo/logs/python-tl-worker-notify-worker-codex.jsonl` holds the worker's
+`notify_parent` and the delivery it produced:
+
+```json
+{"type":"agent.notify_parent","data":{"message":"[PYTHON-TL-WORKER-NOTIFY] Codex
+ worker notify_parent reached the Python TL controller.","parent":"root",
+ "source":"agent","status":"success"}}
+{"type":"message.delivery","data":{"method":"Tmux","outcome":"success",
+ "recipient":"root","source":"agent"}}
+{"type":"message.delivery","data":{"attempt":1,"detail":"TL","method":
+ "agent_inbox_tmux","outcome":"success","recipient":"root"}}
+```
+
+So worker dispatch, isolated `CODEX_HOME`, hook and project trust, the role-correct
+MCP identity, `notify_parent`, and delivery to the `root` recipient through both
+tmux methods are all proven here. The controller received the message; that was
+never the open question.
+
+### Three fixture defects this run found
+
+Each one was invisible to every static check, and each would have burned the
+validator's full 600s budget per assertion.
+
+**A marker grep that could never match.** The delivery assertion passed
+`$MESSAGE_MARKER` to `grep` as a basic regular expression. The marker is
+`[PYTHON-TL-WORKER-NOTIFY]`, so the brackets open a bracket expression whose `-`
+characters are ranges, and GNU grep rejects the whole pattern:
+
+```console
+$ grep -R '[PYTHON-TL-WORKER-NOTIFY]' logs
+grep: Invalid range end          # exit 2, never matches
+```
+
+It now reads `grep -RF`. This is the same defect `chainlink-codex` fixed, tracked
+there as `MARKER_FIXED` in `test_contract.py` and here by the same list.
+
+**A `wait_for` probe that was structurally unreachable.** `wait_for` evaluates
+its probe with `bash -c`, and `bash -c` starts a *fresh* shell: it inherits
+exported variables but not unexported shell functions. The window assertion
+passed the bare name `marker_reached_controller_window`, so every poll printed
+
+```
+bash: line 1: marker_reached_controller_window: command not found
+```
+
+and burned the full 600s -- while this same run's logs held the marker and two
+successful deliveries. The property held and the probe could not see it. The
+probe is now a `--assert-window-marker` re-entry point that `wait_for` invokes as
+`bash "$0" --assert-window-marker "$SESSION" "$TL_WINDOW"`, which is the idiom
+`chainlink-codex/validate.sh` already uses for its own subshell assertions.
+`test_contract.py::test_no_wait_for_probe_is_an_unreachable_shell_function` pins
+the shape for every migrated scenario.
+
+**A validator that could not report its own verdict.** `validate.sh` runs under
+`set -euo pipefail` and calls its helpers as bare statements, so a helper
+returning 1 on failure aborted the script at the *first* failed assertion --
+skipping every later one and never writing `$RESULT_FILE`. `run.sh` then reports
+`validator wrote no result file`, which is the opposite of what happened. Both
+helpers return 0 now and let the recorded failure count decide; the count is
+what `run.sh` already keys on. Pinned as `SET_E_FIXED`.
+
+The model capability preflight is wired here too. `run.sh` now calls
+`e2e_python_tl_assert_codex_model_runnable` before `init`, so an account that
+cannot run the provisioned model fails in about five seconds with the model's
+name instead of stalling for the validator's whole budget and reading as a
+messaging failure. Chainlink #1149.
+
+### What still blocks it: #1148, and this run reproduces it
+
+The controller quarantines its own dispatch confirmation, so the slice never
+leaves `spawned`. From this run's `.exo/tl-loop/root/`:
+
+```
+run.json:            phase tl_running, slice python-tl-worker-notify-worker = spawned
+event-quarantine.json: agent.spawned
+    correlation        integrity_conflict
+    correlation_reason intent_mismatch
+    run_id             949d5daf-be5c-4f2a-9307-107225592541   <- controller has "root"
+    agent_id           root                                  <- controller expects the slice
+```
+
+That is the same signature recorded on the reference branch, reproduced
+independently on a different host and a different day, and it is the product's:
+the worker's work is complete and correct, and the controller's own event
+correlation rejects its confirmation of it. Filed as Chainlink #1148. The harness
+needs no further change for it.
+
+Because the slice never advances, `controller reached a terminal phase` cannot
+succeed either, so this row stays **Blocked**. Nothing here has been observed
+reaching `tl_done`.
 
 ## Running it
 
