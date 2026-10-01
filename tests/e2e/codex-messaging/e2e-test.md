@@ -107,12 +107,13 @@ This row is **not** Green: the messaging and role assertions above are proven,
 but the run does not reach `tl_done`, so the durable-controller-state row is not
 yet satisfied.
 
-### Later runs on another host, same date
+### Two later runs on the same host, same date
 
-Two further runs of this scenario on a different host never got past the server
-health check, so they add nothing to the messaging evidence and are recorded
-here only so the row is not read as more settled than it is. Work dirs
-`codex-messaging.d2RDU06h` and `codex-messaging.iFGVZpeS`:
+Two further runs of this scenario, on **this same host** as the reference run
+above, never got past the server health check. They add nothing to the messaging
+evidence and are recorded here only so the row is not read as more settled than
+it is. Work dirs `codex-messaging.d2RDU06h` and `codex-messaging.iFGVZpeS`,
+both under this host's `~/.cache/exomonad-e2e`:
 
 ```
 OK: account can run model gpt-5.6-luna          <- the #1149 preflight, both runs
@@ -133,11 +134,36 @@ identically, which rules that out. Both runs wrote
 `"codex/gpt-5.6-luna" = "standard"` into `harness_capability.toml`, so the
 account-resolved harness reached the controller's config on both.
 
-The blocker is the `is_healthy` probe over the UDS
-(`rust/exomonad/src/uds_client.rs`), not the isolation and not the model. Filed
-as Chainlink #1150. Note that this host also runs a long-lived `exomonad serve`
-holding the webhook port `0.0.0.0:7433`; that is a plausible contributor and is
-explicitly **unconfirmed**.
+The cause is **confirmed, and it is not a host property.** This host still runs
+the `exomonad serve` (pid 4156428) left behind by the 11:21 reference run, and it
+holds the default webhook port `0.0.0.0:7433`. The fixture's `config.toml` sets no
+`port`, so `serve` defaults to 7433 and the sequence in
+`rust/exomonad/src/serve.rs` is:
+
+```
+INFO exomonad::serve: Binding MCP Unix domain socket .../.exo/server.sock   <- succeeds
+INFO exomonad::serve: Binding public TCP webhook listener address=0.0.0.0:7433
+Error: Failed to bind TCP listener 0.0.0.0:7433
+    Address already in use (os error 98)
+```
+
+Reproduced directly on this host outside the scenario: the UDS bind lands, the TCP
+bind fails, `serve` exits 1, and the **stale `server.sock` is left on disk**.
+`wait_for_server_socket` (`rust/exomonad/src/init.rs`) therefore passes its
+"socket exists" check and then polls `is_healthy`
+(`rust/exomonad/src/uds_client.rs`) against a socket nobody is listening on,
+which is the 30s timeout. Setting a free `port` in the same fixture makes `serve`
+stay up and bind cleanly.
+
+So the ordering matters: the reference run at 11:21 succeeded *and* left the
+process holding the port, and the two later runs on this same host then failed for
+that reason alone. Filed as Chainlink #1150. Two distinct defects are involved and
+neither is fixed here:
+
+* the leftover `serve` is never reaped, so one run's success poisons the next;
+* `serve` leaves a stale `server.sock` behind when it dies after the UDS bind, so
+  the next health check waits out its full budget against a dead socket instead of
+  failing fast.
 
 Because `init` never returned, no worker was dispatched, no Codex rollout
 exists, and `event-quarantine.json` was never written on this host. So this
