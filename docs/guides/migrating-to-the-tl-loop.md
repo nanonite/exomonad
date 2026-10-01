@@ -77,7 +77,14 @@ Leaving them in place is harmless; relying on them is not.
 | `tl_effort_level` | Ignored |
 | `spawn_agent_type` | **Still live.** Default harness for workers, leaves, companions |
 | `worker_effort_level` | **Still live.** Inherited by leaves, sub-TLs, companions |
-| retired provider setting | **Fails closed.** Use `codex` (model `gpt-luna`) |
+| retired provider setting | **Fails closed.** Use `codex`, with a model your Codex account can run — see below |
+
+An old policy may name a model the account no longer supports (this repo's
+scaffold used to write `codex/gpt-luna`, which a ChatGPT-account login refuses
+with a 400 before the worker's first inference). That failure is invisible to
+every allowlist and budget check, so check the model half of each
+`codex/...` entry against your own Codex config while migrating, and rate the
+same key in `.exo/harness_capability.toml`.
 
 ### New files the project now requires
 

@@ -10,11 +10,27 @@ from tl_loop.select.policy import PolicyInvalid, PolicyMissing, load_policy, val
 
 
 def test_checked_in_policy_is_valid() -> None:
-    policy = load_policy(Path(".exo/harness_policy.toml"))
+    """Every role allowlists the codex harness this repo's account can run.
 
-    assert policy.roles["tl"].allow == ("codex/gpt-luna",)
-    assert policy.roles["reviewer"].allow == ("codex/gpt-luna",)
-    assert policy.roles["worker"].allow[0] == "codex/gpt-luna"
+    The harness is read back out of the loaded policy rather than compared to a
+    literal: `exomonad new` resolves the model half from the operator's Codex
+    config, so the name moves when their account does. What is pinned is the
+    shape — one codex entry for tl and reviewer, and it leading the worker's
+    list, since that ordering is what makes codex the default rank-1 worker.
+    """
+    policy = load_policy(Path(".exo/harness_policy.toml"))
+    allowed = {
+        harness
+        for role in policy.roles.values()
+        for harness in role.allow
+        if harness.startswith("codex/")
+    }
+    assert len(allowed) == 1, f"the roles must share one codex harness: {allowed}"
+    (codex_harness,) = allowed
+
+    assert policy.roles["tl"].allow == (codex_harness,)
+    assert policy.roles["reviewer"].allow == (codex_harness,)
+    assert policy.roles["worker"].allow[0] == codex_harness
 
 
 def test_missing_policy_fails_closed(tmp_path: Path) -> None:

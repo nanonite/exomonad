@@ -24,9 +24,16 @@ from tl_loop.state.schema import SliceState, SliceStatus, Verdict
 
 ROOT = Path(__file__).resolve().parents[2]
 POLICY_PATH = ROOT / ".exo/harness_policy.toml"
-CAPABILITIES = CapabilityMap(
-    {"codex/gpt-luna": Difficulty.STANDARD, "claude/sonnet": Difficulty.HARD}
+#: The codex harness this repo's own policy allows. Read from the policy rather
+#: than written as a literal: the model half is whatever the operator's Codex
+#: account can run, so a literal here goes stale whenever that policy moves, and
+#: the failures land on the learned policy instead of on the name that changed.
+CODEX_HARNESS = next(
+    harness
+    for harness in load_policy(POLICY_PATH).roles["worker"].allow
+    if harness.startswith("codex/")
 )
+CAPABILITIES = CapabilityMap({CODEX_HARNESS: Difficulty.STANDARD, "claude/sonnet": Difficulty.HARD})
 
 
 def test_learned_harness_outside_allowlist_is_rejected() -> None:
@@ -52,7 +59,7 @@ def test_store_snapshots_mutations_and_rolls_back_exact_payload(tmp_path: Path) 
             "decomposition_heuristics": {"focused_slice": ["keep boundary narrow"]},
             "task_class_preferences": {
                 "focused_slice": {
-                    "worker": ["claude/sonnet", "codex/gpt-luna"],
+                    "worker": ["claude/sonnet", CODEX_HARNESS],
                 }
             },
             "repair_patterns": {
@@ -108,13 +115,13 @@ def test_selector_keeps_allowlist_confinement_with_adversarial_learned_order() -
 
     assert choice is not None
     assert choice.harness in policy.roles["worker"].allow
-    assert choice.harness == "codex/gpt-luna"
+    assert choice.harness == CODEX_HARNESS
 
 
 def test_selector_uses_learned_order_for_equal_cost_rank() -> None:
     role = {
-        "allow": ["codex/gpt-luna", "claude/sonnet"],
-        "cost_rank": {"codex/gpt-luna": 1, "claude/sonnet": 1},
+        "allow": [CODEX_HARNESS, "claude/sonnet"],
+        "cost_rank": {CODEX_HARNESS: 1, "claude/sonnet": 1},
         "token_budget": 120000,
         "per_harness_budget": {},
         "escalate_after_attempts": 1,
@@ -124,7 +131,7 @@ def test_selector_uses_learned_order_for_equal_cost_rank() -> None:
     )
     document = default_document()
     document["task_class_preferences"] = {
-        "focused_slice": {"worker": ["claude/sonnet", "codex/gpt-luna"]}
+        "focused_slice": {"worker": ["claude/sonnet", CODEX_HARNESS]}
     }
     document["evidence"] = {"task_class_preferences:focused_slice:worker": [1, 2]}
     learned = validate_learned_policy(document, policy)

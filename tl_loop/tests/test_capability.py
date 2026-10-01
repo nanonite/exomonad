@@ -13,18 +13,29 @@ from tl_loop.select.capability import (
     validate_capability,
 )
 from tl_loop.select.classify import Difficulty
-from tl_loop.select.policy import PolicyInvalid, PolicyMissing, validate_policy
+from tl_loop.select.policy import PolicyInvalid, PolicyMissing, load_policy, validate_policy
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_checked_in_capability_map_is_valid() -> None:
+    """The checked-in pair agrees on the harnesses this repo's account can run.
+
+    The codex key is read from the policy rather than written as a literal: the
+    model half is resolved from the operator's Codex config, so a literal here
+    went stale whenever the policy moved, and `load_capability` then failed on a
+    KeyError that named the stale name rather than the disagreement.
+    """
+    policy = load_policy(ROOT / ".exo/harness_policy.toml")
+    codex_harness = next(
+        harness for harness in policy.roles["worker"].allow if harness.startswith("codex/")
+    )
     capability = load_capability(
         ROOT / ".exo/harness_capability.toml",
         policy_path=ROOT / ".exo/harness_policy.toml",
     )
 
-    assert capability["codex/gpt-luna"] is Difficulty.STANDARD
+    assert capability[codex_harness] is Difficulty.STANDARD
     assert capability["claude/sonnet"] is Difficulty.HARD
 
 

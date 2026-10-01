@@ -1093,7 +1093,11 @@ def test_harness_policy_scaffold_allows_the_codex_children_the_scenarios_dispatc
     scaffold = read(PROJECT_ROOT / "rust" / "exomonad" / "src" / "new.rs")
     for role in ("roles.tl", "roles.worker", "roles.reviewer"):
         assert f"[{role}]" in scaffold, f"the scaffold must declare {role}"
-    assert "codex/gpt-luna" in scaffold, "the scaffold allowlist is codex-based"
+    # The allowlist is still codex-based, but the model is a resolved variable
+    # rather than a literal: a literal names one model, and no model is
+    # runnable on every account. Chainlink #1149.
+    assert "{codex_harness}" in scaffold, "the scaffold allowlist takes the resolved harness"
+    assert 'allow = ["{codex_harness}"]' in scaffold, "roles.tl allows the resolved harness"
 
 
 def test_tl_loop_policy_fixture_still_validates() -> None:
@@ -1107,4 +1111,25 @@ def test_tl_loop_policy_fixture_still_validates() -> None:
         path = PROJECT_ROOT / ".exo" / name
         assert path.is_file(), f".exo/{name} must exist"
         tomllib.loads(read(path))
+
+
+def test_this_repos_own_policy_covers_its_allowlist() -> None:
+    """``.exo/harness_capability.toml`` must rate every harness the policy allows.
+
+    This repo is itself scaffolded, so its policy carries the model its account
+    can run. ``_require_policy_coverage``
+    (``tl_loop/select/capability.py``) rejects a policy whose allowlist the
+    capability map does not cover, and the two files naming different models is
+    the shape that fails -- at controller startup, not in a test.
+    """
+    policy = tomllib.loads(read(PROJECT_ROOT / ".exo" / "harness_policy.toml"))
+    capability = tomllib.loads(read(PROJECT_ROOT / ".exo" / "harness_capability.toml"))
+    ratings = capability.get("capabilities", {})
+    allowed = {
+        harness
+        for role in policy.get("roles", {}).values()
+        for harness in role.get("allow", [])
+    }
+    missing = sorted(allowed - set(ratings))
+    assert not missing, f"no capability rating for: {missing}"
 

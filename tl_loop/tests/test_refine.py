@@ -17,6 +17,7 @@ from tl_loop.harness.refine import (
     maybe_refine,
 )
 from tl_loop.select.learned_policy import DispatchPolicyStore
+from tl_loop.select.policy import load_policy
 from tl_loop.state.schema import (
     BudgetLedger,
     EventCursor,
@@ -82,6 +83,7 @@ def test_mid_wave_refinement_is_refused() -> None:
 
 
 def test_reusable_tactic_and_repeated_role_are_learned(tmp_path: Path) -> None:
+    codex = _codex_harness()
     tactic_store = _store(tmp_path / "tactic")
     tactic_result = maybe_refine(
         _state(TLPhase.TLDone),
@@ -92,7 +94,7 @@ def test_reusable_tactic_and_repeated_role_are_learned(tmp_path: Path) -> None:
                 "outcome": "success",
                 "tactic": "narrow-retry",
                 "role": "worker",
-                "harness": "codex/gpt-luna",
+                "harness": codex,
             },
             {
                 "run_seq": 22,
@@ -100,7 +102,7 @@ def test_reusable_tactic_and_repeated_role_are_learned(tmp_path: Path) -> None:
                 "outcome": "success",
                 "tactic": "narrow-retry",
                 "role": "worker",
-                "harness": "codex/gpt-luna",
+                "harness": codex,
             },
         ],
         store=tactic_store,
@@ -111,7 +113,7 @@ def test_reusable_tactic_and_repeated_role_are_learned(tmp_path: Path) -> None:
         for proposal in tactic_result.proposals
     )
     assert tactic_result.policy is not None
-    assert tactic_result.policy.repair_patterns["narrow-retry"]["worker"] == ("codex/gpt-luna",)
+    assert tactic_result.policy.repair_patterns["narrow-retry"]["worker"] == (codex,)
 
     role_store = _store(tmp_path / "role")
     role_result = maybe_refine(
@@ -122,14 +124,14 @@ def test_reusable_tactic_and_repeated_role_are_learned(tmp_path: Path) -> None:
                 "type": "agent.spawned",
                 "task_class": "focused_slice",
                 "role": "worker",
-                "harness": "codex/gpt-luna",
+                "harness": codex,
             },
             {
                 "run_seq": 32,
                 "type": "agent.spawned",
                 "task_class": "focused_slice",
                 "role": "worker",
-                "harness": "codex/gpt-luna",
+                "harness": codex,
             },
         ],
         store=role_store,
@@ -139,14 +141,13 @@ def test_reusable_tactic_and_repeated_role_are_learned(tmp_path: Path) -> None:
         proposal.trigger is RefinementTrigger.REPEATED_ROLE for proposal in role_result.proposals
     )
     assert role_result.policy is not None
-    assert role_result.policy.task_class_preferences["focused_slice"]["worker"] == (
-        "codex/gpt-luna",
-    )
+    assert role_result.policy.task_class_preferences["focused_slice"]["worker"] == (codex,)
 
 
 def test_behavior_policy_and_capability_observations_are_evidence_backed(
     tmp_path: Path,
 ) -> None:
+    codex = _codex_harness()
     store = _store(tmp_path)
     result = maybe_refine(
         _state(TLPhase.TLFailed),
@@ -155,7 +156,7 @@ def test_behavior_policy_and_capability_observations_are_evidence_backed(
                 "run_seq": 41,
                 "task_class": "focused_slice",
                 "behavior_policy": "keep retries bounded",
-                "harness": "codex/gpt-luna",
+                "harness": codex,
                 "role": "worker",
                 "outcome": "success",
             },
@@ -163,7 +164,7 @@ def test_behavior_policy_and_capability_observations_are_evidence_backed(
                 "run_seq": 42,
                 "task_class": "focused_slice",
                 "behavior_policy": "keep retries bounded",
-                "harness": "codex/gpt-luna",
+                "harness": codex,
                 "role": "worker",
                 "outcome": "failure",
             },
@@ -176,7 +177,7 @@ def test_behavior_policy_and_capability_observations_are_evidence_backed(
         proposal.trigger is RefinementTrigger.BEHAVIOR_POLICY for proposal in result.proposals
     )
     assert result.policy is not None
-    capability = result.policy.capability_observations["codex/gpt-luna"]
+    capability = result.policy.capability_observations[codex]
     assert (capability.passed, capability.failed) == (1, 1)
     assert capability.evidence_seqs == (41, 42)
     assert result.policy.evidence["decomposition_heuristics:focused_slice"] == (41, 42)
@@ -209,6 +210,19 @@ def _store(path: Path) -> DispatchPolicyStore:
         policy_path=POLICY_PATH,
         snapshot_dir=path / "snapshots",
     )
+
+
+def _codex_harness() -> str:
+    """The codex harness this repo's own policy allows.
+
+    Read from the policy rather than written as a literal: the model half is
+    whatever the operator's Codex account can run, and `exomonad new` resolves
+    it from their Codex config. A literal here went stale the moment the
+    checked-in policy moved, and the resulting failures pointed at the learned
+    policy rather than at the name that had changed.
+    """
+    allowed = load_policy(POLICY_PATH).roles["worker"].allow
+    return next(harness for harness in allowed if harness.startswith("codex/"))
 
 
 def _state(phase: TLPhase) -> RunState:

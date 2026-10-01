@@ -85,12 +85,20 @@ allowed entry:
 # .exo/harness_policy.toml — the human-authored allowlist and budget ceiling.
 # Required. A missing or invalid file is a startup error; no default is synthesized.
 [roles.tl]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
+allow = ["codex/<your-model>"]
+cost_rank = { "codex/<your-model>" = 1 }
 token_budget = 120000
 escalate_after_attempts = 1
 # ... and the same for [roles.worker] and [roles.reviewer]
 ```
+
+`<your-model>` must be a model your Codex account can run — the controller
+passes it straight through as the worker's `model`, and an unsupported one is
+refused by the provider on the first turn. `exomonad new` fills these in from
+the top-level `model` in your Codex config, or from `EXOMONAD_CODEX_MODEL`, and
+refuses to scaffold when neither supplies one. Rate the same key in
+`.exo/harness_capability.toml`; preflight rejects a policy whose allowlist the
+capability map does not cover.
 
 Set the Forgejo connection values in `.exo/config.toml` using the credentials
 for the repository and webhook. Do not commit live credentials:

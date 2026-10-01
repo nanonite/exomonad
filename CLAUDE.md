@@ -348,7 +348,7 @@ task = "You are sleeptime"     # optional — omit for interactive session
 model = "haiku"                # optional — passed as --model flag to companion
 ```
 
-Gemini is retired; old configurations fail closed with: `agent_type 'gemini' is retired; use 'codex' (model gpt-luna). See CLAUDE.md Configuration.`
+Gemini is retired; old configurations fail closed with: `agent_type 'gemini' is retired; use 'codex' (model: the top-level \`model\` in your Codex config, or EXOMONAD_CODEX_MODEL). See CLAUDE.md Configuration.` The message names no model on purpose: every model probed against a ChatGPT-account Codex login is refused the same way, so only the account knows which ones run. `exomonad new` resolves the model its harness policy names from your Codex config and refuses to scaffold when it cannot.
 
 **Role-specific harness and effort:** `--tl`, `--worker`, and `--reviewer` select the
 root, worker/companion, and reviewer harnesses independently. Effort precedence is

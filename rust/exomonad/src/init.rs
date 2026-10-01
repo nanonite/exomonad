@@ -4354,23 +4354,75 @@ fn ensure_harness_capability(cwd: &Path) -> Result<()> {
     }
     let policy_text = std::fs::read_to_string(&policy)
         .with_context(|| format!("failed to read {}", policy.display()))?;
-    for line in policy_text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("allow") {
-            for entry in trimmed.split('"').skip(1).step_by(2) {
-                if !crate::new::HARNESS_CAPABILITY_CONTENT.contains(&format!("\"{entry}\"")) {
-                    anyhow::bail!(
-                        "cannot backfill {} without widening the policy allowlist; add it explicitly",
-                        capability.display()
-                    );
-                }
+    // Rate exactly the harnesses the existing policy allows, rather than a
+    // canonical default keyed on one fixed model. A policy the operator already
+    // widened past the scaffold's model is the common case here, and rating it
+    // for the model it actually names is what keeps the backfill from refusing
+    // the project it is supposed to unblock.
+    let allowed = policy_allowed_harnesses(&policy_text)?;
+    if allowed.is_empty() {
+        anyhow::bail!(
+            "cannot backfill {}: the policy at {} allows no harness to rate",
+            capability.display(),
+            policy.display()
+        );
+    }
+    std::fs::write(&capability, capability_content_for(&allowed))
+        .with_context(|| format!("failed to backfill {}", capability.display()))?;
+    info!(path = %capability.display(), "Backfilled harness capability map from the policy allowlist");
+    Ok(())
+}
+
+/// The harnesses named by every `allow` list in a policy document, deduplicated.
+///
+/// Parsed as TOML rather than scraped: a quoted model name that happens to
+/// contain `allow` cannot smuggle an entry past the coverage check, and a role
+/// whose `allow` is missing is a startup error the controller will report
+/// anyway — surfacing it here means the backfill does not write a map that
+/// disagrees with the policy it is rating.
+fn policy_allowed_harnesses(policy_text: &str) -> Result<Vec<String>> {
+    let document = policy_text
+        .parse::<toml::Value>()
+        .context("failed to parse the existing harness policy")?;
+    let roles = document
+        .get("roles")
+        .and_then(toml::Value::as_table)
+        .context("the existing harness policy has no [roles] table")?;
+    let mut allowed: Vec<String> = Vec::new();
+    for (role, table) in roles {
+        let entries = table
+            .get("allow")
+            .and_then(toml::Value::as_array)
+            .with_context(|| format!("roles.{role} has no allow list"))?;
+        for entry in entries {
+            let harness = entry
+                .as_str()
+                .with_context(|| format!("roles.{role} allow holds a non-string entry"))?;
+            if !allowed.iter().any(|seen| seen == harness) {
+                allowed.push(harness.to_string());
             }
         }
     }
-    std::fs::write(&capability, crate::new::HARNESS_CAPABILITY_CONTENT)
-        .with_context(|| format!("failed to backfill {}", capability.display()))?;
-    info!(path = %capability.display(), "Backfilled harness capability map from the canonical default");
-    Ok(())
+    Ok(allowed)
+}
+
+/// The capability map for exactly these harnesses.
+///
+/// Every allowed harness is rated `standard`, keyed on the name the policy
+/// already uses rather than on any one model: the backfill's job is to unblock a
+/// project the controller would otherwise refuse at
+/// `_require_policy_coverage` (tl_loop/select/capability.py), and a map that
+/// named a different model would trade that startup error for a different one.
+/// Raising a rating above `standard` is the operator's call, made by editing the
+/// file after the backfill.
+fn capability_content_for(allowed: &[String]) -> String {
+    let mut content = String::from(
+        "# Static capability ratings. Each entry records the operator's basis.\n\n[capabilities]\n",
+    );
+    for harness in allowed {
+        content.push_str(&format!("# Basis: the harnesses this policy allows; standard tasks only.\n\"{harness}\" = \"standard\"\n"));
+    }
+    content
 }
 
 fn tl_loop_python_with<F>(env: F) -> String
@@ -7272,6 +7324,7 @@ fn log_ignored_effort(role: &str, agent_type: AgentType, effort: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_model::REJECTED_SCAFFOLD_MODEL;
     use crate::config::{
         validate_session_name, SessionNameSource, SessionNameTooLong,
         DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS, DEFAULT_TL_DISPATCH_RETRY_LIMIT,
@@ -7283,6 +7336,96 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn backfilled_capability_covers_the_models_the_policy_names() {
+        // A policy the operator widened past the scaffold's model is the case
+        // this exists for: rating only one hard-coded model left the project
+        // stuck at `missing capability entry for codex/<model>`.
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join(".exo/harness_policy.toml");
+        std::fs::create_dir_all(policy.parent().unwrap()).unwrap();
+        std::fs::write(
+            &policy,
+            "[roles.worker]\nallow = [\"codex/resolved-model\", \"claude/sonnet\"]\n",
+        )
+        .unwrap();
+
+        ensure_harness_capability(dir.path()).unwrap();
+
+        let content =
+            std::fs::read_to_string(dir.path().join(".exo/harness_capability.toml")).unwrap();
+        let ratings: toml::Value = toml::from_str(&content).unwrap();
+        let table = ratings.get("capabilities").unwrap().as_table().unwrap();
+        for harness in ["codex/resolved-model", "claude/sonnet"] {
+            assert!(table.contains_key(harness), "no rating for {harness}");
+        }
+    }
+
+    #[test]
+    fn backfill_is_idempotent_and_leaves_an_existing_map_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".exo")).unwrap();
+        std::fs::write(
+            dir.path().join(".exo/harness_policy.toml"),
+            "[roles.tl]\nallow = [\"codex/some-model\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".exo/harness_capability.toml"),
+            "hand-rated = true\n",
+        )
+        .unwrap();
+
+        ensure_harness_capability(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".exo/harness_capability.toml")).unwrap(),
+            "hand-rated = true\n"
+        );
+    }
+
+    #[test]
+    fn backfill_refuses_a_policy_with_no_harness_to_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".exo")).unwrap();
+        std::fs::write(
+            dir.path().join(".exo/harness_policy.toml"),
+            "min_rounds = 1\n",
+        )
+        .unwrap();
+
+        let error = ensure_harness_capability(dir.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("no [roles] table"), "{error}");
+        assert!(
+            !dir.path().join(".exo/harness_capability.toml").exists(),
+            "a refused backfill must not leave a half-written map"
+        );
+    }
+
+    #[test]
+    fn backfill_never_introduces_the_rejected_model() {
+        // The backfill must rate what the policy names. If the policy does name
+        // the rejected model, that is the operator's hand-authored file and
+        // `exomonad new` refuses it; what must never happen is the backfill
+        // substituting one of its own.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".exo")).unwrap();
+        std::fs::write(
+            dir.path().join(".exo/harness_policy.toml"),
+            "[roles.tl]\nallow = [\"codex/supported-model\"]\n",
+        )
+        .unwrap();
+
+        ensure_harness_capability(dir.path()).unwrap();
+
+        let content =
+            std::fs::read_to_string(dir.path().join(".exo/harness_capability.toml")).unwrap();
+        assert!(!content.contains(REJECTED_SCAFFOLD_MODEL), "{content}");
+    }
 
     #[test]
     fn codex_protocol_delivery_is_prompt_independent() {

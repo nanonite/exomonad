@@ -54,6 +54,16 @@ PENDING_PROBE = ()
 #: a turn.
 SCAFFOLD_MODEL = "gpt-luna"
 
+#: The module `exomonad new` resolves the scaffold's Codex model through. The
+#: fixtures resolve theirs in bash (`e2e_python_tl_codex_model`); the shipped
+#: scaffold resolves its own so a project created by `exomonad new` provisions
+#: the same model the operator's own `codex` run uses.
+SCAFFOLD_MODULE = PROJECT_ROOT / "rust" / "exomonad" / "src" / "codex_model.rs"
+
+#: The override the shipped scaffold reads, so a project whose account cannot be
+#: discovered from disk still has a supported, explicit source.
+CODEX_MODEL_ENV_NAME = "EXOMONAD_CODEX_MODEL"
+
 
 def lib_source() -> str:
     return LIB.read_text(encoding="utf-8")
@@ -210,6 +220,158 @@ def test_the_probe_coverage_is_accounted_for() -> None:
         f"PROBE_WIRED {sorted(wired)} plus PENDING_PROBE {sorted(pending)} must be "
         f"an exact partition of SCENARIOS {sorted(SCENARIOS)}; a scenario may not "
         f"be dropped from both lists to silence a failure"
+    )
+
+
+# --------------------------------------------------------------------------
+# The shipped scaffold, which the fixtures' run.sh bootstrap with
+# --------------------------------------------------------------------------
+
+RESOLVER = "resolve_scaffold_harness"
+
+
+def test_the_scaffold_does_not_hard_code_a_model() -> None:
+    """`exomonad new` must provision a resolved model, not a literal one.
+
+    A literal provisions a model the operator's account may not be able to run,
+    which is how every scaffolded Codex worker came to be dispatched with a
+    name its account refuses before the first inference.
+    """
+    scaffold = (PROJECT_ROOT / "rust" / "exomonad" / "src" / "new.rs").read_text(
+        encoding="utf-8"
+    )
+    policy = scaffold.split("fn harness_policy_content", 1)[1].split("\n}\n", 1)[0]
+    code = "\n".join(
+        line for line in policy.splitlines() if not line.strip().startswith("#")
+    )
+    assert SCAFFOLD_MODEL not in code, (
+        f"harness_policy_content must not emit a literal '{SCAFFOLD_MODEL}'; it "
+        f"takes the resolved harness as a parameter"
+    )
+    assert "{codex_harness}" in code, (
+        "every allowlist entry must interpolate the resolved harness"
+    )
+    assert 'allow = ["{codex_harness}"]' in code
+
+
+def test_the_scaffold_resolves_the_model_before_writing_anything() -> None:
+    """Resolution has to precede the first write, or `new` leaves half a project.
+
+    `exomonad new` writes `.exo/config.toml` before the harness policy. A
+    resolution failure after that point leaves a directory that the next run
+    rejects as "project already exists", so the operator fixes the model and
+    still cannot proceed.
+    """
+    scaffold = (PROJECT_ROOT / "rust" / "exomonad" / "src" / "new.rs").read_text(
+        encoding="utf-8"
+    )
+    resolve = scaffold.index(RESOLVER)
+    for marker in (
+        "std::fs::write(&config_path",
+        "write_tl_loop_defaults(",
+    ):
+        assert resolve < scaffold.index(marker), (
+            f"the model must resolve before {marker!r}, or a failed resolution "
+            f"leaves a project behind that cannot be re-created"
+        )
+
+
+def test_the_scaffold_refuses_the_rejected_model() -> None:
+    """Reading the rejected name from the operator's config must still fail.
+
+    Refusing only the hard-coded literal would be enough to make the shipped
+    scaffold stop naming `gpt-luna`, but not enough to stop a config or an
+    `EXOMONAD_CODEX_MODEL` that carries it. The refusal lives with the
+    resolution so no source can route around it.
+    """
+    resolver = SCAFFOLD_MODULE.read_text(encoding="utf-8")
+    assert f'pub(crate) const REJECTED_SCAFFOLD_MODEL: &str = "{SCAFFOLD_MODEL}"' in resolver
+    refusal = resolver.split("fn reject_unrunnable_model", 1)[1].split("\n}\n", 1)[0]
+    assert "REJECTED_SCAFFOLD_MODEL" in refusal, (
+        "the refusal must compare against the rejected name, not re-spell it"
+    )
+    assert RESOLVER.split("(")[0] in resolver
+    # The refusal runs on the path that produces the harness key, so it cannot
+    # be skipped by anyone assembling a policy key from the model directly.
+    resolve_body = resolver.split(f"pub(crate) fn {RESOLVER}", 1)[1].split("\n}\n", 1)[0]
+    assert "reject_unrunnable_model(" in resolve_body, (
+        f"{RESOLVER} must apply the refusal; a name read from the operator's "
+        f"config is exactly how the rejected model would come back"
+    )
+
+
+def test_the_scaffold_refusal_names_the_model_and_the_issue() -> None:
+    """A refusal the operator cannot act on is the same as a silent skip."""
+    bail = _refusal_body()
+    assert "not supported when using Codex" in bail, (
+        "the refusal must quote the account's own reason so the operator "
+        "recognises it as a model problem, not a policy problem"
+    )
+    assert SCAFFOLD_MODEL in bail or "{model}" in bail, (
+        "the refusal must name the model it refuses"
+    )
+    # The message interpolates the constant rather than re-spelling its value,
+    # so the assertion is on the placeholder plus the constant's declaration.
+    assert "{CODEX_MODEL_ENV}" in bail, (
+        "the refusal must tell the operator how to supply a model instead"
+    )
+    resolver = SCAFFOLD_MODULE.read_text(encoding="utf-8")
+    assert f'pub(crate) const CODEX_MODEL_ENV: &str = "{CODEX_MODEL_ENV_NAME}"' in resolver
+    assert "1149" in bail, "the refusal must point at the filed issue"
+
+
+def _refusal_body() -> str:
+    """The text of the refusal, from `anyhow::bail!` to the end of the function."""
+    resolver = SCAFFOLD_MODULE.read_text(encoding="utf-8")
+    function = resolver.split("fn reject_unrunnable_model", 1)[1].split("\n}\n", 1)[0]
+    return function.split("anyhow::bail!", 1)[1]
+
+
+def test_the_scaffold_falls_back_to_the_hosts_own_codex_config() -> None:
+    """The scaffold reads the model a bare `codex` run uses.
+
+    That is the one model name already known to work on this account, so reading
+    it is what makes the scaffold follow the account rather than guess.
+    """
+    resolver = SCAFFOLD_MODULE.read_text(encoding="utf-8")
+    assert "CODEX_MODEL_ENV" in resolver, "an explicit override must take precedence"
+    assert "CODEX_HOME_ENV" in resolver, (
+        "the fallback must read the Codex config Codex itself honors, so the "
+        "scaffold and the operator's own `codex` run agree on the model"
+    )
+    assert ".codex" in resolver, (
+        "with CODEX_HOME unset the scaffold must still find ~/.codex/config.toml"
+    )
+    # No built-in default: a guess is what produced the rejected name.
+    resolve_body = resolver.split(f"pub(crate) fn {RESOLVER}", 1)[1].split("\n}\n", 1)[0]
+    assert SCAFFOLD_MODEL not in resolve_body, (
+        f"{RESOLVER} must not carry '{SCAFFOLD_MODEL}' as a default"
+    )
+
+
+def test_no_shipped_scaffold_document_names_the_rejected_model() -> None:
+    """Docs and config that tell operators to provision `gpt-luna` send them nowhere.
+
+    The scaffold's own model is now resolved, so a document still printing the
+    rejected name as the thing to configure would be the next place the name
+    comes from.
+    """
+    shipped = (
+        PROJECT_ROOT / "README.md",
+        PROJECT_ROOT / "CLAUDE.md",
+        PROJECT_ROOT / "docs" / "guides" / "programming-the-tl.md",
+        PROJECT_ROOT / "docs" / "guides" / "migrating-to-the-tl-loop.md",
+        PROJECT_ROOT / ".exo" / "harness_policy.toml",
+        PROJECT_ROOT / ".exo" / "harness_capability.toml",
+    )
+    offenders = [
+        str(path.relative_to(PROJECT_ROOT))
+        for path in shipped
+        if f'"{SCAFFOLD_MODEL}"' in path.read_text(encoding="utf-8")
+    ]
+    assert not offenders, (
+        f"documents/config still naming the rejected model as a harness entry: {offenders}. "
+        f"Name the model your Codex config selects, or describe it as resolved."
     )
 
 

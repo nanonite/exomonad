@@ -81,7 +81,7 @@ class HarnessChoice:
 def policy_approved_candidates(request: str, role_policy: RolePolicy) -> tuple[str, ...]:
     """Return the policy-approved harnesses one declared request may select.
 
-    A plan request is a harness identifier (``codex`` or ``codex/gpt-luna``).
+    A plan request is a harness identifier (``codex`` or ``codex/<model>``).
     Only harnesses the role's ``allow`` list already approves can answer it, so
     a request can never widen the allowlist:
 

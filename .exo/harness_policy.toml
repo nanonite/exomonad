@@ -1,20 +1,28 @@
 # Human-authored harness and budget boundaries for the TL loop.
 
+# The codex harness names a model the account can actually run. A ChatGPT-account
+# Codex login refuses `gpt-luna` — the name this file used to carry — with
+# "400 invalid_request_error: The 'gpt-luna' model is not supported when using
+# Codex with a ChatGPT account", so every worker was provisioned with a model it
+# could not take a turn on. `exomonad new` now resolves this name from the top-
+# level `model` in your Codex config (or EXOMONAD_CODEX_MODEL) instead of
+# hard-coding one. See Chainlink #1149.
+
 [roles.tl]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
+allow = ["codex/gpt-5.6-luna"]
+cost_rank = { "codex/gpt-5.6-luna" = 1 }
 token_budget = 120000
 escalate_after_attempts = 1
 
 [roles.worker]
-allow = ["codex/gpt-luna", "claude/sonnet"]
-cost_rank = { "codex/gpt-luna" = 1, "claude/sonnet" = 2 }
+allow = ["codex/gpt-5.6-luna", "claude/sonnet"]
+cost_rank = { "codex/gpt-5.6-luna" = 1, "claude/sonnet" = 2 }
 token_budget = 120000
-per_harness_budget = { "codex/gpt-luna" = 80000, "claude/sonnet" = 40000 }
+per_harness_budget = { "codex/gpt-5.6-luna" = 80000, "claude/sonnet" = 40000 }
 escalate_after_attempts = 1
 
 [roles.reviewer]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
+allow = ["codex/gpt-5.6-luna"]
+cost_rank = { "codex/gpt-5.6-luna" = 1 }
 token_budget = 60000
 escalate_after_attempts = 1

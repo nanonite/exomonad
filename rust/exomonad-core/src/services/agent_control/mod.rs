@@ -370,8 +370,13 @@ pub enum AgentType {
     Process,
 }
 
+// Deliberately names no model: every model probed against a ChatGPT-account
+// Codex login is refused the same way, so only that account knows which ones
+// run. Pointing at a name here would send operators to a model that cannot
+// take a turn. See `exomonad`'s `codex_model` module for where the scaffold
+// sources one instead.
 pub const AGENT_TYPE_DEPRECATION_MESSAGE: &str =
-    "agent_type 'gemini' is retired; use 'codex' (model gpt-luna). See CLAUDE.md Configuration."; // deprecation
+    "agent_type 'gemini' is retired; use 'codex' (model: the top-level `model` in your Codex config, or EXOMONAD_CODEX_MODEL). See CLAUDE.md Configuration."; // deprecation
 
 impl<'de> Deserialize<'de> for AgentType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

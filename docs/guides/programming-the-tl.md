@@ -61,30 +61,50 @@ This is the human's veto over what the controller may spend and on what.
 
 ```toml
 # Human-authored harness and budget boundaries for the TL loop.
+#
+# The codex entries name the model your Codex account can run — `exomonad new`
+# fills them in from the top-level `model` in your Codex config, or from
+# EXOMONAD_CODEX_MODEL. There is no built-in default: a model that no account
+# supports provisions workers that cannot take a turn.
 
 [roles.tl]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
+allow = ["codex/<your-model>"]
+cost_rank = { "codex/<your-model>" = 1 }
 token_budget = 120000
 escalate_after_attempts = 1
 task_timeout_seconds = 3600.0 # optional; zero disables the task ceiling
 
 [roles.worker]
-allow = ["codex/gpt-luna", "claude/sonnet"]
-cost_rank = { "codex/gpt-luna" = 1, "claude/sonnet" = 2 }
+allow = ["codex/<your-model>", "claude/sonnet"]
+cost_rank = { "codex/<your-model>" = 1, "claude/sonnet" = 2 }
 token_budget = 120000
-per_harness_budget = { "codex/gpt-luna" = 80000, "claude/sonnet" = 40000 }
+per_harness_budget = { "codex/<your-model>" = 80000, "claude/sonnet" = 40000 }
 escalate_after_attempts = 1
 
 [roles.reviewer]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
+allow = ["codex/<your-model>"]
+cost_rank = { "codex/<your-model>" = 1 }
 token_budget = 60000
 escalate_after_attempts = 1
 ```
 
 All three role tables — `tl`, `worker`, `reviewer` — must be present. Unknown
 role names and unknown keys are rejected.
+
+### The codex model has to be one your account can run
+
+`codex/<model>` is not a label. The controller splits it
+(`parse_harness_identifier`) and the model half becomes `model = ...` in the
+generated child config, so the string names the model each worker asks for. A
+model the account does not support fails on the first inference with a 400 from
+the provider, not with anything a budget or allowlist check can see.
+
+Which models those are depends entirely on the login, so nothing in ExoMonad
+can answer it. `exomonad new` therefore does not pick a model: it reads the
+top-level `model` from your Codex config — the same place a bare `codex` run
+without `--model` gets its own — or takes `EXOMONAD_CODEX_MODEL`, and refuses to
+scaffold at all when neither supplies one. The refusal names the model and the
+account's own rejection rather than emitting a policy that fails later.
 
 | Key | Rule |
 |-----|------|
@@ -333,8 +353,8 @@ It narrows the selector's candidate set to the harnesses
 approval, and the capability map and the role and per-harness token budgets
 still apply to the narrowed set. A bare agent type (`codex`) selects among the
 approved entries of that agent type, which keeps the model choice in policy
-instead of in the plan; a model-qualified value (`codex/gpt-luna`) must name an
-allowed entry exactly.
+instead of in the plan; a model-qualified value (`codex/<your-model>`) must name
+an allowed entry exactly.
 
 The request is either honored or refused, never silently replaced:
 
@@ -1044,7 +1064,7 @@ Only the validated plan identity and a bounded judgment audit record, in
   "document": { "run_id": "root", "plan": { "leaves": [] } },
   "audit": {
     "judgment": "decompose",
-    "model": "gpt-luna",
+    "model": "<the model that made the judgment>",
     "attempts": 2,
     "tokens": 418,
     "failures": 1,
@@ -1403,7 +1423,11 @@ A project must provide four files under `.exo/`: `config.toml`, `harness_policy.
 
 ```toml
 [capabilities]
-"codex/gpt-luna" = "standard"
+"codex/<your-model>" = "standard"
 ```
+
+Every key is the *same* string the policy allowlist uses. A map keyed on a
+different model is the same failure as a missing key: preflight rejects it with
+`missing capability entry for codex/<model>` before a run starts.
 
 Run `python3 ~/.exo/tl_loop.pyz preflight --project-root .` to validate all four files before starting the controller.

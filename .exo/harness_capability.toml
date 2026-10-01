@@ -1,7 +1,11 @@
 # Static capability ratings. Each entry records the operator's basis.
 
+# Every harness a role allows needs a rating here, keyed on the exact same name:
+# `_require_policy_coverage` (tl_loop/select/capability.py) rejects a policy
+# whose allowlist this map does not cover.
+
 [capabilities]
-# Basis: operator judgment for the default low-cost worker model; standard tasks only.
-"codex/gpt-luna" = "standard"
+# Basis: the Codex model this account can run; standard tasks only.
+"codex/gpt-5.6-luna" = "standard"
 # Basis: vendor tier and the configured escalation target; hard tasks are supported.
 "claude/sonnet" = "hard"

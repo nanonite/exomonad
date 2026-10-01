@@ -8,6 +8,7 @@
 
 mod app_state;
 mod clean;
+mod codex_model;
 mod codex_prune_trust;
 mod control;
 mod control_cleanup;

@@ -1,3 +1,4 @@
+use crate::codex_model;
 use anyhow::{anyhow, Context, Result};
 use exomonad::config::Config;
 use serde::Deserialize;
@@ -5,15 +6,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// Canonical capability-map template shared by project creation and init backfill.
-pub(crate) const HARNESS_CAPABILITY_CONTENT: &str = r#"# Static capability ratings. Each entry records the operator's basis.
-
-[capabilities]
-# Basis: operator judgment for the default low-cost worker model; standard tasks only.
-"codex/gpt-luna" = "standard"
-# Basis: vendor tier and the configured escalation target; hard tasks are supported.
-"claude/sonnet" = "hard"
-"#;
+/// Read an environment variable, treating an empty value as unset.
+///
+/// Blank means unset for every variable the resolver consults: `EXOMONAD_CODEX_MODEL=""`
+/// reads as "not supplied" rather than as an empty model name.
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
 
 /// Initialize a new exomonad project in the current directory.
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
@@ -26,9 +27,17 @@ pub async fn run(_name: Option<String>, reviewer_max_rounds: Option<u32>) -> Res
     }
 
     info!("Initializing new ExoMonad project");
+    // Resolve the model before writing anything, so a project is never left
+    // half-scaffolded around an unrunnable harness key: a failed resolution
+    // aborts with the operator's own name in the message and nothing on disk.
+    let codex_harness = codex_model::resolve_scaffold_harness(&process_env)?;
+    info!(
+        harness = codex_harness,
+        "Resolved the Codex harness for the harness policy"
+    );
     std::fs::create_dir_all(cwd.join(".exo"))?;
     std::fs::write(&config_path, config_content())?;
-    write_tl_loop_defaults(&cwd)?;
+    write_tl_loop_defaults(&cwd, &codex_harness)?;
 
     let policy_path = cwd.join(".exo/review-policy.toml");
     if !policy_path.exists() {
@@ -189,43 +198,71 @@ fn config_content() -> String {
     .to_string()
 }
 
-fn write_tl_loop_defaults(project_dir: &Path) -> std::io::Result<()> {
+fn write_tl_loop_defaults(project_dir: &Path, codex_harness: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(project_dir.join(".exo"))?;
     let policy_path = project_dir.join(".exo/harness_policy.toml");
     if !policy_path.exists() {
-        std::fs::write(
-            &policy_path,
-            r#"# Human-authored harness and budget boundaries for the TL loop.
-
-[roles.tl]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
-token_budget = 120000
-escalate_after_attempts = 1
-
-[roles.worker]
-allow = ["codex/gpt-luna", "claude/sonnet"]
-cost_rank = { "codex/gpt-luna" = 1, "claude/sonnet" = 2 }
-token_budget = 120000
-per_harness_budget = { "codex/gpt-luna" = 80000, "claude/sonnet" = 40000 }
-escalate_after_attempts = 1
-
-[roles.reviewer]
-allow = ["codex/gpt-luna"]
-cost_rank = { "codex/gpt-luna" = 1 }
-token_budget = 60000
-escalate_after_attempts = 1
-"#,
-        )?;
-        info!("Created .exo/harness_policy.toml");
+        std::fs::write(&policy_path, harness_policy_content(codex_harness))?;
+        info!(harness = codex_harness, "Created .exo/harness_policy.toml");
     }
 
     let capability_path = project_dir.join(".exo/harness_capability.toml");
     if !capability_path.exists() {
-        std::fs::write(&capability_path, HARNESS_CAPABILITY_CONTENT)?;
+        std::fs::write(&capability_path, harness_capability_content(codex_harness))?;
         info!("Created .exo/harness_capability.toml");
     }
     Ok(())
+}
+
+/// Canonical harness-policy template, allowlisted on the resolved Codex harness.
+///
+/// The policy key is `codex/<model>`: the controller splits it
+/// (`parse_harness_identifier`, `tl_loop/select/harness.py`) and the model half
+/// becomes `model = ...` in the generated child config, so this string is the
+/// model every scaffolded worker is provisioned with.
+pub(crate) fn harness_policy_content(codex_harness: &str) -> String {
+    format!(
+        r#"# Human-authored harness and budget boundaries for the TL loop.
+
+[roles.tl]
+allow = ["{codex_harness}"]
+cost_rank = {{ "{codex_harness}" = 1 }}
+token_budget = 120000
+escalate_after_attempts = 1
+
+[roles.worker]
+allow = ["{codex_harness}", "claude/sonnet"]
+cost_rank = {{ "{codex_harness}" = 1, "claude/sonnet" = 2 }}
+token_budget = 120000
+per_harness_budget = {{ "{codex_harness}" = 80000, "claude/sonnet" = 40000 }}
+escalate_after_attempts = 1
+
+[roles.reviewer]
+allow = ["{codex_harness}"]
+cost_rank = {{ "{codex_harness}" = 1 }}
+token_budget = 60000
+escalate_after_attempts = 1
+"#
+    )
+}
+
+/// Canonical capability-map template, rated for the resolved Codex harness.
+///
+/// Both the codex entry and the claude escalation entry are required:
+/// `_require_policy_coverage` (`tl_loop/select/capability.py`) rejects a policy
+/// whose allowlist the capability map does not cover, so a capability map that
+/// names a different Codex harness than the policy refuses the run at preflight.
+pub(crate) fn harness_capability_content(codex_harness: &str) -> String {
+    format!(
+        r#"# Static capability ratings. Each entry records the operator's basis.
+
+[capabilities]
+# Basis: the Codex model the account can run, resolved at scaffold time; standard tasks only.
+"{codex_harness}" = "standard"
+# Basis: vendor tier and the configured escalation target; hard tasks are supported.
+"claude/sonnet" = "hard"
+"#
+    )
 }
 fn forgejo_ssh_remote_url(
     forgejo_url: &str,
@@ -438,10 +475,12 @@ async fn register_forgejo_repo(
 mod tests {
     use super::*;
 
+    const HARNESS: &str = "codex/gpt-5.6-luna";
+
     #[test]
     fn tl_loop_defaults_are_created_and_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        write_tl_loop_defaults(dir.path()).unwrap();
+        write_tl_loop_defaults(dir.path(), HARNESS).unwrap();
 
         let policy = dir.path().join(".exo/harness_policy.toml");
         let capability = dir.path().join(".exo/harness_capability.toml");
@@ -450,9 +489,67 @@ mod tests {
         let original = std::fs::read_to_string(&policy).unwrap();
 
         std::fs::write(&policy, "custom = true\n").unwrap();
-        write_tl_loop_defaults(dir.path()).unwrap();
+        write_tl_loop_defaults(dir.path(), HARNESS).unwrap();
         assert_eq!(std::fs::read_to_string(policy).unwrap(), "custom = true\n");
         assert!(!original.is_empty());
+    }
+
+    #[test]
+    fn scaffold_policy_and_capability_agree_on_the_resolved_harness() {
+        // The two files are read by different preflight checks: the policy is
+        // the allowlist, and `_require_policy_coverage` (tl_loop/select/
+        // capability.py) rejects an allowlist the capability map does not cover.
+        // A harness in one and not the other refuses the run before dispatch.
+        let dir = tempfile::tempdir().unwrap();
+        write_tl_loop_defaults(dir.path(), HARNESS).unwrap();
+
+        let policy: toml::Value = toml::from_str(
+            &std::fs::read_to_string(dir.path().join(".exo/harness_policy.toml")).unwrap(),
+        )
+        .unwrap();
+        let capability: toml::Value = toml::from_str(
+            &std::fs::read_to_string(dir.path().join(".exo/harness_capability.toml")).unwrap(),
+        )
+        .unwrap();
+        let ratings = capability.get("capabilities").unwrap().as_table().unwrap();
+        for role in ["tl", "worker", "reviewer"] {
+            let allow = policy
+                .get("roles")
+                .and_then(|r| r.get(role))
+                .and_then(|r| r.get("allow"))
+                .and_then(toml::Value::as_array)
+                .unwrap_or_else(|| panic!("roles.{role} must have an allow list"));
+            assert!(!allow.is_empty(), "roles.{role} must allow something");
+            for entry in allow {
+                let harness = entry.as_str().unwrap();
+                assert!(ratings.contains_key(harness), "no rating for {harness}");
+            }
+        }
+    }
+
+    #[test]
+    fn scaffold_never_provisions_the_rejected_model() {
+        // The name the scaffold used to hard-code. A ChatGPT-account login
+        // refuses it before the worker's first inference, so a scaffold naming
+        // it provisions a worker that cannot take a turn. Chainlink #1149.
+        let dir = tempfile::tempdir().unwrap();
+        write_tl_loop_defaults(dir.path(), HARNESS).unwrap();
+
+        for name in ["harness_policy.toml", "harness_capability.toml"] {
+            let content = std::fs::read_to_string(dir.path().join(".exo").join(name)).unwrap();
+            assert!(
+                !content.contains(codex_model::REJECTED_SCAFFOLD_MODEL),
+                ".exo/{name} still names the rejected model"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_content_rates_the_resolved_harness() {
+        let content = harness_capability_content(HARNESS);
+        assert!(content.contains(&format!("\"{HARNESS}\" = \"standard\"")));
+        assert!(content.contains("\"claude/sonnet\" = \"hard\""));
+        assert!(!content.contains(codex_model::REJECTED_SCAFFOLD_MODEL));
     }
 
     #[test]
