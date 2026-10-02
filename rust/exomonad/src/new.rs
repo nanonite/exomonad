@@ -18,13 +18,22 @@ fn process_env(name: &str) -> Option<String> {
 
 /// Initialize a new exomonad project in the current directory.
 /// Creates .exo/config.toml, .gitignore entries, copies WASM, and rules template.
-pub async fn run(_name: Option<String>, reviewer_max_rounds: Option<u32>) -> Result<()> {
+pub async fn run(
+    _name: Option<String>,
+    reviewer_max_rounds: Option<u32>,
+    retire_stale_codex_root_config: bool,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let config_path = cwd.join(".exo/config.toml");
 
     if config_path.exists() {
         anyhow::bail!("ExoMonad project already exists (found .exo/config.toml)");
     }
+
+    // Before anything is scaffolded: an older ExoMonad's project-root
+    // `.codex/config.toml` applies to every Codex session opened in this
+    // directory, not just to the agent it was written for (chainlink #1145).
+    exomonad_core::codex_stale_root_config::enforce(&cwd, retire_stale_codex_root_config)?;
 
     info!("Initializing new ExoMonad project");
     // Resolve the model before writing anything, so a project is never left

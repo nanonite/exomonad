@@ -47,6 +47,8 @@ pub mod ui_protocol;
 #[cfg(feature = "runtime")]
 pub mod codex_config;
 #[cfg(feature = "runtime")]
+pub mod codex_stale_root_config;
+#[cfg(feature = "runtime")]
 pub mod codex_trust_maintenance;
 #[cfg(feature = "runtime")]
 pub mod common;

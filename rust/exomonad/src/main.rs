@@ -169,6 +169,12 @@ enum Commands {
         /// Inspect explicit legacy sources without writing atlas.db.
         #[arg(long)]
         import_legacy_dry_run: bool,
+        /// Back up and move aside a stale ExoMonad-generated project-root
+        /// `.codex/config.toml` left by an ExoMonad older than this one. Without
+        /// this flag, init refuses to start while that file is present, because
+        /// Codex applies it to every session opened in the project.
+        #[arg(long = "retire-stale-codex-root-config")]
+        retire_stale_codex_root_config: bool,
     },
 
     /// Persist accepted recreate plan bytes supplied on stdin.
@@ -190,6 +196,12 @@ enum Commands {
         /// Maximum review rounds before a PR is escalated to Stuck (default: 5)
         #[arg(long)]
         reviewer_max_rounds: Option<u32>,
+        /// Back up and move aside a stale ExoMonad-generated project-root
+        /// `.codex/config.toml` left by an ExoMonad older than this one. Without
+        /// this flag, new refuses to scaffold while that file is present,
+        /// because Codex applies it to every session opened in the project.
+        #[arg(long = "retire-stale-codex-root-config")]
+        retire_stale_codex_root_config: bool,
     },
 
     /// Recompile WASM plugin from Haskell source
@@ -577,6 +589,7 @@ async fn main() -> Result<()> {
             reset_inbox,
             import_legacy,
             import_legacy_dry_run,
+            retire_stale_codex_root_config,
         } => {
             let mode = init::SessionMode::resolve(start, continue_, recreate)?;
             if let Err(e) = init::run(
@@ -600,6 +613,7 @@ async fn main() -> Result<()> {
                 reset_inbox,
                 import_legacy,
                 import_legacy_dry_run,
+                retire_stale_codex_root_config,
             )
             .await
             {
@@ -618,8 +632,9 @@ async fn main() -> Result<()> {
         Commands::New {
             name,
             reviewer_max_rounds,
+            retire_stale_codex_root_config,
         } => {
-            new::run(name, reviewer_max_rounds).await?;
+            new::run(name, reviewer_max_rounds, retire_stale_codex_root_config).await?;
         }
 
         Commands::Reply {

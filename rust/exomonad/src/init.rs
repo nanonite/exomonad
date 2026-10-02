@@ -5760,6 +5760,7 @@ pub async fn run(
     reset_inbox: bool,
     import_legacy: Vec<PathBuf>,
     import_legacy_dry_run: bool,
+    retire_stale_codex_root_config: bool,
 ) -> Result<()> {
     use exomonad_core::services::tmux_ipc::TmuxIpc;
     use exomonad_core::services::{resolve_role_context_path, AgentType, InboxStore};
@@ -5772,6 +5773,12 @@ pub async fn run(
     if !config_path.exists() {
         anyhow::bail!("No exomonad project found. Run `exomonad new` first.");
     }
+
+    // Before any configuration, inbox, capability, plan, or orchestration side
+    // effect: an older ExoMonad's project-root `.codex/config.toml` applies to
+    // every Codex session opened in this project, not just to the agent it was
+    // written for (chainlink #1145).
+    exomonad_core::codex_stale_root_config::enforce(&cwd, retire_stale_codex_root_config)?;
 
     // Validate ExoMonad-owned runtime artifacts before any configuration,
     // inbox, capability, plan, or orchestration side effect.

@@ -410,7 +410,19 @@ the ignore rule.
 
 The `SessionStart` hook is critical for child processes that request context inheritance — it registers the Claude session UUID in `ClaudeSessionRegistry` for the host spawn handler. Without it, such child processes start with no inherited context.
 
-Codex agents use per-agent `.codex/config.toml` files for MCP and hook settings.
+**Codex project-root configs are never written, and a stale one is fatal to start.** Codex agents use per-agent `.codex/config.toml` files for MCP and hook settings — one per agent directory (`.exo/agents/<agent>/`, including `.exo/agents/<companion>/`), never at the project root. Codex applies a project-root config to *every* session opened in the project, not just to the agent it was written for, so ExoMonad writes none. ExoMonad used to write one at the project root for a Codex root agent; projects set up before that changed still carry the gitignored file, and nothing removes it for you because the path may equally be yours (`rust/exomonad-core/src/codex_stale_root_config.rs`).
+
+Both `exomonad init` and `exomonad new` check for it before any other side effect and **refuse to start** while it is present, naming the file and the exact repair:
+
+```bash
+mv .codex/config.toml .codex/config.toml.exomonad-stale.1.bak
+# or, equivalently:
+exomonad init --retire-stale-codex-root-config
+```
+
+Recognition requires two independent signals, because one alone is not evidence ExoMonad wrote the file: an `mcp_servers.exomonad` entry in ExoMonad's own `mcp-stdio --role <tl|root> --name <agent>` form, **and** at least one `<exomonad> hook <pre-tool-use|post-tool-use|stop> --runtime codex` command under `hooks`. Only `hooks` subtrees are searched, so prose in `developer_instructions` quoting a hook command is not a signal; a file that does not parse as TOML is never claimed. A hand-written project-root `.codex/config.toml` is left completely alone.
+
+The flag *moves* the file to the first unused `.codex/config.toml.exomonad-stale.<n>.bak`; it never overwrites a backup and never edits the file. ExoMonad will not silently edit or delete it. The Codex *hook trust* the retired config left in `~/.codex/config.toml` is not reclaimed automatically — that residue is operator-only, through `exomonad codex-prune-trust` (see `rust/exomonad-core/src/codex_trust_maintenance.rs`).
 
 **Claude Code settings help:** We have a Claude Code configuration specialist (preloaded with official documentation) available as an oracle for hook syntax, settings structure, MCP setup, and debugging.
 
