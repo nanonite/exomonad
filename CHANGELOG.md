@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Detect and retire a stale ExoMonad-generated project-root .codex/config.toml (#1145)
 - Fix exomonad serve never becoming healthy for the chainlink-codex e2e fixture (#1150)
 - Stop provisioning the unsupported gpt-luna model in Codex fixtures and the new scaffold (#1149)
 - Make plan agent type requests policy-bound and effective (#1128)
