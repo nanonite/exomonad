@@ -2264,8 +2264,9 @@ Run `exomonad recompile` first to build it.",
     }
     info!("MCP server exited gracefully");
 
-    // The socket and the pid record go back when `_server_artifacts` drops,
-    // which is what makes the cleanup above hold on the error paths too.
+    // The socket goes back when `_server_artifacts` drops, which is what makes
+    // the cleanup hold on the error paths too. The pid record stays as a
+    // tombstone; see `ServerArtifacts`.
     info!("MCP server shut down");
     Ok(())
 }

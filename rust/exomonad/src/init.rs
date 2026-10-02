@@ -11987,10 +11987,10 @@ mod tests {
         let pid_path = exo_dir.join("server.pid");
         let mut watch = ServerStartupWatch::default();
 
-        // The server records itself, and `ServerArtifacts::drop` then reclaims
-        // both artifacts on its way out -- exactly what a server that loses the
-        // TCP bind does. Re-reading the record now finds nothing, so only a
-        // latched pid can see the exit.
+        // The server records itself, exits, and `ServerArtifacts::drop` reclaims the
+        // socket while the record survives as a tombstone -- what a server that
+        // loses the TCP bind leaves behind. Reading that dead pid back is what
+        // makes the exit observable.
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let exited = child.id() as i32;
         std::fs::write(&pid_path, format!(r#"{{"pid":{exited}}}"#)).unwrap();
