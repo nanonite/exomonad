@@ -36,6 +36,62 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn, Instrument};
 
+/// The pid a `.exo/server.pid` record names, if it names one.
+fn recorded_server_pid(server_pid_path: &StdPath) -> Option<i32> {
+    let record = std::fs::read_to_string(server_pid_path).ok()?;
+    let pid = serde_json::from_str::<serde_json::Value>(&record)
+        .ok()?
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)?
+        .try_into()
+        .ok()?;
+    (pid > 1).then_some(pid)
+}
+
+/// Reclaims the socket and pid record `exomonad serve` owns, on every exit path.
+///
+/// The server binds its Unix socket before its public TCP listener and can still
+/// fail after that -- a contended port, a permissions failure, a listener error
+/// -- and the shutdown step that used to own this cleanup only ran once both
+/// listeners had returned `Ok`. Every one of those paths left a socket file that
+/// no process would ever answer on, and `init` then spent its whole startup
+/// budget health-checking a server that had already exited.
+struct ServerArtifacts {
+    socket_path: PathBuf,
+    server_pid_path: PathBuf,
+    pid: i32,
+}
+
+impl ServerArtifacts {
+    fn arm(socket_path: &StdPath, server_pid_path: &StdPath) -> Self {
+        Self {
+            socket_path: socket_path.to_path_buf(),
+            server_pid_path: server_pid_path.to_path_buf(),
+            pid: std::process::id() as i32,
+        }
+    }
+}
+
+impl Drop for ServerArtifacts {
+    fn drop(&mut self) {
+        // A successor server may already own these paths; only reclaim the
+        // record this process wrote.
+        if recorded_server_pid(&self.server_pid_path) != Some(self.pid) {
+            return;
+        }
+        remove_owned_artifact(&self.server_pid_path, "server.pid");
+        remove_owned_artifact(&self.socket_path, "server socket");
+    }
+}
+
+fn remove_owned_artifact(path: &StdPath, label: &str) {
+    match std::fs::remove_file(path) {
+        Ok(()) => info!(path = %path.display(), "Cleaned up {label}"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(path = %path.display(), %error, "Could not clean up {label}"),
+    }
+}
+
 fn parse_reviewer_max_rounds_override(value: Option<&str>) -> Result<Option<u32>> {
     let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
@@ -1970,6 +2026,9 @@ Run `exomonad recompile` first to build it.",
     }
     std::fs::write(&server_pid_path, serde_json::to_string_pretty(&pid_info)?)?;
     info!(path = %server_pid_path.display(), "Wrote server.pid");
+    // From here on this process owns the socket and the pid record, so every
+    // exit path has to give them back rather than leave a dead socket behind.
+    let _server_artifacts = ServerArtifacts::arm(&socket_path, &server_pid_path);
 
     let reviewer_max_rounds = reviewer_max_rounds_override_from_env()?;
     let review_policy =
@@ -2180,9 +2239,6 @@ Run `exomonad recompile` first to build it.",
         "Plugins ready, accepting connections"
     );
 
-    let socket_path_for_cleanup = socket_path.clone();
-    let server_pid_for_cleanup = server_pid_path.clone();
-
     // Run both listeners with graceful shutdown on SIGINT, SIGTERM, or /shutdown endpoint.
     let uds_shutdown_signal = shutdown_signal.clone();
     let uds_server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal_future(
@@ -2201,16 +2257,8 @@ Run `exomonad recompile` first to build it.",
     }
     info!("MCP server exited gracefully");
 
-    // Clean up socket and pid on shutdown
-    if socket_path_for_cleanup.exists() {
-        let _ = std::fs::remove_file(&socket_path_for_cleanup);
-        info!("Cleaned up server socket");
-    }
-    if server_pid_for_cleanup.exists() {
-        let _ = std::fs::remove_file(&server_pid_for_cleanup);
-        info!("Cleaned up server.pid");
-    }
-
+    // The socket and the pid record go back when `_server_artifacts` drops,
+    // which is what makes the cleanup above hold on the error paths too.
     info!("MCP server shut down");
     Ok(())
 }
@@ -2220,6 +2268,56 @@ mod tests {
     use super::*;
     use exomonad_core::mcp::tools::MCPCallOutput;
     use exomonad_core::services::InboxMessageRecord;
+
+    fn stub_project() -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".exo")).unwrap();
+        project
+    }
+
+    #[test]
+    fn server_artifacts_are_reclaimed_when_the_server_exits() {
+        let project = stub_project();
+        let socket_path = project.path().join(".exo/server.sock");
+        let pid_path = project.path().join(".exo/server.pid");
+        // The socket stands in for the one the listener would have bound.
+        std::fs::write(&socket_path, b"").unwrap();
+        std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, std::process::id())).unwrap();
+
+        drop(ServerArtifacts::arm(&socket_path, &pid_path));
+
+        assert!(!socket_path.exists(), "socket must not outlive serve");
+        assert!(!pid_path.exists(), "pid record must not outlive serve");
+    }
+
+    #[test]
+    fn server_artifacts_leave_a_successors_own_pieces_alone() {
+        let project = stub_project();
+        let socket_path = project.path().join(".exo/server.sock");
+        let pid_path = project.path().join(".exo/server.pid");
+        std::fs::write(&socket_path, b"").unwrap();
+        // A successor server already owns these paths by the time this process
+        // unwinds, so its socket and record must survive.
+        let successor_pid = format!(r#"{{"pid":{}}}"#, i32::MAX);
+        std::fs::write(&pid_path, successor_pid).unwrap();
+
+        drop(ServerArtifacts::arm(&socket_path, &pid_path));
+
+        assert!(socket_path.exists(), "a successor's socket must survive");
+        assert!(pid_path.exists(), "a successor's pid record must survive");
+    }
+
+    #[test]
+    fn reclaiming_absent_server_artifacts_is_not_an_error() {
+        let project = stub_project();
+        let socket_path = project.path().join(".exo/server.sock");
+        let pid_path = project.path().join(".exo/server.pid");
+        std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, std::process::id())).unwrap();
+
+        drop(ServerArtifacts::arm(&socket_path, &pid_path));
+
+        assert!(!pid_path.exists());
+    }
 
     #[tokio::test]
     async fn unresolved_agent_identity_returns_contextual_json() {

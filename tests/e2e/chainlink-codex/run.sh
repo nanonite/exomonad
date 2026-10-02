@@ -234,13 +234,15 @@ poll_interval = 5
 #
 # port = 0 takes an ephemeral port for the public webhook/health listener, which
 # this scenario never uses -- it pushes nothing and receives nothing. Without it
-# serve defaults to 7433, and a server left behind by any earlier run still
-# holds 7433, so this run binds the UDS, loses the TCP bind, exits 1 and leaves a
-# dead socket for init's health check to wait out its full 30s budget on. Every
-# other e2e server scenario here sets a port for the same reason (claude-only,
-# claude-teams-inbox, codex-reviewer-sandbox). The two product defects behind
-# that -- serve is never reaped, and the leftover socket turns a fast failure
-# into a 30s wait -- are Chainlink #1150 and are not fixed by this.
+# serve defaults to 7433 and a server left behind by any earlier run still holds
+# it, so this run binds the UDS, loses the TCP bind and exits 1. Every other e2e
+# server scenario here sets a port for the same reason (claude-only,
+# claude-teams-inbox, codex-reviewer-sandbox). Two product defects behind that
+# failure are fixed (#1150): serve now reclaims its socket and pid record on every
+# exit path, and init reports a server that exited during startup together with the
+# Server window's own output instead of waiting out its 30s budget on a socket
+# nothing would answer. The port stays 0 because the collision is real, not
+# because its symptoms have been hidden.
 
 [[companions]]
 name = "chainlink-codex-validator"

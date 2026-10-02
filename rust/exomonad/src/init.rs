@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Explicit lifecycle choice for an `exomonad init` invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5125,9 +5125,92 @@ async fn launch_server_recovery(
         )
         .await?;
     ipc.set_window_remain_on_exit(&server_window, true).await?;
-    wait_for_server_socket(project_dir).await?;
+    let routing = exomonad_core::domain::RoutingInfo::window(server_window.clone());
+    wait_for_server_startup(
+        project_dir,
+        ServerProcessProbe::Window(&routing),
+        ipc,
+        &server_window,
+    )
+    .await?;
     report_observability_health(project_dir);
     Ok(())
+}
+
+/// Whether the startup wait can observe `exomonad serve` exiting directly.
+///
+/// The two ways `init` starts the server do not agree on whether tmux watches
+/// the server or the shell around it, and only the first can report an exit
+/// without consulting the server's artifacts.
+enum ServerProcessProbe<'a> {
+    /// The window's own process is `serve`, so a dead window is a dead server.
+    /// `remain-on-exit` keeps that window addressable after it exits, which is
+    /// what makes its captured output readable as the failure reason.
+    Window(&'a exomonad_core::domain::RoutingInfo),
+    /// The window runs a shell that `serve` was typed into, so the window's
+    /// liveness tracks the shell and says nothing about the server. Only the
+    /// server's own artifacts are available.
+    ShellOnly,
+}
+
+/// Wait for the server to be ready, reporting the window's output on failure.
+///
+/// `serve` reaps its socket and pid record when it exits, so after a failed
+/// start there is nothing left on disk to poll. Where the window watches `serve`
+/// directly its exit is the signal; where it does not, a server that exits
+/// without ever binding leaves the same trace as one that is merely slow, and
+/// only the window's retained output carries the reason.
+async fn wait_for_server_startup(
+    project_dir: &Path,
+    probe: ServerProcessProbe<'_>,
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    window: &exomonad_core::services::tmux_ipc::WindowId,
+) -> Result<()> {
+    match wait_for_server_socket(project_dir).await {
+        Ok(()) => Ok(()),
+        Err(error) => Err(match server_process_exited(ipc, probe).await {
+            Some(reason) => {
+                let reason = match capture_or_warn(ipc, window.as_str()).await {
+                    Some(output) => startup_failure_with_pane_output(reason, &output),
+                    None => reason,
+                };
+                error!(reason = %reason, "Server process exited during startup");
+                anyhow::anyhow!("{reason}")
+            }
+            None => server_startup_error_with_pane_output(ipc, window, error).await,
+        }),
+    }
+}
+
+/// The reason a server process is gone, if the wait could observe it exit.
+async fn server_process_exited(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    probe: ServerProcessProbe<'_>,
+) -> Option<String> {
+    let ServerProcessProbe::Window(routing) = probe else {
+        return None;
+    };
+    match ipc.routing_target_process_alive(routing).await {
+        Ok(true) => None,
+        Ok(false) => Some("exomonad serve exited before the server became healthy".to_owned()),
+        Err(error) => {
+            warn!(%error, "Could not probe the Server window for process liveness");
+            None
+        }
+    }
+}
+
+async fn capture_or_warn(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    target: &str,
+) -> Option<String> {
+    match ipc.capture_pane(target).await {
+        Ok(output) => Some(output),
+        Err(error) => {
+            warn!(%error, "Could not capture the Server window output");
+            None
+        }
+    }
 }
 
 async fn launch_tl_recovery(
@@ -5212,8 +5295,16 @@ async fn reconcile_existing_session(
             }
             None => false,
         };
-        if server_alive {
-            wait_for_server_socket(project_dir).await?;
+        if let (true, Some(window)) = (server_alive, server_window) {
+            // The window watches `serve` directly, so its exit is observable.
+            let routing = exomonad_core::domain::RoutingInfo::window(window.window_id.clone());
+            wait_for_server_startup(
+                project_dir,
+                ServerProcessProbe::Window(&routing),
+                ipc,
+                &window.window_id,
+            )
+            .await?;
         } else {
             if let Some(window) = server_window {
                 info!(window = %window.window_id, "Server window is dead, removing before recovery");
@@ -5596,6 +5687,25 @@ async fn tl_controller_startup_failure(
         warn!(%error, "Failed to persist TL controller startup failure");
     }
     anyhow::bail!("TL controller failed during startup in tmux window {window_id}: {reason}");
+}
+
+/// Attach the Server window's own output to a server startup failure.
+///
+/// `serve` runs as a command inside the Server window's shell, so its exit
+/// status and stderr land in that pane rather than in `init`. The pane is the
+/// only place the actual reason -- a contended port, a missing plugin -- is
+/// written down, so a failure reported without it is a failure the operator
+/// still cannot act on.
+async fn server_startup_error_with_pane_output(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    server_target: &exomonad_core::services::tmux_ipc::WindowId,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let reason = format!("{error}; output of the Server window:");
+    match capture_or_warn(ipc, server_target.as_str()).await {
+        Some(output) => anyhow::anyhow!("{}", startup_failure_with_pane_output(reason, &output)),
+        None => error,
+    }
 }
 
 fn startup_failure_with_pane_output(fallback_reason: String, output: &str) -> String {
@@ -6419,7 +6529,12 @@ pub async fn run(
     }
 
     // 4. Wait for the server before launching the controller or Watcher.
-    wait_for_server_socket(&cwd).await?;
+    //
+    // The Server window runs a shell, so its pane liveness cannot report that
+    // `serve` exited -- only the shell's exit would. `wait_for_server_socket`
+    // decides that from the server's own artifacts, and the pane is read for the
+    // reason once it has.
+    wait_for_server_startup(&cwd, ServerProcessProbe::ShellOnly, &ipc, &server_target).await?;
     report_observability_health(&cwd);
     if mode == SessionMode::Continue {
         clean::report_continue_cleanup(&cwd).await;
@@ -7193,51 +7308,138 @@ fn remove_server_artifact(path: &Path) -> Result<()> {
     }
 }
 
+/// Clear server artifacts that no live server owns.
+///
+/// Both artifacts are stale together or not at all: a live server always has
+/// both, and `serve` reaps both when it exits. Clearing the pid record even
+/// when no socket is present is what keeps a record left by an older run from
+/// being read as this run's server dying during startup.
 fn prepare_server_socket_for_start(project_dir: &Path) -> Result<()> {
-    let socket_path = project_dir.join(".exo/server.sock");
-    if !socket_path.exists() || server_pid_is_alive(&project_dir.join(".exo/server.pid")) {
+    let pid_path = project_dir.join(".exo/server.pid");
+    if server_pid_is_alive(&pid_path) {
         return Ok(());
     }
 
-    remove_server_artifact(&socket_path)?;
-    remove_server_artifact(&project_dir.join(".exo/server.pid"))?;
+    remove_server_artifact(&project_dir.join(".exo/server.sock"))?;
+    remove_server_artifact(&pid_path)?;
     Ok(())
 }
 
-#[cfg(test)]
-async fn wait_for_socket_path(socket_path: &Path, timeout_dur: Duration) -> Result<()> {
-    wait_for_socket_path_until(socket_path, Instant::now() + timeout_dur, timeout_dur).await
+/// Why a waiting `init` can stop waiting: the server is already gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerStartupFailure {
+    /// The recorded server process has exited, so no socket will ever answer.
+    ProcessExited(i32),
+    /// A socket exists but nothing is listening, so it is a dead server's
+    /// leftover rather than a server still coming up.
+    SocketNotListening,
 }
 
-async fn wait_for_socket_path_until(
-    socket_path: &Path,
+impl ServerStartupFailure {
+    /// The report a human needs, rather than a budget timeout that hides it.
+    fn describe(&self, project_dir: &Path) -> String {
+        match self {
+            Self::ProcessExited(pid) => format!(
+                "exomonad serve (pid {pid}) exited before the server became healthy. \
+                 Read the Server window of the ExoMonad tmux session for the reason it exited."
+            ),
+            Self::SocketNotListening => format!(
+                "A server socket exists at {} but nothing is listening on it, so the server \
+                 that created it is gone. Run `exomonad init --recreate` to clear it.",
+                project_dir.join(".exo/server.sock").display()
+            ),
+        }
+    }
+}
+
+/// Detect a server that has already given up, so `init` reports the real cause
+/// instead of waiting out its whole budget on a socket nothing will answer.
+///
+/// A pid record that names a dead process is decisive: `serve` writes that
+/// record before it binds anything, and reaps it when it exits. An absent or
+/// unreadable record proves nothing, because the server may not have written it
+/// yet, so only the socket's own reachability settles that case.
+fn server_startup_failure(project_dir: &Path) -> Option<ServerStartupFailure> {
+    match read_server_pid_record(&project_dir.join(".exo/server.pid")) {
+        ServerPidRecord::Pid(pid) if pid_is_dead(pid) => {
+            Some(ServerStartupFailure::ProcessExited(pid))
+        }
+        ServerPidRecord::Pid(_) => None,
+        ServerPidRecord::Absent | ServerPidRecord::Unreadable => {
+            let socket_path = project_dir.join(".exo/server.sock");
+            (socket_path.exists() && !server_socket_is_live(&socket_path))
+                .then_some(ServerStartupFailure::SocketNotListening)
+        }
+    }
+}
+
+/// Sleep until the next health poll, or fail once the deadline has passed.
+async fn sleep_until_next_poll(deadline: Instant) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let sleep_duration = SERVER_HEALTH_POLL_INTERVAL.min(remaining);
+    anyhow::ensure!(
+        !sleep_duration.is_zero(),
+        "startup budget elapsed before the next poll"
+    );
+    tokio::time::sleep(sleep_duration).await;
+    Ok(())
+}
+
+/// Report why the server will never come up, rather than a budget timeout.
+///
+/// The failure is logged before it is returned so the reason survives in the
+/// run's log even where only a terse exit status is reported.
+fn server_startup_failure_error(
+    failure: &ServerStartupFailure,
+    project_dir: &Path,
+) -> anyhow::Error {
+    let reason = failure.describe(project_dir);
+    error!(reason = %reason, "Server startup failed");
+    anyhow::anyhow!("{reason}")
+}
+
+pub async fn wait_for_server_socket(project_dir: &Path) -> Result<()> {
+    let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
+    wait_for_server_socket_until(project_dir, deadline, SERVER_STARTUP_TIMEOUT).await
+}
+
+/// The wait `wait_for_server_socket` performs, with an explicit deadline.
+///
+/// A server that exits during startup leaves a socket nothing will answer on, so
+/// both the socket-appearance wait and the health wait stop as soon as the
+/// server is provably gone. Waiting out the budget in that case reported a
+/// timeout for a process that had already exited, which is what made a dead
+/// server indistinguishable from a slow one.
+async fn wait_for_server_socket_until(
+    project_dir: &Path,
     deadline: Instant,
     timeout_dur: Duration,
 ) -> Result<()> {
+    let socket_path = project_dir.join(".exo/server.sock");
     while Instant::now() < deadline {
         if socket_path.exists() {
-            return Ok(());
+            return wait_for_server_health_until(project_dir, deadline).await;
         }
-        let sleep_duration =
-            SERVER_HEALTH_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
-        if sleep_duration.is_zero() {
-            break;
+        if let Some(failure) = server_startup_failure(project_dir) {
+            return Err(server_startup_failure_error(&failure, project_dir));
         }
-        tokio::time::sleep(sleep_duration).await;
+        let _ = sleep_until_next_poll(deadline).await;
     }
 
     anyhow::bail!(
         "Server socket not found at {} after {}s.",
         socket_path.display(),
         timeout_dur.as_secs()
-    );
+    )
 }
 
-pub async fn wait_for_server_socket(project_dir: &Path) -> Result<()> {
+/// Wait for the server to answer `/health` over its socket.
+///
+/// The health endpoint does real work — resolving the WASM plugin — so a socket
+/// that is up can still take seconds to answer. The budget covers that; it does
+/// not cover a server that has already exited, which is reported on sight.
+async fn wait_for_server_health_until(project_dir: &Path, deadline: Instant) -> Result<()> {
     let socket_path = project_dir.join(".exo/server.sock");
-    let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
-    wait_for_socket_path_until(&socket_path, deadline, SERVER_STARTUP_TIMEOUT).await?;
-
     let client = uds_client::ServerClient::new(socket_path.to_path_buf());
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -7248,16 +7450,17 @@ pub async fn wait_for_server_socket(project_dir: &Path) -> Result<()> {
         {
             return Ok(());
         }
-        let sleep_duration =
-            SERVER_HEALTH_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()));
-        if sleep_duration.is_zero() {
+        if let Some(failure) = server_startup_failure(project_dir) {
+            return Err(server_startup_failure_error(&failure, project_dir));
+        }
+        if sleep_until_next_poll(deadline).await.is_err() {
             break;
         }
-        tokio::time::sleep(sleep_duration).await;
     }
 
     anyhow::bail!(
-        "Server socket exists but health check failed after {}s.",
+        "Server socket exists but health check failed after {}s. The server is running but not \
+         answering /health; check its log in .exo/logs/ and the Server window.",
         SERVER_STARTUP_TIMEOUT.as_secs()
     )
 }
@@ -11568,8 +11771,8 @@ mod tests {
     fn server_wait_precedes_tl_window_creation() {
         let source = include_str!("init.rs");
         let server_wait = source
-            .find("wait_for_server_socket(&cwd).await?")
-            .expect("init must wait for the server socket");
+            .find("wait_for_server_startup(&cwd, ServerProcessProbe::ShellOnly")
+            .expect("init must wait for the server before continuing");
         let tl_window = source
             .find("ipc.new_window(\"TL\"")
             .expect("init must create the TL window");
@@ -11579,21 +11782,170 @@ mod tests {
         );
     }
 
+    /// A stand-in for `exomonad serve`: binds the socket only after `bind_delay`,
+    /// then answers `/health` for `serve_for`.
+    async fn spawn_stub_server(
+        socket_path: PathBuf,
+        bind_delay: Duration,
+        serve_for: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::sleep(bind_delay).await;
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            let deadline = tokio::time::Instant::now() + serve_for;
+            while tokio::time::Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    let body = r#"{"wasm_hash":"stub"}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        })
+    }
+
     #[tokio::test]
-    async fn delayed_server_socket_creation_is_detected_before_timeout() {
+    async fn a_server_that_binds_late_is_still_awaited() {
         let project = tempfile::tempdir().unwrap();
-        let socket_path = project.path().join("server.sock");
-        let delayed_path = socket_path.clone();
-        let creator = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(75)).await;
-            let _listener = tokio::net::UnixListener::bind(delayed_path).unwrap();
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let server = spawn_stub_server(
+            exo_dir.join("server.sock"),
+            Duration::from_millis(75),
+            Duration::from_secs(2),
+        )
+        .await;
+
+        wait_for_server_socket_until(
+            project.path(),
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a server that comes up inside the budget must pass the wait");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_server_that_is_listening_but_not_answering_yet_is_still_awaited() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        // Bound and accepting, but never answers /health: a real server takes
+        // seconds to load its WASM plugin, and the budget has to cover that.
+        let listener = tokio::net::UnixListener::bind(exo_dir.join("server.sock")).unwrap();
+        let accepting = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        wait_for_socket_path(&socket_path, Duration::from_secs(2))
-            .await
-            .unwrap();
-        creator.abort();
+        let error = wait_for_server_socket_until(
+            project.path(),
+            Instant::now() + Duration::from_millis(600),
+            Duration::from_millis(600),
+        )
+        .await
+        .expect_err("a server that never answers must fail the wait");
+
+        assert!(
+            error.to_string().contains("not answering /health"),
+            "the failure must say the server is up but unhealthy: {error}"
+        );
+        accepting.abort();
+    }
+
+    #[tokio::test]
+    async fn exited_server_process_fails_the_wait_without_waiting_out_the_budget() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        // A socket bound by a server that has since exited: nothing answers on it.
+        let socket_path = exo_dir.join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+        std::fs::write(exo_dir.join("server.pid"), r#"{"pid":2147483647}"#).unwrap();
+
+        let started = Instant::now();
+        let error = wait_for_server_socket_until(
+            project.path(),
+            Instant::now() + SERVER_STARTUP_TIMEOUT,
+            SERVER_STARTUP_TIMEOUT,
+        )
+        .await
+        .expect_err("a dead server must not pass the startup wait");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must stop on the dead server, not on the budget: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("exited before the server became healthy"),
+            "the failure must name the exited process: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreaped_socket_without_a_pid_record_fails_the_health_wait() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let socket_path = exo_dir.join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+
+        let started = Instant::now();
+        let error = wait_for_server_socket_until(
+            project.path(),
+            Instant::now() + SERVER_STARTUP_TIMEOUT,
+            SERVER_STARTUP_TIMEOUT,
+        )
+        .await
+        .expect_err("a socket nothing listens on must not pass the startup wait");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must stop on the dead socket, not on the budget: {error}"
+        );
+        assert!(
+            error.to_string().contains("nothing is listening on it"),
+            "the failure must name the dead socket: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_has_not_recorded_its_pid_yet_is_still_awaited() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        // An unreadable record proves nothing: the server may not have written
+        // a parsable one yet, so the wait must keep polling rather than fail.
+        std::fs::write(exo_dir.join("server.pid"), "{\"pid\":").unwrap();
+
+        assert!(server_startup_failure(project.path()).is_none());
+    }
+
+    #[test]
+    fn stale_pid_record_without_a_socket_is_cleared_before_start() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let pid_path = exo_dir.join("server.pid");
+        std::fs::write(&pid_path, r#"{"pid":2147483647}"#).unwrap();
+
+        prepare_server_socket_for_start(project.path()).unwrap();
+
+        assert!(!pid_path.exists());
     }
 
     #[test]

@@ -161,13 +161,18 @@ dispatch. That is Chainlink #1148, and it is the product's, not the harness's:
 the worker's five calls all returned success.
 
 The socket health check that used to stop this scenario before dispatch
-(`Server socket exists but health check failed after 30s`, #1150) is gone from
-this fixture. The cause was the fixture claiming no `port`, so `serve` contended
-for the default `0.0.0.0:7433` with a server an earlier run had left behind; the
-fixture now sets `port = 0`, as `claude-only` and `claude-teams-inbox` already
-did. The two product defects behind it — `serve` is never reaped, and the
-leftover socket turns a fast failure into a 30s wait — are #1150 and are not
-fixed by this.
+(`Server socket exists but health check failed after 30s`) is gone, and the two
+product defects behind it are fixed rather than worked around. `serve` binds its
+Unix socket before the public TCP listener, so a contended port failed *after*
+the socket existed; it now reclaims both the socket and the pid record on every
+exit path, including that one. `init` also stops waiting as soon as the server is
+provably gone — a recorded pid that has exited, or a socket nothing is listening
+on — and attaches the Server window's own output to the failure, so the reason
+(`Address already in use`) reaches the operator instead of a bare timeout.
+
+The fixture itself still sets `port = 0`, as `claude-only` and `claude-teams-inbox`
+already did: a fixed port contended by a server an earlier run left behind is a
+real collision, and `port = 0` is what keeps it out of this scenario.
 
 ## What was removed and why
 
