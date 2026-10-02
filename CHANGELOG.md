@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Retain shadow child_spawned rows refused for an epoch mismatch as audit evidence (#1136)
 - Detect and retire a stale ExoMonad-generated project-root .codex/config.toml (#1145)
 - Fix exomonad serve never becoming healthy for the chainlink-codex e2e fixture (#1150)
 - Stop provisioning the unsupported gpt-luna model in Codex fixtures and the new scaffold (#1149)
