@@ -7,6 +7,11 @@ reconstruction reads the attempt back from the slice's own dispatch provenance.
 Both are single methods, so a newly added ``DispatchAttempt`` field cannot be
 dropped without one of these tests failing.
 
+A route has two dimensions and both survive a restart. The slice persists the
+qualified ``agent_type/model`` identifier policy selected alongside the bare
+protocol ``agent_type``, so a reconstruction reports which approved harness
+entry ran rather than only which agent family it belonged to (#1135).
+
 The dispatch pass here is ``_dispatch_children``, the real one the loop calls:
 it emits both durable boundaries, calls the spawn effect, and persists the
 result. Nothing here sleeps or reads wall time to decide an outcome.
@@ -37,6 +42,7 @@ from tl_loop.loop.driver import (
     WorkPlan,
     _dispatch_children,
     _emit_dispatch_confirmation,
+    _reconcile_dispatches,
     correlate_dispatch_event,
 )
 from tl_loop.select.capability import CapabilityMap
@@ -53,6 +59,9 @@ CONTROLLER_EPOCH = "epoch-of-the-dispatch-provenance-run"
 HARNESS = "codex/gpt-luna"
 AGENT_TYPE = "codex"
 MODEL = "gpt-luna"
+#: The bare protocol name a plan declares. Policy narrows it to one approved
+#: ``agent_type/model`` entry, so the request and the route are distinct values.
+REQUESTED_HARNESS = "codex"
 #: A creation race: the branch now exists and this attempt created nothing.
 BRANCH_EXISTS = "worktree.branch_exists"
 BASE_DELAY = 10.0
@@ -198,9 +207,10 @@ def _dispatch_pass(
     clock: ScriptedClock,
     *,
     policy: bool,
+    requested_harness: str | None = None,
 ) -> RunState:
     return _dispatch_children(
-        _plan(),
+        _plan(requested_harness),
         store.load(),
         _config(root, clock, policy=policy),
         EffectClient(transport),
@@ -209,10 +219,19 @@ def _dispatch_pass(
     )
 
 
-def _dispatch(root: Path, *, policy: bool) -> DispatchPass:
-    store = _store(root)
+def _dispatch(
+    root: Path, *, policy: bool, requested_harness: str | None = None
+) -> DispatchPass:
+    store = _store(root, requested_harness)
     transport = RecordingTransport(project_root=root)
-    state = _dispatch_pass(store, root, transport, ScriptedClock(), policy=policy)
+    state = _dispatch_pass(
+        store,
+        root,
+        transport,
+        ScriptedClock(),
+        policy=policy,
+        requested_harness=requested_harness,
+    )
     return DispatchPass(
         payloads={
             str(event["event_type"]): dict(event["payload"])
@@ -225,17 +244,20 @@ def _dispatch(root: Path, *, policy: bool) -> DispatchPass:
     )
 
 
-def _plan() -> WorkPlan:
-    return WorkPlan.from_mapping({"leaves": [{"name": SLICE, "task": "implement"}]})
+def _plan(requested_harness: str | None = None) -> WorkPlan:
+    leaf: dict[str, object] = {"name": SLICE, "task": "implement"}
+    if requested_harness is not None:
+        leaf["agent_type"] = requested_harness
+    return WorkPlan.from_mapping({"leaves": [leaf]})
 
 
-def _store(root: Path) -> RunStore:
+def _store(root: Path, requested_harness: str | None = None) -> RunStore:
     root.mkdir(parents=True, exist_ok=True)
     create(RUN_ID, {}, root_dir=root)
     store = RunStore(RUN_ID, root)
     store.checkpoint(
         TLPhase.TLDispatching,
-        {SLICE: _pending_slice()},
+        {SLICE: _pending_slice(requested_harness)},
         BudgetLedger(tokens=0, wall_seconds=0),
         0,
     )
@@ -243,7 +265,7 @@ def _store(root: Path) -> RunStore:
     return store
 
 
-def _pending_slice() -> SliceState:
+def _pending_slice(requested_harness: str | None = None) -> SliceState:
     return SliceState(
         id=SLICE,
         status=SliceStatus.PENDING,
@@ -259,6 +281,7 @@ def _pending_slice() -> SliceState:
         reviewed_head=None,
         verdict=None,
         attempts=0,
+        requested_harness=requested_harness,
     )
 
 
@@ -451,6 +474,70 @@ def test_a_resumed_checkpoint_reads_the_persisted_generation_back(tmp_path: Path
     assert rebuilt.attempt == 2
 
 
+def test_a_resumed_checkpoint_rebuilds_the_qualified_harness_it_dispatched(
+    tmp_path: Path,
+) -> None:
+    """A restart can still name which approved harness entry the slice ran.
+
+    ``agent_type`` is the bare protocol half of the identifier, so it cannot
+    distinguish two entries the role's policy approves. The qualified
+    identifier is persisted with the intent in the same state write, which is
+    what lets a rebuilt attempt answer "which ``agent_type/model`` ran?" on a
+    slice that recorded no more than ``agent_type``.
+    """
+    root = tmp_path / "resume"
+    _dispatch(root, policy=True, requested_harness=REQUESTED_HARNESS)
+
+    resumed = RunStore(RUN_ID, root).load().slices[SLICE]
+
+    assert resumed.resolved_harness == HARNESS
+    assert resumed.agent_type == AGENT_TYPE
+    # The two dimensions are distinct facts, so one cannot stand in for the
+    # other without collapsing the route into a bare protocol name.
+    assert resumed.resolved_harness != resumed.agent_type
+
+    rebuilt = DispatchAttempt.recorded_for(resumed, CONTROLLER_EPOCH)
+
+    assert rebuilt.harness == HARNESS
+    assert rebuilt.agent_type == AGENT_TYPE
+    assert rebuilt.requested_harness == REQUESTED_HARNESS
+    assert rebuilt.model == MODEL
+
+
+def test_a_restarted_run_reconciles_under_the_persisted_qualified_harness(
+    tmp_path: Path,
+) -> None:
+    """Reconciliation names the dispatched entry, not the bare agent type.
+
+    The reconciliation boundaries are rebuilt from the persisted slice, so
+    every one of them reports the qualified identifier the policy chose. An
+    audit read after a restart therefore still says which harness entry the
+    run was waiting on.
+    """
+    root = tmp_path / "reconcile"
+    _dispatch(root, policy=True, requested_harness=REQUESTED_HARNESS)
+    store = RunStore(RUN_ID, root)
+    transport = RecordingTransport(project_root=root)
+
+    _reconcile_dispatches(
+        store.load(),
+        _config(root, ScriptedClock(), policy=True),
+        EffectClient(transport),
+        store,
+        [],
+    )
+
+    for event_type in (
+        "tl.dispatch_reconciliation_started",
+        "tl.dispatch_reconciliation_completed",
+    ):
+        payloads = transport.payloads(event_type)
+        assert payloads
+        assert payloads[0]["harness"] == HARNESS
+        assert payloads[0]["agent_type"] == AGENT_TYPE
+        assert payloads[0]["requested_harness"] == REQUESTED_HARNESS
+
+
 def test_a_spawn_observation_is_adopted_only_at_the_persisted_generation(
     tmp_path: Path,
 ) -> None:
@@ -478,15 +565,17 @@ def test_a_spawn_observation_is_adopted_only_at_the_persisted_generation(
 
 def test_a_rebuilt_attempt_reads_every_field_from_its_slice() -> None:
     """A reconstruction reports the attempt the slice's boundary records."""
-    # A slice records the resolved agent type, not the qualified harness
-    # identifier the policy selection chose, so the recorded attempt's routing
-    # dimensions are that one value.
+    # The slice's ``agent_type`` is only the protocol half of the harness, so a
+    # route is only distinguishable when the qualified identifier is a distinct
+    # value. ``harness`` and ``agent_type`` are therefore deliberately unequal
+    # here, and a reconstruction that derives both from ``agent_type`` fails.
     recorded = DispatchAttempt(
         intent_id="intent-2",
         started_at=1_000.0,
-        harness=AGENT_TYPE,
+        harness=HARNESS,
         agent_type=AGENT_TYPE,
         model=MODEL,
+        requested_harness=REQUESTED_HARNESS,
         attempt=2,
         controller_epoch=CONTROLLER_EPOCH,
         dispatch_generation=2,
@@ -500,6 +589,10 @@ def test_a_rebuilt_attempt_reads_every_field_from_its_slice() -> None:
     assert {f.name: getattr(rebuilt, f.name) for f in fields(DispatchAttempt)} == {
         f.name: getattr(recorded, f.name) for f in fields(DispatchAttempt)
     }
+    # Each routing dimension reads its own persisted value, not one shared one.
+    assert rebuilt.harness == HARNESS
+    assert rebuilt.agent_type == AGENT_TYPE
+    assert rebuilt.requested_harness == REQUESTED_HARNESS
 
 
 def test_the_rebuild_constructor_propagates_every_dispatch_field() -> None:
@@ -517,6 +610,28 @@ def test_the_rebuild_constructor_propagates_every_dispatch_field() -> None:
     }
 
     assert assigned | supplied == {f.name for f in fields(DispatchAttempt)}
+
+
+def test_the_rebuild_reads_the_qualified_harness_rather_than_the_agent_type() -> None:
+    """``harness`` is bound to the slice's qualified identifier, not its type.
+
+    The two dimensions are separately persisted facts, so assigning ``harness``
+    from ``agent_type`` would still satisfy the completeness guard above while
+    discarding the route. Naming the field the reconstruction reads is what
+    keeps the guard honest about *which* provenance each dimension comes from.
+    """
+    source = textwrap.dedent(inspect.getsource(DispatchAttempt.recorded_for))
+
+    assert "resolved_harness" in _slice_attributes(ast.parse(source))
+
+
+def _slice_attributes(tree: ast.AST) -> set[str]:
+    """The slice-state fields the reconstruction reads."""
+    return {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr.islower() and "_" in node.attr
+    }
 
 
 def test_routing_an_attempt_preserves_every_identity_field() -> None:
@@ -570,6 +685,8 @@ def _recorded_slice(attempt: DispatchAttempt) -> SliceState:
         agent_type=attempt.agent_type,
         model=attempt.model,
         attempts=attempt.attempt,
+        requested_harness=attempt.requested_harness,
+        resolved_harness=attempt.harness,
         dispatch_intent_id=attempt.intent_id,
         dispatch_started_at=attempt.started_at,
         dispatch_ledger_floor=attempt.ledger_floor,
