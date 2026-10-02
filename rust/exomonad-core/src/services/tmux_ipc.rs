@@ -244,8 +244,24 @@ impl TmuxIpc {
     // -- Session management (static, no &self) --
 
     /// Create a new tmux session. Returns the stable window ID (@N) of the initial window.
-    pub async fn new_session(name: &str, cwd: &Path) -> Result<WindowId> {
-        let output = tmux_command()
+    ///
+    /// `environment` is applied through `new-session -e NAME=value`, which tmux merges
+    /// into the session environment before it spawns the initial window. A pane snapshots
+    /// its environment when tmux spawns the pane's process and never re-reads it, so a
+    /// value written afterwards with `set-environment` reaches every window created later
+    /// and never the one `new-session` already created. When a tmux server is already
+    /// running, that first pane keeps the server's captured value instead: a new session
+    /// starts from an empty session environment and falls back to the server's global one.
+    ///
+    /// `-e` requires tmux 3.2 or newer, so this is the only tmux version requirement the
+    /// product imposes, and only on the paths that pass a non-empty `environment`.
+    pub async fn new_session(
+        name: &str,
+        cwd: &Path,
+        environment: &[(&str, &str)],
+    ) -> Result<WindowId> {
+        let mut command = tmux_command();
+        command
             .args([
                 "new-session",
                 "-d",
@@ -255,16 +271,24 @@ impl TmuxIpc {
                 "-F",
                 "#{window_id}",
                 "-c",
-                &cwd.to_string_lossy(),
             ])
+            .arg(cwd.as_os_str());
+        for (variable, value) in environment {
+            command.arg("-e").arg(format!("{variable}={value}"));
+        }
+        let output = command
             .output()
             .await
             .context("Failed to run tmux new-session")?;
         if !output.status.success() {
-            anyhow::bail!(
-                "tmux new-session failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let rejected_flag = stderr.contains("unknown flag");
+            let version_hint = if !environment.is_empty() && rejected_flag {
+                " `new-session -e` requires tmux 3.2 or newer."
+            } else {
+                ""
+            };
+            anyhow::bail!("tmux new-session failed: {stderr}{version_hint}");
         }
         let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let window_id =

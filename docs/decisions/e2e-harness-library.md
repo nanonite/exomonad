@@ -37,10 +37,11 @@ starts a real ExoMonad process with a Codex agent type performs that write. Two
 properties follow, and both are enforced rather than documented.
 
 **The home is per-run and created before any ExoMonad process starts.**
-`exomonad init` propagates `CODEX_HOME` into the tmux session environment and
-`build_spawn_env` propagates it into every spawned agent's environment, so a
-value exported after those processes are running has isolated nothing.
-`e2e_create_work_dir` therefore calls `e2e_isolate_codex_home`, which makes
+`exomonad init` hands `CODEX_HOME` to `tmux new-session` as `-e CODEX_HOME=<path>`,
+so the session's first window — the `Server` window that runs `exomonad serve` — is
+born with it, and `build_spawn_env` propagates it into every spawned agent's
+environment, so a value exported after those processes are running has isolated
+nothing. `e2e_create_work_dir` therefore calls `e2e_isolate_codex_home`, which makes
 isolation a property of having a work dir rather than something a scenario has
 to remember. A harness that manages its own work dir calls the helper directly.
 

@@ -159,6 +159,16 @@ The controller waits for `.exo/tl-loop/plan.json` when no structured
 `workers`, `leaves`, and/or `sub_tls`; legacy natural-language TL prompts are
 rejected because there is no interactive TL fallback.
 
+A tmux pane's environment is fixed when tmux spawns the pane's process, so a value
+written with `set-environment` after `new-session` returns reaches only the windows
+created afterwards. `init` therefore hands `CODEX_HOME` to `new-session` itself as
+`-e CODEX_HOME=<path>`, which makes the window it renames to `Server` — and so
+every agent `exomonad serve` spawns — resolve the run's Codex home even when a tmux
+server started by another process already exists. It then reads that pane's own
+`/proc/<pid>/environ` and refuses to start when it disagrees with the exported
+`CODEX_HOME`. `tmux show-environment` is not a substitute for that check: the session
+and window environments both follow later writes.
+
 The three init modes are explicit and recorded in `.exo/tl-loop/session-mode.json`
 and the run checkpoint. In this surface-only phase, omitting a mode retains the
 --continue is the safe default. Supplying more than one mode is rejected.

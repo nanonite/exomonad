@@ -4316,6 +4316,122 @@ fn set_reviewer_max_rounds_environment(session: &str, value: Option<u32>) -> Res
     Ok(())
 }
 
+/// The Codex home the operator exported, if any.
+///
+/// `init` provisions no Codex agent of its own — the TL window runs the Python TL
+/// controller — so the entries that matter are the ones
+/// `services::agent_control::codex_lifecycle` wrote for companions and leaves, and
+/// every pane that reaches them resolves the home through this value. An unexported
+/// `CODEX_HOME` is not a failure: Codex then uses the operator's own `~/.codex`,
+/// which is where that configuration is written.
+fn operator_codex_home() -> Option<String> {
+    std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+}
+
+/// The environment the tmux session has to be *born* with.
+///
+/// tmux snapshots a pane's environment when it spawns the pane's process and never
+/// re-reads it. `set-environment -t <session>` therefore reaches every window created
+/// after the write and never the window `new-session` already created — the one
+/// `init` renames to `Server` and sends `exomonad serve` into, which is the process
+/// that spawns every agent. With a tmux server already running that pane keeps the
+/// *server's* captured value, because a new session starts from an empty session
+/// environment and falls back to the server's global one; `set-environment` then makes
+/// the session environment read back correctly while the server and its agents
+/// resolve a different Codex home, so Codex reports the hooks ExoMonad wrote as
+/// untrusted and seeds neither `[hooks.state]` nor project trust.
+///
+/// Only non-secret values belong here, because `new-session -e` puts them on the tmux
+/// client's command line. `CODEX_HOME` is a path, and the Forgejo credentials stay on
+/// `set-environment` — the path this file already uses to keep a token out of a
+/// command string and out of scrollback.
+///
+/// `CODEX_HOME` is the one session variable `exomonad serve` has to resolve itself. It
+/// is the process that spawns every agent, and every Codex agent reads the home the
+/// lifecycle wrote its hook trust into, so the value has to be in the environment tmux
+/// hands the `Server` pane when it spawns it.
+fn first_window_environment(codex_home: Option<&str>) -> Vec<(&str, &str)> {
+    codex_home
+        .map(|home| vec![("CODEX_HOME", home)])
+        .unwrap_or_default()
+}
+
+/// The pid of the process tmux spawned in a window's only pane.
+fn window_pane_pid(window: &str) -> Option<u32> {
+    let output = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", window, "#{pane_pid}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// One variable out of a running process's own environment.
+///
+/// `/proc/<pid>/environ` is the only place the disagreement this guards is visible: the
+/// tmux session environment and the tmux window environment both follow later
+/// `set-environment` writes, while the environment of the process tmux spawned keeps
+/// what it was handed at exec time.
+fn process_environment_variable(pid: u32, name: &str) -> Option<String> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{name}=");
+    environ
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix(prefix.as_str()))
+        .map(str::to_owned)
+}
+
+/// Classify the Codex home the session's first window was actually born with.
+///
+/// `observed` is `None` when tmux named no process or `/proc` could not be read. An
+/// unreadable answer is not a mismatch, so it is reported and startup continues; a
+/// readable answer that disagrees is a leak the operator cannot see from the session
+/// environment, and continuing would seed this run's hook trust into one Codex home
+/// while every pane reads another.
+fn first_window_codex_home_verdict(expected: &str, observed: Option<&str>) -> Result<()> {
+    match observed {
+        Some(observed) if observed == expected => {
+            info!(
+                codex_home = %observed,
+                "tmux session's first window inherited the exported CODEX_HOME"
+            );
+            Ok(())
+        }
+        Some(observed) => anyhow::bail!(
+            "the tmux session's first window runs on CODEX_HOME={observed}, not {expected}. \
+             ExoMonad seeds this run's Codex hook trust into {expected}, so a pane on another home \
+             reports those hooks as untrusted and seeds no project trust. The tmux server that \
+             created this session was already running and captured a different CODEX_HOME."
+        ),
+        None => {
+            warn!(
+                "cannot verify the tmux session's first window was born with CODEX_HOME={expected}; \
+                 tmux named no pane process or /proc did not yield its environment"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Prove the session's first window can resolve the operator's Codex home.
+///
+/// This reads the spawned process rather than `tmux show-environment`: the session
+/// environment is written after the window exists and so agrees with `init` no matter
+/// what the pane actually inherited.
+fn verify_first_window_codex_home(window: &str, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let observed =
+        window_pane_pid(window).and_then(|pid| process_environment_variable(pid, "CODEX_HOME"));
+    first_window_codex_home_verdict(expected, observed.as_deref())
+}
+
 fn agent_configuration_environment(config: &Config) -> String {
     let mut parts = Vec::new();
     if let Some(model) = &config.opencode.tl_model {
@@ -6336,7 +6452,14 @@ pub async fn run(
     info!("Wrote .mcp.json with {} MCP server(s)", mcp_servers.len());
 
     // 2. Create session in background
-    let server_window_id = TmuxIpc::new_session(&session, &cwd).await?;
+    let codex_home = operator_codex_home();
+    let server_window_id = TmuxIpc::new_session(
+        &session,
+        &cwd,
+        &first_window_environment(codex_home.as_deref()),
+    )
+    .await?;
+    verify_first_window_codex_home(server_window_id.as_str(), codex_home.as_deref())?;
 
     // Verify session
     if !TmuxIpc::has_session(&session).await? {
@@ -6422,25 +6545,6 @@ pub async fn run(
             chainlink_db.to_str().unwrap_or_default(),
         ])
         .status();
-
-    // Propagate CODEX_HOME into the tmux session env so Codex panes see the
-    // same hook-trust DB the agent lifecycle seeded for each Codex agent. init
-    // provisions no Codex agent of its own — the TL window runs the Python TL
-    // controller — so the entries that matter are the ones
-    // services::agent_control::codex_lifecycle wrote for companions and leaves.
-    // Without this, when tmux server is already running from another session
-    // (e.g., a parallel workspace), the new session attaches to that server
-    // and inherits the server's captured env — NOT the env exported by the
-    // shell that ran `exomonad init`. Codex then falls back to ~/.codex and
-    // sees the hooks as untrusted, firing "3 hooks need review". The e2e
-    // tests/e2e/reviewer-convergence-loop hit this reliably (chainlink #253).
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        if !codex_home.is_empty() {
-            let _ = std::process::Command::new("tmux")
-                .args(["set-environment", "-t", &session, "CODEX_HOME", &codex_home])
-                .status();
-        }
-    }
 
     // Set EXOMONAD_ROLE=root so hook CLI passes &role=root to server
     let role_output = std::process::Command::new("tmux")
@@ -12838,5 +12942,103 @@ mod tests {
             status.success(),
             "embedded archive validation failed: {status}"
         );
+    }
+
+    /// Only a Codex home travels into `new-session`, because that is the one value the
+    /// process tmux spawns in the session's first window has to resolve. An operator who
+    /// exported none gets no `-e`, which keeps `new-session` on the flags it always ran.
+    #[test]
+    fn only_an_exported_codex_home_travels_into_the_first_window() {
+        assert_eq!(
+            first_window_environment(Some("/run/codex-home")),
+            vec![("CODEX_HOME", "/run/codex-home")]
+        );
+        assert!(first_window_environment(None).is_empty());
+    }
+
+    #[test]
+    fn a_first_window_on_another_codex_home_is_refused() {
+        // The session environment says one thing and the pane says another: the exact
+        // state a session-environment read cannot see.
+        let error = first_window_codex_home_verdict("/run/codex-home", Some("/foreign/codex-home"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("/foreign/codex-home"), "{error}");
+        assert!(error.contains("/run/codex-home"), "{error}");
+    }
+
+    #[test]
+    fn a_first_window_on_the_exported_codex_home_is_accepted() {
+        first_window_codex_home_verdict("/run/codex-home", Some("/run/codex-home"))
+            .expect("a pane born with the exported Codex home");
+    }
+
+    #[test]
+    fn an_unreadable_first_window_environment_is_not_a_mismatch() {
+        // No pane process named, or no `/proc` to read: nothing is known, and refusing
+        // startup over a missing observation would be a failure of this check, not of
+        // the session.
+        first_window_codex_home_verdict("/run/codex-home", None)
+            .expect("an unobserved pane must not stop init");
+    }
+
+    /// A child process, killed and reaped when it goes out of scope so a failed
+    /// assertion cannot leave one behind.
+    struct ProcessProbe(Option<std::process::Child>);
+
+    impl Drop for ProcessProbe {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn a_process_environment_variable_is_read_past_its_nul_separators() {
+        let variable = "EXOMONAD_TEST_PROC_ENVIRONMENT";
+        // `/proc/<pid>/environ` is fixed at exec time, so the probe has to be a process
+        // that was *born* with the variable rather than one this test mutated.
+        let probe = ProcessProbe(Some(
+            Command::new("sh")
+                .args(["-c", "sleep 30"])
+                .env(variable, "/run/codex-home")
+                .spawn()
+                .expect("spawn the environment probe"),
+        ));
+        let pid = probe.0.as_ref().expect("probe child").id();
+
+        // `spawn` returns before the child has finished `execve`, and
+        // `/proc/<pid>/environ` only exists once it has.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observed = loop {
+            if let Some(value) = process_environment_variable(pid, variable) {
+                break value;
+            }
+            assert!(Instant::now() < deadline, "the probe never exec'd");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert_eq!(observed, "/run/codex-home");
+        assert_eq!(
+            process_environment_variable(pid, "EXOMONAD_TEST_UNSET_VARIABLE"),
+            None,
+            "an absent variable reads as absent, not as an empty value"
+        );
+        assert_eq!(
+            process_environment_variable(u32::MAX, variable),
+            None,
+            "a pid with no /proc entry reads as absent"
+        );
+    }
+
+    /// An operator who never exported `CODEX_HOME` is on the host's own `~/.codex`,
+    /// which is where that configuration is written. There is nothing to propagate and
+    /// nothing to verify.
+    #[test]
+    fn no_exported_codex_home_skips_the_first_window_verification() {
+        verify_first_window_codex_home("@0", None).expect("nothing to verify");
     }
 }

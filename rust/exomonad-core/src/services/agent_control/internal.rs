@@ -419,11 +419,13 @@ impl<
         // Propagate CODEX_HOME to every spawned codex pane. The Codex lifecycle
         // seeds [hooks.state] entries in `$CODEX_HOME/config.toml`; without this
         // pass-through, spawned codex agents fall back to ~/.codex and see the hooks
-        // as untrusted, firing "3 hooks need review" (chainlink #259). The init.rs
-        // tmux set-environment for CODEX_HOME covers the root TL pane but does not
-        // reliably reach panes created later by spawn_leaf — this shell-prefix entry
-        // closes that gap explicitly on the production code path. Harmless for non-
-        // codex agents (they ignore an unfamiliar env var).
+        // as untrusted, firing "3 hooks need review" (chainlink #259). The tmux session
+        // carries CODEX_HOME from creation — `init` hands it to `new-session` as
+        // `-e CODEX_HOME=<path>`, so every window and pane the controller creates
+        // inherits it — but this shell-prefix entry resolves the home from the process
+        // that reads it, which is this function's server, and so it also covers a pane
+        // created outside that session. Harmless for non-codex agents (they ignore an
+        // unfamiliar env var).
         if let Ok(codex_home) = std::env::var("CODEX_HOME") {
             if !codex_home.is_empty() {
                 env_vars.insert("CODEX_HOME".to_string(), codex_home);

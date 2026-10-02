@@ -518,7 +518,7 @@ async fn terminal_invocation_with_stale_routing_requires_configured_tmux_session
     assert_eq!(service.liveness(&agent_dir).await, CleanupLiveness::Unknown);
 
     let configured_session = format!("cleanup-stale-{}", invocation.invocation_id);
-    TmuxIpc::new_session(&configured_session, temp.path())
+    TmuxIpc::new_session(&configured_session, temp.path(), &[])
         .await
         .unwrap();
     let configured_service = VerifiedCleanupService::new(
@@ -556,7 +556,9 @@ async fn recovered_liveness_requires_current_server_tmux_evidence() {
 
     let session = format!("cleanup-recovered-liveness-{}", std::process::id());
     let _ = TmuxIpc::kill_session(&session).await;
-    TmuxIpc::new_session(&session, temp.path()).await.unwrap();
+    TmuxIpc::new_session(&session, temp.path(), &[])
+        .await
+        .unwrap();
     let configured = VerifiedCleanupService::new(
         temp.path(),
         resolver,
@@ -1399,7 +1401,9 @@ async fn recovered_merged_pr_residual_uses_verified_provenance_end_to_end() {
     let branch = fixture.record.birth_branch.to_string();
     let tmux_session = format!("cleanup-recovery-{}", std::process::id());
     let _ = TmuxIpc::kill_session(&tmux_session).await;
-    TmuxIpc::new_session(&tmux_session, &project).await.unwrap();
+    TmuxIpc::new_session(&tmux_session, &project, &[])
+        .await
+        .unwrap();
     fixture.services.tmux_session = Some(tmux_session.clone());
     let branch_sha = local_branch_state(&project, &branch)
         .await

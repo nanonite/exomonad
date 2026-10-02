@@ -46,22 +46,21 @@ E2E_PYTHON_TL_HELPER_LOADED=1
 # Point this run at its own tmux server, so the server's captured environment is
 # this run's.
 #
-# `exomonad init` creates the tmux session -- and therefore its first window --
-# before it propagates CODEX_HOME into the session environment
-# (`new_session` at rust/exomonad/src/init.rs, then `set-environment` about a
-# hundred lines later). When a tmux server is already running, which is the normal
-# case for a host with more than one workspace, the new session attaches to it,
-# so the window `init` renames to `Server` and runs `exomonad serve` in keeps the
-# *existing* server's captured CODEX_HOME. The session environment then reads
-# correctly, so `tmux show-environment` passes, while the server and every agent
-# it spawns resolve a different Codex home and seed no hook trust.
+# `exomonad init` hands `CODEX_HOME` to `tmux new-session` itself, as
+# `-e CODEX_HOME=<path>` (rust/exomonad-core/src/services/tmux_ipc.rs), because
+# tmux snapshots a pane's environment when it spawns the pane's process. A value
+# written afterwards reaches every window created later and never the window
+# `new-session` already created -- the one `init` renames to `Server` and runs
+# `exomonad serve` in, whose spawned agents then seed no hook trust. `init`
+# verifies the spawned pane's own environment rather than the session's, so a run
+# cannot report the right value while resolving a different one.
 #
-# The mitigation already in `init.rs` describes this failure and is defeated only
-# by the ordering. Giving the run its own server removes the foreign environment
-# entirely: the server starts from this harness's environment and the first
-# window inherits it like every later window. This is the same isolation
-# `tests/e2e/lib/e2e_harness/tmuxio.py` gives the Python acceptances through
-# `TMUX_TMPDIR`.
+# This helper keeps a run off the host's shared server for the rest of the run's
+# tmux traffic as well: its sessions, its harness teardown, and the validator
+# companion all reach one server the run owns rather than one another workspace,
+# a parallel scenario, or a developer may already be using. It is the same
+# isolation `tests/e2e/lib/e2e_harness/tmuxio.py` gives the Python acceptances
+# through `TMUX_TMPDIR`.
 #
 # Must run before the first `tmux` call in the script, and before `init`; every
 # `tmux` call in the run inherits TMUX_TMPDIR, so harness cleanup and the
@@ -639,11 +638,17 @@ PY
 
 # Assert CODEX_HOME reached the tmux session environment.
 #
-# `init` propagates CODEX_HOME into the tmux session env; without that, a Codex
-# pane spawned into a session whose tmux server was already running falls back
-# to `~/.codex` and the run edits the operator's config. Asserting the session
-# value is therefore a propagation test, not a restatement of the isolation
-# helper.
+# `init` hands CODEX_HOME to `tmux new-session` as `-e CODEX_HOME=<path>`, so the
+# session carries it from creation and every window created after that inherits it
+# from the session. Asserting the session value is therefore a propagation test, not
+# a restatement of the isolation helper.
+#
+# It is not, on its own, proof that a pane sees that home: `show-environment`
+# answers for the session and the window, and a value written into either after a
+# pane was spawned still reads back. `e2e_python_tl_assert_codex_trust` closes that
+# gap from the other end -- the trust entries only exist if a live Codex process
+# resolved the run's home -- and `init` itself refuses to start when the spawned
+# pane's own `/proc/<pid>/environ` disagrees.
 #
 # `tmux show-environment` prints `NAME=value`, and prefixes the name with `-`
 # when the variable is *unset* in the session. Both are stripped here: comparing
