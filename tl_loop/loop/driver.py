@@ -647,6 +647,11 @@ class DispatchCorrelation:
 DISPATCH_CORRELATED = "correlated"
 DISPATCH_HISTORICAL_AUDIT = "historical_audit"
 DISPATCH_INTEGRITY_CONFLICT = "integrity_conflict"
+#: A spawn row was confirmed under a controller epoch that is not the current
+#: one, so it belongs to a predecessor generation and can never confirm a
+#: dispatch this run owns. This is the one refusal reason that is historical
+#: evidence rather than an integrity conflict.
+DISPATCH_EPOCH_MISMATCH = "controller_epoch_mismatch"
 #: The spawn row names an intent this run already recorded a confirmation for.
 #: One dispatch writes two such rows -- the child registration carries
 #: ``child_agent`` and the dispatch record carries ``slug``/``task_summary`` --
@@ -658,6 +663,13 @@ DISPATCH_ALREADY_CONFIRMED = "already_confirmed"
 #: with a recorded authoritative sequence this is the durable proof that a
 #: duplicate confirmation is a duplicate and not a first confirmation.
 DISPATCH_CONFIRMED_BOUNDARY = "agent.spawned"
+#: Correlation markers that name a permanently retained audit row. A refused
+#: publication and a refused spawn confirmation from a predecessor controller
+#: epoch are the same class of evidence: they prove what an earlier generation
+#: did, so they are written to the audit log and never to the pending queue.
+PUBLICATION_HISTORY_AUDIT = "publication_history_audit"
+SPAWN_HISTORY_AUDIT = "spawn_history_audit"
+AUDIT_CORRELATIONS = frozenset({PUBLICATION_HISTORY_AUDIT, SPAWN_HISTORY_AUDIT})
 
 
 @dataclass
@@ -2933,13 +2945,28 @@ def _run_loop(
             next_phase = phase_transition(phase, fsm_event)
         except IllegalTransition as error:
             raise TLLoopError(str(error)) from error
+        spawn_refusal = _spawn_confirmation_refusal(
+            state.slices, event, controller_epoch=state.controller_epoch
+        )
+        if spawn_refusal == DISPATCH_EPOCH_MISMATCH:
+            # A row from a predecessor epoch proves what that generation did,
+            # never what this one owns. Retain it as permanent audit evidence on
+            # the same terms as a refused publication -- never as pending work,
+            # so it cannot re-enter replay -- and let the reducer run without a
+            # spawn confirmation so the slice stays untouched.
+            _record_historical_spawn(store, event, spawn_refusal)
+            LOGGER.warning(
+                "[TL loop] retaining spawn row from a prior controller epoch "
+                "run_id=%s event_seq=%s run_seq=%s",
+                run_id,
+                event_seq,
+                event.run_seq,
+            )
         next_slices = _update_slices(
             state.slices,
             fsm_event,
             slice_id=event_slice_id,
-            allow_spawn_confirmation=_dispatch_confirmation_matches(
-                state.slices, event, controller_epoch=state.controller_epoch
-            ),
+            allow_spawn_confirmation=spawn_refusal is None,
         )
         if isinstance(fsm_event, ChildCompleted):
             completed_slice = next_slices.get(event_slice_id or "")
@@ -8292,7 +8319,7 @@ def correlate_dispatch_event(state: RunState, event: EventEnvelope) -> DispatchC
             return DispatchCorrelation(
                 DISPATCH_HISTORICAL_AUDIT,
                 candidate.id,
-                "controller_epoch_mismatch",
+                DISPATCH_EPOCH_MISMATCH,
             )
         event_generation = _event_dispatch_generation(event)
         if event_generation is not None and event_generation != candidate.dispatch_generation:
@@ -8311,7 +8338,7 @@ def correlate_dispatch_event(state: RunState, event: EventEnvelope) -> DispatchC
         return DispatchCorrelation(
             DISPATCH_HISTORICAL_AUDIT,
             current.id,
-            "controller_epoch_mismatch",
+            DISPATCH_EPOCH_MISMATCH,
         )
     return DispatchCorrelation(DISPATCH_INTEGRITY_CONFLICT, hint, "intent_mismatch")
 
@@ -8360,7 +8387,7 @@ def _correlate_duplicate_confirmation(
         return DispatchCorrelation(
             DISPATCH_HISTORICAL_AUDIT,
             owner.id,
-            "controller_epoch_mismatch",
+            DISPATCH_EPOCH_MISMATCH,
         )
     event_generation = _event_dispatch_generation(event)
     if event_generation is not None and event_generation != owner.dispatch_generation:
@@ -8401,11 +8428,29 @@ def _dispatch_confirmation_matches(
     *,
     controller_epoch: str | None = None,
 ) -> bool:
+    """Whether a spawn row may confirm this controller's dispatch."""
+    return _spawn_confirmation_refusal(slices, event, controller_epoch=controller_epoch) is None
+
+
+def _spawn_confirmation_refusal(
+    slices: Mapping[str, SliceState],
+    event: EventEnvelope,
+    *,
+    controller_epoch: str | None = None,
+) -> str | None:
+    """Why a spawn row cannot confirm this controller's dispatch, or None.
+
+    The reason matters, not just the verdict: a row confirmed under a
+    predecessor controller epoch is historical evidence about an earlier
+    generation, while a row naming no owned intent is an integrity conflict
+    about this one. The caller keeps the two apart, and only the historical
+    refusal is retained.
+    """
     if not _is_spawn_confirmation_event(event):
-        return True
+        return None
     intent_id = _event_dispatch_intent_id(event)
     if intent_id is None:
-        return False
+        return "dispatch intent is missing"
     matches = [
         slice_state
         for slice_state in slices.values()
@@ -8413,16 +8458,14 @@ def _dispatch_confirmation_matches(
         and slice_state.status in DISPATCHING_STATUSES
     ]
     if len(matches) != 1:
-        return False
-    current = matches[0]
-    if (
-        controller_epoch is not None
-        and _event_dispatch_epoch(event) is not None
-        and _event_dispatch_epoch(event) != controller_epoch
-    ):
-        return False
+        return "dispatch intent names no single dispatching slice"
+    event_epoch = _event_dispatch_epoch(event)
+    if controller_epoch is not None and event_epoch is not None and event_epoch != controller_epoch:
+        return DISPATCH_EPOCH_MISMATCH
     generation = _event_dispatch_generation(event)
-    return generation is None or generation == current.dispatch_generation
+    if generation is not None and generation != matches[0].dispatch_generation:
+        return "dispatch_generation_mismatch"
+    return None
 
 
 def _emit_dispatch_confirmation(
@@ -13255,10 +13298,32 @@ def _quarantine_historical_publication(
     store.append_audit_event(
         {
             **envelope_document(event),
-            "correlation": "publication_history_audit",
+            "correlation": PUBLICATION_HISTORY_AUDIT,
             "correlation_reason": reason,
         }
     )
+
+
+def _record_historical_spawn(store: RunStore, event: EventEnvelope, reason: str) -> None:
+    """Retain a spawn row from a predecessor epoch permanently for audit.
+
+    A row confirmed under another controller epoch proves what the generation
+    that wrote it did, never what this one owns, so it is audit evidence on the
+    same terms as a refused publication: it goes to the audit log, never to
+    the pending event-quarantine queue, and is never released.
+    """
+    store.append_audit_event(
+        {
+            **envelope_document(event),
+            "correlation": SPAWN_HISTORY_AUDIT,
+            "correlation_reason": reason,
+        }
+    )
+
+
+def _is_audit_document(document: Mapping[str, object]) -> bool:
+    """Whether a durable row is permanent audit evidence rather than work."""
+    return document.get("correlation") in AUDIT_CORRELATIONS
 
 
 def _replayable_quarantine_documents(store: RunStore) -> list[Mapping[str, object]]:
@@ -13268,11 +13333,7 @@ def _replayable_quarantine_documents(store: RunStore) -> list[Mapping[str, objec
     migration, but its top-level audit marker is not preserved by the event
     projection, so it is filtered out here and can never re-enter replay.
     """
-    return [
-        document
-        for document in store.quarantined_events()
-        if document.get("correlation") != "publication_history_audit"
-    ]
+    return [document for document in store.quarantined_events() if not _is_audit_document(document)]
 
 
 def _migrate_audit_marked_quarantine(store: RunStore) -> None:
@@ -13285,7 +13346,7 @@ def _migrate_audit_marked_quarantine(store: RunStore) -> None:
     failed append leaves the pending row intact.
     """
     for document in store.quarantined_events():
-        if document.get("correlation") != "publication_history_audit":
+        if not _is_audit_document(document):
             continue
         try:
             store.append_audit_event(document)

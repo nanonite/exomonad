@@ -53,6 +53,8 @@ BASELINE_ROWS = (
 )
 CONTROL_ROWS = (DISPATCH_CONFIRMATION, *COMPLETION_ROWS)
 WITHOUT_HISTORICAL_ROWS = (DISPATCH_CONFIRMATION, CURRENT_PUBLICATION, *COMPLETION_ROWS)
+WITHOUT_DISPATCH_ROWS = (HISTORICAL_PUBLICATION, CURRENT_PUBLICATION, *COMPLETION_ROWS)
+DISPATCH_RUN_SEQ = 100
 
 RUN_ID = "replay-recreate"
 LEAF_AGENT_ID = "recreated-leaf-opencode"
@@ -324,6 +326,75 @@ def test_a_dispatch_confirmed_by_another_generation_is_never_adopted(tmp_path: P
     assert state.get("publication") is None
     assert _leaf_state(baseline)["publication"]["pr_number"] == 102
     assert _leaf_state(root).get("publication") is None
+
+
+def test_a_spawn_row_from_a_prior_epoch_is_retained_as_audit_evidence(
+    tmp_path: Path,
+) -> None:
+    """A refused spawn row is permanent audit evidence, never pending work.
+
+    The predecessor generation confirmed this dispatch, so the row is proof of
+    what *it* did. Dropping it on refusal -- as the publications of #1112/#1117
+    must not be dropped -- loses the only durable trace of the spawn, so it is
+    retained in the audit log with its refusal reason, exactly as a refused
+    historical publication is.
+    """
+    root = tmp_path / "prior-epoch-audit"
+    _replay(
+        root,
+        _patched(DISPATCH_CONFIRMATION, {"data": {"controller_epoch": PREDECESSOR_EPOCH}}),
+    )
+    control = tmp_path / "prior-epoch-control"
+    _replay(control, _rows(CONTROL_ROWS))
+
+    # The refused row is retained, with the reason that refused it, on the same
+    # terms as the historical publication: an audit marker of its own and a
+    # correlation reason naming the refusal.
+    assert _audit_rows(root) == [
+        {
+            "run_seq": DISPATCH_RUN_SEQ,
+            "event_type": "agent.notify_parent",
+            "correlation": "spawn_history_audit",
+            "correlation_reason": "controller_epoch_mismatch",
+            "agent_id": LEAF_AGENT_ID,
+            "invocation_id": RECREATED_INVOCATION,
+            "pr_number": None,
+            "head_sha": None,
+            "controller_epoch": PREDECESSOR_EPOCH,
+        }
+    ]
+    # It is audit evidence and never pending work, so it can neither re-enter
+    # replay nor be released.
+    assert _pending_seqs(root) == []
+    # The identical run whose row carries no epoch mismatch retains nothing,
+    # which proves the retention came from the mismatch and not from the row
+    # being delivered at all.
+    assert _audit_rows(control) == []
+
+
+def test_a_refused_spawn_row_never_mutates_slice_state(tmp_path: Path) -> None:
+    """The refused row's only durable effect is the audit record.
+
+    It must not advance the slice: no agent, no invocation, and no confirmation
+    sequence, because a row from a predecessor epoch proves nothing about the
+    dispatch this generation owns.
+    """
+    root = tmp_path / "prior-epoch-no-mutation"
+    _replay(
+        root,
+        _patched(DISPATCH_CONFIRMATION, {"data": {"controller_epoch": PREDECESSOR_EPOCH}}),
+    )
+    # The control is the same run in which the refused row was never observed.
+    absent = tmp_path / "row-absent"
+    _replay(absent, _rows(WITHOUT_DISPATCH_ROWS))
+
+    state = _child_document(root)["slices"][LEAF]
+    assert state.get("dispatch_agent_id") is None
+    assert state.get("dispatch_invocation_id") is None
+    assert state.get("dispatch_authoritative_event_seq") is None
+    # Retaining the row as audit evidence must not outlive a slice mutation:
+    # the durable state is exactly the state of the run that never saw it.
+    assert _leaf_state(root) == _leaf_state(absent)
 
 
 def test_a_dispatch_confirmed_by_a_prior_epoch_is_never_adopted(tmp_path: Path) -> None:
