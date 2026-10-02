@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Propagate CODEX_HOME before creating the tmux session's first window (#1147)
 - Record the qualified harness identifier on the slice, not only the agent type (#1135)
 - Retain shadow child_spawned rows refused for an epoch mismatch as audit evidence (#1136)
 - Detect and retire a stale ExoMonad-generated project-root .codex/config.toml (#1145)
