@@ -5148,9 +5148,18 @@ enum ServerProcessProbe<'a> {
     /// what makes its captured output readable as the failure reason.
     Window(&'a exomonad_core::domain::RoutingInfo),
     /// The window runs a shell that `serve` was typed into, so the window's
-    /// liveness tracks the shell and says nothing about the server. Only the
-    /// server's own artifacts are available.
+    /// liveness tracks the shell and says nothing about the server. The pid
+    /// record `serve` leaves behind carries the signal instead.
     ShellOnly,
+}
+
+impl ServerProcessProbe<'_> {
+    fn routing(&self) -> Option<&exomonad_core::domain::RoutingInfo> {
+        match self {
+            Self::Window(routing) => Some(routing),
+            Self::ShellOnly => None,
+        }
+    }
 }
 
 /// Wait for the server to be ready, reporting the window's output on failure.
@@ -5168,35 +5177,34 @@ async fn wait_for_server_startup(
 ) -> Result<()> {
     match wait_for_server_socket(project_dir).await {
         Ok(()) => Ok(()),
-        Err(error) => Err(match server_process_exited(ipc, probe).await {
-            Some(reason) => {
-                let reason = match capture_or_warn(ipc, window.as_str()).await {
-                    Some(output) => startup_failure_with_pane_output(reason, &output),
-                    None => reason,
-                };
-                error!(reason = %reason, "Server process exited during startup");
-                anyhow::anyhow!("{reason}")
-            }
-            None => server_startup_error_with_pane_output(ipc, window, error).await,
-        }),
+        Err(error) => Err(server_startup_error_with_pane_output(
+            ipc,
+            window,
+            server_startup_reason(ipc, probe, error).await,
+        )
+        .await),
     }
 }
 
-/// The reason a server process is gone, if the wait could observe it exit.
-async fn server_process_exited(
+/// Name what stopped the server, preferring what the wait already established.
+///
+/// The wait stops on a server that has exited, so the pane is only consulted to
+/// recover the reason it exited. Where the window watches `serve` directly, that
+/// window also says whether the server is still running, which distinguishes a
+/// server that failed from a server that came up and then went unhealthy.
+async fn server_startup_reason(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     probe: ServerProcessProbe<'_>,
-) -> Option<String> {
-    let ServerProcessProbe::Window(routing) = probe else {
-        return None;
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let Some(routing) = probe.routing() else {
+        return error;
     };
     match ipc.routing_target_process_alive(routing).await {
-        Ok(true) => None,
-        Ok(false) => Some("exomonad serve exited before the server became healthy".to_owned()),
-        Err(error) => {
-            warn!(%error, "Could not probe the Server window for process liveness");
-            None
+        Ok(false) => {
+            anyhow::anyhow!("exomonad serve exited before the server became healthy ({error})")
         }
+        Ok(true) | Err(_) => error,
     }
 }
 
@@ -7328,7 +7336,7 @@ fn prepare_server_socket_for_start(project_dir: &Path) -> Result<()> {
 /// Why a waiting `init` can stop waiting: the server is already gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServerStartupFailure {
-    /// The recorded server process has exited, so no socket will ever answer.
+    /// The server process has exited, so no socket will ever answer.
     ProcessExited(i32),
     /// A socket exists but nothing is listening, so it is a dead server's
     /// leftover rather than a server still coming up.
@@ -7352,24 +7360,51 @@ impl ServerStartupFailure {
     }
 }
 
-/// Detect a server that has already given up, so `init` reports the real cause
-/// instead of waiting out its whole budget on a socket nothing will answer.
+/// Watches the `exomonad serve` process a startup wait is waiting for.
 ///
-/// A pid record that names a dead process is decisive: `serve` writes that
-/// record before it binds anything, and reaps it when it exits. An absent or
-/// unreadable record proves nothing, because the server may not have written it
-/// yet, so only the socket's own reachability settles that case.
-fn server_startup_failure(project_dir: &Path) -> Option<ServerStartupFailure> {
-    match read_server_pid_record(&project_dir.join(".exo/server.pid")) {
-        ServerPidRecord::Pid(pid) if pid_is_dead(pid) => {
-            Some(ServerStartupFailure::ProcessExited(pid))
+/// The pid is latched rather than re-read because `serve` reclaims both of its
+/// artifacts when it exits: re-reading the record finds nothing there, and a
+/// server that gave up cleanly then looks exactly like one that has not started
+/// yet. Latching makes the exit observable on the path that matters — the server
+/// that failed on purpose — and not only on the leftovers a crash would leave
+/// behind.
+#[derive(Debug, Default)]
+struct ServerStartupWatch {
+    /// The first live server pid this wait saw, held for the rest of the wait.
+    observed_pid: Option<i32>,
+}
+
+impl ServerStartupWatch {
+    /// Note the server pid if one is recorded and nothing has been latched yet.
+    ///
+    /// `init` clears a stale record before it starts a server, so a pid seen
+    /// here belongs to the server this wait is watching.
+    fn observe(&mut self, project_dir: &Path) {
+        if self.observed_pid.is_some() {
+            return;
         }
-        ServerPidRecord::Pid(_) => None,
-        ServerPidRecord::Absent | ServerPidRecord::Unreadable => {
-            let socket_path = project_dir.join(".exo/server.sock");
-            (socket_path.exists() && !server_socket_is_live(&socket_path))
-                .then_some(ServerStartupFailure::SocketNotListening)
+        if let ServerPidRecord::Pid(pid) =
+            read_server_pid_record(&project_dir.join(".exo/server.pid"))
+        {
+            self.observed_pid = Some(pid);
         }
+    }
+
+    /// Detect a server that has already given up.
+    ///
+    /// The latched pid's death is decisive. So is a socket file that nothing
+    /// accepts on, which is a dead server's leftover from a run that was killed
+    /// rather than one that exited. Neither an absent nor an unreadable record
+    /// proves anything on its own: the server may not have written a parsable
+    /// record yet, and the socket may not exist yet either.
+    fn failure(&mut self, project_dir: &Path) -> Option<ServerStartupFailure> {
+        self.observe(project_dir);
+        if let Some(pid) = self.observed_pid.filter(|pid| pid_is_dead(*pid)) {
+            return Some(ServerStartupFailure::ProcessExited(pid));
+        }
+        let socket_path = project_dir.join(".exo/server.sock");
+        (socket_path.exists() && !server_socket_is_live(&socket_path))
+            .then_some(ServerStartupFailure::SocketNotListening)
     }
 }
 
@@ -7416,11 +7451,16 @@ async fn wait_for_server_socket_until(
     timeout_dur: Duration,
 ) -> Result<()> {
     let socket_path = project_dir.join(".exo/server.sock");
+    let mut watch = ServerStartupWatch::default();
     while Instant::now() < deadline {
+        // Observe before branching on the socket: a server that binds and then
+        // exits on the way out reaps the record within a poll interval, so the
+        // socket appearing is exactly when the pid has to be latched.
+        watch.observe(project_dir);
         if socket_path.exists() {
-            return wait_for_server_health_until(project_dir, deadline).await;
+            return wait_for_server_health_until(project_dir, &mut watch, deadline).await;
         }
-        if let Some(failure) = server_startup_failure(project_dir) {
+        if let Some(failure) = watch.failure(project_dir) {
             return Err(server_startup_failure_error(&failure, project_dir));
         }
         let _ = sleep_until_next_poll(deadline).await;
@@ -7438,7 +7478,11 @@ async fn wait_for_server_socket_until(
 /// The health endpoint does real work — resolving the WASM plugin — so a socket
 /// that is up can still take seconds to answer. The budget covers that; it does
 /// not cover a server that has already exited, which is reported on sight.
-async fn wait_for_server_health_until(project_dir: &Path, deadline: Instant) -> Result<()> {
+async fn wait_for_server_health_until(
+    project_dir: &Path,
+    watch: &mut ServerStartupWatch,
+    deadline: Instant,
+) -> Result<()> {
     let socket_path = project_dir.join(".exo/server.sock");
     let client = uds_client::ServerClient::new(socket_path.to_path_buf());
     while Instant::now() < deadline {
@@ -7450,7 +7494,7 @@ async fn wait_for_server_health_until(project_dir: &Path, deadline: Instant) -> 
         {
             return Ok(());
         }
-        if let Some(failure) = server_startup_failure(project_dir) {
+        if let Some(failure) = watch.failure(project_dir) {
             return Err(server_startup_failure_error(&failure, project_dir));
         }
         if sleep_until_next_poll(deadline).await.is_err() {
@@ -11932,7 +11976,87 @@ mod tests {
         // a parsable one yet, so the wait must keep polling rather than fail.
         std::fs::write(exo_dir.join("server.pid"), "{\"pid\":").unwrap();
 
-        assert!(server_startup_failure(project.path()).is_none());
+        assert!(ServerStartupWatch::default()
+            .failure(project.path())
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cleanly_exiting_server_is_still_reported_as_exited() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let pid_path = exo_dir.join("server.pid");
+        let mut watch = ServerStartupWatch::default();
+
+        // The server records itself, and `ServerArtifacts::drop` then reclaims
+        // both artifacts on its way out -- exactly what a server that loses the
+        // TCP bind does. Re-reading the record now finds nothing, so only a
+        // latched pid can see the exit.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let exited = child.id() as i32;
+        std::fs::write(&pid_path, format!(r#"{{"pid":{exited}}}"#)).unwrap();
+        watch.observe(project.path());
+        std::fs::remove_file(&pid_path).unwrap();
+        let _ = child.wait();
+
+        assert_eq!(
+            watch.failure(project.path()),
+            Some(ServerStartupFailure::ProcessExited(exited)),
+            "a server that reaped its own artifacts must still be reported as exited"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wait_stops_when_a_running_server_exits_and_reaps_itself() {
+        let project = tempfile::tempdir().unwrap();
+        let exo_dir = project.path().join(".exo");
+        std::fs::create_dir_all(&exo_dir).unwrap();
+        let pid_path = exo_dir.join("server.pid");
+
+        // A stub server that records a live pid, binds the socket without ever
+        // answering it, then exits and reaps both artifacts -- the contended
+        // TCP bind, reproduced without contending a port. The recorded pid is a
+        // real child so its death is observable; the test process's own pid would
+        // outlive the wait. The record outlives a few polls so the wait can
+        // observe the server alive before it exits, rather than racing a server
+        // that came and went inside one poll interval.
+        let server = tokio::spawn(async move {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, child.id())).unwrap();
+            let socket = exo_dir.join("server.sock");
+            let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(_listener);
+            let _ = std::fs::remove_file(&socket);
+            let _ = std::fs::remove_file(&pid_path);
+        });
+
+        let started = Instant::now();
+        let error = wait_for_server_socket_until(
+            project.path(),
+            Instant::now() + SERVER_STARTUP_TIMEOUT,
+            SERVER_STARTUP_TIMEOUT,
+        )
+        .await
+        .expect_err("a server that exits must not pass the startup wait");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait must stop when the server exits, not on the budget: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("exited before the server became healthy"),
+            "the failure must name the exited server: {error}"
+        );
+        server.await.unwrap();
     }
 
     #[test]

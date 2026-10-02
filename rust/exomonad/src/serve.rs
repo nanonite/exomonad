@@ -48,7 +48,7 @@ fn recorded_server_pid(server_pid_path: &StdPath) -> Option<i32> {
     (pid > 1).then_some(pid)
 }
 
-/// Reclaims the socket and pid record `exomonad serve` owns, on every exit path.
+/// Reclaims the socket `exomonad serve` owns, on every exit path.
 ///
 /// The server binds its Unix socket before its public TCP listener and can still
 /// fail after that -- a contended port, a permissions failure, a listener error
@@ -56,6 +56,14 @@ fn recorded_server_pid(server_pid_path: &StdPath) -> Option<i32> {
 /// listeners had returned `Ok`. Every one of those paths left a socket file that
 /// no process would ever answer on, and `init` then spent its whole startup
 /// budget health-checking a server that had already exited.
+///
+/// The pid record is deliberately left behind. `init` reads it to tell a server
+/// that exited from one that has not started yet, and a record that only exists
+/// while the server is alive disappears inside one poll interval of a server that
+/// dies quickly -- leaving `init` no way to distinguish the two and no choice but
+/// to wait out its budget. A pid record naming a dead process is a tombstone, not
+/// a leftover: the next `init` clears it before starting a server, and
+/// `serve` overwrites it.
 struct ServerArtifacts {
     socket_path: PathBuf,
     server_pid_path: PathBuf,
@@ -74,12 +82,11 @@ impl ServerArtifacts {
 
 impl Drop for ServerArtifacts {
     fn drop(&mut self) {
-        // A successor server may already own these paths; only reclaim the
-        // record this process wrote.
+        // A successor server may already own these paths; only reclaim what this
+        // process wrote.
         if recorded_server_pid(&self.server_pid_path) != Some(self.pid) {
             return;
         }
-        remove_owned_artifact(&self.server_pid_path, "server.pid");
         remove_owned_artifact(&self.socket_path, "server socket");
     }
 }
@@ -2276,7 +2283,7 @@ mod tests {
     }
 
     #[test]
-    fn server_artifacts_are_reclaimed_when_the_server_exits() {
+    fn the_socket_does_not_outlive_serve() {
         let project = stub_project();
         let socket_path = project.path().join(".exo/server.sock");
         let pid_path = project.path().join(".exo/server.pid");
@@ -2287,7 +2294,28 @@ mod tests {
         drop(ServerArtifacts::arm(&socket_path, &pid_path));
 
         assert!(!socket_path.exists(), "socket must not outlive serve");
-        assert!(!pid_path.exists(), "pid record must not outlive serve");
+    }
+
+    #[test]
+    fn the_pid_record_outlives_serve_as_a_tombstone() {
+        let project = stub_project();
+        let socket_path = project.path().join(".exo/server.sock");
+        let pid_path = project.path().join(".exo/server.pid");
+        let pid = std::process::id();
+        std::fs::write(&socket_path, b"").unwrap();
+        std::fs::write(&pid_path, format!(r#"{{"pid":{pid}}}"#)).unwrap();
+
+        drop(ServerArtifacts::arm(&socket_path, &pid_path));
+
+        // `init` reads this record to tell a server that exited from one that has
+        // not started yet. Reclaiming it on the way out would erase that within
+        // one poll interval of a server that dies quickly, leaving no way to
+        // report anything but a budget timeout.
+        assert_eq!(
+            recorded_server_pid(&pid_path),
+            Some(pid as i32),
+            "the record must survive so the exit is observable"
+        );
     }
 
     #[test]
@@ -2298,8 +2326,7 @@ mod tests {
         std::fs::write(&socket_path, b"").unwrap();
         // A successor server already owns these paths by the time this process
         // unwinds, so its socket and record must survive.
-        let successor_pid = format!(r#"{{"pid":{}}}"#, i32::MAX);
-        std::fs::write(&pid_path, successor_pid).unwrap();
+        std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, i32::MAX)).unwrap();
 
         drop(ServerArtifacts::arm(&socket_path, &pid_path));
 
@@ -2308,7 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn reclaiming_absent_server_artifacts_is_not_an_error() {
+    fn reclaiming_an_absent_socket_is_not_an_error() {
         let project = stub_project();
         let socket_path = project.path().join(".exo/server.sock");
         let pid_path = project.path().join(".exo/server.pid");
@@ -2316,7 +2343,7 @@ mod tests {
 
         drop(ServerArtifacts::arm(&socket_path, &pid_path));
 
-        assert!(!pid_path.exists());
+        assert!(!socket_path.exists());
     }
 
     #[tokio::test]

@@ -239,10 +239,10 @@ poll_interval = 5
 # server scenario here sets a port for the same reason (claude-only,
 # claude-teams-inbox, codex-reviewer-sandbox). Two product defects behind that
 # failure are fixed (#1150): serve now reclaims its socket and pid record on every
-# exit path, and init reports a server that exited during startup together with the
-# Server window's own output instead of waiting out its 30s budget on a socket
-# nothing would answer. The port stays 0 because the collision is real, not
-# because its symptoms have been hidden.
+# exit path, and init now stops as soon as the server process has exited, reporting it
+# together with the Server window's own output rather than a socket timeout. The
+# port stays 0 because the collision is real, not because its symptoms have been
+# hidden.
 
 [[companions]]
 name = "chainlink-codex-validator"

@@ -164,8 +164,11 @@ The socket health check that used to stop this scenario before dispatch
 (`Server socket exists but health check failed after 30s`) is gone, and the two
 product defects behind it are fixed rather than worked around. `serve` binds its
 Unix socket before the public TCP listener, so a contended port failed *after*
-the socket existed; it now reclaims both the socket and the pid record on every
-exit path, including that one. `init` also stops waiting as soon as the server is
+the socket existed; it now reclaims the socket on every exit path, including that
+one, while leaving its pid record behind as a tombstone — a record that existed
+only while the server was alive would vanish inside one poll interval of a server
+that dies quickly, leaving `init` unable to tell it from one that has not started
+and no choice but to wait out its budget. `init` stops as soon as the server is
 provably gone — a recorded pid that has exited, or a socket nothing is listening
 on — and attaches the Server window's own output to the failure, so the reason
 (`Address already in use`) reaches the operator instead of a bare timeout.

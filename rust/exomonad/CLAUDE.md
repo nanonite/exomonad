@@ -50,14 +50,17 @@ exomonad shutdown                 # Gracefully shut down the running server
 The TL window wraps the controller command so live output remains in the pane. A normal zero exit keeps the existing startup retention release, while a failed exit or durable controller-exit marker retains the pane and prints the failure marker plus the `controller-output.log` path.
 
 **Server startup:** `init` waits up to 30s for the server to answer `/health` over
-`.exo/server.sock`. `serve` reclaims its socket and pid record on every exit path,
-including a failed one, so a server that gives up leaves nothing behind for `init`
-to mistake for a server still starting. `init` still distinguishes the cases the
-wait cannot otherwise tell apart, and attaches the Server window's own output to
-the failure: a recorded pid that has exited, a socket nothing is listening on, and
-a socket that never appeared. `serve` also binds the public TCP listener at
-`0.0.0.0:<port>` (default 7433), so two projects on one host need distinct ports;
-`port = 0` takes an ephemeral one.
+`.exo/server.sock`. `serve` reclaims its socket on every exit path, including a
+failed one, so a server that gives up leaves no socket for `init` to mistake for a
+server still starting. It deliberately leaves its pid record behind: a record that
+existed only while the server was alive would disappear inside one poll interval of
+a server that dies quickly, leaving `init` unable to tell that apart from one that
+has not started yet. `init` stops as soon as the server is provably gone — a
+recorded pid that has exited, or a socket nothing is listening on — and attaches the
+Server window's own output to the failure. A server that is up but still loading its
+WASM plugin is awaited, because the budget covers that. `serve` also binds the public
+TCP listener at `0.0.0.0:<port>` (default 7433), so two projects on one host need
+distinct ports; `port = 0` takes an ephemeral one.
 
 Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is newer (consuming projects only, not source projects with `.exo/roles/`).
 
