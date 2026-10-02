@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Fix exomonad serve never becoming healthy for the chainlink-codex e2e fixture (#1150)
 - Stop provisioning the unsupported gpt-luna model in Codex fixtures and the new scaffold (#1149)
 - Make plan agent type requests policy-bound and effective (#1128)
 - Fix a dispatched Codex worker that never calls notify_parent (#1148)
