@@ -238,11 +238,11 @@ poll_interval = 5
 # it, so this run binds the UDS, loses the TCP bind and exits 1. Every other e2e
 # server scenario here sets a port for the same reason (claude-only,
 # claude-teams-inbox, codex-reviewer-sandbox). Two product defects behind that
-# failure are fixed (#1150): serve now reclaims its socket and pid record on every
-# exit path, and init now stops as soon as the server process has exited, reporting it
-# together with the Server window's own output rather than a socket timeout. The
-# port stays 0 because the collision is real, not because its symptoms have been
-# hidden.
+# failure are fixed (#1150): serve now reclaims its socket on every exit path and
+# keeps its pid record as a tombstone that init reads, and init stops as soon as the
+# server process has exited, reporting it together with the Server window's own
+# output rather than a socket timeout. The port stays 0 because the collision is
+# real, not because its symptoms have been hidden.
 
 [[companions]]
 name = "chainlink-codex-validator"

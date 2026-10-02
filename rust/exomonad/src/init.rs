@@ -5164,11 +5164,10 @@ impl ServerProcessProbe<'_> {
 
 /// Wait for the server to be ready, reporting the window's output on failure.
 ///
-/// `serve` reaps its socket and pid record when it exits, so after a failed
-/// start there is nothing left on disk to poll. Where the window watches `serve`
-/// directly its exit is the signal; where it does not, a server that exits
-/// without ever binding leaves the same trace as one that is merely slow, and
-/// only the window's retained output carries the reason.
+/// `serve` reaps its socket when it exits and keeps its pid record, so a failed
+/// start leaves the record that says so. Where the window watches `serve`
+/// directly its exit is a second, independent signal; the window's retained
+/// output is what carries the reason in either case.
 async fn wait_for_server_startup(
     project_dir: &Path,
     probe: ServerProcessProbe<'_>,
@@ -7318,10 +7317,10 @@ fn remove_server_artifact(path: &Path) -> Result<()> {
 
 /// Clear server artifacts that no live server owns.
 ///
-/// Both artifacts are stale together or not at all: a live server always has
-/// both, and `serve` reaps both when it exits. Clearing the pid record even
-/// when no socket is present is what keeps a record left by an older run from
-/// being read as this run's server dying during startup.
+/// `serve` keeps its pid record after exiting, so a record naming a dead process
+/// is the tombstone a failed start leaves behind rather than a leftover. Clearing
+/// it here -- even when no socket is present -- is what keeps the previous run's
+/// tombstone from being read as this run's server dying during startup.
 fn prepare_server_socket_for_start(project_dir: &Path) -> Result<()> {
     let pid_path = project_dir.join(".exo/server.pid");
     if server_pid_is_alive(&pid_path) {
@@ -7362,12 +7361,11 @@ impl ServerStartupFailure {
 
 /// Watches the `exomonad serve` process a startup wait is waiting for.
 ///
-/// The pid is latched rather than re-read because `serve` reclaims both of its
-/// artifacts when it exits: re-reading the record finds nothing there, and a
-/// server that gave up cleanly then looks exactly like one that has not started
-/// yet. Latching makes the exit observable on the path that matters — the server
-/// that failed on purpose — and not only on the leftovers a crash would leave
-/// behind.
+/// The pid is latched so it survives a server that exits and a successor that
+/// overwrites the record mid-wait: `serve` keeps its record on exit, so a dead
+/// pid read from disk is already decisive, and latching additionally decides the
+/// case where the record changes under us while the server we were watching is
+/// the one that died.
 #[derive(Debug, Default)]
 struct ServerStartupWatch {
     /// The first live server pid this wait saw, held for the rest of the wait.
@@ -7453,9 +7451,9 @@ async fn wait_for_server_socket_until(
     let socket_path = project_dir.join(".exo/server.sock");
     let mut watch = ServerStartupWatch::default();
     while Instant::now() < deadline {
-        // Observe before branching on the socket: a server that binds and then
-        // exits on the way out reaps the record within a poll interval, so the
-        // socket appearing is exactly when the pid has to be latched.
+        // Observe before branching on the socket: the socket appearing is exactly
+        // when the server has finished starting, so that is the last poll at which
+        // a live pid can be latched for a server that dies moments later.
         watch.observe(project_dir);
         if socket_path.exists() {
             return wait_for_server_health_until(project_dir, &mut watch, deadline).await;
@@ -12015,7 +12013,7 @@ mod tests {
         let pid_path = exo_dir.join("server.pid");
 
         // A stub server that records a live pid, binds the socket without ever
-        // answering it, then exits and reaps both artifacts -- the contended
+        // answering it, then exits and reaps its socket -- the contended
         // TCP bind, reproduced without contending a port. The recorded pid is a
         // real child so its death is observable; the test process's own pid would
         // outlive the wait. The record outlives a few polls so the wait can
