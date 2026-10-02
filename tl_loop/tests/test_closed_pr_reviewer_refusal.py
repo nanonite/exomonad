@@ -8,7 +8,7 @@ made the server refuse the spawn -- ``ensure_open_unmerged_pr`` in
 ``_execute_direct_reviewer_intent`` re-raised that refusal as a run failure.
 
 A closed, unmerged PR is an authoritative observation the product already knows
-how to classify: ``_pr_terminal_cause`` in ``tl_loop/loop/heartbeat.py`` returns
+how to classify: ``pr_terminal_cause`` in ``tl_loop/loop/heartbeat.py`` returns
 ``ParkCause.PR_CLOSED_UNMERGED`` for it, and the heartbeat parks the slice and
 escalates exactly once. The refusal only needs to stop killing the run so that
 path can run. In a nested child the failure was worse than useless: the child

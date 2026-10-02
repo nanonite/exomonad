@@ -1168,3 +1168,19 @@ def test_the_heartbeat_logs_the_classification_it_did_not_act_on(
     assert lines, "the heartbeat classified nothing"
     assert "pr_state='open'" in lines[0]
     assert "ownership=verified" in lines[0]
+
+
+def test_the_pr_classification_helpers_are_public() -> None:
+    """Startup reconciliation reads the same two helpers across modules (#1144).
+
+    `_reconfirm_park` in `tl_loop.loop.driver` classifies the observation that
+    proves a park and writes the audit the heartbeat's parks write, so both
+    helpers belong to this module's public surface. Reaching into a private
+    name from another module is what this guards.
+    """
+    from tl_loop.loop import driver, heartbeat
+
+    assert "pr_payload" in heartbeat.__all__
+    assert "pr_terminal_cause" in heartbeat.__all__
+    assert driver.pr_payload is heartbeat.pr_payload
+    assert driver.pr_terminal_cause is heartbeat.pr_terminal_cause

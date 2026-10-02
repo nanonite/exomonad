@@ -1071,8 +1071,13 @@ def main() -> int:
         project = bootstrap(
             scope, instance, database, session=scope.session_prefix, leg=arguments.leg
         )
-        database = chainlink_db.create(root, project_dir=repo)
-        SEED_ISSUE_IDS.extend(chainlink_db.seed(database, SEED_ISSUES))
+        created = chainlink_db.create(root, project_dir=repo)
+        require(
+            created == database,
+            "the database this run seeds is not the one bootstrap anchored the "
+            f"session to: anchored={database} created={created}",
+        )
+        SEED_ISSUE_IDS.extend(chainlink_db.seed(created, SEED_ISSUES))
         report.evidence["chainlink_database"] = str(database)
         report.evidence["seeded_issues"] = list(SEED_ISSUE_IDS)
         state = walk(project, arguments.leg)

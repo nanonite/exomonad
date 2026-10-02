@@ -138,9 +138,9 @@ from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
     SyntheticHeartbeatEvent,
-    _pr_payload,
-    _pr_terminal_cause,
     heartbeat_once,
+    pr_payload,
+    pr_terminal_cause,
 )
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.recovery_policy import policy_for_cause
@@ -7009,7 +7009,7 @@ def _reconfirm_park(
     """
     if current.park_cause is None or watcher is None:
         return None
-    cause = _pr_terminal_cause(watcher)
+    cause = pr_terminal_cause(watcher)
     if cause is None or cause.value != current.park_cause.value:
         return None
     if isinstance(effects, ReadOnlyEffectClient):
@@ -7020,7 +7020,7 @@ def _reconfirm_park(
         store=store,
         issue_creator=effects,
         ledger=state.budgets,
-        audit=_pr_payload(watcher),
+        audit=pr_payload(watcher),
     )
     refreshed = store.load().slices.get(current.id)
     return refreshed if refreshed is not None else None

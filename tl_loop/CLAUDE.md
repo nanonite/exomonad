@@ -114,6 +114,33 @@ or conflicting evidence creates a deterministic `plan-manifest-migration`
 gate and leaves the legacy checkpoint untouched; only a proven migration may
 clear those gates.
 
+## Startup re-confirmation of a parked slice
+
+Startup reconciliation treats a parked slice as already decided and rebuilds no
+other derived field for it. The one thing it may do is re-confirm the park the
+slice already holds, and only when the authoritative watcher observation still
+proves that exact cause: `pr_terminal_cause` classifies the snapshot and the
+cause must equal the persisted `park_cause`. `_reconfirm_park` then re-runs
+`park` on the unchanged slice. `park` resolves the escalation intent by
+`(slice, cause, attempt)` under the writer lock and reuses the issue that intent
+names, and an already-pending gate is re-used rather than opened a second time,
+so a re-confirmation adds no second intent, no second Chainlink issue, and no
+second gate. A read-only effect client re-confirms nothing at all.
+
+A re-confirmation *does* emit `tl.slice_parked` again: re-emitting that
+boundary is what shows the restarted controller reached the conclusion it had
+already recorded. So `tl.slice_parked` is not a count of distinct parks -- one
+park reconciled twice emits it twice, and the #1117 acceptance
+(`tests/e2e/recursive-crash-convergence`) records `parks_after_restart: 2`
+against `escalations_after_restart: 1` and one Chainlink issue. A consumer that
+needs a park count must count escalation intents, gate names, or the durable
+`park_cause`/`park_issue_id` on the slice, never the event stream.
+
+A park whose observation no longer proves its cause -- the PR reopened or
+merged, or its head became reachable again -- is left exactly as it is.
+Reconciliation never resurrects a parked slice on an observation that no longer
+supports the decision.
+
 ## Durable post-merge recovery boundaries
 
 Remote merge adoption opens a per-slice recovery FSM; it does not complete the
@@ -205,7 +232,7 @@ new synthetic event.
 
 Classifications must not depend on a default being spelled out. A watcher
 snapshot answers in protobuf, where a boolean or string with no value simply
-isn't there, so `_pr_terminal_cause` and `reconcile_slice` read "a closed PR
+isn't there, so `pr_terminal_cause` and `reconcile_slice` read "a closed PR
 that does not prove it was merged" (`merged is not True`) rather than "a closed
 PR that spells out `false`", and a review observation with no submission time
 is normalized to none before it reaches `ReviewValidationObservation`, whose

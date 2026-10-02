@@ -367,7 +367,7 @@ def heartbeat_once(
                     "pr.publication_refused",
                     "watcher_pr_state",
                     slice_state.id,
-                    _pr_payload(watcher),
+                    pr_payload(watcher),
                 )
             )
             continue
@@ -386,7 +386,7 @@ def heartbeat_once(
                 )
                 progress = True
             slice_state = current.slices[slice_state.id]
-        terminal_cause = _pr_terminal_cause(watcher)
+        terminal_cause = pr_terminal_cause(watcher)
         if terminal_cause is None:
             # One line per slice per cycle. The synthetic events a heartbeat
             # produces are returned in the run result, never written to the
@@ -415,7 +415,7 @@ def heartbeat_once(
                 store=store,
                 issue_creator=effects,
                 ledger=current.budgets,
-                audit=_pr_payload(watcher),
+                audit=pr_payload(watcher),
             )
             current = store.load()
             parked_slice = current.slices[slice_state.id]
@@ -448,7 +448,7 @@ def heartbeat_once(
                     else "pr.head_unreachable",
                     "watcher_pr_state",
                     slice_state.id,
-                    _pr_payload(watcher),
+                    pr_payload(watcher),
                 )
             )
             continue
@@ -477,7 +477,7 @@ def heartbeat_once(
                 observed,
                 "watcher_pr_state",
                 slice_state.id,
-                _pr_payload(watcher),
+                pr_payload(watcher),
             )
         )
 
@@ -892,11 +892,16 @@ def _ownership_reason(watcher: WatcherObservation) -> str:
     )
 
 
-def _pr_payload(payload: WatcherObservation | JsonMapping) -> dict[str, object]:
+def pr_payload(payload: WatcherObservation | JsonMapping) -> dict[str, object]:
+    """Return the audit payload for one watcher observation.
+
+    Startup reconciliation re-confirms a parked slice through the same audit
+    trail the heartbeat parks write, so this is shared rather than private.
+    """
     return _as_watcher_observation(payload).to_payload()
 
 
-def _pr_terminal_cause(payload: WatcherObservation | JsonMapping) -> ParkCause | None:
+def pr_terminal_cause(payload: WatcherObservation | JsonMapping) -> ParkCause | None:
     """Classify only explicit Forgejo/head observations as terminal."""
     payload = _as_watcher_observation(payload)
     if payload.ownership_verified_present and (
@@ -1324,4 +1329,6 @@ __all__ = [
     "SyntheticHeartbeatEvent",
     "heartbeat_due",
     "heartbeat_once",
+    "pr_payload",
+    "pr_terminal_cause",
 ]
