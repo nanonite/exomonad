@@ -11979,29 +11979,35 @@ mod tests {
             .is_none());
     }
 
+    /// The latched pid decides the exit even when the record is gone by the time
+    /// the wait looks again.
+    ///
+    /// `serve` keeps its record on exit, so a dead record on disk is already
+    /// decisive and this case does not arise in production. It does arise if a
+    /// successor server overwrites the record mid-wait, and it is the case latching
+    /// exists for: without the latch the wait would see a record naming a process
+    /// that is alive and keep waiting out its budget for a server already gone.
     #[tokio::test]
-    async fn a_cleanly_exiting_server_is_still_reported_as_exited() {
+    async fn a_latched_pid_survives_its_record_being_replaced() {
         let project = tempfile::tempdir().unwrap();
         let exo_dir = project.path().join(".exo");
         std::fs::create_dir_all(&exo_dir).unwrap();
         let pid_path = exo_dir.join("server.pid");
         let mut watch = ServerStartupWatch::default();
 
-        // The server records itself, exits, and `ServerArtifacts::drop` reclaims the
-        // socket while the record survives as a tombstone -- what a server that
-        // loses the TCP bind leaves behind. Reading that dead pid back is what
-        // makes the exit observable.
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let exited = child.id() as i32;
         std::fs::write(&pid_path, format!(r#"{{"pid":{exited}}}"#)).unwrap();
         watch.observe(project.path());
+        // A successor taking over the record leaves no trace of the pid this wait
+        // is watching.
         std::fs::remove_file(&pid_path).unwrap();
         let _ = child.wait();
 
         assert_eq!(
             watch.failure(project.path()),
             Some(ServerStartupFailure::ProcessExited(exited)),
-            "a server that reaped its own artifacts must still be reported as exited"
+            "the pid latched before the record was replaced must still report the exit"
         );
     }
 

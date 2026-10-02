@@ -2033,8 +2033,9 @@ Run `exomonad recompile` first to build it.",
     }
     std::fs::write(&server_pid_path, serde_json::to_string_pretty(&pid_info)?)?;
     info!(path = %server_pid_path.display(), "Wrote server.pid");
-    // From here on this process owns the socket and the pid record, so every
-    // exit path has to give them back rather than leave a dead socket behind.
+    // From here on every exit path has to reclaim the socket rather than leave a
+    // dead one behind. The pid record stays as a tombstone init reads; see
+    // `ServerArtifacts`.
     let _server_artifacts = ServerArtifacts::arm(&socket_path, &server_pid_path);
 
     let reviewer_max_rounds = reviewer_max_rounds_override_from_env()?;
