@@ -506,6 +506,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Tidy the #1137 follow-ups: dead assignment, private heartbeat imports, re-park docs (#1144)
 - Decide whether one slice's dispatch exhaustion should stop sibling slices (#1134)
 - Diagnose the spawned-slice stall with a leaf under a child sub-TL (#1138)
 - Replace Beast-derived identifiers in offline tests and docs with neutral synthetic ones (#1118)
