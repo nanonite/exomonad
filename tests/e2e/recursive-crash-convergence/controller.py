@@ -14,6 +14,10 @@ from boundaries import CrashBoundary
 from crash_transport import CrashBoundaryTransport, RecordingTransport
 from evidence import AcceptanceError
 
+# Imported for its annotation only, at runtime as well: ``repository`` is the
+# one value that tells a controller which repository it is integrating into.
+from tl_loop.state.schema import RepositoryIdentity  # isort: skip
+
 
 def _write_handoff(repo: Path, payload: dict[str, object]) -> None:
     """Publish the crash/resume contract the leaf actor reads at file_pr time.
@@ -41,6 +45,7 @@ def controller(
     advance_base: bool,
     chainlink_issue_id: int,
     chainlink_db: Path,
+    repository: RepositoryIdentity,
 ) -> None:
     """Run one controller invocation until the injected process death."""
     os.environ["CHAINLINK_DB"] = str(chainlink_db)
@@ -93,6 +98,7 @@ def controller(
                 ledger_run_id=ledger_run_id,
                 chainlink_issue_id=chainlink_issue_id,
                 review_model_choice=real._recovery_review_choice(),
+                repository_identity=repository,
             ),
             root_dir=state_root,
         )
@@ -128,6 +134,7 @@ def resume(
     trace_path: Path,
     chainlink_issue_id: int,
     chainlink_db: Path,
+    repository: RepositoryIdentity,
 ) -> Any:
     """Resume from the persisted manifest, recording all resumed UDS calls."""
     os.environ["CHAINLINK_DB"] = str(chainlink_db)
@@ -164,6 +171,7 @@ def resume(
                 ledger_run_id=ledger_run_id,
                 chainlink_issue_id=chainlink_issue_id,
                 review_model_choice=real._recovery_review_choice(),
+                repository_identity=repository,
             ),
             root_dir=state_root,
         )

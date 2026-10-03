@@ -55,6 +55,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(ORDERED_DIR))
 sys.path.insert(0, str(LIB_DIR))
 
+from tl_loop.state.schema import RepositoryIdentity  # noqa: E402
+
 import e2e_harness.chainlink_db as chainlink_db  # noqa: E402
 import e2e_harness.cleanup as cl  # noqa: E402
 import e2e_harness.forgejo_stack as fj  # noqa: E402
@@ -91,6 +93,17 @@ GIT_USER_EMAIL = "recursive-crash-e2e@example.invalid"
 
 #: The path of the repository inside a case's own directory.
 CASE_REPOSITORY = "repo"
+
+#: The actor that reports CI for a case's own repository. It is a module rather
+#: than a function in this file because it runs in its own process with no
+#: harness Python around it, so it may only be configured by its environment.
+CI_STATUS_ACTOR = Path(__file__).resolve().parent / "ci_status_actor.py"
+
+#: How long a released case waits for its CI actor to leave on its own before
+#: the actor's process group is signalled. A poll is one forge round trip, so a
+#: second is generous and a case does not spend the rest of the run waiting for
+#: an actor that is never going to notice.
+CI_ACTOR_STOP_SECONDS = 5.0
 
 #: Everything the matrix can fail with. A run that fails for any other reason is
 #: a harness fault, not a verdict, so it is reported as one.
@@ -523,6 +536,16 @@ def run_case(
     """
     state_root = root / "controller-state"
     ledger_run_id = real.server_run_id(repo)
+    # The controller has to be told which repository this case is about. Its
+    # aggregate merge resolves a durable lane keyed by ``owner/repo``
+    # (``_candidate_lane_key`` -> ``_repository_identity``), which raises when
+    # the run carries no repository identity -- so an unconfigured controller
+    # reserves nothing, proposes ``merge_aggregate`` again on the next pass, and
+    # the run parks the slice on ``repeated_state_version_action``. The identity
+    # is this case's own repository on the instance the run provisioned, read
+    # from the instance rather than reconstructed, so it cannot name a forge the
+    # run did not create.
+    repository_identity = RepositoryIdentity(instance.owner, instance.repo, BASE_BRANCH)
     # Structure-only plan for seeding (sources are not serialized into the
     # manifest, so seeding is unaffected by them).
     work_plan = plan()
@@ -549,7 +572,16 @@ def run_case(
         before_restart=traces / f"{case_name}.before.json",
         after_restart=traces / f"{case_name}.after.json",
     )
-    _crash_the_controller(crash, repo, work_plan, boundary, case_name, chainlink_issue_id, chainlink_db)
+    _crash_the_controller(
+        crash,
+        repo,
+        work_plan,
+        boundary,
+        case_name,
+        chainlink_issue_id,
+        chainlink_db,
+        repository_identity,
+    )
     result = resume(
         crash.run_id,
         crash.state_root,
@@ -558,6 +590,7 @@ def run_case(
         crash.resume_trace,
         chainlink_issue_id,
         chainlink_db,
+        repository_identity,
     )
     shutil.copy2(crash.checkpoint, crash.after_restart)
     return _assert_case_evidence(repo, instance, boundary, case_name, crash, result)
@@ -571,6 +604,7 @@ def _crash_the_controller(
     case_name: str,
     chainlink_issue_id: int,
     chainlink_db: Path,
+    repository: RepositoryIdentity,
 ) -> None:
     """Run the controller until the injected process death, and snapshot it.
 
@@ -593,6 +627,7 @@ def _crash_the_controller(
             boundary.name == "review",
             chainlink_issue_id,
             chainlink_db,
+            repository,
         ),
         name=case_name,
     )
@@ -684,6 +719,7 @@ def _run_case(
     )
     scope.track_process(server, f"#1057 {case_name} server")
     scope.track_tmux_server(tmuxio.socket_path(root))
+    ci_actor, ci_stop = _start_ci_actor(scope, repository, root, case_name)
     failure: BaseException | None = None
     result: dict[str, Any] | None = None
     try:
@@ -692,12 +728,80 @@ def _run_case(
         )
     except BaseException as error:  # noqa: BLE001 - released, then re-raised
         failure = error
-    _release_case(scope, server, repo, root, case_name, failure)
+    _release_case(scope, server, repo, root, case_name, failure, ci_actor, ci_stop)
     if failure is not None:
         raise failure
     assert result is not None
     result["server_run"] = repetition
     return result
+
+
+def _start_ci_actor(
+    scope: cl.RunScope,
+    repository: fj.Instance,
+    root: Path,
+    case_name: str,
+) -> tuple[Any, Path]:
+    """Report CI for this case's repository, because nothing else will.
+
+    The Forgejo this run provisions has Actions disabled and no runner against
+    it, so every head the watcher polls reads ``ci_status: unknown`` and the
+    controller's merge gates -- which require ``success`` or ``neutral`` --
+    refuse. A case would then fail at every boundary that has to merge or adopt,
+    for a reason that is about the instance this run chose to bring up rather
+    than about the boundary it crashed at. The actor is that instance's CI
+    provider: it reports one success status per head it sees on a pull request
+    and writes nothing into the controller's state, so every approval and
+    publication in the case is still earned the way the boundary earns it.
+
+    It runs in its own process, registered with the run scope, so a case that
+    dies with the actor still alive fails the run for the leak rather than
+    leaving a poller behind on the host.
+    """
+    stop = root / "ci-actor.stop"
+    log = (root / "ci-actor.log").open("w", encoding="utf-8")
+    environment = {
+        **os.environ,
+        "EXOMONAD_CI_FORGE_URL": repository.base_url,
+        "EXOMONAD_CI_OWNER": repository.owner,
+        "EXOMONAD_CI_REPO": repository.repo,
+        "EXOMONAD_CI_TOKEN": repository.author.token,
+        "EXOMONAD_CI_LOG": str(root / "ci-status.jsonl"),
+        "EXOMONAD_CI_STOP": str(stop),
+    }
+    process = subprocess.Popen(
+        [sys.executable, str(CI_STATUS_ACTOR)],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        stdout=log,
+        stderr=log,
+        text=True,
+        # Its own process group, so releasing the case can signal the actor
+        # without the signal reaching the harness.
+        start_new_session=True,
+    )
+    scope.track_process(process, f"#1057 {case_name} CI actor")
+    return process, stop
+
+
+def _stop_ci_actor(actor: Any, stop: Path, case_name: str) -> None:
+    """Ask this case's CI actor to leave, then make sure it did.
+
+    The stop file goes first so an actor between polls exits on its own terms,
+    and the terminate afterwards is what stops one that is stuck in a forge
+    call. A refusal is printed rather than raised: the case's own verdict is the
+    one the run is reporting, and an actor that outlived its case is a leak the
+    run scope already fails on.
+    """
+    try:
+        stop.write_text("stop\n", encoding="utf-8")
+        actor.wait(timeout=CI_ACTOR_STOP_SECONDS)
+    except subprocess.TimeoutExpired:
+        # The actor spawns nothing, so terminating the process is enough; it
+        # runs in its own session, so the signal cannot reach this harness.
+        real.stop_subprocess(actor, f"#1057 {case_name} CI actor", timeout=5)
+    except BaseException as error:  # noqa: BLE001 - reported, never raised
+        print(f"FAIL TEARDOWN {case_name}: CI actor: {type(error).__name__}: {error}", flush=True)
 
 
 def _release_case(
@@ -707,6 +811,8 @@ def _release_case(
     root: Path,
     case_name: str,
     failure: BaseException | None,
+    ci_actor: Any | None = None,
+    ci_stop: Path | None = None,
 ) -> None:
     """Stop this case's server and remove its directory, keeping the first failure.
 
@@ -715,6 +821,8 @@ def _release_case(
     trip on a host another harness is also writing to, so the case's real
     diagnosis would be the one thing lost.
     """
+    if ci_actor is not None and ci_stop is not None:
+        _stop_ci_actor(ci_actor, ci_stop, case_name)
     try:
         real.stop_server(server, repo, f"#1057 {case_name} acceptance")
     except BaseException as error:  # noqa: BLE001 - reported or raised, never lost

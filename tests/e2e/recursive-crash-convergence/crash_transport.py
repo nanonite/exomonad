@@ -29,6 +29,13 @@ class CrashBoundaryTransport(TransportClient):
         crash_owner_pid: int | None = None,
     ) -> None:
         super().__init__(project_root=project_root, timeout=10)
+        # The base advance pushes to this case's own clone, so the transport
+        # keeps the root it was given rather than deriving it later. The base
+        # class resolves its socket to an absolute path and keeps no root, and a
+        # review boundary that could not find one died in the watcher callback
+        # with an AttributeError -- which reads as a controller that exited
+        # before its boundary, not as the fixture bug it was.
+        self.project_root = Path(project_root)
         self.trace_path = trace_path
         self.boundary = boundary
         self.advance_base_after_watcher = advance_base_after_watcher

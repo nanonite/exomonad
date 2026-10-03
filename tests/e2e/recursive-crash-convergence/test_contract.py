@@ -230,6 +230,48 @@ def test_spawn_boundary_matches_real_child_process_effects_only(tmp_path: Path) 
     )
 
 
+def test_the_review_boundary_advances_the_real_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review boundary's base advance must reach the case's own clone.
+
+    A review boundary moves ``main`` forward on the remote so the resumed run has
+    to revalidate against a base the crash left behind. The advance is made from
+    the crash transport, which the base client hands only a resolved socket path
+    -- so a transport that looked for a project root it never stored died in the
+    watcher callback, and the case reported a controller that exited before its
+    boundary instead of the fixture fault it was.
+    """
+    transport = CrashBoundaryTransport(
+        tmp_path,
+        tmp_path / "crash.jsonl",
+        # A boundary that does not match this call, so the assertion is about the
+        # advance the review cases rely on and not about the process death the
+        # same transport performs when it does match.
+        boundary_for("spawn", "before"),
+        advance_base_after_watcher=True,
+    )
+    advanced: list[tuple[Path, int]] = []
+    monkeypatch.setattr(
+        real, "advance_remote_base", lambda root, count: advanced.append((root, count))
+    )
+    monkeypatch.setattr(
+        CrashBoundaryTransport.__mro__[1],
+        "_ensure_socket",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        CrashBoundaryTransport.__mro__[1],
+        "_send_request",
+        lambda self, method, path, body, headers: (200, b'{"success": true}'),
+    )
+    transport.call_tool("tl", "parent", "watcher_pr_state", {"pr_number": 1})
+    assert advanced == [(tmp_path, 1)]
+    # And only once: a second observation of the same PR is not a second push.
+    transport.call_tool("tl", "parent", "watcher_pr_state", {"pr_number": 1})
+    assert advanced == [(tmp_path, 1)]
+
+
 def test_boundary_lookup_and_effect_identity_are_canonical() -> None:
     with pytest.raises(KeyError):
         boundary_for("not-a-real-effect", "before")
@@ -1229,6 +1271,197 @@ def test_the_reviewer_actor_reaches_only_the_forge_its_shim_configured(
     assert posted[-1][0] == (
         "http://forgejo/api/v1/repos/run-author/case-repo/pulls/7/reviews"
     )
+
+
+class _RecordedPopen:
+    """A stand-in for :class:`subprocess.Popen` that records how it was called."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.pid = 424242
+
+    def __call__(self, *arguments: Any, **keywords: Any) -> _RecordedProcess:
+        self.calls.append((arguments, keywords))
+        return _RecordedProcess()
+
+
+class _RecordedProcess:
+    def __init__(self) -> None:
+        self.waited = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        return 0
+
+    def poll(self) -> int | None:
+        return 0
+
+
+def test_every_case_reports_the_ci_its_own_forge_cannot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A case gets a CI provider, and it is the run's own process to stop.
+
+    The Forgejo the matrix provisions has Actions disabled and no runner, so
+    every head the watcher polls reads ``ci_status: unknown`` and both merge
+    gates -- ``_execute_aggregate_merges`` and ``_direct_merge_evidence`` --
+    refuse anything but ``success`` or ``neutral``. A case without a CI provider
+    fails at every boundary that merges, about the instance rather than about the
+    crash. The actor is started per case and registered with the run scope, so an
+    actor that outlives its case is a leak the run fails on.
+    """
+    assert "_start_ci_actor(" in inspect.getsource(runner._run_case)
+    assert "_stop_ci_actor(" in inspect.getsource(runner._release_case)
+
+    tracked: dict[str, str] = {}
+
+    class _Scope:
+        def track_process(self, process: Any, label: str) -> Any:
+            tracked["label"] = label
+            return process
+
+    recorded = _RecordedPopen()
+    monkeypatch.setattr(runner.subprocess, "Popen", recorded)
+    repository = fj.Instance(
+        project="exo-e2e-1057-runforgejo-p1",
+        compose_file=tmp_path / "docker-compose.yml",
+        base_url="http://127.0.0.1:3999",
+        host="127.0.0.1:3999",
+        admin_username="run-admin",
+        author=fj.Account(username="run-author", token="run-author-token"),
+        reviewer=fj.Account(username="run-reviewer", token="run-reviewer-token"),
+        owner="run-author",
+        repo="crash-r1-review-before",
+    )
+    process, stop = runner._start_ci_actor(
+        _Scope(), repository, tmp_path, "crash-r1-review-before"
+    )
+    assert tracked["label"] == "#1057 crash-r1-review-before CI actor"
+    arguments, keywords = recorded.calls[0]
+    assert arguments[0] == [sys.executable, str(runner.CI_STATUS_ACTOR)]
+    assert keywords["start_new_session"] is True
+    environment = keywords["env"]
+    assert environment["EXOMONAD_CI_FORGE_URL"] == "http://127.0.0.1:3999"
+    assert environment["EXOMONAD_CI_OWNER"] == "run-author"
+    assert environment["EXOMONAD_CI_REPO"] == "crash-r1-review-before"
+    assert environment["EXOMONAD_CI_TOKEN"] == "run-author-token"
+    assert environment["EXOMONAD_CI_STOP"] == str(stop)
+    assert stop.parent == tmp_path
+
+    runner._stop_ci_actor(process, stop, "crash-r1-review-before")
+    assert stop.is_file()
+    assert process.waited is True
+
+
+def test_every_controller_invocation_is_told_which_repository_it_owns() -> None:
+    """Both invocations carry the case's own repository identity.
+
+    ``_candidate_lane_key`` resolves ``owner/repo`` through
+    ``_repository_identity``, which raises when the run carries none. Without it
+    the aggregate merge reserves no lane, returns the state unchanged, proposes
+    ``merge_aggregate`` again on the next pass, and the run parks the slice on
+    ``repeated_state_version_action`` -- reported as a case that would not
+    converge, about nothing the boundary did. Both the crashing invocation and
+    the resumed one must carry it, because the resumed one is the process that
+    has to move the candidate.
+    """
+    from controller import controller, resume
+
+    for entry in (controller, resume):
+        parameters = inspect.signature(entry).parameters
+        assert "repository" in parameters, f"{entry.__name__} takes no repository"
+        identity = parameters["repository"].annotation
+        assert "RepositoryIdentity" in str(identity), (
+            f"{entry.__name__} must be told the repository identity, not a path"
+        )
+    source = inspect.getsource(runner.run_case)
+    assert "RepositoryIdentity(instance.owner, instance.repo, BASE_BRANCH)" in source
+    assert source.count("repository_identity,") >= 2
+
+
+def test_the_ci_actor_reports_each_head_once_and_only_a_real_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The actor posts one success status per head, and never invents a head.
+
+    A CI provider that reported the same head repeatedly would bury the forge in
+    statuses the controller then had to reconcile; one that reported a head
+    nobody published would be fabricating the evidence the CI gate exists to
+    insist on. Both are refused here, and the log records what was reported so a
+    case's own report can name it.
+    """
+    import ci_status_actor
+
+    calls: list[tuple[str, str, Any]] = []
+    pulls = [
+        {"number": 7, "head": {"sha": "head-one"}},
+        {"number": 8, "head": {"sha": "head-two"}},
+        {"number": 9},
+        {"head": {"sha": "no-number"}},
+        "not-an-object",
+    ]
+    monkeypatch.setattr(
+        ci_status_actor,
+        "_request",
+        lambda method, url, *, token, payload=None: calls.append((method, url, payload))
+        or (pulls if method == "GET" else {"status": "success"}),
+    )
+    actor = ci_status_actor.CIActor(
+        "http://forgejo/api/v1/repos/run-author/case-repo",
+        "run-author-token",
+        tmp_path / "ci-status.jsonl",
+    )
+    assert sorted(actor.poll_once()) == ["head-one", "head-two"]
+    assert actor.poll_once() == []
+    posted = [url for method, url, _ in calls if method == "POST"]
+    assert posted == [
+        "http://forgejo/api/v1/repos/run-author/case-repo/statuses/head-one",
+        "http://forgejo/api/v1/repos/run-author/case-repo/statuses/head-two",
+    ]
+    assert all(
+        payload["state"] == "success" and payload["context"] == ci_status_actor.STATUS_CONTEXT
+        for method, _, payload in calls
+        if method == "POST"
+    )
+    logged = [json.loads(line) for line in (tmp_path / "ci-status.jsonl").read_text().splitlines()]
+    assert [record["head_sha"] for record in logged] == ["head-one", "head-two"]
+
+
+def test_the_ci_actor_leaves_when_the_case_releases_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop file is the actor's exit, so a released case keeps no poller."""
+    import ci_status_actor
+
+    monkeypatch.setattr(ci_status_actor, "_request", lambda *a, **k: [])
+    stop = tmp_path / "ci-actor.stop"
+    actor = ci_status_actor.CIActor(
+        "http://forgejo/api/v1/repos/run-author/case-repo",
+        "token",
+        tmp_path / "ci-status.jsonl",
+        stop,
+        lifetime_seconds=60.0,
+    )
+    stop.write_text("stop\n", encoding="utf-8")
+    assert actor.serve() == 0
+
+
+def test_the_ci_actor_fails_closed_when_it_cannot_name_its_forge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No forge coordinates means no CI, not a guess at somebody else's forge."""
+    import ci_status_actor
+
+    for name in (
+        "EXOMONAD_CI_FORGE_URL",
+        "EXOMONAD_CI_OWNER",
+        "EXOMONAD_CI_REPO",
+        "EXOMONAD_CI_TOKEN",
+        "EXOMONAD_CI_LOG",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ci_status_actor.CIActorError):
+        ci_status_actor._actor_from_environment()
 
 
 def test_the_leaf_shim_carries_the_runs_own_forge_credentials(tmp_path: Path) -> None:

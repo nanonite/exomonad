@@ -59,10 +59,10 @@ input; `--mode server` is the only mode, and it names the only thing that has
 ever been true of the matrix — every case runs against a real server this run
 started, against a real Forgejo this run brought up.
 
-A run owns all of it, with two differences from the scenario above: a case
+A run owns all of it, with three differences from the scenario above: a case
 publishes branches named after the boundary it is exercising, so cases cannot
-share a repository, and a pass gets its own Forgejo rather than sharing the
-run's.
+share a repository, a pass gets its own Forgejo rather than sharing the run's,
+and every case starts the CI provider its Forgejo does not have.
 
 | Resource | How it is named |
 |----------|-----------------|
@@ -70,6 +70,7 @@ run's.
 | repository | one fresh repository per case on that pass's instance, named after the case |
 | Chainlink database | `chainlink init` inside the case's own directory, seeded with exactly the one issue the case's controller closes |
 | tmux | one server per case, on its own socket inside the case's directory, registered with the run scope |
+| CI | one `ci_status_actor.py` process per case, registered with the run scope |
 | directory | `mktemp -d` under `exo-e2e-1057-`, one subdirectory per case |
 
 `--repetitions 1` is a single diagnostic pass; the default of three is the
@@ -115,40 +116,68 @@ harness-side one:
 | `refusing watcher publication evidence: provenance mismatch` | the seed filed the PR over REST, so `published-heads.json` stayed empty | the seed publishes through the shipped `file_pr`, as the owning child |
 | `No TL transition for TLRunning and PRFiled` | the seed published for children behind the barrier | only the released stage's children publish |
 | the seeded approval sat at `await_aggregate_review` forever | the repeated-verdict guard returned the state unchanged, dropping the aggregate lifecycle edge the held approval still owed the run | a recognised repeat binds the candidate it left behind |
+| every head read `ci_status: unknown` | the run's Forgejo has Actions disabled and no runner, so nothing ever reported a commit status | `ci_status_actor.py` is the instance's CI provider |
+| `repeated_state_version_action` on `merge_aggregate` | neither controller invocation was told which repository the case owns, so `_repository_identity` raised and the merge lane never resolved | both invocations carry the case's own `RepositoryIdentity` |
+| `'CrashBoundaryTransport' object has no attribute 'project_root'` | the review boundary's base advance read a project root the base client never stores | the transport keeps the root it was constructed with |
 
-Two things were diagnosed against a real run. The Forgejo one is fixed and now
-reads as a bounded, named failure; the other still stops the cases converging,
-and it is not a harness change:
+The CI and the merge-lane rows are the two the last pass found, and they were the
+same class of fault: the run had provisioned everything the controller needs and
+then not told the controller about it. The Forgejo it brings up has Actions
+disabled and no runner registered, so nothing on that instance ever reports a
+commit status and every head reads `ci_status: unknown`;
+`_execute_aggregate_merges` and `_direct_merge_evidence` both require `success`
+or `neutral`, so the case failed at every boundary that merges, about the
+instance rather than about the crash. And `_candidate_lane_key` resolves
+`owner/repo` through `_repository_identity`, which raises when the run carries
+none: an unconfigured controller reserves no lane, returns the state unchanged,
+proposes `merge_aggregate` again on the next pass, and the run parks the slice.
+Neither is a change to how the controller treats evidence.
 
-1. **Nothing on this Forgejo ever reports CI.** The seed posts a real approval
-   and the watcher duly records it (`pr.review`, `verdict: approved`,
-   `review_id` matching), and the approval now binds: the aggregate candidate
-   leaves `aggregate_pr_open` for `ready_for_integration`. The next action is
-   `validate_integration`, which asks the forge for a commit status on the
-   aggregate head. This run brings up a Forgejo and nothing else -- no Actions
-   runner is registered against it -- so every head reads `ci_status: unknown`,
-   the integration evidence is never bound, `validate_integration` is proposed
-   twice with no durable state advancing, and the controller parks the slice on
-   `repeated_state_version_action` and fails the run. The ordered-recursive probe
-   passes the same field from its mock forge (`ci_status: success`), which is
-   why the discrepancy is only visible against a real instance.
+`ci_status_actor.py` is the CI provider for one case's repository: it polls for
+open pull requests and posts one `success` commit status per head it has not
+reported on, which is what a CI provider does and what the watcher then observes
+by polling like any other forge fact. It reports on heads only -- it never writes
+a slice, a checkpoint, a review, or a controller event -- so every approval and
+every publication in a case is still earned the way the boundary under test earns
+it, and a run with no actor fails exactly as it did before.
 
-   One log line is a false lead here: `ignoring review without binding findings`
-   is not the approval. It is the watcher's `[CI TRIGGERED]` notification for
-   the same PR -- a `pr.review` row carrying `kind: ci_triggered` and no verdict
-   at all -- which reaches the review reducer and finds no findings to bind.
+One log line is a false lead here: `ignoring review without binding findings` is
+not the approval. It is the watcher's `[CI TRIGGERED]` notification for the same
+PR -- a `pr.review` row carrying `kind: ci_triggered` and no verdict at all --
+which reaches the review reducer and finds no findings to bind.
 
-2. **The run's own Forgejo died part-way through a pass.** Around the eighth
-   case, `POST /api/v1/user/repos` began answering `Connection refused`; on a
-   host with little free memory the container was killed. Holding one Forgejo for
-   all 28 cases meant every case after that point failed at provisioning rather
-   than at its boundary, so a run that died at case 8 could not demonstrate a
-   28-case matrix at all. The matrix now brings one up per pass and releases it
-   when the pass ends, so the loss is bounded to that pass, the next pass
-   provisions its own, and the health check between cases reports one
-   `FAIL FORGEJO` naming the compose project instead of twenty identical case
-   failures. It still costs that pass its remaining cases, so a loaded host shows
-   up as an incomplete matrix rather than as a lost container.
+### The one that remains
+
+**The seeded approval has no durable reviewer, so `merge_pr` refuses it.** The
+review cases now get all the way to `merge_pr` and stop there:
+
+    EffectFailed: merge_pr for 'sub-a': Canonical merge evidence for PR #1:
+    review evidence for PR #1: reviewer identity could not be authenticated:
+    Forgejo review author did not resolve to a registered agent
+
+The seed posts its approval with the reviewer token, exactly as it should, and
+the watcher records the review -- but `resolve_review_author` binds the review to
+an agent through `resolve_reviewer_invocation`, which looks for an invocation
+with `trigger: review` for that PR and head
+(`agent_resolver.rs:362`). The seed writes its invocations with
+`trigger: spawn`, because that is what dispatched them, and no `spawn_reviewer`
+ever ran: the slice arrives already carrying its verdict and its review
+evidence, so the reducer's `reviewer_attempt` is set and it never proposes one.
+The reviewer's approval is therefore an approval nobody was assigned to make,
+which is precisely what the merge evidence check exists to refuse.
+
+This is a question about what the acceptance is allowed to seed, not about how it
+is provisioned, and it has two honest answers that deserve their own review: have
+the seed let the shipped reducer dispatch its own reviewer (so the invocation is
+the controller's, and the approval is the spawned stand-in's), or change what the
+merge evidence is willing to accept. Writing an invocation record into the
+fixture would make `merge_pr` accept an approval no controller ever assigned, and
+a matrix that went green that way would be proving nothing about the boundary.
+
+The Forgejo lifetime question from the last pass is still open and still bounded:
+one instance per pass, released when the pass ends, with a health check between
+cases naming the compose project that stopped answering and how many of that
+pass's cases were not attempted.
 
 The walk does not stop at a case failure: every failure is attributed to its own
 case and the remaining boundaries still run, so the report distinguishes a
