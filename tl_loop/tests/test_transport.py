@@ -23,6 +23,8 @@ from tl_loop.client.transport import (
     TransportClient,
     resolve_socket_path,
 )
+from tl_loop.tests import socket_root
+from tl_loop.tests.long_tmpdir import long_tmpdir
 
 
 @dataclass(frozen=True)
@@ -82,9 +84,16 @@ class StubServer(ThreadedUnixStreamServer):
 
 @contextmanager
 def stub_server(response_factory: ResponseFactory) -> Iterator[Path]:
-    """Run a one-socket HTTP stub and clean up its temporary path."""
-    with tempfile.TemporaryDirectory() as directory:
-        socket_path = Path(directory) / "server.sock"
+    """Run a one-socket HTTP stub and clean up its temporary path.
+
+    The socket lives under :func:`~tl_loop.tests.socket_root.temporary_short_root`
+    rather than ``tempfile``'s own directory: ``sun_path`` is 107 bytes and
+    ``tempfile`` honours ``TMPDIR``, so a caller whose ``TMPDIR`` is long enough
+    that nothing socket-shaped fits under it would otherwise fail here with
+    ``OSError: AF_UNIX path too long``.
+    """
+    with socket_root.temporary_short_root() as directory:
+        socket_path = socket_root.socket_path(directory)
         server = StubServer(str(socket_path), response_factory)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -144,6 +153,32 @@ class TransportTest(unittest.TestCase):
             missing = Path(directory) / "missing.sock"
             with self.assertRaises(ServerUnreachable):
                 TransportClient(socket_path=missing).get_json("/health")
+
+    def test_a_long_tmpdir_cannot_move_the_stub_socket(self) -> None:
+        """The stub binds and answers with a ``TMPDIR`` no socket fits under.
+
+        ``sun_path`` is 107 bytes, so a root ``tempfile`` hands out beneath a
+        long ``TMPDIR`` -- the lead's shell had 187 characters -- yields a
+        socket path the kernel refuses, and the stub dies with ``OSError:
+        AF_UNIX path too long`` before the transport is ever exercised. The
+        stub's root is pinned to ``/tmp`` instead, so both halves are asserted:
+        the inherited root is refused, and the stub still serves a request.
+        """
+        with long_tmpdir("transport"):
+            inherited = Path(tempfile.mkdtemp())
+            try:
+                with self.assertRaises(socket_root.SocketRootError):
+                    socket_root.socket_path(inherited)
+            finally:
+                inherited.rmdir()
+
+            with stub_server(lambda _request, _body: ResponseSpec(200, b'{"ok":true}')) as path:
+                self.assertLessEqual(
+                    len(str(path).encode("utf-8")), socket_root.MAX_SOCKET_PATH_BYTES, str(path)
+                )
+                self.assertEqual(
+                    TransportClient(socket_path=path, timeout=0.5).get_json("/health"), {"ok": True}
+                )
 
     def test_socket_path_precedence_is_explicit_env_then_project(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
