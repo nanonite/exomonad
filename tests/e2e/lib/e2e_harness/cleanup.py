@@ -93,6 +93,7 @@ class RunScope:
     root: Path
     prefix: str
     sessions: set[str] = field(default_factory=set)
+    tmux_servers: set[Path] = field(default_factory=set)
     processes: dict[int, str] = field(default_factory=dict)
     compose_projects: set[str] = field(default_factory=set)
     compose_files: dict[str, Path] = field(default_factory=dict)
@@ -151,6 +152,20 @@ class RunScope:
         self.processes[int(process.pid)] = label
         return process
 
+    def track_tmux_server(self, socket: Path) -> Path:
+        """Record a tmux server this run started on a socket of its own.
+
+        A run that brings more than one tmux server up -- a matrix that starts a
+        server per case, say -- has to name every socket it created, because
+        teardown can only stop the servers whose sockets it knows. An untracked
+        socket leaves a server listening on a directory teardown is about to
+        remove, which is exactly the leak that is then invisible: nothing left
+        to find it by.
+        """
+        tracked = Path(socket)
+        self.tmux_servers.add(tracked)
+        return tracked
+
     def track_compose(self, project: str, compose_file: Path) -> str:
         """Record a compose project this run brought up."""
         if not project.startswith(self.session_prefix):
@@ -172,8 +187,12 @@ class RunScope:
         self.sessions.clear()
         # The server itself is a resource too: killing its sessions leaves it
         # listening on a socket inside a directory this teardown is about to
-        # remove, and an unreachable server is still a running process.
+        # remove, and an unreachable server is still a running process. A run
+        # that started servers on sockets of its own stops those too.
         self.problems.extend(tmuxio.kill_server(self.tmux_socket))
+        for socket in sorted(self.tmux_servers):
+            self.problems.extend(tmuxio.kill_server(socket))
+        self.tmux_servers.clear()
         for pid, label in sorted(self.processes.items()):
             self.problems.extend(_kill_process(pid, label))
         self.processes.clear()

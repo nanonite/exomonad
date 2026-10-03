@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import secrets
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,7 +32,13 @@ import e2e_harness.chainlink_db as chainlink_db  # noqa: E402
 import e2e_harness.cleanup as cl  # noqa: E402
 import e2e_harness.forgejo_stack as fj  # noqa: E402
 from e2e_harness.waiter import Timeout, await_boundary  # noqa: E402
-from run_prefix import LEAF_SLICE, LEGS, PREFIX, SEED_ISSUES  # noqa: E402
+from run_prefix import (  # noqa: E402
+    LEAF_SLICE,
+    LEGS,
+    PREFIX,
+    SEED_ISSUES,
+    new_run_id,
+)
 from scenario import (  # noqa: E402
     Project,
     ScenarioError,
@@ -141,13 +146,11 @@ class Report:
 def run_id() -> str:
     """Return a run id unique to this invocation.
 
-    It becomes the compose project name, the tmux session prefix, the Forgejo
-    account and repository names, and the temporary directory, so two runs can
-    never reach each other's state. The length is bounded because the tmux
-    session name is derived from it and the server keeps only the first 36
-    characters of that name.
+    The bound and the reason for it live with the other names this acceptance
+    owns, in :mod:`run_prefix`, so the driver and the matrix cannot drift apart
+    on what a run is allowed to call itself.
     """
-    return secrets.token_hex(4)
+    return new_run_id()
 
 
 class Scenario:

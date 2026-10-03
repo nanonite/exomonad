@@ -4,11 +4,17 @@ Static checks (no server, forge, or project):
 
     just check-e2e-recursive-crash-convergence
 
-The acceptance provisions everything it needs and takes no operator input:
+The recreated-publication acceptance provisions everything it needs and takes no
+operator input:
 
     just tl-loop-recursive-crash-convergence-e2e
 
-A run owns all of it:
+The crash/restart matrix is the second run in this directory, and it is
+equally self-contained:
+
+    just tl-loop-crash-matrix-e2e
+
+The recreated-publication run owns all of it:
 
 | Resource | How it is named |
 |----------|-----------------|
@@ -47,12 +53,59 @@ installed archive.
 
 ## Crash matrix (chainlink #1057)
 
-`python3 tests/e2e/recursive-crash-convergence/run.py --mode server` runs the
-14-boundary crash/restart matrix. It still needs the dedicated repository
-environment (`EXOMONAD_FORGEJO_E2E_URL`, `_TOKEN`, `_REVIEWER_TOKEN`, `_OWNER`,
-`_REPO`, `_GIT_REMOTE`) and creates its own disposable Chainlink database per
-case. Set `EXOMONAD_1057_SERVER_RUNS=1` for a single diagnostic pass; that is
-not the acceptance configuration. It refuses the Forgejo-shaped mock.
+`./tests/e2e/recursive-crash-convergence/run-matrix.sh` runs the 14-boundary
+crash/restart matrix. It provisions everything it needs and takes no operator
+input; `--mode server` is the only mode, and it names the only thing that has
+ever been true of the matrix — every case runs against a real server this run
+started, against a real Forgejo this run brought up.
+
+A run owns all of it, with one difference from the scenario above: a case
+publishes branches named after the boundary it is exercising, so cases cannot
+share a repository.
+
+| Resource | How it is named |
+|----------|-----------------|
+| Forgejo | its own compose project from `tests/e2e/lib/forgejo/docker-compose.yml`, ephemeral host port, torn down with `down -v` |
+| repository | one fresh repository per case on that instance, named after the case |
+| Chainlink database | `chainlink init` inside the case's own directory, seeded with exactly the one issue the case's controller closes |
+| tmux | one server per case, on its own socket inside the case's directory, registered with the run scope |
+| directory | `mktemp -d` under `exo-e2e-1057-`, one subdirectory per case |
+
+`--repetitions 1` is a single diagnostic pass; the default of three is the
+acceptance configuration. `--keep` leaves the whole run in place for
+inspection, which is how a failed case is read. Each case prints one
+`PASS`/`FAIL` line, and the run exits non-zero if any case failed or anything
+leaked.
+
+A case never closes its own Chainlink issue on the way out. The row is the
+case's only durable record of the `issue_close` boundary, so a case that
+leaves it open has failed that boundary rather than tidied up after it. The
+database goes at `<repo>/.chainlink/issues.db`, which is where the shipped
+controller resolves it; anywhere else is a file no escalation reaches.
+
+## Known blocker: the restart seed lacks watcher provenance
+
+The matrix provisions, isolates, runs, and tears down correctly today: a run
+reports `0 leaks, 0 cleanup problems, 0 sweep problems` and leaves nothing on
+the host. The **cases** are red, and the reason is not the provisioning.
+
+`seed_delayed_restart_run` binds each slice's aggregate PR, verdict, and
+reviewed head directly on the slice, but production requires a watcher
+observation to carry its own durable provenance before it will bind a
+publication at all (`tl_loop/loop/reconcile.py::accepted_publication_from_watcher`:
+`author_agent` must equal the slice's `dispatch_agent_id`, an `invocation_id`
+must be present, and it must succeed the current dispatch). The seed supplies
+none of that, so the controller refuses the watcher publication
+(`refusing watcher publication evidence for <slice>: provenance mismatch`),
+never reaches the effect boundary under test, and the case reports that it
+exited without writing its crash marker.
+
+The watcher snapshot is produced by the server, not by this harness, so the
+provenance cannot be written into a fixture — it has to be *earned*. Fixing this
+means either teaching the seed to publish through the real watcher (so the
+server records the provenance it will later insist on) or changing what the
+acceptance is allowed to seed. Both are changes to the scenario's evidence, not
+to how it is provisioned, and neither is a harness-ownership fix.
 
 ## Topology note: same-order consuming children
 

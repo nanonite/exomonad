@@ -1,16 +1,26 @@
 """The host-visible names this acceptance owns, and what it seeds.
 
 Every resource the run takes on the host -- tmux sessions, compose projects,
-volumes, and the run's temporary directory -- carries ``PREFIX``, so a sweep of
-this harness can only ever reach its own leftovers. The shared package takes it
-as a parameter precisely so that no harness bakes another's name in.
+volumes, and the run's temporary directory -- carries the run's prefix, so a
+sweep of this harness can only ever reach its own leftovers. The shared package
+takes it as a parameter precisely so that no harness bakes another's name in.
+
+Two runs live here and they must never reach each other: the recreated
+publication acceptance the driver walks, and the crash/restart matrix the
+runner walks. They provision their own forges, their own databases, and their
+own tmux servers, so they carry their own prefixes and their own run ids.
 """
 
 from __future__ import annotations
 
+import secrets
 from typing import Any
 
+#: The prefix every host-visible name of the recreated-publication run carries.
 PREFIX = "exo-e2e-1117-"
+
+#: The prefix every host-visible name of the crash/restart matrix carries.
+MATRIX_PREFIX = "exo-e2e-1057-"
 
 #: The run-directory prefix ``mktemp -d`` uses under the run's temp root.
 RUN_DIRECTORY_PREFIX = PREFIX
@@ -44,3 +54,15 @@ SEED_ISSUES: tuple[dict[str, Any], ...] = (
         "labels": ("needs-human",),
     },
 )
+
+
+def new_run_id() -> str:
+    """Return a run id unique to this invocation.
+
+    It becomes the compose project name, the tmux session prefix, the Forgejo
+    account and repository names, and part of the temporary directory, so two
+    runs can never reach each other's state. The length is bounded because the
+    tmux session name is derived from it and the server rejects a session name
+    past its limit at config load.
+    """
+    return secrets.token_hex(4)

@@ -24,7 +24,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -397,9 +397,31 @@ def provision(scope: cl.RunScope, project_root: Path, run_id: str) -> Instance:
         owner=author.username,
         repo=instance.repo,
     )
-    _create_repository(instance)
+    create_repository(instance, instance.repo)
     _add_collaborator(instance)
     return instance
+
+
+def create_repository(instance: Instance, name: str) -> Instance:
+    """Create one more repository on this run's own instance and select it.
+
+    A run that walks many cases against one forge needs each case to start from
+    an empty history. A case publishes branches such as ``main.sub-a`` and
+    ``aggregate/<case>/<name>``, and a repository that already carries them
+    rejects the push as a non-fast-forward, so every case after the first would
+    be testing the previous case's leftovers instead of its own. One repository
+    per case is far cheaper than one Forgejo per case and leaves no shared
+    remote at all.
+
+    The result is the same instance with the new repository selected, so
+    ``repository_api_url()`` and ``clone_url()`` address it while the accounts,
+    the compose project, and the base URL stay the ones this run provisioned.
+    """
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", name):
+        raise ForgejoError(f"repository name is not one Forgejo will accept: {name!r}")
+    scoped = replace(instance, repo=name)
+    _create_repository(scoped)
+    return scoped
 
 
 def _create_repository(instance: Instance) -> None:
@@ -460,6 +482,7 @@ __all__ = [
     "ForgejoError",
     "Instance",
     "api",
+    "create_repository",
     "down",
     "provision",
     "published_host",

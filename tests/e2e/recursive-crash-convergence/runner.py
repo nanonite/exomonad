@@ -1,15 +1,39 @@
-"""Run the real-server recursive crash/restart acceptance matrix."""
+"""Run the real-server recursive crash/restart acceptance matrix.
+
+The run owns everything it touches. It provisions one Forgejo from the shared
+template at ``tests/e2e/lib/forgejo/docker-compose.yml`` under its own compose
+project, creates one fresh repository per case on that instance, seeds a fresh
+Chainlink database inside each case's own directory, and registers every tmux
+server and server process it starts with its run scope. Nothing outside this
+worktree's build output and this run's own temporary directory is read or
+written, and no operator-supplied forge, token, or repository is required or
+consulted.
+
+Each case is independent by construction. Its own repository means its own
+branch namespace, so a case cannot observe another case's published branches
+and cannot have its own fixture pushes rejected as non-fast-forwards against
+them, and its own directory means its own tmux server, socket, database, and
+ledger. There is therefore nothing left for a case to clean up: teardown
+removes the compose project and its volume, and every other resource lives
+inside the run directory.
+
+A case is a crash: the controller runs in a child process whose transport dies
+at one named effect boundary, and the resumed run picks the next action from
+the persisted manifest rather than from external plan input. See
+:func:`run_case` for the evidence every case must produce.
+"""
 
 from __future__ import annotations
 
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +49,8 @@ sys.path.insert(0, str(LIB_DIR))
 
 import e2e_harness.chainlink_db as chainlink_db  # noqa: E402
 import e2e_harness.cleanup as cl  # noqa: E402
+import e2e_harness.forgejo_stack as fj  # noqa: E402
+import e2e_harness.tmuxio as tmuxio  # noqa: E402
 import real_server_transport as real  # noqa: E402
 from boundaries import CRASH_BOUNDARIES, CrashBoundary, validate_matrix
 from controller import controller, resume, wait_for_crash
@@ -39,26 +65,153 @@ from evidence import (
     assert_resume_not_redispatched,
 )
 from fixture import plan, seed_aggregate_publication
+from run_prefix import MATRIX_PREFIX, new_run_id
+
+#: The branch every case clones and asserts remote ancestry against. The run's
+#: repositories are created with this default branch, so it is never a choice a
+#: case has to be told about.
+BASE_BRANCH = "main"
+
+#: How many passes of the whole matrix an acceptance run makes. One pass proves
+#: a boundary converged once; three prove it converges every time.
+DEFAULT_REPETITIONS = 3
+
+#: The identity the case clones commit as. It is a fixture identity, not a
+#: person: nothing in the run is attributed to whoever is running it.
+GIT_USER_NAME = "recursive-crash-e2e"
+GIT_USER_EMAIL = "recursive-crash-e2e@example.invalid"
+
+#: The path of the repository inside a case's own directory.
+CASE_REPOSITORY = "repo"
+
+#: Everything the matrix can fail with. A run that fails for any other reason is
+#: a harness fault, not a verdict, so it is reported as one.
+ACCEPTANCE_FAILURES = (
+    AcceptanceError,
+    fj.ForgejoError,
+    chainlink_db.ChainlinkError,
+    cl.CleanupError,
+    real.HarnessError,
+    tmuxio.TmuxError,
+    OSError,
+)
 
 
-def _environment() -> dict[str, str]:
-    required = (
-        "EXOMONAD_FORGEJO_E2E_URL",
-        "EXOMONAD_FORGEJO_E2E_TOKEN",
-        "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN",
-        "EXOMONAD_FORGEJO_E2E_OWNER",
-        "EXOMONAD_FORGEJO_E2E_REPO",
-        "EXOMONAD_FORGEJO_E2E_GIT_REMOTE",
-    )
-    missing = [name for name in required if not os.environ.get(name)]
-    if missing:
-        raise AcceptanceError(
-            "#1057 requires a dedicated real Forgejo repository; missing "
-            + ", ".join(missing)
+# --------------------------------------------------------------------------
+# The report
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class MatrixReport:
+    """The matrix run's verdict: one entry per case, plus the teardown checks."""
+
+    cases: list[dict[str, Any]] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    leaks: list[str] = field(default_factory=list)
+    cleanup_problems: list[str] = field(default_factory=list)
+    sweep_problems: list[str] = field(default_factory=list)
+    effect_problem: str | None = None
+    operation_totals: dict[str, int] = field(default_factory=dict)
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def passed(self) -> bool:
+        return not (
+            self.failures
+            or self.effect_problem
+            or self.leaks
+            or self.cleanup_problems
+            or self.sweep_problems
         )
-    if os.environ.get("EXOMONAD_FORGEJO_E2E_MOCK") == "1":
-        raise AcceptanceError("#1057 cannot run with the Forgejo-shaped mock API")
-    return {name: os.environ[name] for name in required}
+
+    def emit(self) -> None:
+        """Print one line per case, then any leak, then the verdict."""
+        for case in self.cases:
+            detail = json.dumps(case, sort_keys=True, default=str)
+            print(f"PASS {case['case']} {detail[:2000]}")
+        for problem in self.cleanup_problems:
+            print(f"FAIL CLEANUP {problem}")
+        for problem in self.sweep_problems:
+            print(f"FAIL SWEEP {problem}")
+        for leak in self.leaks:
+            print(f"FAIL LEAK {leak}")
+        if self.effect_problem:
+            print(f"FAIL EFFECTS {self.effect_problem}")
+        for failure in self.failures:
+            print(f"FAIL CASE {failure}")
+        verdict = "PASS" if self.passed else "FAIL"
+        print(
+            f"{verdict} recursive-crash-convergence matrix: {len(self.cases)} "
+            f"cases passed, {len(self.failures)} failed, {len(self.leaks)} leaks, "
+            f"{len(self.cleanup_problems)} cleanup problems, "
+            f"{len(self.sweep_problems)} sweep problems"
+        )
+
+
+# --------------------------------------------------------------------------
+# Case identity
+# --------------------------------------------------------------------------
+
+
+def _case_name(repetition: int, boundary: CrashBoundary) -> str:
+    """Return the name that identifies one case inside the whole run.
+
+    It names the seeded aggregate branches, the controller state root, and the
+    durable markers a case writes, so it has to be distinct for every
+    (pass, boundary) pair rather than merely for every boundary.
+    """
+    return f"crash-r{repetition}-{boundary.name}-{boundary.point}"
+
+
+def _repository_name(case_name: str) -> str:
+    """Return a repository name Forgejo will accept for one case.
+
+    Deriving it from the case name keeps it unique inside the run's own
+    instance without a counter a report would have to carry, and strips the
+    underscores a boundary name carries so the name is one Forgejo accepts.
+    """
+    name = re.sub(r"[^a-z0-9-]+", "-", case_name.lower()).strip("-")
+    if not name:
+        raise AcceptanceError(f"case name has no usable repository name: {case_name!r}")
+    return name
+
+
+# --------------------------------------------------------------------------
+# The case's own resources
+# --------------------------------------------------------------------------
+
+
+def _case_directory(run_root: Path, repetition: int, boundary: CrashBoundary) -> Path:
+    """Create this case's own directory inside the run directory.
+
+    Nesting under the run root is what keeps the case inside everything the
+    scope tears down and sweeps: a case directory under the temp root instead
+    is a directory no prefix-driven sweep of this harness names. The name stays
+    short because the case holds a Unix socket, and ``tmuxio.socket_path``
+    refuses a path the kernel could not bind.
+    """
+    root = run_root / f"c{repetition}-{boundary.name}-{boundary.point}"
+    root.mkdir(parents=True)
+    return root
+
+
+def _clone_case_repository(root: Path, instance: fj.Instance) -> Path:
+    """Clone the case's own repository and give the clone its credential.
+
+    The clone is the only local repository the case touches, and the credential
+    is scoped to the run's own forge in the clone's own config, so a push can
+    only ever reach a repository this run created.
+    """
+    repo = root / CASE_REPOSITORY
+    real.run_command(["git", "clone", "--quiet", instance.clone_url(), str(repo)])
+    real.git(repo, "config", "user.name", GIT_USER_NAME)
+    real.git(repo, "config", "user.email", GIT_USER_EMAIL)
+    real.git(
+        repo, "config", instance.extra_header_key(), instance.author.extra_header()
+    )
+    real.git(repo, "switch", "--quiet", BASE_BRANCH)
+    return repo
 
 
 def _issue_id(value: Any) -> int | None:
@@ -104,6 +257,14 @@ def _chainlink_command_with_db(database: Path, *arguments: str) -> Any:
 
 
 def _create_fixture_issue(database: Path, case_name: str) -> int:
+    """Create the one issue the case's controller closes when it finishes.
+
+    The database is this case's own, created by ``chainlink init`` inside this
+    case's own directory, so the row is the case's own evidence and disappears
+    with the directory. Nothing else is created and nothing else is read: a
+    case that later finds this issue still open failed its ``issue_close``
+    boundary, which is why the run no longer closes the row on the way out.
+    """
     value = _chainlink_command_with_db(
         database,
         "create",
@@ -121,40 +282,9 @@ def _create_fixture_issue(database: Path, case_name: str) -> int:
     return issue_id
 
 
-def _cleanup_fixture_issue(database: Path, issue_id: int) -> None:
-    value = _chainlink_command_with_db(database, "show", str(issue_id), "--json")
-    status = _status(value)
-    if status == "closed":
-        return
-    result = subprocess.run(
-        ["chainlink", "close", str(issue_id), "--no-changelog", "--quiet"],
-        cwd=PROJECT_ROOT,
-        env={**os.environ, "CHAINLINK_DB": str(database)},
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode:
-        raise AcceptanceError(
-            f"Chainlink cleanup failed ({result.returncode}): {result.stderr.strip()}"
-        )
-
-
-def _status(value: Any) -> str | None:
-    if isinstance(value, Mapping):
-        status = value.get("status")
-        if isinstance(status, str):
-            return status.lower()
-        for child in value.values():
-            found = _status(child)
-            if found is not None:
-                return found
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        for child in value:
-            found = _status(child)
-            if found is not None:
-                return found
-    return None
+# --------------------------------------------------------------------------
+# Plan identities
+# --------------------------------------------------------------------------
 
 
 def _identity_agents(work_plan: real.WorkPlan) -> dict[str, str]:
@@ -194,8 +324,9 @@ def _leaf_branches(work_plan: real.WorkPlan) -> tuple[str, ...]:
     return tuple(sorted(branches))
 
 
-def _case_name(root: Path, boundary: CrashBoundary) -> str:
-    return f"crash-{boundary.name}-{boundary.point}-{root.name[-8:]}"
+# --------------------------------------------------------------------------
+# Evidence
+# --------------------------------------------------------------------------
 
 
 def _nested_aggregate_evidence(
@@ -259,8 +390,7 @@ def _nested_aggregate_evidence(
 
 
 def _assert_nested_aggregate_pr(
-    config: dict[str, str],
-    forgejo_url: str,
+    instance: fj.Instance,
     repo: Path,
     case_name: str,
     state_root: Path,
@@ -270,9 +400,8 @@ def _assert_nested_aggregate_pr(
     expected_pr, expected_head, _ = _nested_aggregate_evidence(state_root, marker)
     pulls = real.json_request(
         "GET",
-        f"{forgejo_url}/api/v1/repos/{config['EXOMONAD_FORGEJO_E2E_OWNER']}/"
-        f"{config['EXOMONAD_FORGEJO_E2E_REPO']}/pulls?state=all&limit=100",
-        token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
+        f"{instance.repository_api_url()}/pulls?state=all&limit=100",
+        token=instance.author.token,
     )
     if not isinstance(pulls, list):
         raise AcceptanceError(f"Forgejo pull listing is not an array: {pulls!r}")
@@ -301,52 +430,89 @@ def _assert_nested_aggregate_pr(
         )
 
 
+def _seed_case_run(
+    instance: fj.Instance,
+    root: Path,
+    repo: Path,
+    work_plan: real.WorkPlan,
+    boundary: CrashBoundary,
+    case_name: str,
+) -> tuple[str, real.WorkPlan]:
+    """Leave the case's controller state at the boundary it is going to crash at."""
+    if boundary.name in {"publication", "aggregate_publication"}:
+        return seed_aggregate_publication(root, repo, work_plan, case_name=case_name)
+    if boundary.name == "spawn":
+        run_id, work_plan, _, _ = real.seed_dispatch_restart_run(
+            root, repo, work_plan
+        )
+        return run_id, work_plan
+    seed_boundary = (
+        "aggregate_review"
+        if boundary.name in {"review", "adoption", "repair"}
+        else "merging"
+    )
+    run_id, work_plan, _, _ = real.seed_delayed_restart_run(
+        real.TransportClient(project_root=repo, timeout=10),
+        root,
+        repo,
+        instance.base_url,
+        boundary=seed_boundary,
+        forgejo_owner=instance.owner,
+        forgejo_repo=instance.repo,
+        forgejo_token=instance.author.token,
+        forgejo_reviewer_token=instance.reviewer.token,
+        case_name=case_name,
+        plan=work_plan,
+        review_verdict=("changes_requested" if boundary.name == "repair" else "approved"),
+    )
+    return run_id, work_plan
+
+
+@dataclass
+class Crash:
+    """Where one case's crash and its restart left their durable evidence.
+
+    The controller is run in a child process that dies at a named effect
+    boundary, so the run has to hold the trace, the marker, and the checkpoint
+    on both sides of the restart: they are the only records that survive the
+    process whose convergence they are about to judge.
+    """
+
+    run_id: str
+    state_root: Path
+    ledger_run_id: str
+    marker: Path
+    resume_trace: Path
+    before_restart: Path
+    after_restart: Path
+
+    @property
+    def checkpoint(self) -> Path:
+        return self.state_root / self.run_id / "run.json"
+
+
 def run_case(
     root: Path,
     repo: Path,
-    forgejo_url: str,
-    config: dict[str, str],
+    instance: fj.Instance,
     boundary: CrashBoundary,
+    case_name: str,
     chainlink_issue_id: int,
     chainlink_db: Path,
 ) -> dict[str, Any]:
+    """Crash one case at one boundary, resume it, and return its evidence.
+
+    ``instance`` is scoped to this case's own repository, so every forge read
+    here and every assertion below is about this case's state alone.
+    """
     state_root = root / "controller-state"
     ledger_run_id = real.server_run_id(repo)
     # Structure-only plan for seeding (sources are not serialized into the
     # manifest, so seeding is unaffected by them).
     work_plan = plan()
-    case_name = _case_name(root, boundary)
-    if boundary.name in {"publication", "aggregate_publication"}:
-        run_id, work_plan = seed_aggregate_publication(
-            root,
-            repo,
-            work_plan,
-            case_name=case_name,
-        )
-    elif boundary.name == "spawn":
-        run_id, work_plan, _, _ = real.seed_dispatch_restart_run(root, repo, work_plan)
-    else:
-        seed_boundary = (
-            "aggregate_review"
-            if boundary.name in {"review", "adoption", "repair"}
-            else "merging"
-        )
-        run_id, _, _, _ = real.seed_delayed_restart_run(
-            real.TransportClient(project_root=repo, timeout=10),
-            root,
-            repo,
-            forgejo_url,
-            boundary=seed_boundary,
-            forgejo_owner=config["EXOMONAD_FORGEJO_E2E_OWNER"],
-            forgejo_repo=config["EXOMONAD_FORGEJO_E2E_REPO"],
-            forgejo_token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
-            forgejo_reviewer_token=config["EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"],
-            case_name=case_name,
-            plan=work_plan,
-            review_verdict=(
-                "changes_requested" if boundary.name == "repair" else "approved"
-            ),
-        )
+    run_id, work_plan = _seed_case_run(
+        instance, root, repo, work_plan, boundary, case_name
+    )
     # Rebuild with distinct child ledger sources now that the parent run id is
     # known. The declaration structure is identical, so the persisted manifest
     # digest is unchanged; only the in-memory sources differ.
@@ -355,21 +521,59 @@ def run_case(
         state_root=state_root / run_id,
         ledger_run_id=ledger_run_id,
     )
-    marker = root / "crash-traces" / f"{case_name}.jsonl"
-    # The leaf actor writes its own file_pr attempts here before calling, so the
-    # crash handoff must carry the path before the controller process starts.
-    resume_trace = root / "crash-traces" / f"{case_name}.resume.jsonl"
+    traces = root / "crash-traces"
+    crash = Crash(
+        run_id=run_id,
+        state_root=state_root,
+        ledger_run_id=ledger_run_id,
+        marker=traces / f"{case_name}.jsonl",
+        # The leaf actor writes its own file_pr attempts here before calling, so
+        # the crash handoff must carry the path before the controller starts.
+        resume_trace=traces / f"{case_name}.resume.jsonl",
+        before_restart=traces / f"{case_name}.before.json",
+        after_restart=traces / f"{case_name}.after.json",
+    )
+    _crash_the_controller(crash, repo, work_plan, boundary, case_name, chainlink_issue_id, chainlink_db)
+    result = resume(
+        crash.run_id,
+        crash.state_root,
+        repo,
+        crash.ledger_run_id,
+        crash.resume_trace,
+        chainlink_issue_id,
+        chainlink_db,
+    )
+    shutil.copy2(crash.checkpoint, crash.after_restart)
+    return _assert_case_evidence(repo, instance, boundary, case_name, crash, result)
+
+
+def _crash_the_controller(
+    crash: Crash,
+    repo: Path,
+    work_plan: real.WorkPlan,
+    boundary: CrashBoundary,
+    case_name: str,
+    chainlink_issue_id: int,
+    chainlink_db: Path,
+) -> None:
+    """Run the controller until the injected process death, and snapshot it.
+
+    The crash has to be observed, not waited out: the marker is written by the
+    transport immediately before it kills its own process, so the marker and the
+    process's death together are the boundary, and a timeout means the boundary
+    was never reached.
+    """
     process = multiprocessing.get_context("fork").Process(
         target=controller,
         args=(
-            run_id,
-            state_root,
+            crash.run_id,
+            crash.state_root,
             repo,
-            ledger_run_id,
+            crash.ledger_run_id,
             work_plan,
             boundary,
-            marker,
-            resume_trace,
+            crash.marker,
+            crash.resume_trace,
             boundary.name == "review",
             chainlink_issue_id,
             chainlink_db,
@@ -377,41 +581,43 @@ def run_case(
         name=case_name,
     )
     process.start()
-    wait_for_crash(process, marker)
-    checkpoint = state_root / run_id / "run.json"
-    before_restart = root / "crash-traces" / f"{case_name}.before.json"
-    shutil.copy2(checkpoint, before_restart)
-    result = resume(
-        run_id,
-        state_root,
-        repo,
-        ledger_run_id,
-        resume_trace,
-        chainlink_issue_id,
-        chainlink_db,
-    )
-    after_restart = root / "crash-traces" / f"{case_name}.after.json"
-    shutil.copy2(checkpoint, after_restart)
-    after_document = json.loads(checkpoint.read_text(encoding="utf-8"))
-    final_state = real.RunStore(run_id, state_root).load()
+    wait_for_crash(process, crash.marker)
+    shutil.copy2(crash.checkpoint, crash.before_restart)
+
+
+def _assert_case_evidence(
+    repo: Path,
+    instance: fj.Instance,
+    boundary: CrashBoundary,
+    case_name: str,
+    crash: Crash,
+    result: Any,
+) -> dict[str, Any]:
+    """Prove the resumed case converged, and return what it proved."""
+    after_document = json.loads(crash.checkpoint.read_text(encoding="utf-8"))
+    final_state = real.RunStore(crash.run_id, crash.state_root).load()
     if final_state.fsm.phase is not real.TLPhase.TLDone:
         raise AcceptanceError(f"{case_name} did not converge to TLDone")
     if boundary.name in {"publication", "aggregate_publication"}:
-        _assert_nested_aggregate_pr(config, forgejo_url, repo, case_name, state_root)
-    identity = assert_crash_record(marker, boundary.name, boundary.point)
-    counts = assert_recursive_effect_cardinality(state_root / run_id)
-    assert_checkpoint_progression([before_restart, after_restart])
+        _assert_nested_aggregate_pr(instance, repo, case_name, crash.state_root)
+    identity = assert_crash_record(crash.marker, boundary.name, boundary.point)
+    counts = assert_recursive_effect_cardinality(crash.state_root / crash.run_id)
+    assert_checkpoint_progression([crash.before_restart, crash.after_restart])
     assert_remote_ancestry(
         after_document,
         workspace=repo,
-        remote=config["EXOMONAD_FORGEJO_E2E_GIT_REMOTE"],
-        remote_branch="main",
+        remote=instance.clone_url(),
+        remote_branch=BASE_BRANCH,
     )
     resumed_calls = assert_resume_not_redispatched(
-        resume_trace, identity, boundary=boundary.name, point=boundary.point
+        crash.resume_trace,
+        identity,
+        boundary=boundary.name,
+        point=boundary.point,
     )
-    effects = assert_effect_events(repo, ledger_run_id)
+    effects = assert_effect_events(repo, crash.ledger_run_id)
     return {
+        "case": case_name,
         "boundary": boundary.name,
         "point": boundary.point,
         "effect_identity": identity,
@@ -423,92 +629,189 @@ def run_case(
     }
 
 
-def _server_repetitions() -> int:
-    value = os.environ.get("EXOMONAD_1057_SERVER_RUNS", "3")
+# --------------------------------------------------------------------------
+# The run
+# --------------------------------------------------------------------------
+
+
+def _run_case(
+    scope: cl.RunScope,
+    instance: fj.Instance,
+    run_root: Path,
+    repetition: int,
+    boundary: CrashBoundary,
+) -> dict[str, Any]:
+    """Give one case its own forge state, its own server, and its own directory."""
+    root = _case_directory(run_root, repetition, boundary)
+    case_name = _case_name(repetition, boundary)
+    repository = fj.create_repository(instance, _repository_name(case_name))
+    repo = _clone_case_repository(root, repository)
+    # The database goes where the shipped controller resolves it for this
+    # project -- ``<repo>/.chainlink/issues.db``. ``exomonad init`` anchors
+    # ``CHAINLINK_DB`` there and ``build_spawn_env`` does the same for every
+    # agent it spawns, so a database anywhere else is one the controller never
+    # writes an escalation to, and an absent one kills it mid-park.
+    database = chainlink_db.create(root, project_dir=repo)
+    issue_id = _create_fixture_issue(database, case_name)
+    server, _ = real.start_server(
+        root,
+        repo,
+        repository.base_url,
+        PROJECT_ROOT,
+        forgejo_token=repository.author.token,
+        forgejo_reviewer_token=repository.reviewer.token,
+        forgejo_owner=repository.owner,
+        forgejo_repo=repository.repo,
+        identity_agents=_identity_agents(plan()),
+        leaf_branches=_leaf_branches(plan()),
+        chainlink_db=database,
+    )
+    scope.track_process(server, f"#1057 {case_name} server")
+    scope.track_tmux_server(tmuxio.socket_path(root))
+    failure: BaseException | None = None
+    result: dict[str, Any] | None = None
     try:
-        repetitions = int(value)
-    except ValueError as error:
-        raise AcceptanceError("EXOMONAD_1057_SERVER_RUNS must be an integer") from error
-    if repetitions <= 0:
-        raise AcceptanceError("EXOMONAD_1057_SERVER_RUNS must be positive")
-    return repetitions
+        result = run_case(
+            root, repo, repository, boundary, case_name, issue_id, database
+        )
+    except BaseException as error:  # noqa: BLE001 - released, then re-raised
+        failure = error
+    _release_case(scope, server, repo, root, case_name, failure)
+    if failure is not None:
+        raise failure
+    assert result is not None
+    result["server_run"] = repetition
+    return result
 
 
-def run_matrix() -> dict[str, Any]:
+def _release_case(
+    scope: cl.RunScope,
+    server: Any,
+    repo: Path,
+    root: Path,
+    case_name: str,
+    failure: BaseException | None,
+) -> None:
+    """Stop this case's server and remove its directory, keeping the first failure.
+
+    A teardown that raised here would replace the failure the case actually hit,
+    and the check it raises on -- the Codex sentinel -- is the one most likely to
+    trip on a host another harness is also writing to, so the case's real
+    diagnosis would be the one thing lost.
+    """
+    try:
+        real.stop_server(server, repo, f"#1057 {case_name} acceptance")
+    except BaseException as error:  # noqa: BLE001 - reported or raised, never lost
+        if failure is None:
+            raise
+        print(f"FAIL TEARDOWN {case_name}: {type(error).__name__}: {error}", flush=True)
+    finally:
+        # The scope's teardown removes the run directory anyway; this only keeps
+        # one case's server log and ledger out of the next case's run.
+        if not scope.keep:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def run_matrix(
+    repetitions: int = DEFAULT_REPETITIONS, keep: bool = False
+) -> MatrixReport:
+    """Run every boundary of the matrix and return the run's verdict.
+
+    The run is self-contained: it sweeps what an interrupted predecessor left,
+    provisions its own forge, gives every case its own repository, database,
+    directory, and server, and finally tears all of that down and fails if any
+    of it outlived the run.
+    """
     validate_matrix()
-    config = _environment()
-    results: list[dict[str, Any]] = []
-    operation_totals: dict[str, int] = {}
-    for repetition in range(1, _server_repetitions() + 1):
+    if repetitions <= 0:
+        raise AcceptanceError(f"the matrix needs at least one pass, not {repetitions}")
+    report = MatrixReport()
+    identifier = new_run_id()
+    run_root = cl.make_root(cl.TEMP_ROOT, MATRIX_PREFIX)
+    scope = cl.RunScope(
+        run_id=identifier, root=run_root, prefix=MATRIX_PREFIX, keep=keep
+    )
+    report.evidence["run_id"] = identifier
+    report.evidence["run_directory"] = str(run_root)
+    report.evidence["repetitions"] = repetitions
+    instance: fj.Instance | None = None
+
+    cl.install_trap(scope)
+    try:
+        swept = cl.sweep_stale(
+            MATRIX_PREFIX, fj.template_path(PROJECT_ROOT), MATRIX_PREFIX
+        )
+        report.sweep_problems = swept
+        report.evidence["swept_before_run"] = swept
+        instance = fj.provision(scope, PROJECT_ROOT, identifier)
+        report.evidence["forgejo"] = {
+            "compose_project": instance.project,
+            "discovered_host": instance.host,
+            "admin": instance.admin_username,
+            "owner": instance.owner,
+        }
+        _walk(scope, instance, run_root, repetitions, report)
+    except ACCEPTANCE_FAILURES as error:
+        report.failures.append(f"setup: {type(error).__name__}: {error}")
+        print(f"FAIL SETUP {report.failures[-1]}", flush=True)
+    except BaseException as error:  # noqa: BLE001 - the run still owes its report
+        report.failures.append(f"harness: {type(error).__name__}: {error}")
+        print(f"FAIL HARNESS {report.failures[-1]}", flush=True)
+    finally:
+        # The report is owed even when teardown misbehaves, so nothing here may
+        # raise. Teardown removes the compose project and its volume, which is
+        # what takes every case's repository with it, so there is no per-record
+        # cleanup left to fail.
+        try:
+            report.cleanup_problems = scope.teardown()
+        except BaseException as error:  # noqa: BLE001 - reported, never raised
+            report.cleanup_problems = [f"teardown raised: {type(error).__name__}: {error}"]
+        try:
+            report.leaks = scope.leaks()
+        except BaseException as error:  # noqa: BLE001 - reported, never raised
+            report.leaks = [f"leak check raised: {type(error).__name__}: {error}"]
+        if keep:
+            print(
+                f"KEPT {run_root} (compose project "
+                f"{instance.project if instance else 'none'})",
+                flush=True,
+            )
+    return report
+
+
+def _walk(
+    scope: cl.RunScope,
+    instance: fj.Instance,
+    run_root: Path,
+    repetitions: int,
+    report: MatrixReport,
+) -> None:
+    """Run every case of every pass, continuing past a failing one.
+
+    One failing case must not hide the verdict of the ones after it: the cases
+    are independent, so every case is attempted, each reports its own verdict,
+    and the run's status is the conjunction of all of them.
+    """
+    totals: dict[str, int] = {}
+    for repetition in range(1, repetitions + 1):
         for boundary in CRASH_BOUNDARIES:
-            # `dir` is pinned: a case directory holds the server's Unix
-            # socket, and `tempfile` would otherwise honour a caller's TMPDIR,
-            # which can be long enough that the socket path does not fit.
-            with tempfile.TemporaryDirectory(
-                prefix=f"exomonad-1057-run{repetition}-{boundary.name}-{boundary.point}-",
-                dir=cl.TEMP_ROOT,
-            ) as raw:
-                root = Path(raw)
-                repo, _, _ = real.clone_external_fixture(root)
-                case_name = _case_name(root, boundary)
-                # A fresh database inside this case's own directory: the
-                # operator's database is never read, so the case cannot depend
-                # on a row some other run left behind.
-                database = chainlink_db.create(root)
-                issue_id = _create_fixture_issue(database, case_name)
-                server = None
-                try:
-                    server, _ = real.start_server(
-                        root,
-                        repo,
-                        config["EXOMONAD_FORGEJO_E2E_URL"],
-                        PROJECT_ROOT,
-                        forgejo_token=config["EXOMONAD_FORGEJO_E2E_TOKEN"],
-                        forgejo_reviewer_token=config[
-                            "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN"
-                        ],
-                        identity_agents=_identity_agents(plan()),
-                        leaf_branches=_leaf_branches(plan()),
-                        chainlink_db=database,
-                    )
-                    result = run_case(
-                        root,
-                        repo,
-                        config["EXOMONAD_FORGEJO_E2E_URL"],
-                        config,
-                        boundary,
-                        issue_id,
-                        database,
-                    )
-                    result["server_run"] = repetition
-                    results.append(result)
-                    for operation, count in result["journal_operations"].items():
-                        operation_totals[operation] = (
-                            operation_totals.get(operation, 0) + count
-                        )
-                finally:
-                    try:
-                        if server is not None:
-                            real.stop_server(
-                                server, repo, "#1057 real-server acceptance"
-                            )
-                        real.cleanup_external_case(
-                            repo,
-                            config["EXOMONAD_FORGEJO_E2E_URL"],
-                            config["EXOMONAD_FORGEJO_E2E_OWNER"],
-                            config["EXOMONAD_FORGEJO_E2E_REPO"],
-                            config["EXOMONAD_FORGEJO_E2E_TOKEN"],
-                            case_name,
-                        )
-                    finally:
-                        _cleanup_fixture_issue(database, issue_id)
-    assert_required_effects(operation_totals)
-    return {
-        "passed": True,
-        "server_runs": results,
-        "operation_totals": dict(sorted(operation_totals.items())),
-    }
-
-
-if __name__ == "__main__":
-    print(json.dumps(run_matrix(), indent=2, sort_keys=True))
+            try:
+                result = _run_case(scope, instance, run_root, repetition, boundary)
+            except ACCEPTANCE_FAILURES as error:
+                failure = _case_name(repetition, boundary)
+                report.failures.append(f"{failure}: {type(error).__name__}: {error}")
+                print(f"FAIL {failure} {report.failures[-1][:2000]}", flush=True)
+                continue
+            report.cases.append(result)
+            for operation, count in result["journal_operations"].items():
+                totals[operation] = totals.get(operation, 0) + count
+            print(
+                f"PASS {result['case']} "
+                f"{json.dumps(result, sort_keys=True, default=str)[:2000]}",
+                flush=True,
+            )
+    report.operation_totals = dict(sorted(totals.items()))
+    try:
+        assert_required_effects(report.operation_totals)
+    except AcceptanceError as error:
+        report.effect_problem = str(error)

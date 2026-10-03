@@ -146,8 +146,22 @@ tl-loop-recursive-crash-convergence-e2e:
     just wasm devswarm
     ./tests/e2e/recursive-crash-convergence/run.sh
 
+# Run the crash/restart matrix (chainlink #1057): crash the controller
+# immediately before and immediately after each of 14 effect boundaries and
+# prove the resumed run converges without redispatching the crashed effect.
+# Each case prints one PASS/FAIL line with the durable evidence it used. The run
+# provisions its own Forgejo, a fresh repository per case, its own Chainlink
+# database and tmux server per case, takes no operator input, and fails if
+# anything leaks. Pass `keep=true` to leave a failed run's state for inspection,
+# or `repetitions="1"` for a single diagnostic pass.
+tl-loop-crash-matrix-e2e keep="false" repetitions="3":
+    nix develop --command cargo build -p exomonad
+    just wasm devswarm
+    ./tests/e2e/recursive-crash-convergence/run-matrix.sh --repetitions {{repetitions}} {{ if keep == "true" { "--keep" } else { "" } }}
+
 check-e2e-recursive-crash-convergence:
     bash -n tests/e2e/recursive-crash-convergence/run.sh
+    bash -n tests/e2e/recursive-crash-convergence/run-matrix.sh
     {{py}} -m py_compile tests/e2e/recursive-crash-convergence/*.py
     {{py}} -m py_compile tests/e2e/lib/e2e_harness/*.py
     {{py}} -m pytest -q tests/e2e/recursive-crash-convergence/test_contract.py

@@ -660,6 +660,102 @@ def test_teardown_is_idempotent(scope):
 
 
 @pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
+def test_teardown_stops_a_server_on_a_socket_of_the_runs_own(scope):
+    """A run that starts more than one tmux server owns all of them.
+
+    The crash/restart matrix brings a server up per case, each on its own
+    socket under the run directory. A teardown that only knew the run's own
+    socket would leave every case's server listening on a directory it is about
+    to delete, and nothing left to find them by -- which is the untraceable
+    half of a leaked process.
+    """
+    other_root = scope.root / "case-one"
+    other_root.mkdir()
+    socket = scope.track_tmux_server(tmuxio.socket_path(other_root))
+    tmuxio.tmux(
+        socket,
+        "new-session",
+        "-d",
+        "-s",
+        f"{scope.session_prefix}-case",
+        "-n",
+        "probe",
+        "sleep",
+        "600",
+        check=True,
+    )
+    assert tmuxio.server_alive(socket)
+
+    assert scope.teardown() == []
+
+    assert not tmuxio.server_alive(socket)
+    assert not socket.parent.exists()
+    assert scope.leaks() == []
+
+
+def test_a_second_repository_on_the_same_forge_is_its_own(
+    monkeypatch, tmp_path
+):
+    """A forge can hold several run-owned repositories without them colliding.
+
+    The matrix gives every case its own repository on one instance, because a
+    case publishes branches such as ``main.sub-a`` and a repository that already
+    carries them rejects the next case's push. This is asserted without Docker:
+    the records of what was created, and which repository the returned instance
+    then addresses, are the whole contract.
+    """
+    import e2e_harness.forgejo_stack as fj
+
+    requested: list[tuple[str, str, object]] = []
+
+    def fake_api(method, url, *, token=None, payload=None):
+        requested.append((method, url, payload))
+        return {"full_name": f"abcdef12-author/{payload['name']}"}
+
+    monkeypatch.setattr(fj, "api", fake_api)
+    instance = _instance(tmp_path, "run-repo")
+
+    second = fj.create_repository(instance, "crash-r1-spawn-before")
+
+    assert instance.repo == "run-repo", "the first repository must be untouched"
+    assert second.repo == "crash-r1-spawn-before"
+    assert second.base_url == instance.base_url
+    assert second.author == instance.author
+    assert second.project == instance.project
+    assert second.repository_api_url().endswith(
+        "/repos/abcdef12-author/crash-r1-spawn-before"
+    )
+    assert second.clone_url().endswith("/abcdef12-author/crash-r1-spawn-before.git")
+    assert [method for method, _url, _payload in requested] == ["POST"]
+    assert requested[0][1].endswith("/api/v1/user/repos")
+
+
+def test_a_repository_name_the_forge_would_refuse_is_refused_here(tmp_path):
+    """The harness refuses a name it cannot provision rather than sending it."""
+    import e2e_harness.forgejo_stack as fj
+
+    with pytest.raises(fj.ForgejoError):
+        fj.create_repository(_instance(tmp_path, "run-repo"), "Not A Repo")
+
+
+def _instance(root: Path, repo: str) -> Any:
+    """Return a provisioned-instance record without provisioning one."""
+    import e2e_harness.forgejo_stack as fj
+
+    return fj.Instance(
+        project="exo-e2e-1057-abcdef12forgejo",
+        compose_file=root / "docker-compose.yml",
+        base_url="http://127.0.0.1:3001",
+        host="127.0.0.1:3001",
+        admin_username="abcdef12-admin",
+        author=fj.Account(username="abcdef12-author", token="author-token"),
+        reviewer=fj.Account(username="abcdef12-reviewer", token="reviewer-token"),
+        owner="abcdef12-author",
+        repo=repo,
+    )
+
+
+@pytest.mark.skipif(not _tmux_available(), reason="tmux is required")
 def test_a_leaked_session_is_reported_rather_than_ignored(scope):
     """The scope fails the run when a session it owns is still there."""
     session = f"{scope.session_prefix}orphan"

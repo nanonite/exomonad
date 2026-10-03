@@ -247,15 +247,17 @@ def _review_owned_by_harness() -> bool:
 
 
 def review_assigned_pr(pr_number: int) -> bool:
-    """Submit one authoritative approval for the exact assigned PR head."""
-    forgejo_url = _required_environment(
-        "EXOMONAD_FORGEJO_E2E_URL", "FORGEJO_URL"
-    ).rstrip("/")
-    owner = _required_environment("EXOMONAD_FORGEJO_E2E_OWNER", "FORGEJO_OWNER")
-    repository = _required_environment("EXOMONAD_FORGEJO_E2E_REPO", "FORGEJO_REPO")
-    token = _required_environment(
-        "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN", "FORGEJO_REVIEWER_TOKEN"
-    )
+    """Submit one authoritative approval for the exact assigned PR head.
+
+    The coordinates come from the shim that started this actor, which the harness
+    wrote from the Forgejo instance it provisioned. There is no fallback to an
+    operator-supplied instance: an actor that could not reach the forge this run
+    started must fail, not approve on somebody else's repository.
+    """
+    forgejo_url = _required_environment("FORGEJO_URL").rstrip("/")
+    owner = _required_environment("FORGEJO_OWNER")
+    repository = _required_environment("FORGEJO_REPO")
+    token = _required_environment("FORGEJO_REVIEWER_TOKEN")
     endpoint = f"{forgejo_url}/api/v1/repos/{owner}/{repository}"
     head_sha = _review_current_head(endpoint, token, pr_number)
     login = _reviewer_login(forgejo_url, token)

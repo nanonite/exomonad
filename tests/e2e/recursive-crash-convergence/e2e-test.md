@@ -4,7 +4,9 @@ This is the real-server acceptance for the recreated-publication correlation,
 and the final real-server gate before #1058. It uses a disposable checkout on
 this run's own Forgejo, its own Chainlink database, its own tmux socket, the
 production Rust server, the generated WASM tools, and the Unix-socket
-TransportClient. It refuses the Forgejo-shaped mock and takes no operator input.
+TransportClient. It takes no operator input: there is no shared instance, no
+supplied forge URL, token, or repository, and therefore nothing an operator has
+to reserve before the run can start.
 
 ## The recreate scenario (#1117)
 
@@ -43,7 +45,31 @@ bookkeeping push, stage release, aggregate publication, and root finalization.
 Same-order sub-TLs run together, later orders remain barriers, and nested
 children publish only to their direct parent branches.
 
-Each matrix case owns its Chainlink database: `chainlink init` inside the
-case's own temporary directory, seeded with exactly the disposable issue the
-case needs. The operator's database is never read, so the evidence a case
-produces is its own.
+Each case owns everything it can reach another case through. Its repository is
+created fresh on the run's own Forgejo, because a case publishes branches named
+after the boundary it is exercising (`main.sub-a`, `aggregate/<case>/<name>`)
+and a repository that already carries them rejects the next case's push as a
+non-fast-forward — the second case would then be testing the first case's
+leftovers. Its directory holds its own Chainlink database (`chainlink init`
+inside the case's own directory, seeded with exactly the disposable issue the
+case needs, so the operator's database is never read), its own tmux server and
+socket, and its own controller state. The run's teardown removes the compose
+project and its volume, which takes every case's repository with it; the run
+fails if anything it created outlived it.
+
+The row the case seeds is the only durable record of its `issue_close`
+boundary, so a case never closes it on the way out: an issue left open is a
+boundary that failed, not a fixture that needed tidying. The database is
+anchored at `<repo>/.chainlink/issues.db`, where `exomonad init` and
+`build_spawn_env` resolve `CHAINLINK_DB`, because an escalation written to any
+other file is one nothing reads.
+
+The seed emits no controller event of its own. `emit_controller_event` is
+validated against `docs/observability/controller-event-contract.v1.json`, and
+`pr.review` / `ci.status_changed` are watcher observations rather than
+controller events — the server refuses them, and fabricating an observation to
+satisfy a reducer would assert that a watcher saw a review no watcher watched.
+The verdict, reviewed head, review id, and CI status are therefore stated on
+the slice itself, and the seed checkpoints `TLPlanning` rather than an active
+`TLWaiting`, which `_ensure_canonical_scope` refuses to upgrade for a
+multi-stage plan.

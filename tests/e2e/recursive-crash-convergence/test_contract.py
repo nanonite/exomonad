@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import http.server
+import os
+import re
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -17,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import leaf_publication_agent
 import runner  # inserts PROJECT_ROOT and ordered-recursive onto sys.path
 import scenario
+import e2e_harness.cleanup as cl
+import e2e_harness.forgejo_stack as fj
 import e2e_harness.tmuxio as tmuxio
 import fixture
 import real_server_transport as real
@@ -721,15 +727,316 @@ def test_nested_aggregate_assertion_ignores_historical_pr_heads(
     ]
     monkeypatch.setattr(runner.real, "json_request", lambda *args, **kwargs: pulls)
     runner._assert_nested_aggregate_pr(
-        {
-            "EXOMONAD_FORGEJO_E2E_OWNER": "owner",
-            "EXOMONAD_FORGEJO_E2E_REPO": "repo",
-            "EXOMONAD_FORGEJO_E2E_TOKEN": "token",
-        },
-        "http://forgejo",
+        _instance(tmp_path, repo="case-repo"),
         tmp_path,
         "case",
         state_root,
+    )
+
+
+def _instance(root: Path, repo: str, base_url: str = "http://forgejo") -> fj.Instance:
+    """Return a provisioned-instance record without provisioning one.
+
+    ``Instance`` is a frozen record of what a run brought up, so a test can name
+    a forge the harness never started and exercise every reader that takes one.
+    """
+    return fj.Instance(
+        project="exo-e2e-1057-abcdef12forgejo",
+        compose_file=root / "docker-compose.yml",
+        base_url=base_url,
+        host=base_url.removeprefix("http://"),
+        admin_username="abcdef12-admin",
+        author=fj.Account(username="abcdef12-author", token="author-token"),
+        reviewer=fj.Account(username="abcdef12-reviewer", token="reviewer-token"),
+        owner="abcdef12-author",
+        repo=repo,
+    )
+
+
+def test_the_matrix_takes_no_operator_supplied_forge() -> None:
+    """The retired shared-instance environment is gone from the matrix.
+
+    The run provisions its own Forgejo, so a variable naming somebody else's
+    instance is not an input it could accept: a run that honoured one would
+    publish its branches onto a repository the next run has to reconcile, which
+    is the whole class of leak per-test ownership exists to remove.
+
+    Every module the matrix reaches is checked, not just the two the first pass
+    covered: the leaf actor runs as a spawned agent with no harness Python
+    around it, so a fallback left there would be the one place the retired
+    environment could still reach a real run.
+    """
+    for module in (runner, real, leaf_publication_agent):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        assert "EXOMONAD_FORGEJO_E2E" not in source, module.__name__
+    assert not hasattr(runner, "_environment")
+    assert not hasattr(real, "clone_external_fixture")
+    assert not hasattr(real, "cleanup_external_case")
+
+
+def test_the_seed_only_emits_controller_events_the_shipped_contract_admits() -> None:
+    """The restart seed may not ask the server for an event it will refuse.
+
+    ``emit_controller_event`` is validated against
+    ``docs/observability/controller-event-contract.v1.json``. ``pr.review`` and
+    ``ci.status_changed`` are watcher observations rather than controller events,
+    so emitting them is refused outright -- which is what stopped every delayed
+    restart case before it reached its boundary. The seed asserts that instead:
+    every ``emit_controller_event`` it makes names an event the contract carries.
+    """
+    contract = json.loads(
+        (runner.PROJECT_ROOT / "docs/observability/controller-event-contract.v1.json")
+        .read_text(encoding="utf-8")
+    )
+    admitted = set(contract["events"])
+    emitted = set(
+        re.findall(
+            r'emit_controller_event\(\s*event_type="([a-z_.]+)"',
+            Path(real.__file__).read_text(encoding="utf-8"),
+        )
+    )
+    assert emitted, "the assertion would prove nothing if nothing is emitted"
+    assert emitted <= admitted, sorted(emitted - admitted)
+
+
+def test_a_restart_seed_is_written_at_a_phase_production_can_upgrade() -> None:
+    """The seed may not write a legacy phase the driver refuses to resume.
+
+    ``_ensure_canonical_scope`` upgrades a legacy checkpoint only from phases it
+    can derive the canonical scope from; an active ``TLWaiting`` checkpoint on a
+    multi-stage plan is refused because dispatch evidence for the stage is
+    ambiguous. A seed written there produces a run the product has deliberately
+    made unresumable, so the seeds must checkpoint ``TLPlanning`` and let
+    production derive the scope from the manifest.
+    """
+    seeds = {
+        name: inspect.getsource(getattr(real, name))
+        for name in ("seed_delayed_restart_run", "seed_dispatch_restart_run")
+    }
+    for name, source in seeds.items():
+        phases = set(re.findall(r"checkpoint\(\s*(TL[A-Za-z]+)\(", source))
+        assert phases, f"{name} seeds no phase"
+        assert "TLWaiting" not in phases, f"{name}: {phases}"
+        assert "TLPlanning" in phases, f"{name}: {phases}"
+
+    # The guard the seeds are written against, read from production rather than
+    # restated: these are the legacy phases _ensure_canonical_scope can upgrade.
+    # ``TLWaiting`` is absent because it is only upgraded when the manifest has no
+    # ordered stage, and both restart seeds use a multi-stage plan.
+    from tl_loop.loop.driver import TLPhase
+
+    upgradable = {TLPhase.TLPlanning, TLPhase.TLDone, TLPhase.TLFailed}
+    assert TLPhase.TLWaiting not in upgradable
+
+
+def test_a_case_anchors_its_chainlink_database_where_the_controller_reads_it() -> None:
+    """The database goes at ``<repo>/.chainlink/issues.db``, or nowhere.
+
+    ``exomonad init`` anchors ``CHAINLINK_DB`` there for the session it starts
+    and ``build_spawn_env`` does the same for every agent it spawns. A database
+    anywhere else is one the controller never writes an escalation to, and its
+    absence kills the controller inside ``park()`` before it can park anything.
+    """
+    source = inspect.getsource(runner._run_case)
+    assert "chainlink_db.create(root, project_dir=repo)" in source
+    assert "chainlink_db.create(root)" not in source
+    assert runner.chainlink_db.database_path_for(Path("/p/repo")) == Path(
+        "/p/repo/.chainlink/issues.db"
+    )
+
+
+def test_the_reviewer_actor_reaches_only_the_forge_its_shim_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actor's forge coordinates come from the run, with no fallback.
+
+    The shim ``start_server`` writes carries the instance this run provisioned.
+    An actor that also accepted an operator-supplied instance could approve a PR
+    on a repository this run never created, which is the exact leak per-test
+    ownership removes -- so an unset coordinate must fail rather than fall back.
+    """
+    for name in (
+        "FORGEJO_URL",
+        "FORGEJO_OWNER",
+        "FORGEJO_REPO",
+        "FORGEJO_REVIEWER_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("EXOMONAD_FORGEJO_E2E_URL", "http://somebody-elses-forge")
+    monkeypatch.setenv("EXOMONAD_FORGEJO_E2E_OWNER", "operator")
+    monkeypatch.setenv("EXOMONAD_FORGEJO_E2E_REPO", "operator-repo")
+    monkeypatch.setenv("EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN", "operator-token")
+    with pytest.raises(leaf_publication_agent.LeafPublicationError):
+        leaf_publication_agent.review_assigned_pr(7)
+
+    monkeypatch.setenv("FORGEJO_URL", "http://forgejo")
+    monkeypatch.setenv("FORGEJO_OWNER", "run-author")
+    monkeypatch.setenv("FORGEJO_REPO", "case-repo")
+    monkeypatch.setenv("FORGEJO_REVIEWER_TOKEN", "run-reviewer-token")
+    posted: list[tuple[str, object]] = []
+
+    def fake_request(method, url, *, token, payload=None):
+        posted.append((url, payload))
+        if url.endswith("/api/v1/user"):
+            return {"login": "run-reviewer"}
+        if url.endswith("/pulls/7"):
+            return {"head": {"sha": "run-head"}}
+        if url.endswith("/pulls/7/reviews"):
+            return []
+        return {"id": 5}
+
+    monkeypatch.setattr(leaf_publication_agent, "_request", fake_request)
+    assert leaf_publication_agent.review_assigned_pr(7)
+    assert posted[0] == ("http://forgejo/api/v1/repos/run-author/case-repo/pulls/7", None)
+    assert posted[-1][0] == (
+        "http://forgejo/api/v1/repos/run-author/case-repo/pulls/7/reviews"
+    )
+
+
+def test_the_leaf_shim_carries_the_runs_own_forge_credentials(tmp_path: Path) -> None:
+    """The shim the spawned reviewer resolves through names this run's forge.
+
+    ``start_server`` writes it, and the actor reads its forge coordinates from
+    it, so a reviewer is pointed at the same URL, owner, repository, and
+    reviewer token the server was configured with -- and at nothing else.
+    """
+    shim = tmp_path / "fake-bin" / "codex"
+    shim.parent.mkdir()
+    real.write_leaf_actor_shim(
+        shim,
+        project_root=runner.PROJECT_ROOT,
+        repo=tmp_path / "repo",
+        forgejo_url="http://127.0.0.1:3001",
+        forgejo_owner="run-author",
+        forgejo_repo="case-repo",
+        reviewer_token="run-reviewer-token",
+        leaf_branches=("main.sub-c.sub-c-output",),
+    )
+
+    exported: dict[str, str] = {}
+    for line in shim.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("export "):
+            continue
+        name, _, value = line.removeprefix("export ").partition("=")
+        exported[name] = value.strip("'\"")
+
+    assert exported["FORGEJO_URL"] == "http://127.0.0.1:3001"
+    assert exported["FORGEJO_OWNER"] == "run-author"
+    assert exported["FORGEJO_REPO"] == "case-repo"
+    assert exported["FORGEJO_REVIEWER_TOKEN"] == "run-reviewer-token"
+    assert exported["EXOMONAD_1057_LEAF_BRANCHES"] == "main.sub-c.sub-c-output"
+    assert not [name for name in exported if name.startswith("EXOMONAD_FORGEJO")]
+    assert os.access(shim, os.X_OK)
+
+
+def test_the_matrix_addresses_its_forge_only_through_a_provisioned_instance() -> None:
+    """There is no way for a case to name a forge the run did not bring up.
+
+    ``run_case`` and ``_clone_case_repository`` take the instance itself rather
+    than a dictionary read from the environment, so the URL, the owner, the
+    repository, and both tokens are all the ones :mod:`e2e_harness.forgejo_stack`
+    provisioned for this run.
+    """
+    assert list(inspect.signature(runner.run_case).parameters) == [
+        "root",
+        "repo",
+        "instance",
+        "boundary",
+        "case_name",
+        "chainlink_issue_id",
+        "chainlink_db",
+    ]
+    assert list(inspect.signature(runner._clone_case_repository).parameters) == [
+        "root",
+        "instance",
+    ]
+
+
+def test_every_case_in_every_pass_has_its_own_name_and_repository() -> None:
+    """A case is identified by (pass, boundary), and its repository by that name.
+
+    The name files the seeded aggregate branches, the controller state root, and
+    the durable markers a case writes, so two cases sharing one would publish
+    onto each other's branches and the second case's fixture pushes would be
+    rejected as non-fast-forwards against the first case's.
+    """
+    names = {
+        runner._case_name(repetition, boundary)
+        for repetition in range(1, runner.DEFAULT_REPETITIONS + 1)
+        for boundary in CRASH_BOUNDARIES
+    }
+    assert len(names) == runner.DEFAULT_REPETITIONS * len(CRASH_BOUNDARIES)
+    repositories = {runner._repository_name(name) for name in names}
+    assert len(repositories) == len(names)
+    for name in repositories:
+        assert re.fullmatch(r"[a-z0-9][a-z0-9.-]*", name), name
+
+
+def test_every_case_directory_leaves_room_for_the_socket_it_holds() -> None:
+    """Each case binds a tmux socket and a server socket under its directory.
+
+    ``sun_path`` is 108 bytes, so a directory long enough to push either over
+    the limit fails at bind time, far from the name that caused it. The case
+    directory is nested under the run directory for the sweep's sake, which is
+    exactly the trade this checks.
+    """
+    run_root = cl.make_root(cl.TEMP_ROOT, runner.MATRIX_PREFIX)
+    try:
+        for repetition in range(1, runner.DEFAULT_REPETITIONS + 1):
+            for boundary in CRASH_BOUNDARIES:
+                case = runner._case_directory(run_root, repetition, boundary)
+                sockets = (
+                    tmuxio.socket_path(case),
+                    case / runner.CASE_REPOSITORY / ".exo" / "server.sock",
+                )
+                for socket in sockets:
+                    assert (
+                        len(str(socket).encode("utf-8")) <= tmuxio.MAX_SOCKET_PATH_BYTES
+                    ), socket
+    finally:
+        shutil.rmtree(run_root, ignore_errors=True)
+
+
+def _bare_repository(path: Path) -> Path:
+    """Create a bare repository whose only branch is ``main`` with one commit."""
+    seed = path.parent / "seed"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True)
+    subprocess.run(
+        ["git", "-C", str(seed), "config", "user.name", "seed"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(seed), "config", "user.email", "seed@example.invalid"],
+        check=True,
+    )
+    (seed / "README.md").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "Seed"], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(path)], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", str(path), "main"], check=True)
+    return path
+
+
+def test_a_case_clones_its_own_repository_with_the_runs_own_credential(
+    tmp_path: Path,
+) -> None:
+    """The clone is the case's, and its credential is scoped to this run's forge.
+
+    A case publishes branches through ``origin``, so the clone has to carry the
+    credential the run's own Forgejo issued. The credential is written into the
+    clone's own config against that forge's URL prefix rather than into a
+    global one, which is what keeps it from reaching anything else.
+    """
+    forge = tmp_path / "forge"
+    _bare_repository(forge / "abcdef12-author" / "case-repo.git")
+    instance = _instance(tmp_path, repo="case-repo", base_url=f"file://{forge}")
+
+    repo = runner._clone_case_repository(tmp_path / "case", instance)
+
+    assert (repo / "README.md").is_file()
+    assert real.git(repo, "rev-parse", "--abbrev-ref", "HEAD") == runner.BASE_BRANCH
+    assert (
+        real.git(repo, "config", "--get", instance.extra_header_key())
+        == instance.author.extra_header()
     )
 
 
@@ -762,28 +1069,6 @@ def test_the_case_database_is_created_fresh_and_seeds_what_the_case_needs(
     assert len(runner.chainlink_db.database_files(database)) >= 1
     runner.chainlink_db.remove(database)
     assert not database.exists()
-
-
-def test_a_case_never_reads_an_operator_chainlink_database(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """CHAINLINK_DB is not an input: the harness builds its own and says so."""
-    for name in (
-        "EXOMONAD_FORGEJO_E2E_URL",
-        "EXOMONAD_FORGEJO_E2E_TOKEN",
-        "EXOMONAD_FORGEJO_E2E_REVIEWER_TOKEN",
-        "EXOMONAD_FORGEJO_E2E_OWNER",
-        "EXOMONAD_FORGEJO_E2E_REPO",
-        "EXOMONAD_FORGEJO_E2E_GIT_REMOTE",
-    ):
-        monkeypatch.setenv(name, "set")
-    monkeypatch.delenv("CHAINLINK_DB", raising=False)
-    monkeypatch.delenv("EXOMONAD_FORGEJO_E2E_MOCK", raising=False)
-    config = runner._environment()
-    assert "CHAINLINK_DB" not in config
-    assert not hasattr(runner, "_copy_chainlink_database")
-
-
 
 
 def test_effect_event_assertion_requires_one_merge_lifecycle(tmp_path: Path) -> None:

@@ -804,30 +804,6 @@ def create_fixture(root: Path) -> tuple[Path, Path, str]:
     return repo, remote, "feature/ordered-server"
 
 
-def clone_external_fixture(root: Path) -> tuple[Path, Path, str]:
-    """Clone the dedicated Forgejo repository used by acceptance runs.
-
-    The clone is disposable; the remote must be a repository reserved for the
-    acceptance job.  Requiring the explicit remote prevents this harness from
-    accidentally publishing test branches into an operator checkout.
-    """
-    remote_url = os.environ.get("EXOMONAD_FORGEJO_E2E_GIT_REMOTE")
-    if not remote_url:
-        raise HarnessError(
-            "EXOMONAD_FORGEJO_E2E_GIT_REMOTE is required for real acceptance"
-        )
-    repo = root / "repo"
-    run_command(["git", "clone", "--quiet", remote_url, str(repo)])
-    git(repo, "config", "user.name", "recursive-crash-e2e")
-    git(repo, "config", "user.email", "recursive-crash-e2e@example.com")
-    branch = os.environ.get("EXOMONAD_FORGEJO_E2E_BASE_BRANCH", "main")
-    git(repo, "switch", "--quiet", branch)
-    # The clone is the only local repository involved in the run.  Returning it
-    # in both repository slots keeps this helper's fixture-shaped API while
-    # avoiding a misleading Path conversion for HTTPS/SSH remotes.
-    return repo, repo, branch
-
-
 def start_mock(
     root: Path, project_root: Path, remote: Path
 ) -> tuple[subprocess.Popen[str], str]:
@@ -887,6 +863,56 @@ def ordered_parent_identity(worktree: Path) -> dict[str, object]:
     }
 
 
+def write_leaf_actor_shim(
+    path: Path,
+    *,
+    project_root: Path,
+    repo: Path,
+    forgejo_url: str,
+    forgejo_owner: str,
+    forgejo_repo: str,
+    reviewer_token: str,
+    leaf_branches: Sequence[str] | None,
+) -> None:
+    """Write the executable every spawned agent resolves to.
+
+    With no leaf branches the agents are idle placeholders. With them, every
+    agent type runs the one deterministic actor beside this harness, so no real
+    agent binary is ever started against a disposable repository.
+
+    The forge coordinates are part of that contract rather than the actor's
+    environment to discover: the actor needs them to approve the PR it was
+    assigned, and the only place they may come from is the instance this run
+    provisioned. An actor handed an operator-supplied instance could approve on
+    a repository the run never created, so the shim exports exactly the URL,
+    owner, repository, and reviewer token the server was configured with.
+    """
+    if not leaf_branches:
+        path.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
+        path.chmod(0o755)
+        return
+    actor = (
+        project_root / "tests/e2e/recursive-crash-convergence/leaf_publication_agent.py"
+    )
+    exports = {
+        "EXOMONAD_SOCKET": str(repo / ".exo" / "server.sock"),
+        "EXOMONAD_1057_LEAF_BRANCHES": ",".join(sorted(set(leaf_branches))),
+        "FORGEJO_URL": forgejo_url,
+        "FORGEJO_OWNER": forgejo_owner,
+        "FORGEJO_REPO": forgejo_repo,
+        "FORGEJO_REVIEWER_TOKEN": reviewer_token,
+    }
+    path.write_text(
+        "#!/bin/sh\n"
+        + "".join(
+            f"export {name}={shlex.quote(value)}\n" for name, value in exports.items()
+        )
+        + f"exec {shlex.quote(sys.executable)} {shlex.quote(str(actor))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
 def start_server(
     root: Path,
     repo: Path,
@@ -895,6 +921,8 @@ def start_server(
     *,
     forgejo_token: str = "test-token",
     forgejo_reviewer_token: str | None = None,
+    forgejo_owner: str = "owner",
+    forgejo_repo: str = "repo",
     identity_agents: Mapping[str, str] | None = None,
     chainlink_db: Path | None = None,
     leaf_branches: Sequence[str] | None = None,
@@ -1043,22 +1071,16 @@ def start_server(
     fake_bin = root / "fake-bin"
     fake_bin.mkdir()
     fake_codex = fake_bin / "codex"
-    if leaf_branches:
-        actor = (
-            project_root
-            / "tests/e2e/recursive-crash-convergence/leaf_publication_agent.py"
-        )
-        configured_branches = ",".join(sorted(set(leaf_branches)))
-        fake_codex.write_text(
-            "#!/bin/sh\n"
-            f"export EXOMONAD_SOCKET={shlex.quote(str(repo / '.exo/server.sock'))}\n"
-            f"export EXOMONAD_1057_LEAF_BRANCHES={shlex.quote(configured_branches)}\n"
-            f'exec {shlex.quote(sys.executable)} {shlex.quote(str(actor))} "$@"\n',
-            encoding="utf-8",
-        )
-    else:
-        fake_codex.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
-    fake_codex.chmod(0o755)
+    write_leaf_actor_shim(
+        fake_codex,
+        project_root=project_root,
+        repo=repo,
+        forgejo_url=forgejo_url,
+        forgejo_owner=forgejo_owner,
+        forgejo_repo=forgejo_repo,
+        reviewer_token=forgejo_reviewer_token or forgejo_token,
+        leaf_branches=leaf_branches,
+    )
     test_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
     socket = tmuxio.socket_path(root)
     environment = tmuxio.child_env(root, {**os.environ, "PATH": test_path})
@@ -1156,92 +1178,6 @@ def stop_server(process: subprocess.Popen[str], repo: Path, label: str) -> None:
         except HarnessError:
             return
         tmuxio.tmux(socket, "kill-session", "-t", session)
-
-
-def cleanup_external_case(
-    repo: Path,
-    forgejo_url: str,
-    forgejo_owner: str,
-    forgejo_repo: str,
-    forgejo_token: str,
-    case_name: str,
-) -> None:
-    """Close and delete only PRs/branches created by one acceptance case."""
-    pulls = json_request(
-        "GET",
-        f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls?state=all&limit=100",
-        token=forgejo_token,
-    )
-    if not isinstance(pulls, list):
-        raise HarnessError(f"Forgejo pull listing is not an array: {pulls!r}")
-    branch_prefix = f"aggregate/{case_name}/"
-    for pull in pulls:
-        if not isinstance(pull, Mapping):
-            continue
-        head = pull.get("head")
-        head_ref = head.get("ref") if isinstance(head, Mapping) else None
-        title = pull.get("title")
-        belongs = isinstance(head_ref, str) and head_ref.startswith(branch_prefix)
-        belongs = belongs or (
-            isinstance(title, str)
-            and title.startswith("Aggregate ")
-            and isinstance(head_ref, str)
-            and head_ref
-            in {
-                "main.sub-a",
-                "main.sub-b",
-                "main.sub-c",
-                "main.sub-a.nested-a",
-            }
-        )
-        if not belongs:
-            continue
-        number = pull.get("number")
-        if type(number) is int and pull.get("state") == "open":
-            json_request(
-                "PATCH",
-                f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls/{number}",
-                {"state": "closed"},
-                token=forgejo_token,
-            )
-        if isinstance(head_ref, str):
-            result = subprocess.run(
-                ["git", "push", "origin", "--delete", head_ref],
-                cwd=repo,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            if result.returncode and "remote ref does not exist" not in result.stderr:
-                raise HarnessError(
-                    f"could not delete acceptance branch {head_ref!r}: {result.stderr}"
-                )
-    parent_marker = repo / ".exo" / f"1057-parent-branches-{case_name}.json"
-    try:
-        parent_branches = json.loads(parent_marker.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        parent_branches = []
-    if isinstance(parent_branches, list):
-        for branch in parent_branches:
-            if not isinstance(branch, str) or not branch:
-                continue
-            result = subprocess.run(
-                ["git", "push", "origin", "--delete", branch],
-                cwd=repo,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            if result.returncode and "remote ref does not exist" not in result.stderr:
-                raise HarnessError(
-                    f"could not delete acceptance parent branch {branch!r}: {result.stderr}"
-                )
-    try:
-        parent_marker.unlink()
-    except FileNotFoundError:
-        pass
-    for marker in repo.glob(f".exo/1057-nested-baseline-heads-{case_name}.json"):
-        marker.unlink()
 
 
 def server_ledger_events(repo: Path) -> list[dict[str, Any]]:
@@ -2390,7 +2326,6 @@ def seed_delayed_restart_run(
     }[boundary]
     verdict = None if boundary == "aggregate_review" else Verdict.GO
     direct_sub_tls = tuple(plan.sub_tls)
-    review_ids: dict[str, int] = {}
     for name in (task.name for task in direct_sub_tls):
         branch = f"aggregate/{case_slug}/{name}"
         create_branch_with_commit(
@@ -2436,10 +2371,12 @@ def seed_delayed_restart_run(
             },
             token=forgejo_reviewer_token or forgejo_token,
         )
+        # The review is posted on the forge for real and must come back with a
+        # durable id: the seeded slice claims this review happened, and an id
+        # nobody can cite is not a review.
         review_id = review.get("id") if isinstance(review, Mapping) else None
         if type(review_id) is not int or review_id <= 0:
             raise HarnessError(f"Forgejo review omitted its durable ID: {review!r}")
-        review_ids[name] = review_id
         current = state.slices[name]
         owner_id = f"{run_id}:{name}:integration"
         updated_slices[name] = replace(
@@ -2515,12 +2452,16 @@ def seed_delayed_restart_run(
         },
         candidates=candidates,
     )
-    waiting = {
-        task.name: ChildHandle(task.name, f"main.{task.name}", "sub-tl")
-        for task in direct_sub_tls
-    }
+    # Seeded at `TLPlanning`, not `TLWaiting`, for the same reason the dispatch
+    # restart seed is: a legacy active `TLWaiting` checkpoint cannot be resumed
+    # for a multi-stage plan (driver._ensure_canonical_scope refuses it, because
+    # dispatch evidence for the stage is ambiguous), so a seed written there is a
+    # state the product has deliberately made unresumable. `TLPlanning` is the
+    # one legacy phase production upgrades from the manifest, and the slice state
+    # above already carries every child as IN_REVIEW with its aggregate PR bound,
+    # which is what the boundary under test actually needs.
     seeded_slices.checkpoint(
-        TLWaiting(waiting),
+        TLPlanning(),
         updated_slices,
         BudgetLedger(tokens=0, wall_seconds=0),
         0,
@@ -2528,49 +2469,16 @@ def seed_delayed_restart_run(
         ordered_stages=stages,
         integration=integration,
     )
-    for task in direct_sub_tls:
-        current = updated_slices[task.name]
-        review_payload = {
-            "slice_id": task.name,
-            "pr_number": current.pr_number,
-            "head_sha": current.reviewed_head,
-            "review_head_sha": current.reviewed_head,
-            "review_id": review_ids[task.name],
-            "review_state": review_verdict,
-            "kind": "approved" if review_verdict == "approved" else "changes_requested",
-            "verdict": "GO" if review_verdict == "approved" else "NO-GO",
-            "reviewer_agent_id": current.reviewer_agent_id,
-            "reviewer_account_authenticated": True,
-            "reviewer_identity_unresolved": False,
-            "findings": []
-            if review_verdict == "approved"
-            else [
-                {
-                    "severity": "blocking",
-                    "path": "acceptance",
-                    "rationale": "Acceptance repair finding",
-                }
-            ],
-        }
-        review_result = parent_effects.emit_controller_event(
-            event_type="pr.review", payload=review_payload
-        )
-        if not review_result.success:
-            raise HarnessError(
-                f"could not seed review ledger evidence: {review_result.raw!r}"
-            )
-        ci_result = parent_effects.emit_controller_event(
-            event_type="ci.status_changed",
-            payload={
-                "slice_id": task.name,
-                "pr_number": current.pr_number,
-                "head_sha": current.reviewed_head,
-                "status": "success",
-                "ci_status": "success",
-            },
-        )
-        if not ci_result.success:
-            raise HarnessError(f"could not seed CI ledger evidence: {ci_result.raw!r}")
+    # No review or CI ledger row is seeded. The controller's own event surface is
+    # the contract in docs/observability/controller-event-contract.v1.json, and
+    # `pr.review` / `ci.status_changed` are not on it: they are watcher
+    # observations, written by the watcher from what the forge reports, never
+    # controller events, and asking the server to emit them is refused outright.
+    # The seed states the verdict, the reviewed head, the review id, and the CI
+    # status on the slice itself (above), which is where a resumed controller
+    # reads them from. Fabricating an observation event to satisfy a reducer
+    # would also be the wrong evidence: it would assert that a watcher saw a
+    # review no watcher ever watched.
     return (
         run_id,
         plan,
