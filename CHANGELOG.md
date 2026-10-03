@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Keep tl_loop transport tests' Unix socket off TMPDIR so they pass under a long TMPDIR (#1142)
 - Propagate CODEX_HOME before creating the tmux session's first window (#1147)
 - Record the qualified harness identifier on the slice, not only the agent type (#1135)
 - Retain shadow child_spawned rows refused for an epoch mismatch as audit evidence (#1136)
