@@ -508,6 +508,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Give the crash matrix a Forgejo per pass instead of one for all 28 cases (#1156)
 - Contract tests must create short socket roots inside their try/finally (#1143)
 - Tidy the #1137 follow-ups: dead assignment, private heartbeat imports, re-park docs (#1144)
 - Decide whether one slice's dispatch exhaustion should stop sibling slices (#1134)
