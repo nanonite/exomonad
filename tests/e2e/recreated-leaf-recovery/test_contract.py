@@ -963,6 +963,159 @@ def _compose_file() -> Path:
 
 
 # --------------------------------------------------------------------------
+# Short socket roots
+# --------------------------------------------------------------------------
+#
+# A short root exists because ``sun_path`` is 107 bytes and ``TMPDIR`` is not
+# the harness's to set. It is therefore created under ``/tmp`` with the socket
+# prefix instead of with a run's directory prefix, which makes it the one run
+# resource that survives a cleanup scoped to run directories -- and the one
+# that survived a crash the longest, because nothing reclaimed it at all.
+
+
+def _abandoned_short_root() -> Path:
+    """Return a short socket root aged past the sweep's idle window.
+
+    Made with ``make_root`` under the socket prefix rather than through the
+    helper, because a root created by the helper is by definition inside a
+    block that removes it. This one is what an interrupted run leaves: created,
+    never reclaimed. Its modification time is pushed back so the age is the
+    only thing that identifies it, exactly as it is for a real leftover.
+    """
+    root = cl.make_root("/tmp", tmuxio.SHORT_ROOT_PREFIX)
+    abandoned = time.time() - cl.SHORT_ROOT_IDLE_SECONDS - 60
+    os.utime(root, (abandoned, abandoned))
+    return root
+
+
+def _unreachable_run_prefix(label: str) -> str:
+    """Return a run prefix that names no session, project, or volume."""
+    import secrets
+
+    return f"{PREFIX}{label}-{secrets.token_hex(3)}-"
+
+
+def test_the_sweep_reclaims_a_short_socket_root_an_interrupted_run_left_behind() -> None:
+    """An abandoned short root is reclaimed by the next run's sweep.
+
+    Nothing under a run directory prefix names it, so a sweep scoped to run
+    directories cannot see it however long it sits in ``/tmp``. An empty
+    ``exo-e2e-sock-*/root`` was observed outliving runs on 2026-09-28, which is
+    what an allocation made outside its own cleanup leaves behind when the
+    bind that follows it fails.
+    """
+    root = _abandoned_short_root()
+    try:
+        # The run-directory pass is expected to miss it. If it ever stops
+        # missing it, this test is asserting the wrong thing.
+        assert root not in cl.stale_run_roots(PREFIX)
+        assert root in cl.stale_short_roots()
+        assert (
+            cl.sweep_stale(_unreachable_run_prefix("short"), _compose_file(), PREFIX)
+            == []
+        )
+        assert not root.exists(), "the sweep left an abandoned short root behind"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_a_short_socket_root_created_now_is_left_to_the_run_that_owns_it() -> None:
+    """The sweep reclaims an abandoned root, not one a live run is holding.
+
+    Acceptances run concurrently, and each of them creates short roots while it
+    works. A sweep that reclaimed by name alone would delete a live run's
+    directory out from under it, which is why age is part of the test.
+    """
+    with tmuxio.temporary_short_root() as root:
+        assert root not in cl.stale_short_roots()
+        assert cl.sweep_stale(
+            _unreachable_run_prefix("live"), _compose_file(), PREFIX
+        ) == []
+        assert root.is_dir(), "the sweep removed a short root that is still in use"
+
+
+def test_the_sweep_leaves_an_aged_short_root_that_still_has_a_process_in_it() -> None:
+    """Age alone does not condemn a short root that something is running in.
+
+    The sweep kills processes running inside run directories before it removes
+    them, and it must not do that to a root a live run is using: the process
+    is found by its working directory, the same way a leak is found, and the
+    root is left exactly as it was found.
+    """
+    root = _abandoned_short_root()
+    process = subprocess.Popen(["sleep", "600"], cwd=root, start_new_session=True)
+    try:
+        # Look as far past the idle window as the clock allows, so age alone
+        # would condemn this root and the process in it is the only thing left
+        # to save it. That is what is being asserted.
+        later = time.time() + cl.SHORT_ROOT_IDLE_SECONDS + 60
+        assert root not in cl.stale_short_roots(now=later), (
+            "a short root with a live process in it is not an abandoned one, "
+            "however old it is"
+        )
+        assert cl.sweep_stale(
+            _unreachable_run_prefix("busy"), _compose_file(), PREFIX
+        ) == []
+        assert root.is_dir(), "the sweep removed a short root a process is in"
+        assert cl._process_alive(process.pid), (
+            "the sweep killed a process running inside a short root"
+        )
+    finally:
+        if cl._process_alive(process.pid):
+            process.kill()
+            process.wait(timeout=30)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+#: The one module allowed to allocate a short root: it owns the prefix, and the
+#: helper that allocates a root inside its own removal.
+SHORT_ROOT_OWNER = "tests/e2e/lib/e2e_harness/tmuxio.py"
+
+#: A short-root allocation: the bare name or the qualified one. The word
+#: boundary keeps this off ``temporary_short_root`` and ``short_roots``, which
+#: are the entry points a caller is meant to arrive through.
+_SHORT_ROOT_ALLOCATION = re.compile(r"\b(?:tmuxio\.)?short_root\s*\(")
+
+
+def _short_root_allocations(path: Path) -> list[int]:
+    """Return the line numbers where a file allocates a short root itself."""
+    offenders: list[int] = []
+    for number, line in enumerate(
+        path.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+    ):
+        if line.strip().startswith("#"):
+            continue
+        if _SHORT_ROOT_ALLOCATION.search(line):
+            offenders.append(number)
+    return offenders
+
+
+def test_no_harness_allocates_a_short_root_outside_its_cleanup() -> None:
+    """A short root may only be created by the helper that also removes it.
+
+    Every caller that allocates one allocates it *before* the ``try`` that
+    removes it, because everything it does next -- making the socket's
+    directory, binding a server -- belongs inside the block that has to survive
+    a failure. A bind that fails in that gap strands the root, and nothing
+    scoped to run directories can reclaim it afterwards. Allocating through the
+    helper puts the allocation inside the removal, so there is no gap.
+    """
+    found: dict[str, list[int]] = {}
+    for path in sorted((PROJECT_ROOT / "tests" / "e2e").rglob("*.py")):
+        relative = path.relative_to(PROJECT_ROOT).as_posix()
+        if relative == SHORT_ROOT_OWNER:
+            continue
+        lines = _short_root_allocations(path)
+        if lines:
+            found[relative] = lines
+    assert not found, (
+        "a short root must be allocated inside the cleanup that removes it: use "
+        "the temporary short root helper from e2e_harness.tmuxio instead: "
+        f"{found}"
+    )
+
+
+# --------------------------------------------------------------------------
 # The tmux boundary
 # --------------------------------------------------------------------------
 
@@ -1095,74 +1248,77 @@ def test_teardown_cannot_reach_a_tmux_server_outside_the_run() -> None:
     """
     # Not ``tmp_path``: the outer server's socket has to fit in ``sun_path``,
     # and ``tmp_path`` descends from ``TMPDIR``, which a caller may have made
-    # long enough that no socket path fits under it.
-    outer_root = tmuxio.short_root()
-    outer_socket = tmuxio.socket_path(outer_root)
-    outer_session = "exo-e2e-outer-server-guard"
-    tmuxio.tmux(
-        outer_socket,
-        "new-session",
-        "-d",
-        "-s",
-        outer_session,
-        "sleep",
-        "600",
-        check=True,
-    )
-    previous = os.environ.get("TMUX")
-    stale_root = cl.make_root("/tmp", PREFIX)
-    scope = cl.RunScope(
-        run_id=f"guard{os.getpid()}", root=cl.make_root("/tmp", PREFIX), prefix=PREFIX
-    )
-    session = scope.track_session(scope.session_prefix)
-    stale_session = f"{PREFIX}stale-guard"
-    os.environ["TMUX"] = f"{outer_socket},{os.getpid()},0"
-    try:
+    # long enough that no socket path fits under it. Allocated through the
+    # helper that removes it, so the server it starts below cannot outlive the
+    # block that put its directory in /tmp.
+    with tmuxio.temporary_short_root() as outer_root:
+        outer_socket = tmuxio.socket_path(outer_root)
+        outer_session = "exo-e2e-outer-server-guard"
         tmuxio.tmux(
-            scope.tmux_socket,
+            outer_socket,
             "new-session",
             "-d",
             "-s",
-            session,
-            "-n",
-            "probe",
+            outer_session,
             "sleep",
             "600",
             check=True,
         )
-        tmuxio.tmux(
-            tmuxio.socket_path(stale_root),
-            "new-session",
-            "-d",
-            "-s",
-            stale_session,
-            "sleep",
-            "600",
-            check=True,
+        previous = os.environ.get("TMUX")
+        stale_root = cl.make_root("/tmp", PREFIX)
+        scope = cl.RunScope(
+            run_id=f"guard{os.getpid()}",
+            root=cl.make_root("/tmp", PREFIX),
+            prefix=PREFIX,
         )
-        assert tmuxio.server_alive(outer_socket)
-        assert tmuxio.server_alive(scope.tmux_socket)
+        session = scope.track_session(scope.session_prefix)
+        stale_session = f"{PREFIX}stale-guard"
+        os.environ["TMUX"] = f"{outer_socket},{os.getpid()},0"
+        try:
+            tmuxio.tmux(
+                scope.tmux_socket,
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-n",
+                "probe",
+                "sleep",
+                "600",
+                check=True,
+            )
+            tmuxio.tmux(
+                tmuxio.socket_path(stale_root),
+                "new-session",
+                "-d",
+                "-s",
+                stale_session,
+                "sleep",
+                "600",
+                check=True,
+            )
+            assert tmuxio.server_alive(outer_socket)
+            assert tmuxio.server_alive(scope.tmux_socket)
 
-        assert scope.teardown() == []
-        assert cl.sweep_stale(PREFIX, _compose_file(), PREFIX) == []
-        assert scope.leaks() == []
+            assert scope.teardown() == []
+            assert cl.sweep_stale(PREFIX, _compose_file(), PREFIX) == []
+            assert scope.leaks() == []
 
-        # The outer server is untouched by both, and both of the run's servers
-        # are gone.
-        assert tmuxio.tmux(
-            outer_socket, "has-session", "-t", outer_session
-        ).returncode == 0, "the outer tmux server lost its session"
-        assert not scope.tmux_socket.parent.is_dir()
-        assert not tmuxio.server_alive(tmuxio.socket_path(stale_root))
-    finally:
-        if previous is None:
-            os.environ.pop("TMUX", None)
-        else:
-            os.environ["TMUX"] = previous
-        tmuxio.tmux(outer_socket, "kill-server")
-        shutil.rmtree(outer_root, ignore_errors=True)
-        shutil.rmtree(stale_root, ignore_errors=True)
-        shutil.rmtree(scope.root, ignore_errors=True)
+            # The outer server is untouched by both, and both of the run's
+            # servers are gone.
+            assert tmuxio.tmux(
+                outer_socket, "has-session", "-t", outer_session
+            ).returncode == 0, "the outer tmux server lost its session"
+            assert not scope.tmux_socket.parent.is_dir()
+            assert not tmuxio.server_alive(tmuxio.socket_path(stale_root))
+        finally:
+            if previous is None:
+                os.environ.pop("TMUX", None)
+            else:
+                os.environ["TMUX"] = previous
+            tmuxio.tmux(outer_socket, "kill-server")
+            shutil.rmtree(stale_root, ignore_errors=True)
+            shutil.rmtree(scope.root, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -1211,15 +1367,24 @@ def test_a_long_tmpdir_cannot_produce_an_unbindable_socket() -> None:
         with pytest.raises(tmuxio.TmuxError, match="kernel allows"):
             tmuxio.socket_path(monkey_root)
 
-        # The harness's own roots ignore TMPDIR and still fit.
+        # The harness's own roots ignore TMPDIR and still fit. Both are created
+        # inside the cleanup that removes them: a root allocated outside its own
+        # cleanup is what stranded /tmp/exo-e2e-sock-* roots in the first place,
+        # and an assertion between the allocation and the removal would strand
+        # one again.
         run_root = cl.make_root("/tmp", PREFIX)
-        short_root = tmuxio.short_root()
-        for root in (run_root, short_root):
-            socket = tmuxio.socket_path(root)
-            assert len(str(socket).encode("utf-8")) <= tmuxio.MAX_SOCKET_PATH_BYTES
-            tmuxio.ensure(socket)
-            assert socket.parent.is_dir()
-            shutil.rmtree(root, ignore_errors=True)
+        try:
+            with tmuxio.temporary_short_root() as short:
+                for root in (run_root, short):
+                    socket = tmuxio.socket_path(root)
+                    assert (
+                        len(str(socket).encode("utf-8"))
+                        <= tmuxio.MAX_SOCKET_PATH_BYTES
+                    )
+                    tmuxio.ensure(socket)
+                    assert socket.parent.is_dir()
+        finally:
+            shutil.rmtree(run_root, ignore_errors=True)
     finally:
         if previous is None:
             os.environ.pop("TMPDIR", None)

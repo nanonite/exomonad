@@ -62,6 +62,17 @@ TMUX_TIMEOUT_SECONDS = 15.0
 #: Bounded wait for a compose project to be removed.
 COMPOSE_TIMEOUT_SECONDS = 120.0
 
+#: How long a short socket root must have gone untouched before a start-of-run
+#: sweep may reclaim it.
+#:
+#: A short root is created, bound, and removed inside one test or one harness
+#: step: seconds, never minutes. One that has not changed for longer than this
+#: belongs to a run that was killed from outside and never got its cleanup, and
+#: the window is what stops a sweep from reaching into work that is still
+#: running: acceptances run concurrently, and a root a live one is using must
+#: not be removed from under it.
+SHORT_ROOT_IDLE_SECONDS = 300.0
+
 
 class CleanupError(RuntimeError):
     """Raised when a resource could not be removed or is still present."""
@@ -445,6 +456,61 @@ def stale_run_roots(run_directory_prefix: str) -> list[str]:
     return roots
 
 
+def stale_short_roots(
+    idle_seconds: float = SHORT_ROOT_IDLE_SECONDS, now: float | None = None
+) -> list[Path]:
+    """Return the short socket roots an interrupted run left behind.
+
+    A short root (``tmuxio.SHORT_ROOT_PREFIX`` under ``/tmp``) is a leak class
+    of its own: it is created outside every run directory prefix, so
+    ``stale_run_roots`` cannot see one however long it sits there, and nothing
+    about it says whether its owner is still alive. Age is the only evidence, so
+    a root that has not changed for ``idle_seconds`` is treated as abandoned --
+    and an empty ``exo-e2e-sock-*/root`` was observed outliving runs in the
+    meantime.
+
+    A root with a process still running in it is never reported, at any age.
+    That is a run still using it, and reclaiming it would remove a directory out
+    from under live work; the process is found by its working directory, exactly
+    as ``leaks`` finds a survivor, and survives the removal for the same reason.
+
+    It is a sweep input rather than a leak-check input: ``leaks`` answers what
+    the scope that owns them left behind, and no scope owns a short root -- the
+    callers that create one create it outside any run scope, which is what
+    allowed a failure to strand it in the first place.
+    """
+    moment = time.time() if now is None else now
+    idle = [
+        root
+        for root in tmuxio.short_roots()
+        if _idle_seconds(root, moment) >= idle_seconds
+    ]
+    if not idle:
+        return []
+    running = [
+        cwd for _pid, cwd, _command in processes_in_scopes([str(root) for root in idle])
+    ]
+    return [
+        root
+        for root in idle
+        if not any(_is_within(cwd, [str(root)]) for cwd in running)
+    ]
+
+
+def _idle_seconds(root: Path, moment: float) -> float:
+    """Return how long a directory has gone without changing.
+
+    A short root's modification time is when it was created, or when the socket
+    directory was made inside it, so it reads as the age of the owner rather
+    than as activity. A root that cannot be stat'd is reported as freshly
+    touched, so a disappearing directory is never reclaimed on stale evidence.
+    """
+    try:
+        return moment - root.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def sweep_stale(
     run_prefix: str, compose_file: Path, run_directory_prefix: str
 ) -> list[str]:
@@ -469,6 +535,11 @@ def sweep_stale(
     removing a directory first converts a detectable leak into an untraceable
     one. Directories go last, once everything that could have been running in
     them is gone.
+
+    Short socket roots are reclaimed last and separately, under the age rule in
+    ``stale_short_roots``. They carry the socket prefix rather than the run's,
+    so nothing above can see one, and they are the one resource a caller can
+    still strand by allocating it outside its own cleanup.
     """
     problems: list[str] = []
     roots = stale_run_roots(run_directory_prefix)
@@ -497,6 +568,17 @@ def sweep_stale(
             shutil.rmtree(root, ignore_errors=True)
             if Path(root).is_dir():
                 problems.append(f"stale run directory survived the sweep: {root}")
+    # Short socket roots are swept last and by a different rule, because they
+    # are not run directories at all: they carry the socket prefix rather than
+    # the run's, so the pass above never sees one, and a caller that allocated
+    # one outside its own cleanup stranded it there indefinitely. A root old
+    # enough to be abandoned and with nothing running in it is reclaimed; one a
+    # live run is still using is left alone, so a sweep never reaches sideways.
+    for root in stale_short_roots():
+        problems.extend(tmuxio.kill_server(tmuxio.socket_path(root)))
+        shutil.rmtree(root, ignore_errors=True)
+        if root.is_dir():
+            problems.append(f"stale short socket root survived the sweep: {root}")
     return problems
 
 
@@ -578,10 +660,12 @@ __all__ = [
     "CleanupError",
     "RunScope",
     "SESSION_NAME_MAX_LENGTH",
+    "SHORT_ROOT_IDLE_SECONDS",
     "TEMP_ROOT",
     "install_trap",
     "make_root",
     "processes_in_scopes",
     "stale_run_roots",
+    "stale_short_roots",
     "sweep_stale",
 ]

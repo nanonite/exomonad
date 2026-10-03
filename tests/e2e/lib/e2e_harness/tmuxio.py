@@ -27,8 +27,9 @@ import shutil
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Mapping
+from typing import Iterator, Mapping
 
 #: The default socket name tmux uses under a ``TMUX_TMPDIR``.
 SOCKET_NAME = "default"
@@ -79,10 +80,47 @@ def short_root(prefix: str = SHORT_ROOT_PREFIX) -> Path:
     ``tempfile`` honours ``TMPDIR``, and a caller's ``TMPDIR`` can be long
     enough that nothing socket-shaped fits underneath it. A socket root is
     therefore created under ``/tmp`` explicitly, with ``mkdtemp``'s own random
-    suffix keeping two callers apart, and is the caller's to remove.
+    suffix keeping two callers apart.
+
+    It is the caller's to remove, and a caller that removes it somewhere other
+    than the path that created it is how one gets stranded: everything the
+    caller does afterwards -- creating the socket's directory, binding the
+    server -- runs before its ``try``, so a failure there loses the root. Use
+    :func:`temporary_short_root` unless the root genuinely has to outlive a
+    block; it puts the allocation inside the removal.
     """
     directory = Path(tempfile.mkdtemp(dir=SHORT_ROOT_BASE, prefix=prefix))
     return _fit(directory)
+
+
+@contextmanager
+def temporary_short_root(prefix: str = SHORT_ROOT_PREFIX) -> Iterator[Path]:
+    """Create a short socket root for the body of a ``with`` and remove it after.
+
+    The allocation happens here, so it is inside the block that removes it: a
+    failure in ``mkdir``, in ``bind``, or in any assertion between them cannot
+    leave a ``/tmp/exo-e2e-sock-*`` directory behind. That is not a cosmetic
+    concern -- an abandoned short root is created outside every run directory
+    prefix, so no prefix-driven sweep of a run would ever find it, and an empty
+    ``exo-e2e-sock-*/root`` was observed outliving runs on 2026-09-28.
+    """
+    root = short_root(prefix)
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def short_roots(prefix: str = SHORT_ROOT_PREFIX) -> list[Path]:
+    """Return every short root carrying ``prefix``, live or abandoned.
+
+    Short roots have no age attached to them the way a run directory does, so
+    this is the only way a sweep can see one at all; deciding whether it is
+    stale is the caller's job.
+    """
+    return sorted(
+        path for path in Path(SHORT_ROOT_BASE).glob(f"{prefix}*") if path.is_dir()
+    )
 
 
 def _fit(path: Path) -> Path:
@@ -221,6 +259,8 @@ __all__ = [
     "kill_server",
     "server_alive",
     "short_root",
+    "short_roots",
     "socket_path",
+    "temporary_short_root",
     "tmux",
 ]

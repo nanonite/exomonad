@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import http.server
-import shutil
 import socketserver
 import subprocess
 import sys
@@ -267,7 +266,8 @@ def test_leaf_publication_uses_the_explicit_root_socket(
     The root is not ``tmp_path``: a Unix socket path is at most 107 bytes, and
     ``tmp_path`` descends from ``TMPDIR``, which a caller may have made long
     enough that nothing socket-shaped fits. A short root under ``/tmp`` is used
-    instead and removed whatever the test does.
+    instead, through the helper that allocates it inside its own removal, so it
+    is gone whether the publication succeeds or the bind never happens.
     """
     requests: list[tuple[str, bytes]] = []
 
@@ -288,34 +288,69 @@ def test_leaf_publication_uses_the_explicit_root_socket(
     class UnixHTTPServer(socketserver.UnixStreamServer):
         allow_reuse_address = True
 
-    root = tmuxio.short_root()
-    socket_path = root / "root" / ".exo" / "server.sock"
-    socket_path.parent.mkdir(parents=True)
-    assert len(str(socket_path).encode("utf-8")) <= tmuxio.MAX_SOCKET_PATH_BYTES
-    server = UnixHTTPServer(str(socket_path), UnixHTTPHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    monkeypatch.setenv(
-        "EXOMONAD_1057_LEAF_BRANCHES", "main.sub-a.nested-a.nested-output"
-    )
-    monkeypatch.setenv("EXOMONAD_SOCKET", str(socket_path))
-    monkeypatch.setattr(
-        leaf_publication_agent,
-        "_current_branch",
-        lambda: "main.sub-a.nested-a.nested-output",
-    )
-    monkeypatch.setattr(leaf_publication_agent, "_current_head", lambda: "leaf-head")
-    try:
-        assert leaf_publication_agent.publish_leaf()
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-        shutil.rmtree(root, ignore_errors=True)
+    with tmuxio.temporary_short_root() as root:
+        socket_path = root / "root" / ".exo" / "server.sock"
+        socket_path.parent.mkdir(parents=True)
+        assert len(str(socket_path).encode("utf-8")) <= tmuxio.MAX_SOCKET_PATH_BYTES
+        server = UnixHTTPServer(str(socket_path), UnixHTTPHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        monkeypatch.setenv(
+            "EXOMONAD_1057_LEAF_BRANCHES", "main.sub-a.nested-a.nested-output"
+        )
+        monkeypatch.setenv("EXOMONAD_SOCKET", str(socket_path))
+        monkeypatch.setattr(
+            leaf_publication_agent,
+            "_current_branch",
+            lambda: "main.sub-a.nested-a.nested-output",
+        )
+        monkeypatch.setattr(leaf_publication_agent, "_current_head", lambda: "leaf-head")
+        try:
+            assert leaf_publication_agent.publish_leaf()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
     assert len(requests) == 1
     path, body = requests[0]
     assert path == "/agents/tl/nested-output/tools/call"
     assert json.loads(body)["arguments"]["base_branch"] == "main.sub-a.nested-a"
+
+
+def test_a_bind_that_fails_leaves_no_short_root() -> None:
+    """A short root is removed even when the socket could not be bound.
+
+    This is the leak the allocation site used to have: the root was created,
+    the socket directory made, and the server bound -- all before the block
+    that removed it -- so a failure at any of those three steps stranded an
+    ``exo-e2e-sock-*`` directory that no run's prefix-scoped sweep could ever
+    find. One such directory with an empty ``root/`` was observed outliving runs
+    on 2026-09-28.
+
+    The failure is forced rather than described: the socket path is already
+    bound when the second bind is attempted, which is the ``OSError`` a busy or
+    unusable path produces, and the assertion is that the root is gone after it.
+    """
+    created: Path | None = None
+    before = set(tmuxio.short_roots())
+
+    class UnixHTTPServer(socketserver.UnixStreamServer):
+        allow_reuse_address = True
+
+    with pytest.raises(OSError):
+        with tmuxio.temporary_short_root() as root:
+            created = root
+            socket_path = root / "root" / ".exo" / "server.sock"
+            socket_path.parent.mkdir(parents=True)
+            held = UnixHTTPServer(str(socket_path), http.server.BaseHTTPRequestHandler)
+            try:
+                UnixHTTPServer(str(socket_path), http.server.BaseHTTPRequestHandler)
+            finally:
+                held.server_close()
+
+    assert created is not None, "the short root was never created"
+    assert not created.exists(), f"a failed bind left a short root: {created}"
+    assert set(tmuxio.short_roots()) == before
 
 
 def test_leaf_records_file_pr_attempt_before_the_call(

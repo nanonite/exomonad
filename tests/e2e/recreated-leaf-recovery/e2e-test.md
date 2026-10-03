@@ -60,3 +60,16 @@ Teardown is not the only reclamation path. A SIGKILL, a host reboot, or a Docker
 restart takes the trap with it, so every run starts by sweeping for, and
 reclaiming, what an interrupted run left behind. The sweep is prefix-driven,
 because a run this harness has no record of is exactly what it has to reclaim.
+
+Short socket roots are swept too, under a different rule. A short root exists
+because `sun_path` is 107 bytes and `TMPDIR` is not the harness's to set, so it
+is created under `/tmp` with the socket prefix (`exo-e2e-sock-`) rather than
+with a run's directory prefix — which is exactly why a run-scoped sweep cannot
+see one, and why an abandoned one outlived runs on 2026-09-28. A short root is
+allocated through `tmuxio.temporary_short_root`, so the allocation sits inside
+the block that removes it and a failed `bind` cannot strand the directory. The
+sweep is the backstop for what a SIGKILL strands: it reclaims a root that has
+been untouched for `SHORT_ROOT_IDLE_SECONDS` with no process running in it, and
+leaves a younger one, or one something is still running in, to the run that owns
+it. A contract test fails the build if any harness allocates a short root
+outside that helper.
