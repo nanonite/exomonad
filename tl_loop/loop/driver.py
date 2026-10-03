@@ -12171,6 +12171,23 @@ def _is_aggregate_slice(slice_state: SliceState) -> bool:
     )
 
 
+def _event_review_head(event: EventEnvelope) -> str | None:
+    """Return the head a review is about, wherever the row carries it.
+
+    The watcher's ``pr.review`` row names the reviewed head twice: as the
+    envelope's own ``head_sha`` and, authoritatively, inside the event data
+    alongside ``review_head_sha``. Reading only the envelope field made the
+    repeated-verdict guard compare against a value the row never set, so a
+    review the slice already held was re-derived from scratch -- and a
+    re-derived approval demands findings a clean approval has none of.
+    """
+    for key in ("head_sha", "review_head_sha"):
+        value = event.data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return event.head_sha
+
+
 def _event_findings(event: EventEnvelope) -> list[dict[str, str]] | None:
     if "findings" not in event.data:
         return None
@@ -12235,7 +12252,7 @@ def _route_review_event(
     current = state.slices.get(slice_id)
     if current is None:
         raise TLLoopError(f"review event references unknown slice {slice_id!r}")
-    head_sha = event.head_sha
+    head_sha = _event_review_head(event)
     findings = _event_findings(event)
     if head_sha is None:
         raise TLLoopError(f"{event.event_type!r} findings have no head SHA")
