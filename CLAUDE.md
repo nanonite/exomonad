@@ -818,6 +818,20 @@ The instance is installed-locked with registration disabled, so the only way in
 is the container CLI, and the run's accounts and repository are created from
 code. Nothing is copied from a live forge and no account pre-exists.
 
+**A run that walks many cases owns a Forgejo per batch, not one for the whole
+run.** A matrix case pushes, reviews, and merges; one container asked to carry
+all of them is a single point of failure whose death turns every case after it
+into an identical provisioning refusal, so the report reads as dozens of
+boundary verdicts when there was one incident. `fj.provision(..., batch=)` puts
+the batch label in the compose project name (`forgejo-p2`), which keeps every
+instance separately attributable to its run and its batch and separately
+reclaimable by the prefix sweep, and `fj.release(scope, instance)` gives one back
+mid-run with the same `down -v` teardown, so a run can finish a batch without
+waiting for its end to hand the container back. Between cases the run
+re-checks the instance (`fj.assert_answering`) and reports a lost one against
+its compose project — naming the resource that died and how many cases were not
+attempted — instead of letting each later case blame its own provisioning.
+
 **A test owns everything it creates.** A run scope registers each resource
 *before* it is started, and one trap on `EXIT`/`INT`/`TERM` tears the run down
 whatever happens — including a failed assertion. Teardown is idempotent, because

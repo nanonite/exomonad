@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Chainlink #1057 real-server crash and restart acceptance.
 
-The run provisions everything it needs -- its own Forgejo, its own repository,
-database, directory, and tmux servers per case -- so it takes no operator input
-and needs no shared instance. ``--mode server`` is the only mode: every case
-runs against a real server this run started against a real forge this run
-brought up.
+The run provisions everything it needs -- its own Forgejo per pass, its own
+repository, database, directory, and tmux servers per case -- so it takes no
+operator input and needs no shared instance. ``--mode server`` is the only mode:
+every case runs against a real server this run started against a real forge this
+run brought up for that pass.
 """
 
 from __future__ import annotations

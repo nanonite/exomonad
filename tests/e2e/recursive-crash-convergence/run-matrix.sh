@@ -2,8 +2,9 @@
 # Crash/restart matrix (chainlink #1057): crash the controller at each of 14
 # effect boundaries and prove the resumed run converges.
 #
-# The run owns everything it touches: its own Forgejo under its own compose
-# project with an ephemeral port, one fresh repository per case on it, its own
+# The run owns everything it touches: its own Forgejo per pass, each under its
+# own compose project with an ephemeral port and released with `down -v` when
+# that pass ends, one fresh repository per case on that pass's instance, its own
 # Chainlink database inside each case's own directory, its own tmux server per
 # case, and the `exomonad serve` built from this worktree. Nothing outside this
 # worktree's build output and this run's temporary directory is read or

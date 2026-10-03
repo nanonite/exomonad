@@ -836,6 +836,159 @@ def _volumes() -> list[str]:
     return result.stdout.split()
 
 
+def test_a_released_forge_that_will_not_go_is_reported_against_its_own_project(
+    monkeypatch,
+):
+    """A forge given back mid-run and refused is named, recorded, and forgotten.
+
+    A run that brings one forge up per batch releases each one when its batch
+    ends, so a refusal to remove one is the run's failure to report -- and it has
+    to be reported against the project that refused, not folded into a general
+    cleanup complaint or dropped because the run has already moved on. The
+    project is also forgotten afterwards, or the run's teardown would be holding a
+    stale handle on something it gave back.
+
+    The scope is built here rather than taken from the ``scope`` fixture, because
+    this test is the one place that asserts the scope ends the run *owing* a
+    problem, which is exactly what the fixture refuses to let happen.
+    """
+    import secrets
+
+    scope = cl.RunScope(
+        run_id=f"ct{secrets.token_hex(3)}",
+        root=cl.make_root("/tmp", PREFIX),
+        prefix=PREFIX,
+    )
+    released = scope.track_compose(
+        f"{scope.session_prefix}forgejo-p2", Path("docker-compose.yml")
+    )
+    later = scope.track_compose(
+        f"{scope.session_prefix}forgejo-p3", Path("docker-compose.yml")
+    )
+    asked: list[str] = []
+
+    def fake_compose(project, _compose_file, *arguments):
+        asked.append(project)
+        if project == released:
+            return [
+                f"docker compose {' '.join(arguments)} failed for {project}: refused"
+            ]
+        return []
+
+    monkeypatch.setattr(cl, "_compose", fake_compose)
+
+    try:
+        problems = scope.release_compose(released)
+
+        assert problems == [
+            f"docker compose down -v --remove-orphans failed for {released}: refused"
+        ]
+        assert released not in scope.compose_projects
+        assert released not in scope.compose_files
+        # The refusal is the run's to fail on: it is recorded where teardown reads
+        # it from, so a caller that ignores the return value cannot lose it.
+        assert problems[0] in scope.teardown(), scope.problems
+        assert asked.count(released) == 1, "the run released the same project twice"
+        assert later in asked, "teardown gave back the project the run still owned"
+    finally:
+        shutil.rmtree(scope.root, ignore_errors=True)
+
+
+def test_release_refuses_a_project_this_run_never_tracked(scope):
+    """Releasing is ownership, so it only works on something already owned.
+
+    A batch label makes a project name this run could plausibly have used, and a
+    release that accepted any name with the right prefix would let a run tear
+    down an instance it never brought up -- which is the only way a compose
+    project carrying this harness's prefix can belong to somebody else.
+    """
+    with pytest.raises(cl.CleanupError):
+        scope.release_compose(f"{scope.session_prefix}forgejo-p9")
+    assert scope.teardown() == []
+
+
+def test_a_keeping_run_keeps_the_forge_it_was_asked_to_inspect(monkeypatch):
+    """``--keep`` keeps a batch's forge too: it is the state a failed case is read from.
+
+    A run that walks passes releases each batch's forge when the batch ends, so a
+    run asked to leave its state in place for inspection must not have the forge
+    of the failing pass taken away at exactly that moment. Teardown already
+    returns early for a keeping scope, so the release has to mean the same thing
+    -- or the flag would keep a run directory while destroying the instance its
+    cases were pushing to.
+    """
+    import secrets
+
+    scope = cl.RunScope(
+        run_id=f"ct{secrets.token_hex(3)}",
+        root=cl.make_root("/tmp", PREFIX),
+        prefix=PREFIX,
+        keep=True,
+    )
+    project = scope.track_compose(
+        f"{scope.session_prefix}forgejo-p2", Path("docker-compose.yml")
+    )
+    asked: list[str] = []
+
+    def fake_compose(name, _compose_file, *arguments):
+        asked.append(name)
+        return []
+
+    monkeypatch.setattr(cl, "_compose", fake_compose)
+    try:
+        assert scope.release_compose(project) == []
+        assert asked == [], "the run removed a forge it was told to keep"
+        assert scope.teardown() == []
+        assert asked == [], "teardown removed a forge the run was told to keep"
+    finally:
+        shutil.rmtree(scope.root, ignore_errors=True)
+
+
+def test_the_sweep_reclaims_a_forge_a_run_killed_mid_pass_left_behind() -> None:
+    """A Forgejo a run was killed holding is reclaimed by the next run's sweep.
+
+    A pass's forge is released when its pass ends, so a run killed mid-pass is
+    holding one that nothing in its own records will ever take back: the trap
+    never ran and the process is gone. The sweep has to reach it by name alone --
+    the run prefix, the batch suffix, and the project-scoped volume -- or an
+    interrupted matrix loses a container and its data on every pass it dies in.
+
+    The run-directory prefix is one that names no directory on purpose: the
+    contract under test is the forge, and a sweep broad enough to reach a
+    concurrent run's directories would prove nothing extra while reaching
+    sideways.
+    """
+    import secrets
+
+    import e2e_harness.forgejo_stack as fj
+
+    prefix = _unreachable_run_prefix("midpass")
+    project = f"{prefix}{secrets.token_hex(3)}forgejo-p2"
+    compose_file = _compose_file()
+    volume = f"{project}_forgejo-data"
+    left: tuple[bool, bool] | None = None
+    # The run is killed the moment its pass's forge is up: no teardown, no trap,
+    # and nothing left that knows this project exists.
+    try:
+        fj.up(project, compose_file)
+        fj.published_host(project, compose_file)
+        assert volume in _volumes(), "the forge was never really brought up"
+
+        assert (
+            cl.sweep_stale(prefix, compose_file, _unreachable_run_prefix("passdir"))
+            == []
+        )
+        # Read before the fallback teardown below: a `down -v` this test performs
+        # itself would reclaim the leftovers and prove nothing about the sweep.
+        left = (volume in _volumes(), _compose_projects_present(project))
+    finally:
+        fj.down(project, compose_file)
+
+    assert left == (False, False), (
+        f"the sweep left a killed run's forge behind: {left}"
+    )
+
+
 def _compose_projects_present(project: str) -> bool:
     result = subprocess.run(
         ["docker", "compose", "ls", "--all", "--format", "json"],

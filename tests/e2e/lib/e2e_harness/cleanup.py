@@ -177,6 +177,49 @@ class RunScope:
         self.compose_files[project] = compose_file
         return project
 
+    def release_compose(self, project: str) -> list[str]:
+        """Take one compose project back before the run ends, and forget it.
+
+        A run that provisions a forge per batch rather than one forge for the
+        whole run has to give each one back when its batch ends, so that a
+        container is not asked to carry a whole matrix and the next batch starts
+        against an instance this run did not inherit. This is the same
+        ``down -v --remove-orphans`` teardown performs, run at a moment the run
+        chooses, and it records its own problems so teardown reports them too:
+        a forge that will not go away is a leak whether the run noticed at the
+        end of its batch or at the end of itself.
+
+        A scope that is keeping its state -- an operator asked to inspect a
+        failed run -- keeps the project instead, because a released project is
+        part of the state being inspected.
+
+        Forgetting the project is the other half. ``teardown`` must not hold a
+        handle on something this run already gave back -- both because the handle
+        would be stale and because a released project is no longer a resource the
+        run is leaking if it survives: the prefix-driven sweep and leak check
+        still find one by name if it does.
+        """
+        compose_file = self.compose_files.get(project)
+        if compose_file is None:
+            raise CleanupError(
+                f"refusing to release compose project {project!r}: this run "
+                f"never tracked it, so it is not this run's to remove"
+            )
+        if self.keep:
+            # ``--keep`` means leave this run's state in place to be inspected,
+            # and a released project is exactly the state a failed batch is
+            # inspected through. Teardown already returns early for a keeping
+            # scope, so holding it here is consistent with that rather than a
+            # second, narrower idea of what keeping means.
+            self.compose_projects.discard(project)
+            del self.compose_files[project]
+            return []
+        problems = _compose(project, compose_file, "down", "-v", "--remove-orphans")
+        self.compose_projects.discard(project)
+        del self.compose_files[project]
+        self.problems.extend(problems)
+        return problems
+
     def teardown(self) -> list[str]:
         """Remove everything this run created. Safe to call more than once."""
         if self.released or self.keep:

@@ -59,23 +59,38 @@ input; `--mode server` is the only mode, and it names the only thing that has
 ever been true of the matrix — every case runs against a real server this run
 started, against a real Forgejo this run brought up.
 
-A run owns all of it, with one difference from the scenario above: a case
+A run owns all of it, with two differences from the scenario above: a case
 publishes branches named after the boundary it is exercising, so cases cannot
-share a repository.
+share a repository, and a pass gets its own Forgejo rather than sharing the
+run's.
 
 | Resource | How it is named |
 |----------|-----------------|
-| Forgejo | its own compose project from `tests/e2e/lib/forgejo/docker-compose.yml`, ephemeral host port, torn down with `down -v` |
-| repository | one fresh repository per case on that instance, named after the case |
+| Forgejo | one per pass: `exo-e2e-1057-<run id>forgejo-p<pass>`, its own compose project from `tests/e2e/lib/forgejo/docker-compose.yml`, ephemeral host port, released with `down -v` when that pass ends |
+| repository | one fresh repository per case on that pass's instance, named after the case |
 | Chainlink database | `chainlink init` inside the case's own directory, seeded with exactly the one issue the case's controller closes |
 | tmux | one server per case, on its own socket inside the case's directory, registered with the run scope |
 | directory | `mktemp -d` under `exo-e2e-1057-`, one subdirectory per case |
 
 `--repetitions 1` is a single diagnostic pass; the default of three is the
 acceptance configuration. `--keep` leaves the whole run in place for
-inspection, which is how a failed case is read. Each case prints one
+inspection, which is how a failed case is read, including that pass's Forgejo:
+a run that is keeping its state does not release its instances between passes,
+so the KEPT line names the compose projects still up. Each case prints one
 `PASS`/`FAIL` line, and the run exits non-zero if any case failed or anything
 leaked.
+
+Each pass gets its own Forgejo and releases it when the pass ends. One
+instance for the whole run made the container the thing that decided how much of
+the matrix ran: it carried all 28 cases of a pass, so on a loaded host a
+container the kernel killed turned every case after it into an identical
+`Connection refused` at repository creation, and the report read as twenty
+boundary verdicts instead of one incident. A per-pass instance bounds that to
+one pass, the next pass brings up its own, and a health check between cases
+names the instance that stopped answering and says how many cases of that pass
+were not attempted. A pass that cannot provision or that loses its instance is
+reported as a `FAIL FORGEJO` line naming the compose project; the run carries on
+with the next pass, and exits non-zero.
 
 A case never closes its own Chainlink issue on the way out. The row is the
 case's only durable record of the `issue_close` boundary, so a case that
@@ -87,7 +102,7 @@ controller resolves it; anywhere else is a file no escalation reaches.
 
 The run owns, isolates, and tears down everything it touches: a run reports
 `0 leaks, 0 cleanup problems, 0 sweep problems` and leaves nothing on the host.
-The **cases** are red, and none of the remaining causes is provisioning.
+The **cases** are red, and the remaining cause is the one below.
 
 Everything the harness previously got wrong is fixed, and each fix is a
 harness-side one:
@@ -101,7 +116,9 @@ harness-side one:
 | `No TL transition for TLRunning and PRFiled` | the seed published for children behind the barrier | only the released stage's children publish |
 | the seeded approval sat at `await_aggregate_review` forever | the repeated-verdict guard returned the state unchanged, dropping the aggregate lifecycle edge the held approval still owed the run | a recognised repeat binds the candidate it left behind |
 
-Two things still stop the cases converging, and neither is a harness change:
+Two things were diagnosed against a real run. The Forgejo one is fixed and now
+reads as a bounded, named failure; the other still stops the cases converging,
+and it is not a harness change:
 
 1. **Nothing on this Forgejo ever reports CI.** The seed posts a real approval
    and the watcher duly records it (`pr.review`, `verdict: approved`,
@@ -121,16 +138,23 @@ Two things still stop the cases converging, and neither is a harness change:
    the same PR -- a `pr.review` row carrying `kind: ci_triggered` and no verdict
    at all -- which reaches the review reducer and finds no findings to bind.
 
-2. **The run's own Forgejo dies part-way through.** Around the eighth case,
-   `POST /api/v1/user/repos` starts answering `Connection refused`. The matrix
-   holds one Forgejo for all 28 cases, so every later case fails at
-   provisioning rather than at its boundary. On a host with little free memory
-   the container is killed; the harness reports it, and teardown is still clean,
-   but the run cannot be trusted end to end.
+2. **The run's own Forgejo died part-way through a pass.** Around the eighth
+   case, `POST /api/v1/user/repos` began answering `Connection refused`; on a
+   host with little free memory the container was killed. Holding one Forgejo for
+   all 28 cases meant every case after that point failed at provisioning rather
+   than at its boundary, so a run that died at case 8 could not demonstrate a
+   28-case matrix at all. The matrix now brings one up per pass and releases it
+   when the pass ends, so the loss is bounded to that pass, the next pass
+   provisions its own, and the health check between cases reports one
+   `FAIL FORGEJO` naming the compose project instead of twenty identical case
+   failures. It still costs that pass its remaining cases, so a loaded host shows
+   up as an incomplete matrix rather than as a lost container.
 
-The walk does not stop at either: every failure is attributed to its own case
-and the remaining boundaries still run, so the report distinguishes a boundary
-that failed from one that was never attempted.
+The walk does not stop at a case failure: every failure is attributed to its own
+case and the remaining boundaries still run, so the report distinguishes a
+boundary that failed from one that was never attempted. A pass whose *instance*
+is gone is the one exception, and the `FAIL FORGEJO` line says which instance
+died and how many cases of that pass were not attempted.
 
 ## Topology note: same-order consuming children
 

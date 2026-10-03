@@ -46,16 +46,28 @@ Same-order sub-TLs run together, later orders remain barriers, and nested
 children publish only to their direct parent branches.
 
 Each case owns everything it can reach another case through. Its repository is
-created fresh on the run's own Forgejo, because a case publishes branches named
+created fresh on its pass's Forgejo, because a case publishes branches named
 after the boundary it is exercising (`main.sub-a`, `aggregate/<case>/<name>`)
 and a repository that already carries them rejects the next case's push as a
 non-fast-forward — the second case would then be testing the first case's
 leftovers. Its directory holds its own Chainlink database (`chainlink init`
 inside the case's own directory, seeded with exactly the disposable issue the
 case needs, so the operator's database is never read), its own tmux server and
-socket, and its own controller state. The run's teardown removes the compose
-project and its volume, which takes every case's repository with it; the run
-fails if anything it created outlived it.
+socket, and its own controller state. The pass's compose project and its volume
+are released with `down -v` when the pass ends, which takes every repository on
+that instance with them; the run fails if anything it created outlived it.
+
+Each pass owns its Forgejo, released with `down -v` when the pass ends rather
+than held for the whole run. One instance carrying all 28 cases made the
+container the resource that decided how much of the matrix ran: on a loaded host
+the container was killed around the eighth case, and every case after it failed
+at repository creation with the same connection refusal, so a run could not
+demonstrate a 28-case matrix. A per-pass instance bounds that loss to one pass,
+the next pass provisions its own, and a health check between cases reports the
+instance that stopped answering — naming its compose project and how many cases of
+that pass were not attempted — instead of attributing one incident to twenty
+boundaries. A pass that cannot provision is reported the same way, and the run
+continues with the next pass.
 
 The row the case seeds is the only durable record of its `issue_close`
 boundary, so a case never closes it on the way out: an issue left open is a

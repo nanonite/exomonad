@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -36,6 +37,7 @@ from boundaries import (
 )
 from crash_transport import CrashBoundaryTransport
 from evidence import (
+    REQUIRED_RECURSIVE_EFFECTS,
     AcceptanceError,
     assert_checkpoint_progression,
     assert_crash_record,
@@ -734,14 +736,19 @@ def test_nested_aggregate_assertion_ignores_historical_pr_heads(
     )
 
 
-def _instance(root: Path, repo: str, base_url: str = "http://forgejo") -> fj.Instance:
+def _instance(
+    root: Path,
+    repo: str,
+    base_url: str = "http://forgejo",
+    project: str = "exo-e2e-1057-abcdef12forgejo",
+) -> fj.Instance:
     """Return a provisioned-instance record without provisioning one.
 
     ``Instance`` is a frozen record of what a run brought up, so a test can name
     a forge the harness never started and exercise every reader that takes one.
     """
     return fj.Instance(
-        project="exo-e2e-1057-abcdef12forgejo",
+        project=project,
         compose_file=root / "docker-compose.yml",
         base_url=base_url,
         host=base_url.removeprefix("http://"),
@@ -890,16 +897,219 @@ def test_a_seeded_agents_invocation_is_one_function_of_its_name() -> None:
 
 
 def test_a_case_failure_never_aborts_the_walk() -> None:
-    """One case's verdict must not be the end of the matrix.
+    """One case's verdict must not be the end of its pass, or of the matrix.
 
     An exception the harness does not recognise is still one case's result.
     Stopping the walk there would report every later boundary as untried when it
     was merely unattempted, which is the difference between a finding and a gap
-    in the evidence.
+    in the evidence. A pass whose *instance* is gone is the one exception, and
+    that is asserted on its own, below.
     """
-    source = inspect.getsource(runner._walk)
+    source = inspect.getsource(runner._walk_pass)
     assert "except BaseException" in source
     assert "except ACCEPTANCE_FAILURES" not in source
+
+
+# --------------------------------------------------------------------------
+# One Forgejo per pass
+# --------------------------------------------------------------------------
+
+
+def _walk_over_fakes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    repetitions: int = 1,
+    answers: int | None = None,
+    unprovisionable: tuple[str, ...] = (),
+    failing_case: int | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Walk the matrix over fakes and return the report with what the run did.
+
+    ``answers`` is how many of the per-case health checks answer before the
+    instance stops answering, ``unprovisionable`` names pass batches whose
+    instance cannot be brought up, and ``failing_case`` is the 1-based position
+    of a case whose execution raises. Everything else is the real walk: the same
+    ordering, the same reporting, and the same release of each pass's instance.
+    """
+    calls: dict[str, Any] = {"provisions": [], "releases": [], "cases": [], "asked": 0}
+    scope = cl.RunScope(
+        run_id=f"ct{os.getpid()}",
+        root=cl.make_root(cl.TEMP_ROOT, runner.MATRIX_PREFIX),
+        prefix=runner.MATRIX_PREFIX,
+    )
+
+    def fake_provision(_scope, _project_root, run_id, batch=None):
+        if batch in unprovisionable:
+            raise fj.ForgejoError(f"batch {batch} brought up no instance")
+        calls["provisions"].append((run_id, batch))
+        port = 3000 + len(calls["provisions"])
+        return _instance(
+            tmp_path,
+            repo=f"{run_id}-{batch}-repo",
+            base_url=f"http://127.0.0.1:{port}",
+            project=f"{runner.MATRIX_PREFIX}{run_id}forgejo-{batch}",
+        )
+
+    def fake_release(_scope, instance):
+        calls["releases"].append(instance.project)
+        return []
+
+    def fake_answering(instance):
+        calls["asked"] += 1
+        if answers is not None and calls["asked"] > answers:
+            raise fj.ForgejoError(
+                f"the run's Forgejo {instance.project!r} at {instance.host} "
+                f"stopped answering"
+            )
+
+    def fake_run_case(_scope, instance, _run_root, repetition, boundary):
+        case = runner._case_name(repetition, boundary)
+        calls["cases"].append((repetition, case, instance.project))
+        if failing_case == len(calls["cases"]):
+            raise RuntimeError(f"case {boundary.name} did not converge")
+        return {
+            "case": case,
+            "boundary": boundary.name,
+            # Every effect family the run requires, so a walk over fakes exercises
+            # the ordering and the reporting rather than the effect tally.
+            "journal_operations": dict.fromkeys(
+                {*REQUIRED_RECURSIVE_EFFECTS, "spawn_leaf"}, 1
+            ),
+        }
+
+    monkeypatch.setattr(runner.fj, "provision", fake_provision)
+    monkeypatch.setattr(runner.fj, "release", fake_release)
+    monkeypatch.setattr(runner.fj, "assert_answering", fake_answering)
+    monkeypatch.setattr(runner, "_run_case", fake_run_case)
+    report = runner.MatrixReport()
+    try:
+        runner._walk(scope, tmp_path, repetitions, "abcdef12", report)
+    finally:
+        shutil.rmtree(scope.root, ignore_errors=True)
+    return report, calls
+
+
+def _instance_per_pass(calls: dict[str, Any]) -> dict[int, str]:
+    """Return the one compose project each pass's cases all ran against."""
+    projects: dict[int, set[str]] = {}
+    for repetition, _case, project in calls["cases"]:
+        projects.setdefault(repetition, set()).add(project)
+    return {
+        repetition: seen.pop() if len(seen) == 1 else f"MIXED: {sorted(seen)}"
+        for repetition, seen in projects.items()
+    }
+
+
+def test_each_pass_brings_up_and_releases_its_own_forge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One instance per pass, each released when its pass ends.
+
+    One instance for the whole run is what makes the container the failure that
+    takes down every case that has not run yet: 28 cases of a pass push, review,
+    and merge through it, and a run of three passes asks the same container to
+    carry all of them. An instance per pass bounds the loss to one pass and gives
+    the next pass a fresh one, and releasing each with ``down -v`` is what keeps a
+    run from holding one container open from its first case to its last.
+    """
+    report, calls = _walk_over_fakes(monkeypatch, tmp_path, repetitions=2)
+
+    assert [batch for _run_id, batch in calls["provisions"]] == ["p1", "p2"]
+    assert {run_id for run_id, _batch in calls["provisions"]} == {"abcdef12"}, (
+        "accounts and repositories are still named from the run id, so every "
+        "batch is attributable to this run"
+    )
+    by_pass = _instance_per_pass(calls)
+    assert set(by_pass) == {1, 2}
+    assert by_pass[1] != by_pass[2], "two passes shared one instance"
+    assert len(calls["cases"]) == 2 * len(CRASH_BOUNDARIES)
+    assert calls["releases"] == [by_pass[1], by_pass[2]], (
+        "each pass gave its instance back, in order, before the next brought one up"
+    )
+    assert [entry["compose_project"] for entry in report.evidence["forges"]] == [
+        by_pass[1],
+        by_pass[2],
+    ]
+    assert report.passed, report.failures
+
+
+def test_a_pass_that_lost_its_forge_reports_the_forge_and_not_twenty_cases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dead instance is one incident, named, instead of every remaining case.
+
+    With one instance for the whole run, a container the host killed turned every
+    case after it into an identical ``Connection refused`` at repository creation,
+    so the report read as twenty boundary verdicts when there had been one
+    incident. The health check between cases names the resource that died, and
+    the pass it names is the one that stops: the passes are independent, so the
+    next one brings up an instance nothing else has been pushing to, while
+    continuing inside the dead one would produce nothing but the same refusal
+    again.
+    """
+    report, calls = _walk_over_fakes(monkeypatch, tmp_path, answers=2)
+    project = _instance_per_pass(calls)[1]
+
+    assert len(calls["cases"]) == 2, "the walk continued past a dead instance"
+    assert report.failures == [], report.failures
+    assert len(report.forge_problems) == 1, report.forge_problems
+    problem = report.forge_problems[0]
+    assert "stopped answering" in problem, problem
+    assert project in problem, problem
+    assert (
+        f"{len(CRASH_BOUNDARIES) - 3} further case(s) of this pass were not attempted"
+        in problem
+    ), problem
+    assert calls["releases"] == [project], (
+        "a pass whose instance died still has to give that instance back"
+    )
+    assert not report.passed
+
+
+def test_a_pass_that_brings_up_no_instance_does_not_end_the_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pass that never got a forge is one problem, and the run continues.
+
+    The passes are independent, so the next pass provisioning its own instance is
+    exactly the case this change exists for. Reporting the pass and moving on
+    keeps a provisioning failure from reading as the end of the matrix.
+    """
+    report, calls = _walk_over_fakes(
+        monkeypatch, tmp_path, repetitions=2, unprovisionable=("p1",)
+    )
+
+    assert {batch for _run_id, batch in calls["provisions"]} == {"p2"}
+    assert len(calls["cases"]) == len(CRASH_BOUNDARIES)
+    assert {repetition for repetition, _n, _p in calls["cases"]} == {2}
+    assert len(report.forge_problems) == 1, report.forge_problems
+    assert "pass 1 has no Forgejo" in report.forge_problems[0]
+    assert f"{len(CRASH_BOUNDARIES)} cases were not attempted" in (
+        report.forge_problems[0]
+    )
+    assert report.failures == []
+    assert calls["releases"] == [_instance_per_pass(calls)[2]]
+    assert not report.passed
+
+
+def test_a_pass_releases_its_forge_after_a_case_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failing case does not cost the pass its instance.
+
+    The release sits in the walk's ``finally`` rather than at the end of the
+    loop, because a case that raises is the ordinary case -- the whole reason the
+    walk continues -- and a release placed after the loop would leave every pass
+    that hit a failing case holding its container until the run ended.
+    """
+    report, calls = _walk_over_fakes(monkeypatch, tmp_path, failing_case=2)
+
+    assert len(report.failures) == 1, report.failures
+    assert report.failures[0].startswith(calls["cases"][1][1]), report.failures
+    assert len(calls["cases"]) == len(CRASH_BOUNDARIES)
+    assert calls["releases"] == [_instance_per_pass(calls)[1]]
+    assert not report.passed
 
 
 def test_the_seed_only_emits_controller_events_the_shipped_contract_admits() -> None:

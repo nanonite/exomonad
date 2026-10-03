@@ -11,6 +11,16 @@ removed with its project-scoped volume.
 The host port is ephemeral and discovered with ``docker compose port``, so two
 runs never collide and a previous run's database can never answer this run's
 API calls.
+
+A run that walks many cases can bring one up per batch rather than one for the
+whole run. The batch label goes into the compose project name, so each batch's
+instance is separately attributable and separately reclaimable, and
+:func:`release` gives it back with the same ``down -v`` teardown the run would
+have performed at its end. One container asked to carry a whole matrix is a
+resource whose failure then takes down every case that has not run yet; a
+container per batch bounds that, and the run's health re-check names the batch
+whose instance stopped answering instead of letting every later case report the
+same connection refusal as its own provisioning fault.
 """
 
 from __future__ import annotations
@@ -39,6 +49,22 @@ CONTAINER_PORT = 3000
 
 #: Bounded wait for the instance to report a passing health check.
 HEALTH_TIMEOUT_SECONDS = 120.0
+
+#: Bounded wait when re-checking an instance a run is already using.
+#:
+#: This is the health of a forge the run has been talking to, not a fresh one
+#: starting up, so the window is far shorter than :data:`HEALTH_TIMEOUT_SECONDS`.
+#: It is not zero-threshold either: an instance that is merely slow under load
+#: must not cost the run a whole pass of cases, which is what an impatient probe
+#: would do. The wait is paid at most once per instance, because the first
+#: refusal abandons that batch, so a generous window here costs one pause rather
+#: than a case at a time.
+ANSWERING_TIMEOUT_SECONDS = 30.0
+
+#: The compose-project suffix a batch label contributes to a project name. Kept
+#: short so ``<prefix><run id>forgejo<batch>`` stays a name Docker accepts and a
+#: name the prefix sweep still matches.
+BATCH_LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,16}")
 
 #: Bounded wait for the published port to be discoverable.
 PORT_TIMEOUT_SECONDS = 60.0
@@ -172,6 +198,19 @@ def down(project: str, compose_file: Path) -> list[str]:
     return cl._compose(project, compose_file, "down", "-v", "--remove-orphans")
 
 
+def release(scope: cl.RunScope, instance: Instance) -> list[str]:
+    """Give one instance back mid-run and stop owning it.
+
+    A run that provisions a forge per batch releases each one when its batch
+    ends, so no single container carries a whole matrix and a later batch starts
+    against an instance nothing else has been pushing to. Releasing through the
+    scope is what keeps the ownership honest in both directions: the project is
+    removed now, forgotten now, and a refusal to remove it is recorded as the run
+    owes a cleanup problem rather than being dropped on the floor.
+    """
+    return scope.release_compose(instance.project)
+
+
 def published_host(project: str, compose_file: Path) -> str:
     """Read back the ephemeral host and port the instance was published on.
 
@@ -232,22 +271,50 @@ def api(
     return json.loads(text)
 
 
-def wait_healthy(instance: Instance) -> dict[str, Any]:
-    """Block until the run's instance reports a passing health check."""
-    deadline = time.monotonic() + HEALTH_TIMEOUT_SECONDS
+def _poll_health(instance: Instance, timeout: float, complaint: str) -> dict[str, Any]:
+    """Poll the health endpoint until it passes, then return what it reported."""
+    deadline = time.monotonic() + timeout
     last: Any = None
     while time.monotonic() < deadline:
         try:
             report = api("GET", f"{instance.base_url}/api/healthz")
         except ForgejoError as error:
             last = error
-            time.sleep(0.5)
-            continue
-        if isinstance(report, Mapping) and report.get("status") == "pass":
-            return dict(report)
-        last = report
+        else:
+            if isinstance(report, Mapping) and report.get("status") == "pass":
+                return dict(report)
+            last = report
         time.sleep(0.5)
-    raise ForgejoError(f"{instance.base_url} never became healthy: {last!r}")
+    raise ForgejoError(f"{complaint}: {last!r}")
+
+
+def wait_healthy(instance: Instance) -> dict[str, Any]:
+    """Block until the run's instance reports a passing health check."""
+    return _poll_health(
+        instance,
+        HEALTH_TIMEOUT_SECONDS,
+        f"{instance.base_url} never became healthy",
+    )
+
+
+def assert_answering(instance: Instance) -> dict[str, Any]:
+    """Fail, naming the instance, when an instance the run is using stops answering.
+
+    A run that provisions one forge for many cases has to be able to say which of
+    them the forge died in front of. Without this, a container killed by the host
+    turns every later case into an identical connection-refused provisioning
+    failure and the report reads as twenty boundary verdicts when there was one
+    incident. The failure here names the compose project and the address, so the
+    dead resource is the thing reported rather than each case that noticed.
+    """
+    return _poll_health(
+        instance,
+        ANSWERING_TIMEOUT_SECONDS,
+        (
+            f"the run's Forgejo {instance.project!r} at {instance.host} "
+            f"stopped answering"
+        ),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -358,17 +425,40 @@ def _create_account(instance: Instance, username: str) -> Account:
     return Account(username=username, token=_token_from(output, "account creation"))
 
 
-def provision(scope: cl.RunScope, project_root: Path, run_id: str) -> Instance:
+def compose_project_name(scope: cl.RunScope, batch: str | None = None) -> str:
+    """Return the compose project name one instance of this run is brought up under.
+
+    The name is the run's own prefix, so the prefix-driven sweep and the leak
+    check both recognise it, and ``batch`` distinguishes the instances of a run
+    that brings one up per batch. Without it two batches of one run would collide
+    on a name, and the second would silently reuse the first's container -- the
+    shared-instance outcome per-test ownership exists to prevent.
+    """
+    suffix = "" if batch is None else f"-{batch}"
+    return f"{scope.session_prefix}forgejo{suffix}"
+
+
+def provision(
+    scope: cl.RunScope, project_root: Path, run_id: str, batch: str | None = None
+) -> Instance:
     """Bring up and fully provision this run's own Forgejo.
 
     ``scope`` is what makes the instance disposable: the compose project is
     registered with it, so the run's teardown removes the instance and its
     volume even when a T-item fails partway through.
+
+    ``batch`` names which batch of the run this instance serves, and gives each
+    batch its own compose project so a run can give one back mid-run with
+    :func:`release` instead of asking one container to carry every case. The
+    accounts and repository are still named from ``run_id``: each batch has its
+    own instance, so nothing collides with the batches before or after it.
     """
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,40}", run_id):
         raise ForgejoError(f"run id is not a safe compose project name: {run_id!r}")
+    if batch is not None and not BATCH_LABEL.fullmatch(batch):
+        raise ForgejoError(f"batch label is not a safe compose name suffix: {batch!r}")
     compose_file = template_path(project_root)
-    project = scope.track_compose(f"{scope.session_prefix}forgejo", compose_file)
+    project = scope.track_compose(compose_project_name(scope, batch), compose_file)
     up(project, compose_file)
     host = published_host(project, compose_file)
     instance = Instance(
@@ -412,6 +502,10 @@ def create_repository(instance: Instance, name: str) -> Instance:
     be testing the previous case's leftovers instead of its own. One repository
     per case is far cheaper than one Forgejo per case and leaves no shared
     remote at all.
+
+    The instance is the one the caller was given -- a run's current batch
+    instance -- so a repository name only has to be unique inside it, and the
+    ``down -v`` that releases that batch takes every repository on it.
 
     The result is the same instance with the new repository selected, so
     ``repository_api_url()`` and ``clone_url()`` address it while the accounts,
@@ -477,15 +571,19 @@ def _add_collaborator(instance: Instance) -> None:
 
 
 __all__ = [
+    "ANSWERING_TIMEOUT_SECONDS",
     "COMPOSE_TEMPLATE",
     "Account",
     "ForgejoError",
     "Instance",
     "api",
+    "assert_answering",
+    "compose_project_name",
     "create_repository",
     "down",
     "provision",
     "published_host",
+    "release",
     "template_path",
     "up",
     "wait_healthy",

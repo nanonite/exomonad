@@ -1,21 +1,29 @@
 """Run the real-server recursive crash/restart acceptance matrix.
 
-The run owns everything it touches. It provisions one Forgejo from the shared
-template at ``tests/e2e/lib/forgejo/docker-compose.yml`` under its own compose
-project, creates one fresh repository per case on that instance, seeds a fresh
-Chainlink database inside each case's own directory, and registers every tmux
-server and server process it starts with its run scope. Nothing outside this
-worktree's build output and this run's own temporary directory is read or
-written, and no operator-supplied forge, token, or repository is required or
-consulted.
+The run owns everything it touches. For each pass it provisions one Forgejo from
+the shared template at ``tests/e2e/lib/forgejo/docker-compose.yml`` under its own
+compose project and releases it when that pass ends, creates one fresh
+repository per case on that instance, seeds a fresh Chainlink database inside
+each case's own directory, and registers every tmux server and server process it
+starts with its run scope. Nothing outside this worktree's build output and this
+run's own temporary directory is read or written, and no operator-supplied forge,
+token, or repository is required or consulted.
 
 Each case is independent by construction. Its own repository means its own
 branch namespace, so a case cannot observe another case's published branches
 and cannot have its own fixture pushes rejected as non-fast-forwards against
 them, and its own directory means its own tmux server, socket, database, and
-ledger. There is therefore nothing left for a case to clean up: teardown
-removes the compose project and its volume, and every other resource lives
-inside the run directory.
+ledger. There is therefore nothing left for a case to clean up: the pass's
+compose project and its volume take every repository on that instance with them,
+and every other resource lives inside the run directory.
+
+Each pass is independent for the same reason. One Forgejo for a whole run means
+one container carries every case of every pass, and on a loaded host the
+container is the thing that dies -- taking with it every case that had not run
+yet, each of which then reports an identical provisioning refusal of its own. A
+forge per pass bounds that loss to one pass, the next pass brings up its own, and
+a health check between cases names the instance that stopped answering instead of
+letting the report blame the boundaries.
 
 A case is a crash: the controller runs in a child process whose transport dies
 at one named effect boundary, and the resumed run picks the next action from
@@ -111,6 +119,10 @@ class MatrixReport:
     leaks: list[str] = field(default_factory=list)
     cleanup_problems: list[str] = field(default_factory=list)
     sweep_problems: list[str] = field(default_factory=list)
+    #: Passes abandoned because their own Forgejo stopped answering. Reported
+    #: against the instance rather than duplicated onto every case after it, so
+    #: one dead container reads as one incident.
+    forge_problems: list[str] = field(default_factory=list)
     effect_problem: str | None = None
     operation_totals: dict[str, int] = field(default_factory=dict)
     evidence: dict[str, Any] = field(default_factory=dict)
@@ -123,6 +135,7 @@ class MatrixReport:
             or self.leaks
             or self.cleanup_problems
             or self.sweep_problems
+            or self.forge_problems
         )
 
     def emit(self) -> None:
@@ -134,6 +147,8 @@ class MatrixReport:
             print(f"FAIL CLEANUP {problem}")
         for problem in self.sweep_problems:
             print(f"FAIL SWEEP {problem}")
+        for problem in self.forge_problems:
+            print(f"FAIL FORGEJO {problem}")
         for leak in self.leaks:
             print(f"FAIL LEAK {leak}")
         if self.effect_problem:
@@ -145,7 +160,8 @@ class MatrixReport:
             f"{verdict} recursive-crash-convergence matrix: {len(self.cases)} "
             f"cases passed, {len(self.failures)} failed, {len(self.leaks)} leaks, "
             f"{len(self.cleanup_problems)} cleanup problems, "
-            f"{len(self.sweep_problems)} sweep problems"
+            f"{len(self.sweep_problems)} sweep problems, "
+            f"{len(self.forge_problems)} forge problems"
         )
 
 
@@ -718,9 +734,9 @@ def run_matrix(
     """Run every boundary of the matrix and return the run's verdict.
 
     The run is self-contained: it sweeps what an interrupted predecessor left,
-    provisions its own forge, gives every case its own repository, database,
-    directory, and server, and finally tears all of that down and fails if any
-    of it outlived the run.
+    provisions its own forge for each pass, gives every case its own repository,
+    database, directory, and server, and finally tears all of that down and fails
+    if any of it outlived the run.
     """
     validate_matrix()
     if repetitions <= 0:
@@ -734,7 +750,6 @@ def run_matrix(
     report.evidence["run_id"] = identifier
     report.evidence["run_directory"] = str(run_root)
     report.evidence["repetitions"] = repetitions
-    instance: fj.Instance | None = None
 
     cl.install_trap(scope)
     try:
@@ -743,14 +758,7 @@ def run_matrix(
         )
         report.sweep_problems = swept
         report.evidence["swept_before_run"] = swept
-        instance = fj.provision(scope, PROJECT_ROOT, identifier)
-        report.evidence["forgejo"] = {
-            "compose_project": instance.project,
-            "discovered_host": instance.host,
-            "admin": instance.admin_username,
-            "owner": instance.owner,
-        }
-        _walk(scope, instance, run_root, repetitions, report)
+        _walk(scope, run_root, repetitions, identifier, report)
     except ACCEPTANCE_FAILURES as error:
         report.failures.append(f"setup: {type(error).__name__}: {error}")
         print(f"FAIL SETUP {report.failures[-1]}", flush=True)
@@ -759,7 +767,7 @@ def run_matrix(
         print(f"FAIL HARNESS {report.failures[-1]}", flush=True)
     finally:
         # The report is owed even when teardown misbehaves, so nothing here may
-        # raise. Teardown removes the compose project and its volume, which is
+        # raise. Teardown removes each compose project and its volume, which is
         # what takes every case's repository with it, so there is no per-record
         # cleanup left to fail.
         try:
@@ -772,50 +780,192 @@ def run_matrix(
             report.leaks = [f"leak check raised: {type(error).__name__}: {error}"]
         if keep:
             print(
-                f"KEPT {run_root} (compose project "
-                f"{instance.project if instance else 'none'})",
+                f"KEPT {run_root} (per-pass compose projects still up: "
+                f"{', '.join(_forge_projects(report)) or 'none'})",
                 flush=True,
             )
     return report
 
 
+def _forge_projects(report: MatrixReport) -> list[str]:
+    """Return the compose projects this run brought up, one per pass.
+
+    Read with a default rather than by key: a run that never reached its first
+    pass -- or that kept its state for inspection with nothing provisioned --
+    still owes the operator that line.
+    """
+    forges = report.evidence.get("forges", ())
+    return [str(entry["compose_project"]) for entry in forges]
+
+
 def _walk(
     scope: cl.RunScope,
-    instance: fj.Instance,
     run_root: Path,
     repetitions: int,
+    run_id: str,
     report: MatrixReport,
 ) -> None:
-    """Run every case of every pass, continuing past a failing one.
+    """Walk every pass, each against a Forgejo this run brought up for it.
 
-    One failing case must not hide the verdict of the ones after it: the cases
-    are independent, so every case is attempted, each reports its own verdict,
-    and the run's status is the conjunction of all of them.
+    One Forgejo per pass, released with ``down -v`` when the pass ends, rather
+    than one instance for all of them. A pass walks every boundary before and after
+    each operation -- 28 cases that each push, review, and merge against the same
+    container -- and asking one instance to carry every pass of a run is what made
+    a container killed by a loaded host take down the cases that had not run yet:
+    the run then read as twenty connection-refused boundary verdicts instead of one
+    dead resource. With a per-pass instance the loss is bounded to a pass, the next
+    pass provisions its own, and the run says which instance died.
+
+    A failing case still does not end its pass: the cases are independent, so
+    every case is attempted, each reports its own verdict, and the run's status
+    is the conjunction of all of them. A pass whose *instance* is gone is the one
+    exception, because every remaining case in it would fail identically for a
+    reason that is not about the boundary it is exercising.
     """
     totals: dict[str, int] = {}
     for repetition in range(1, repetitions + 1):
-        for boundary in CRASH_BOUNDARIES:
-            failure = _case_name(repetition, boundary)
-            try:
-                result = _run_case(scope, instance, run_root, repetition, boundary)
-            except BaseException as error:  # noqa: BLE001 - one case, then on
-                # Every failure is attributed to the case it happened in and the
-                # walk continues: an exception the harness does not recognise is
-                # still one case's verdict, and stopping there would report every
-                # later boundary as untried when it was merely unattempted.
-                report.failures.append(f"{failure}: {type(error).__name__}: {error}")
-                print(f"FAIL {failure} {report.failures[-1][:2000]}", flush=True)
-                continue
-            report.cases.append(result)
-            for operation, count in result["journal_operations"].items():
-                totals[operation] = totals.get(operation, 0) + count
-            print(
-                f"PASS {result['case']} "
-                f"{json.dumps(result, sort_keys=True, default=str)[:2000]}",
-                flush=True,
-            )
+        instance = _forge_for_pass(scope, run_id, repetition, report)
+        if instance is None:
+            continue
+        try:
+            _walk_pass(scope, instance, run_root, repetition, report, totals)
+        finally:
+            _release_pass(scope, instance, repetition)
     report.operation_totals = dict(sorted(totals.items()))
     try:
         assert_required_effects(report.operation_totals)
     except AcceptanceError as error:
         report.effect_problem = str(error)
+
+
+def _forge_for_pass(
+    scope: cl.RunScope,
+    run_id: str,
+    repetition: int,
+    report: MatrixReport,
+) -> fj.Instance | None:
+    """Bring up this pass's own Forgejo and record what it is.
+
+    A pass whose instance cannot be provisioned reports against the pass and
+    returns nothing, so the walk moves on to the next one instead of ending the
+    run: the passes are independent, and a pass that never got a forge has
+    attempted no case that could have succeeded.
+    """
+    batch = _batch_label(repetition)
+    try:
+        instance = fj.provision(scope, PROJECT_ROOT, run_id, batch=batch)
+    except fj.ForgejoError as error:
+        report.forge_problems.append(
+            f"pass {repetition} has no Forgejo: {type(error).__name__}: {error}; "
+            f"its {len(CRASH_BOUNDARIES)} cases were not attempted"
+        )
+        print(f"FAIL FORGEJO {report.forge_problems[-1][:2000]}", flush=True)
+        return None
+    report.evidence.setdefault("forges", []).append(
+        {
+            "pass": repetition,
+            "compose_project": instance.project,
+            "discovered_host": instance.host,
+            "admin": instance.admin_username,
+            "owner": instance.owner,
+        }
+    )
+    return instance
+
+
+def _batch_label(repetition: int) -> str:
+    """Return the compose-name suffix that distinguishes one pass's instance.
+
+    The label is the pass number, so the compose project names both the run and
+    the pass: ``exo-e2e-1057-<run id>forgejo-p2`` says which run brought it up
+    and which pass it served, which is what makes a leftover from a run killed
+    mid-pass attributable after the fact.
+    """
+    return f"p{repetition}"
+
+
+def _release_pass(
+    scope: cl.RunScope,
+    instance: fj.Instance,
+    repetition: int,
+) -> None:
+    """Give this pass's instance back, and say so if it will not go.
+
+    The instance is released whether the pass passed, failed, or was abandoned,
+    because the run scope still owns it until something removes it. A refusal is
+    printed here rather than appended to this report: ``fj.release`` already
+    recorded it on the scope, so teardown reports it against the project it
+    names, and a refused release that appeared under two headings would read as
+    two failures. Raising is not an option either -- the run still owes the report
+    for every pass it walked, and a teardown that raised here would replace the
+    verdict of the pass that just finished.
+    """
+    problems = fj.release(scope, instance)
+    if problems:
+        print(
+            f"FAIL FORGEJO pass {repetition} left its Forgejo "
+            f"{instance.project!r} behind: {'; '.join(problems)[:1500]}",
+            flush=True,
+        )
+
+
+def _walk_pass(
+    scope: cl.RunScope,
+    instance: fj.Instance,
+    run_root: Path,
+    repetition: int,
+    report: MatrixReport,
+    totals: dict[str, int],
+) -> None:
+    """Run every case of one pass against that pass's own instance."""
+    for index, boundary in enumerate(CRASH_BOUNDARIES):
+        case = _case_name(repetition, boundary)
+        unattempted = len(CRASH_BOUNDARIES) - index - 1
+        if not _forge_answers(instance, case, unattempted, repetition, report):
+            return
+        try:
+            result = _run_case(scope, instance, run_root, repetition, boundary)
+        except BaseException as error:  # noqa: BLE001 - one case, then on
+            # Every failure is attributed to the case it happened in and the walk
+            # continues: an exception the harness does not recognise is still one
+            # case's verdict, and stopping there would report every later boundary
+            # as untried when it was merely unattempted.
+            report.failures.append(f"{case}: {type(error).__name__}: {error}")
+            print(f"FAIL {case} {report.failures[-1][:2000]}", flush=True)
+            continue
+        report.cases.append(result)
+        for operation, count in result["journal_operations"].items():
+            totals[operation] = totals.get(operation, 0) + count
+        print(
+            f"PASS {result['case']} "
+            f"{json.dumps(result, sort_keys=True, default=str)[:2000]}",
+            flush=True,
+        )
+
+
+def _forge_answers(
+    instance: fj.Instance,
+    case: str,
+    unattempted: int,
+    repetition: int,
+    report: MatrixReport,
+) -> bool:
+    """Return whether this pass's instance is still there, naming it if not.
+
+    The check is between cases, because that is where it can change the report:
+    the instance was answering when the previous case finished, so a refusal here
+    is one incident rather than the fault of the case that happened to come next.
+    The failure names the compose project and the host, and says how many cases
+    the pass did not attempt, so a lost instance cannot be read as twenty
+    boundary verdicts.
+    """
+    try:
+        fj.assert_answering(instance)
+    except fj.ForgejoError as error:
+        report.forge_problems.append(
+            f"pass {repetition} abandoned before {case}: {error}; "
+            f"{unattempted} further case(s) of this pass were not attempted"
+        )
+        print(f"FAIL FORGEJO {report.forge_problems[-1][:2000]}", flush=True)
+        return False
+    return True
