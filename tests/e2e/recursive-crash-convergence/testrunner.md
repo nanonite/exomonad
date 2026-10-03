@@ -99,21 +99,27 @@ harness-side one:
 | `unable to open database file: <repo>/.chainlink/issues.db` | the database was not where the controller resolves it | anchored at `<repo>/.chainlink` |
 | `refusing watcher publication evidence: provenance mismatch` | the seed filed the PR over REST, so `published-heads.json` stayed empty | the seed publishes through the shipped `file_pr`, as the owning child |
 | `No TL transition for TLRunning and PRFiled` | the seed published for children behind the barrier | only the released stage's children publish |
+| the seeded approval sat at `await_aggregate_review` forever | the repeated-verdict guard returned the state unchanged, dropping the aggregate lifecycle edge the held approval still owed the run | a recognised repeat binds the candidate it left behind |
 
 Two things still stop the cases converging, and neither is a harness change:
 
-1. **A seeded approval is refused on findings.** The seed posts a real approval
-   on the forge with a durable review id and records that review on the slice,
+1. **Nothing on this Forgejo ever reports CI.** The seed posts a real approval
    and the watcher duly records it (`pr.review`, `verdict: approved`,
-   `review_id` matching). The controller still logs `ignoring review without
-   binding findings`, because the repeated-verdict guard
-   (`driver._route_review_event`) compares the envelope's own `head_sha` against
-   the slice's `reviewed_head` while the watcher's head lives in `data`. The
-   review is therefore re-derived from scratch instead of recognised as the
-   repeat it is, and a re-derived approval needs findings the fixture has no
-   honest source for. `review-*` and `spawn-*` stop at
-   `await_aggregate_review`; `publication` and `repair` never write their crash
-   marker.
+   `review_id` matching), and the approval now binds: the aggregate candidate
+   leaves `aggregate_pr_open` for `ready_for_integration`. The next action is
+   `validate_integration`, which asks the forge for a commit status on the
+   aggregate head. This run brings up a Forgejo and nothing else -- no Actions
+   runner is registered against it -- so every head reads `ci_status: unknown`,
+   the integration evidence is never bound, `validate_integration` is proposed
+   twice with no durable state advancing, and the controller parks the slice on
+   `repeated_state_version_action` and fails the run. The ordered-recursive probe
+   passes the same field from its mock forge (`ci_status: success`), which is
+   why the discrepancy is only visible against a real instance.
+
+   One log line is a false lead here: `ignoring review without binding findings`
+   is not the approval. It is the watcher's `[CI TRIGGERED]` notification for
+   the same PR -- a `pr.review` row carrying `kind: ci_triggered` and no verdict
+   at all -- which reaches the review reducer and finds no findings to bind.
 
 2. **The run's own Forgejo dies part-way through.** Around the eighth case,
    `POST /api/v1/user/repos` starts answering `Connection refused`. The matrix

@@ -57,6 +57,7 @@ from tl_loop.loop.driver import (
     _execute_direct_reviewer_intent,
     _initial_slices,
     _integrate_one_candidate,
+    _is_aggregate_slice,
     _merge_result_is_authoritative,
     _migrate_audit_marked_quarantine,
     _new_dispatch_attempt,
@@ -113,6 +114,7 @@ from tl_loop.state.schema import (
     ActionPhase,
     ActionState,
     BudgetLedger,
+    DurableReviewEvidence,
     FSMState,
     RunState,
     GateState,
@@ -2764,6 +2766,206 @@ def test_aggregate_review_advances_hierarchical_lifecycle(tmp_path: Path) -> Non
     )
     assert restored.slices["leaf-a"].verdict is Verdict.GO
     assert _effect_names(transport) == []
+
+
+def _watcher_approval_row() -> EventEnvelope:
+    """The row the watcher writes for an approval it read off the forge.
+
+    Verbatim in the shape that matters: a clean approval carries no ``findings``
+    key at all, so a row that is re-derived as a first verdict has nothing to
+    bind, and its head lives in the event data next to ``review_head_sha``.
+    """
+    return project(
+        {
+            "type": "pr.review",
+            "run_seq": 13,
+            "run_id": "review-run",
+            "agent_id": "reviewer-unresolved",
+            "lifecycle_state": "emitted",
+            "observed_at": "2026-08-12T00:00:00Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "review_head_sha": "head-a",
+                "review_id": 1,
+                "kind": "approved",
+                "verdict": "approved",
+                "ci_status": "unknown",
+                "reviewer_account_authenticated": False,
+                "reviewer_identity_reason": "Forgejo review author did not resolve",
+                "reviewer_identity_unresolved": True,
+            },
+        }
+    )
+
+
+def _validated_approval() -> DurableReviewEvidence:
+    return DurableReviewEvidence(
+        review_id=1,
+        pr_number=42,
+        head_sha="head-a",
+        reviewer_agent_id="leaf-a:reviewer",
+        verdict=Verdict.GO,
+        submitted_at="2026-08-12T00:00:00Z",
+        validated_at="2026-08-12T00:00:00Z",
+    )
+
+
+def _aggregate_candidate(lifecycle: IntegrationLifecycle) -> IntegrationCandidateState:
+    return IntegrationCandidateState(
+        lifecycle=lifecycle,
+        aggregate_pr_number=42,
+        aggregate_head_sha="head-a",
+        aggregate_patch_digest="patch-a",
+        aggregate_original_base_sha="main",
+        integration_owner_id="leaf-a",
+        integration_owner_run_id="leaf-a",
+        integration_owner_branch="main.leaf-a",
+        integration_owner_worktree=".worktrees/leaf-a",
+        head_sha="head-a",
+        patch_digest="patch-a",
+    )
+
+
+def _route_watcher_approval(store: RunStore, state: RunState) -> RunState:
+    return _route_review_event(
+        WorkPlan(sub_tls=(SubTLTask("leaf-a", WorkPlan(), source=SyntheticQueue([])),)),
+        store,
+        state,
+        TLPlanning(),
+        _watcher_approval_row(),
+        13,
+        TLLoopConfig(active=True),
+        EffectClient(RecordingTransport()),
+        [],
+    )
+
+
+def test_a_repeated_aggregate_approval_binds_the_lifecycle_it_owes_the_run(
+    tmp_path: Path,
+) -> None:
+    """A restart resumes holding the approval; the repeat still has to bind it.
+
+    The watcher's row for a review the slice already validated is not a new
+    verdict, so nothing is re-derived -- but the aggregate candidate's lifecycle
+    edge is derived from that verdict and from nothing else. Dropping it on the
+    recognised repeat left the run waiting on ``await_aggregate_review`` for a
+    review it had been holding all along.
+    """
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    owner = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_last_boundary="aggregate_pr_open",
+        review_evidence=_validated_approval(),
+    )
+    state = store.checkpoint(
+        TLPlanning(),
+        {"leaf-a": owner},
+        BudgetLedger(0, 0),
+        offset=0,
+        integration=IntegrationRuntimeState(
+            lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+            sub_tl_states={"leaf-a": IntegrationLifecycle.AGGREGATE_PR_OPEN},
+            candidates={"leaf-a": _aggregate_candidate(IntegrationLifecycle.AGGREGATE_PR_OPEN)},
+        ),
+    )
+
+    routed = _route_watcher_approval(store, state)
+
+    assert (
+        routed.integration.candidates["leaf-a"].lifecycle
+        is IntegrationLifecycle.READY_FOR_INTEGRATION
+    )
+    # The verdict was recognised, not re-derived: the slice is byte-for-byte the
+    # one the run already held, findings included.
+    assert routed.slices["leaf-a"] == state.slices["leaf-a"]
+
+
+def test_an_aggregate_approval_the_candidate_already_holds_binds_nothing(
+    tmp_path: Path,
+) -> None:
+    """A repeat past the binding writes no checkpoint that advances nothing."""
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    owner = replace(
+        store.load().slices["leaf-a"],
+        dispatch_agent_id="leaf-a",
+        dispatch_last_boundary="aggregate_pr_open",
+        review_evidence=_validated_approval(),
+    )
+    state = store.checkpoint(
+        TLPlanning(),
+        {"leaf-a": owner},
+        BudgetLedger(0, 0),
+        offset=0,
+        integration=IntegrationRuntimeState(
+            lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
+            sub_tl_states={"leaf-a": IntegrationLifecycle.READY_FOR_INTEGRATION},
+            candidates={
+                "leaf-a": _aggregate_candidate(IntegrationLifecycle.READY_FOR_INTEGRATION)
+            },
+        ),
+    )
+
+    assert _route_watcher_approval(store, state) == state
+
+
+def test_a_repeated_approval_on_a_direct_review_leaf_binds_nothing(tmp_path: Path) -> None:
+    """The repeat guard's original answer still holds for a slice that owns no aggregate."""
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    state = store.checkpoint(
+        TLPlanning(),
+        {"leaf-a": replace(store.load().slices["leaf-a"], review_evidence=_validated_approval())},
+        BudgetLedger(0, 0),
+        offset=0,
+    )
+
+    assert _route_watcher_approval(store, state) == state
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "aggregate_pr_open",
+        "base_revalidation",
+        "integration_revalidation",
+        "integration_conflict",
+        "integration_gate",
+    ],
+)
+def test_an_aggregate_owner_stays_recognisable_at_every_boundary_it_reaches(
+    boundary: str,
+) -> None:
+    """Revalidation overwrites the publication's boundary label, not the identity.
+
+    Recognising only the label the aggregate PR was opened with loses the owner
+    the moment its base or head evidence is invalidated -- and an aggregate the
+    reducer cannot recognise is one whose approval is re-derived as a first
+    review instead of binding.
+    """
+    owner = SliceState(
+        id="leaf-a",
+        status=SliceStatus.IN_REVIEW,
+        paths=(),
+        depends_on=(),
+        base_ref="main",
+        test_plan=(),
+        agent_type=None,
+        model=None,
+        branch="main.leaf-a",
+        worktree=None,
+        pr_number=42,
+        reviewed_head="head-a",
+        attempts=1,
+        verdict=Verdict.GO,
+        dispatch_agent_id="leaf-a",
+    )
+
+    assert _is_aggregate_slice(replace(owner, dispatch_last_boundary=boundary))
+    assert not _is_aggregate_slice(
+        replace(owner, dispatch_last_boundary="spawn_request_accepted")
+    )
 
 
 def _ownership_publication_snapshot(

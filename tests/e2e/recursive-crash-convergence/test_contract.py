@@ -801,6 +801,48 @@ def test_the_seed_asserts_the_verdict_of_the_review_it_actually_posted() -> None
     assert "review_evidence=DurableReviewEvidence(" in source
 
 
+def test_the_seed_marks_its_slice_the_aggregate_owner_production_persists() -> None:
+    """A restarted aggregate owner must be recognisable as one after its restart.
+
+    ``_is_aggregate_slice`` reads the dispatch boundary production writes for a
+    sub-TL that owns an aggregate PR, and the binding a recognised approval owes
+    the run is gated on exactly that. The seed's ``boundary`` argument is the
+    restart phase the candidate's lifecycle is seeded at, so writing it as the
+    dispatch boundary described a slice production never persists: the reducer
+    could not tell the aggregate owner from a direct-review leaf, and its
+    approval was re-derived as a first review that demands findings the clean
+    approval does not have.
+    """
+    from tl_loop.loop.driver import _is_aggregate_slice
+    from tl_loop.state.schema import SliceState, SliceStatus
+
+    source = inspect.getsource(real.seed_delayed_restart_run)
+    assert 'dispatch_last_boundary="aggregate_pr_open"' in source
+    assert "dispatch_last_boundary=boundary" not in source, (
+        "the seed writes its restart phase as a dispatch boundary"
+    )
+
+    owner = SliceState(
+        id="sub-a",
+        status=SliceStatus.IN_REVIEW,
+        paths=(),
+        depends_on=(),
+        base_ref="main",
+        test_plan=(),
+        agent_type=None,
+        model=None,
+        branch="main.sub-a",
+        worktree=None,
+        pr_number=1,
+        reviewed_head="head",
+        attempts=1,
+        verdict=None,
+        dispatch_agent_id="sub-a",
+        dispatch_last_boundary="aggregate_pr_open",
+    )
+    assert _is_aggregate_slice(owner)
+
+
 def test_the_server_the_seed_polls_for_its_review_actually_polls() -> None:
     """The seed posts a review on the forge and waits for the watcher to see it.
 

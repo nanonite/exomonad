@@ -2444,7 +2444,15 @@ def seed_delayed_restart_run(
             dispatch_intent_id=f"seeded-{name}",
             dispatch_invocation_id=invocation_id,
             dispatch_started_at=time.time(),
-            dispatch_last_boundary=boundary,
+            # ``aggregate_pr_open`` is the boundary production persists for a
+            # sub-TL that owns an aggregate PR, and it is how ``_is_aggregate_slice``
+            # recognises the owner without trusting event text. The ``boundary``
+            # argument is the restart phase the candidate's lifecycle is seeded
+            # at, not a dispatch boundary: writing it here described a slice
+            # production never persists, so the reducer could not tell an
+            # aggregate owner from a direct-review leaf and dropped the binding
+            # its approval still owed the run.
+            dispatch_last_boundary="aggregate_pr_open",
             dispatch_agent_id=owner_id,
             dispatch_authoritative_event_seq=1,
             verdict=verdict,

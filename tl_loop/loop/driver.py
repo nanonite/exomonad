@@ -12158,17 +12158,42 @@ def _review_slice_id(event: EventEnvelope, state: RunState) -> str | None:
     return resolve_event_slice(event, state).slice_id
 
 
+#: Every dispatch boundary a persisted sub-TL aggregate owner can carry. The
+#: integration paths overwrite the label the publication wrote, so recognising
+#: only ``aggregate_pr_open`` loses the owner's identity the moment its base or
+#: head evidence is invalidated -- and an aggregate whose review is no longer
+#: bound is one whose approval is re-derived as a first review instead.
+_AGGREGATE_DISPATCH_BOUNDARIES: frozenset[str] = frozenset(
+    {
+        "aggregate_pr_open",
+        "base_revalidation",
+        "integration_revalidation",
+        "integration_conflict",
+        "integration_gate",
+    }
+)
+
+
 def _is_aggregate_slice(slice_state: SliceState) -> bool:
     """Identify a persisted sub-TL aggregate owner without trusting event text."""
     return slice_state.dispatch_agent_id is not None and (
-        slice_state.dispatch_last_boundary
-        in {
-            "aggregate_pr_open",
-            "integration_conflict",
-            "integration_gate",
-        }
+        slice_state.dispatch_last_boundary in _AGGREGATE_DISPATCH_BOUNDARIES
         or slice_state.dispatch_agent_id.endswith(":integration")
     )
+
+
+def _aggregate_awaits_code_review(state: RunState, slice_id: str) -> bool:
+    """Whether an aggregate owner still owes an approval its slice already holds.
+
+    Only these two lifecycles can consume one, so asking first keeps the
+    repeated-verdict guard from writing a checkpoint that advances nothing --
+    and keeps it from reaching an edge the transition table does not offer from
+    wherever the candidate actually is.
+    """
+    return _candidate_runtime(state.integration, slice_id).lifecycle in {
+        IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        IntegrationLifecycle.CODE_REVIEWED,
+    }
 
 
 def _event_review_head(event: EventEnvelope) -> str | None:
@@ -12276,6 +12301,22 @@ def _route_review_event(
                 current.verdict.value,
                 incoming_verdict.value,
             )
+            # A recognised repeat has no verdict to re-derive, but the aggregate
+            # lifecycle edge that verdict implies is still owed to the run. A
+            # restarted aggregate owner resumes holding the approval its slice
+            # already validated, and the watcher's row for that same review is
+            # the only thing that arrives to move its candidate off
+            # ``aggregate_pr_open``. Returning the state unchanged dropped that
+            # binding, and the run then waited on ``await_aggregate_review`` for
+            # a review it had been holding all along.
+            if (
+                current.verdict in {Verdict.GO, Verdict.GO_WITH_NITS}
+                and _is_aggregate_slice(current)
+                and _aggregate_awaits_code_review(state, slice_id)
+            ):
+                return _record_aggregate_review_lifecycle(
+                    store, state, phase, event_seq, slice_id, current.verdict
+                )
             return state
     review_findings = _review_findings(current, head_sha, findings)
     patch_digest = _event_patch_digest(event)
