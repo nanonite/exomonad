@@ -90,6 +90,7 @@ from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse
 from tl_loop.state.schema import (
     BudgetLedger,
+    DurableReviewEvidence,
     HandoffEvidence,
     IntegrationCandidateState,
     IntegrationRuntimeState,
@@ -1059,6 +1060,12 @@ def start_server(
                 f'tmux_session = "{session}"',
                 f"port = {port}",
                 "yolo = true",
+                # The watcher has to observe what the acceptance posts on the
+                # forge -- the seeded review, the CI status, the commit status
+                # after a push -- and it only ever sees them by polling. Without
+                # this the run waits on an observation the server was never asked
+                # to make, and the case reports a timeout rather than a finding.
+                "poll_interval = 1",
                 'spawn_agent_type = "codex"',
                 f'forgejo_url = "{forgejo_url}"',
                 f'forgejo_token = "{forgejo_token}"',
@@ -2347,7 +2354,12 @@ def seed_delayed_restart_run(
         "merging": IntegrationLifecycle.MERGING,
     }[boundary]
     verdict = None if boundary == "aggregate_review" else Verdict.GO
-    direct_sub_tls = tuple(plan.sub_tls)
+    # Only the released stage's children have published. A later-order child is
+    # still behind its barrier, so a publication from it is a scope event naming
+    # a child outside the active barrier -- production refuses it, and refusing
+    # is right: nothing outside the barrier has been dispatched.
+    first_order = min((task.order for task in plan.sub_tls), default=0)
+    direct_sub_tls = tuple(task for task in plan.sub_tls if task.order == first_order)
     for name in (task.name for task in direct_sub_tls):
         # The aggregate PR is published through the shipped ``file_pr`` tool as
         # the child that owns the branch, not filed over the forge API.
@@ -2433,6 +2445,19 @@ def seed_delayed_restart_run(
             verdict=verdict,
             reviewer_attempt={head_sha: 1},
             reviewer_agent_id=f"{owner_id}:reviewer",
+            # The review the watcher will now observe is the one already posted
+            # on the forge. Recording its durable identity is what makes the
+            # watcher's row a repeat the controller recognises, instead of a
+            # first verdict it has to re-derive findings for.
+            review_evidence=DurableReviewEvidence(
+                review_id=review_id,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                reviewer_agent_id=f"{owner_id}:reviewer",
+                verdict=Verdict.GO if review_verdict == "approved" else Verdict.NO_GO,
+                submitted_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                validated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            ),
             publication=PublicationBinding(
                 pr_number=pr_number,
                 head_sha=head_sha,

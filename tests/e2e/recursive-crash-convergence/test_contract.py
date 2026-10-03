@@ -774,6 +774,31 @@ def test_the_matrix_takes_no_operator_supplied_forge() -> None:
     assert not hasattr(real, "cleanup_external_case")
 
 
+def test_the_restart_seed_publishes_only_for_a_released_stage() -> None:
+    """A child behind its barrier must not publish, and the seed must not say it did.
+
+    A scope event naming a child outside the active barrier is refused by
+    production: nothing behind the barrier has been dispatched. Publishing for a
+    later-order child would therefore assert a state the product cannot be in,
+    and the row would be refused rather than reconciled.
+    """
+    source = inspect.getsource(real.seed_delayed_restart_run)
+    assert "task.order == first_order" in source
+    assert "first_order = min(" in source
+
+
+def test_the_server_the_seed_polls_for_its_review_actually_polls() -> None:
+    """The seed posts a review on the forge and waits for the watcher to see it.
+
+    The watcher only ever learns what happened on the forge by polling, so a
+    server started without a poll interval is never asked to look. The case
+    would then time out on an observation nothing was tasked to make, and report
+    a timeout where the real fault is a configuration that cannot converge.
+    """
+    source = inspect.getsource(real.start_server)
+    assert "poll_interval = 1" in source
+
+
 def test_the_restart_seed_earns_its_publication_instead_of_asserting_one() -> None:
     """The seed must publish through ``file_pr``, never file over the forge API.
 
