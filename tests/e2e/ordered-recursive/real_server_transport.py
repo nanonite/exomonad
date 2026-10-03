@@ -1028,7 +1028,7 @@ def start_server(
             json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         invocation = {
-            "invocation_id": f"1057-seeded-{agent_id}",
+            "invocation_id": seeded_invocation_id(agent_id),
             "runtime": "codex",
             "trigger": "spawn",
             "mode": "interactive",
@@ -2257,6 +2257,29 @@ def mock_merge_count(log_path: Path) -> int:
     )
 
 
+def seeded_invocation_id(agent_id: str) -> str:
+    """Return the durable invocation id ``start_server`` seeded for one agent.
+
+    The two have to be one function of one name, because the ``file_pr``
+    publication this seed earns records the id the server resolves for that
+    agent, and the slice must name the same one or the watcher refuses the
+    publication on provenance.
+    """
+    return f"1057-seeded-{agent_id}"
+
+
+def _published_pr_number(raw: Any, agent_name: str) -> int:
+    """Return the PR number a shipped ``file_pr`` call actually created."""
+    result = raw.get("result") if isinstance(raw, Mapping) else None
+    payload = result if isinstance(result, Mapping) else raw
+    number = payload.get("pr_number") if isinstance(payload, Mapping) else None
+    if type(number) is not int or number <= 0:
+        raise HarnessError(
+            f"file_pr did not publish a pull request for {agent_name}: {raw!r}"
+        )
+    return number
+
+
 def seed_delayed_restart_run(
     client: TransportClient,
     root: Path,
@@ -2316,7 +2339,6 @@ def seed_delayed_restart_run(
         slices=state.slices,
     )
     state = seeded_slices.load()
-    parent_effects = EffectClient(client, role="tl", name="parent")
     candidates: dict[str, IntegrationCandidateState] = {}
     updated_slices = dict(state.slices)
     lifecycle = {
@@ -2327,30 +2349,39 @@ def seed_delayed_restart_run(
     verdict = None if boundary == "aggregate_review" else Verdict.GO
     direct_sub_tls = tuple(plan.sub_tls)
     for name in (task.name for task in direct_sub_tls):
-        branch = f"aggregate/{case_slug}/{name}"
-        create_branch_with_commit(
-            repo,
-            branch,
-            "main",
+        # The aggregate PR is published through the shipped ``file_pr`` tool as
+        # the child that owns the branch, not filed over the forge API.
+        #
+        # That is the only route that produces a publication the watcher will
+        # later accept: the ``file_pr`` handler is what records the verified
+        # publication, and it records it with the agent's own identity, the
+        # server-resolved slice, and the agent's durable invocation id. A PR
+        # filed over REST leaves ``published-heads.json`` empty, so
+        # ``accepted_publication_from_watcher`` refuses the evidence on
+        # provenance -- the run would then never reach the boundary it is
+        # supposed to crash at.
+        #
+        # The branch is the child's own ``main.<name>``, which is what an ordered
+        # sub-TL publishes to its parent (see the nested aggregate PR the
+        # acceptance asserts: head ``main.sub-a.nested-a``, base ``main.sub-a``).
+        branch = f"main.{name}"
+        invocation_id = seeded_invocation_id(name)
+        commit_fixture_worktree(
+            agent_worktree(repo, branch),
             relative_path=f"e2e-fixtures/{case_slug}/{name}.txt",
             content=f"{name} aggregate source\n",
             message=f"Prepare delayed {name} aggregate source",
         )
-        filed = json_request(
-            "POST",
-            f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls",
-            {
-                "title": f"Delayed aggregate {name}",
-                "body": "Controller restart acceptance fixture",
-                "head": branch,
-                "base": "main",
-            },
-            token=forgejo_token,
+        child_effects = EffectClient(client, role="tl", name=name)
+        filed = child_effects.file_pr(
+            title=f"Aggregate {name} into main",
+            body="Controller restart acceptance fixture",
+            base_branch="main",
         )
-        if not isinstance(filed, Mapping) or type(filed.get("number")) is not int:
-            raise HarnessError(f"mock Forgejo did not create delayed PR: {filed!r}")
-        pr_number = int(filed["number"])
-        snapshot = parent_effects.watcher_pr_state(pr_number=pr_number)
+        pr_number = _published_pr_number(filed.raw, name)
+        snapshot = EffectClient(client, role="tl", name="parent").watcher_pr_state(
+            pr_number=pr_number
+        )
         evidence = find_object(
             snapshot,
             {"head_sha", "base_sha", "patch_digest", "merge_tree_sha"},
@@ -2378,17 +2409,23 @@ def seed_delayed_restart_run(
         if type(review_id) is not int or review_id <= 0:
             raise HarnessError(f"Forgejo review omitted its durable ID: {review!r}")
         current = state.slices[name]
-        owner_id = f"{run_id}:{name}:integration"
+        # The owner identity is the agent the publication was actually filed by,
+        # and the invocation is that agent's durable invocation. Both have to be
+        # the real ones: the watcher correlates its publication record against
+        # exactly these, and a seeded value that names nobody is refused as a
+        # provenance mismatch.
+        owner_id = name
         updated_slices[name] = replace(
             current,
             status=SliceStatus.IN_REVIEW,
             base_ref="main",
             branch=branch,
-            worktree=str(parent_worktree / name),
+            worktree=str(agent_worktree(repo, branch)),
             pr_number=pr_number,
             reviewed_head=head_sha,
             review_patch_digests={head_sha: patch_digest},
             dispatch_intent_id=f"seeded-{name}",
+            dispatch_invocation_id=invocation_id,
             dispatch_started_at=time.time(),
             dispatch_last_boundary=boundary,
             dispatch_agent_id=owner_id,
@@ -2402,13 +2439,13 @@ def seed_delayed_restart_run(
                 head_branch=branch,
                 base_branch="main",
                 attempt=1,
-                invocation_id=f"{owner_id}:publication",
+                invocation_id=invocation_id,
             ),
             handoff=HandoffEvidence(
                 pr_number=pr_number,
                 head_sha=head_sha,
                 attempt=1,
-                invocation_id=f"{owner_id}:handoff",
+                invocation_id=invocation_id,
                 agent_id=owner_id,
                 observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             ),
@@ -2422,7 +2459,7 @@ def seed_delayed_restart_run(
             integration_owner_id=owner_id,
             integration_owner_run_id=name,
             integration_owner_branch=branch,
-            integration_owner_worktree=str(parent_worktree / name),
+            integration_owner_worktree=str(agent_worktree(repo, branch)),
             head_sha=head_sha,
             patch_digest=patch_digest,
             validated_base_sha=(

@@ -795,10 +795,14 @@ def _walk(
     totals: dict[str, int] = {}
     for repetition in range(1, repetitions + 1):
         for boundary in CRASH_BOUNDARIES:
+            failure = _case_name(repetition, boundary)
             try:
                 result = _run_case(scope, instance, run_root, repetition, boundary)
-            except ACCEPTANCE_FAILURES as error:
-                failure = _case_name(repetition, boundary)
+            except BaseException as error:  # noqa: BLE001 - one case, then on
+                # Every failure is attributed to the case it happened in and the
+                # walk continues: an exception the harness does not recognise is
+                # still one case's verdict, and stopping there would report every
+                # later boundary as untried when it was merely unattempted.
                 report.failures.append(f"{failure}: {type(error).__name__}: {error}")
                 print(f"FAIL {failure} {report.failures[-1][:2000]}", flush=True)
                 continue

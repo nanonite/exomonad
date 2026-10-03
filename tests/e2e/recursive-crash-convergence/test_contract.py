@@ -774,6 +774,53 @@ def test_the_matrix_takes_no_operator_supplied_forge() -> None:
     assert not hasattr(real, "cleanup_external_case")
 
 
+def test_the_restart_seed_earns_its_publication_instead_of_asserting_one() -> None:
+    """The seed must publish through ``file_pr``, never file over the forge API.
+
+    Only the shipped ``file_pr`` handler records a verified publication, and it
+    records it with the calling agent's identity, the server-resolved slice, and
+    that agent's durable invocation. A PR filed over REST leaves
+    ``published-heads.json`` empty, so ``accepted_publication_from_watcher``
+    refuses the evidence on provenance and the controller never reaches the
+    boundary it is supposed to crash at.
+    """
+    source = inspect.getsource(real.seed_delayed_restart_run)
+    assert ".file_pr(" in source
+    assert 'f"{forgejo_url}/api/v1/repos/{forgejo_owner}/{forgejo_repo}/pulls", {' not in (
+        source
+    ), "the seed files a PR over REST instead"
+    assert "publication=PublicationBinding(" in source
+    # The owner identity and the invocation are the ones the publication was
+    # actually filed under, not a synthetic owner the watcher cannot match.
+    assert "owner_id = name" in source
+    assert "invocation_id = seeded_invocation_id(name)" in source
+
+
+def test_a_seeded_agents_invocation_is_one_function_of_its_name() -> None:
+    """The recorded invocation and the slice's invocation must be one value.
+
+    ``file_pr`` records the id the server resolves for the calling agent, and
+    the slice has to name the same one or the watcher's succession check refuses
+    the publication. Two spellings of one id would drift silently.
+    """
+    assert real.seeded_invocation_id("sub-a") == "1057-seeded-sub-a"
+    server = inspect.getsource(real.start_server)
+    assert '"invocation_id": seeded_invocation_id(agent_id)' in server
+
+
+def test_a_case_failure_never_aborts_the_walk() -> None:
+    """One case's verdict must not be the end of the matrix.
+
+    An exception the harness does not recognise is still one case's result.
+    Stopping the walk there would report every later boundary as untried when it
+    was merely unattempted, which is the difference between a finding and a gap
+    in the evidence.
+    """
+    source = inspect.getsource(runner._walk)
+    assert "except BaseException" in source
+    assert "except ACCEPTANCE_FAILURES" not in source
+
+
 def test_the_seed_only_emits_controller_events_the_shipped_contract_admits() -> None:
     """The restart seed may not ask the server for an event it will refuse.
 

@@ -83,29 +83,33 @@ leaves it open has failed that boundary rather than tidied up after it. The
 database goes at `<repo>/.chainlink/issues.db`, which is where the shipped
 controller resolves it; anywhere else is a file no escalation reaches.
 
-## Known blocker: the restart seed lacks watcher provenance
+## Known blocker: the controller has no transition for a replayed PRFiled
 
 The matrix provisions, isolates, runs, and tears down correctly today: a run
 reports `0 leaks, 0 cleanup problems, 0 sweep problems` and leaves nothing on
-the host. The **cases** are red, and the reason is not the provisioning.
+the host.
 
-`seed_delayed_restart_run` binds each slice's aggregate PR, verdict, and
-reviewed head directly on the slice, but production requires a watcher
-observation to carry its own durable provenance before it will bind a
-publication at all (`tl_loop/loop/reconcile.py::accepted_publication_from_watcher`:
-`author_agent` must equal the slice's `dispatch_agent_id`, an `invocation_id`
-must be present, and it must succeed the current dispatch). The seed supplies
-none of that, so the controller refuses the watcher publication
-(`refusing watcher publication evidence for <slice>: provenance mismatch`),
-never reaches the effect boundary under test, and the case reports that it
-exited without writing its crash marker.
+The seed now **earns** its publication instead of asserting one. It publishes
+each child's aggregate PR through the shipped `file_pr` tool, as the child that
+owns the branch, so the server itself records the verified publication with that
+agent's identity, the server-resolved slice, and its durable invocation — and
+the watcher accepts it. Filing the PR over REST left `published-heads.json`
+empty, so `accepted_publication_from_watcher` refused it on provenance and the
+controller never reached the boundary under test.
 
-The watcher snapshot is produced by the server, not by this harness, so the
-provenance cannot be written into a fixture — it has to be *earned*. Fixing this
-means either teaching the seed to publish through the real watcher (so the
-server records the provenance it will later insist on) or changing what the
-acceptance is allowed to seed. Both are changes to the scenario's evidence, not
-to how it is provisioned, and neither is a harness-ownership fix.
+What is left is the next guard in the chain. `file_pr` appends `pr.published` to
+the event log, which the controller decodes as `PRFiled`, and a root `TLRunning`
+scope has no transition for it: `No TL transition for TLRunning and PRFiled`.
+A publication this run caused is evidence of something the slice already
+records, not a phase the controller should enter, so the row needs to be
+retained as historical the way a refused or superseded publication already is,
+rather than replayed as a live event.
+
+That is a change to how the controller treats its own publication evidence, so
+it is a product change with its own review rather than a harness one. Until it
+lands, the matrix reports `0 cases passed` with every failure named per case —
+it no longer aborts part-way, so the report distinguishes a boundary that failed
+from one that was never attempted.
 
 ## Topology note: same-order consuming children
 
