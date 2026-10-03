@@ -787,6 +787,20 @@ def test_the_restart_seed_publishes_only_for_a_released_stage() -> None:
     assert "first_order = min(" in source
 
 
+def test_the_seed_asserts_the_verdict_of_the_review_it_actually_posted() -> None:
+    """A review the seed posted on the forge is a verdict the slice may hold.
+
+    The seed posts the review before it checkpoints, and keeps the durable id the
+    forge returned. Leaving the verdict unset would claim the run had not yet
+    seen a review it holds an id for, and the controller then treats the
+    watcher's row for that same review as a first verdict to re-derive rather
+    than the repeat it is.
+    """
+    source = inspect.getsource(real.seed_delayed_restart_run)
+    assert 'Verdict.GO if review_verdict == "approved" else Verdict.NO_GO' in source
+    assert "review_evidence=DurableReviewEvidence(" in source
+
+
 def test_the_server_the_seed_polls_for_its_review_actually_polls() -> None:
     """The seed posts a review on the forge and waits for the watcher to see it.
 

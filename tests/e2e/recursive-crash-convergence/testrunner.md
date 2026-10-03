@@ -83,33 +83,48 @@ leaves it open has failed that boundary rather than tidied up after it. The
 database goes at `<repo>/.chainlink/issues.db`, which is where the shipped
 controller resolves it; anywhere else is a file no escalation reaches.
 
-## Known blocker: the controller has no transition for a replayed PRFiled
+## Known blockers: the matrix provisions correctly and still reports 0/28
 
-The matrix provisions, isolates, runs, and tears down correctly today: a run
-reports `0 leaks, 0 cleanup problems, 0 sweep problems` and leaves nothing on
-the host.
+The run owns, isolates, and tears down everything it touches: a run reports
+`0 leaks, 0 cleanup problems, 0 sweep problems` and leaves nothing on the host.
+The **cases** are red, and none of the remaining causes is provisioning.
 
-The seed now **earns** its publication instead of asserting one. It publishes
-each child's aggregate PR through the shipped `file_pr` tool, as the child that
-owns the branch, so the server itself records the verified publication with that
-agent's identity, the server-resolved slice, and its durable invocation — and
-the watcher accepts it. Filing the PR over REST left `published-heads.json`
-empty, so `accepted_publication_from_watcher` refused it on provenance and the
-controller never reached the boundary under test.
+Everything the harness previously got wrong is fixed, and each fix is a
+harness-side one:
 
-What is left is the next guard in the chain. `file_pr` appends `pr.published` to
-the event log, which the controller decodes as `PRFiled`, and a root `TLRunning`
-scope has no transition for it: `No TL transition for TLRunning and PRFiled`.
-A publication this run caused is evidence of something the slice already
-records, not a phase the controller should enter, so the row needs to be
-retained as historical the way a refused or superseded publication already is,
-rather than replayed as a live event.
+| Was | Cause | Now |
+|-----|-------|------|
+| `unsupported controller event type: pr.review` | the seed asked the server to emit watcher observations | the verdict lives on the slice |
+| `legacy active phase 'tl_waiting' cannot be resumed safely` | the seed wrote a phase `_ensure_canonical_scope` refuses | the seed checkpoints `TLPlanning` |
+| `unable to open database file: <repo>/.chainlink/issues.db` | the database was not where the controller resolves it | anchored at `<repo>/.chainlink` |
+| `refusing watcher publication evidence: provenance mismatch` | the seed filed the PR over REST, so `published-heads.json` stayed empty | the seed publishes through the shipped `file_pr`, as the owning child |
+| `No TL transition for TLRunning and PRFiled` | the seed published for children behind the barrier | only the released stage's children publish |
 
-That is a change to how the controller treats its own publication evidence, so
-it is a product change with its own review rather than a harness one. Until it
-lands, the matrix reports `0 cases passed` with every failure named per case —
-it no longer aborts part-way, so the report distinguishes a boundary that failed
-from one that was never attempted.
+Two things still stop the cases converging, and neither is a harness change:
+
+1. **A seeded approval is refused on findings.** The seed posts a real approval
+   on the forge with a durable review id and records that review on the slice,
+   and the watcher duly records it (`pr.review`, `verdict: approved`,
+   `review_id` matching). The controller still logs `ignoring review without
+   binding findings`, because the repeated-verdict guard
+   (`driver._route_review_event`) compares the envelope's own `head_sha` against
+   the slice's `reviewed_head` while the watcher's head lives in `data`. The
+   review is therefore re-derived from scratch instead of recognised as the
+   repeat it is, and a re-derived approval needs findings the fixture has no
+   honest source for. `review-*` and `spawn-*` stop at
+   `await_aggregate_review`; `publication` and `repair` never write their crash
+   marker.
+
+2. **The run's own Forgejo dies part-way through.** Around the eighth case,
+   `POST /api/v1/user/repos` starts answering `Connection refused`. The matrix
+   holds one Forgejo for all 28 cases, so every later case fails at
+   provisioning rather than at its boundary. On a host with little free memory
+   the container is killed; the harness reports it, and teardown is still clean,
+   but the run cannot be trusted end to end.
+
+The walk does not stop at either: every failure is attributed to its own case
+and the remaining boundaries still run, so the report distinguishes a boundary
+that failed from one that was never attempted.
 
 ## Topology note: same-order consuming children
 

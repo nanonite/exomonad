@@ -2353,7 +2353,12 @@ def seed_delayed_restart_run(
         "base_revalidation": IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
         "merging": IntegrationLifecycle.MERGING,
     }[boundary]
-    verdict = None if boundary == "aggregate_review" else Verdict.GO
+    # The verdict is whatever review this seed actually posted on the forge, and
+    # it posts it before the checkpoint. Leaving it unset would claim the run had
+    # not yet seen the review it holds a durable review id for, and the
+    # controller then treats the watcher's row for that same review as a first
+    # verdict it has to re-derive findings for, rather than the repeat it is.
+    verdict = Verdict.GO if review_verdict == "approved" else Verdict.NO_GO
     # Only the released stage's children have published. A later-order child is
     # still behind its barrier, so a publication from it is a scope event naming
     # a child outside the active barrier -- production refuses it, and refusing
