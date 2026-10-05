@@ -49,6 +49,7 @@ from tl_loop.loop.driver import (
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
     BudgetLedger,
+    GateStatus,
     IntegrationRuntimeState,
     OrderedStageState,
     ParkCause,
@@ -281,6 +282,57 @@ def _leaf_evidence(parent_store: RunStore) -> dict[str, Any]:
         "phase": child.recursive_fsm,
         "gates": [gate.name for gate in child.gates],
     }
+
+
+def test_rejected_recovery_gate_stays_gated_and_is_never_re_asked(
+    tmp_path: Path,
+) -> None:
+    """Answering the recorded checkpoint's gate as declined changes nothing.
+
+    The operator declined the recovery, so the run stays ``tl_failed`` with the
+    same named gate, now carrying the answer. Repeating the continuation must
+    neither re-open the child nor reset the answer back to pending, which would
+    silently re-ask a question that was already answered.
+    """
+    parent_store, plan, config = _terminal_failed_checkpoints(tmp_path)
+    before = _leaf_evidence(parent_store)
+    parent_store.set_gate(f"{GATE_PREFIX}{CHILD}")
+    parent_store.answer_gate(f"{GATE_PREFIX}{CHILD}", GateStatus.REJECTED)
+
+    result, transport = _continue(parent_store, plan, config)
+
+    assert transport.calls == []
+    state = result.final_state
+    assert isinstance(state.recursive_fsm, TLFailed)
+    assert state.fsm.phase.value == "tl_failed"
+    gates = {gate.name: gate.status for gate in state.gates}
+    assert gates == {f"{GATE_PREFIX}{CHILD}": GateStatus.REJECTED}
+    assert result.diagnostics["recovery_gate"] == f"{GATE_PREFIX}{CHILD}"
+    assert result.diagnostics["recovery_gate_status"] == GateStatus.REJECTED.value
+    assert _leaf_evidence(parent_store) == before
+
+    second, second_transport = _continue(parent_store, plan, config)
+    assert second_transport.calls == []
+    assert {gate.name: gate.status for gate in second.final_state.gates} == {
+        f"{GATE_PREFIX}{CHILD}": GateStatus.REJECTED
+    }
+    assert _leaf_evidence(parent_store) == before
+
+
+def test_pending_recovery_gate_is_not_duplicated_on_repeat(tmp_path: Path) -> None:
+    """The unanswered question stays one pending gate, not a fresh occurrence."""
+    parent_store, plan, config = _terminal_failed_checkpoints(tmp_path)
+    first, first_transport = _continue(parent_store, plan, config)
+
+    assert first_transport.calls == []
+    assert [gate.name for gate in first.final_state.gates] == [f"{GATE_PREFIX}{CHILD}"]
+    assert first.final_state.gates[0].status is GateStatus.PENDING
+
+    second, second_transport = _continue(parent_store, plan, config)
+
+    assert second_transport.calls == []
+    assert [gate.name for gate in second.final_state.gates] == [f"{GATE_PREFIX}{CHILD}"]
+    assert second.final_state.gates[0].status is GateStatus.PENDING
 
 
 def test_continue_alone_keeps_the_recorded_failure_and_names_the_gate(

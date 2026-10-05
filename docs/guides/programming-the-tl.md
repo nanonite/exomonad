@@ -751,6 +751,38 @@ Restart reads the persisted stage, owner, PR, head, base, evidence, and
 attempt counters; it never treats a missing event as permission to duplicate a
 spawn, PR, review, repair, or merge.
 
+#### Ordered-child recovery gates
+
+A terminal ordered child whose controller stopped before authoritative
+resolution is recovered by `--continue` only when the durable proof holds:
+matching plan manifest, child branch and worktree, parent ownership, an
+accepted dispatch intent, an exit diagnostic bound to that exact checkpoint
+revision, and a retryable exit reason. Any failed proof keeps `tl_failed` and
+opens `tl-ordered-child-recovery-<child>`.
+
+Only an `approved` answer releases that gate, and only when the exit-reason
+classification is the single unproven fact. `pending` and `rejected` both
+leave the run gated, and neither is written back to `pending`, so a decline
+survives every later restart rather than being re-asked:
+
+```bash
+python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root \
+  --name tl-ordered-child-recovery-<child> --approve
+```
+
+Approval is a judgement, not evidence. A gate raised because the recorded branch
+is not the declared owner's, publication evidence needs integration
+reconciliation, a merge is in flight, or the action journal holds an
+unreconciled effect stays gated however it is answered — those require
+re-decomposition, not a yes. So does a gate whose failed child cannot be
+uniquely identified, because reopening that scope would relaunch its siblings.
+
+An approved recovery relaunches the child with a fresh invocation identity when
+its recorded controller has exited. Reusing the old identity would resolve the
+pane that already exited and fail delivery instead of recovering. Branch,
+worktree, controller identity, PR, head, and publication ownership are preserved:
+the child is reopened, never duplicated.
+
 ### Troubleshooting `status`
 
 The status projection is intentionally body-free but contains enough evidence

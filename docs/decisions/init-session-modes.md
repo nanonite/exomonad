@@ -47,6 +47,52 @@ resolved by the operator through the appropriate recovery or recreate path.
 Answering that gate does not authorize the controller to guess ownership or
 discard resources.
 
+## Answered ordered-child recovery gates (#1157)
+
+The gate is a question, so an answer to it is a decision with two halves: what
+the answer releases, and what it must never do again.
+
+Recovery decides from durable checkpoint evidence first. Only when that proof
+fails does the recorded answer matter, and then an `approved` answer releases the
+recovery in exactly one case: when the sole unproven fact is how the child's exit
+reason is classified, because every ownership, publication, merge, and
+effect-reconciliation proof already holds. An operator can overrule a judgement
+about a message; an answer cannot manufacture an ownership binding or un-run an
+effect that may already have landed, so those proofs stay hard however the gate is
+answered and the slice is re-decomposed or escalated instead. A `pending` gate
+opens exactly once and stays pending; a `rejected` gate is never re-armed to
+`pending` and never releases anything. A repeat `--continue` re-reads the answer
+instead of overwriting it, so a decision an operator already made survives as many
+restarts as it takes.
+
+An approved recovery of a child whose controller already exited relaunches that
+child with a **fresh** invocation identity and dispatch generation. The relaunch
+reuses the same agent name, branch, worktree, and publication ownership, so
+reusing the recorded invocation would resolve the delivery target that already
+exited — `exomonad init --continue` would then fail with `tmux paste-buffer
+target pane has exited` and leave the run `tl_failed`, having been told to
+recover. The replacement invocation is derived from the child's own exit
+diagnostic, so repeating the recovery reuses it rather than walking the
+generation forward without a child ever running. The child is reopened, never
+duplicated: no second slice, no second branch, and the child's recorded PR, head,
+and publication binding are untouched.
+
+The same durability rule governs parking. `park` opens the named gate *before*
+it writes the parked state, so a controller that dies between the two leaves the
+operator's question rather than a parked slice nobody was ever asked about. The
+reverse order loses the question while keeping the work stopped.
+
+## Chainlink result shapes normalize to one issue (#1157)
+
+`issue_id` is the canonical create-response key and `cicoIssueId` is the legacy
+Haskell shape older checkpoints still carry. Both normalize to the same positive
+integer, so one escalation reconciles against exactly one issue and a retry after
+a crash reuses it instead of opening a second. A shape carrying two *different*
+positive IDs is contradictory, not a preference order: it fails closed instead of
+picking one, because reconciling a park against the wrong issue is worse than not
+reconciling at all. Records read back from disk are treated the same way, so no
+caller can adopt either ID from a self-contradictory record.
+
 ## Terminal checkpoint answer (#1112)
 
 A recorded production run ended with the root and its `recreate-stage` child

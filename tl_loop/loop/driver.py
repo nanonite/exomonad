@@ -19,7 +19,7 @@ from fnmatch import fnmatchcase
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol, cast
+from typing import NamedTuple, Protocol, cast
 
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
@@ -81,7 +81,12 @@ from tl_loop.fsm.post_merge_events import (
     PostMergeRebuildRequested,
 )
 from tl_loop.fsm.post_merge_evidence import PushReceipt
-from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
+from tl_loop.fsm.recovery import (
+    RecoveryPhase,
+    RecoveryState,
+    begin_recovery,
+    transition_recovery,
+)
 from tl_loop.fsm.scope import (
     TLAllMerged as RecursiveTLAllMerged,
 )
@@ -663,6 +668,20 @@ DISPATCH_ALREADY_CONFIRMED = "already_confirmed"
 #: with a recorded authoritative sequence this is the durable proof that a
 #: duplicate confirmation is a duplicate and not a first confirmation.
 DISPATCH_CONFIRMED_BOUNDARY = "agent.spawned"
+#: Boundaries at which an ordered child controller's dispatch is durably
+#: reconciled rather than in flight. ``sub_tl_started`` is recorded when the
+#: controller takes the child's spawn confirmation; ``sub_tl_recovered`` is
+#: recorded when an approved recovery mints a replacement invocation for a child
+#: whose previous controller had already exited. Both name a dispatch of record,
+#: so either is a state the controller can still act on and re-dispatch from.
+#: Recovery must not leave a child at a boundary the next continuation proof
+#: rejects: a child that fails again after an approved recovery has to stay
+#: provable, or the run is permanently unrecoverable on a false diagnosis.
+SUB_TL_DISPATCH_STARTED_BOUNDARY = "sub_tl_started"
+SUB_TL_DISPATCH_RECOVERED_BOUNDARY = "sub_tl_recovered"
+RECONCILED_SUB_TL_DISPATCH_BOUNDARIES: frozenset[str] = frozenset(
+    {SUB_TL_DISPATCH_STARTED_BOUNDARY, SUB_TL_DISPATCH_RECOVERED_BOUNDARY}
+)
 #: Correlation markers that name a permanently retained audit row. A refused
 #: publication and a refused spawn confirmation from a predecessor controller
 #: epoch are the same class of evidence: they prove what an earlier generation
@@ -1167,7 +1186,7 @@ def run_tl_loop(
             )
             if decision is not None:
                 if not decision.recoverable:
-                    state = store.set_gate(decision.gate_name)
+                    state = _hold_ordered_recovery_gate(store, decision)
                     return TLRunResult(
                         state,
                         (),
@@ -1179,6 +1198,11 @@ def run_tl_loop(
                             "cursor": state.events.last_consumed_offset,
                             "ordered_recovery": decision.reason,
                             "recovery_gate": decision.gate_name,
+                            "recovery_gate_status": (
+                                decision.gate_status.value
+                                if decision.gate_status is not None
+                                else GateStatus.PENDING.value
+                            ),
                         },
                         (),
                     )
@@ -1187,6 +1211,7 @@ def run_tl_loop(
                     recovery_plan,
                     store,
                     decision.task_name,
+                    authorized=decision.authorized,
                 )
                 selected = replace(
                     selected,
@@ -1843,6 +1868,23 @@ class OrderedRecoveryDecision:
     gate_name: str
     reason: str
     recoverable: bool
+    #: The recorded answer for ``gate_name``, or ``None`` when the gate has
+    #: never been opened. Only an ``APPROVED`` answer authorizes a recovery the
+    #: checkpoint evidence alone cannot prove; ``PENDING`` and ``REJECTED`` both
+    #: leave the run gated, and neither is ever re-armed to pending.
+    gate_status: GateStatus | None = None
+    #: Whether an approved gate, rather than the checkpoint evidence, authorizes
+    #: the reopen. An authorized reopen mints a fresh child invocation instead of
+    #: reusing the recorded one, because the prior delivery target is gone.
+    authorized: bool = False
+    #: Whether an approved gate may release *this* failure. True only when the
+    #: sole unproven fact is how the child's exit reason is classified, because
+    #: every ownership, publication, and effect-reconciliation proof already
+    #: holds. An operator may overrule a judgement about a message; no operator
+    #: answer can manufacture an ownership binding or un-run an effect that may
+    #: already have landed, so the other failures stay gated however they are
+    #: answered.
+    operator_overridable: bool = False
 
 
 def _ordered_recovery_gate_name(task_name: str | None) -> str:
@@ -1851,6 +1893,52 @@ def _ordered_recovery_gate_name(task_name: str | None) -> str:
 
 
 def _ordered_terminal_recovery_decision(
+    state: RunState,
+    plan: WorkPlan,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> OrderedRecoveryDecision | None:
+    """Classify a failed ordered child, then apply the operator's answer.
+
+    The checkpoint proof decides first. An incomplete proof leaves the run gated,
+    and the recorded answer for that named gate decides what happens next: an
+    approved gate authorizes the reopen when — and only when — the sole unproven
+    fact is how the child's exit reason is classified. Ownership, publication,
+    merge, and effect-reconciliation proofs are never released by an answer,
+    because approving a question is not evidence that a sibling does not exist,
+    that an effect did not already land, or that the recorded branch is this
+    child's. A pending or rejected answer leaves the run gated. An answer is
+    never overwritten and a rejected gate is never re-armed to pending, so a
+    repeat `--continue` cannot undo a decision.
+    """
+    proof = _ordered_recovery_proof(state, plan, config, store)
+    if proof is None:
+        return None
+    gate_status = next(
+        (gate.status for gate in state.gates if gate.name == proof.gate_name),
+        None,
+    )
+    if proof.recoverable:
+        return replace(proof, gate_status=gate_status)
+    if gate_status is not GateStatus.APPROVED:
+        return replace(proof, gate_status=gate_status)
+    if not proof.operator_overridable or proof.task_name is None:
+        # An answer to a question about ownership or effects is not a proof of
+        # them. Re-decomposing or escalating is the only way past these.
+        return replace(proof, gate_status=gate_status)
+    return replace(
+        proof,
+        recoverable=True,
+        authorized=True,
+        gate_status=gate_status,
+        reason=(
+            f"operator approved gate {proof.gate_name} for child {proof.task_name!r}: "
+            f"{proof.reason}"
+        ),
+    )
+
+
+def _ordered_recovery_proof(
     state: RunState,
     plan: WorkPlan,
     config: TLLoopConfig,
@@ -1925,13 +2013,14 @@ def _ordered_terminal_recovery_decision(
             f"failed child checkpoint cannot be verified: {error}",
             False,
         )
-    reason = _ordered_child_recovery_reason(state, task, child_state, config, store)
-    if reason is not None:
+    proof = _ordered_child_recovery_reason(state, task, child_state, config, store)
+    if proof.reason is not None:
         return OrderedRecoveryDecision(
             task_name,
             _ordered_recovery_gate_name(task_name),
-            reason,
+            proof.reason,
             False,
+            operator_overridable=proof.operator_overridable,
         )
     return OrderedRecoveryDecision(
         task_name,
@@ -1941,49 +2030,94 @@ def _ordered_terminal_recovery_decision(
     )
 
 
+def _hold_ordered_recovery_gate(
+    store: RunStore,
+    decision: OrderedRecoveryDecision,
+) -> RunState:
+    """Keep an unresolved or rejected ordered recovery gated, answering nothing.
+
+    A gate that an operator already answered is the durable record of a
+    decision, so it is left exactly as it is: re-arming a rejected gate to
+    pending would silently re-ask a question that was already declined, and
+    re-arming an approved one would discard the authorization this decision
+    just consumed. Only an unrecorded name opens one pending gate.
+    """
+    if decision.gate_status is not None:
+        return store.load()
+    return store.set_gate(decision.gate_name, GateStatus.PENDING)
+
+
+class _ChildRecoveryProof(NamedTuple):
+    """Why one failed ordered child is not provably retryable.
+
+    ``reason`` is ``None`` when the checkpoint proves the child retryable, and
+    otherwise the fail-closed reason. ``operator_overridable`` is true only when
+    the sole unproven fact is the classification of the child's exit reason: at
+    that point every ownership, publication, and effect-reconciliation proof has
+    already held. It is the one failure an operator answer can release, because
+    an operator can judge a message but cannot prove an ownership binding or
+    un-run an effect.
+    """
+
+    reason: str | None
+    operator_overridable: bool
+
+
 def _ordered_child_recovery_reason(
     parent_state: RunState,
     task: SubTLTask,
     child_state: RunState,
     config: TLLoopConfig,
     store: RunStore,
-) -> str | None:
+) -> _ChildRecoveryProof:
     """Return a fail-closed reason when child continuation proof is incomplete."""
     child_store = RunStore(task.name, store.run_dir)
     parent_slice = parent_state.slices.get(task.name)
     if parent_slice is None:
-        return f"parent checkpoint is missing child slice {task.name!r}"
+        return _hard_failure(f"parent checkpoint is missing child slice {task.name!r}")
     parent_branch = parent_state.owner_branch or config.branch
     recovery_config = replace(config, branch=parent_branch)
     branch = derive_child_branch(parent_branch, _child_controller_name(task))
     worktree = str(_sub_tl_worktree(recovery_config, store.root_dir, store.run_id, task))
     if parent_slice.branch != branch or parent_slice.worktree != worktree:
-        return "parent child branch or worktree does not match the declared owner"
+        return _hard_failure("parent child branch or worktree does not match the declared owner")
+    # Either reconciled boundary proves the child's dispatch of record: the
+    # original spawn confirmation, or the replacement invocation an approved
+    # recovery minted. Anything else means the dispatch is unresolved or failed,
+    # which no operator answer can release.
     if (
         not parent_slice.dispatch_intent_id
         or parent_slice.dispatch_authoritative_event_seq is None
-        or parent_slice.dispatch_last_boundary != "sub_tl_started"
+        or parent_slice.dispatch_last_boundary not in RECONCILED_SUB_TL_DISPATCH_BOUNDARIES
     ):
-        return "accepted ordered-child dispatch intent is not durably reconciled"
+        return _hard_failure(
+            "accepted ordered-child dispatch intent is not durably reconciled"
+        )
     expected_controller = _child_controller_name(task)
     if parent_slice.dispatch_agent_id != expected_controller:
-        return (
+        return _hard_failure(
             "accepted ordered-child dispatch identity "
             f"{parent_slice.dispatch_agent_id!r} does not match the declared controller "
             f"{expected_controller!r}"
         )
     if parent_slice.pr_number is not None or parent_slice.publication is not None:
-        return "parent child has publication evidence requiring integration reconciliation"
+        return _hard_failure(
+            "parent child has publication evidence requiring integration reconciliation"
+        )
     if child_state.run_id != task.name:
-        return "child checkpoint run identity does not match the declared child"
+        return _hard_failure("child checkpoint run identity does not match the declared child")
     if not isinstance(child_state.recursive_fsm, RecursiveTLFailed):
-        return "child checkpoint is not an authoritative recursive failure"
+        return _hard_failure("child checkpoint is not an authoritative recursive failure")
     if child_state.owner_branch != branch or child_state.owner_worktree != worktree:
-        return "child checkpoint owner branch or worktree conflicts with the parent"
+        return _hard_failure(
+            "child checkpoint owner branch or worktree conflicts with the parent"
+        )
     if child_state.parent_run_id != parent_state.run_id or child_state.parent_branch != parent_branch:
-        return "child checkpoint parent ownership does not match the current controller"
+        return _hard_failure(
+            "child checkpoint parent ownership does not match the current controller"
+        )
     if child_state.plan_manifest is None or parent_state.plan_manifest is None:
-        return "matching child plan manifest is missing"
+        return _hard_failure("matching child plan manifest is missing")
     node = next(
         (candidate for candidate in parent_state.plan_manifest.nodes if candidate.name == task.name),
         None,
@@ -1994,34 +2128,42 @@ def _ordered_child_recovery_reason(
         else None
     )
     if expected_child is None or child_state.plan_manifest.digest != expected_child.digest:
-        return "child checkpoint plan manifest does not match the parent declaration"
+        return _hard_failure("child checkpoint plan manifest does not match the parent declaration")
     diagnostic = RunStore(task.name, store.run_dir).exit_diagnostics()
     exit_reason = diagnostic.get("reason") if isinstance(diagnostic, Mapping) else None
     if not isinstance(exit_reason, str) or not exit_reason:
-        return "durable child exit diagnostic is missing"
+        return _hard_failure("durable child exit diagnostic is missing")
     binding_error = _ordered_exit_diagnostic_binding_error(diagnostic, child_state)
     if binding_error is not None:
-        return binding_error
+        return _hard_failure(binding_error)
     if not _retryable_ordered_exit_reason(exit_reason):
-        return f"child exit is not a retryable startup, transport, or process failure: {exit_reason}"
+        # Every ownership, publication, and effect proof above already holds, so
+        # the only thing left unproven is how this message is classified. That
+        # judgement is exactly what an operator is being asked to make.
+        return _ChildRecoveryProof(
+            f"child exit is not a retryable startup, transport, or process failure: {exit_reason}",
+            True,
+        )
     integration = child_state.integration
     if integration.lifecycle in {
         IntegrationLifecycle.MERGED,
         IntegrationLifecycle.INTEGRATION_VALIDATED,
         IntegrationLifecycle.MERGING,
     }:
-        return "child integration has completed or in-flight merge evidence"
+        return _hard_failure(
+            "child integration has completed or in-flight merge evidence"
+        )
     for slice_state in child_state.slices.values():
         if slice_state.status in {SliceStatus.FAILED, SliceStatus.PARKED, SliceStatus.BLOCKED}:
-            return f"child slice {slice_state.id!r} has an unsafe terminal status"
+            return _hard_failure(f"child slice {slice_state.id!r} has an unsafe terminal status")
         if slice_state.status is SliceStatus.MERGED:
-            return f"child slice {slice_state.id!r} already completed"
+            return _hard_failure(f"child slice {slice_state.id!r} already completed")
         if slice_state.action is not None and slice_state.action.phase in {
             ActionPhase.INTENDED,
             ActionPhase.IN_FLIGHT,
             ActionPhase.UNKNOWN,
         }:
-            return f"child slice {slice_state.id!r} has an unresolved action boundary"
+            return _hard_failure(f"child slice {slice_state.id!r} has an unresolved action boundary")
         if slice_state.status in {
             SliceStatus.SPAWNED,
             SliceStatus.DISPATCH_UNCONFIRMED,
@@ -2032,15 +2174,20 @@ def _ordered_child_recovery_reason(
             or not slice_state.dispatch_agent_id
             or slice_state.dispatch_authoritative_event_seq is None
         ):
-            return f"child slice {slice_state.id!r} lacks accepted dispatch evidence"
+            return _hard_failure(f"child slice {slice_state.id!r} lacks accepted dispatch evidence")
     journal_path = child_store.run_dir / "action-journal.json"
     try:
         pending = EffectJournal(task.name, journal_path).pending_entries()
     except ActionJournalError as error:
-        return f"child action journal cannot be verified: {error}"
+        return _hard_failure(f"child action journal cannot be verified: {error}")
     if pending:
-        return "child action journal contains an unreconciled effect"
-    return None
+        return _hard_failure("child action journal contains an unreconciled effect")
+    return _ChildRecoveryProof(None, False)
+
+
+def _hard_failure(reason: str) -> _ChildRecoveryProof:
+    """One fail-closed reason no operator answer may release."""
+    return _ChildRecoveryProof(reason, False)
 
 
 def _ordered_exit_diagnostic_binding_error(
@@ -2121,13 +2268,135 @@ def _retryable_ordered_exit_reason(reason: str) -> bool:
     )
 
 
+def _ordered_child_invocation_is_gone(store: RunStore, task_name: str) -> bool:
+    """Whether the recorded child controller invocation provably no longer exists.
+
+    A child controller that exited before authoritative resolution persisted its
+    own recursive failure checkpoint and an exit diagnostic bound to that exact
+    checkpoint revision. That diagnostic is the only durable proof available
+    that the prior invocation — and therefore its delivery target — is gone,
+    so it is what authorizes minting a replacement instead of reusing the
+    recorded identity.
+    """
+    child_store = RunStore(task_name, store.run_dir)
+    if not child_store.path.exists():
+        return False
+    try:
+        child_state = child_store.load()
+    except (OSError, ValueError):
+        return False
+    if _ordered_exit_diagnostic_binding_error(
+        child_store.exit_diagnostics(),
+        child_state,
+    ) is not None:
+        return False
+    return isinstance(child_state.recursive_fsm, RecursiveTLFailed)
+
+
+def _mint_ordered_child_invocation(
+    target: SliceState,
+    state: RunState,
+    store: RunStore,
+    target_name: str,
+    agent_id: str,
+) -> SliceState:
+    """Replace one ordered child's exited invocation with a fresh, valid identity.
+
+    An approved recovery of a child whose controller already exited must not
+    deliver to the pane that exited: the relaunch reuses the same agent name,
+    branch, worktree, and dispatch intent, so without a new invocation the
+    server would resolve the dead one. The replacement is deterministic in the
+    child's own exit diagnostic, which is what makes a repeated `--continue`
+    idempotent instead of minting a second identity per attempt.
+
+    The relaunched slice stays at a reconciled dispatch boundary, so a child that
+    fails again after this recovery is still provable. A boundary outside
+    ``RECONCILED_SUB_TL_DISPATCH_BOUNDARIES`` would be read as an unresolved
+    dispatch by the next continuation proof, which would make a second failure of
+    the same child permanently unrecoverable and would report it as a dispatch
+    reconciliation fault rather than the exit that actually caused it.
+
+    Publication ownership is untouched: the child's recorded PR, head, and
+    publication binding survive, so nothing here can hand the child's work to
+    another owner or re-publish it.
+    """
+    diagnostic = RunStore(target_name, store.run_dir).exit_diagnostics()
+    revision = diagnostic.get("checkpoint_revision") if isinstance(diagnostic, Mapping) else None
+    seed = f"{state.run_id}:{target_name}:ordered-recovery:{revision}"
+    intent_id = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+    if target.dispatch_intent_id == intent_id:
+        # This exact exit already authorized this exact invocation. Re-minting
+        # would let a repeated `--continue` walk the dispatch generation forward
+        # without any new child ever running.
+        return target
+    generation = target.dispatch_generation + 1
+    # The authoritative boundary moves forward to the position this recovery was
+    # decided at, and never backward: a stale-boundary marker would let a
+    # confirmation from the previous invocation satisfy this one.
+    authoritative_seq = max(
+        target.dispatch_authoritative_event_seq or 0,
+        state.events.last_consumed_offset,
+    )
+    return replace(
+        target,
+        dispatch_intent_id=intent_id,
+        dispatch_invocation_id=intent_id,
+        dispatch_generation=generation,
+        dispatch_authoritative_event_seq=authoritative_seq,
+        dispatch_last_boundary=SUB_TL_DISPATCH_RECOVERED_BOUNDARY,
+        dispatch_error=None,
+        dispatch_error_code=None,
+        recovery=_ordered_child_recovery_state(
+            state,
+            target_name,
+            intent_id,
+            agent_id,
+            generation,
+        ),
+    )
+
+
+def _ordered_child_recovery_state(
+    state: RunState,
+    target_name: str,
+    intent_id: str,
+    agent_id: str,
+    generation: int,
+) -> RecoveryState:
+    """Record the approved recovery that produced one fresh child invocation."""
+    return begin_recovery(
+        cause="ordered_child_pane_exited",
+        owner_run_id=state.run_id,
+        slice_attempt=1,
+        owner_agent_id=agent_id,
+        invocation_generation=generation,
+        evidence={
+            "invocation_id": intent_id,
+            "slice_id": target_name,
+            "authorization_source": "human",
+            "reopened_from": "ordered_child_recovery",
+        },
+        next_action="resume_same_owner",
+    )
+
+
 def _reopen_ordered_scope(
     state: RunState,
     plan: WorkPlan,
     store: RunStore,
     target_name: str | None,
+    *,
+    authorized: bool = False,
 ) -> RunState:
-    """Reopen one proven ordered scope while retaining all durable identities."""
+    """Reopen one proven ordered scope while retaining all durable identities.
+
+    ``authorized`` marks an operator-approved recovery, where the prior child
+    controller invocation is provably gone. That child is relaunched with a
+    fresh invocation identity and dispatch generation so guidance lands on a live
+    delivery target instead of the exited pane, while its branch, worktree,
+    publication ownership, and dispatch intent are all preserved: the child is
+    reopened, never duplicated.
+    """
     if state.plan_manifest is None:
         raise TLLoopError("ordered recovery checkpoint has no plan manifest")
     planning = _canonical_planning_from_manifest(state.plan_manifest, state.slices)
@@ -2200,11 +2469,21 @@ def _reopen_ordered_scope(
     slices = dict(state.slices)
     if target_name is not None:
         target = slices[target_name]
-        slices[target_name] = replace(
+        reopened = replace(
             slice_transition(target, SliceStatusChanged(SliceStatus.SPAWNED)),
             park_cause=None,
             dispatch_error=None,
         )
+        if authorized and _ordered_child_invocation_is_gone(store, target_name):
+            task = tasks_by_name.get(target_name)
+            reopened = _mint_ordered_child_invocation(
+                reopened,
+                state,
+                store,
+                target_name,
+                _child_controller_name(task) if task is not None else target_name,
+            )
+        slices[target_name] = reopened
     sub_tl_states = dict(state.integration.sub_tl_states)
     if target_name is not None:
         sub_tl_states[target_name] = IntegrationLifecycle.RUNNING
@@ -9156,7 +9435,7 @@ def _prepare_sub_tl_stage(
                 worktree=worktree,
                 dispatch_intent_id=internal_intent_id,
                 dispatch_started_at=internal_attempt.started_at,
-                dispatch_last_boundary="sub_tl_started",
+                dispatch_last_boundary=SUB_TL_DISPATCH_STARTED_BOUNDARY,
                 dispatch_agent_id=child_name,
                 dispatch_authoritative_event_seq=authoritative_seq,
                 dispatch_generation=internal_attempt.dispatch_generation,

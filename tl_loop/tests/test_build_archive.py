@@ -100,6 +100,39 @@ def test_new_nested_source_is_present_after_incremental_build() -> None:
         _build_exomonad()
 
 
+def test_rebuilt_archive_carries_the_ordered_recovery_evidence(tmp_path: Path) -> None:
+    """The controller the server runs must contain the recovery fix itself.
+
+    The ordered-recovery fix lives in the packaged archive, not in the binary's
+    own source: the ExoMonad server executes this zipapp. A stale archive would
+    therefore keep the pre-fix behavior — legacy Chainlink results rejected,
+    answered gates re-armed, and a recovery relaunched against the exited child
+    pane — while every source-level test passed. The evidence has to be read out
+    of the rebuilt artifact, not out of the tree it was built from.
+    """
+    archive = tmp_path / "tl_loop.pyz"
+    build_archive(REPOSITORY_ROOT / "tl_loop", archive)
+
+    with zipfile.ZipFile(archive) as package:
+        escalate = package.read("tl_loop/loop/escalate.py").decode("utf-8")
+        driver = package.read("tl_loop/loop/driver.py").decode("utf-8")
+
+    # The legacy Chainlink shape normalizes to one positive issue ID.
+    assert "cicoIssueId" in escalate
+    assert "def chainlink_issue_id(" in escalate
+    assert "AmbiguousIssueId" in escalate
+    # An approved gate authorizes recovery; a rejected one is never re-armed.
+    assert "def _hold_ordered_recovery_gate(" in driver
+    assert "authorized: bool = False" in driver
+    assert "def _ordered_child_invocation_is_gone(" in driver
+    assert "def _mint_ordered_child_invocation(" in driver
+    assert '"sub_tl_recovered"' in driver
+    # A reopened child must stay at a boundary the next proof accepts, or a second
+    # failure of the same child is permanently unrecoverable.
+    assert "RECONCILED_SUB_TL_DISPATCH_BOUNDARIES" in driver
+    assert "dispatch_last_boundary not in RECONCILED_SUB_TL_DISPATCH_BOUNDARIES" in driver
+
+
 def test_archive_excludes_interpreter_artifacts_and_tests(tmp_path: Path) -> None:
     archive_path = tmp_path / "tl_loop.pyz"
     subprocess.run(

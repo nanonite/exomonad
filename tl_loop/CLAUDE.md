@@ -610,6 +610,54 @@ Ledger readers may set `scope_run_id` and `scope_agent_id`. An agent scope
 includes the agent's own events and its directly spawned children, so a root
 reader does not consume a grandchild review event.
 
+### Ordered-child recovery gate answers
+
+`--continue` reopens an ordered child only when the durable checkpoint proof
+holds: matching plan manifest, child branch and worktree, parent ownership,
+accepted dispatch intent, an exit diagnostic bound to the exact child
+checkpoint revision, and a retryable exit reason. When any proof fails the run
+keeps `tl_failed` and opens `tl-ordered-child-recovery-<child>`.
+
+An answer to that gate is a decision, and the two non-approvals are treated
+differently from each other only in what they release, never in what they may
+undo. `pending` and `rejected` both leave the run gated, and neither is ever
+written back to `pending`: `_hold_ordered_recovery_gate` opens a gate only when
+its name has never been recorded, so a decline survives every later `--continue`
+instead of silently re-asking the question.
+
+`approved` releases the recovery in exactly one case: when the sole unproven
+fact is how the child's exit reason is classified, because every ownership,
+publication, merge, and effect-reconciliation proof already holds. An operator
+may overrule a judgement about a message; no answer can manufacture an ownership
+binding or un-run an effect that may already have landed. The other failures —
+a branch that is not the declared owner's, publication evidence needing
+integration reconciliation, an in-flight merge, a sibling in an unsafe terminal
+state, or an unreconciled action-journal entry — stay gated however they are
+answered, and the slice must be re-decomposed or escalated instead. An approved
+gate can also never release a run whose failed child cannot be uniquely
+identified, because reopening that scope would relaunch siblings.
+
+An approved recovery of a child whose controller already exited relaunches that
+child with a fresh invocation id, dispatch generation, and `sub_tl_recovered`
+boundary. Without that, the relaunch resolves the same agent name and would
+deliver to the pane that already exited, failing with `tmux paste-buffer target
+pane has exited` and leaving the run `tl_failed` after being told to recover.
+The replacement id is derived from the child's own exit diagnostic revision, so
+a repeat recovery reuses it instead of advancing the generation without a child
+ever running. Branch, worktree, controller identity, PR, head, and publication
+binding are all preserved: the child is reopened, never duplicated.
+
+`park` opens its named gate before writing the parked state, so a controller
+that dies between the two leaves the operator's question rather than a parked
+slice nobody was asked about.
+
+Chainlink create results normalize through `chainlink_issue_id`: `issue_id` is
+canonical and `cicoIssueId` is the legacy Haskell shape, and both resolve to the
+same positive integer so one escalation reconciles against exactly one issue. A
+shape carrying two different positive ids raises `AmbiguousIssueId` instead of
+picking one, and `_issue_id` — the total reader used for stored records — treats
+the same shape as unprovable.
+
 ## Learned dispatch policy
 
 `tl_loop.select.learned_policy.DispatchPolicyStore` persists optional learned

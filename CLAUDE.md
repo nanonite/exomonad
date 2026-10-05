@@ -991,6 +991,22 @@ The controller resumes from the checkpoint. It does not coax a model to keep
 working, silently retry beyond a ceiling, or ask a second interactive TL to
 make the decision.
 
+An answer is never rewritten. A gate the controller re-reads on a later
+`--continue` keeps the status the operator recorded: `pending` and `rejected`
+leave the run gated and are never written back to `pending`. That matters most
+for `tl-ordered-child-recovery-<child>`, where `--continue` relaunches an ordered
+child only after the durable proof (matching plan manifest, branch, worktree,
+parent ownership, accepted dispatch intent, an exit diagnostic bound to that
+exact child checkpoint revision, and a retryable exit reason) holds. An
+`approved` answer releases the recovery only when the exit-reason classification
+is the single unproven fact: approving a question about ownership, publication,
+or an unreconciled effect is not evidence for it, so those proofs stay hard and
+the slice is re-decomposed instead. An approved recovery whose child controller
+has exited relaunches that child with a fresh invocation identity, because
+relaunching against the recorded one would deliver to the pane that already
+exited. Branch, worktree, controller identity, PR, head, and publication
+ownership are preserved, so the child is reopened rather than duplicated.
+
 A dispatch failure is one of those bounded failures, and it is classified by a
 stable machine code rather than by a message. The code is the `code` the runtime
 recorded on the correlated `agent.spawn_failed` ledger event. **Only a refusal

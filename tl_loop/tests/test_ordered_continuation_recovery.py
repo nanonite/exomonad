@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import queue
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from typing import NamedTuple
+
+import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
@@ -14,6 +18,7 @@ from tl_loop.events.envelope import EventEnvelope
 from tl_loop.fsm.scope import TLFailed, TLRunning
 from tl_loop.loop import driver
 from tl_loop.loop.driver import (
+    RECONCILED_SUB_TL_DISPATCH_BOUNDARIES,
     LeafTask,
     SubTLTask,
     TLLoopConfig,
@@ -22,6 +27,7 @@ from tl_loop.loop.driver import (
     _candidate_manifest,
     _child_config,
     _ensure_canonical_scope,
+    _hold_ordered_recovery_gate,
     _initial_slices,
     _manifest_for_plan,
     _ordered_terminal_recovery_decision,
@@ -31,12 +37,15 @@ from tl_loop.loop.driver import (
     _supervise_live_sub_tl,
     run_tl_loop,
 )
+from tl_loop.loop.journal import EffectJournal
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
     BudgetLedger,
+    GateStatus,
     IntegrationRuntimeState,
     OrderedStageState,
     PublicationBinding,
+    RunState,
     SliceStatus,
 )
 from tl_loop.state.store import RunStore, create
@@ -183,6 +192,444 @@ def _failed_ordered_run(
     # a diagnostic bound to that exact checkpoint.
     _supervise_live_sub_tl(_ExitedProcess(), child_store, config)
     return parent_store, plan, config
+
+
+GATE = "tl-ordered-child-recovery-child"
+#: The recorded production failure: the child controller died parsing a Chainlink
+#: escalation result, which no retry can fix on its own.
+UNPROVABLE_EXIT = "chainlink issue result has no positive issue ID: {'cicoIssueId': 816}"
+
+
+def _answer(parent_store: RunStore, status: GateStatus) -> RunState:
+    """Record one operator answer for the named ordered-recovery gate."""
+    parent_store.set_gate(GATE)
+    return parent_store.answer_gate(GATE, status)
+
+
+def _unprovable_child_exit(parent_store: RunStore) -> None:
+    """Replace the retryable child exit with the recorded nonretryable one.
+
+    The retryable default is recovered by the checkpoint proof alone. This
+    fixture is the case that proof must refuse, so it is the one where only an
+    operator answer can release the recovery.
+    """
+    child_store = RunStore("child", parent_store.run_dir)
+    state = child_store.load()
+    child_store.checkpoint(
+        TLFailed(UNPROVABLE_EXIT),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        integration=state.integration,
+    )
+    driver._record_child_exit_reason(child_store, UNPROVABLE_EXIT)
+
+
+def test_approved_gate_authorizes_recovery_the_evidence_cannot_prove(tmp_path: Path) -> None:
+    """An approval is a decision the checkpoint alone cannot supply.
+
+    The recorded run's child exited on a nonretryable failure, so the proof
+    refuses. Answering the gate is how the operator says to proceed anyway.
+    """
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.APPROVED)
+
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert decision is not None
+    assert decision.recoverable is True
+    assert decision.authorized is True
+    assert decision.gate_status is GateStatus.APPROVED
+    assert decision.task_name == "child"
+    assert GATE in decision.reason
+    assert UNPROVABLE_EXIT in decision.reason
+
+
+@pytest.mark.parametrize("status", [GateStatus.PENDING, GateStatus.REJECTED])
+def test_unresolved_or_rejected_recovery_stays_gated(
+    tmp_path: Path, status: GateStatus
+) -> None:
+    """Only approval releases the recovery; the other answers never do."""
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, status)
+
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert decision is not None
+    assert decision.recoverable is False
+    assert decision.authorized is False
+    assert decision.gate_status is status
+
+
+def test_rejected_gate_is_never_re_armed_to_pending(tmp_path: Path) -> None:
+    """A repeat `--continue` must not re-ask a question already declined."""
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.REJECTED)
+    before = parent_store.load()
+
+    result = run_tl_loop(
+        "parent",
+        plan,
+        EmptyQueue(),
+        ReadOnlyEffectClient(
+            EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
+        ),
+        config=replace(config, active=False),
+        root_dir=parent_store.root_dir,
+        budgets=BudgetLedger(0, 0),
+    )
+
+    after = parent_store.load()
+    assert after.gates[0].status is GateStatus.REJECTED
+    assert result.diagnostics["recovery_gate_status"] == GateStatus.REJECTED.value
+    assert isinstance(result.final_state.recursive_fsm, TLFailed)
+    assert after.recursive_fsm == before.recursive_fsm
+
+
+def test_approved_recovery_reopens_the_child_with_a_fresh_invocation(tmp_path: Path) -> None:
+    """An approved recovery must not deliver to the pane that already exited.
+
+    The child controller exited, so the recorded invocation is gone. Reopening
+    the scope with the same identity would resolve that dead delivery target
+    again, so an authorized recovery mints a fresh validated invocation while
+    keeping the same branch, worktree, and controller.
+    """
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.APPROVED)
+    state = parent_store.load()
+    before = state.slices["child"]
+
+    decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
+
+    assert decision is not None and decision.authorized is True
+    reopened = _reopen_ordered_scope(
+        state,
+        plan,
+        parent_store,
+        decision.task_name,
+        authorized=decision.authorized,
+    )
+    child = reopened.slices["child"]
+    # The exited child is reopened once, never duplicated.
+    assert list(reopened.slices) == ["child"]
+
+    assert child.dispatch_invocation_id != before.dispatch_invocation_id
+    assert child.dispatch_intent_id != before.dispatch_intent_id
+    assert child.dispatch_generation == before.dispatch_generation + 1
+    assert child.dispatch_last_boundary == "sub_tl_recovered"
+    # The child itself is reopened, never duplicated, and keeps its ownership.
+    assert child.branch == before.branch
+    assert child.worktree == before.worktree
+    assert child.dispatch_agent_id == before.dispatch_agent_id
+    assert child.recovery is not None
+    assert child.recovery.evidence["invocation_id"] == child.dispatch_invocation_id
+    assert child.recovery.evidence["authorization_source"] == "human"
+    assert reopened.recursive_fsm is not None
+    assert isinstance(reopened.recursive_fsm, TLRunning)
+
+
+def test_approved_recovery_reuses_its_invocation_when_repeated(tmp_path: Path) -> None:
+    """A repeat approved `--continue` must not mint a second identity."""
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.APPROVED)
+    state = parent_store.load()
+    decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
+    assert decision is not None
+    first = _reopen_ordered_scope(
+        state, plan, parent_store, decision.task_name, authorized=True
+    )
+    second = _reopen_ordered_scope(
+        first, plan, parent_store, decision.task_name, authorized=True
+    )
+
+    assert (
+        second.slices["child"].dispatch_invocation_id
+        == first.slices["child"].dispatch_invocation_id
+    )
+    assert (
+        second.slices["child"].dispatch_generation
+        == first.slices["child"].dispatch_generation
+    )
+
+
+#: A transient child-controller failure: the pane exited without ever reaching an
+#: authoritative resolution, so the checkpoint alone proves the child retryable.
+RETRYABLE_EXIT = "controller exited before authoritative resolution"
+
+
+def _refail_recovered_child(parent_store: RunStore, reason: str) -> None:
+    """Simulate the recovered child controller exiting a second time.
+
+    This is the ordinary second failure of the same child: the reopened slice
+    fails, the child persists its own recursive failure checkpoint, and the exit
+    diagnostic is rebound to that newer checkpoint.
+    """
+    child_store = RunStore("child", parent_store.run_dir)
+    state = child_store.load()
+    child_store.checkpoint(
+        TLFailed(reason),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        integration=state.integration,
+    )
+    driver._record_child_exit_reason(child_store, reason)
+    parent_state = parent_store.load()
+    parent_store.checkpoint(
+        TLFailed("recursive child failed"),
+        {"child": replace(parent_state.slices["child"], status=SliceStatus.FAILED)},
+        parent_state.budgets,
+        parent_state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=(OrderedStageState(1, ("child",)),),
+        integration=IntegrationRuntimeState(
+            sub_tl_states={"child": IntegrationLifecycle.FAILED}
+        ),
+    )
+
+
+def _approved_reopen(parent_store: RunStore, plan: WorkPlan, config: TLLoopConfig) -> None:
+    """Drive one approved recovery and persist the reopened child."""
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.APPROVED)
+    state = parent_store.load()
+    decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
+    assert decision is not None and decision.authorized is True
+    _reopen_ordered_scope(state, plan, parent_store, decision.task_name, authorized=True)
+
+
+def test_recovered_child_that_fails_again_is_still_provable(tmp_path: Path) -> None:
+    """One approved recovery must not permanently foreclose the same child.
+
+    Recovery exists so an exited pane can be relaunched. If the relaunched child
+    then exits too — the same scenario this issue exists for — the next
+    continuation must still be able to prove it. A recovery that leaves the
+    reopened slice at a boundary the proof rejects would instead make every later
+    failure of that child unrecoverable, and would report it as a dispatch
+    reconciliation fault rather than the exit that actually caused it.
+    """
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _approved_reopen(parent_store, plan, config)
+
+    reopened = parent_store.load().slices["child"]
+    assert reopened.dispatch_last_boundary in RECONCILED_SUB_TL_DISPATCH_BOUNDARIES
+
+    # A transient second failure needs no operator answer: the checkpoint proves it.
+    _refail_recovered_child(parent_store, RETRYABLE_EXIT)
+    transient = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert transient is not None
+    assert transient.recoverable is True
+    assert transient.authorized is False
+    assert transient.task_name == "child"
+
+
+def test_recovered_child_nonretryable_failure_stays_operator_overridable(
+    tmp_path: Path,
+) -> None:
+    """A second unprovable exit must still be released by an operator answer.
+
+    Only the classification of the exit reason is ever overridable. If a prior
+    recovery moved the child off a reconciled dispatch boundary, an answer could
+    no longer release it at all, and the run would be stuck on a diagnosis that
+    names dispatch reconciliation instead of the child's exit.
+    """
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _approved_reopen(parent_store, plan, config)
+    _refail_recovered_child(parent_store, UNPROVABLE_EXIT)
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None
+    # The operator already authorized recovery of this child, so the standing
+    # answer still releases a later failure without being asked again.
+    assert decision.authorized is True
+    assert decision.recoverable is True
+    # The proof reached the exit-reason classification, which is overridable.
+    # It did not stop at the dispatch check, which no answer could release.
+    assert decision.operator_overridable is True
+    assert "dispatch" not in decision.reason
+
+
+def test_second_recovery_mints_a_new_invocation_for_the_second_exit(
+    tmp_path: Path,
+) -> None:
+    """Each exited invocation gets its own replacement, never a reused identity."""
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _approved_reopen(parent_store, plan, config)
+    first = parent_store.load().slices["child"]
+
+    _refail_recovered_child(parent_store, UNPROVABLE_EXIT)
+    state = parent_store.load()
+    decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
+    assert decision is not None and decision.authorized is True
+    reopened = _reopen_ordered_scope(
+        state, plan, parent_store, decision.task_name, authorized=True
+    )
+    second = reopened.slices["child"]
+
+    assert second.dispatch_invocation_id != first.dispatch_invocation_id
+    assert second.dispatch_generation == first.dispatch_generation + 1
+    assert second.dispatch_last_boundary in RECONCILED_SUB_TL_DISPATCH_BOUNDARIES
+
+
+def test_approved_recovery_keeps_publication_ownership(tmp_path: Path) -> None:
+    """Recovery must not hand a child's published work to another owner."""
+    parent_store, plan, config = _failed_ordered_run(
+        tmp_path,
+        child_status=SliceStatus.IN_REVIEW,
+        child_publication=True,
+    )
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.APPROVED)
+    state = parent_store.load()
+    child_state = RunStore("child", parent_store.run_dir).load()
+    publication = child_state.slices["leaf"].publication
+    assert publication is not None and publication.pr_number == 41
+
+    decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
+
+    assert decision is not None and decision.authorized is True
+    reopened = _reopen_ordered_scope(
+        state, plan, parent_store, decision.task_name, authorized=True
+    )
+    child = reopened.slices["child"]
+
+    assert child.pr_number == state.slices["child"].pr_number
+    assert child.publication == state.slices["child"].publication
+    recovered = RunStore("child", parent_store.run_dir).load()
+    assert recovered.slices["leaf"].publication == publication
+    assert recovered.slices["leaf"].dispatch_intent_id == "leaf-dispatch"
+
+
+class _UnreconciledIntent(NamedTuple):
+    """One effect the child recorded as intended and never confirmed."""
+
+    operation: str
+    target: str
+    arguments: Mapping[str, object]
+
+
+def test_approved_gate_does_not_release_an_ownership_failure(tmp_path: Path) -> None:
+    """Approval cannot make an unproven branch binding provable.
+
+    The parent slice claims a branch that is not the one derived for this child,
+    so the controller cannot tell whose work the relaunch would adopt. Approving
+    the gate is an operator's judgement about a question, not evidence about
+    ownership, so the run stays gated.
+    """
+    parent_store, plan, config = _failed_ordered_run(tmp_path, child_owner_branch="main.imposter")
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.APPROVED)
+
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert decision is not None
+    assert decision.recoverable is False
+    assert decision.authorized is False
+    assert "declared owner" in decision.reason
+    assert decision.gate_status is GateStatus.APPROVED
+
+
+def test_approved_gate_does_not_release_an_unreconciled_effect(tmp_path: Path) -> None:
+    """Approval cannot re-dispatch an effect the child may already have run.
+
+    The child recorded an intended effect it never confirmed, so relaunching it
+    would risk running that effect twice. The child exited retryably here, so the
+    only thing refusing the proof is that unreconciled entry — proving the gate
+    is answerable and that answering it still changes nothing.
+    """
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    child_store = RunStore("child", parent_store.run_dir)
+    EffectJournal("child", child_store.run_dir / "action-journal.json").append(
+        _UnreconciledIntent("merge_pr", "41", {"pr_number": 41})
+    )
+    _answer(parent_store, GateStatus.APPROVED)
+
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert decision is not None
+    assert decision.recoverable is False
+    assert decision.authorized is False
+    assert "unreconciled effect" in decision.reason
+    assert decision.gate_status is GateStatus.APPROVED
+
+
+def test_approved_ownership_failure_dispatches_nothing(tmp_path: Path) -> None:
+    """The gated run stays ``tl_failed`` and redispatches no child at all.
+
+    This is the end-to-end shape of the safety property: an approved gate whose
+    proof is unprovable for ownership reasons must produce the same
+    no-delivery outcome as a rejected one, not a relaunch against a branch the
+    controller never proved was this child's.
+    """
+    parent_store, plan, config = _failed_ordered_run(tmp_path, child_owner_branch="main.imposter")
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.APPROVED)
+    before = _child_identity(parent_store)
+
+    result = run_tl_loop(
+        "parent",
+        plan,
+        EmptyQueue(),
+        ReadOnlyEffectClient(
+            EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
+        ),
+        config=replace(config, active=False),
+        root_dir=parent_store.root_dir,
+        budgets=BudgetLedger(0, 0),
+    )
+
+    assert isinstance(result.final_state.recursive_fsm, TLFailed)
+    assert result.final_state.fsm.phase.value == "tl_failed"
+    assert result.diagnostics["recovery_gate_status"] == GateStatus.APPROVED.value
+    assert _child_identity(parent_store) == before
+
+
+def _child_identity(parent_store: RunStore) -> tuple[object, ...]:
+    """The durable dispatch identity a redispatch would have to change."""
+    child = parent_store.load().slices["child"]
+    return (
+        child.status,
+        child.dispatch_invocation_id,
+        child.dispatch_intent_id,
+        child.dispatch_generation,
+        child.dispatch_last_boundary,
+    )
+
+
+def test_unanswered_recovery_opens_exactly_one_pending_gate(tmp_path: Path) -> None:
+    """The gate is opened once and stays pending until an operator answers."""
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _unprovable_child_exit(parent_store)
+
+    decision = _ordered_terminal_recovery_decision(
+        parent_store.load(), plan, config, parent_store
+    )
+
+    assert decision is not None
+    assert decision.gate_status is None
+    first = _hold_ordered_recovery_gate(parent_store, decision)
+    second = _hold_ordered_recovery_gate(parent_store, decision)
+    assert [gate.name for gate in first.gates] == [GATE]
+    assert second.gates[0].status is GateStatus.PENDING
 
 
 def test_continue_reopens_only_proven_failed_ordered_child(tmp_path: Path) -> None:

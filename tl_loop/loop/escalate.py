@@ -74,6 +74,11 @@ _BLOCKED_GATE_CAUSES = frozenset(
         ParkCause.REPEATED_ACTION_NO_PROGRESS,
     }
 )
+#: Every issue-ID key a Chainlink create or list response may use. ``issue_id``
+#: is canonical; ``cicoIssueId`` is the legacy Haskell shape that older
+#: checkpoints still carry. Both must normalize to the same integer so one
+#: escalation reconciles against exactly one issue.
+_ISSUE_ID_KEYS = ("issue_id", "id", "number", "cicoIssueId")
 
 
 class EscalationError(RuntimeError):
@@ -82,6 +87,10 @@ class EscalationError(RuntimeError):
 
 class IssueCreationError(EscalationError):
     """The needs-human issue was not created with a usable ID."""
+
+
+class AmbiguousIssueId(EscalationError):
+    """One Chainlink result carried two different positive issue IDs."""
 
 
 def blocked_gate_name(run_id: str, slice_id: str, attempt: int, cause: str) -> str:
@@ -312,9 +321,14 @@ def park(
         return document
 
     prior_phase = store.load().fsm.phase.value
-    apply(store.run_dir, mutate)
+    # The operator's question is decided before the issue is created, so the
+    # gate is opened first. Park-and-gate evidence is then durable as a unit: a
+    # controller that dies between the park and its gate can never leave a
+    # parked slice whose named question is invisible. The reverse ordering is
+    # the unsafe one, and it is exactly the window that lost #816's park.
     if gate_name is not None:
         gate_created = _ensure_gate(store, gate_name)
+    apply(store.run_dir, mutate)
     if isinstance(issue_creator, EffectClient):
         _emit_park_events(
             issue_creator,
@@ -1174,7 +1188,7 @@ def _create_issue_locked(
         if result.success is not True:
             raise IssueCreationError(result.error or "chainlink issue creation failed")
         value = result.result
-    issue_id = _issue_id(value)
+    issue_id = chainlink_issue_id(value)
     if issue_id is None:
         raise IssueCreationError(f"chainlink issue result has no positive issue ID: {value!r}")
     _write_escalation_intent(
@@ -1192,19 +1206,64 @@ def _create_issue_locked(
     return issue_id
 
 
+def _issue_id_candidates(value: object) -> tuple[int, ...]:
+    """Every distinct positive issue id one Chainlink result shape carries.
+
+    ``issue_id`` is canonical and ``cicoIssueId`` is the legacy Haskell shape;
+    both are read, so either normalizes to the same integer. A wrapper object
+    (``{"issue": {...}}``) is unwrapped one level because the create and list
+    responses both use it. Non-positive and non-integer values are not
+    candidates: they are malformed, and they are never silently coerced.
+    """
+    if type(value) is int:
+        return (value,) if value > 0 else ()
+    if not isinstance(value, Mapping):
+        return ()
+    found: list[int] = []
+    for key in _ISSUE_ID_KEYS:
+        candidate = value.get(key)
+        if type(candidate) is int and candidate > 0 and candidate not in found:
+            found.append(candidate)
+    nested = value.get("issue")
+    if isinstance(nested, Mapping):
+        for candidate in _issue_id_candidates(nested):
+            if candidate not in found:
+                found.append(candidate)
+    return tuple(found)
+
+
+def chainlink_issue_id(value: object) -> int | None:
+    """Normalize one Chainlink issue result to exactly one positive issue ID.
+
+    The canonical ``issue_id`` shape, the legacy ``cicoIssueId`` shape, a bare
+    decimal, and a one-level ``issue`` wrapper all normalize to one integer, so
+    one escalation always reconciles against exactly one issue. A shape that
+    carries two different positive IDs is contradictory: it fails closed
+    instead of picking one and reconciling the wrong issue later.
+    """
+    candidates = _issue_id_candidates(value)
+    if len(candidates) > 1:
+        raise AmbiguousIssueId(
+            f"chainlink issue result carries conflicting issue IDs {list(candidates)}: {value!r}"
+        )
+    return candidates[0] if candidates else None
+
+
 def _issue_id(value: object) -> int | None:
-    if type(value) is int and value > 0:
-        return value
-    if isinstance(value, Mapping):
-        # `issue_id` is canonical; `cicoIssueId` is the legacy Haskell shape.
-        for key in ("issue_id", "id", "number", "cicoIssueId"):
-            candidate = value.get(key)
-            if type(candidate) is int and candidate > 0:
-                return candidate
-    return None
+    """Return one issue ID from a stored record, or None when it is unprovable.
+
+    Readers use this total form: a record that is absent, malformed, or
+    self-contradictory carries no usable ID, so the caller fails closed on the
+    record instead of reconciling against an id it cannot prove.
+    """
+    try:
+        return chainlink_issue_id(value)
+    except AmbiguousIssueId:
+        return None
 
 
 __all__ = [
+    "AmbiguousIssueId",
     "EscalationError",
     "HarnessSwitchDecision",
     "IssueCreationError",
@@ -1213,6 +1272,7 @@ __all__ = [
     "authorize_harness_switch",
     "bind_legacy_escalation",
     "blocked_gate_name",
+    "chainlink_issue_id",
     "park",
     "switch_harness",
 ]

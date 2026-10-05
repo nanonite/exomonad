@@ -15,7 +15,9 @@ import pytest
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import JsonObject, JsonValue
+from tl_loop.loop import escalate
 from tl_loop.loop.escalate import (
+    AmbiguousIssueId,
     EscalationError,
     HarnessSwitchDecision,
     IssueCreationError,
@@ -31,6 +33,7 @@ from tl_loop.loop.escalate import (
     authorize_harness_switch,
     bind_legacy_escalation,
     blocked_gate_name,
+    chainlink_issue_id,
     park,
     switch_harness,
 )
@@ -163,6 +166,83 @@ def test_issue_id_accepts_canonical_and_legacy_shapes(
     payload: object, expected: int | None
 ) -> None:
     assert _issue_id(payload) == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"issue_id": 816},
+        {"cicoIssueId": 816},
+        {"id": 816},
+        {"number": 816},
+        {"issue": {"issue_id": 816}},
+        {"issue": {"cicoIssueId": 816}},
+    ],
+)
+def test_canonical_and_legacy_shapes_normalize_to_one_positive_issue_id(
+    payload: object,
+) -> None:
+    """Every accepted result shape is the same issue, not a second one.
+
+    The canonical `issue_id` shape and the legacy `cicoIssueId` shape that older
+    controllers persisted must both reconcile against exactly one positive
+    issue ID, so one escalation never opens two issues for one park.
+    """
+    assert chainlink_issue_id(payload) == 816
+    assert chainlink_issue_id(payload) == _issue_id(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"issue_id": 816, "cicoIssueId": 816},
+        {"cicoIssueId": 816, "issue_id": 816},
+        {"issue_id": 816, "id": 816},
+        {"issue_id": 816, "number": 816},
+        {"issue_id": 816, "issue": {"cicoIssueId": 816}},
+    ],
+)
+def test_agreeing_keys_are_one_issue_id(payload: object) -> None:
+    assert chainlink_issue_id(payload) == 816
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"issue_id": 816, "cicoIssueId": 9001},
+        {"cicoIssueId": 9001, "issue_id": 816},
+        {"issue_id": 816, "number": 9001},
+        {"issue_id": 816, "issue": {"cicoIssueId": 9001}},
+    ],
+)
+def test_conflicting_shapes_fail_closed_instead_of_picking_one(payload: object) -> None:
+    """Two different IDs are contradictory, not a preference order.
+
+    Picking one would reconcile a park against an issue that may not be the one
+    this escalation created, and would let a later retry create a duplicate.
+    """
+    with pytest.raises(AmbiguousIssueId, match="conflicting issue IDs"):
+        chainlink_issue_id(payload)
+    # The total reader form used for stored records treats the same shape as
+    # unprovable, so no caller can adopt either ID.
+    assert _issue_id(payload) is None
+
+
+def test_conflicting_create_result_fails_closed_at_the_boundary() -> None:
+    class ConflictingCreator:
+        def chainlink_issue_create(
+            self,
+            *,
+            title: str,
+            description: str | None = None,
+            labels: Sequence[str] | None = None,
+            priority: str | None = None,
+        ) -> ToolResult:
+            del title, description, labels, priority
+            return _tool_result({"issue_id": 816, "cicoIssueId": 9001})
+
+    with pytest.raises(AmbiguousIssueId, match="conflicting issue IDs"):
+        _create_issue(ConflictingCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
 
 
 def test_create_issue_parses_legacy_cico_issue_id_result() -> None:
@@ -1309,9 +1389,12 @@ def test_park_reuses_durable_intent_for_non_gated_cause(tmp_path: Path) -> None:
     assert len(created) == 1, "non-gated causes must also deduplicate"
 
 
-def test_effect_client_parses_legacy_cico_issue_id_at_the_boundary(tmp_path: Path) -> None:
+@pytest.mark.parametrize("result_shape", [{"cicoIssueId": 816}, {"issue_id": 816}])
+def test_effect_client_parses_both_issue_id_shapes_at_the_boundary(
+    tmp_path: Path, result_shape: dict[str, int]
+) -> None:
     transport = ParkingTransport()
-    transport.chainlink_result = {"cicoIssueId": 816}
+    transport.chainlink_result = dict(result_shape)
     store = _store(tmp_path)
     result = park(
         _slice(),
@@ -1323,6 +1406,96 @@ def test_effect_client_parses_legacy_cico_issue_id_at_the_boundary(tmp_path: Pat
     assert isinstance(result, ParkResult)
     assert result.issue_id == 816
     assert store.load().slices["root"].park_issue_id == 816
+
+
+@pytest.mark.parametrize("result_shape", [{"cicoIssueId": 816}, {"issue_id": 816}])
+def test_reconciliation_against_either_shape_is_exactly_once(
+    tmp_path: Path, result_shape: dict[str, int]
+) -> None:
+    """A park reconciled after a crash reuses its issue, whatever the shape.
+
+    Both shapes name the same issue, so the retry must resolve to it through the
+    durable intent and must not open a second one.
+    """
+    store = _store(tmp_path)
+    created: list[str] = []
+
+    class Creator:
+        marker_title: str | None = None
+
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
+            title = str(kwargs["title"])
+            created.append(title)
+            Creator.marker_title = title
+            return _tool_result(dict(result_shape))
+
+        def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
+            del kwargs
+            issues = (
+                [{**result_shape, "title": Creator.marker_title}]
+                if Creator.marker_title is not None
+                else []
+            )
+            return _tool_result({"issues": issues})
+
+    creator = Creator()
+    first = park(_slice(), ParkCause.REVIEW_STUCK, store=store, issue_creator=creator)
+    second = park(_slice(), ParkCause.REVIEW_STUCK, store=store, issue_creator=creator)
+
+    assert isinstance(first, ParkResult) and isinstance(second, ParkResult)
+    assert first.issue_id == second.issue_id == 816
+    assert len(created) == 1
+
+
+def test_gate_is_durable_before_the_park_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between the gate and the park leaves the question, not silence.
+
+    Park and gate evidence must both outlive a child controller that dies at
+    either boundary. A parked slice whose named gate was never written is
+    invisible to the operator, because the gate is the only place the question
+    is asked. The gate therefore opens before the parked state is written, so
+    the only losing window is one where neither exists yet.
+    """
+    store = _store(tmp_path)
+    cause = ParkCause.PUBLICATION_OWNERSHIP_UNRESOLVED
+    gate_name = blocked_gate_name(store.run_id, "root", 2, cause.value)
+
+    def failing_apply(*_args: object, **_kwargs: object) -> None:
+        raise OSError("controller exited before the parked state was written")
+
+    monkeypatch.setattr(escalate, "apply", failing_apply)
+
+    with pytest.raises(OSError, match="controller exited"):
+        park(
+            _slice(),
+            cause,
+            store=store,
+            issue_creator=_ListingCallable(lambda *_: 816),
+            audit={"attempt": 2},
+        )
+
+    state = store.load()
+    # The park did not land, and the operator's question did.
+    assert state.slices["root"].status is SliceStatus.PENDING
+    assert state.slices["root"].park_issue_id is None
+    assert [gate.name for gate in state.gates] == [gate_name]
+
+    # The retry completes both halves against the same issue.
+    monkeypatch.undo()
+    result = park(
+        _slice(),
+        cause,
+        store=store,
+        issue_creator=_ListingCallable(lambda *_: 816),
+        audit={"attempt": 2},
+    )
+    completed = store.load()
+    assert isinstance(result, ParkResult)
+    assert completed.slices["root"].status is SliceStatus.PARKED
+    assert completed.slices["root"].park_issue_id == 816
+    assert [gate.name for gate in completed.gates] == [gate_name]
 
 
 def test_failed_issue_creation_does_not_mutate_state(tmp_path: Path) -> None:
