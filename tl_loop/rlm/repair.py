@@ -102,11 +102,90 @@ def compose_repair(
             if attempt == attempts:
                 raise RepairHandoffRejected(attempts, feedback) from error
             continue
-        _dispatch_resume(selected_client, number, handoff, model, dispatch=dispatch)
+        dispatch_resume(selected_client, number, handoff, model, dispatch=dispatch)
         increment_attempts(pr, number, store, slice_id)
         return handoff
 
     raise RepairHandoffRejected(attempts, feedback)
+
+
+def forward_review_findings(
+    pr: Mapping[str, object] | object,
+    verdict: Verdict | str,
+    review: Mapping[str, object] | AdjudicationResult | object,
+    *,
+    client: EffectClient | object,
+    test_plan: Sequence[str],
+    store: RunStore | None = None,
+    slice_id: str | None = None,
+    model: str | None = None,
+    dispatch: Callable[[JsonObject], object] | None = None,
+) -> RepairHandoff:
+    """Forward a NO-GO's findings verbatim to the existing PR owner, with no model.
+
+    This is the inner worker<->reviewer loop's repair: the reviewer's reasons
+    become the handoff's ROOT CAUSE unchanged, the slice's own boundary and test
+    plan supply the remaining sections, and ``resume_pr`` resumes the same owner.
+    """
+    number, paths = pr_identity(pr)
+    watch_existing_pr(client, number)
+    reasons = review_inputs(verdict, review)
+    handoff = findings_handoff(reasons, paths, test_plan)
+    dispatch_resume(client, number, handoff, model, dispatch=dispatch)
+    increment_attempts(pr, number, store, slice_id)
+    return handoff
+
+
+def dispatch_guide_handoff(
+    pr: Mapping[str, object] | object,
+    handoff: RepairHandoff,
+    *,
+    client: EffectClient | object,
+    store: RunStore | None = None,
+    slice_id: str | None = None,
+    model: str | None = None,
+    dispatch: Callable[[JsonObject], object] | None = None,
+) -> RepairHandoff:
+    """Dispatch a TL-authored handoff to the existing PR owner after boundary validation."""
+    number, paths = pr_identity(pr)
+    watch_existing_pr(client, number)
+    validate_owned_paths(handoff, paths)
+    dispatch_resume(client, number, handoff, model, dispatch=dispatch)
+    increment_attempts(pr, number, store, slice_id)
+    return handoff
+
+
+def findings_handoff(
+    reasons: Sequence[Mapping[str, object]],
+    paths: Sequence[str],
+    test_plan: Sequence[str],
+) -> RepairHandoff:
+    """Build the seven-section handoff whose ROOT CAUSE is the reviewer's findings."""
+    if not test_plan:
+        raise RepairInputError("a findings handoff requires the slice test plan")
+    findings = [_finding_line(reason) for reason in reasons]
+    return RepairHandoff(
+        root_cause="Reviewer findings, verbatim:\n" + "\n".join(findings),
+        proposed_solution=(
+            "Resolve every reviewer finding listed under ROOT CAUSE on the existing PR branch."
+        ),
+        read_first=tuple(paths),
+        steps=tuple(f"Resolve: {line.removeprefix('- ')}" for line in findings),
+        verify=tuple(test_plan),
+        boundary=("Only edit files under the slice-owned paths: " + ", ".join(paths),),
+        done_criteria=(
+            "Every finding listed under ROOT CAUSE is resolved on the PR head",
+            "The verify commands pass",
+        ),
+    )
+
+
+def _finding_line(reason: Mapping[str, object]) -> str:
+    location = str(reason.get("file", "review"))
+    line = reason.get("line")
+    if type(line) is int and line > 0:
+        location = f"{location}:{line}"
+    return f"- [{reason.get('severity', 'blocking')}] {location}: {reason.get('claim', '')}"
 
 
 def _repair_inputs(
@@ -162,7 +241,7 @@ def _repair_inputs(
     return {"sections": cast(JsonValue, sections)}
 
 
-def _dispatch_resume(
+def dispatch_resume(
     client: object,
     number: int,
     handoff: RepairHandoff,
@@ -222,4 +301,8 @@ __all__ = [
     "RepairInputError",
     "RepairPRStateError",
     "compose_repair",
+    "dispatch_guide_handoff",
+    "dispatch_resume",
+    "findings_handoff",
+    "forward_review_findings",
 ]
