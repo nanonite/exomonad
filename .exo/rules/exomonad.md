@@ -74,7 +74,8 @@ The loop advances only on authoritative events: PR/review/CI state, fixes
 pushed, approved or timed-out review, merge result, worker failure, and liveness
 observation. Reviewed-head SHA binding prevents merging a verdict for another
 head. Review repair uses `resume_pr` and never creates a stacked or duplicate
-owner.
+owner; below `reviewer_max_rounds` it carries the reviewer's findings verbatim and
+makes no model call.
 
 A dev invocation that exits without an authoritative completion, notify-parent,
 or PR handoff is never treated as successful, including exit code 0. The
@@ -124,11 +125,15 @@ ledger state:
 2. The leaf implements, tests, commits, and files the PR.
 3. The reviewer checks the exact PR head; review comments are delivered to the
    owner, and the watcher emits the resulting review/CI events.
-4. A NO-GO repair is composed and sent through `resume_pr`; a new owner,
+4. Below `reviewer_max_rounds`, a NO-GO (or a pre-merge CI failure on the
+   reviewed head) sends the reviewer's findings verbatim to the owner through
+   `resume_pr`, with no model call and no composed handoff; a new owner,
    branch, or coordinator is not created.
 5. `[PR READY]`, `[FIXES PUSHED]`, or policy-allowed `[REVIEW TIMEOUT]` plus
-   passing CI permits merge of the reviewed head. `[STUCK]` and `[FAILED]`
-   park the run and expose a human gate.
+   passing CI permits merge of the reviewed head. At `reviewer_max_rounds` the
+   controller makes one `roles.tl` guide/escalate judgment: `guide` resumes the
+   owner with a validated handoff and a fresh round budget, `escalate` opens a
+   human gate. `[STUCK]` and `[FAILED]` park the run and expose a human gate.
 
 The inbox remains a human/worker delivery mechanism. Controller coordination
 uses the durable ledger projection and run checkpoint, not inbox text or a

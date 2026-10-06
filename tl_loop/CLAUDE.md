@@ -63,7 +63,11 @@ decomposition reaches run state.
 ## RLM review adjudication boundary
 
 tl_loop.rlm.adjudicate.adjudicate_review receives the diff, comments,
-criteria, and exact reviewed head through an injected model choice. The diff
+criteria, and exact reviewed head through an injected model choice. It runs only
+for review events that carry no reviewer verdict, and only when
+`TLLoopConfig.review_model_choice` is set; the shipped runner sets none, so a
+direct reviewer verdict (the reviewer's own GO / GO-WITH-NITS / NO-GO) is the
+production decision and no model adjudicates it. The diff
 and criteria remain required RLM sections, so ContextOverflow stops the call
 before a compacted-away diff can be judged. The model output is closed to GO,
 GO-WITH-NITS, and NO-GO with structured reasons and an echoed head. Python
@@ -565,16 +569,71 @@ a coordination stop hook; its worker and reviewer lifecycle hooks remain
 independent. The Python loop owns terminal decisions without copying nudge prose
 or external checks for uncommitted work and missing PRs.
 
-## RLM repair boundary
+## Review loop and repair boundary
 
-tl_loop.rlm.repair.compose_repair is the only repair handoff path for a
-NO-GO review. It calls watcher_pr_state first and requires the existing PR to
-be open, unmerged, and identified by both head branch and SHA. The RLM receives
-the NO-GO reasons as its primary required section and returns exactly the seven
-RepairHandoff sections. Python retries semantic path-boundary violations,
-dispatches only through resume_pr, and increments the owning slice's attempts
-once after a successful dispatch. No repair handoff creates a branch, leaf
-name, or agent type.
+The review loop has two levels, and only the second uses a model.
+
+**Inner loop (deterministic, no model).** While `SliceState.review_rounds <
+reviewer_max_rounds`, a reviewer NO-GO and a pre-merge CI failure on the
+reviewed head are forwarded verbatim to the live PR owner.
+`tl_loop.rlm.repair.forward_review_findings` calls watcher_pr_state first
+(the PR must be open, unmerged, with head branch and SHA), builds the
+seven-section handoff with the reviewer's reasons as ROOT CAUSE and the slice's
+own paths and test plan as the other sections, dispatches only through
+resume_pr, and increments the owning slice's attempts once after a successful
+dispatch. No owned-path validation applies because the content is the
+reviewer's, not a model's. A round is one completed reviewer verdict
+(`ReviewVerdictObserved`) or one first CI failure on the reviewed head
+(`CIStatusObserved`); a repeated CI failure for the same head is not a round. No
+repair creates a branch, leaf name, or agent type. This path needs no
+`review_model_choice` and no model.
+
+**Outer loop (roles.tl, only at the ceiling).** When the reconciler reports
+`review_rounds_exhausted`, `_judge_review_stuck` in `loop/driver.py` runs. If
+`SliceState.tl_intervention_attempts` has reached `roles.tl.escalate_after_attempts`
+the human gate opens with no model call. Otherwise the intervention is
+checkpointed first, then `tl_loop.rlm.tl_judgment.judge_review_stuck` makes one
+`review_stuck` judgment whose closed schema is `{action: guide|escalate, reason,
+handoff?}`. `guide` carries a `RepairHandoff` (the compose_repair schema);
+`dispatch_guide_handoff` validates it against the slice's owned paths and
+dispatches it through resume_pr, and the slice's `review_rounds` is reset to 0
+(`ReviewRoundsReset`). `escalate` parks the slice with `review_rounds_exhausted`
+and opens the named human gate. A malformed or out-of-boundary guide, a backend
+failure, a context overflow, or an exhausted `roles.tl.token_budget` parks the
+slice with `ParkCause.REVIEW_STUCK` and the error in `dispatch_error`; nothing
+falls back. Each judgment emits `tl.review_stuck_judged`. A shadow (inactive)
+controller only records the gate. An active controller without
+`tl_model_choice` or `policy` raises.
+
+**compose_repair.** `tl_loop.rlm.repair.compose_repair` (a model-composed handoff)
+remains only for post-merge integration repair (`_handle_integration_conflict`),
+which still requires `review_model_choice`.
+
+### roles.tl model resolution and backend
+
+`tl_loop.rlm.tl_judgment.build_tl_model_choice` runs at startup in both
+`__main__` config sites (`_run` and `_redispatch`), inside the guarded block that
+records an exit reason through `RunStore.record_exit_reason`. The model comes from
+the first `roles.tl.allow` entry in `.exo/harness_policy.toml`: a
+`harness/model` entry pins it; a bare harness resolves through
+`.exo/model-catalog.json`. Neither resolving raises `TLModelResolutionError` naming
+the file to fix. The bare harness name is never used as a model id (plan
+authoring's `_catalog_model_id` keeps its own, separate behavior). The returned
+`RlmModelChoice` carries `RlmRoleLedger(budgets={"tl": token_budget})`.
+
+`tl_loop.rlm.subprocess_backend.SubprocessRlmBackend` is the tool-free backend: one
+stateless CLI call per request, in an empty scratch directory. `claude` runs
+`claude -p --output-format json --model <id> --no-session-persistence --tools ""`
+and reads authoritative usage from the envelope; `codex` runs `codex exec --model
+<id> --sandbox read-only --ephemeral --ignore-user-config` and reads
+`--output-last-message`; `opencode` runs `opencode run --standalone -m <id>`
+(opencode has no flag that disables tools, so isolation is the empty working
+directory and the absence of `--auto`). Codex and opencode report no usage here,
+so the charge is the deterministic `ApproximateTokenCounter` estimate. Any other
+harness, or a harness binary not on PATH, refuses startup. Each call logs the
+command and prompt size before it runs, and the exit code, response size, and on
+failure the stderr after. A call that exceeds `DEFAULT_CALL_TIMEOUT_SECONDS` (600)
+raises `RlmCallError`.
 
 ## Recursive sub-TL ownership
 

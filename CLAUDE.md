@@ -443,7 +443,7 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`. To ov
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `min_review_rounds` | 1 | Minimum review rounds before merge is permitted |
-| `reviewer_max_rounds` | 5 | Max completed verdicts before `tl_loop` parks and opens a human gate |
+| `reviewer_max_rounds` | 5 | Max review rounds (completed reviewer verdicts plus pre-merge CI failures) a slice's deterministic worker<->reviewer loop may run before `tl_loop` hands it to the one `roles.tl` review-stuck judgment |
 | `reviewer_max_wait_seconds` | 1200 | Max wait for reviewer response (20 min) |
 | `reviewer_max_rate_limit_retries` | 2 | Max rate-limit retries for reviewer agents |
 | `review_freshness_window_secs` | 1200 | Window for a review to be considered "fresh" |
@@ -454,7 +454,7 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`. To ov
 
 **Reviewer identity discipline:** Every reviewer invocation uses the one configured `exomonad-reviewer` Forgejo service account and `forgejo_reviewer_token`; per-invocation Forgejo accounts and logins are not part of this deployment. Authorization proves that the review author is the reviewer-token account rather than the PR-authoring account, then binds the review to the exact PR head and the durable reviewer invocation assigned to that slice. Git identity, branch provenance, and invocation IDs remain distinct internal traceability, and an agent never reviews its own authored PR.
 
-**Stuck state:** `tl_loop` counts completed reviewer verdicts in durable `SliceState.review_rounds`, across head resets. When the count reaches `reviewer_max_rounds` without convergence, the controller parks the slice with `review_rounds_exhausted`, opens a named human gate, and emits bounded round/ceiling telemetry. The watcher remains an observation source and never owns this control decision.
+**Stuck state:** `tl_loop` counts rounds in durable `SliceState.review_rounds`, across head resets: one per completed reviewer verdict and one per pre-merge CI failure on the reviewed head. Below `reviewer_max_rounds` the worker<->reviewer loop is deterministic and makes no model call. When the count reaches `reviewer_max_rounds` without convergence, the controller makes ONE `roles.tl` judgment with a closed `guide`/`escalate` schema. `guide` dispatches a validated seven-section handoff through `resume_pr` to the same owner with a fresh round budget; `escalate` parks the slice with `review_rounds_exhausted` and opens the named human gate. Interventions per slice are bounded by `roles.tl.escalate_after_attempts`; when they are used up the gate opens without another model call. Each judgment emits `tl.review_stuck_judged` and is charged to `roles.tl.token_budget`. A `roles.tl` model that cannot be resolved, or whose harness binary is not installed, refuses controller startup; a backend failure at judgment time parks the slice as `review_stuck` with the error recorded. The watcher remains an observation source and never owns this control decision.
 
 ### Notification Vocabulary
 
@@ -940,10 +940,14 @@ parallelism/retries; it cannot choose a harness, model, budget, or hidden
 fallback. The selector applies `.exo/harness_policy.toml` and capability
 ratings without widening an allowlist or ceiling.
 
-Model calls are narrow structured judgments: `decompose`,
-`adjudicate_review`, and `compose_repair`. Their schemas, context budgets,
-attempts, token charges, and replay records are explicit. Control flow stays
-in Python and the state writer, not in a free-form prompt.
+Model calls are narrow structured judgments: `decompose`, `adjudicate_review`,
+`compose_repair` (post-merge integration repair only), and the `review_stuck`
+guide/escalate judgment. Their schemas, context budgets, attempts, token
+charges, and replay records are explicit. Control flow stays in Python and the
+state writer, not in a free-form prompt. The `roles.tl` judgment model resolves
+from `.exo/harness_policy.toml` and `.exo/model-catalog.json` at startup and is
+served by a tool-free harness subprocess backend (`claude`, `codex`, or
+`opencode`); see [tl_loop/CLAUDE.md](tl_loop/CLAUDE.md).
 
 ### Dispatch and convergence
 
@@ -952,18 +956,24 @@ in Python and the state writer, not in a free-form prompt.
 2. A leaf works in its issue-owned branch/worktree, commits, and files its PR.
 3. The watcher and reviewer produce ledger events; the controller consumes
    them by sequence number and acknowledges only after handling succeeds.
-4. Review comments go to the live PR owner. A changed head is repaired through
-   `resume_pr`; a fresh branch or duplicate coordinator is never created.
-5. A fresh TL-adjudicated GO based on binding reviewer findings, with passing
-   CI, permits `merge_pr`. Review timeout parks the slice. The controller
-   verifies the post-merge state before advancing dependents.
+4. The worker<->reviewer inner loop is deterministic. Below
+   `reviewer_max_rounds`, a reviewer NO-GO or a pre-merge CI failure on the
+   reviewed head sends its findings verbatim to the live PR owner through
+   `resume_pr`, with no model call; a fresh branch or duplicate coordinator is
+   never created.
+5. A reviewer GO with passing same-head CI permits `merge_pr`, performed
+   mechanically by the controller. Review timeout parks the slice. The
+   controller verifies the post-merge state before advancing dependents. At
+   `reviewer_max_rounds` the outer loop runs: one `roles.tl` guide/escalate
+   judgment (see Review Policy, Stuck state).
 
 Review orchestration has one path: watcher facts are projected into the typed
 controller input alphabet, `step(state, event)` selects one intent or wait
 reason, and the `EffectJournal` executor performs the effect. A reviewer is one-shot for an
 exact head. Its terminal verdict is persisted before exit; GO waits for
 same-head CI and then uses compare evidence for `merge_pr`, while NO-GO or
-same-head CI failure uses one same-owner `resume_pr`. A head change invalidates
+same-head CI failure uses one same-owner `resume_pr` carrying the findings
+verbatim. A head change invalidates
 the prior verdict and queues one reviewer for the new head. Pane liveness never
 authorizes a merge or repair, and no path messages an exited reviewer, rewinds
 the ledger cursor, edits `plan.json`, or creates a sibling owner.

@@ -27,7 +27,7 @@ The coordinator is not one of them. `tl_loop` is a Python controller process —
 
 | Actor | Model | Spawns | Files PR | Merges PR | Lifecycle |
 |-------|-------|--------|----------|-----------|-----------|
-| `tl_loop` controller | n/a — Python; calls a model only for `decompose`, `adjudicate_review`, `compose_repair` | yes | via children | yes | one per run; resumable from `.exo/tl-loop/<run_id>/run.json` |
+| `tl_loop` controller | n/a — Python; calls a model only for `decompose`, the `roles.tl` `review_stuck` guide/escalate judgment, `compose_repair` (post-merge integration repair only), and `adjudicate_review` (review events without a reviewer verdict only) | yes | via children | yes | one per run; resumable from `.exo/tl-loop/<run_id>/run.json` |
 | `root` / `tl` roles | policy-selected from `[roles.tl]` | yes | yes | yes | RPC surface + branch coordinates; an active sub-TL is an isolated controller process, not an interactive session |
 | `dev` | policy-selected from `[roles.worker]` | no | yes | no | one assignment per invocation, exits after handoff |
 | `reviewer` | policy-selected from `[roles.reviewer]` | no | no | no | ephemeral per review round |
@@ -337,7 +337,7 @@ stateDiagram-v2
   note right of DevNeedsHumanDirection: canExit = Clean\n(TL uses resume_pr for repair)
 ```
 
-Round vocabulary is zero-based and tied to reviewer verdicts. Round 0 is the first reviewer verdict after the PR is filed. `tl_loop` persists the completed count on `SliceState.review_rounds`; it survives head resets and is compared with `reviewer_max_rounds`. Exhaustion transitions the slice to `review_rounds_exhausted` and opens a named human gate. This is controller-owned human clarification, not a watcher health failure.
+Round vocabulary is zero-based and tied to reviewer verdicts. Round 0 is the first reviewer verdict after the PR is filed. A pre-merge CI failure on the reviewed head is also a round, counted once per head. `tl_loop` persists the completed count on `SliceState.review_rounds`; it survives head resets and is compared with `reviewer_max_rounds`. Below the ceiling the worker<->reviewer loop is deterministic and calls no model. At the ceiling the controller makes one `roles.tl` judgment: `guide` resumes the same owner through `resume_pr` with a validated handoff and a fresh round budget, `escalate` transitions the slice to `review_rounds_exhausted` and opens a named human gate. `roles.tl.escalate_after_attempts` bounds the judgments per slice; past it the gate opens without a model call. This is controller-owned clarification, not a watcher health failure.
 
 ### ReviewerPhase
 
@@ -376,8 +376,22 @@ Worker has no `canExit` guards — workers are ephemeral and may end at any time
 ## 5. PR Review Convergence Flow
 
 The TL runs the workflow; the watcher only observes world state (filesystem, CI,
-Forgejo, and time). The reviewer supplies binding evidence, the TL adjudicates
-that evidence, and the controller owns repair and merge decisions.
+Forgejo, and time). The reviewer supplies the binding verdict and findings, the
+controller forwards findings to the owner and performs the merge mechanically,
+and a `roles.tl` model judgment happens only when a slice cannot converge on its
+own. The full responsibility split:
+
+| Event | Owner | Model call |
+|---|---|---|
+| Reviewer NO-GO below `reviewer_max_rounds` | inner loop: findings verbatim to the same owner through `resume_pr` | none |
+| Pre-merge CI failure on the PR head | inner loop: the failure to the same owner through `resume_pr`; counts as a round | none |
+| Reviewer GO with same-head CI green | the reviewer's decision; the controller performs `merge_pr` mechanically | none |
+| Review stuck (rounds exhausted) | one `roles.tl` judgment: `guide` or `escalate` | `roles.tl` |
+| Post-merge integration failure | `roles.tl` judgment: delegate or escalate | `roles.tl`; implemented by the follow-up issue #1160, not by this change |
+
+The inner loops are per slice and independent, so slices converge in parallel
+with no TL model call on the critical path. The TL intervenes only where slices
+interact or one cannot converge on its own.
 
 Two delivery paths run side by side and must not be confused:
 
@@ -406,10 +420,10 @@ sequenceDiagram
   Reviewer->>Reviewer: submit findings for the exact head SHA
   Note over Reviewer: ReviewerPhase: ReviewerPosted
   Watcher->>Ctl: ledger append (pr.review, ci.status_changed)
-  Ctl->>Ctl: adjudicate_review(findings, head_sha)
+  Ctl->>Ctl: persist reviewer verdict GO bound to head_sha
   CI-->>Watcher: CIStatus = success
   Watcher->>Ctl: ledger append (ci.status_changed)
-  Ctl->>Ctl: verify_review — TL GO, CI success/neutral, head binding
+  Ctl->>Ctl: verify_review — reviewer GO, CI success/neutral, head binding
   Ctl->>Ctl: merge_pr, then verify post-merge state
   Ctl->>Ctl: checkpoint slice = merged, advance dependents
   Watcher->>Ctl: observe PR branch gone
@@ -427,20 +441,28 @@ sequenceDiagram
 
   Reviewer->>Reviewer: submit findings (NO-GO)
   Watcher->>Ctl: ledger append (pr.review)
-  Ctl->>Ctl: adjudicate_review -> NO-GO
-  Ctl->>Ctl: compose_repair -> resume_pr (same owner/branch/PR)
-  Ctl->>Dev: repair guidance through resume_pr
+  Ctl->>Ctl: review_rounds < reviewer_max_rounds: no model call
+  Ctl->>Dev: resume_pr with the findings verbatim (same owner/branch/PR)
   Dev->>Dev: fix, commit, push (SHA changes)
   Watcher->>Ctl: ledger append (pr.head_changed)
   Ctl->>Reviewer: spawn reviewer for the new head
   alt GO after binding findings
     Ctl->>Ctl: wait for CI on the same head
-  else repeated NO-GO or timeout
+  else NO-GO or CI failure below the ceiling
+    Ctl->>Dev: resume_pr with the findings verbatim (another round)
+  else review_rounds reaches reviewer_max_rounds
+    Ctl->>Ctl: one roles.tl review_stuck judgment
+    alt guide
+      Ctl->>Dev: resume_pr with the validated handoff, fresh round budget
+    else escalate or roles.tl.escalate_after_attempts used up
+      Ctl->>Ctl: park review_rounds_exhausted; open named gate
+    end
+  else timeout
     Ctl->>Ctl: park named gate; no merge
   end
 ```
 
-Repair never creates a new branch, leaf name, agent type, or `-2` suffix. `compose_repair` calls `watcher_pr_state` first and requires the PR to be open, unmerged, and identified by both head branch and SHA; it dispatches only through `resume_pr`.
+Repair never creates a new branch, leaf name, agent type, or `-2` suffix. Every repair path (`forward_review_findings` for the inner loop, `dispatch_guide_handoff` for a `roles.tl` guide) calls `watcher_pr_state` first and requires the PR to be open, unmerged, and identified by both head branch and SHA; each dispatches only through `resume_pr`. Only a `guide` handoff is validated against the slice's owned paths, because only it is model-authored.
 
 ### Single-path ownership and restart behavior
 
@@ -481,7 +503,7 @@ These are the `PRReviewEvent` constructors the watcher emits. Each role's `prRev
 | `CommitsPushed` | SHA change outside the changes-requested window | `CommitsPushedEv` -> round++ | `ReviewerCommitsPushedEv` |
 | `ReviewTimeout` | no reviewer response within `reviewer_max_wait_seconds` | log only | `ReviewerTimedOutEv` -> Done |
 | `MergeReady` | **Deprecated derived state:** inferred from `pr.review` + `ci.status_changed`; not a source event | compatibility notification only; the TL derives merge eligibility | no required handler |
-| `Stuck` | controller reaches `reviewer_max_rounds` in durable `SliceState.review_rounds` | park `review_rounds_exhausted` and open a named human gate | no watcher decision |
+| `Stuck` | controller reaches `reviewer_max_rounds` in durable `SliceState.review_rounds` | one `roles.tl` judgment: `guide` resumes the owner with a fresh round budget; `escalate`, or `roles.tl.escalate_after_attempts` used up, parks `review_rounds_exhausted` and opens a named human gate | no watcher decision |
 | `DevNotPushing` / `ReviewerNotResponding` / `ReviewerNeverStarted` | health probes | log only (escalated by watcher to chainlink `review-stuck`) | n/a |
 
 ### CI and review evidence
@@ -491,8 +513,11 @@ flowchart TD
   A[Watcher observes PR review and CI] --> B[ledger: pr.review + ci.status_changed]
   B --> C{binding reviewer findings?}
   C -- no --> Z[park named gate]
-  C -- yes --> D[TL adjudicate_review]
-  D -- NO-GO --> R[compose_repair -> resume_pr same owner]
+  C -- yes --> D[reviewer verdict bound to head]
+  D -- NO-GO below ceiling --> R[findings verbatim -> resume_pr same owner]
+  D -- NO-GO at ceiling --> S[one roles.tl judgment: guide or escalate]
+  S -- guide --> R
+  S -- escalate --> Z
   D -- GO --> E{CI success or neutral on same head?}
   E -- no --> Z
   E -- yes --> F{head SHA equals live PR head?}
@@ -501,7 +526,7 @@ flowchart TD
 ```
 
 Without Forgejo Actions producing a CI status, the canonical merge rule cannot
-pass even when the TL has adjudicated GO. Review timeout is never approval; it
+pass even when the reviewer has approved. Review timeout is never approval; it
 parks the slice with a named gate.
 
 CI failures are attributed only against an immutable pair of snapshots: the verified base SHA and the observed PR head SHA. A failed check whose identity was already failing on the base is reported as base CI instability and emits task-blocked telemetry; a head-introduced check remains on the normal PR repair path. Missing SHA or check identity evidence is indeterminate and requires human confirmation rather than repairing the base.
@@ -512,7 +537,7 @@ CI failures are attributed only against an immutable pair of snapshots: the veri
 
 | Gate | Where | Failure mode it prevents |
 |------|-------|--------------------------|
-| TL adjudicated GO | `tl_loop/rlm/adjudicate.py` consumes binding reviewer findings plus TL-owned criteria; no verdict is invented without reviewer evidence | Merging without a reviewer-evidence-backed workflow decision |
+| Reviewer GO | the reviewer's exact-head verdict with binding findings (authenticated reviewer identity); no verdict is invented without reviewer evidence | Merging without a reviewer-evidence-backed workflow decision |
 | CI success or neutral | watcher ledger projection for the current head | Merging code that does not satisfy the machine gate |
 | Head binding | `tl_loop/loop/review.py` — the reviewed head must equal the live PR head | Approving one commit and merging another |
 
@@ -534,7 +559,7 @@ them and do not respawn the dev leaf.
 | `dev_not_pushing` | open chainlink `review-stuck` issue |
 | `reviewer_not_responding` | open chainlink `review-stuck` issue |
 | `reviewer_never_started` | open chainlink `review-stuck` issue |
-| `Stuck` (rounds exceeded) | `tl_loop` parks `review_rounds_exhausted` and opens a named gate; the watcher reports only review observations |
+| `Stuck` (rounds exceeded) | `tl_loop` makes one `roles.tl` guide/escalate judgment; `escalate` or an exhausted intervention ceiling parks `review_rounds_exhausted` and opens a named gate; the watcher reports only review observations |
 
 ---
 
@@ -575,8 +600,8 @@ Every bounded failure ends in one of these, with an auditable cause recorded in 
 | `budget_exhausted` | Role or per-harness ceiling reached | Raise the ceiling deliberately, or narrow the plan |
 | `no_capable_harness` | No allowed entry meets the capability requirement | Widen `allow` deliberately |
 | `schedule_deadlock` | Nothing dispatchable, or `max_depth` exceeded | Fix plan structure |
-| `review_stuck` | Review rounds exceeded without convergence | Read the PR |
-| `review_rounds_exhausted` | Controller-owned per-slice review ceiling reached across heads | Answer the named gate or re-plan |
+| `review_stuck` | The `roles.tl` review-stuck judgment failed (backend error, unusable guide, exhausted budget) or a repair dispatch failed | Read the PR and the recorded `dispatch_error` |
+| `review_rounds_exhausted` | Review ceiling reached across heads and the `roles.tl` judgment escalated, or its intervention ceiling was used up | Answer the named gate or re-plan |
 | `harness_switch_requested` | Configured harness could not proceed | Approve explicitly; `EXOMONAD_ALLOW_HARNESS_SWITCH=1` |
 | `stall_detected` | Dead pane or no progress past the heartbeat threshold | Investigate the worker |
 

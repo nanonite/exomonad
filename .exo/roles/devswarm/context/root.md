@@ -28,10 +28,16 @@ Do not do any of these. They belong to the controller or no longer exist:
   `tl_run`, not another agent session.
 - **No merge queue.** The controller decides what merges, after four
   independent gates: current-head reviewer approval and CI
-  `success`/`neutral` observations, a closed adjudication verdict, the
+  `success`/`neutral` observations, the reviewer's exact-head verdict, the
   `.exo/review-policy.toml` policy veto, and reviewed-head SHA binding. The
   watcher reports observations; it does not authorize merging. Do not diagnose
   a stalled PR by hand and call `merge_pr` without those gates.
+- **No repair composing in the review loop.** Below `reviewer_max_rounds`, the
+  controller forwards a NO-GO's findings (or a pre-merge CI failure) verbatim to
+  the same owner through `resume_pr` and makes no model call. At
+  `reviewer_max_rounds` it makes one `roles.tl` guide/escalate judgment, bounded
+  by `roles.tl.escalate_after_attempts`, then opens the human gate. Do not
+  hand-compose a repair for a slice the controller is already driving.
 - **No run termination.** A bounded failure parks with an auditable cause and
   waits for a named human gate answered with
   `python3 -m tl_loop gate --run-id <id> --name <gate> --approve|--reject`.

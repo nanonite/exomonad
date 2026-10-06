@@ -119,7 +119,50 @@ The conceptual hylomorphism remains useful: a plan and checkpoint are the
 unfold boundary, while event-driven review, merge, and upward PR effects are
 the fold boundary. The controller makes those transitions executable and
 testable; the model supplies only bounded structured judgments
-(`decompose`, `adjudicate_review`, and `compose_repair`).
+(`decompose`, the `review_stuck` guide/escalate judgment, and, for post-merge
+integration repair, `compose_repair`; `adjudicate_review` applies only to review
+events that carry no reviewer verdict).
+
+### 2026-10-06: Inner/outer review loop
+
+**Decision.** Review convergence has three intelligence levels, each with its own
+`.exo/harness_policy.toml` role and budget: `tl`, `reviewer`, and `worker`. The
+reviewer only produces findings; the worker only implements. The TL level makes a
+model judgment only where slices interact or one cannot converge on its own.
+
+| Event | Owner | Model call |
+|---|---|---|
+| Reviewer NO-GO below `reviewer_max_rounds` | inner loop: findings verbatim to the same owner through `resume_pr` | none |
+| Pre-merge CI failure on the PR head | inner loop: the failure to the same owner through `resume_pr`; counts as a round | none |
+| Reviewer GO with same-head CI green | the reviewer's decision; the controller performs `merge_pr` mechanically | none |
+| Review stuck (rounds exhausted) | one `roles.tl` judgment, `guide` or `escalate` | `roles.tl` |
+| Post-merge integration failure (parent-branch CI/build after merge) | `roles.tl` judgment: delegate or escalate | `roles.tl`; implemented by the follow-up issue #1160, not by this change |
+
+**Why.** A beast-workspace run parked a leaf as `REVIEW_STUCK` on reviewer round 1
+with `compose_repair requires an effect client and resolved model choice`. The
+controller put a model call (`compose_repair`) inside every review round, the
+shipped runner never configured a model choice, and no production backend
+existed, so the first NO-GO failed and parked with no `resume_pr`. Every repair
+test injected a model choice, so none built the configuration the runner builds.
+The deterministic loop mirrors the outer/inner structure of the
+opencode-chainlink-loop plugin: no model sits in the control path of a normal
+review round.
+
+**Parallelization.** The inner loops are per slice and independent. Slices
+converge in parallel with no TL model call on the critical path, so there is no
+TL contention. The TL intervenes only where slices interact (the shared parent
+branch after merge, the integration row above) or where a slice cannot converge
+on its own (review stuck).
+
+**Fail hard.** The `roles.tl` judgment model resolves from `roles.tl` in
+`.exo/harness_policy.toml` plus `.exo/model-catalog.json`: a pinned
+`harness/model` entry wins, otherwise the catalog must resolve a model. If
+neither does, or the harness has no tool-free backend or is not installed, the
+controller refuses to start, records the reason through
+`RunStore.record_exit_reason`, and names the file to fix. A bare harness name is
+never used as a model id. A backend failure at judgment time parks the slice with
+the error recorded. Interventions per slice are bounded by
+`roles.tl.escalate_after_attempts`; past that the human gate opens.
 
 ### Ordered recursive stages
 

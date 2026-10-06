@@ -38,7 +38,7 @@
 <p>The coordinator is not an agent. <code>tl_loop</code> is a Python controller process — no worktree of its own by default, no context window, no inbox. It calls the same Rust UDS runtime that agents call, and consumes the immutable ledger rather than messages. The <code>root</code> and <code>tl</code> <em>roles</em> persist as the RPC surface (tool registration, hook policy, event handlers); they are no longer an interactive session.</p>
 <table>
 <tr><th>Actor</th><th>Model</th><th>Spawns</th><th>Files PR</th><th>Merges PR</th><th>Lifecycle</th></tr>
-<tr><td><code>tl_loop</code> controller</td><td>Python; calls a model only for <code>decompose</code>, <code>adjudicate_review</code>, <code>compose_repair</code></td><td>yes</td><td>via children</td><td>yes</td><td>one per run; resumable from <code>.exo/tl-loop/&lt;run_id&gt;/run.json</code></td></tr>
+<tr><td><code>tl_loop</code> controller</td><td>Python; calls a model only for <code>decompose</code>, the <code>roles.tl</code> <code>review_stuck</code> guide/escalate judgment, <code>compose_repair</code> (post-merge integration repair only), and <code>adjudicate_review</code> (review events without a reviewer verdict only)</td><td>yes</td><td>via children</td><td>yes</td><td>one per run; resumable from <code>.exo/tl-loop/&lt;run_id&gt;/run.json</code></td></tr>
 <tr><td><code>root</code> / <code>tl</code> roles</td><td>from <code>[roles.tl]</code></td><td>yes</td><td>yes</td><td>yes</td><td>RPC surface + branch coordinates; an active sub-TL is an isolated controller process, not an interactive session</td></tr>
 <tr><td><code>dev</code></td><td>from <code>[roles.worker]</code></td><td>no</td><td>yes</td><td>no</td><td>one assignment per invocation, exits after handoff</td></tr>
 <tr><td><code>reviewer</code></td><td>from <code>[roles.reviewer]</code></td><td>no</td><td>no</td><td>no</td><td>ephemeral per review round</td></tr>
@@ -241,7 +241,7 @@ stateDiagram-v2
 
 <h2>5. PR Review Convergence Flow</h2>
 
-<p>The TL runs the workflow; the watcher only observes world state (filesystem, CI, Forgejo, and time). The reviewer supplies binding evidence, the TL adjudicates that evidence, and the controller owns repair and merge decisions. Two delivery paths run side by side and must not be confused. <strong>Agent-facing:</strong> the watcher calls <code>handle_event</code> on the agent's WASM plugin and acts on the returned <code>EventAction</code>. <strong>Controller-facing:</strong> the same world observations are appended to the immutable ledger at <code>.exo/ledger/segments/</code>, and <code>tl_loop</code> consumes them by global <code>run_seq</code>. The controller does not read the inbox for coordination — a free-form message cannot approve a merge.</p>
+<p>The TL runs the workflow; the watcher only observes world state (filesystem, CI, Forgejo, and time). The reviewer supplies the binding verdict and findings, the controller forwards findings to the owner and performs the merge mechanically, and a <code>roles.tl</code> model judgment happens only when a slice cannot converge on its own. Below <code>reviewer_max_rounds</code> a NO-GO or a pre-merge CI failure goes verbatim to the same owner through <code>resume_pr</code> with no model call; at the ceiling one <code>roles.tl</code> judgment chooses <code>guide</code> (validated handoff, fresh round budget) or <code>escalate</code> (named human gate), bounded per slice by <code>roles.tl.escalate_after_attempts</code>. The inner loops are per slice and independent, so slices converge in parallel with no TL model call on the critical path. Post-merge integration failure is a <code>roles.tl</code> judgment implemented by follow-up issue #1160. Two delivery paths run side by side and must not be confused. <strong>Agent-facing:</strong> the watcher calls <code>handle_event</code> on the agent's WASM plugin and acts on the returned <code>EventAction</code>. <strong>Controller-facing:</strong> the same world observations are appended to the immutable ledger at <code>.exo/ledger/segments/</code>, and <code>tl_loop</code> consumes them by global <code>run_seq</code>. The controller does not read the inbox for coordination — a free-form message cannot approve a merge.</p>
 
 <h3>Happy path</h3>
 <div class="mermaid">
@@ -262,10 +262,10 @@ sequenceDiagram
   Reviewer->>Reviewer: submit findings for the exact head SHA
   Note over Reviewer: ReviewerPhase: ReviewerPosted
   Watcher->>Ctl: ledger append (pr.review, ci.status_changed)
-  Ctl->>Ctl: adjudicate_review(findings, head_sha)
+  Ctl->>Ctl: persist reviewer verdict GO bound to head_sha
   CI-->>Watcher: CIStatus = success
   Watcher->>Ctl: ledger append (ci.status_changed)
-  Ctl->>Ctl: verify_review — TL GO, CI success/neutral, head binding
+  Ctl->>Ctl: verify_review — reviewer GO, CI success/neutral, head binding
   Ctl->>Ctl: merge_pr, then verify post-merge state
   Ctl->>Ctl: checkpoint slice = merged, advance dependents
   Watcher->>Ctl: observe PR branch gone
@@ -282,20 +282,28 @@ sequenceDiagram
 
   Reviewer->>Reviewer: submit findings (NO-GO)
   Watcher->>Ctl: ledger append (pr.review)
-  Ctl->>Ctl: adjudicate_review -> NO-GO
-  Ctl->>Ctl: compose_repair -> resume_pr (same owner/branch/PR)
-  Ctl->>Dev: repair guidance through resume_pr
+  Ctl->>Ctl: review_rounds < reviewer_max_rounds: no model call
+  Ctl->>Dev: resume_pr with the findings verbatim (same owner/branch/PR)
   Dev->>Dev: fix, commit, push (SHA changes)
   Watcher->>Ctl: ledger append (pr.head_changed)
   Ctl->>Reviewer: spawn reviewer for the new head
   alt GO after binding findings
     Ctl->>Ctl: wait for CI on the same head
-  else repeated NO-GO or timeout
+  else NO-GO or CI failure below the ceiling
+    Ctl->>Dev: resume_pr with the findings verbatim (another round)
+  else review_rounds reaches reviewer_max_rounds
+    Ctl->>Ctl: one roles.tl review_stuck judgment
+    alt guide
+      Ctl->>Dev: resume_pr with the validated handoff, fresh round budget
+    else escalate or roles.tl.escalate_after_attempts used up
+      Ctl->>Ctl: park review_rounds_exhausted; open named gate
+    end
+  else timeout
     Ctl->>Ctl: park named gate; no merge
   end
 </div>
 
-<p class="note">Repair never creates a new branch, leaf name, agent type, or <code>-2</code> suffix. <code>compose_repair</code> calls <code>watcher_pr_state</code> first and requires the PR to be open, unmerged, and identified by both head branch and SHA.</p>
+<p class="note">Repair never creates a new branch, leaf name, agent type, or <code>-2</code> suffix. Every repair path (<code>forward_review_findings</code> for the inner loop, <code>dispatch_guide_handoff</code> for a <code>roles.tl</code> guide) calls <code>watcher_pr_state</code> first and requires the PR to be open, unmerged, and identified by both head branch and SHA, and dispatches only through <code>resume_pr</code>.</p>
 
 <h3>Single-path ownership and restart behavior</h3>
 <p>The watcher is a sensor: it appends verified Forgejo, CI, git, and process
@@ -323,7 +331,7 @@ owner. <code>tl.action_queued</code>, <code>tl.action_reconciled</code>, and
 <tr><td><code>CommitsPushed</code></td><td>SHA change outside changes-requested window</td><td><code>CommitsPushedEv</code> -&gt; round++</td><td><code>ReviewerCommitsPushedEv</code></td></tr>
 <tr><td><code>ReviewTimeout</code></td><td>no reviewer response within <code>reviewer_max_wait_seconds</code></td><td>log only</td><td><code>ReviewerTimedOutEv</code> -&gt; Done</td></tr>
 <tr><td><code>MergeReady</code></td><td><strong>Deprecated derived state:</strong> inferred from <code>pr.review</code> + <code>ci.status_changed</code>; not a source event</td><td>compatibility notification only; the TL derives merge eligibility</td><td>no required handler</td></tr>
-<tr><td><code>Stuck</code></td><td>controller reaches <code>reviewer_max_rounds</code></td><td>park <code>review_rounds_exhausted</code> and open a named gate</td><td>no watcher decision</td></tr>
+<tr><td><code>Stuck</code></td><td>controller reaches <code>reviewer_max_rounds</code></td><td>one <code>roles.tl</code> judgment: <code>guide</code> resumes the owner with a fresh round budget; <code>escalate</code>, or <code>roles.tl.escalate_after_attempts</code> used up, parks <code>review_rounds_exhausted</code> and opens a named gate</td><td>no watcher decision</td></tr>
 <tr><td><code>DevNotPushing</code> / <code>ReviewerNotResponding</code> / <code>ReviewerNeverStarted</code></td><td>health probes</td><td>log only (the controller may escalate to chainlink <code>review-stuck</code>)</td><td>n/a</td></tr>
 </table>
 
@@ -333,8 +341,11 @@ flowchart TD
   A[Watcher observes PR review and CI] --> B[ledger: pr.review + ci.status_changed]
   B --> C{binding reviewer findings?}
   C -- no --> Z[park named gate]
-  C -- yes --> D[TL adjudicate_review]
-  D -- NO-GO --> R[compose_repair -> resume_pr same owner]
+  C -- yes --> D[reviewer verdict bound to head]
+  D -- NO-GO below ceiling --> R[findings verbatim -> resume_pr same owner]
+  D -- NO-GO at ceiling --> S[one roles.tl judgment: guide or escalate]
+  S -- guide --> R
+  S -- escalate --> Z
   D -- GO --> E{CI success or neutral on same head?}
   E -- no --> Z
   E -- yes --> F{head SHA equals live PR head?}
@@ -342,13 +353,13 @@ flowchart TD
   F -- yes --> G[merge_pr]
 </div>
 
-<p class="note">Without Forgejo Actions producing a CI status, the canonical merge rule cannot pass even when the TL has adjudicated GO. Review timeout is never approval; it parks the slice with a named gate.</p>
+<p class="note">Without Forgejo Actions producing a CI status, the canonical merge rule cannot pass even when the reviewer has approved. Review timeout is never approval; it parks the slice with a named gate.</p>
 
 <h3>Controller-side merge gates</h3>
 <p><code>tl_loop</code> applies the canonical merge rule before it calls <code>merge_pr</code>:</p>
 <table>
 <tr><th>Gate</th><th>Where</th><th>Failure mode it prevents</th></tr>
-<tr><td>TL adjudicated GO</td><td><code>tl_loop/rlm/adjudicate.py</code> consumes binding reviewer findings plus TL-owned criteria; no verdict is invented without reviewer evidence</td><td>Merging without a reviewer-evidence-backed workflow decision</td></tr>
+<tr><td>Reviewer GO</td><td>the reviewer's exact-head verdict with binding findings (authenticated reviewer identity); no verdict is invented without reviewer evidence</td><td>Merging without a reviewer-evidence-backed workflow decision</td></tr>
 <tr><td>CI success or neutral</td><td>watcher ledger projection for the current head</td><td>Merging code that does not satisfy the machine gate</td></tr>
 <tr><td>Head binding</td><td><code>tl_loop/loop/review.py</code> — the reviewed head must equal the live PR head</td><td>Approving one commit and merging another</td></tr>
 </table>
@@ -396,7 +407,7 @@ stateDiagram-v2
 <tr><td><code>budget_exhausted</code></td><td>Role or per-harness ceiling reached</td><td>Raise the ceiling deliberately, or narrow the plan</td></tr>
 <tr><td><code>no_capable_harness</code></td><td>No allowed entry meets the capability requirement</td><td>Widen <code>allow</code> deliberately</td></tr>
 <tr><td><code>schedule_deadlock</code></td><td>Nothing dispatchable, or <code>max_depth</code> exceeded</td><td>Fix plan structure</td></tr>
-<tr><td><code>review_rounds_exhausted</code></td><td>Controller review-round ceiling reached without convergence</td><td>Read the PR and answer the named gate</td></tr>
+<tr><td><code>review_rounds_exhausted</code></td><td>Review ceiling reached and the <code>roles.tl</code> judgment escalated, or its intervention ceiling was used up</td><td>Read the PR and answer the named gate</td></tr>
 <tr><td><code>harness_switch_requested</code></td><td>Configured harness could not proceed</td><td>Approve explicitly; <code>EXOMONAD_ALLOW_HARNESS_SWITCH=1</code></td></tr>
 <tr><td><code>stall_detected</code></td><td>Dead pane or no progress past the heartbeat threshold</td><td>Investigate the worker</td></tr>
 </table>

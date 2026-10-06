@@ -130,6 +130,30 @@ the three ceilings. A terminal invocation record is reconciled before a task
 budget disposal in the same heartbeat, so elapsed time never overrides
 authoritative lifecycle evidence.
 
+### The `roles.tl` judgment model has to resolve at startup
+
+`roles.tl` also owns the one model judgment the review loop makes (see
+section 2). The controller resolves that model before it does anything else, from
+the first `roles.tl.allow` entry:
+
+- a `harness/model` entry pins the model (`allow = ["claude/sonnet"]`); or
+- a bare harness (`allow = ["claude"]`) defers to `.exo/model-catalog.json`.
+
+If neither yields a model, the controller refuses to start, records the reason
+as the run's exit reason, and names the file to fix. The bare harness name is
+never used as a model id. For example, `allow = ["claude"]` with no catalog:
+
+```text
+roles.tl.allow entry 'claude' pins no model and .exo/model-catalog.json does not
+exist. Pin a model in .exo/harness_policy.toml (for example
+allow = ["claude/<model-id>"]) or add .exo/model-catalog.json.
+```
+
+The judgment is served by a tool-free subprocess of the harness's own CLI, so the
+`tl` harness must be one of `claude`, `codex`, or `opencode`, and its binary must
+be on `PATH`; otherwise startup is refused the same way. Each judgment is charged
+to `roles.tl.token_budget`.
+
 ### How the selector spends this
 
 Before a spawn is written to run state, the selector estimates its cost and
@@ -199,16 +223,17 @@ The rule has two authorities and one integrity invariant:
 
 ```text
 merge_allowed =
-      tl_adjudicated_go(current_head_sha)  # binding reviewer findings
+      reviewer_go(current_head_sha)  # binding reviewer findings
    && ci_success_or_neutral(current_head_sha)
    && current_head_sha == live_pr_head_sha
 ```
 
-**a. TL adjudication on binding reviewer findings.** The reviewer supplies
-structured findings for the exact head it inspected. The TL's
-`adjudicate_review` call turns those findings, the TL-owned acceptance criteria,
-and the diff into `GO` or `NO-GO`. The TL cannot invent a verdict without
-reviewer evidence or ignore an unresolved blocking finding.
+**a. The reviewer's verdict on binding findings.** The reviewer supplies a
+`GO`/`GO-WITH-NITS`/`NO-GO` verdict and structured findings for the exact head it
+inspected. The controller records that verdict bound to the head and performs
+`merge_pr` mechanically once CI agrees; no model re-judges it. The controller
+cannot invent a verdict without reviewer evidence or ignore an unresolved
+blocking finding.
 
 **b. CI is the machine authority.** The current head must have CI status
 `success` or `neutral`. If Forgejo Actions does not post a status, the CI
@@ -225,20 +250,46 @@ and merging another.
 Projects may require a second reviewer for declared risk paths or large diffs
 using `external_review_paths`, `external_review_threshold`, and the complexity
 threshold. Those are optional policy gates, not universal approval layers. A
-`GO-WITH-NITS` remains mergeable, and the TL stores every nit in durable
+`GO-WITH-NITS` remains mergeable, and the controller stores every nit in durable
 per-head review findings for follow-up. It does not require an external
 Chainlink issue writer, because the run checkpoint is the authoritative home
 for review evidence.
 
 ### The repair path when review says NO-GO
 
-`compose_repair` calls `watcher_pr_state` first and requires the PR to be open,
-unmerged, and identified by both head branch and SHA. It produces exactly seven
-sections (ROOT CAUSE, PROPOSED SOLUTION, READ FIRST, STEPS, VERIFY, BOUNDARY,
-DONE CRITERIA) and dispatches through `resume_pr` — the same owner, worktree,
-branch, and PR. It never creates a new branch, a `-2` suffix, or a second agent.
-After `escalate_after_attempts` NO-GOs the slice parks with `review_stuck` and
-waits for a human gate.
+Review convergence has an inner loop and an outer loop, and only the outer loop
+uses a model.
+
+**Inner loop: worker <-> reviewer, no model.** While a slice's completed rounds
+are below `reviewer_max_rounds`, a reviewer NO-GO, and a pre-merge CI failure on
+the reviewed head, go to the same owner through `resume_pr`, with the reviewer's
+findings (or the CI failure) verbatim as the handoff's ROOT CAUSE. The slice's own
+paths and test plan fill the remaining sections. `resume_pr` resumes the same
+owner, worktree, branch, and PR; the controller never creates a new branch, a
+`-2` suffix, or a second agent. A round is one completed reviewer verdict or one
+first CI failure on a head. This loop works with nothing configured beyond
+`harness_policy.toml`.
+
+**Outer loop: review stuck, one `roles.tl` judgment.** When the round count
+reaches `reviewer_max_rounds` without convergence, the controller makes one
+`roles.tl` judgment whose result is exactly one of:
+
+- `guide`: a seven-section handoff (ROOT CAUSE, PROPOSED SOLUTION, READ FIRST,
+  STEPS, VERIFY, BOUNDARY, DONE CRITERIA) validated against the slice's owned
+  paths and dispatched through `resume_pr` to the same owner with a fresh round
+  budget;
+- `escalate`: the slice parks with `review_rounds_exhausted` and the named human
+  gate opens.
+
+Interventions per slice are bounded by `roles.tl.escalate_after_attempts`; once
+they are used up the gate opens without another model call. Each judgment emits
+`tl.review_stuck_judged` and is charged to `roles.tl.token_budget`. If the
+judgment cannot be made (backend failure, malformed or out-of-boundary guide,
+exhausted budget) the slice parks as `review_stuck` with the error in its
+`dispatch_error`; nothing falls back.
+
+`compose_repair` (a model-composed handoff) is used only for post-merge
+integration repair.
 
 ### Making the gates stricter
 
@@ -255,8 +306,9 @@ external_review_threshold = 200
 
 Review timeout is never approval. The controller parks the run at the durable
 `tl-timeout` gate. `reviewer_max_wait_seconds` controls when the timeout is detected,
-and `reviewer_max_rounds` controls when repeated review attempts park the PR for a
-human.
+and `reviewer_max_rounds` controls when the deterministic review loop hands the
+slice to the `roles.tl` review-stuck judgment, and so, at most
+`escalate_after_attempts` judgments later, to a human.
 
 ---
 
@@ -844,7 +896,8 @@ The watcher is a sensor. It never spawns a reviewer, adjudicates a verdict,
 repairs a leaf, or merges a PR. A reviewer is one-shot for an exact head and
 must persist its terminal GO/NO-GO evidence before exiting. The reducer then
 derives either a compare-guarded `merge_pr` (GO + same-head CI success/neutral)
-or one same-owner `resume_pr` (NO-GO/comments or same-head CI failure). A new
+or one same-owner `resume_pr` carrying the findings verbatim (NO-GO/comments or
+same-head CI failure) while the slice is below `reviewer_max_rounds`. A new
 head clears prior verdict and CI evidence before a new reviewer is derived.
 
 Action intent is journaled before dispatch and keyed by run, slice, operation,
@@ -1222,7 +1275,8 @@ the only operator mutation; do not manually mark a stage merged.
 | `budget_exhausted` | Role or harness ceiling reached | Raise the ceiling in `harness_policy.toml` or narrow the plan |
 | `no_capable_harness` | No allowed entry meets the capability requirement | Widen `allow` deliberately |
 | `schedule_deadlock` | Nothing dispatchable, or `max_depth` hit | Fix the plan structure |
-| `review_rounds_exhausted` | Controller review-round ceiling reached without convergence | Human reads the PR and answers the named gate |
+| `review_rounds_exhausted` | Review-round ceiling reached and the `roles.tl` judgment escalated, or `roles.tl.escalate_after_attempts` guides were already spent | Human reads the PR and answers the named gate |
+| `review_stuck` | The `roles.tl` review-stuck judgment failed (backend error, unusable guide, exhausted budget) or a repair dispatch failed | Read the PR and the slice's `dispatch_error`; fix `roles.tl` or the plan and resume |
 | `harness_switch_requested` | The configured harness could not proceed | Approve explicitly; set `EXOMONAD_ALLOW_HARNESS_SWITCH=1` |
 | `stall_detected` | Dead pane or no progress past the heartbeat threshold | Investigate the worker |
 | `task_budget_exceeded` | A declared slice execution ceiling elapsed | Inspect the deadline ledger and adjust the task budget or plan |
@@ -1325,7 +1379,7 @@ failure mode this field exists to prevent.
 
 `tl_loop.rlm.intent.interpret_operator_intent` translates operator prose into
 one of `Query`, `GateAnswer`, `PlanProposal`, or `Unclear`. It is a bounded
-judgment like `decompose` and `adjudicate_review`: closed output schema,
+judgment like `decompose` and the `review_stuck` guide/escalate judgment: closed output schema,
 `tools=()`, no effect client, no filesystem capability.
 
 The model **translates; it does not decide**. Its output passes the same
