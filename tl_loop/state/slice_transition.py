@@ -148,6 +148,11 @@ class ReviewRoundsExhausted(SliceEvent):
 
 
 @dataclass(frozen=True)
+class ReviewRoundsReset(SliceEvent):
+    """A roles.tl guide grants the slice a fresh review-round budget."""
+
+
+@dataclass(frozen=True)
 class RedispatchRequested(SliceEvent):
     """Reset review-owned evidence before a deliberate redispatch."""
 
@@ -269,14 +274,18 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
         ci_state[event.head_sha] = event.status
         verdict = state.verdict
         verdict_at = state.verdict_at
+        review_rounds = state.review_rounds
         if event.status == "failure" and state.reviewed_head == event.head_sha:
             verdict = Verdict.NO_GO
             verdict_at = event.observed_at
+            if state.ci_state.get(event.head_sha) != "failure":
+                review_rounds += 1
         return replace(
             state,
             ci_state=ci_state,
             verdict=verdict,
             verdict_at=verdict_at,
+            review_rounds=review_rounds,
             review_evidence=None if event.status == "failure" else state.review_evidence,
             review_validation_required=False
             if event.status == "failure"
@@ -342,6 +351,8 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
         )
     if isinstance(event, ReviewRoundsExhausted):
         return replace(state, status=SliceStatus.PARKED, action=None)
+    if isinstance(event, ReviewRoundsReset):
+        return replace(state, review_rounds=0)
     if isinstance(event, RedispatchRequested):
         return replace(
             state,

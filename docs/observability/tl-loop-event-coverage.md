@@ -113,6 +113,7 @@ failed write must not change the controller state transition.
 | `tl.slice_status_changed` | `tl_loop/loop/escalate.py:267-285`; `rust/exomonad-core/src/handlers/tl.rs:14-30` | covered | Status transitions are emitted from durable slice state changes. |
 | `tl.slice_parked` | `tl_loop/loop/escalate.py:286-293`; `tl_loop/loop/driver.py:747-756` | covered | Park cause, attempt count, and the bounded review-stuck reason are dimensions; no body is emitted. |
 | `tl.review_rounds_exhausted` | `tl_loop/loop/driver.py:_park_review_rounds_exhausted` | covered | The controller records the durable per-slice round count and configured ceiling when it parks and opens the human gate. |
+| `tl.review_stuck_judged` | `tl_loop/loop/driver.py:_judge_review_stuck` | covered | One roles.tl review-stuck judgment records the chosen action (`guide` or `escalate`), the per-slice intervention count against `roles.tl.escalate_after_attempts`, the model id, and the tokens charged to `roles.tl`; no handoff or finding text is emitted. |
 | `tl.gate_opened` | `tl_loop/loop/driver.py:599-608`; `rust/exomonad-core/src/handlers/tl.rs:14-30` | covered | Timeout parking opens the named gate before the terminal failed phase. |
 | `tl.gate_answered` | `tl_loop/__main__.py:320-340` | covered | CLI/control answers carry gate name, decision, and source. |
 | `tl.merge_decided` | `tl_loop/loop/driver.py:1109-1118` | covered | The decision carries a PR number and bounded head-SHA hash, not the merge body. |

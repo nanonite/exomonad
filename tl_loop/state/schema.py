@@ -602,6 +602,7 @@ SLICE_KEYS = frozenset(
         "reviewer_agent_id",
         "repair_attempts",
         "review_rounds",
+        "tl_intervention_attempts",
         "reviewed_head",
         "verdict_at",
         "review_evidence",
@@ -851,6 +852,7 @@ class SliceState:
     reviewer_agent_id: str | None = None
     repair_attempts: int = 0
     review_rounds: int = 0
+    tl_intervention_attempts: int = 0
     verdict_at: str | None = None
     review_evidence: DurableReviewEvidence | None = None
     review_validation_required: bool = False
@@ -1473,6 +1475,8 @@ def _validate_slice(
         _non_negative_int(value, "repair_attempts", path, errors)
     if "review_rounds" in value:
         _non_negative_int(value, "review_rounds", path, errors)
+    if "tl_intervention_attempts" in value:
+        _non_negative_int(value, "tl_intervention_attempts", path, errors)
     _nullable_enum_value(value, "park_cause", path, ParkCause, errors)
     _nullable_positive_int(value, "park_issue_id", path, errors)
     _nullable_string(value, "blocked_by", path, errors)

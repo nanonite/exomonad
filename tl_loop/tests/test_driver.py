@@ -2633,17 +2633,6 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -
                     "blocking_count": 1,
                 }
             ),
-            RlmResponse(
-                {
-                    "root_cause": "The failure path is unhandled in src/leaf.py",
-                    "proposed_solution": "Handle the failure in src/leaf.py",
-                    "read_first": ["src/leaf.py"],
-                    "steps": ["Update src/leaf.py"],
-                    "verify": ["just tl-loop-test"],
-                    "boundary": ["Only edit src/leaf.py"],
-                    "done_criteria": ["The failure path is covered"],
-                }
-            ),
         ]
     )
     transport = ReviewRepairTransport()
@@ -2682,14 +2671,13 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -
     )
 
     restored = store.load().slices["leaf-a"]
-    assert [request.name for request in backend.requests] == [
-        "adjudicate_review",
-        "compose_repair",
-    ]
+    assert [request.name for request in backend.requests] == ["adjudicate_review"]
     assert _effect_names(transport) == [
         "watcher_pr_state",
         "resume_pr",
     ]
+    resume = next(arguments for name, arguments in transport.calls if name == "resume_pr")
+    assert "The failure path is unhandled" in str(resume["context"])
     assert restored.status is SliceStatus.REPAIRING
     assert restored.reviewed_head == "head-a"
     assert restored.verdict is Verdict.NO_GO
@@ -3151,21 +3139,6 @@ def test_go_with_nits_persists_follow_up_in_per_head_state(tmp_path: Path) -> No
 
 
 def test_ci_failure_records_head_and_resumes_same_pr(tmp_path: Path) -> None:
-    backend = ReviewBackend(
-        [
-            RlmResponse(
-                {
-                    "root_cause": "CI exposed a failure in src/leaf.py",
-                    "proposed_solution": "Fix the failure in src/leaf.py",
-                    "read_first": ["src/leaf.py"],
-                    "steps": ["Update src/leaf.py"],
-                    "verify": ["just tl-loop-test"],
-                    "boundary": ["Only edit src/leaf.py"],
-                    "done_criteria": ["CI passes"],
-                }
-            )
-        ]
-    )
     transport = ReviewRepairTransport()
     store = _review_store(tmp_path, verdict=Verdict.GO)
     state = store.load()
@@ -3177,7 +3150,6 @@ def test_ci_failure_records_head_and_resumes_same_pr(tmp_path: Path) -> None:
         1,
         TLLoopConfig(
             active=True,
-            review_model_choice=_review_choice(backend),
             review_policy_path=Path(".exo/review-policy.toml"),
         ),
         EffectClient(transport),
@@ -3255,21 +3227,6 @@ def test_ci_failure_for_stale_head_does_not_override_verdict(tmp_path: Path) -> 
 def test_ci_failure_after_review_binds_head_then_still_repairs(tmp_path: Path) -> None:
     """A CI failure before review is recorded harmlessly; once review binds the
     same head, a subsequent CI failure on it still sets NO_GO and repairs."""
-    backend = ReviewBackend(
-        [
-            RlmResponse(
-                {
-                    "root_cause": "CI exposed a failure in src/leaf.py",
-                    "proposed_solution": "Fix the failure in src/leaf.py",
-                    "read_first": ["src/leaf.py"],
-                    "steps": ["Update src/leaf.py"],
-                    "verify": ["just tl-loop-test"],
-                    "boundary": ["Only edit src/leaf.py"],
-                    "done_criteria": ["CI passes"],
-                }
-            )
-        ]
-    )
     pre_review_event = project(
         {
             "type": "ci.status_changed",
@@ -3316,7 +3273,6 @@ def test_ci_failure_after_review_binds_head_then_still_repairs(tmp_path: Path) -
         2,
         TLLoopConfig(
             active=True,
-            review_model_choice=_review_choice(backend),
             review_policy_path=Path(".exo/review-policy.toml"),
         ),
         EffectClient(repair_transport),
@@ -3337,6 +3293,16 @@ def _review_choice(backend: ReviewBackend) -> RlmModelChoice:
     return RlmModelChoice(
         model_id="test-model",
         backend=backend,
+        store=RlmCallStore(),
+        context_length=10_000,
+    )
+
+
+def _tl_choice(backend: ReviewBackend) -> RlmModelChoice:
+    return RlmModelChoice(
+        model_id="tl-model",
+        backend=backend,
+        role="tl",
         store=RlmCallStore(),
         context_length=10_000,
     )
@@ -3532,21 +3498,7 @@ def test_direct_reviewer_approval_is_reduced_for_exact_head_without_model(tmp_pa
 
 
 def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path: Path) -> None:
-    backend = ReviewBackend(
-        [
-            RlmResponse(
-                {
-                    "root_cause": "The failure path is unhandled in src/leaf.py",
-                    "proposed_solution": "Handle the failure in src/leaf.py",
-                    "read_first": ["src/leaf.py"],
-                    "steps": ["Update src/leaf.py"],
-                    "verify": ["just tl-loop-test"],
-                    "boundary": ["Only edit src/leaf.py"],
-                    "done_criteria": ["The failure path is covered"],
-                }
-            )
-        ]
-    )
+    backend = ReviewBackend([])
     transport = ReviewRepairTransport()
     store = _review_store(tmp_path)
     current = store.load().slices["leaf-a"]
@@ -3611,6 +3563,7 @@ def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path
     assert restored.verdict is Verdict.NO_GO
     assert restored.status is SliceStatus.REPAIRING
     assert len([name for name, _ in transport.calls if name == "resume_pr"]) == 1
+    assert backend.requests == []
 
 
 def test_review_round_exhaustion_parks_gate_and_emits_once(tmp_path: Path) -> None:
@@ -3643,7 +3596,14 @@ def test_review_round_exhaustion_parks_gate_and_emits_once(tmp_path: Path) -> No
     store.set_review_policy(2, "policy_file")
     transport = IssueTransport()
     journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
-    config = TLLoopConfig(active=True)
+    backend = ReviewBackend(
+        [RlmResponse({"action": "escalate", "reason": "the reviewer and owner disagree"})]
+    )
+    config = TLLoopConfig(
+        active=True,
+        policy=validate_policy(_selector_policy(1)),
+        tl_model_choice=_tl_choice(backend),
+    )
 
     result = _apply_convergence(
         store.load(),
@@ -3669,6 +3629,7 @@ def test_review_round_exhaustion_parks_gate_and_emits_once(tmp_path: Path) -> No
         and arguments.get("event_type") == "tl.review_rounds_exhausted"
     ]
     assert len(exhaustion_events) == 1
+    assert [request.name for request in backend.requests] == ["review_stuck"]
     assert not any(name in {"resume_pr", "spawn_reviewer"} for name, _ in transport.calls)
 
     _apply_convergence(

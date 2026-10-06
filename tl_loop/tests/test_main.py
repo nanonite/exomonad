@@ -285,6 +285,7 @@ def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(launcher, "_run_id", lambda document, configured: "root")
     monkeypatch.setattr(launcher, "_authoritative_ledger_run_id", lambda root: None)
     monkeypatch.setattr(launcher, "load_policy", lambda path: object())
+    monkeypatch.setattr(launcher, "build_tl_model_choice", lambda policy, catalog: object())
     monkeypatch.setattr(launcher, "load_capability", lambda path, policy_path: object())
     monkeypatch.setattr(launcher, "load_model_catalog", lambda path: None)
     monkeypatch.setattr(launcher, "tl_run", lambda *a, **kw: object())

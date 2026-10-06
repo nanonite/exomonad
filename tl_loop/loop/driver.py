@@ -186,7 +186,17 @@ from tl_loop.ordered import (
 )
 from tl_loop.plan_dependencies import validate_leaf_dependencies
 from tl_loop.rlm.adjudicate import adjudicate_review
-from tl_loop.rlm.repair import RepairError, RepairHandoff, compose_repair
+from tl_loop.rlm.budget import ContextBudgetError
+from tl_loop.rlm.call import RlmError
+from tl_loop.rlm.repair import (
+    RepairError,
+    RepairHandoff,
+    compose_repair,
+    dispatch_guide_handoff,
+    forward_review_findings,
+)
+from tl_loop.rlm.store import BudgetExceeded, RlmModelChoice
+from tl_loop.rlm.tl_judgment import judge_review_stuck
 from tl_loop.select.agent_type import (
     SelectionFailure,
     parse_harness_identifier,
@@ -248,6 +258,7 @@ from tl_loop.state.slice_transition import (
     ReviewerDispatched,
     ReviewerIdentityObserved,
     ReviewRoundsExhausted,
+    ReviewRoundsReset,
     ReviewValidated,
     ReviewValidationFailed,
     ReviewVerdictObserved,
@@ -294,6 +305,11 @@ from .reconcile import (
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
+
+RepairWith = Callable[
+    [Mapping[str, object], EffectClient, Callable[[JsonObject], object], "str | None"],
+    object,
+]
 #: Dispatch gates are scoped to the slice whose dispatch exhausted or conflicted,
 #: exactly as ``tl-ordered-child-recovery-<child>`` is scoped to its child. A run's
 #: gate list is shared by every slice, so a run-global name lets a second
@@ -949,6 +965,7 @@ class TLLoopConfig:
     ordered_recovery_child: str | None = None
     ordered_recovery: bool = False
     review_model_choice: object | None = None
+    tl_model_choice: RlmModelChoice | None = None
     branch: str = "main"
     worktree: str | Path | None = None
     agent_id: str | None = None
@@ -3634,7 +3651,14 @@ def _park_review_rounds_exhausted(
     effects_log: list[EffectIntent],
     reviewer_max_rounds: int | None,
 ) -> RunState:
-    """Durably park the first exhausted direct-review slice and open its gate."""
+    """Hand the first exhausted direct-review slice to the roles.tl judgment.
+
+    The deterministic worker<->reviewer loop is over for this slice. While the
+    slice has roles.tl interventions left, ONE judgment chooses ``guide`` (a
+    validated handoff through ``resume_pr`` with a fresh round budget) or
+    ``escalate`` (the named human gate). Without interventions left, the gate
+    opens. A shadow (inactive) controller only records the gate.
+    """
     effective_reviewer_max_rounds = (
         state.reviewer_max_rounds
         if state.reviewer_max_rounds_source is not None
@@ -3660,6 +3684,154 @@ def _park_review_rounds_exhausted(
     )
     if target is None:
         return state
+    if config.active:
+        return _judge_review_stuck(
+            state, target, store, config, effects, effects_log, effective_reviewer_max_rounds
+        )
+    return _open_review_stuck_gate(
+        state, target, store, config, effects, effects_log, effective_reviewer_max_rounds
+    )
+
+
+def _judge_review_stuck(
+    state: RunState,
+    target: SliceState,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    reviewer_max_rounds: int | None,
+) -> RunState:
+    """Make the one bounded roles.tl judgment for a slice that cannot converge."""
+    choice = config.tl_model_choice
+    if choice is None or config.policy is None:
+        raise TLLoopError(
+            "review_rounds_exhausted requires config.tl_model_choice and config.policy; "
+            "the controller must resolve roles.tl at startup"
+        )
+    ceiling = config.policy.roles["tl"].escalate_after_attempts
+    if target.tl_intervention_attempts >= ceiling:
+        LOGGER.info(
+            "[TL loop] review stuck slice=%s interventions=%d ceiling=%d; opening the human gate",
+            target.id,
+            target.tl_intervention_attempts,
+            ceiling,
+        )
+        return _open_review_stuck_gate(
+            state, target, store, config, effects, effects_log, reviewer_max_rounds
+        )
+    # The intervention is charged before the model is called, so a crash between
+    # the call and its outcome cannot grant an unbounded number of judgments.
+    reserved = replace(target, tl_intervention_attempts=target.tl_intervention_attempts + 1)
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, target.id: reserved},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    spent_before = choice.store.ledger.spent.get(choice.role, 0)
+    LOGGER.info(
+        "[TL loop] review stuck slice=%s pr=%s rounds=%d intervention=%d/%d model=%s",
+        target.id,
+        target.pr_number,
+        target.review_rounds,
+        reserved.tl_intervention_attempts,
+        ceiling,
+        choice.model_id,
+    )
+    try:
+        decision = judge_review_stuck(
+            choice,
+            evidence=_review_stuck_evidence(target, reviewer_max_rounds),
+            owned_paths=target.paths,
+        )
+    except (RlmError, RepairError, BudgetExceeded, ContextBudgetError) as error:
+        LOGGER.error("[TL loop] review-stuck judgment failed slice=%s: %s", target.id, error)
+        return _park_repair_failed(
+            store,
+            state,
+            reserved,
+            state.events.last_consumed_offset,
+            error,
+            config,
+            effects,
+            effects_log,
+        )
+    _record_controller_event(
+        target.id,
+        "tl.review_stuck_judged",
+        {
+            "slice_id": target.id,
+            "pr_number": target.pr_number,
+            "head_sha": _persisted_slice_head(target),
+            "action": decision.action,
+            "intervention": reserved.tl_intervention_attempts,
+            "ceiling": ceiling,
+            "model": choice.model_id,
+            "tokens": choice.store.ledger.spent.get(choice.role, 0) - spent_before,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    if decision.action == "escalate":
+        return _open_review_stuck_gate(
+            state, reserved, store, config, effects, effects_log, reviewer_max_rounds
+        )
+    guide = cast(RepairHandoff, decision.handoff)
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, target.id: slice_transition(reserved, ReviewRoundsReset())},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    return _route_repair(
+        store,
+        state,
+        state.fsm,
+        state.events.last_consumed_offset,
+        target.id,
+        config,
+        effects,
+        effects_log,
+        _guide_repair(guide, store, target.id),
+    )
+
+
+def _review_stuck_evidence(
+    target: SliceState, reviewer_max_rounds: int | None
+) -> dict[str, object]:
+    """The bounded facts the review-stuck judgment may read."""
+    return {
+        "slice_id": target.id,
+        "pr_number": target.pr_number,
+        "head_sha": _persisted_slice_head(target),
+        "review_rounds": target.review_rounds,
+        "reviewer_max_rounds": reviewer_max_rounds,
+        "ci_state": dict(target.ci_state),
+        "findings_by_head": {
+            head: [dict(finding) for finding in findings]
+            for head, findings in target.review_findings.items()
+        },
+    }
+
+
+def _open_review_stuck_gate(
+    state: RunState,
+    target: SliceState,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    effective_reviewer_max_rounds: int | None,
+) -> RunState:
+    """Durably park the slice on ``review_rounds_exhausted`` and open its human gate."""
     audit = {
         "review_rounds": target.review_rounds,
         "reviewer_max_rounds": effective_reviewer_max_rounds,
@@ -4044,7 +4216,7 @@ def _execute_direct_repair_intent(
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
 ) -> RunState:
-    """Route direct-leaf repair through the existing same-owner handoff path."""
+    """Forward the reviewer's findings to the same owner; no model call is made."""
     current = state.slices[intent.target_id]
     reasons = _repair_reasons(current)
     review = {"verdict": Verdict.NO_GO.value, "reasons": reasons}
@@ -4061,10 +4233,10 @@ def _execute_direct_repair_intent(
         state.fsm,
         state.events.last_consumed_offset,
         current.id,
-        review,
         config,
         effects,
         effects_log,
+        _forward_findings_repair(review, store, current),
     )
 
 
@@ -10818,20 +10990,25 @@ def _handle_integration_conflict(
         _phase_from_state(state),
         state.events.last_consumed_offset,
         task.name,
-        {
-            "verdict": Verdict.NO_GO.value,
-            "reasons": [
-                {
-                    "severity": "blocking",
-                    "file": "integration",
-                    "line": 0,
-                    "claim": reason[:500],
-                }
-            ],
-        },
         config,
         effects,
         effects_log,
+        _model_repair(
+            {
+                "verdict": Verdict.NO_GO.value,
+                "reasons": [
+                    {
+                        "severity": "blocking",
+                        "file": "integration",
+                        "line": 0,
+                        "claim": reason[:500],
+                    }
+                ],
+            },
+            config,
+            store,
+            task.name,
+        ),
     )
 
 
@@ -12770,17 +12947,7 @@ def _route_review_event(
             store, state, phase, event_seq, slice_id, decision_verdict
         )
     if decision_verdict is Verdict.NO_GO:
-        max_rounds = (
-            state.reviewer_max_rounds
-            if state.reviewer_max_rounds_source is not None
-            else _reviewer_max_rounds(config.review_policy_path)
-        )
-        current_rounds = state.slices[slice_id].review_rounds
-        if (
-            max_rounds is not None
-            and current_rounds >= max_rounds
-            and not _is_aggregate_slice(state.slices[slice_id])
-        ):
+        if _review_rounds_exhausted(state, state.slices[slice_id], config):
             return state
         return _route_repair(
             store,
@@ -12788,10 +12955,14 @@ def _route_review_event(
             phase,
             event_seq,
             slice_id,
-            {"verdict": decision_verdict.value, "reasons": list(decision_reasons)},
             config,
             effects,
             effects_log,
+            _forward_findings_repair(
+                {"verdict": decision_verdict.value, "reasons": list(decision_reasons)},
+                store,
+                state.slices[slice_id],
+            ),
         )
     return state
 
@@ -12913,13 +13084,13 @@ def _route_ci_event(
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     should_repair = (
-        _review_workflow_enabled(config)
+        config.active
         and status == "failure"
         and current.reviewed_head == head_sha
         and current.status is not SliceStatus.REPAIRING
         and current.ci_state.get(head_sha) != "failure"
     )
-    if not should_repair:
+    if not should_repair or _review_rounds_exhausted(state, state.slices[slice_id], config):
         return state
     reason = {
         "severity": "blocking",
@@ -12933,10 +13104,14 @@ def _route_ci_event(
         phase,
         event_seq,
         slice_id,
-        {"verdict": Verdict.NO_GO.value, "reasons": [reason]},
         config,
         effects,
         effects_log,
+        _forward_findings_repair(
+            {"verdict": Verdict.NO_GO.value, "reasons": [reason]},
+            store,
+            state.slices[slice_id],
+        ),
     )
 
 
@@ -12967,11 +13142,17 @@ def _route_repair(
     phase: PhaseValue,
     event_seq: int,
     slice_id: str,
-    review: object,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    repair_with: RepairWith,
 ) -> RunState:
+    """Resume the slice's existing PR owner through ``repair_with``.
+
+    ``repair_with`` decides what the handoff says; the same-owner ``resume_pr``
+    dispatch, the REPAIRING checkpoint, and the REVIEW_STUCK parking on a
+    failed dispatch are shared by every repair path.
+    """
     current = state.slices.get(slice_id)
     if current is None or current.pr_number is None:
         raise TLLoopError(f"repair event references slice without PR {slice_id!r}")
@@ -13028,60 +13209,11 @@ def _route_repair(
                 raise_on_failure=False,
             )
 
-        compose_repair(
-            pr,
-            Verdict.NO_GO,
-            review,
-            client=live,
-            model_choice=config.review_model_choice,
-            store=store,
-            slice_id=slice_id,
-            model=repair_model,
-            dispatch=dispatch_resume,
-        )
+        repair_with(pr, live, dispatch_resume, repair_model)
     except (RepairError, ValueError) as error:
-        parked = slice_transition(
-            slice_transition(current, SliceStatusChanged(SliceStatus.PARKED)),
-            ActionChanged(None),
+        return _park_repair_failed(
+            store, state, current, event_seq, error, config, effects, effects_log
         )
-        parked = slice_transition(parked, StallClassificationObserved("review_stuck"))
-        parked = replace(
-            parked,
-            park_cause=ParkCause.REVIEW_STUCK,
-            dispatch_last_boundary="repair_exhausted",
-            dispatch_error=str(error)[:500],
-        )
-        remaining = {
-            waiting_id: ChildHandle(
-                waiting_id,
-                state.slices[waiting_id].branch or "",
-                state.slices[waiting_id].agent_type or "unknown",
-            )
-            for waiting_id in state.fsm.waiting
-            if waiting_id != slice_id
-            and state.slices[waiting_id].status
-            in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
-        }
-        repair_phase: PhaseValue = TLWaiting(remaining) if remaining else TLPlanning()
-        state = store.checkpoint(
-            repair_phase,
-            {**state.slices, slice_id: parked},
-            state.budgets,
-            event_seq,
-        )
-        _record_controller_event(
-            slice_id,
-            "tl.slice_parked",
-            {
-                "slice_id": slice_id,
-                "park_cause": ParkCause.REVIEW_STUCK.value,
-                "reason": str(error)[:500],
-            },
-            config,
-            effects,
-            effects_log,
-        )
-        return state
     refreshed = store.load()
     resumed = slice_transition(
         refreshed.slices[slice_id],
@@ -13095,6 +13227,163 @@ def _route_repair(
         current_order=refreshed.current_order,
         ordered_stages=refreshed.ordered_stages,
         integration=refreshed.integration,
+    )
+
+
+def _park_repair_failed(
+    store: RunStore,
+    state: RunState,
+    current: SliceState,
+    event_seq: int,
+    error: Exception,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Park a slice whose repair or review-stuck judgment failed, with the cause recorded."""
+    slice_id = current.id
+    parked = slice_transition(
+        slice_transition(current, SliceStatusChanged(SliceStatus.PARKED)),
+        ActionChanged(None),
+    )
+    parked = slice_transition(parked, StallClassificationObserved("review_stuck"))
+    parked = replace(
+        parked,
+        park_cause=ParkCause.REVIEW_STUCK,
+        dispatch_last_boundary="repair_exhausted",
+        dispatch_error=str(error)[:500],
+    )
+    remaining = {
+        waiting_id: ChildHandle(
+            waiting_id,
+            state.slices[waiting_id].branch or "",
+            state.slices[waiting_id].agent_type or "unknown",
+        )
+        for waiting_id in state.fsm.waiting
+        if waiting_id != slice_id
+        and state.slices[waiting_id].status
+        in {SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+    }
+    repair_phase: PhaseValue = TLWaiting(remaining) if remaining else TLPlanning()
+    state = store.checkpoint(
+        repair_phase,
+        {**state.slices, slice_id: parked},
+        state.budgets,
+        event_seq,
+    )
+    _record_controller_event(
+        slice_id,
+        "tl.slice_parked",
+        {
+            "slice_id": slice_id,
+            "park_cause": ParkCause.REVIEW_STUCK.value,
+            "reason": str(error)[:500],
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return state
+
+
+def _model_repair(
+    review: object,
+    config: TLLoopConfig,
+    store: RunStore,
+    slice_id: str,
+) -> RepairWith:
+    """Compose the handoff with the review model (post-merge integration repair only)."""
+
+    def repair(
+        pr: Mapping[str, object],
+        live: EffectClient,
+        dispatch: Callable[[JsonObject], object],
+        model: str | None,
+    ) -> object:
+        return compose_repair(
+            pr,
+            Verdict.NO_GO,
+            review,
+            client=live,
+            model_choice=config.review_model_choice,
+            store=store,
+            slice_id=slice_id,
+            model=model,
+            dispatch=dispatch,
+        )
+
+    return repair
+
+
+def _forward_findings_repair(
+    review: object,
+    store: RunStore,
+    current: SliceState,
+) -> RepairWith:
+    """Forward the reviewer's or CI's findings verbatim; the inner loop makes no model call."""
+
+    def repair(
+        pr: Mapping[str, object],
+        live: EffectClient,
+        dispatch: Callable[[JsonObject], object],
+        model: str | None,
+    ) -> object:
+        return forward_review_findings(
+            pr,
+            Verdict.NO_GO,
+            review,
+            client=live,
+            test_plan=current.test_plan,
+            store=store,
+            slice_id=current.id,
+            model=model,
+            dispatch=dispatch,
+        )
+
+    return repair
+
+
+def _guide_repair(
+    handoff: RepairHandoff,
+    store: RunStore,
+    slice_id: str,
+) -> RepairWith:
+    """Dispatch the roles.tl guide handoff after its owned-path validation."""
+
+    def repair(
+        pr: Mapping[str, object],
+        live: EffectClient,
+        dispatch: Callable[[JsonObject], object],
+        model: str | None,
+    ) -> object:
+        return dispatch_guide_handoff(
+            pr,
+            handoff,
+            client=live,
+            store=store,
+            slice_id=slice_id,
+            model=model,
+            dispatch=dispatch,
+        )
+
+    return repair
+
+
+def _effective_reviewer_max_rounds(state: RunState, config: TLLoopConfig) -> int | None:
+    return (
+        state.reviewer_max_rounds
+        if state.reviewer_max_rounds_source is not None
+        else _reviewer_max_rounds(config.review_policy_path)
+    )
+
+
+def _review_rounds_exhausted(state: RunState, current: SliceState, config: TLLoopConfig) -> bool:
+    """Whether the inner loop is over and the slice belongs to the review-stuck judgment."""
+    max_rounds = _effective_reviewer_max_rounds(state, config)
+    return (
+        max_rounds is not None
+        and current.review_rounds >= max_rounds
+        and not _is_aggregate_slice(current)
     )
 
 

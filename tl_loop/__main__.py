@@ -52,6 +52,7 @@ from tl_loop.rlm.plan_acceptance import (
     proposal_summary,
     recorded_plan,
 )
+from tl_loop.rlm.tl_judgment import build_tl_model_choice
 from tl_loop.select.capability import load_capability
 from tl_loop.select.model import load_model_catalog
 from tl_loop.select.policy import load_policy
@@ -415,6 +416,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
             policy_path=project_root / ".exo" / "harness_policy.toml",
         )
         catalog = load_model_catalog(project_root / ".exo" / "model-catalog.json")
+        tl_model_choice = build_tl_model_choice(policy, catalog)
     except Exception as error:
         RunStore(run_id, state_root).record_exit_reason(str(error), error=error)
         raise
@@ -440,6 +442,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         policy=policy,
         capabilities=capabilities,
         catalog=catalog,
+        tl_model_choice=tl_model_choice,
         dispatch_retry_limit=getattr(args, "dispatch_retry_limit", DEFAULT_RETRY_LIMIT),
         dispatch_retry_base_delay_seconds=_dispatch_retry_base_delay(args),
         dispatch_retry_max_delay_seconds=getattr(
@@ -617,6 +620,14 @@ def _redispatch(args: argparse.Namespace) -> None:
     state_root = project_root / ".exo" / "tl-loop"
     store = RunStore(args.run_id, state_root)
     state = store.load()
+    try:
+        tl_model_choice = build_tl_model_choice(
+            load_policy(project_root / ".exo" / "harness_policy.toml"),
+            load_model_catalog(project_root / ".exo" / "model-catalog.json"),
+        )
+    except Exception as error:
+        store.record_exit_reason(str(error), error=error)
+        raise
     effects = EffectClient(
         TransportClient(project_root=project_root, timeout=args.transport_timeout),
         role="tl",
@@ -624,6 +635,7 @@ def _redispatch(args: argparse.Namespace) -> None:
     )
     config = TLLoopConfig(
         active=True,
+        tl_model_choice=tl_model_choice,
         root_dir=state_root,
         project_root=project_root,
         run_id=args.run_id,

@@ -24,7 +24,6 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.reconcile import Quiescent, _derive_slice_action
-from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -1787,16 +1786,6 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
     assert len(journal.confirmed_entries("post_merge_push", "slice-a")) == 1
 
 
-@dataclass
-class RecordingRepairBackend:
-    response: RlmResponse
-    requests: list[RlmRequest] = field(default_factory=list)
-
-    def complete(self, request: RlmRequest) -> object:
-        self.requests.append(request)
-        return self.response
-
-
 def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
@@ -1807,29 +1796,10 @@ def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_p
         review_body="Handle the missing error branch in src/a.py before retrying.",
         reviewer_agent_id="review-pr-99-codex",
     )
-    backend = RecordingRepairBackend(
-        RlmResponse(
-            {
-                "root_cause": "The error branch is not handled",
-                "proposed_solution": "Handle the error branch in src/a.py",
-                "read_first": ["src/a.py"],
-                "steps": ["Update src/a.py"],
-                "verify": ["just test"],
-                "boundary": ["Only edit src/a.py"],
-                "done_criteria": ["The error branch is covered"],
-            }
-        )
-    )
     config = TLLoopConfig(
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        review_model_choice=RlmModelChoice(
-            model_id="test-model",
-            backend=backend,
-            store=RlmCallStore(),
-            context_length=10_000,
-        ),
     )
 
     recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, [])
@@ -1838,16 +1808,9 @@ def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_p
     assert slice_state.review_findings["head-a"][0]["rationale"] == (
         "Handle the missing error branch in src/a.py before retrying."
     )
-    assert len(backend.requests) == 1
-    no_go_sections = [
-        section
-        for section in backend.requests[0].inputs["sections"]
-        if section["name"] == "no_go_reasons"
-    ]
-    assert len(no_go_sections) == 1
-    assert "Handle the missing error branch" in str(no_go_sections[0]["content"])
     assert len(client.resume_pr_calls) == 1
     assert client.resume_pr_calls[0]["pr_number"] == 99
+    assert "Handle the missing error branch" in str(client.resume_pr_calls[0]["context"])
 
     repeated = _reconcile_nonterminal_slices(
         _PLAN,
@@ -1859,7 +1822,6 @@ def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_p
     )
 
     assert repeated.slices["slice-a"].verdict is not None
-    assert len(backend.requests) == 1
     assert len(client.resume_pr_calls) == 1
 
 
@@ -1880,29 +1842,10 @@ def test_repair_effect_journal_recovers_unknown_resume_without_duplicate_dispatc
         review_body="Handle the missing error branch in src/a.py before retrying.",
         reviewer_agent_id="review-pr-99-codex",
     )
-    backend = RecordingRepairBackend(
-        RlmResponse(
-            {
-                "root_cause": "The error branch is not handled",
-                "proposed_solution": "Handle the error branch in src/a.py",
-                "read_first": ["src/a.py"],
-                "steps": ["Update src/a.py"],
-                "verify": ["just test"],
-                "boundary": ["Only edit src/a.py"],
-                "done_criteria": ["The error branch is covered"],
-            }
-        )
-    )
     config = TLLoopConfig(
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        review_model_choice=RlmModelChoice(
-            model_id="test-model",
-            backend=backend,
-            store=RlmCallStore(),
-            context_length=10_000,
-        ),
     )
     journal_path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-1", journal_path)
