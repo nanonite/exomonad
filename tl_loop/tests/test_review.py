@@ -787,6 +787,15 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
                         "head_sha": "abc123",
                         "base_sha": "base-a",
                         "pr_state": "closed",
+                        },
+                    }
+            if tool_name == "chainlink_issue_show":
+                return {
+                    "success": True,
+                    "result": {
+                        "id": arguments["issue_id"],
+                        "title": "linked work",
+                        "status": "open",
                     },
                 }
             if tool_name == "post_merge_parent_sync":

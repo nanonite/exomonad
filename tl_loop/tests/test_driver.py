@@ -931,6 +931,15 @@ class RecordingTransport:
                     "receipt_id": "issue-close-receipt",
                 },
             }
+        if tool_name == "chainlink_issue_show":
+            return {
+                "success": True,
+                "result": {
+                    "id": arguments["issue_id"],
+                    "title": "linked work",
+                    "status": "open",
+                },
+            }
         if tool_name == "post_merge_changelog":
             return {
                 "success": True,

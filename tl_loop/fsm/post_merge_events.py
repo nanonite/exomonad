@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 from .child import TLOrchestrationEvent
 from .post_merge_evidence import PushReceipt
@@ -47,6 +48,50 @@ class IssueCloseConfirmed(TLOrchestrationEvent):
     issue_id: str
     intent_id: str
     journal_id: str
+
+
+class IssueCloseFailureKind(str, Enum):
+    """Closed categories for a linked issue-close recovery boundary."""
+
+    UNAVAILABLE = "unavailable"
+    TIMEOUT = "timeout"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class IssueCloseFailed(TLOrchestrationEvent):
+    """Persist a recoverable issue-close failure without a receipt."""
+
+    child_id: str
+    issue_id: str
+    intent_id: str
+    failure_generation: int
+    failure_kind: IssueCloseFailureKind
+    detail: str
+    observed_status: str | None = None
+
+
+@dataclass(frozen=True)
+class IssueCloseRetryAuthorized(TLOrchestrationEvent):
+    """Record an issue-close retry after an approved gate and open status proof."""
+
+    child_id: str
+    issue_id: str
+    intent_id: str
+    failure_generation: int
+    next_attempt: int
+    observed_status: str
+
+
+@dataclass(frozen=True)
+class IssueCloseAlreadyClosed(TLOrchestrationEvent):
+    """Accept an exact issue whose authoritative status is already closed."""
+
+    child_id: str
+    issue_id: str
+    intent_id: str
+    observed_status: str
 
 
 @dataclass(frozen=True)
@@ -113,8 +158,12 @@ class PostMergeRebuildRequested(TLOrchestrationEvent):
 __all__ = [
     "ChangelogCommitted",
     "ChangelogPending",
+    "IssueCloseAlreadyClosed",
     "IssueCloseConfirmed",
+    "IssueCloseFailed",
+    "IssueCloseFailureKind",
     "IssueClosePending",
+    "IssueCloseRetryAuthorized",
     "MergeAdopted",
     "ParentBranchSynced",
     "ParentPushPending",

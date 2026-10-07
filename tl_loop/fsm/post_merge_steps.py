@@ -10,8 +10,12 @@ from .post_merge import PostMergePhase, PostMergeState
 from .post_merge_events import (
     ChangelogCommitted,
     ChangelogPending,
+    IssueCloseAlreadyClosed,
     IssueCloseConfirmed,
+    IssueCloseFailed,
+    IssueCloseFailureKind,
     IssueClosePending,
+    IssueCloseRetryAuthorized,
     MergeAdopted,
     ParentBranchSynced,
     ParentPushPending,
@@ -32,6 +36,12 @@ def advance_standard_post_merge(state: PostMergeState, event: object) -> PostMer
         return _issue_close_pending(state, event)
     if isinstance(event, IssueCloseConfirmed):
         return _issue_close_confirmed(state, event)
+    if isinstance(event, IssueCloseAlreadyClosed):
+        return _issue_close_already_closed(state, event)
+    if isinstance(event, IssueCloseFailed):
+        return _issue_close_failed(state, event)
+    if isinstance(event, IssueCloseRetryAuthorized):
+        return _issue_close_retry_authorized(state, event)
     if isinstance(event, ChangelogPending):
         return _changelog_pending(state, event)
     if isinstance(event, ChangelogCommitted):
@@ -107,7 +117,11 @@ def _issue_close_pending(state: PostMergeState, event: IssueClosePending) -> Pos
     return _with_evidence(
         state,
         PostMergePhase.ISSUE_CLOSE_PENDING,
-        {"issue_id": event.issue_id, "issue_close_intent_id": event.intent_id},
+        {
+            "issue_id": event.issue_id,
+            "issue_close_intent_id": event.intent_id,
+            "issue_close_attempt": "1",
+        },
     )
 
 
@@ -151,8 +165,116 @@ def _issue_close_confirmed(state: PostMergeState, event: IssueCloseConfirmed) ->
     return _with_evidence(
         state,
         PostMergePhase.ISSUE_CLOSE_CONFIRMED,
-        {"issue_close_journal_id": event.journal_id},
+        {
+            "issue_close_journal_id": event.journal_id,
+            "issue_close_outcome": "closed",
+        },
     )
+
+
+def _issue_close_already_closed(
+    state: PostMergeState, event: IssueCloseAlreadyClosed
+) -> PostMergeState:
+    _require_issue_close_identity(state, event)
+    if event.observed_status.lower() != "closed":
+        raise ValueError("already-closed evidence must report closed status")
+    if state.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED:
+        _require_evidence(state, "issue_close_outcome", "already_closed")
+        _require_evidence(state, "issue_close_observed_issue_id", event.issue_id)
+        _require_evidence(state, "issue_close_observed_status", "closed")
+        return state
+    _require_phase(state, PostMergePhase.ISSUE_CLOSE_PENDING, "already-closed issue adoption")
+    return _with_evidence(
+        state,
+        PostMergePhase.ISSUE_CLOSE_CONFIRMED,
+        {
+            "issue_close_outcome": "already_closed",
+            "issue_close_observed_issue_id": event.issue_id,
+            "issue_close_observed_status": "closed",
+        },
+    )
+
+
+def _issue_close_failed(state: PostMergeState, event: IssueCloseFailed) -> PostMergeState:
+    _require_issue_close_identity(state, event)
+    _require_phase(state, PostMergePhase.ISSUE_CLOSE_PENDING, "issue-close failure")
+    if not isinstance(event.failure_kind, IssueCloseFailureKind):
+        raise TypeError("issue-close failure kind must be typed")
+    if event.failure_generation <= 0:
+        raise ValueError("issue-close failure generation must be positive")
+    _require_text(event.detail, "issue-close failure detail")
+    prior_generation = _evidence_integer(state, "issue_close_failure_generation", 0)
+    generation_key = str(event.failure_generation)
+    if event.failure_generation != prior_generation + 1:
+        if event.failure_generation == prior_generation:
+            _require_evidence(
+                state,
+                f"issue_close_failure_{generation_key}_kind",
+                event.failure_kind.value,
+            )
+            _require_evidence(
+                state,
+                f"issue_close_failure_{generation_key}_detail",
+                event.detail[:500],
+            )
+            return state
+        raise ValueError("issue-close failure generation must advance by one")
+    attempt = _evidence_integer(state, "issue_close_attempt", 1)
+    additions = {
+        "issue_close_failure_generation": generation_key,
+        "issue_close_failure_attempt": str(attempt),
+        f"issue_close_failure_{generation_key}_kind": event.failure_kind.value,
+        f"issue_close_failure_{generation_key}_detail": event.detail[:500],
+    }
+    if event.observed_status is not None:
+        additions[f"issue_close_failure_{generation_key}_observed_status"] = (
+            event.observed_status
+        )
+    return _with_evidence(state, PostMergePhase.ISSUE_CLOSE_PENDING, additions)
+
+
+def _issue_close_retry_authorized(
+    state: PostMergeState, event: IssueCloseRetryAuthorized
+) -> PostMergeState:
+    _require_issue_close_identity(state, event)
+    _require_phase(state, PostMergePhase.ISSUE_CLOSE_PENDING, "issue-close retry")
+    _require_positive(event.failure_generation, "issue-close failure generation")
+    _require_positive(event.next_attempt, "issue-close retry attempt")
+    observed_status = event.observed_status.lower()
+    if observed_status not in {"open", "in_progress"}:
+        raise ValueError("issue-close retry requires an open issue status")
+    _require_evidence(state, "issue_close_failure_generation", str(event.failure_generation))
+    current_attempt = _evidence_integer(state, "issue_close_attempt", 1)
+    if event.next_attempt != current_attempt + 1:
+        raise ValueError("issue-close retry attempt must advance by one")
+    return _with_evidence(
+        state,
+        PostMergePhase.ISSUE_CLOSE_PENDING,
+        {
+            "issue_close_attempt": str(event.next_attempt),
+            "issue_close_retry_authorized_generation": str(event.failure_generation),
+            "issue_close_retry_observed_issue_id": event.issue_id,
+            "issue_close_retry_observed_status": observed_status,
+        },
+    )
+
+
+def _require_issue_close_identity(state: PostMergeState, event: object) -> None:
+    issue_id = getattr(event, "issue_id", "")
+    intent_id = getattr(event, "intent_id", "")
+    _require_text(issue_id, "Chainlink issue ID")
+    _require_text(intent_id, "issue-close intent ID")
+    _require_evidence(state, "issue_id", issue_id)
+    _require_evidence(state, "issue_close_intent_id", intent_id)
+
+
+def _evidence_integer(state: PostMergeState, key: str, default: int) -> int:
+    value = state.evidence.get(key)
+    if value is None:
+        return default
+    if not value.isdigit():
+        raise ValueError(f"{key} evidence must be a non-negative integer")
+    return int(value)
 
 
 def _changelog_pending(state: PostMergeState, event: ChangelogPending) -> PostMergeState:

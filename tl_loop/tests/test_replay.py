@@ -379,6 +379,16 @@ class _RecoveryTransport(RecordingTransport):
                     },
                 },
             }
+        if tool_name == "chainlink_issue_show":
+            self.calls.append((tool_name, dict(arguments)))
+            return {
+                "success": True,
+                "result": {
+                    "id": arguments["issue_id"],
+                    "title": "linked work",
+                    "status": "open",
+                },
+            }
         return super().call_tool(role, name, tool_name, arguments)
 
 

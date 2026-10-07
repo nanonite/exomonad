@@ -167,6 +167,17 @@ remote heads, ancestry proofs, or push receipts. Parent pushes use
 pending when that compare fails, so restart can reconcile the exact durable
 intent without redispatching an already confirmed effect.
 
+A linked slice closes only its own persisted `chainlink_issue_id`. Before a
+close dispatch or retry, the controller reads that exact issue: `closed` is
+accepted with the observed issue ID and status as evidence, while `open` or
+`in_progress` permits a close attempt. A confirmed close reuses its journaled
+receipt after restart. Unavailable, timed-out, rejected, or unclassifiable
+results remain in `ISSUE_CLOSE_PENDING` with a typed failure kind and the
+original issue and close-intent identity; they never create a receipt. A retry
+needs its named gate approved and a fresh open-status observation. The outcome
+is also emitted as `tl.issue_close_outcome`. An unlinked slice records both
+issue closure and changelog as not applicable and makes no Chainlink call.
+
 ## Repository identity resolution
 
 `RunState.repository_identity` (owner, repo, base branch, forge host,

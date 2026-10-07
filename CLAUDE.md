@@ -949,6 +949,10 @@ duplicate bindings stop plan admission with a reconciliation gate.
 After confirmed parent-branch sync, an unlinked merged slice records issue
 closure and changelog as not applicable, makes no Chainlink call, and releases
 its integration lane.
+For a linked slice, the controller reads that exact issue before closing it,
+accepts an already-closed status with observation evidence, and reuses a
+confirmed close receipt on restart. Unavailable, timed-out, or rejected closes
+remain recoverable at the issue-close boundary without a fabricated receipt.
 
 Model calls are narrow structured judgments: `decompose`, `adjudicate_review`,
 `compose_repair` (post-merge integration repair only), and the `review_stuck`

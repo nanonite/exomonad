@@ -11,8 +11,12 @@ from .evidence import require_fields as _require_fields
 from .post_merge_events import (
     ChangelogCommitted,
     ChangelogPending,
+    IssueCloseAlreadyClosed,
     IssueCloseConfirmed,
+    IssueCloseFailed,
+    IssueCloseFailureKind,
     IssueClosePending,
+    IssueCloseRetryAuthorized,
     MergeAdopted,
     ParentBranchSynced,
     ParentPushPending,
@@ -81,7 +85,6 @@ _REQUIRED_EVIDENCE: dict[PostMergePhase, tuple[str, ...]] = {
         "parent_commit_sha",
         "issue_id",
         "issue_close_intent_id",
-        "issue_close_journal_id",
     ),
     PostMergePhase.CHANGELOG_PENDING: _cumulative(
         "repository",
@@ -93,7 +96,6 @@ _REQUIRED_EVIDENCE: dict[PostMergePhase, tuple[str, ...]] = {
         "parent_commit_sha",
         "issue_id",
         "issue_close_intent_id",
-        "issue_close_journal_id",
         "changelog_intent_id",
         "changelog_generation",
     ),
@@ -107,7 +109,6 @@ _REQUIRED_EVIDENCE: dict[PostMergePhase, tuple[str, ...]] = {
         "parent_commit_sha",
         "issue_id",
         "issue_close_intent_id",
-        "issue_close_journal_id",
         "changelog_intent_id",
         "changelog_generation",
         "changelog_commit_sha",
@@ -122,7 +123,6 @@ _REQUIRED_EVIDENCE: dict[PostMergePhase, tuple[str, ...]] = {
         "parent_commit_sha",
         "issue_id",
         "issue_close_intent_id",
-        "issue_close_journal_id",
         "changelog_intent_id",
         "changelog_generation",
         "changelog_commit_sha",
@@ -140,7 +140,6 @@ _REQUIRED_EVIDENCE: dict[PostMergePhase, tuple[str, ...]] = {
         "parent_commit_sha",
         "issue_id",
         "issue_close_intent_id",
-        "issue_close_journal_id",
         "changelog_intent_id",
         "changelog_generation",
         "changelog_commit_sha",
@@ -188,14 +187,32 @@ def _required_evidence(phase: PostMergePhase, evidence: Mapping[str, str]) -> tu
             "issue_close_outcome",
             "changelog_outcome",
         )
-    return _REQUIRED_EVIDENCE.get(phase, ())
+    required = _REQUIRED_EVIDENCE.get(phase, ())
+    if phase in {
+        PostMergePhase.ISSUE_CLOSE_CONFIRMED,
+        PostMergePhase.CHANGELOG_PENDING,
+        PostMergePhase.CHANGELOG_COMMITTED,
+        PostMergePhase.PARENT_PUSH_PENDING,
+        PostMergePhase.COMPLETE,
+    }:
+        proof = (
+            ("issue_close_observed_issue_id", "issue_close_observed_status")
+            if evidence.get("issue_close_outcome") == "already_closed"
+            else ("issue_close_journal_id",)
+        )
+        return (*required, *proof)
+    return required
 
 
 __all__ = [
     "ChangelogCommitted",
     "ChangelogPending",
+    "IssueCloseAlreadyClosed",
     "IssueCloseConfirmed",
+    "IssueCloseFailed",
+    "IssueCloseFailureKind",
     "IssueClosePending",
+    "IssueCloseRetryAuthorized",
     "MergeAdopted",
     "ParentBranchSynced",
     "ParentPushPending",

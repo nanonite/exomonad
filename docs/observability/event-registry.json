@@ -116,6 +116,7 @@
     {"type": "tl.gate_opened", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.gate_answered", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.merge_decided", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.issue_close_outcome", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.judgment", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.plan_proposed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.dispatch_intended", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},

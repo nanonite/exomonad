@@ -106,6 +106,7 @@ class FakeClient:
     resume_pr_calls: list[dict[str, object]] = field(default_factory=list)
     chainlink_issue_close_calls: list[dict[str, object]] = field(default_factory=list)
     chainlink_issue_close_result: ToolResult | None = None
+    chainlink_issue_status: str = "open"
 
     def list_agents(self, *, filter_type: str | None = None) -> ToolResult:
         return ToolResult(
@@ -277,7 +278,29 @@ class FakeClient:
         )
         if self.chainlink_issue_close_result is not None:
             return self.chainlink_issue_close_result
-        return ToolResult(raw={"success": True}, success=True, result={}, error=None)
+        return ToolResult(
+            raw={
+                "success": True,
+                "result": {
+                    "issue_id": issue_id,
+                    "receipt_id": f"chainlink-close:{issue_id}",
+                },
+            },
+            success=True,
+            result={
+                "issue_id": issue_id,
+                "receipt_id": f"chainlink-close:{issue_id}",
+            },
+            error=None,
+        )
+
+    def chainlink_issue_show(self, *, issue_id: int) -> ToolResult:
+        return ToolResult(
+            raw={"success": True},
+            success=True,
+            result={"id": issue_id, "title": "linked work", "status": self.chainlink_issue_status},
+            error=None,
+        )
 
     def emit_controller_event(self, *, event_type: str, payload: dict[str, object]) -> ToolResult:
         del event_type, payload

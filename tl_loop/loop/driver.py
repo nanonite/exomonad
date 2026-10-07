@@ -23,7 +23,13 @@ from typing import NamedTuple, Protocol, cast
 
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
-from tl_loop.client.transport import JsonObject, TransportClient
+from tl_loop.client.transport import (
+    JsonObject,
+    ServerTimeout,
+    ServerUnreachable,
+    TransportClient,
+    TransportError,
+)
 from tl_loop.events.envelope import BlockCause, EnvelopeError, EventEnvelope, EventKind, project
 from tl_loop.events.identity import (
     IdentityResolution,
@@ -74,8 +80,12 @@ from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.post_merge_events import (
     ChangelogCommitted,
     ChangelogPending,
+    IssueCloseAlreadyClosed,
     IssueCloseConfirmed,
+    IssueCloseFailed,
+    IssueCloseFailureKind,
     IssueClosePending,
+    IssueCloseRetryAuthorized,
     MergeAdopted,
     ParentBranchSynced,
     ParentPushPending,
@@ -552,6 +562,27 @@ class ChainlinkIssueBindingError(ValueError):
 
 class EffectFailed(TLLoopError):
     """An active effect returned an explicit failure."""
+
+
+class IssueCloseRecoveryError(RuntimeError):
+    """A linked issue-close boundary failed without authoritative success."""
+
+    def __init__(
+        self,
+        issue_id: str,
+        intent_id: str,
+        attempt: int,
+        failure_kind: IssueCloseFailureKind,
+        detail: str,
+        observed_status: str | None = None,
+    ) -> None:
+        self.issue_id = issue_id
+        self.intent_id = intent_id
+        self.attempt = attempt
+        self.failure_kind = failure_kind
+        self.detail = detail
+        self.observed_status = observed_status
+        super().__init__(detail)
 
 
 @dataclass(frozen=True)
@@ -5102,6 +5133,8 @@ def _advance_post_merge_boundary(
             )
         if post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING:
             return _run_parent_push(state, current, evidence, config, effects, effects_log, store)
+    except IssueCloseRecoveryError as error:
+        return _record_issue_close_failure(store, state, slice_id, error, config, effects, effects_log)
     except (EffectFailed, TLLoopError, ToolUnavailableError, TypeError, ValueError) as error:
         return _block_post_merge_recovery(store, state, slice_id, str(error))
     return state
@@ -5521,32 +5554,517 @@ def _run_issue_close(
 ) -> RunState:
     issue_id = _required_issue_id(current.chainlink_issue_id)
     intent_id = _required_merge_identity(evidence, ("issue_close_intent_id",), "issue-close intent")
-    arguments = {"issue_id": int(issue_id), "force": True, "commit_changelog": False}
-    result = _post_merge_effect(
-        "post_merge_issue_close",
-        current.id,
-        {**arguments, "intent_id": intent_id},
-        effects,
-        effects_log,
-        "chainlink_issue_close",
-        active=config.active,
-        call_arguments={
-            "issue_id": int(issue_id),
-            "force": True,
-            "commit_changelog": False,
-            "summary": f"Closed after successful merge of PR #{evidence['pr_number']}",
-        },
-    )
+    attempt = _evidence_int(evidence, "issue_close_attempt", "issue-close attempt", default=1)
+    observed_status = evidence.get("issue_close_retry_observed_status", "open")
+    if not isinstance(observed_status, str):
+        observed_status = "open"
+    arguments: dict[str, object] = {
+        "issue_id": int(issue_id),
+        "force": True,
+        "commit_changelog": False,
+    }
+    if attempt > 1:
+        arguments["retry_attempt"] = attempt
+    effect_arguments = {**arguments, "intent_id": intent_id}
+    intent = EffectIntent("post_merge_issue_close", current.id, effect_arguments, config.active)
+    journal_entry = effects_log.existing(intent) if isinstance(effects_log, EffectJournal) else None
+    journal_status = journal_entry.get("status") if journal_entry else None
+    if journal_status == "reconciled":
+        resolution = journal_entry.get("resolution")
+        if (
+            isinstance(resolution, Mapping)
+            and resolution.get("issue_id") == int(issue_id)
+            and resolution.get("status") == "closed"
+        ):
+            return _accept_already_closed_issue(
+                state, current, issue_id, intent_id, store, config, effects, effects_log
+            )
+
+    replayable_receipt = _issue_close_entry_has_receipt(journal_entry, issue_id)
+    if replayable_receipt:
+        result = _post_merge_issue_close_effect(
+            current,
+            issue_id,
+            intent_id,
+            attempt,
+            observed_status,
+            evidence,
+            config,
+            effects,
+            effects_log,
+        )
+    else:
+        observed_status = _chainlink_issue_status(
+            current, issue_id, attempt, config, effects, effects_log
+        )
+        if observed_status is None:
+            return state
+        if observed_status == "closed":
+            _resolve_issue_close_entry(effects_log, intent, issue_id, observed_status)
+            updated = _accept_already_closed_issue(
+                state, current, issue_id, intent_id, store, config, effects, effects_log
+            )
+            return _clear_issue_close_gates(store, updated, current.id, intent, effects_log)
+
+        if journal_entry and journal_status in {"intended", "unknown", "reconciled"}:
+            _resolve_issue_close_entry(effects_log, intent, issue_id, observed_status)
+            current_failure = _evidence_int(
+                evidence,
+                "issue_close_failure_attempt",
+                "issue-close failure attempt",
+                default=0,
+            )
+            if current_failure != attempt:
+                failure_generation = _evidence_int(
+                    evidence,
+                    "issue_close_failure_generation",
+                    "issue-close failure generation",
+                    default=0,
+                ) + 1
+                return _record_issue_close_failure(
+                    store,
+                    state,
+                    current.id,
+                    IssueCloseRecoveryError(
+                        issue_id,
+                        intent_id,
+                        attempt,
+                        IssueCloseFailureKind.UNKNOWN,
+                        "Restart observed the linked issue still open after an unresolved close attempt.",
+                        observed_status,
+                    ),
+                    config,
+                    effects,
+                    effects_log,
+                    failure_generation=failure_generation,
+                )
+
+        failure_attempt = _evidence_int(
+            evidence,
+            "issue_close_failure_attempt",
+            "issue-close failure attempt",
+            default=0,
+        )
+        if failure_attempt == attempt:
+            failure_generation = _evidence_int(
+                evidence,
+                "issue_close_failure_generation",
+                "issue-close failure generation",
+                default=0,
+            )
+            gate_name = _issue_close_gate_name(current.id, failure_generation)
+            gate = next((item for item in state.gates if item.name == gate_name), None)
+            if gate is None or gate.status is not GateStatus.APPROVED:
+                return state
+            state = _checkpoint_post_merge_event(
+                store,
+                state,
+                current.id,
+                IssueCloseRetryAuthorized(
+                    current.id,
+                    issue_id,
+                    intent_id,
+                    failure_generation,
+                    attempt + 1,
+                    observed_status,
+                ),
+            )
+            state = store.clear_gate(gate_name)
+            current = state.slices[current.id]
+            evidence = dict(current.post_merge.evidence) if current.post_merge else evidence
+            attempt = _evidence_int(evidence, "issue_close_attempt", "issue-close attempt")
+            intent_arguments: dict[str, object] = dict(arguments)
+            intent_arguments["retry_attempt"] = attempt
+            intent = EffectIntent(
+                "post_merge_issue_close",
+                current.id,
+                {**intent_arguments, "intent_id": intent_id},
+                config.active,
+            )
+
+        result = _post_merge_issue_close_effect(
+            current,
+            issue_id,
+            intent_id,
+            attempt,
+            observed_status,
+            evidence,
+            config,
+            effects,
+            effects_log,
+        )
+
+    if result is None:
+        return state
+    if result.success is not True:
+        failure_kind = (
+            IssueCloseFailureKind.UNAVAILABLE
+            if result.error_kind == "tool_unavailable"
+            else IssueCloseFailureKind.REJECTED
+        )
+        raise IssueCloseRecoveryError(
+            issue_id,
+            intent_id,
+            attempt,
+            failure_kind,
+            result.error or "Chainlink rejected the issue-close request.",
+            observed_status,
+        )
     payload = _required_effect_result(result, ("issue_id", "receipt_id"))
     if str(payload["issue_id"]) != issue_id:
-        raise ValueError("issue-close receipt has a different issue ID")
+        raise IssueCloseRecoveryError(
+            issue_id,
+            intent_id,
+            attempt,
+            IssueCloseFailureKind.UNKNOWN,
+            "Issue-close receipt has a different issue ID.",
+            observed_status,
+        )
     updated = _checkpoint_post_merge_event(
         store,
         state,
         current.id,
         IssueCloseConfirmed(current.id, issue_id, intent_id, payload["receipt_id"]),
     )
+    _record_issue_close_outcome(current.id, issue_id, "closed", config, effects, effects_log)
+    return _clear_issue_close_gates(store, updated, current.id, intent, effects_log)
+
+
+def _post_merge_issue_close_effect(
+    current: SliceState,
+    issue_id: str,
+    intent_id: str,
+    attempt: int,
+    observed_status: str,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> ToolResult | None:
+    arguments: dict[str, object] = {
+        "issue_id": int(issue_id),
+        "force": True,
+        "commit_changelog": False,
+    }
+    if attempt > 1:
+        arguments["retry_attempt"] = attempt
+    try:
+        return _post_merge_effect(
+            "post_merge_issue_close",
+            current.id,
+            {**arguments, "intent_id": intent_id},
+            effects,
+            effects_log,
+            "chainlink_issue_close",
+            active=config.active,
+            call_arguments={
+                "issue_id": int(issue_id),
+                "force": True,
+                "commit_changelog": False,
+                "summary": f"Closed after successful merge of PR #{evidence['pr_number']}",
+            },
+            retryable_failure=True,
+        )
+    except ToolUnavailableError as error:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            intent_id,
+            attempt,
+            IssueCloseFailureKind.UNAVAILABLE,
+            str(error),
+            observed_status,
+        ) from error
+    except (ServerTimeout, TimeoutError) as error:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            intent_id,
+            attempt,
+            IssueCloseFailureKind.TIMEOUT,
+            str(error),
+            observed_status,
+        ) from error
+    except ServerUnreachable as error:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            intent_id,
+            attempt,
+            IssueCloseFailureKind.UNAVAILABLE,
+            str(error),
+            observed_status,
+        ) from error
+    except TransportError as error:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            intent_id,
+            attempt,
+            IssueCloseFailureKind.UNKNOWN,
+            str(error),
+            observed_status,
+        ) from error
+
+
+def _chainlink_issue_status(
+    current: SliceState,
+    issue_id: str,
+    attempt: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> str | None:
+    try:
+        result = _invoke(
+            "post_merge_issue_status",
+            current.id,
+            {"issue_id": int(issue_id)},
+            config.active,
+            cast(EffectClient, effects),
+            lambda client: client.chainlink_issue_show(issue_id=int(issue_id)),
+            effects_log,
+            raise_on_failure=False,
+        )
+    except ToolUnavailableError as error:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            _post_merge_key_from_slice(current),
+            attempt,
+            IssueCloseFailureKind.UNAVAILABLE,
+            str(error),
+        ) from error
+    except (ServerTimeout, TimeoutError) as error:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            _post_merge_key_from_slice(current),
+            attempt,
+            IssueCloseFailureKind.TIMEOUT,
+            str(error),
+        ) from error
+    except ServerUnreachable as error:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            _post_merge_key_from_slice(current),
+            attempt,
+            IssueCloseFailureKind.UNAVAILABLE,
+            str(error),
+        ) from error
+    except TransportError as error:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            _post_merge_key_from_slice(current),
+            attempt,
+            IssueCloseFailureKind.UNKNOWN,
+            str(error),
+        ) from error
+    if result is None:
+        return None
+    if result.success is not True or not isinstance(result.result, Mapping):
+        raise IssueCloseRecoveryError(
+            issue_id,
+            _post_merge_key_from_slice(current),
+            attempt,
+            IssueCloseFailureKind.UNAVAILABLE,
+            result.error or "Chainlink issue status could not be read.",
+        )
+    observed_id = result.result.get("id")
+    if type(observed_id) is not int or str(observed_id) != issue_id:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            _post_merge_key_from_slice(current),
+            attempt,
+            IssueCloseFailureKind.UNKNOWN,
+            "Chainlink issue status returned a different or invalid issue ID.",
+        )
+    status = result.result.get("status")
+    if not isinstance(status, str) or status.lower() not in {"open", "in_progress", "closed"}:
+        raise IssueCloseRecoveryError(
+            issue_id,
+            _post_merge_key_from_slice(current),
+            attempt,
+            IssueCloseFailureKind.UNKNOWN,
+            "Chainlink issue status returned an unsupported status.",
+        )
+    return status.lower()
+
+
+def _post_merge_key_from_slice(current: SliceState) -> str:
+    if current.post_merge is None:
+        raise ValueError("issue-close recovery has no post-merge state")
+    return _required_merge_identity(
+        current.post_merge.evidence,
+        ("issue_close_intent_id",),
+        "issue-close intent",
+    )
+
+
+def _issue_close_entry_has_receipt(
+    entry: Mapping[str, object] | None,
+    issue_id: str,
+) -> bool:
+    if entry is None or entry.get("status") != "confirmed":
+        return False
+    raw_result = entry.get("result")
+    if not isinstance(raw_result, dict):
+        return False
+    result = ToolResult.from_raw(cast(JsonObject, raw_result))
+    payload = _merge_result_payload(result)
+    return bool(
+        payload
+        and str(payload.get("issue_id")) == issue_id
+        and isinstance(payload.get("receipt_id"), str)
+        and payload.get("receipt_id")
+    )
+
+
+def _resolve_issue_close_entry(
+    effects_log: list[EffectIntent],
+    intent: EffectIntent,
+    issue_id: str,
+    observed_status: str,
+) -> None:
+    if not isinstance(effects_log, EffectJournal):
+        return
+    entry = effects_log.existing(intent)
+    if entry is None:
+        return
+    key = entry.get("key")
+    if not isinstance(key, str):
+        raise TLLoopError("issue-close action journal entry has no stable key")
+    effects_log.resolve_by_key(
+        key,
+        status="reconciled",
+        resolution={"kind": "chainlink_issue_show", "issue_id": int(issue_id), "status": observed_status},
+    )
+
+
+def _accept_already_closed_issue(
+    state: RunState,
+    current: SliceState,
+    issue_id: str,
+    intent_id: str,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    updated = _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        IssueCloseAlreadyClosed(current.id, issue_id, intent_id, "closed"),
+    )
+    _record_issue_close_outcome(
+        current.id, issue_id, "already_closed", config, effects, effects_log
+    )
     return updated
+
+
+def _record_issue_close_failure(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    error: IssueCloseRecoveryError,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    *,
+    failure_generation: int | None = None,
+) -> RunState:
+    current = state.slices[slice_id]
+    if current.post_merge is None:
+        raise TLLoopError("issue-close failure has no post-merge checkpoint")
+    evidence = current.post_merge.evidence
+    generation = failure_generation or (
+        _evidence_int(
+            evidence,
+            "issue_close_failure_generation",
+            "issue-close failure generation",
+            default=0,
+        )
+        + 1
+    )
+    updated = _checkpoint_post_merge_event(
+        store,
+        state,
+        slice_id,
+        IssueCloseFailed(
+            slice_id,
+            error.issue_id,
+            error.intent_id,
+            generation,
+            error.failure_kind,
+            error.detail[:500],
+            error.observed_status,
+        ),
+    )
+    changed = replace(
+        slice_transition(updated.slices[slice_id], ActionChanged(None)),
+        dispatch_error=error.detail[:500],
+    )
+    updated = _checkpoint_slice_action(
+        store,
+        updated,
+        slice_id,
+        None,
+        slice_state=changed,
+        integration=_abandon_owned_lane_integration(
+            updated, changed, updated.integration, "post_merge_issue_close", error.detail[:500]
+        ),
+    )
+    gate_name = _issue_close_gate_name(slice_id, generation)
+    if not any(gate.name == gate_name for gate in updated.gates):
+        updated = store.set_gate(gate_name, GateStatus.PENDING)
+    _record_issue_close_outcome(
+        slice_id, error.issue_id, error.failure_kind.value, config, effects, effects_log
+    )
+    return updated
+
+
+def _issue_close_gate_name(slice_id: str, generation: int) -> str:
+    return f"tl-post-merge-issue-close-{slice_id}-{generation}"
+
+
+def _clear_issue_close_gates(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    intent: EffectIntent,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    names = {f"tl-post-merge-{slice_id}"}
+    if isinstance(effects_log, EffectJournal):
+        entry = effects_log.existing(intent)
+        if entry is not None:
+            key = entry.get("key")
+            if isinstance(key, str):
+                names.add(
+                    _action_journal_gate_name(key, _action_journal_compensation_attempt(entry))
+                )
+    for gate in state.gates:
+        if (
+            gate.name.startswith(f"tl-post-merge-issue-close-{slice_id}-")
+            and gate.status is GateStatus.PENDING
+        ):
+            names.add(gate.name)
+    for name in sorted(names):
+        state = store.clear_gate(name)
+    return state
+
+
+def _record_issue_close_outcome(
+    slice_id: str,
+    issue_id: str,
+    outcome: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    _record_controller_event(
+        slice_id,
+        "tl.issue_close_outcome",
+        {"slice_id": slice_id, "issue_id": int(issue_id), "outcome": outcome},
+        config,
+        effects,
+        effects_log,
+    )
 
 
 def _run_changelog(
@@ -5912,6 +6430,23 @@ def _required_int(
         value = int(value)
     minimum = 0 if allow_zero else 1
     if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} is unavailable")
+    return value
+
+
+def _evidence_int(
+    evidence: Mapping[str, object],
+    key: str,
+    name: str,
+    *,
+    default: int | None = None,
+) -> int:
+    value = evidence.get(key)
+    if value is None and default is not None:
+        return default
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    if type(value) is not int or value < 0:
         raise ValueError(f"{name} is unavailable")
     return value
 
@@ -7386,6 +7921,8 @@ def _reconcile_action_journal(
     if not isinstance(effects_log, EffectJournal):
         return state
     for entry in effects_log.pending_entries():
+        if entry.get("operation") == "post_merge_issue_close":
+            continue
         key = entry.get("key")
         if not isinstance(key, str) or not key:
             continue
@@ -13971,6 +14508,11 @@ def _invoke(
                 detail = result.error or f"{operation} returned failure"
                 raise EffectFailed(f"{operation} for {target!r}: {detail}")
             return result
+        if status == "reconciled":
+            raise TLLoopError(
+                f"lifecycle effect {operation} for {target!r} was reconciled from external "
+                "evidence and must be adopted by its owning state transition"
+            )
         if status in {"intended", "unknown"}:
             key = prior.get("key", journal.key_for(intent))
             gate_name = _action_journal_gate_name(key, _action_journal_compensation_attempt(prior))

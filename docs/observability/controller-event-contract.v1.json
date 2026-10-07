@@ -52,6 +52,9 @@
     "tl.merge_decided": {
       "fields": ["slice_id", "pr_number", "decision", "head_sha_hash"]
     },
+    "tl.issue_close_outcome": {
+      "fields": ["slice_id", "issue_id", "outcome"]
+    },
     "tl.judgment": {
       "fields": [
         "judgment",

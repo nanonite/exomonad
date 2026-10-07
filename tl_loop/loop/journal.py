@@ -54,6 +54,7 @@ EffectProbeStatus = Literal[
     "confirmed",
     "rejected",
     "compensated",
+    "reconciled",
     "not_dispatched",
 ]
 
@@ -73,7 +74,7 @@ class EffectProbe:
     @property
     def is_terminal(self) -> bool:
         """Whether the journal has an authoritative effect outcome."""
-        return self.status in {"confirmed", "rejected"}
+        return self.status in {"confirmed", "rejected", "reconciled"}
 
 
 def stable_action_key(
@@ -137,6 +138,7 @@ class EffectJournal(list[Any]):
             "confirmed",
             "rejected",
             "compensated",
+            "reconciled",
             "not_dispatched",
         }:
             raise ActionJournalError(f"invalid action journal status {raw_status!r}")
