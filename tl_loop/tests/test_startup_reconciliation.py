@@ -44,6 +44,7 @@ from tl_loop.state.slice_transition import (
     ReviewValidationFailed,
     slice_transition,
 )
+from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.store import RunStore, _encode_slice, create
 
 _PLAN = WorkPlan(
@@ -283,7 +284,7 @@ class FakeClient:
         return ToolResult(raw={"success": True}, success=True, result={}, error=None)
 
 
-def _load_state(tmp_path):
+def _load_state(tmp_path, *, chainlink_issue_id: int | None = None):
     create(
         "reconcile",
         {
@@ -297,6 +298,21 @@ def _load_state(tmp_path):
         root_dir=tmp_path,
     )
     store = RunStore("reconcile", tmp_path)
+    if chainlink_issue_id is not None:
+        store.set_plan_manifest(
+            build_plan_manifest(
+                {
+                    "leaves": [
+                        {
+                            "name": "slice-a",
+                            "task": "implement slice a",
+                            "chainlink_issue_id": chainlink_issue_id,
+                        }
+                    ]
+                },
+                scope_id="reconcile",
+            )
+        )
     return store, store.load()
 
 
@@ -589,7 +605,6 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        chainlink_issue_id=1039,
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
 
@@ -686,7 +701,6 @@ def test_stale_reviewer_action_self_heals_and_queues_merge_once(tmp_path) -> Non
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        chainlink_issue_id=1039,
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
 
@@ -720,7 +734,6 @@ def test_stale_reviewer_action_heal_does_not_fire_with_pending_journal(tmp_path)
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        chainlink_issue_id=1039,
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
     journal.append(
@@ -759,7 +772,6 @@ def test_stale_reviewer_action_heal_does_not_fire_for_ambiguous_state(
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        chainlink_issue_id=1039,
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
 
@@ -1154,7 +1166,6 @@ def test_stale_exact_head_review_refreshes_validation_once_before_merge(tmp_path
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
         review_policy_path=policy_path,
-        chainlink_issue_id=1039,
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
 
@@ -1347,7 +1358,6 @@ def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        chainlink_issue_id=1039,
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
 
@@ -1373,7 +1383,7 @@ def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None
 
 
 def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(tmp_path) -> None:
-    store, _ = _load_state(tmp_path)
+    store, _ = _load_state(tmp_path, chainlink_issue_id=1039)
     state = _review_recovery_state(store)
 
     class DurableRecoveryClient(FakeClient):
@@ -1448,7 +1458,6 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        chainlink_issue_id=1039,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
@@ -1508,7 +1517,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
 
 
 def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None:
-    store, _ = _load_state(tmp_path)
+    store, _ = _load_state(tmp_path, chainlink_issue_id=1039)
     state = _review_recovery_state(store)
 
     class RemoteAdvanceClient(FakeClient):
@@ -1619,7 +1628,6 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        chainlink_issue_id=1039,
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
     recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
@@ -1658,7 +1666,7 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
 def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
     tmp_path, monkeypatch, crash_boundary
 ) -> None:
-    store, _ = _load_state(tmp_path)
+    store, _ = _load_state(tmp_path, chainlink_issue_id=1039)
     state = _review_recovery_state(store)
     crash = {"observed": False, "raised": False}
 
@@ -1738,7 +1746,6 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        chainlink_issue_id=1039,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     client.post_merge_calls = []

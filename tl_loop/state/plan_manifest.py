@@ -45,6 +45,7 @@ MANIFEST_NODE_KEYS = frozenset(
         "order",
         "task",
         "agent_type",
+        "chainlink_issue_id",
         "boundary",
         "depends_on",
         "owned_branch",
@@ -82,6 +83,7 @@ class ManifestNode:
     #: already-dispatched node and a persisted manifest survives restart without
     #: re-reading the plan that produced it.
     depends_on: tuple[str, ...] = ()
+    chainlink_issue_id: int | None = None
     declaration: Mapping[str, object] = field(default_factory=dict)
     integration_contract: Mapping[str, object] = field(default_factory=dict)
     child_manifest_digest: str | None = None
@@ -101,6 +103,7 @@ class ManifestNode:
             raise ManifestError("only sub-TL manifest nodes may carry an order")
         if self.agent_type is not None:
             _require_text(self.agent_type, "manifest node agent_type")
+        _optional_positive_int(self.chainlink_issue_id, "chainlink_issue_id")
         if self.parent_integration_target is not None:
             _require_text(self.parent_integration_target, "manifest node parent target")
         if self.worktree is not None:
@@ -137,6 +140,7 @@ class ManifestNode:
             self.order,
             self.task,
             self.agent_type,
+            self.chainlink_issue_id,
             self.boundary,
             self.owned_branch,
             self.parent_integration_target,
@@ -172,6 +176,8 @@ class ManifestNode:
         }
         if self.depends_on:
             document["depends_on"] = list(self.depends_on)
+        if self.chainlink_issue_id is not None:
+            document["chainlink_issue_id"] = self.chainlink_issue_id
         return {
             **document,
             "declaration": _thaw_json(self.declaration),
@@ -210,6 +216,9 @@ class ManifestNode:
             agent_type=_optional_text(value.get("agent_type"), "agent_type"),
             boundary=tuple(_require_text(item, "boundary item") for item in boundary),
             depends_on=tuple(_require_text(item, "depends_on item") for item in depends_on),
+            chainlink_issue_id=_optional_positive_int(
+                value.get("chainlink_issue_id"), "chainlink_issue_id"
+            ),
             owned_branch=_required_value(value, "owned_branch"),
             parent_integration_target=_optional_text(
                 value.get("parent_integration_target"), "parent_integration_target"
@@ -300,6 +309,7 @@ class PlanManifest:
             child = children.get(node.node_id)
             if child is not None and child.digest != expected:
                 raise ManifestError("child manifest digest does not match its persisted document")
+        _validate_unique_chainlink_bindings(nodes, children)
         object.__setattr__(self, "nodes", nodes)
         object.__setattr__(self, "source_order", ids)
         object.__setattr__(self, "ordered_stages", stages)
@@ -474,6 +484,10 @@ def build_plan_manifest(
                 parent_integration_target=owned_branch,
                 worktree=_optional_text(worktree, "worktree"),
                 depends_on=tuple(depends_on),
+                chainlink_issue_id=_optional_positive_int(
+                    raw.get("chainlink_issue_id"),
+                    f"{kind} {name!r} chainlink_issue_id",
+                ),
                 declaration=_node_declaration(raw, kind),
                 integration_contract=_integration_contract(raw.get("integration")),
                 child_manifest_digest=child_digest,
@@ -598,6 +612,10 @@ def validate_manifest_revision(
         new = candidate_nodes.get(node_id)
         if old is None or new is None:
             raise ManifestError(f"manifest revision cannot remove protected node {node_id!r}")
+        if old.chainlink_issue_id != new.chainlink_issue_id:
+            raise ManifestError(
+                f"manifest revision changes chainlink_issue_id for protected node {node_id!r}"
+            )
         if old.identity() != new.identity():
             raise ManifestError(f"manifest revision mutates protected node {node_id!r}")
     for node_id, old in previous_nodes.items():
@@ -715,6 +733,42 @@ def _node_declaration(value: Mapping[str, object], kind: str) -> Mapping[str, ob
     return _json_mapping(declaration, "manifest node declaration")
 
 
+def _validate_unique_chainlink_bindings(
+    nodes: Sequence[ManifestNode], children: Mapping[str, PlanManifest]
+) -> None:
+    owners: dict[int, str] = {}
+
+    def add(issue_id: int | None, name: str) -> None:
+        if issue_id is None:
+            return
+        prior = owners.get(issue_id)
+        if prior is not None:
+            raise ManifestError(
+                f"chainlink_issue_id {issue_id} is bound to both {prior} and {name}"
+            )
+        owners[issue_id] = name
+
+    for node in nodes:
+        add(node.chainlink_issue_id, node.node_id)
+        child = children.get(node.node_id)
+        if child is not None:
+            for issue_id, name in _manifest_chainlink_bindings(child).items():
+                add(issue_id, name)
+
+
+def _manifest_chainlink_bindings(manifest: PlanManifest) -> dict[int, str]:
+    return {
+        node.chainlink_issue_id: node.node_id
+        for node in manifest.nodes
+        if node.chainlink_issue_id is not None
+    } | {
+        issue_id: name
+        for node in manifest.nodes
+        if (child := manifest.child_manifests.get(node.node_id)) is not None
+        for issue_id, name in _manifest_chainlink_bindings(child).items()
+    }
+
+
 def _json_mapping(value: Mapping[str, object], field_name: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
         raise ManifestError(f"{field_name} must be an object")
@@ -825,6 +879,13 @@ def _optional_int(value: object, field_name: str) -> int | None:
     if type(value) is not int:
         raise ManifestError(f"manifest {field_name} must be an integer or null")
     return value
+
+
+def _optional_positive_int(value: object, field_name: str) -> int | None:
+    result = _optional_int(value, field_name)
+    if result is not None and result <= 0:
+        raise ManifestError(f"manifest {field_name} must be a positive integer or null")
+    return result
 
 
 def _optional_text(value: object, field_name: str) -> str | None:

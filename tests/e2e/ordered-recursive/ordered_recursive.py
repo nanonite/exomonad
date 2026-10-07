@@ -836,6 +836,7 @@ def _build_plan(scenario: ControllerScenario, root_source: EventStream) -> WorkP
                 source=alpha_source,
                 worktree=scenario.owner_worktrees["alpha"],
                 order=1,
+                chainlink_issue_id=1052,
                 integration=IntegrationContract(),
             ),
             SubTLTask(
@@ -932,7 +933,6 @@ def main() -> None:
             run_id="ordered-root",
             branch="main",
             worktree=repo,
-            chainlink_issue_id=1052,
             repository_identity=RepositoryIdentity(api.owner, api.repo, "main"),
             source=root_source,
             effects=effects,

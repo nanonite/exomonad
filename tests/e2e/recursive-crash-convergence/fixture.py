@@ -30,6 +30,7 @@ def plan(
     segments: Path | None = None,
     state_root: Path | None = None,
     ledger_run_id: str | None = None,
+    chainlink_issue_id: int | None = None,
 ) -> real.WorkPlan:
     """Build nested work with same-order parallelism and a later barrier.
 
@@ -72,6 +73,7 @@ def plan(
                 source=_child_source(segments, state_root, ledger_run_id, "sub-c"),
                 agent_id="sub-c",
                 order=2,
+                chainlink_issue_id=chainlink_issue_id,
             ),
         )
     )

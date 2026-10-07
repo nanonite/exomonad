@@ -22,6 +22,8 @@ DECOMPOSE_PROMPT = """ANTI-PATTERNS (FIRST)
 - Do not create overlapping path ownership or a cyclic depends_on graph.
 - Do not invent a silent fallback, repair a malformed slice, or omit its test_plan.
 - Do not add work outside the root specification.
+- Do not invent Chainlink issue IDs. Copy a positive ID only when the root
+  specification explicitly assigns it to that slice; otherwise omit the field.
 
 READ FIRST
 - Read the repository guidance and every path needed by the slice.

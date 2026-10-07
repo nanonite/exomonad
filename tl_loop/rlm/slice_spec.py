@@ -26,6 +26,7 @@ _SLICE_SPEC_PROPERTIES: JsonObject = {
     "verify": copy.deepcopy(_STRING_ARRAY_SCHEMA),
     "boundary": copy.deepcopy(_STRING_ARRAY_SCHEMA),
     "done_criteria": copy.deepcopy(_STRING_ARRAY_SCHEMA),
+    "chainlink_issue_id": {"type": "integer", "minimum": 1},
 }
 SLICE_SPEC_SCHEMA: JsonObject = {
     "type": "object",
@@ -35,7 +36,9 @@ SLICE_SPEC_SCHEMA: JsonObject = {
             "items": {
                 "type": "object",
                 "properties": _SLICE_SPEC_PROPERTIES,
-                "required": list(_SLICE_SPEC_PROPERTIES),
+                "required": [
+                    key for key in _SLICE_SPEC_PROPERTIES if key != "chainlink_issue_id"
+                ],
                 "additionalProperties": False,
             },
         }
@@ -67,10 +70,11 @@ class SliceSpec:
     verify: tuple[str, ...]
     boundary: tuple[str, ...]
     done_criteria: tuple[str, ...]
+    chainlink_issue_id: int | None = None
 
     def to_mapping(self) -> JsonObject:
         """Return the JSON shape consumed by state and spawn adapters."""
-        return {
+        result = {
             "id": self.id,
             "title": self.title,
             "paths": list(self.paths),
@@ -82,6 +86,9 @@ class SliceSpec:
             "boundary": list(self.boundary),
             "done_criteria": list(self.done_criteria),
         }
+        if self.chainlink_issue_id is not None:
+            result["chainlink_issue_id"] = self.chainlink_issue_id
+        return result
 
 
 def validate_decomposition(output: Mapping[str, object]) -> tuple[SliceSpec, ...]:
@@ -116,7 +123,19 @@ def _slice_spec(raw: object, index: int) -> SliceSpec:
         verify=_text_list(raw, "verify", index, allow_empty=True),
         boundary=_text_list(raw, "boundary", index, allow_empty=True),
         done_criteria=_text_list(raw, "done_criteria", index),
+        chainlink_issue_id=_optional_positive_int(raw, index),
     )
+
+
+def _optional_positive_int(raw: Mapping[str, object], index: int) -> int | None:
+    value = raw.get("chainlink_issue_id")
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise DecompositionValidationError(
+            (f"output.slices[{index}].chainlink_issue_id must be a positive integer",)
+        )
+    return value
 
 
 def _cross_slice_violations(slices: Sequence[SliceSpec]) -> tuple[str, ...]:

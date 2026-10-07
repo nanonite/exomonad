@@ -13,7 +13,9 @@ from tl_loop.run_ids import ARCHIVED_ROOT_PREFIX, uses_reserved_archive_prefix
 _PLAN_KEYS = frozenset({"run_id", "budgets", "plan", "workers", "leaves", "sub_tls"})
 _PROPOSAL_KEYS = frozenset({"plan", "workers", "leaves", "sub_tls", "clarification"})
 _TASK_KEYS = {
-    "workers": frozenset({"name", "task", "agent_type", "task_timeout_seconds"}),
+    "workers": frozenset(
+        {"name", "task", "agent_type", "task_timeout_seconds", "chainlink_issue_id"}
+    ),
     "leaves": frozenset(
         {
             "name",
@@ -27,6 +29,7 @@ _TASK_KEYS = {
             "done_criteria",
             "depends_on",
             "task_timeout_seconds",
+            "chainlink_issue_id",
         }
     ),
     # A sub-TL is a nested controller process, not a model session, so it has
@@ -46,6 +49,7 @@ _TASK_KEYS = {
             "order",
             "integration",
             "task_timeout_seconds",
+            "chainlink_issue_id",
         }
     ),
 }

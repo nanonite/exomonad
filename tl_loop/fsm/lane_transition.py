@@ -8,6 +8,7 @@ from .evidence import require_positive as _require_positive
 from .evidence import require_text as _require_text
 from .lane import (
     LaneAbandoned,
+    LaneBookkeepingNotRequired,
     LaneBookkeepingStarted,
     LaneIntegrationStarted,
     LaneParkRequested,
@@ -47,6 +48,11 @@ def transition_lane(lane: LaneState, event: object) -> LaneState:
         return _start_bookkeeping(lane, event)
     if lane.phase is LanePhase.BOOKKEEPING and isinstance(event, LaneReleased):
         return _release_lane(lane, event)
+    if (
+        lane.phase in (LanePhase.INTEGRATING, LanePhase.BOOKKEEPING)
+        and isinstance(event, LaneBookkeepingNotRequired)
+    ):
+        return _release_without_bookkeeping(lane, event)
     raise ValueError(f"no lane transition for {lane.phase.value} and {type(event).__name__}")
 
 
@@ -181,6 +187,24 @@ def _release_lane(lane: LaneState, event: LaneReleased) -> LaneState:
         last_push_receipt_id=receipt.push_receipt_id,
         last_remote_head=receipt.observed_remote_head,
         last_ancestry_proof=receipt.ancestry_proof,
+    )
+
+
+def _release_without_bookkeeping(
+    lane: LaneState, event: LaneBookkeepingNotRequired
+) -> LaneState:
+    _require_lane_child(lane, event.child_id)
+    return replace(
+        lane,
+        phase=LanePhase.IDLE,
+        child_id=None,
+        lane_epoch=None,
+        expected_base_sha=None,
+        head_sha=None,
+        merge_journal_id=None,
+        push_intent_id=None,
+        push_journal_id=None,
+        changelog_commit=None,
     )
 
 

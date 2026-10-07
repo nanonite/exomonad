@@ -72,6 +72,7 @@ def _candidate_plan() -> WorkPlan:
                 task="retry the recreated leaf",
                 agent_type="codex",
                 boundary=("src",),
+                chainlink_issue_id=CHAINLINK_ISSUE_ID,
             ),
         )
     )
@@ -86,6 +87,7 @@ def _candidate_manifest():
                     "task": "retry the recreated leaf",
                     "agent_type": "codex",
                     "boundary": ["src"],
+                    "chainlink_issue_id": CHAINLINK_ISSUE_ID,
                 }
             ]
         },
@@ -196,7 +198,6 @@ def _seed_action_journal(store: RunStore) -> str:
 def _config() -> TLLoopConfig:
     return TLLoopConfig(
         active=True,
-        chainlink_issue_id=CHAINLINK_ISSUE_ID,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
         enable_reviewer_spawn=True,
         ledger_run_id=RUN_ID,

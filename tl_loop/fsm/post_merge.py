@@ -17,6 +17,7 @@ from .post_merge_events import (
     ParentBranchSynced,
     ParentPushPending,
     PostMergeComplete,
+    PostMergeNotApplicable,
     PostMergeRebuildRequested,
 )
 from .post_merge_evidence import PushReceipt
@@ -166,8 +167,28 @@ class PostMergeState:
         if not isinstance(self.phase, PostMergePhase):
             raise TypeError("post-merge phase must be a PostMergePhase")
         evidence = dict(self.evidence)
-        _require_fields(evidence, _REQUIRED_EVIDENCE.get(self.phase, ()), self.phase.value)
+        _require_fields(evidence, _required_evidence(self.phase, evidence), self.phase.value)
         object.__setattr__(self, "evidence", MappingProxyType(evidence))
+
+
+def _required_evidence(phase: PostMergePhase, evidence: Mapping[str, str]) -> tuple[str, ...]:
+    """Return phase requirements, including the durable unlinked outcome."""
+    if phase is PostMergePhase.COMPLETE and (
+        evidence.get("issue_close_outcome") == "not_applicable"
+        and evidence.get("changelog_outcome") == "not_applicable"
+    ):
+        return _cumulative(
+            "repository",
+            "parent_branch",
+            "pr_number",
+            "head_sha",
+            "merge_journal_id",
+            "lane_epoch",
+            "parent_commit_sha",
+            "issue_close_outcome",
+            "changelog_outcome",
+        )
+    return _REQUIRED_EVIDENCE.get(phase, ())
 
 
 __all__ = [
@@ -179,6 +200,7 @@ __all__ = [
     "ParentBranchSynced",
     "ParentPushPending",
     "PostMergeComplete",
+    "PostMergeNotApplicable",
     "PostMergePhase",
     "PostMergeRebuildRequested",
     "PostMergeState",

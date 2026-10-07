@@ -50,6 +50,13 @@ class IssueCloseConfirmed(TLOrchestrationEvent):
 
 
 @dataclass(frozen=True)
+class PostMergeNotApplicable(TLOrchestrationEvent):
+    """Record that an unlinked slice has no issue or changelog work to do."""
+
+    child_id: str
+
+
+@dataclass(frozen=True)
 class ChangelogPending(TLOrchestrationEvent):
     """Persist the changelog commit intent."""
 
@@ -112,5 +119,6 @@ __all__ = [
     "ParentBranchSynced",
     "ParentPushPending",
     "PostMergeComplete",
+    "PostMergeNotApplicable",
     "PostMergeRebuildRequested",
 ]

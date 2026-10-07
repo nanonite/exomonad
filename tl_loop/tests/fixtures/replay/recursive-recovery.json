@@ -2,7 +2,6 @@
   "name": "recursive-recovery",
   "run_id": "replay-recovery",
   "policy": "selector_policy_cheap_only.toml",
-  "chainlink_issue_id": 1053,
   "repository_identity": {
     "owner": "org",
     "repo": "repo",
@@ -19,6 +18,7 @@
             {
               "name": "child-leaf",
               "task": "implement the recursive child",
+              "chainlink_issue_id": 1053,
               "boundary": ["src/child.py"]
             }
           ]

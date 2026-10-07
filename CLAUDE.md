@@ -941,6 +941,15 @@ parallelism/retries; it cannot choose a harness, model, budget, or hidden
 fallback. The selector applies `.exo/harness_policy.toml` and capability
 ratings without widening an allowlist or ceiling.
 
+Each worker, leaf, or sub-TL may declare its own optional positive integer
+`chainlink_issue_id`. The binding belongs to that slice and is persisted in the
+recursive plan manifest and checkpoint; omitted IDs remain unlinked. The
+controller never infers an ID from a parent or sibling, and malformed or
+duplicate bindings stop plan admission with a reconciliation gate.
+After confirmed parent-branch sync, an unlinked merged slice records issue
+closure and changelog as not applicable, makes no Chainlink call, and releases
+its integration lane.
+
 Model calls are narrow structured judgments: `decompose`, `adjudicate_review`,
 `compose_repair` (post-merge integration repair only), and the `review_stuck`
 guide/escalate judgment. Their schemas, context budgets, attempts, token

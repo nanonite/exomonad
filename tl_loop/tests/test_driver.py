@@ -3063,7 +3063,6 @@ def test_aggregate_candidate_untrusted_ownership_is_not_merged(
     task = SubTLTask("leaf-a", WorkPlan(), source=SyntheticQueue([]))
     config = TLLoopConfig(
         active=True,
-        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
 
@@ -6089,27 +6088,55 @@ def test_active_parent_stays_alive_for_later_recursive_event(
 def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
     tmp_path: Path,
 ) -> None:
-    child_plan = WorkPlan.from_mapping(
-        {
-            "leaves": [
-                {"name": "leaf-a", "task": "implement alpha part one"},
-                {"name": "leaf-b", "task": "implement alpha part two"},
-            ]
-        }
-    )
+    child_plans = {
+        "alpha": WorkPlan.from_mapping(
+            {
+                "leaves": [
+                    {
+                        "name": "leaf-a",
+                        "task": "implement alpha part one",
+                        "chainlink_issue_id": 1052,
+                    },
+                    {
+                        "name": "leaf-b",
+                        "task": "implement alpha part two",
+                        "chainlink_issue_id": 1053,
+                    },
+                ]
+            }
+        ),
+        "beta": WorkPlan.from_mapping(
+            {
+                "leaves": [
+                    {
+                        "name": "leaf-a",
+                        "task": "implement beta part one",
+                        "chainlink_issue_id": 1054,
+                    },
+                    {
+                        "name": "leaf-b",
+                        "task": "implement beta part two",
+                        "chainlink_issue_id": 1055,
+                    },
+                ]
+            }
+        ),
+    }
     plan = WorkPlan(
         sub_tls=(
             SubTLTask(
                 "beta",
-                child_plan,
+                child_plans["beta"],
                 source=SyntheticQueue(_multi_leaf_events("beta")),
                 order=1,
+                chainlink_issue_id=1056,
             ),
             SubTLTask(
                 "alpha",
-                child_plan,
+                child_plans["alpha"],
                 source=SyntheticQueue(_multi_leaf_events("alpha")),
                 order=1,
+                chainlink_issue_id=1057,
             ),
         )
     )
@@ -6152,14 +6179,13 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
         max_events=5,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     parent_root = tmp_path / "ordered-e2e-run"
     for sub_tl_id, pr_number in (("alpha", 101), ("beta", 102)):
         run_tl_loop(
             sub_tl_id,
-            child_plan,
+            child_plans[sub_tl_id],
             SyntheticQueue(_multi_leaf_events(sub_tl_id)),
             EffectClient(transport),
             config=config,
@@ -6463,6 +6489,7 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
                 source=SyntheticQueue([]),
                 agent_id="child-service",
                 order=1,
+                chainlink_issue_id=1052,
             ),
             SubTLTask("later-stage", WorkPlan(), source=SyntheticQueue([]), order=2),
         )
@@ -6471,7 +6498,6 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
 
@@ -6560,13 +6586,20 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         ]
     )
     plan = WorkPlan(
-        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                child_plan,
+                source=SyntheticQueue([]),
+                order=1,
+                chainlink_issue_id=1052,
+            ),
+        )
     )
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     verified: list[tuple[str, str, str, str]] = []
@@ -6657,13 +6690,14 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
 
 def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Path) -> None:
     run_id = "merging-restart-run"
-    plan = WorkPlan(sub_tls=(SubTLTask("aggregate-child", WorkPlan(), order=1),))
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("aggregate-child", WorkPlan(), order=1, chainlink_issue_id=1052),)
+    )
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
-        chainlink_issue_id=1052,
     )
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["aggregate-child"].update(
@@ -6862,14 +6896,21 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
         ]
     )
     plan = WorkPlan(
-        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                child_plan,
+                source=SyntheticQueue([]),
+                order=1,
+                chainlink_issue_id=1052,
+            ),
+        )
     )
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
         max_base_revalidations=1,
         keep_alive_on_waiting=False,
-        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     run_tl_loop(
@@ -7105,14 +7146,21 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
         merge_response={"success": False, "error": "merge conflict with parent base"},
     )
     plan = WorkPlan(
-        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                child_plan,
+                source=SyntheticQueue([]),
+                order=1,
+                chainlink_issue_id=1052,
+            ),
+        )
     )
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
         review_model_choice=_review_choice(backend),
         keep_alive_on_waiting=False,
-        chainlink_issue_id=1052,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     run_tl_loop(

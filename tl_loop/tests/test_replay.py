@@ -566,7 +566,6 @@ def _run_recovery_tl(
         policy=load_policy(POLICY_ROOT / "selector_policy_cheap_only.toml"),
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
         ledger_run_id=ledger_run_id,
-        chainlink_issue_id=1053,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
         session_mode="continue",
         max_events=32,

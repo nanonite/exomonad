@@ -244,7 +244,6 @@ def replay_fixture(
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
         review_clock=None if production_clock else lambda: REPLAY_REVIEW_NOW,
         ledger_run_id=run_id if journal else None,
-        chainlink_issue_id=_optional_positive_int(spec.get("chainlink_issue_id")),
         repository_identity=_repository_identity(spec.get("repository_identity")),
         session_mode=session_mode,
     )
@@ -556,14 +555,6 @@ def _attach_live_child_sources(
             )
         )
     return replace(plan, sub_tls=tuple(children))
-
-
-def _optional_positive_int(value: object) -> int | None:
-    if value is None:
-        return None
-    if type(value) is not int or value <= 0:
-        raise TypeError("fixture.chainlink_issue_id must be a positive integer or null")
-    return value
 
 
 def _repository_identity(value: object) -> RepositoryIdentity | None:

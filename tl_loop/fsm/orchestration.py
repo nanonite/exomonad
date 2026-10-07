@@ -11,6 +11,7 @@ from .child import ChildKind, ChildRecord, TLOrchestrationEvent
 from .evidence import require_text as _require_text
 from .lane import (
     LaneAbandoned,
+    LaneBookkeepingNotRequired,
     LaneBookkeepingStarted,
     LaneIntegrationStarted,
     LaneParkRequested,
@@ -32,6 +33,7 @@ from .post_merge_events import (
     ParentBranchSynced,
     ParentPushPending,
     PostMergeComplete,
+    PostMergeNotApplicable,
     PostMergeRebuildRequested,
 )
 from .post_merge_evidence import PushReceipt
@@ -155,6 +157,7 @@ def transition(phase: PhaseValue, event: TLOrchestrationEvent) -> PhaseValue:
                 ChangelogCommitted,
                 ParentPushPending,
                 PostMergeComplete,
+                PostMergeNotApplicable,
                 PostMergeRebuildRequested,
             ),
         ):
@@ -227,6 +230,7 @@ __all__ = [
     "IssueCloseConfirmed",
     "IssueClosePending",
     "LaneAbandoned",
+    "LaneBookkeepingNotRequired",
     "LaneBookkeepingStarted",
     "LaneIntegrationStarted",
     "LaneParkRequested",
@@ -242,6 +246,7 @@ __all__ = [
     "ParkRequested",
     "PhaseValue",
     "PostMergeComplete",
+    "PostMergeNotApplicable",
     "PostMergePhase",
     "PostMergeRebuildRequested",
     "PostMergeState",

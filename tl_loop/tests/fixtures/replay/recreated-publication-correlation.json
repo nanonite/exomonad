@@ -2,7 +2,6 @@
   "name": "recreated-publication-correlation",
   "run_id": "replay-recreate",
   "policy": "selector_policy_cheap_only.toml",
-  "chainlink_issue_id": 9001,
   "repository_identity": {
     "owner": "synthetic-org",
     "repo": "synthetic-repo",
@@ -28,6 +27,7 @@
             {
               "name": "recreated-leaf",
               "task": "implement the recreated leaf",
+              "chainlink_issue_id": 9001,
               "boundary": ["src/recreated_leaf.rs"],
               "verify": ["just tl-loop-test"],
               "done_criteria": ["the recreated leaf is covered"]

@@ -29,6 +29,7 @@
             {
               "name": "nested-a",
               "order": 1,
+              "chainlink_issue_id": 1053,
               "integration": {"aggregate_pr_required": false},
               "plan": {}
             },

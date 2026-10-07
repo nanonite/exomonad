@@ -96,7 +96,16 @@ the immutable recursive `plan_manifest`, FSM, slice map, budget ledger, and
 event-log replay offset from that file. The manifest records the complete
 scope/node declaration, stable source ordering, branch ownership, integration
 targets, ordered stages, and nested child-manifest digests. Every persisted
-slice carries its exact manifest node ID and revision. Once a run exists,
+slice carries its exact manifest node ID and revision. A slice may also carry
+its own optional positive integer `chainlink_issue_id`; the binding is included
+in manifest identity and checkpoint state, so a revision cannot reassign an
+already dispatched issue. Older manifests and checkpoints without this field
+decode as unlinked. Recursive child runs receive no issue ID from their parent:
+each task must declare its own binding. Invalid or duplicate explicit bindings
+fail closed behind the `chainlink-issue-binding-reconciliation` gate. After
+parent-branch sync, an unlinked merged slice durably records issue closure and
+changelog as not applicable, makes no Chainlink call, and releases its lane.
+Once a run exists,
 external `plan.json` is only a candidate: an equal canonical digest is
 accepted, a changed plan requires an explicit monotonic revision, and a
 revision that mutates dispatched ownership or completed history fails closed.

@@ -15,6 +15,7 @@ from .post_merge_events import (
     MergeAdopted,
     ParentBranchSynced,
     ParentPushPending,
+    PostMergeNotApplicable,
 )
 from .post_merge_recovery import require_fresh_rebuild_push
 
@@ -25,6 +26,8 @@ def advance_standard_post_merge(state: PostMergeState, event: object) -> PostMer
         return _merge_adopted(state, event)
     if isinstance(event, ParentBranchSynced):
         return _parent_branch_synced(state, event)
+    if isinstance(event, PostMergeNotApplicable):
+        return _post_merge_not_applicable(state, event)
     if isinstance(event, IssueClosePending):
         return _issue_close_pending(state, event)
     if isinstance(event, IssueCloseConfirmed):
@@ -105,6 +108,31 @@ def _issue_close_pending(state: PostMergeState, event: IssueClosePending) -> Pos
         state,
         PostMergePhase.ISSUE_CLOSE_PENDING,
         {"issue_id": event.issue_id, "issue_close_intent_id": event.intent_id},
+    )
+
+
+def _post_merge_not_applicable(
+    state: PostMergeState, event: PostMergeNotApplicable
+) -> PostMergeState:
+    _require_text(event.child_id, "post-merge child ID")
+    if state.phase is PostMergePhase.COMPLETE:
+        if (
+            state.evidence.get("issue_close_outcome") == "not_applicable"
+            and state.evidence.get("changelog_outcome") == "not_applicable"
+        ):
+            _require_evidence(state, "child_id", event.child_id)
+            return state
+        raise ValueError("completed post-merge state has a different outcome")
+    _require_phase(state, PostMergePhase.PARENT_BRANCH_SYNCED, "unlinked post-merge completion")
+    if "issue_id" in state.evidence:
+        raise ValueError("a bound Chainlink issue cannot be marked not applicable")
+    return _with_evidence(
+        state,
+        PostMergePhase.COMPLETE,
+        {
+            "issue_close_outcome": "not_applicable",
+            "changelog_outcome": "not_applicable",
+        },
     )
 
 

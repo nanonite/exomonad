@@ -644,6 +644,7 @@ SLICE_KEYS = frozenset(
         "post_merge",
         "manifest_node_id",
         "manifest_revision",
+        "chainlink_issue_id",
     }
 )
 RECONCILIATION_KEYS = frozenset(
@@ -892,6 +893,7 @@ class SliceState:
     post_merge: PostMergeState | None = None
     manifest_node_id: str | None = None
     manifest_revision: int | None = None
+    chainlink_issue_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1191,6 +1193,13 @@ def _validate_plan_manifest(
             continue
         if node.name != slice_id:
             errors.append((f"{path}.manifest_node_id", "resolves to a different slice name"))
+        if record.get("chainlink_issue_id") != node.chainlink_issue_id:
+            errors.append(
+                (
+                    f"{path}.chainlink_issue_id",
+                    "does not match the immutable plan manifest binding",
+                )
+            )
         if type(revision) is not int or revision != manifest.manifest_revision:
             errors.append(
                 (f"{path}.manifest_revision", "does not match the plan manifest revision")
@@ -1453,6 +1462,7 @@ def _validate_slice(
     _nullable_string(value, "manifest_node_id", path, errors)
     _nullable_positive_int(value, "manifest_revision", path, errors)
     _nullable_positive_int(value, "pr_number", path, errors)
+    _nullable_positive_int(value, "chainlink_issue_id", path, errors)
     _non_negative_int(value, "attempts", path, errors)
     _nullable_enum_value(value, "verdict", path, Verdict, errors)
     _nullable_string(value, "verdict_at", path, errors)

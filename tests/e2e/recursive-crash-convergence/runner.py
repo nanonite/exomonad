@@ -548,7 +548,7 @@ def run_case(
     repository_identity = RepositoryIdentity(instance.owner, instance.repo, BASE_BRANCH)
     # Structure-only plan for seeding (sources are not serialized into the
     # manifest, so seeding is unaffected by them).
-    work_plan = plan()
+    work_plan = plan(chainlink_issue_id=chainlink_issue_id)
     run_id, work_plan = _seed_case_run(
         instance, root, repo, work_plan, boundary, case_name
     )
@@ -559,6 +559,7 @@ def run_case(
         segments=repo / ".exo" / "ledger" / "segments",
         state_root=state_root / run_id,
         ledger_run_id=ledger_run_id,
+        chainlink_issue_id=chainlink_issue_id,
     )
     traces = root / "crash-traces"
     crash = Crash(
@@ -578,7 +579,6 @@ def run_case(
         work_plan,
         boundary,
         case_name,
-        chainlink_issue_id,
         chainlink_db,
         repository_identity,
     )
@@ -588,7 +588,6 @@ def run_case(
         repo,
         crash.ledger_run_id,
         crash.resume_trace,
-        chainlink_issue_id,
         chainlink_db,
         repository_identity,
     )
@@ -602,7 +601,6 @@ def _crash_the_controller(
     work_plan: real.WorkPlan,
     boundary: CrashBoundary,
     case_name: str,
-    chainlink_issue_id: int,
     chainlink_db: Path,
     repository: RepositoryIdentity,
 ) -> None:
@@ -625,7 +623,6 @@ def _crash_the_controller(
             crash.marker,
             crash.resume_trace,
             boundary.name == "review",
-            chainlink_issue_id,
             chainlink_db,
             repository,
         ),

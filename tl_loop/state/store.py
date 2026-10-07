@@ -1550,6 +1550,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["manifest_node_id"] = value.manifest_node_id
         if value.manifest_revision is not None:
             record["manifest_revision"] = value.manifest_revision
+        if value.chainlink_issue_id is not None:
+            record["chainlink_issue_id"] = value.chainlink_issue_id
         return record
     if isinstance(value, Mapping):
         return copy.deepcopy(dict(value))
@@ -1585,6 +1587,31 @@ def _bind_slice_records(
             and prior_revision != manifest.manifest_revision
         ):
             raise ManifestError(f"slice {slice_id!r} has a stale manifest revision")
+        node = manifest.node(node_id)
+        binding = raw.get("chainlink_issue_id")
+        if binding != node.chainlink_issue_id:
+            # A legacy manifest predates slice-scoped issue bindings. An
+            # explicit binding on its replacement plan may therefore be
+            # attached to an existing slice during the proven migration, but
+            # a previously persisted binding is never rewritten.
+            legacy_binding_migration = (
+                replace_node_binding
+                and binding is None
+                and node.chainlink_issue_id is not None
+            )
+            if legacy_binding_migration:
+                raw["chainlink_issue_id"] = node.chainlink_issue_id
+                raw["manifest_node_id"] = node_id
+                raw["manifest_revision"] = manifest.manifest_revision
+                continue
+            if raw.get("status") not in {SliceStatus.PENDING.value, SliceStatus.READY.value}:
+                raise ManifestError(
+                    f"slice {slice_id!r} Chainlink issue binding differs from its manifest"
+                )
+            if node.chainlink_issue_id is None:
+                raw.pop("chainlink_issue_id", None)
+            else:
+                raw["chainlink_issue_id"] = node.chainlink_issue_id
         raw["manifest_node_id"] = node_id
         raw["manifest_revision"] = manifest.manifest_revision
 
@@ -1656,6 +1683,11 @@ def _pending_manifest_slice(node: ManifestNode) -> dict[str, object]:
         "reviewed_head": None,
         "attempts": 0,
         "verdict": None,
+        **(
+            {"chainlink_issue_id": node.chainlink_issue_id}
+            if node.chainlink_issue_id is not None
+            else {}
+        ),
     }
 
 
@@ -2577,6 +2609,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         post_merge=_decode_post_merge_state(value.get("post_merge")),
         manifest_node_id=cast(str | None, value.get("manifest_node_id")),
         manifest_revision=cast(int | None, value.get("manifest_revision")),
+        chainlink_issue_id=cast(int | None, value.get("chainlink_issue_id")),
     )
 
 

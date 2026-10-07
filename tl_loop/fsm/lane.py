@@ -88,6 +88,13 @@ class LaneReleased(TLOrchestrationEvent):
 
 
 @dataclass(frozen=True)
+class LaneBookkeepingNotRequired(TLOrchestrationEvent):
+    """Release an integrated lane after durable no-bookkeeping evidence."""
+
+    child_id: str
+
+
+@dataclass(frozen=True)
 class LaneRecoveryRequested(TLOrchestrationEvent):
     """Move an uncertain lane effect behind recovery."""
 
@@ -127,6 +134,7 @@ def transition_lane(lane: LaneState, event: TLOrchestrationEvent) -> LaneState:
 
 __all__ = [
     "LaneAbandoned",
+    "LaneBookkeepingNotRequired",
     "LaneBookkeepingStarted",
     "LaneIntegrationStarted",
     "LaneParkRequested",

@@ -47,6 +47,7 @@ from tl_loop.fsm.event import (
 )
 from tl_loop.fsm.lane import (
     LaneAbandoned,
+    LaneBookkeepingNotRequired,
     LaneBookkeepingStarted,
     LaneIntegrationStarted,
     LanePhase,
@@ -79,6 +80,7 @@ from tl_loop.fsm.post_merge_events import (
     ParentBranchSynced,
     ParentPushPending,
     PostMergeComplete,
+    PostMergeNotApplicable,
     PostMergeRebuildRequested,
 )
 from tl_loop.fsm.post_merge_evidence import PushReceipt
@@ -336,6 +338,7 @@ LEGACY_DISPATCH_GATES = {
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
+CHAINLINK_BINDING_RECONCILIATION_GATE_NAME = "chainlink-issue-binding-reconciliation"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
 MAX_CONVERGENCE_STEPS = 8
@@ -541,6 +544,10 @@ class LoopCancelled(TLLoopError):
 
 class DepthLimitExceeded(TLLoopError):
     """A recursive child reached the configured depth ceiling."""
+
+
+class ChainlinkIssueBindingError(ValueError):
+    """A slice Chainlink issue binding is malformed or ambiguous."""
 
 
 class EffectFailed(TLLoopError):
@@ -793,12 +800,16 @@ class WorkerTask:
     agent_type: str | None = None
     task_timeout_seconds: float | None = None
     task_timeout_declared: bool = False
+    chainlink_issue_id: int | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.name, "worker name")
         _require_text(self.task, "worker task")
         _optional_text(self.agent_type, "worker agent_type")
         _validate_task_timeout(self.task_timeout_seconds, "worker task_timeout_seconds")
+        _validate_chainlink_issue_id(
+            self.chainlink_issue_id, "worker chainlink_issue_id"
+        )
 
 
 @dataclass(frozen=True)
@@ -819,6 +830,7 @@ class LeafTask:
     depends_on: tuple[str, ...] = ()
     task_timeout_seconds: float | None = None
     task_timeout_declared: bool = False
+    chainlink_issue_id: int | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.name, "leaf name")
@@ -826,6 +838,7 @@ class LeafTask:
         _optional_text(self.agent_type, "leaf agent_type")
         _optional_text(self.context, "leaf context")
         _validate_task_timeout(self.task_timeout_seconds, "leaf task_timeout_seconds")
+        _validate_chainlink_issue_id(self.chainlink_issue_id, "leaf chainlink_issue_id")
         for field_name, values in (
             ("boundary", self.boundary),
             ("read_first", self.read_first),
@@ -861,6 +874,7 @@ class WorkPlan:
             # an edge naming either is a rejected plan rather than a lost edge.
             other_names=set(names) - leaf_names,
         )
+        _validate_chainlink_issue_bindings(self)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object], *, path: str = "plan") -> WorkPlan:
@@ -901,6 +915,7 @@ class SubTLTask:
     order_explicit: bool = True
     task_timeout_seconds: float | None = None
     task_timeout_declared: bool = False
+    chainlink_issue_id: int | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.name, "sub-TL name")
@@ -916,6 +931,7 @@ class SubTLTask:
         if not isinstance(self.order_explicit, bool):
             raise TypeError("sub-TL order_explicit must be a boolean")
         _validate_task_timeout(self.task_timeout_seconds, "sub-TL task_timeout_seconds")
+        _validate_chainlink_issue_id(self.chainlink_issue_id, "sub-TL chainlink_issue_id")
 
 
 @dataclass(frozen=True)
@@ -941,7 +957,6 @@ class TLLoopConfig:
     wall_clock: Callable[[], float] | None = None
     heartbeat: HeartbeatConfig | None = None
     goals: GoalState | None = None
-    chainlink_issue_id: int | None = None
     merge_strategy: str | None = None
     working_dir: str | None = None
     repository_identity: RepositoryIdentity | None = None
@@ -1033,8 +1048,6 @@ class TLLoopConfig:
         _require_text(self.task_timeout_source, "task_timeout_source")
         if type(self.enable_reviewer_spawn) is not bool:
             raise ValueError("enable_reviewer_spawn must be a boolean")
-        if self.chainlink_issue_id is not None and self.chainlink_issue_id <= 0:
-            raise ValueError("chainlink_issue_id must be positive")
         _optional_text(self.merge_strategy, "merge_strategy")
         _optional_text(self.working_dir, "working_dir")
         if self.repository_identity is not None and not isinstance(
@@ -1129,7 +1142,15 @@ def tl_run(
     """Run one selector-integrated wave through the shared active/shadow body."""
     if not isinstance(cfg, TLLoopConfig):
         raise TypeError("cfg must be a TLLoopConfig")
-    plan, run_id, source, effects = _root_inputs(root_spec, cfg)
+    try:
+        plan, run_id, source, effects = _root_inputs(root_spec, cfg)
+    except ChainlinkIssueBindingError as error:
+        if cfg.active:
+            _record_chainlink_binding_gate(root_spec, cfg, error)
+        raise TLLoopError(
+            f"{error}; resolve gate {CHAINLINK_BINDING_RECONCILIATION_GATE_NAME!r} "
+            "by correcting the explicit slice binding"
+        ) from error
     policy = cfg.policy or load_policy()
     capabilities = cfg.capabilities or load_capability()
     selected = replace(cfg, policy=policy, capabilities=capabilities)
@@ -1160,6 +1181,18 @@ def run_tl_loop(
     """Dispatch direct children and run one bounded active/shadow event loop."""
     selected = config or TLLoopConfig()
     _validate_mode(selected, effects)
+    if plan is not None and isinstance(plan, Mapping):
+        try:
+            plan = WorkPlan.from_mapping(plan)
+        except ChainlinkIssueBindingError as error:
+            if selected.active:
+                _record_chainlink_binding_gate(
+                    {"run_id": run_id, "plan": plan}, selected, error
+                )
+            raise TLLoopError(
+                f"{error}; resolve gate {CHAINLINK_BINDING_RECONCILIATION_GATE_NAME!r} "
+                "by correcting the explicit slice binding"
+            ) from error
     store = RunStore(run_id, Path(root_dir))
     existing_state = store.load() if store.path.exists() else None
     if existing_state is not None:
@@ -1338,6 +1371,12 @@ def run_tl_loop(
                     slices=initial_slices,
                 )
             except ManifestError as error:
+                if "chainlink_issue_id" in str(error):
+                    store.set_gate(CHAINLINK_BINDING_RECONCILIATION_GATE_NAME)
+                    raise TLLoopError(
+                        f"legacy plan manifest replacement rejected: {error}; resolve gate "
+                        f"{CHAINLINK_BINDING_RECONCILIATION_GATE_NAME!r}"
+                    ) from error
                 raise TLLoopError(f"legacy plan manifest replacement rejected: {error}") from error
             existing_state = _clear_resolved_migration_gate(
                 store,
@@ -1390,6 +1429,12 @@ def run_tl_loop(
                         protected_node_ids=protected,
                     )
                 except ManifestError as error:
+                    if "chainlink_issue_id" in str(error):
+                        store.set_gate(CHAINLINK_BINDING_RECONCILIATION_GATE_NAME)
+                        raise TLLoopError(
+                            f"plan manifest revision rejected: {error}; resolve gate "
+                            f"{CHAINLINK_BINDING_RECONCILIATION_GATE_NAME!r}"
+                        ) from error
                     raise TLLoopError(f"plan manifest revision rejected: {error}") from error
                 work_plan = _work_plan_from_manifest(candidate)
                 manifest = candidate
@@ -1455,6 +1500,11 @@ def run_tl_loop(
             )
         create(run_id, root_state, root_dir=store.root_dir)
     state = store.load()
+    if plan is not None and any(
+        gate.name == CHAINLINK_BINDING_RECONCILIATION_GATE_NAME for gate in state.gates
+    ):
+        store.clear_gate(CHAINLINK_BINDING_RECONCILIATION_GATE_NAME)
+        state = store.load()
     if state.reducer_version != REDUCER_VERSION:
         raise TLLoopError(
             f"checkpoint reducer_version {state.reducer_version} is incompatible "
@@ -4935,7 +4985,20 @@ def _advance_post_merge_boundary(
                 state, current, pr_number, evidence, config, effects, effects_log, store
             )
         if post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED:
-            issue_id = _required_issue_id(config.chainlink_issue_id)
+            if current.chainlink_issue_id is None:
+                lane_event: object | None = None
+                repository, parent_branch = _candidate_lane_key(state, current)
+                lane_key = f"{repository}:{parent_branch}"
+                if lane_key in state.integration.lanes:
+                    lane_event = LaneBookkeepingNotRequired(current.id)
+                return _checkpoint_post_merge_event(
+                    store,
+                    state,
+                    slice_id,
+                    PostMergeNotApplicable(current.id),
+                    lane_event=lane_event,
+                )
+            issue_id = _required_issue_id(current.chainlink_issue_id)
             intent_id = _post_merge_key(state, "issue_close", current.id, pr_number)
             return _checkpoint_post_merge_event(
                 store,
@@ -5456,7 +5519,7 @@ def _run_issue_close(
     effects_log: list[EffectIntent],
     store: RunStore,
 ) -> RunState:
-    issue_id = _required_issue_id(config.chainlink_issue_id)
+    issue_id = _required_issue_id(current.chainlink_issue_id)
     intent_id = _required_merge_identity(evidence, ("issue_close_intent_id",), "issue-close intent")
     arguments = {"issue_id": int(issue_id), "force": True, "commit_changelog": False}
     result = _post_merge_effect(
@@ -5495,7 +5558,7 @@ def _run_changelog(
     effects_log: list[EffectIntent],
     store: RunStore,
 ) -> RunState:
-    issue_id = _required_issue_id(config.chainlink_issue_id)
+    issue_id = _required_issue_id(current.chainlink_issue_id)
     intent_id = _required_merge_identity(evidence, ("changelog_intent_id",), "changelog intent")
     generation = _required_int(
         evidence, "changelog_generation", "changelog generation", allow_zero=True
@@ -6019,8 +6082,6 @@ def _execute_direct_merge_intent(
         "expected_patch_digest": evidence["patch_digest"],
         "expected_merge_tree_sha": evidence["merge_tree_sha"],
     }
-    if config.chainlink_issue_id is not None:
-        arguments["chainlink_issue_id"] = config.chainlink_issue_id
     action = ActionState(
         ActionKind.MERGE,
         ActionPhase.IN_FLIGHT,
@@ -6045,7 +6106,6 @@ def _execute_direct_merge_intent(
             live,
             lambda client: client.merge_pr(
                 pr_number=current.pr_number or 0,
-                chainlink_issue_id=config.chainlink_issue_id,
                 strategy=config.merge_strategy,
                 working_dir=_relative_process_working_dir(config),
                 expected_base_sha=cast(str, evidence["base_sha"]),
@@ -7487,9 +7547,6 @@ def _reconcile_pending_merge_entry(
         return True
     if watcher.success is not True or observation is None or observation.merged is not True:
         return False
-    chainlink_issue_id = arguments.get("chainlink_issue_id")
-    if chainlink_issue_id is not None and type(chainlink_issue_id) is not int:
-        return False
     effects_log.resolve_by_key(
         key,
         status="confirmed",
@@ -7500,7 +7557,7 @@ def _reconcile_pending_merge_entry(
         target,
         pr_number,
         key,
-        TLLoopConfig(active=True, chainlink_issue_id=chainlink_issue_id),
+        TLLoopConfig(active=True),
         effects,
         store,
         effects_log,
@@ -8255,9 +8312,6 @@ def _adopt_authoritative_merged_snapshot(
 ) -> RunState:
     """Adopt a journal-confirmed merge before review/ownership recovery."""
     arguments = merge_entry.get("arguments")
-    issue_id = config.chainlink_issue_id
-    if isinstance(arguments, Mapping) and type(arguments.get("chainlink_issue_id")) is int:
-        issue_id = cast(int, arguments["chainlink_issue_id"])
     merge_key = merge_entry.get("key")
     merge_journal_id = merge_key if isinstance(merge_key, str) else ""
     authoritative_evidence = dict(arguments) if isinstance(arguments, Mapping) else {}
@@ -8268,7 +8322,7 @@ def _adopt_authoritative_merged_snapshot(
         slice_id,
         pr_number,
         merge_journal_id,
-        replace(config, chainlink_issue_id=issue_id),
+        config,
         effects,
         store,
         effects_log,
@@ -14583,6 +14637,43 @@ def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool
     return False
 
 
+def _record_chainlink_binding_gate(
+    root_spec: WorkPlan | Mapping[str, object],
+    config: TLLoopConfig,
+    error: ChainlinkIssueBindingError,
+) -> None:
+    raw_run_id = (
+        root_spec.get("run_id", config.run_id)
+        if isinstance(root_spec, Mapping)
+        else config.run_id
+    )
+    if not isinstance(raw_run_id, str) or not raw_run_id:
+        raise TLLoopError(f"invalid Chainlink binding cannot be gated: {error}") from error
+    store = RunStore(raw_run_id, Path(config.root_dir))
+    if store.path.exists():
+        store.set_gate(CHAINLINK_BINDING_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
+        return
+    manifest = _manifest_for_plan(WorkPlan(), raw_run_id, config)
+    initial: dict[str, object] = {
+        "plan_manifest": manifest.to_document(),
+        "gates": [{"name": CHAINLINK_BINDING_RECONCILIATION_GATE_NAME, "status": "pending"}],
+    }
+    plan_value = root_spec.get("plan", root_spec) if isinstance(root_spec, Mapping) else {}
+    has_sub_tls = isinstance(plan_value, Mapping) and bool(plan_value.get("sub_tls"))
+    if has_sub_tls or config.parent_branch is not None or config.worktree is not None or config.depth > 0:
+        initial.update(
+            {
+                "owner_branch": config.branch,
+                "owner_worktree": _effective_worktree(config, store.root_dir, raw_run_id),
+                "parent_branch": config.parent_branch,
+                "parent_run_id": config.parent_run_id,
+                "parent_agent_id": config.parent_agent_id,
+                "depth": config.depth,
+            }
+        )
+    create(raw_run_id, initial, root_dir=store.root_dir)
+
+
 def _root_inputs(
     root_spec: WorkPlan | Mapping[str, object], config: TLLoopConfig
 ) -> tuple[WorkPlan | None, str, EventQueue, EffectClient | ReadOnlyEffectClient]:
@@ -14656,6 +14747,11 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
             "task": task.task,
             "agent_type": task.agent_type,
             **(
+                {"chainlink_issue_id": task.chainlink_issue_id}
+                if task.chainlink_issue_id is not None
+                else {}
+            ),
+            **(
                 {"task_timeout_seconds": task.task_timeout_seconds}
                 if task.task_timeout_declared
                 else {}
@@ -14674,6 +14770,11 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
             "steps": list(task.steps),
             "verify": list(task.verify),
             "done_criteria": list(task.done_criteria),
+            **(
+                {"chainlink_issue_id": task.chainlink_issue_id}
+                if task.chainlink_issue_id is not None
+                else {}
+            ),
             **(
                 {"task_timeout_seconds": task.task_timeout_seconds}
                 if task.task_timeout_declared
@@ -14696,6 +14797,11 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
                 "integration": _manifest_integration(task.integration),
                 "plan": _manifest_plan(child_plan),
                 "order_explicit": task.order_explicit,
+                **(
+                    {"chainlink_issue_id": task.chainlink_issue_id}
+                    if task.chainlink_issue_id is not None
+                    else {}
+                ),
                 **(
                     {"task_timeout_seconds": task.task_timeout_seconds}
                     if task.task_timeout_declared
@@ -14782,6 +14888,7 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                     node.agent_type,
                     _manifest_timeout(declaration),
                     "task_timeout_seconds" in declaration,
+                    node.chainlink_issue_id,
                 )
             )
         elif node.kind == "leaf":
@@ -14799,6 +14906,7 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                     depends_on=node.depends_on,
                     task_timeout_seconds=_manifest_timeout(declaration),
                     task_timeout_declared="task_timeout_seconds" in declaration,
+                    chainlink_issue_id=node.chainlink_issue_id,
                 )
             )
         elif node.kind == "sub_tl":
@@ -14817,6 +14925,7 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                     order_explicit=bool(declaration.get("order_explicit", True)),
                     task_timeout_seconds=_manifest_timeout(declaration),
                     task_timeout_declared="task_timeout_seconds" in declaration,
+                    chainlink_issue_id=node.chainlink_issue_id,
                 )
             )
         else:
@@ -14952,6 +15061,7 @@ def _initial_slices(
             config=selected,
             task_timeout_seconds=worker.task_timeout_seconds,
             task_timeout_declared=worker.task_timeout_declared,
+            chainlink_issue_id=worker.chainlink_issue_id,
         )
     for leaf in plan.leaves:
         paths = leaf.boundary or (f"tl-loop/{leaf.name}",)
@@ -14970,6 +15080,7 @@ def _initial_slices(
             task_timeout_declared=leaf.task_timeout_declared,
             review_contract=review_contract.as_mapping(),
             depends_on=leaf.depends_on,
+            chainlink_issue_id=leaf.chainlink_issue_id,
         )
     for task in plan.sub_tls:
         # A sub-TL slice records no harness request: the child is a controller
@@ -14986,6 +15097,7 @@ def _initial_slices(
             config=selected,
             task_timeout_seconds=task.task_timeout_seconds,
             task_timeout_declared=task.task_timeout_declared,
+            chainlink_issue_id=task.chainlink_issue_id,
         )
     return result
 
@@ -15063,6 +15175,7 @@ def _initial_slice_record(
     task_timeout_declared: bool = False,
     review_contract: Mapping[str, object] | None = None,
     depends_on: Sequence[str] = (),
+    chainlink_issue_id: int | None = None,
 ) -> dict[str, object]:
     """Build one pending slice record, keeping the plan request separate.
 
@@ -15100,6 +15213,8 @@ def _initial_slice_record(
     }
     if review_contract is not None:
         record["review_contract"] = copy.deepcopy(dict(review_contract))
+    if chainlink_issue_id is not None:
+        record["chainlink_issue_id"] = chainlink_issue_id
     return record
 
 
@@ -15199,6 +15314,7 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         "order",
         "integration",
         "task_timeout_seconds",
+        "chainlink_issue_id",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -15226,6 +15342,9 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
             value.get("task_timeout_seconds"), f"{path}.task_timeout_seconds"
         ),
         task_timeout_declared="task_timeout_seconds" in value,
+        chainlink_issue_id=_optional_chainlink_issue_id(
+            value.get("chainlink_issue_id"), f"{path}.chainlink_issue_id"
+        ),
     )
 
 
@@ -15233,6 +15352,50 @@ def _positive_order(value: object, name: str) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _optional_chainlink_issue_id(value: object, path: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise ChainlinkIssueBindingError(f"{path} must be a positive integer or omitted")
+    return value
+
+
+def _validate_chainlink_issue_id(value: object, path: str) -> None:
+    _optional_chainlink_issue_id(value, path)
+
+
+def _validate_chainlink_issue_bindings(plan: WorkPlan) -> None:
+    bindings: dict[int, str] = {}
+
+    def add(issue_id: int | None, path: str) -> None:
+        if issue_id is None:
+            return
+        prior = bindings.get(issue_id)
+        if prior is not None:
+            raise ChainlinkIssueBindingError(
+                f"chainlink_issue_id {issue_id} is bound to both {prior} and {path}; "
+                "bind each issue to one slice"
+            )
+        bindings[issue_id] = path
+
+    def visit(current: WorkPlan, path: str) -> None:
+        for task in current.workers:
+            add(task.chainlink_issue_id, f"{path}.workers[{task.name!r}]")
+        for task in current.leaves:
+            add(task.chainlink_issue_id, f"{path}.leaves[{task.name!r}]")
+        for task in current.sub_tls:
+            child_path = f"{path}.sub_tls[{task.name!r}]"
+            add(task.chainlink_issue_id, child_path)
+            nested = (
+                task.plan
+                if isinstance(task.plan, WorkPlan)
+                else WorkPlan.from_mapping(task.plan, path=f"{child_path}.plan")
+            )
+            visit(nested, f"{child_path}.plan")
+
+    visit(plan, "plan")
 
 
 def _integration_contract(value: object) -> IntegrationContract:
@@ -15334,6 +15497,11 @@ def _worker(value: object) -> WorkerTask:
         return value
     if not isinstance(value, Mapping):
         raise TypeError("worker task must be an object")
+    _reject_unknown_task_keys(
+        value,
+        {"name", "task", "agent_type", "task_timeout_seconds", "chainlink_issue_id"},
+        "worker",
+    )
     return WorkerTask(
         name=_required_text(value, "name", "worker"),
         task=_required_text(value, "task", "worker"),
@@ -15342,6 +15510,9 @@ def _worker(value: object) -> WorkerTask:
             value.get("task_timeout_seconds"), "worker.task_timeout_seconds"
         ),
         task_timeout_declared="task_timeout_seconds" in value,
+        chainlink_issue_id=_optional_chainlink_issue_id(
+            value.get("chainlink_issue_id"), "worker.chainlink_issue_id"
+        ),
     )
 
 
@@ -15350,6 +15521,24 @@ def _leaf(value: object) -> LeafTask:
         return value
     if not isinstance(value, Mapping):
         raise TypeError("leaf task must be an object")
+    _reject_unknown_task_keys(
+        value,
+        {
+            "name",
+            "task",
+            "agent_type",
+            "boundary",
+            "context",
+            "read_first",
+            "steps",
+            "verify",
+            "done_criteria",
+            "depends_on",
+            "task_timeout_seconds",
+            "chainlink_issue_id",
+        },
+        "leaf",
+    )
     return LeafTask(
         name=_required_text(value, "name", "leaf"),
         task=_required_text(value, "task", "leaf"),
@@ -15365,7 +15554,18 @@ def _leaf(value: object) -> LeafTask:
             value.get("task_timeout_seconds"), "leaf.task_timeout_seconds"
         ),
         task_timeout_declared="task_timeout_seconds" in value,
+        chainlink_issue_id=_optional_chainlink_issue_id(
+            value.get("chainlink_issue_id"), "leaf.chainlink_issue_id"
+        ),
     )
+
+
+def _reject_unknown_task_keys(
+    value: Mapping[str, object], allowed: set[str], kind: str
+) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"{kind} contains unknown keys: {', '.join(unknown)}")
 
 
 def _required_text(value: Mapping[str, object], key: str, kind: str) -> str:

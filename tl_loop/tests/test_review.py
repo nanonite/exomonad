@@ -648,7 +648,7 @@ def test_unknown_merge_merged_with_unresolved_ownership_is_not_adopted(
         state,
         store,
         transport,
-        TLLoopConfig(active=True, chainlink_issue_id=599),
+        TLLoopConfig(active=True),
         journal,
     )
 
@@ -676,7 +676,7 @@ def test_unknown_merge_nonmerged_with_unresolved_ownership_retains_action(
         state,
         store,
         transport,
-        TLLoopConfig(active=True, chainlink_issue_id=599),
+        TLLoopConfig(active=True),
         journal,
     )
 
@@ -704,7 +704,7 @@ def test_unknown_merge_malformed_ownership_retains_action(
         state,
         store,
         transport,
-        TLLoopConfig(active=True, chainlink_issue_id=599),
+        TLLoopConfig(active=True),
         journal,
     )
 
@@ -717,6 +717,16 @@ def test_unknown_merge_malformed_ownership_retains_action(
 
 def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
+    state = store.set_plan_manifest(
+        build_plan_manifest(
+            {
+                "workers": [
+                    {"name": "leaf", "task": "legacy", "chainlink_issue_id": 599}
+                ]
+            },
+            scope_id="review-test",
+        )
+    )
     state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
     state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
     journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
@@ -749,7 +759,7 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
         state,
         store,
         lost,
-        TLLoopConfig(active=True, chainlink_issue_id=599),
+        TLLoopConfig(active=True),
         journal,
     )
 
@@ -822,7 +832,7 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
     )
     assert restarted.integration.lanes["org/repo:main"].phase is LanePhase.INTEGRATING
 
-    config = TLLoopConfig(active=True, chainlink_issue_id=599)
+    config = TLLoopConfig(active=True)
     for _ in range(8):
         restarted = _apply_convergence(
             store.load(),

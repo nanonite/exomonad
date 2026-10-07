@@ -13,6 +13,7 @@ from .post_merge_events import (
     ParentBranchSynced,
     ParentPushPending,
     PostMergeComplete,
+    PostMergeNotApplicable,
     PostMergeRebuildRequested,
 )
 from .post_merge_recovery import (
@@ -28,6 +29,8 @@ def advance_post_merge(state: PostMergeState, event: object) -> PostMergeState:
     if state.phase is PostMergePhase.COMPLETE:
         if isinstance(event, PostMergeComplete) and receipt_matches(state, event):
             return state
+        if isinstance(event, PostMergeNotApplicable):
+            return advance_standard_post_merge(state, event)
         raise ValueError("completed post-merge state rejects new evidence")
     supported = (
         MergeAdopted,
@@ -38,6 +41,7 @@ def advance_post_merge(state: PostMergeState, event: object) -> PostMergeState:
         ChangelogCommitted,
         ParentPushPending,
         PostMergeComplete,
+        PostMergeNotApplicable,
         PostMergeRebuildRequested,
     )
     if not isinstance(event, supported):

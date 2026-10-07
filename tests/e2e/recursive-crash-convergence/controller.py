@@ -43,7 +43,6 @@ def controller(
     trace_path: Path,
     resume_trace: Path,
     advance_base: bool,
-    chainlink_issue_id: int,
     chainlink_db: Path,
     repository: RepositoryIdentity,
 ) -> None:
@@ -96,7 +95,6 @@ def controller(
                 working_dir=str(repo / ".exo/worktrees/parent"),
                 project_root=repo,
                 ledger_run_id=ledger_run_id,
-                chainlink_issue_id=chainlink_issue_id,
                 review_model_choice=real._recovery_review_choice(),
                 repository_identity=repository,
             ),
@@ -132,7 +130,6 @@ def resume(
     repo: Path,
     ledger_run_id: str,
     trace_path: Path,
-    chainlink_issue_id: int,
     chainlink_db: Path,
     repository: RepositoryIdentity,
 ) -> Any:
@@ -169,7 +166,6 @@ def resume(
                 working_dir=str(repo / ".exo/worktrees/parent"),
                 project_root=repo,
                 ledger_run_id=ledger_run_id,
-                chainlink_issue_id=chainlink_issue_id,
                 review_model_choice=real._recovery_review_choice(),
                 repository_identity=repository,
             ),
