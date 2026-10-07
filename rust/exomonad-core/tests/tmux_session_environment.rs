@@ -88,12 +88,12 @@ fn global_codex_home() -> Option<String> {
 /// This is the observation a session-environment read cannot make. `show-environment`
 /// answers for the session and the window, both of which follow later `set-environment`
 /// writes, so it reports the value `init` wrote while the pane runs on another one.
-async fn pane_process_codex_home(window: &str) -> (u32, Option<String>) {
-    let pid = TmuxIpc::wait_for_pane_exec_boundary(window)
+async fn pane_process_codex_home(window: &str, expected: &str) -> (u32, Option<String>) {
+    let (pid, _) = TmuxIpc::wait_for_pane_environment_variable(window, "CODEX_HOME", expected)
         .await
-        .unwrap_or_else(|error| panic!("pane exec boundary failed: {error:#}"));
+        .unwrap_or_else(|error| panic!("pane CODEX_HOME did not settle: {error:#}"));
     let codex_home = process_environment_variable(pid, "CODEX_HOME")
-        .expect("read the pane process environment after exec");
+        .expect("read the pane process environment after the expected value was observed");
     (pid, codex_home)
 }
 
@@ -235,7 +235,8 @@ async fn setting_the_session_environment_after_the_first_window_is_too_late() {
         Some(SESSION_CODEX_HOME),
         "the session environment reports the value that was written into it"
     );
-    let (_, observed) = pane_process_codex_home(session.first_window.as_str()).await;
+    let (_, observed) =
+        pane_process_codex_home(session.first_window.as_str(), SERVER_CODEX_HOME).await;
     assert_eq!(
         observed.as_deref(),
         Some(SERVER_CODEX_HOME),
@@ -254,7 +255,8 @@ async fn the_first_window_pane_is_born_with_the_new_session_environment() {
     };
     let cwd = tempfile::tempdir().expect("temp dir");
     let session = TestSession::create("born", &cwd, &[("CODEX_HOME", SESSION_CODEX_HOME)]).await;
-    let (pane_pid, observed) = pane_process_codex_home(session.first_window.as_str()).await;
+    let (pane_pid, observed) =
+        pane_process_codex_home(session.first_window.as_str(), SESSION_CODEX_HOME).await;
     let pane_exe = std::fs::read_link(format!("/proc/{pane_pid}/exe"));
     let pane_comm = std::fs::read_to_string(format!("/proc/{pane_pid}/comm"));
     let server_pid = test_tmux_output(&[
@@ -315,7 +317,8 @@ async fn a_session_created_without_an_environment_is_unchanged() {
     let session = TestSession::create("bare", &cwd, &[]).await;
 
     test_tmux_output(&["has-session", "-t", &session.name]);
-    let (_, observed) = pane_process_codex_home(session.first_window.as_str()).await;
+    let (_, observed) =
+        pane_process_codex_home(session.first_window.as_str(), SERVER_CODEX_HOME).await;
     assert_eq!(
         observed.as_deref(),
         Some(SERVER_CODEX_HOME),

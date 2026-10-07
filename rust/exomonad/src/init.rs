@@ -4385,21 +4385,27 @@ fn first_window_codex_home_verdict(expected: &str, observed: Option<&str>) -> Re
 /// This reads the spawned process rather than `tmux show-environment`: the session
 /// environment is written after the window exists and so agrees with `init` no matter
 /// what the pane actually inherited. tmux returns from `new-session` after forking the
-/// pane process, before that child execs its pane command. The check waits until the
-/// pane's `/proc/<pid>/exe` differs from the tmux server's executable, then reads
-/// `CODEX_HOME` once and compares it.
+/// pane process, before that child execs its pane command. The check waits until procfs
+/// exposes the expected `CODEX_HOME` in the pane's environment, since the executable
+/// link can update before `/proc/<pid>/environ` shows the environment from `execve`.
 async fn verify_first_window_codex_home(window: &str, expected: Option<&str>) -> Result<()> {
     let Some(expected) = expected else {
         return Ok(());
     };
-    let pid =
-        exomonad_core::services::tmux_ipc::TmuxIpc::wait_for_pane_exec_boundary(window).await?;
-    let observed =
-        exomonad_core::services::tmux_ipc::process_environment_variable(pid, "CODEX_HOME")
-            .with_context(|| {
-                format!("failed to read CODEX_HOME from /proc/{pid}/environ after exec")
-            })?;
-    first_window_codex_home_verdict(expected, observed.as_deref())
+    let (_, observed) =
+        exomonad_core::services::tmux_ipc::TmuxIpc::wait_for_pane_environment_variable(
+            window,
+            "CODEX_HOME",
+            expected,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "the tmux session's first window could not prove CODEX_HOME={expected}; \
+                 ExoMonad seeds its Codex hook trust in that home"
+            )
+        })?;
+    first_window_codex_home_verdict(expected, Some(&observed))
 }
 
 fn agent_configuration_environment(config: &Config) -> String {

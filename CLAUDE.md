@@ -165,15 +165,14 @@ created afterwards. `init` therefore hands `CODEX_HOME` to `new-session` itself 
 `-e CODEX_HOME=<path>`, which makes the window it renames to `Server` — and so
 every agent `exomonad serve` spawns — resolve the run's Codex home even when a tmux
 server started by another process already exists. It then reads that pane's own
-process ID and the tmux server's process ID through the same selected socket, then
-waits until Linux reports a different `/proc/<pane-pid>/exe` from the server's
-`/proc/<server-pid>/exe`. The forked pane child keeps the tmux executable until it
-execs the pane command, so this is the startup boundary the check observes. After
-that boundary, `init` reads `/proc/<pane-pid>/environ` once and compares `CODEX_HOME`
-with the exported value. A bounded timeout before exec and a mismatch after exec both
-fail startup; the timeout reports the last observed executable and command name, plus
-`CODEX_HOME` when readable. `tmux show-environment` is not a substitute for that
-check: the session and window environments both follow later writes.
+process ID and the tmux server's process ID through the same selected socket, waits
+for the pane executable to differ from the server executable, then polls
+`/proc/<pane-pid>/environ` until it exposes the exported `CODEX_HOME` on three
+consecutive reads. The executable link can update before procfs settles on the new
+environment, so one matching read at the exec boundary is not enough. A bounded timeout
+fails startup with the last observed environment and process details. `tmux show-environment`
+is not a substitute for that check: the session and window environments both follow
+later writes.
 
 The three init modes are explicit and recorded in `.exo/tl-loop/session-mode.json`
 and the run checkpoint. In this surface-only phase, omitting a mode retains the
