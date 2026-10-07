@@ -1,5 +1,18 @@
 use super::*;
 
+// `opencode run` is non-interactive. Keep it on a private server so workers in
+// separate projects cannot collide through OpenCode's shared background service.
+// Current OpenCode CLIs take reasoning variants as `provider/model#variant`.
+fn opencode_model_ref(model: &str, variant: Option<&str>) -> String {
+    match variant.filter(|value| !value.is_empty()) {
+        Some(variant) => {
+            let base = model.split_once('#').map_or(model, |(base, _)| base);
+            format!("{base}#{variant}")
+        }
+        None => model.to_string(),
+    }
+}
+
 fn generate_opencode_agent_settings(
     agent_name: &str,
     role: &str,
@@ -591,7 +604,7 @@ impl<
         env_vars: &HashMap<String, String>,
         cwd: &Path,
         claude_flags: Option<&ClaudeSpawnFlags>,
-        _yolo: bool,
+        yolo: bool,
         model: Option<&str>,
         effort: Option<&str>,
         mode: super::InvocationMode,
@@ -628,7 +641,14 @@ impl<
         };
 
         let model_flag = model
-            .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
+            .map(|m| {
+                let model_ref = if agent_type == AgentType::OpenCode {
+                    opencode_model_ref(m, effort)
+                } else {
+                    m.to_string()
+                };
+                format!(" --model {}", shell_escape::escape(model_ref.into()))
+            })
             .unwrap_or_default();
         let effort_flag = if agent_type == AgentType::Claude {
             effort
@@ -637,9 +657,11 @@ impl<
         } else {
             String::new()
         };
-        let variant_flag = effort
-            .map(|level| format!(" --variant {}", shell_escape::escape(level.into())))
-            .unwrap_or_default();
+        let opencode_auto_flag = if agent_type == AgentType::OpenCode && yolo {
+            " --auto"
+        } else {
+            ""
+        };
         let one_shot_flag = if mode == super::InvocationMode::OneShot {
             agent_type.one_shot_flag()
         } else {
@@ -666,14 +688,13 @@ impl<
                     ),
                     AgentType::OpenCode => {
                         format!(
-                            "{} {} --interactive{} --session {} --fork \"$(cat {})\"{}{}",
+                            "{} {} --standalone{} --session {} --fork{} \"$(cat {})\"",
                             cmd,
                             agent_type.prompt_flag(),
-                            perms_flags,
+                            opencode_auto_flag,
                             escaped_session,
-                            escaped_path,
                             model_flag,
-                            variant_flag
+                            escaped_path
                         )
                     }
                     _ => {
@@ -703,13 +724,12 @@ impl<
                     ),
                     AgentType::OpenCode => {
                         format!(
-                            "{} {} --interactive{} \"$(cat {})\"{}{}",
+                            "{} {} --standalone{}{} \"$(cat {})\"",
                             cmd,
                             agent_type.prompt_flag(),
-                            perms_flags,
-                            escaped_path,
+                            opencode_auto_flag,
                             model_flag,
-                            variant_flag
+                            escaped_path
                         )
                     }
                     _ => format!(
@@ -761,10 +781,19 @@ impl<
             };
 
         // Wrap in nix develop shell if flake.nix exists in cwd
-        if cwd.join("flake.nix").exists() {
+        let full_command = if cwd.join("flake.nix").exists() {
             info!("Wrapping agent command in nix develop shell");
             let escaped = full_command.replace('\'', "'\\''");
             format!("nix develop -c sh -c '{}'", escaped)
+        } else {
+            full_command
+        };
+
+        // Preserve the worker's diagnostic output for the invocation-finished
+        // event. The monitor reads and bounds this file after the tmux target exits.
+        if let Some(stderr_file) = env_vars.get("EXOMONAD_INVOCATION_STDERR_FILE") {
+            let escaped_path = Self::escape_for_shell_command(stderr_file);
+            format!("{{ {}; }} 2> {}", full_command, escaped_path)
         } else {
             full_command
         }
@@ -2408,7 +2437,8 @@ mod tests {
             false,
             None,
         );
-        assert!(opencode.contains("run --interactive"));
+        assert!(opencode.contains("opencode run"));
+        assert!(!opencode.contains("--interactive"));
     }
 
     #[test]
@@ -2500,6 +2530,10 @@ mod tests {
             "EXOMONAD_INVOCATION_EXIT_FILE".to_string(),
             "/tmp/exomonad-exit-code".to_string(),
         );
+        env.insert(
+            "EXOMONAD_INVOCATION_STDERR_FILE".to_string(),
+            "/tmp/exomonad-stderr-tail".to_string(),
+        );
         let command = ACS::build_agent_command(
             AgentType::Codex,
             None,
@@ -2513,7 +2547,7 @@ mod tests {
 
         assert!(command.contains("status=$?"));
         assert!(command.contains("/tmp/exomonad-exit-code"));
-        assert!(command.ends_with("exit \"$status\""));
+        assert!(command.ends_with("exit \"$status\"; } 2> '/tmp/exomonad-stderr-tail'"));
     }
 
     #[test]
@@ -2531,7 +2565,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run --interactive \"$(cat '/tmp/test-prompt.txt')\""
+            "opencode run --standalone \"$(cat '/tmp/test-prompt.txt')\""
         );
     }
 
@@ -2550,7 +2584,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run --interactive \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-sonnet-4-5"
+            "opencode run --standalone --model anthropic/claude-sonnet-4-5 \"$(cat '/tmp/test-prompt.txt')\""
         );
     }
 
@@ -2569,7 +2603,7 @@ mod tests {
         );
         assert_eq!(
             cmd,
-            "opencode run --interactive --session 'main.feature-a-opencode' --fork \"$(cat '/tmp/test-prompt.txt')\" --model anthropic/claude-haiku-4-5"
+            "opencode run --standalone --session 'main.feature-a-opencode' --fork --model anthropic/claude-haiku-4-5 \"$(cat '/tmp/test-prompt.txt')\""
         );
     }
 
@@ -2652,7 +2686,8 @@ mod tests {
             super::InvocationMode::Interactive,
         );
 
-        assert!(cmd.ends_with("--model opencode-go/deepseek-v4-pro --variant high"));
+        assert!(cmd.contains("--model opencode-go/deepseek-v4-pro#high"));
+        assert!(!cmd.contains("--variant"));
     }
 
     #[test]

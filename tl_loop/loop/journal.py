@@ -43,6 +43,7 @@ MUTATING_OPERATIONS = frozenset(
         "close_issue_and_cleanup",
         "emit_controller_event",
         "recovery_command",
+        "task_budget_reset",
     }
 )
 RECOVERY_INTENT_STATES = frozenset({"intended", "confirmed", "unknown", "reconciled"})

@@ -38,6 +38,7 @@ from tl_loop.fsm.event import (
     ChildCompleted,
     ChildFailed,
     ChildSpawned,
+    InboxNotificationObserved,
     PRFiled,
     PRMerged,
     PRUpdated,
@@ -287,6 +288,7 @@ from .journal import MUTATING_OPERATIONS, ActionJournalError, EffectJournal, sta
 from .observation import WatcherObservation
 from .reconcile import (
     REPEATED_ACTION_GATE_PREFIX,
+    REPOSITORY_IDENTITY_GATE_NAME,
     ExternalIntent,
     InternalTransition,
     MergeDecision,
@@ -307,7 +309,7 @@ from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slice
 LOGGER = logging.getLogger(__name__)
 
 RepairWith = Callable[
-    [Mapping[str, object], EffectClient, Callable[[JsonObject], object], "str | None"],
+    [Mapping[str, object], EffectClient, Callable[[JsonObject], object]],
     object,
 ]
 #: Dispatch gates are scoped to the slice whose dispatch exhausted or conflicted,
@@ -335,7 +337,6 @@ LEGACY_DISPATCH_GATES = {
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
-REPOSITORY_IDENTITY_GATE_NAME = "tl-repository-identity"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
 MAX_CONVERGENCE_STEPS = 8
@@ -2404,6 +2405,7 @@ def _reopen_ordered_scope(
     target_name: str | None,
     *,
     authorized: bool = False,
+    expected_revision: int | None = None,
 ) -> RunState:
     """Reopen one proven ordered scope while retaining all durable identities.
 
@@ -2521,6 +2523,7 @@ def _reopen_ordered_scope(
         current_order=max(1, current_order),
         ordered_stages=state.ordered_stages,
         integration=integration,
+        expected_revision=expected_revision,
     )
 
 
@@ -2582,7 +2585,7 @@ def _maybe_finalize_root_scope(
     result = _post_merge_effect(
         "root_branch_finalize",
         state.run_id,
-        {"branch": branch, "working_dir": config.working_dir},
+        {"branch": branch, "working_dir": _relative_process_working_dir(config)},
         effects,
         effects_log,
         "root_branch_finalize",
@@ -3125,12 +3128,9 @@ def _run_loop(
             fsm_event = decoder.decode(event)
         except Exception as error:
             raise TLLoopError(str(error)) from error
-        if isinstance(fsm_event, PublicationObserved):
-            # Telemetry-only: ``file_pr`` writes ``pr.published`` before the
-            # definitive ``pr.filed``/``pr.updated`` row and carries no created
-            # flag, so it is acknowledged without an FSM transition or slice
-            # mutation. The immutable ledger row and projected payload remain
-            # available for audit and observability.
+        if isinstance(fsm_event, (PublicationObserved, InboxNotificationObserved)):
+            # Telemetry-only rows are acknowledged without an FSM transition or
+            # slice mutation; the immutable ledger retains their audit payload.
             diagnostics.correlated += 1
             _checkpoint_and_ack(
                 store, source, event, state, phase, acknowledge=not replaying
@@ -4304,6 +4304,145 @@ def _refresh_post_merge_evidence(
     return _watcher_merge_evidence(observation)
 
 
+def _record_confirmed_merge_reconciliation(
+    current: SliceState,
+    pr_number: int,
+    journal_key: str,
+    effects_log: list[EffectIntent],
+    *,
+    boundary: str,
+    merge_evidence: Mapping[str, object] | None,
+) -> None:
+    """Additive journal record for a merge already confirmed by the exact effect.
+
+    The original action result remains intact so merge success and any
+    post-merge sync diagnostic stay separately visible.
+    """
+    if not journal_key or not isinstance(effects_log, EffectJournal):
+        return
+    entry = next(
+        (
+            candidate
+            for candidate in effects_log.confirmed_entries("merge_pr", current.id)
+            if candidate.get("key") == journal_key
+        ),
+        None,
+    )
+    if (
+        entry is None
+        or not _merge_journal_reports_success(entry)
+        or not _merge_journal_is_exact(current, entry)
+    ):
+        return
+    arguments = entry.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return
+    expected_pr = arguments.get("pr_number")
+    expected_head = arguments.get("expected_head_sha")
+    if expected_pr != pr_number or not isinstance(expected_head, str):
+        return
+
+    observed = merge_evidence or {}
+    watcher_snapshot = any(
+        name in observed
+        for name in ("head_branch", "publication_ownership_verified", "publication_ownership_error")
+    )
+    observed_head = observed.get("head_sha")
+    if isinstance(observed_head, str) and observed_head and observed_head != expected_head:
+        raise TLLoopError("confirmed merge reconciliation head does not match its action journal")
+    publication = current.publication
+    handoff = current.handoff
+    evidence: dict[str, object] = {
+        "pr_number": pr_number,
+        "head_sha": expected_head,
+        "head_branch": (
+            observed.get("head_branch")
+            or (publication.head_branch if publication is not None else None)
+            or current.branch
+        ),
+        "base_branch": (
+            observed.get("base_branch")
+            or (publication.base_branch if publication is not None else None)
+            or current.base_ref
+        ),
+        "invocation_id": (
+            (publication.invocation_id if publication is not None else None)
+            or (handoff.invocation_id if handoff is not None else None)
+        ),
+    }
+    if watcher_snapshot and isinstance(observed.get("merged"), bool):
+        evidence["watcher_merged"] = observed["merged"]
+    for source, target in (
+        ("expected_base_sha", "expected_base_sha"),
+        ("expected_patch_digest", "patch_digest"),
+        ("expected_merge_tree_sha", "merge_tree_sha"),
+    ):
+        value = arguments.get(source)
+        if isinstance(value, str) and value:
+            evidence[target] = value
+    if watcher_snapshot:
+        observed_base = observed.get("base_sha")
+        if isinstance(observed_base, str) and observed_base:
+            evidence["observed_base_sha"] = observed_base
+    observed_head = observed.get("head_sha")
+    if isinstance(observed_head, str) and observed_head:
+        evidence["observed_head_sha"] = observed_head
+    ownership_verified = observed.get("publication_ownership_verified")
+    if isinstance(ownership_verified, bool):
+        evidence["publication_ownership_verified"] = ownership_verified
+    ownership_error = observed.get("publication_ownership_error")
+    if isinstance(ownership_error, str) and ownership_error:
+        evidence["publication_ownership_error"] = ownership_error
+
+    old_record = entry.get("merge_reconciliation")
+    old_record = old_record if isinstance(old_record, Mapping) else {}
+    old_evidence = old_record.get("evidence")
+    old_evidence = old_evidence if isinstance(old_evidence, Mapping) else {}
+    for name in (
+        "pr_number",
+        "head_sha",
+        "head_branch",
+        "base_branch",
+        "invocation_id",
+        "expected_base_sha",
+        "patch_digest",
+        "merge_tree_sha",
+    ):
+        previous = old_evidence.get(name)
+        current_value = evidence.get(name)
+        if previous is not None and current_value is not None and previous != current_value:
+            raise TLLoopError(f"merge journal reconciliation changed {name}")
+    merged_evidence = {**old_evidence, **evidence}
+
+    old_boundaries = old_record.get("boundaries")
+    boundaries = (
+        [value for value in old_boundaries if isinstance(value, str)]
+        if isinstance(old_boundaries, list)
+        else []
+    )
+    if boundary not in boundaries:
+        boundaries.append(boundary)
+    raw_result = entry.get("result")
+    raw_payload = raw_result.get("result") if isinstance(raw_result, Mapping) else None
+    effect_result = {
+        name: raw_payload[name]
+        for name in ("success", "merged", "git_fetched", "message", "next")
+        if isinstance(raw_payload, Mapping) and name in raw_payload
+    }
+    now = _now_timestamp()
+    effects_log.resolve_by_key(
+        journal_key,
+        merge_reconciliation={
+            "status": "reconciled_merged",
+            "first_recorded_at": old_record.get("first_recorded_at", now),
+            "last_recorded_at": now,
+            "boundaries": boundaries,
+            "evidence": merged_evidence,
+            "effect_result": effect_result,
+        },
+    )
+
+
 def _reconcile_merged_slice(
     state: RunState,
     slice_id: str,
@@ -4319,6 +4458,14 @@ def _reconcile_merged_slice(
 ) -> RunState:
     """Adopt a confirmed merge and execute at most one recovery boundary."""
     current = state.slices[slice_id]
+    _record_confirmed_merge_reconciliation(
+        current,
+        pr_number,
+        merge_journal_id,
+        effects_log,
+        boundary=boundary,
+        merge_evidence=merge_evidence,
+    )
     checkpoint_needed = False
     if current.post_merge is None or current.post_merge.phase is PostMergePhase.NOT_STARTED:
         try:
@@ -4658,6 +4805,44 @@ def _merge_result_payload(result: ToolResult | None) -> Mapping[str, object] | N
     return result.result
 
 
+def _merge_effect_failed(result: ToolResult | None) -> bool:
+    """Interpret both the tool envelope and MergePrResponse outcome."""
+    if result is None:
+        return False
+    if result.success is False:
+        return True
+    return isinstance(result.result, Mapping) and result.result.get("success") is False
+
+
+def _merge_result_matches_action(
+    result: ToolResult | None,
+    current: SliceState,
+    action: ActionState,
+) -> bool:
+    """Accept the typed success response, checking optional returned identity."""
+    if (
+        action.kind is not ActionKind.MERGE
+        or action.phase is not ActionPhase.IN_FLIGHT
+        or not action.intent_id
+        or not action.head_sha
+    ):
+        return False
+    payload = _merge_result_payload(result)
+    if payload is None or payload.get("success") is not True:
+        return False
+    result_head = payload.get("head_sha")
+    if result_head is not None and (
+        not isinstance(result_head, str)
+        or (result_head and result_head != action.head_sha)
+    ):
+        return False
+    result_branch = payload.get("branch_name")
+    return result_branch is None or (
+        isinstance(result_branch, str)
+        and (not result_branch or current.branch is None or result_branch == current.branch)
+    )
+
+
 def _post_merge_effect(
     operation: str,
     target: str,
@@ -4949,7 +5134,7 @@ def _parent_sync_effect(
 ) -> tuple[dict[str, object], Mapping[str, str]]:
     """Run and validate one authoritative parent-branch observation."""
     arguments = _parent_sync_arguments(
-        current, pr_number, evidence, expected_base_sha, config.working_dir
+        current, pr_number, evidence, expected_base_sha, _relative_process_working_dir(config)
     )
     result = _post_merge_effect(
         operation,
@@ -5106,6 +5291,34 @@ def _validate_structured_merge_proof(
         raise ValueError(f"{operation} squash proof found divergent prospective and authoritative merge trees")
 
 
+def _relative_process_working_dir(config: TLLoopConfig) -> str:
+    """Use the calling controller's own worktree as the process working directory.
+
+    ProcessHandler resolves relative paths under the caller's EffectContext worktree.
+    ``config.working_dir`` already names that checkout, so converting it relative to
+    the project root would append the worktree path a second time. Validate the
+    configured checkout boundary, then pass ``.`` to use the existing context root.
+    """
+    value = config.working_dir
+    if value is not None:
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            if config.project_root is None:
+                raise TLLoopError(
+                    "absolute process working directory requires a project root for validation"
+                )
+            project_root = Path(config.project_root).expanduser().resolve()
+            try:
+                path.resolve().relative_to(project_root)
+            except ValueError as error:
+                raise TLLoopError(
+                    "process working directory is outside the configured project root"
+                ) from error
+        elif ".." in path.parts:
+            raise TLLoopError("process working directory must not traverse above the project root")
+    return "."
+
+
 def _parent_sync_arguments(
     current: SliceState,
     pr_number: int,
@@ -5173,7 +5386,7 @@ def _remote_reconcile_effect(
 ) -> tuple[dict[str, object], Mapping[str, str]]:
     """Rebase local bookkeeping onto a new parent base and validate its receipt."""
     arguments = _parent_sync_arguments(
-        current, pr_number, evidence, expected_base_sha, config.working_dir
+        current, pr_number, evidence, expected_base_sha, _relative_process_working_dir(config)
     )
     result = _post_merge_effect(
         "post_merge_remote_reconcile",
@@ -5291,7 +5504,7 @@ def _run_changelog(
         "expected_base_sha": _required_current_base(current),
         "generation": generation,
         "intent_id": intent_id,
-        "working_dir": config.working_dir,
+        "working_dir": _relative_process_working_dir(config),
     }
     result = _post_merge_effect(
         "post_merge_changelog",
@@ -5368,7 +5581,7 @@ def _run_parent_push(
         "pushed_commit": _required_merge_identity(
             evidence, ("changelog_commit_sha",), "changelog commit"
         ),
-        "working_dir": config.working_dir,
+        "working_dir": _relative_process_working_dir(config),
     }
     result = _post_merge_effect(
         "post_merge_push",
@@ -5779,6 +5992,13 @@ def _execute_direct_merge_intent(
     evidence = _direct_merge_evidence(current, watcher, config)
     if evidence is None:
         return _clear_action_for_reduction(store, state, current.id)
+    if state.repository_identity is None:
+        state = _heal_missing_repository_identity(
+            state, config, effects, effects_log, store
+        )
+        if state.repository_identity is None:
+            return state
+        current = state.slices[current.id]
     state, lane_ready = _ensure_candidate_lane(state, current, evidence["base_sha"], store)
     if not lane_ready:
         return state
@@ -5823,7 +6043,7 @@ def _execute_direct_merge_intent(
                 pr_number=current.pr_number or 0,
                 chainlink_issue_id=config.chainlink_issue_id,
                 strategy=config.merge_strategy,
-                working_dir=config.working_dir,
+                working_dir=_relative_process_working_dir(config),
                 expected_base_sha=cast(str, evidence["base_sha"]),
                 expected_head_sha=cast(str, evidence["head_sha"]),
                 expected_patch_digest=cast(str, evidence["patch_digest"]),
@@ -6113,7 +6333,10 @@ def _watcher_merge_evidence(observation: object) -> dict[str, object]:
         "head_sha",
         "base_sha",
         "base_branch",
+        "head_branch",
         "merged",
+        "publication_ownership_verified",
+        "publication_ownership_error",
         "pr_head_tree_sha",
         "merge_tree_sha",
         "merge_commit_sha",
@@ -6175,9 +6398,9 @@ def _adopt_direct_merge_result(
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
 ) -> RunState:
-    """Adopt a merge only after a second authoritative merged snapshot."""
+    """Adopt a compare-bound merge from its exact journaled effect result."""
     current = state.slices[slice_id]
-    if result is not None and result.success is False:
+    if _merge_effect_failed(result):
         cleared = slice_transition(current, ActionChanged(None))
         return _checkpoint_slice_action(
             store,
@@ -6189,6 +6412,41 @@ def _adopt_direct_merge_result(
                 state, cleared, state.integration, "merge_failed", "direct merge failed"
             ),
         )
+    merge_entry = _confirmed_merge_entry(effects_log, current, current.pr_number)
+    if (
+        merge_entry is not None
+        and merge_entry.get("key") == action.intent_id
+        and _merge_journal_is_exact(current, merge_entry)
+        and _merge_journal_reports_success(merge_entry)
+        and _merge_result_matches_action(result, current, action)
+    ):
+        arguments = merge_entry.get("arguments")
+        assert isinstance(arguments, Mapping)
+        expected_base = arguments.get("expected_base_sha")
+        expected_head = arguments.get("expected_head_sha")
+        expected_tree = arguments.get("expected_merge_tree_sha")
+        if all(isinstance(value, str) and value for value in (expected_base, expected_head)):
+            merge_evidence: dict[str, object] = {
+                "pr_number": current.pr_number,
+                "merged": True,
+                "head_sha": expected_head,
+                "base_sha": expected_base,
+                "base_branch": _publication_parent_branch_from_slice(current),
+            }
+            if isinstance(expected_tree, str) and expected_tree:
+                merge_evidence["merge_tree_sha"] = expected_tree
+            return _reconcile_merged_slice(
+                store.load(),
+                slice_id,
+                current.pr_number or 0,
+                action.intent_id,
+                config,
+                effects,
+                store,
+                effects_log,
+                boundary="direct_merge_effect_confirmed",
+                merge_evidence=merge_evidence,
+            )
     watcher = _invoke(
         "watcher_pr_state",
         slice_id,
@@ -7564,20 +7822,20 @@ def _reconcile_nonterminal_slices(
             agent_listing,
             current.dispatch_intent_id or "",
         )
-        # A watcher-driven merge may only be adopted when the watcher's
-        # publication provenance validates against the dispatch or active
-        # recovery succession. A refused snapshot must not change merge or
-        # post-merge state.
+        # A watcher-only merge may be adopted when publication provenance
+        # validates against the dispatch or active recovery succession. A
+        # confirmed, exact merge journal is a separate authority for adopting
+        # an operation already checked before dispatch; it never authorizes a
+        # new merge. A refused snapshot still cannot change state.
         accepted_publication = (
             _publication_from_watcher(current, watcher, watcher.head_sha, owner_id)
             if watcher is not None
             else None
         )
-        # When the watcher presents publication provenance it must validate; a
-        # refused record may not authorize a merge. When it presents none, an
-        # independently durable merge intent that is exact to the persisted
-        # PR/head may still authorize adoption without borrowing watcher
-        # identity.
+        # A journal-confirmed merge is accepted only for the same persisted
+        # PR/head and matching watcher observation. Without that completed
+        # action, watcher provenance must validate before it can authorize
+        # adoption.
         watcher_presents_publication = _watcher_presents_publication(watcher)
         watcher_merged = watcher is not None and watcher.merged is True
         merge_evidence = _watcher_merge_evidence(watcher) if watcher_merged else None
@@ -7586,9 +7844,27 @@ def _reconcile_nonterminal_slices(
             if watcher_merged and watcher is not None
             else None
         )
-        durable_merge_authorized = not watcher_presents_publication and (
-            (merge_entry is not None and _merge_journal_is_exact(current, merge_entry))
-            or (merge_evidence is not None and _merge_action_is_exact(current, merge_evidence))
+        journaled_merge_authorized = (
+            merge_entry is not None
+            and _merge_journal_is_exact(current, merge_entry)
+            and _merge_journal_reports_success(merge_entry)
+            and _merge_watcher_identity_matches(current, watcher, merge_entry)
+            and (
+                current.action is None
+                or current.action.kind is not ActionKind.MERGE
+                or not current.action.intent_id
+                or current.action.intent_id == merge_entry.get("key")
+            )
+        )
+        # A successful merge effect has already checked publication ownership
+        # and compare-and-swap before it reaches Forgejo. Cleanup can then
+        # remove the worker identity, so a post-merge watcher read may report
+        # unresolved ownership. The exact confirmed journal entry remains
+        # sufficient to adopt that merge; it cannot authorize a new merge.
+        durable_merge_authorized = journaled_merge_authorized or (
+            not watcher_presents_publication
+            and merge_evidence is not None
+            and _merge_action_is_exact(current, merge_evidence)
         )
         merge_authorized = accepted_publication is not None or durable_merge_authorized
         if _watcher_publication_refused(current, watcher, owner_id) or (
@@ -7867,6 +8143,49 @@ def _persisted_merge_head(current: SliceState) -> str | None:
     return None
 
 
+def _merge_journal_reports_success(merge_entry: Mapping[str, object]) -> bool:
+    """Require the confirmed effect envelope and MergePrResponse to both succeed."""
+    result = merge_entry.get("result")
+    if not isinstance(result, Mapping) or result.get("success") is not True:
+        return False
+    payload = result.get("result")
+    return isinstance(payload, Mapping) and (
+        payload.get("success") is True or payload.get("merged") is True
+    )
+
+
+def _merge_watcher_identity_matches(
+    current: SliceState,
+    watcher: WatcherObservation | None,
+    merge_entry: Mapping[str, object],
+) -> bool:
+    """Match a post-merge observation to the PR/head authorized by the journal."""
+    arguments = merge_entry.get("arguments")
+    if not isinstance(arguments, Mapping) or watcher is None or watcher.merged is not True:
+        return False
+    expected_pr = arguments.get("pr_number")
+    expected_head = arguments.get("expected_head_sha")
+    if (
+        type(expected_pr) is not int
+        or expected_pr <= 0
+        or not isinstance(expected_head, str)
+        or not expected_head
+        or watcher.pr_number != expected_pr
+        or current.pr_number != expected_pr
+        or watcher.head_sha != expected_head
+    ):
+        return False
+    if current.branch and watcher.head_branch != current.branch:
+        return False
+    expected_base_branch = current.publication.base_branch if current.publication else None
+    expected_base_branch = expected_base_branch or current.base_ref
+    return not (
+        expected_base_branch
+        and watcher.base_branch is not None
+        and watcher.base_branch != expected_base_branch
+    )
+
+
 def _merge_journal_is_exact(current: SliceState, merge_entry: Mapping[str, object]) -> bool:
     """Whether a confirmed merge journal entry is exact to the persisted PR/head."""
     arguments = merge_entry.get("arguments")
@@ -7913,11 +8232,8 @@ def _confirmed_merge_entry(
             continue
         if current.pr_number is not None and journal_pr_number != current.pr_number:
             continue
-        result = entry.get("result")
-        if isinstance(result, Mapping):
-            nested = result.get("result")
-            if isinstance(nested, Mapping) and nested.get("merged") is False:
-                continue
+        if not _merge_journal_reports_success(entry):
+            continue
         return entry
     return None
 
@@ -10628,17 +10944,15 @@ def _ensure_bookkeeping_lane(
 
 
 def _merge_result_is_authoritative(result: ToolResult | None) -> bool:
-    """Accept a merge response as terminal only with an explicit merged flag."""
-    return (
-        result is not None
-        and result.success is True
-        and isinstance(result.result, Mapping)
-        and result.result.get("merged") is True
+    """Accept the typed merge response's successful operation outcome."""
+    payload = _merge_result_payload(result)
+    return payload is not None and (
+        payload.get("merged") is True or payload.get("success") is True
     )
 
 
 def _merge_failure_classification(result: ToolResult | None) -> str | None:
-    if result is None or result.success is not False:
+    if result is None or not _merge_effect_failed(result):
         return None
     values = [result.error or ""]
     if isinstance(result.result, Mapping):
@@ -10646,6 +10960,12 @@ def _merge_failure_classification(result: ToolResult | None) -> str | None:
             value = result.result.get(key)
             if isinstance(value, str):
                 values.append(value)
+        nested = result.result.get("result")
+        if isinstance(nested, Mapping):
+            for key in ("classification", "reason", "message", "error"):
+                value = nested.get(key)
+                if isinstance(value, str):
+                    values.append(value)
     text = " ".join(values).lower()
     if "conflict" in text:
         return "conflict"
@@ -10674,6 +10994,12 @@ def _merge_failure_reason(result: ToolResult | None) -> str:
             value = result.result.get(key)
             if isinstance(value, str) and value:
                 return value[:500]
+        nested = result.result.get("result")
+        if isinstance(nested, Mapping):
+            for key in ("reason", "message", "error"):
+                value = nested.get(key)
+                if isinstance(value, str) and value:
+                    return value[:500]
     return "merge_pr returned failure"
 
 
@@ -11244,7 +11570,7 @@ def _integrate_one_candidate(
     merge_arguments = {
         "pr_number": current.pr_number,
         "strategy": config.merge_strategy or task.integration.merge_strategy,
-        "working_dir": config.working_dir,
+        "working_dir": _relative_process_working_dir(config),
         "base_sha": base_sha,
     }
     merge_intent_id = stable_action_key(state.run_id, "merge_pr", task.name, merge_arguments)
@@ -11287,7 +11613,7 @@ def _integrate_one_candidate(
         lambda client: client.merge_pr(
             pr_number=current.pr_number or 0,
             strategy=config.merge_strategy or task.integration.merge_strategy,
-            working_dir=config.working_dir,
+            working_dir=_relative_process_working_dir(config),
             expected_base_sha=base_sha,
             expected_head_sha=head_sha,
             expected_patch_digest=patch_digest,
@@ -13158,7 +13484,7 @@ def _route_repair(
         raise TLLoopError(f"repair event references slice without PR {slice_id!r}")
     repair_arguments = {
         "pr_number": current.pr_number,
-        "head_sha": current.reviewed_head,
+        "expected_head_sha": current.reviewed_head,
     }
     repair_action = ActionState(
         ActionKind.REPAIR,
@@ -13180,7 +13506,6 @@ def _route_repair(
     )
     current = state.slices[slice_id]
     live = cast(EffectClient, effects)
-    repair_model = _repair_model(current, config)
     pr = {
         "pr_number": current.pr_number,
         "paths": list(current.paths),
@@ -13198,18 +13523,45 @@ def _route_repair(
     try:
 
         def dispatch_resume(arguments: JsonObject) -> object:
+            resume_arguments = dict(arguments)
+            reset_key = current.task_budget_reset_key
+            task = resume_arguments.get("task")
+            if isinstance(task, str):
+                generation_seed = "\0".join(
+                    (
+                        state.run_id,
+                        slice_id,
+                        str(event_seq),
+                        str(current.attempts),
+                        str(current.repair_attempts),
+                        reset_key or "",
+                    )
+                )
+                recovery_generation = hashlib.sha256(
+                    generation_seed.encode("utf-8")
+                ).hexdigest()[:16]
+                recovery_kind = (
+                    "Operator-authorized execution-budget recovery"
+                    if reset_key is not None
+                    else "Repair dispatch generation"
+                )
+                resume_arguments["task"] = (
+                    f"{task}\n\n{recovery_kind} {recovery_generation}: "
+                    f"continue the existing PR #{current.pr_number} "
+                    "in the same owner worktree and branch; do not create another PR."
+                )
             return _invoke(
                 "resume_pr",
                 slice_id,
-                arguments,
+                resume_arguments,
                 True,
                 live,
-                lambda client: client.resume_pr(**arguments),
+                lambda client: client.resume_pr(**resume_arguments),
                 effects_log,
                 raise_on_failure=False,
             )
 
-        repair_with(pr, live, dispatch_resume, repair_model)
+        repair_with(pr, live, dispatch_resume)
     except (RepairError, ValueError) as error:
         return _park_repair_failed(
             store, state, current, event_seq, error, config, effects, effects_log
@@ -13219,6 +13571,10 @@ def _route_repair(
         refreshed.slices[slice_id],
         ActionChanged(replace(repair_action, phase=ActionPhase.CONFIRMED)),
     )
+    # A successful same-owner resume starts a fresh execution budget. Reusing
+    # the original dispatch timestamp can make the heartbeat immediately time
+    # out the newly resumed worker after a long parked/review interval.
+    resumed = replace(resumed, dispatch_started_at=time.time())
     return store.checkpoint(
         phase,
         {**refreshed.slices, slice_id: resumed},
@@ -13298,7 +13654,6 @@ def _model_repair(
         pr: Mapping[str, object],
         live: EffectClient,
         dispatch: Callable[[JsonObject], object],
-        model: str | None,
     ) -> object:
         return compose_repair(
             pr,
@@ -13308,7 +13663,6 @@ def _model_repair(
             model_choice=config.review_model_choice,
             store=store,
             slice_id=slice_id,
-            model=model,
             dispatch=dispatch,
         )
 
@@ -13326,7 +13680,6 @@ def _forward_findings_repair(
         pr: Mapping[str, object],
         live: EffectClient,
         dispatch: Callable[[JsonObject], object],
-        model: str | None,
     ) -> object:
         return forward_review_findings(
             pr,
@@ -13336,7 +13689,6 @@ def _forward_findings_repair(
             test_plan=current.test_plan,
             store=store,
             slice_id=current.id,
-            model=model,
             dispatch=dispatch,
         )
 
@@ -13354,7 +13706,6 @@ def _guide_repair(
         pr: Mapping[str, object],
         live: EffectClient,
         dispatch: Callable[[JsonObject], object],
-        model: str | None,
     ) -> object:
         return dispatch_guide_handoff(
             pr,
@@ -13362,7 +13713,6 @@ def _guide_repair(
             client=live,
             store=store,
             slice_id=slice_id,
-            model=model,
             dispatch=dispatch,
         )
 
@@ -13385,46 +13735,6 @@ def _review_rounds_exhausted(state: RunState, current: SliceState, config: TLLoo
         and current.review_rounds >= max_rounds
         and not _is_aggregate_slice(current)
     )
-
-
-def _repair_model(current: SliceState, config: TLLoopConfig) -> str | None:
-    if config.requested_model:
-        if config.catalog is not None and current.agent_type:
-            return select_model(current.agent_type, config.catalog, config.requested_model).model_id
-        return config.requested_model
-    if config.catalog is None or config.policy is None:
-        return current.model
-    role_policy = config.policy.roles[config.role]
-    if current.attempts < role_policy.escalate_after_attempts:
-        return current.model
-    if not current.agent_type:
-        return current.model
-    return select_model_for_difficulty(
-        current.agent_type,
-        config.catalog,
-        Difficulty.HARD,
-        escalated=True,
-    ).model_id
-
-
-def _repair_arguments(
-    pr_number: int, handoff: RepairHandoff, model: str | None
-) -> dict[str, object]:
-    root_cause = handoff.root_cause
-    proposed_solution = handoff.proposed_solution
-    arguments: dict[str, object] = {
-        "pr_number": pr_number,
-        "task": proposed_solution,
-        "context": f"ROOT CAUSE: {root_cause}\nPROPOSED SOLUTION: {proposed_solution}",
-        "read_first": list(handoff.read_first),
-        "steps": list(handoff.steps),
-        "verify": list(handoff.verify),
-        "boundary": list(handoff.boundary),
-        "done_criteria": list(handoff.done_criteria),
-    }
-    if model is not None:
-        arguments["model"] = model
-    return arguments
 
 
 def _review_verdict(event: EventEnvelope) -> Verdict | None:
@@ -13717,12 +14027,25 @@ def _record_task_blocked_recovery(
     current = state.slices[slice_id]
     audit.setdefault("invocation_id", event.invocation_id or current.dispatch_invocation_id)
     audit.setdefault("generation", event.generation)
+    policy = policy_for_cause(blocked.cause.value)
     if current.recovery is not None:
         if current.recovery.cause != cause.value:
             raise TLLoopError(
                 f"slice {slice_id!r} already recovers cause {current.recovery.cause!r}"
             )
-        suspended = suspend_dependents(state.slices, slice_id, current.recovery.recovery_round)
+        recovery = current.recovery
+        if policy.immediate_human_gate and recovery.phase is not RecoveryPhase.HUMAN_GATE:
+            recovery = transition_recovery(
+                recovery,
+                RecoveryPhase.HUMAN_GATE,
+                next_action="open_human_gate",
+                evidence=audit,
+            )
+        updated = {
+            **state.slices,
+            slice_id: replace(current, recovery=recovery),
+        }
+        suspended = suspend_dependents(updated, slice_id, recovery.recovery_round)
         return store.checkpoint(phase, suspended, state.budgets, event_seq)
     generation = audit.get("generation")
     recovery = begin_recovery(
@@ -13734,7 +14057,6 @@ def _record_task_blocked_recovery(
         plan_revision=state.revision,
         evidence=audit,
     )
-    policy = policy_for_cause(blocked.cause.value)
     if policy.immediate_human_gate:
         recovery = transition_recovery(
             recovery,

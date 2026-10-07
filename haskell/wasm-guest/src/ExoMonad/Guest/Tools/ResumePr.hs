@@ -15,7 +15,7 @@ module ExoMonad.Guest.Tools.ResumePr
 where
 
 import Control.Monad.Freer (Eff)
-import Data.Aeson (FromJSON (..), object, withObject, (.:), (.:?), (.=))
+import Data.Aeson (FromJSON (..), object, withObject, (.:), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -23,7 +23,6 @@ import Data.Text.Lazy qualified as TL
 import Effects.Agent qualified as PA
 import ExoMonad.Effects.Agent qualified as Agent
 import ExoMonad.Guest.Effects.AgentControl qualified as AC
-import ExoMonad.Guest.ReviewHandoff (ReviewFixTask (..), renderReviewFixTask)
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
@@ -35,14 +34,8 @@ data ResumePr
 
 data ResumePrArgs = ResumePrArgs
   { rpaPrNumber :: Int,
-    rpaTask :: Text,
-    rpaReadFirst :: Maybe [Text],
-    rpaSteps :: Maybe [Text],
-    rpaVerify :: Maybe [Text],
-    rpaBoundary :: Maybe [Text],
-    rpaContext :: Maybe Text,
-    rpaDoneCriteria :: Maybe [Text],
-    rpaModel :: Maybe Text
+    rpaExpectedHeadSha :: Text,
+    rpaTask :: Text
   }
   deriving (Show, Eq, Generic)
 
@@ -50,36 +43,25 @@ instance FromJSON ResumePrArgs where
   parseJSON = withObject "ResumePrArgs" $ \v ->
     ResumePrArgs
       <$> v .: "pr_number"
+      <*> v .: "expected_head_sha"
       <*> v .: "task"
-      <*> v .:? "read_first"
-      <*> v .:? "steps"
-      <*> v .:? "verify"
-      <*> v .:? "boundary"
-      <*> v .:? "context"
-      <*> v .:? "done_criteria"
-      <*> v .:? "model"
 
 resumePrDescription :: Text
 resumePrDescription =
-  "Resume an existing open, unmerged PR by number. The host re-fetches its head SHA, resolves the exact owning agent, branch, and runtime, starts a fresh invocation, and verifies its exact tmux target is ready before reporting success. An already-running owner is an explicit failure, not a fresh resume. Provide the task summary plus optional read_first, steps, verify, boundary, context, and done_criteria fields for a complete review-fix handoff. On the resumed owner's next `file_pr` call, preserve or update the PR body with the literal heading `## Acceptance Criteria` and copy every issue Definition-of-Done bullet verbatim beneath it; use done_criteria as the handoff source and do not silently drop or paraphrase the heading. Never provide a leaf name or agent type. For closed or unrecoverable PRs, use the human-approved replace_close_pr workflow."
+  "Resume an existing open, unmerged PR using its number, the exact expected head SHA, and a complete task handoff. The host re-fetches the PR, verifies that head SHA, resolves the exact owning agent and branch, starts a fresh invocation, and verifies its tmux target is ready before reporting success. An already-running owner is an explicit failure, not a fresh resume. Put all repair instructions, read-first paths, steps, verification commands, boundaries, and done criteria in task. On the resumed owner's next `file_pr` call, preserve or update the PR body with the literal heading `## Acceptance Criteria` and copy every issue Definition-of-Done bullet verbatim beneath it. Never provide a leaf name, agent type, or model. For closed or unrecoverable PRs, use the human-approved replace_close_pr workflow."
 
 resumePrSchema :: Aeson.Object
 resumePrSchema =
   genericToolSchemaWith @ResumePrArgs
     [ ("pr_number", "Existing open, unmerged PR number to resume"),
-      ("task", "Task summary for the owning agent to continue on the existing PR"),
-      ("read_first", "Exact files or documents the leaf must read before editing"),
-      ("steps", "Concrete implementation steps for the repair"),
-      ("verify", "Exact commands the leaf must run before reporting completion"),
-      ("boundary", "Constraints and anti-patterns for the repair"),
-      ("context", "Reviewer analysis, root cause, proposed solution, and relevant snippets"),
-      ("done_criteria", "Issue Definition-of-Done bullets for the repair; the resumed owner must copy them verbatim beneath the literal `## Acceptance Criteria` heading in the next file_pr body"),
-      ("model", "Optional per-spawn model override, separate from agent_type, used to escalate the resumed owner onto a stronger model within the same harness")
+      ("expected_head_sha", "Exact PR head SHA observed by the caller; the host rechecks it before resuming"),
+      ("task", "Complete repair handoff for the owning agent on the existing PR")
     ]
 
 resumePrCore :: ResumePrArgs -> Eff Effects (Either Text Aeson.Value)
 resumePrCore args
   | rpaPrNumber args <= 0 = pure $ Left "pr_number must be positive"
+  | T.null (T.strip (rpaExpectedHeadSha args)) = pure $ Left "expected_head_sha is required"
   | T.null (T.strip (rpaTask args)) = pure $ Left "task must be complete and non-empty"
   | otherwise = do
       let renderedTask = renderResumePrTask args
@@ -103,14 +85,16 @@ resumePrCore args
               pure $ Left "PR has no head branch; refusing to resume it"
           | T.null (T.strip (lazyText (PA.watcherPrStateResponseHeadSha state))) ->
               pure $ Left "PR has no head SHA; refusing to resume it"
+          | T.strip (lazyText (PA.watcherPrStateResponseHeadSha state)) /= T.strip (rpaExpectedHeadSha args) ->
+              pure $ Left "PR head changed since the caller's observation; refusing to resume stale work"
           | otherwise -> do
               spawnResult <-
                 AC.resumePr
                   AC.ResumePrConfig
                     { AC.rpcTask = renderedTask,
                       AC.rpcPrNumber = fromIntegral (rpaPrNumber args),
-                      AC.rpcExpectedHeadSha = lazyText (PA.watcherPrStateResponseHeadSha state),
-                      AC.rpcModel = rpaModel args
+                      AC.rpcExpectedHeadSha = T.strip (rpaExpectedHeadSha args),
+                      AC.rpcModel = Nothing
                     }
               pure $ case spawnResult of
                 Left err -> Left (spawnErrorMessage err)
@@ -137,17 +121,7 @@ instance MCPTool ResumePr where
       Right value -> successResult value
 
 renderResumePrTask :: ResumePrArgs -> Text
-renderResumePrTask args =
-  renderReviewFixTask
-    ReviewFixTask
-      { reviewFixTask = rpaTask args,
-        reviewFixBoundary = rpaBoundary args,
-        reviewFixReadFirst = rpaReadFirst args,
-        reviewFixSteps = rpaSteps args,
-        reviewFixContext = rpaContext args,
-        reviewFixVerify = rpaVerify args,
-        reviewFixDoneCriteria = rpaDoneCriteria args
-      }
+renderResumePrTask = rpaTask
 
 lazyText :: TL.Text -> Text
 lazyText = TL.toStrict

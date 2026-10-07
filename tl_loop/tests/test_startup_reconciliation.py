@@ -1810,7 +1810,8 @@ def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_p
     )
     assert len(client.resume_pr_calls) == 1
     assert client.resume_pr_calls[0]["pr_number"] == 99
-    assert "Handle the missing error branch" in str(client.resume_pr_calls[0]["context"])
+    assert client.resume_pr_calls[0]["expected_head_sha"] == "head-a"
+    assert "Handle the missing error branch" in str(client.resume_pr_calls[0]["task"])
 
     repeated = _reconcile_nonterminal_slices(
         _PLAN,

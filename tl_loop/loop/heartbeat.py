@@ -179,6 +179,10 @@ def heartbeat_once(
             store=store,
         )
         row = worker_rows.get(slice_state.id)
+        if row is not None and _retired_or_unrouted(row):
+            # A retired lifecycle row is not proof of a worker handoff. Route it
+            # through the terminal-invocation evidence path before deciding it is stale.
+            row = None
         if row is None:
             runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
             terminal, evidence = _missing_worker_evidence(
@@ -287,8 +291,6 @@ def heartbeat_once(
                         evidence,
                     )
                 )
-            continue
-        if _retired_or_unrouted(row):
             continue
         budget_event = _enforce_task_budget(
             current=store.load(),
@@ -689,7 +691,7 @@ def _enforce_task_budget(
         "dispatch_started_at": slice_state.dispatch_started_at,
         "elapsed_seconds": elapsed,
         "last_authoritative_event_seq": current.goals.last_authoritative_event_seq,
-        "stderr_tail": _bounded_text(evidence, "stderr_tail"),
+        "stderr_tail": _controller_event_stderr_tail(evidence.get("stderr_tail")),
     }
     emit_controller_event(effects, "agent.task_budget_exceeded", payload)
     park(
@@ -726,7 +728,8 @@ def _mark_invocation_timed_out(
     document["status"] = "timed_out"
     document["exit_classification"] = "task_budget_exceeded"
     document["exit_reason"] = "declared_task_budget_exceeded"
-    document["ended_at"] = now
+    # InvocationRecord in the Rust owner service uses integer Unix seconds.
+    document["ended_at"] = int(now)
     if evidence.get("stderr_tail") is not None:
         document["stderr_tail"] = _bounded_text(evidence, "stderr_tail")
     temporary = path.with_suffix(".timed-out.tmp")
@@ -966,6 +969,17 @@ def _reconcile_recovery(
             recovery, now=now, event_seq=current.goals.last_authoritative_event_seq
         )
         action = "probe"
+    elif decision.action is RecoveryAction.HUMAN_GATE:
+        if recovery.phase is RecoveryPhase.HUMAN_GATE:
+            return current, None, False
+        updated_recovery = transition_recovery(
+            recovery,
+            RecoveryPhase.HUMAN_GATE,
+            next_action="open_human_gate",
+            entered_at=now,
+            evidence={**recovery.evidence, "human_gate_reason": decision.reason},
+        )
+        action = "human_gate"
     elif decision.action is RecoveryAction.EXHAUSTED:
         updated_recovery = transition_recovery(
             recovery,
@@ -1099,6 +1113,10 @@ def _missing_worker_evidence(
         context["authoritative_handoff"] = True
         context["handoff_event_type"] = handoff
         return False, context
+    if _state_handoff_matches_invocation(slice_state, record, runtime_agent_id):
+        context["authoritative_handoff"] = True
+        context["handoff_event_type"] = "run_state.publication_binding"
+        return False, context
     if isinstance(record, Mapping):
         status = _text(record, "status")
         terminal = (
@@ -1123,7 +1141,7 @@ def _worker_event_payload(evidence: Mapping[str, object]) -> dict[str, object]:
         "exit_code": evidence.get("exit_code"),
         "classification": evidence.get("classification"),
         "reason": evidence.get("reason"),
-        "stderr_tail": evidence.get("stderr_tail"),
+        "stderr_tail": _controller_event_stderr_tail(evidence.get("stderr_tail")),
         "branch": evidence.get("branch"),
         "worktree": evidence.get("worktree"),
         "poll_workers_missing": evidence.get("poll_workers_missing"),
@@ -1238,6 +1256,38 @@ def _read_authoritative_handoff(
     return None
 
 
+def _state_handoff_matches_invocation(
+    slice_state: SliceState,
+    record: Mapping[str, object] | None,
+    runtime_agent_id: str,
+) -> bool:
+    """Recognize an exact persisted publication handoff for this invocation."""
+    handoff = slice_state.handoff
+    publication = slice_state.publication
+    if handoff is None or publication is None or not isinstance(record, Mapping):
+        return False
+    status = _text(record, "status")
+    terminal = status in {"exited", "failed", "killed", "timed_out"} or record.get(
+        "ended_at"
+    ) is not None
+    if not terminal:
+        return False
+    invocation_id = _text(record, "invocation_id")
+    branch = _text(record, "branch")
+    pr_number = record.get("pr_number")
+    return (
+        invocation_id is not None
+        and invocation_id == handoff.invocation_id == publication.invocation_id
+        and type(pr_number) is int
+        and pr_number == handoff.pr_number == publication.pr_number == slice_state.pr_number
+        and handoff.head_sha == publication.head_sha
+        and handoff.attempt == publication.attempt
+        and handoff.agent_id == runtime_agent_id == slice_state.dispatch_agent_id
+        and branch == publication.head_branch == slice_state.branch
+        and publication.base_branch == slice_state.base_ref
+    )
+
+
 def _git_handoff_evidence(root_dir: Path, worktree: object) -> dict[str, object]:
     """Collect bounded Git booleans without mutating the preserved worktree."""
     if not isinstance(worktree, str) or not worktree:
@@ -1308,6 +1358,19 @@ def _text(value: Mapping[str, object] | None, key: str) -> str | None:
 def _bounded_text(value: Mapping[str, object] | None, key: str) -> str | None:
     text = _text(value, key)
     return text[-4096:] if text is not None else None
+
+
+def _controller_event_stderr_tail(value: object) -> str | None:
+    """Bound event diagnostics while retaining the full durable invocation tail."""
+    if not isinstance(value, str):
+        return None
+    encoded = value.encode("utf-8")
+    limit = 1024
+    marker = b"[stderr tail truncated; full tail retained in invocation record]\n"
+    if len(encoded) <= limit:
+        return value
+    suffix = encoded[-(limit - len(marker)) :].decode("utf-8", errors="ignore")
+    return marker.decode("ascii") + suffix
 
 
 def _event(kind: str, source: str, slice_id: str, payload: JsonMapping) -> SyntheticHeartbeatEvent:

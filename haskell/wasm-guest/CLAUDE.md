@@ -107,7 +107,7 @@ The SDK (`wasm-guest`) exports **core I/O functions** and **shared descriptions/
 
 ### PR acceptance criteria contract
 
-Every new or updated `file_pr` body carries the issue's Definition of Done under the literal `## Acceptance Criteria` heading, with bullets copied verbatim. `resume_pr` keeps the structured `done_criteria` handoff and instructs the resumed owner to preserve or update that same heading on the next `file_pr` call. Reviewers treat the heading as authoritative and request changes for missing or unsatisfied bullets without inventing criteria.
+Every new or updated `file_pr` body carries the issue's Definition of Done under the literal `## Acceptance Criteria` heading, with bullets copied verbatim. `resume_pr` requires the caller’s observed `expected_head_sha` and carries the complete repair handoff in `task`; it instructs the resumed owner to preserve or update that same heading on the next `file_pr` call. Reviewers treat the heading as authoritative and request changes for missing or unsatisfied bullets without inventing criteria.
 
 ### Roles
 

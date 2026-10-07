@@ -115,6 +115,33 @@ pub enum InvocationStatus {
     TimedOut,
 }
 
+fn deserialize_optional_unix_seconds<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Timestamp {
+        Integer(u64),
+        Fractional(f64),
+    }
+
+    match Option::<Timestamp>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Timestamp::Integer(seconds)) => Ok(Some(seconds)),
+        Some(Timestamp::Fractional(seconds))
+            if seconds.is_finite() && seconds >= 0.0 && seconds < u64::MAX as f64 =>
+        {
+            Ok(Some(seconds.trunc() as u64))
+        }
+        Some(Timestamp::Fractional(_)) => Err(serde::de::Error::custom(
+            "ended_at must be a non-negative Unix timestamp",
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvocationRecord {
     pub invocation_id: String,
@@ -124,7 +151,11 @@ pub struct InvocationRecord {
     pub mode: InvocationMode,
     pub routing: RoutingInfo,
     pub started_at: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_unix_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ended_at: Option<u64>,
     pub status: InvocationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -594,6 +625,33 @@ mod tests {
 
     fn routing() -> RoutingInfo {
         RoutingInfo::window(WindowId::parse("@42").expect("valid window id"))
+    }
+
+    #[test]
+    fn invocation_reader_accepts_fractional_timeout_timestamp_from_python() {
+        let value = serde_json::json!({
+            "invocation_id": "inv-timeout",
+            "runtime": "opencode",
+            "trigger": "resume_pr",
+            "mode": "one_shot",
+            "routing": {"window_id": "@42"},
+            "started_at": 1791330626,
+            "ended_at": 1791330627.2185607,
+            "status": "timed_out",
+            "exit_code": null,
+            "pr_number": 45,
+            "head_sha": "25ec8d08ca984b56497518dd05a572a116d1f883",
+            "generation": 2,
+            "runtime_agent_id": "issue-811-substitution-model-architecture-opencode",
+            "slice_id": "issue-811-substitution-model-architecture",
+            "branch": "main.substitution-model-architecture-stage.issue-811-substitution-model-architecture-opencode",
+            "worktree": ".exo/worktrees/issue-811-substitution-model-architecture-opencode",
+            "exit_reason": "declared_task_budget_exceeded",
+            "exit_classification": "task_budget_exceeded"
+        });
+        let record: InvocationRecord =
+            serde_json::from_value(value).expect("fractional ended_at remains readable");
+        assert_eq!(record.ended_at, Some(1791330627));
     }
 
     #[tokio::test]

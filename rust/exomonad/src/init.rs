@@ -5007,6 +5007,31 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> String {
     )
 }
 
+fn root_has_approved_ordered_recovery(value: &Value) -> bool {
+    let Some(slices) = value.get("slices").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(gates) = value.get("gates").and_then(Value::as_array) else {
+        return false;
+    };
+
+    gates.iter().any(|gate| {
+        let approved = gate.get("status").and_then(Value::as_str) == Some("approved");
+        let child_name = gate
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|name| name.strip_prefix("tl-ordered-child-recovery-"));
+        approved
+            && child_name.is_some_and(|child_name| {
+                slices
+                    .get(child_name)
+                    .and_then(|slice| slice.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("failed")
+            })
+    })
+}
+
 fn root_tl_needs_resume(project_dir: &Path) -> Result<bool> {
     let run_path = project_dir.join(".exo/tl-loop/root/run.json");
     if !run_path.exists() {
@@ -5026,9 +5051,13 @@ fn root_tl_needs_resume(project_dir: &Path) -> Result<bool> {
             )
         })?;
     match phase {
-        "tl_done" | "tl_failed" => Ok(false),
-        "tl_planning" | "tl_dispatching" | "tl_waiting" | "tl_merging" | "tl_all_merged"
-        | "tl_pr_filed" => Ok(true),
+        "tl_done" => Ok(false),
+        // A failed root normally stays terminal. An approved recovery gate for a
+        // specifically failed ordered child is the exception: launch the TL so
+        // its checkpoint proof can consume that authorization and reopen it.
+        "tl_failed" => Ok(root_has_approved_ordered_recovery(&value)),
+        "tl_planning" | "tl_dispatching" | "tl_running" | "tl_waiting" | "tl_merging"
+        | "tl_all_merged" | "tl_pr_filed" => Ok(true),
         other => Err(anyhow::anyhow!(
             "unsupported TL checkpoint {}: unknown phase '{other}'",
             run_path.display()
@@ -6955,10 +6984,7 @@ pub async fn run(
             " --effort {}",
             shell_escape::escape(config.worker_effort_level.level.to_string().into())
         );
-        let worker_variant_flag = format!(
-            " --variant {}",
-            shell_escape::escape(config.worker_effort_level.level.to_string().into())
-        );
+        let worker_variant = config.worker_effort_level.level.to_string();
         let env_prefix = format!(
             "EXOMONAD_AGENT_ID={} EXOMONAD_ROLE={} ",
             companion.name, companion.role
@@ -6983,27 +7009,25 @@ pub async fn run(
                 format!("{env_prefix}{}{}", companion.command, task_part)
             }
             AgentType::OpenCode => {
-                let yolo = if config.yolo {
-                    " --dangerously-skip-permissions"
-                } else {
-                    ""
-                };
+                let yolo = if config.yolo { " --auto" } else { "" };
                 let model_flag = companion
                     .model
                     .as_deref()
-                    .map(|m| format!(" --model {}", shell_escape::escape(m.into())))
+                    .map(|m| {
+                        let base = m.split_once('#').map_or(m, |(base, _)| base);
+                        let model_ref = format!("{base}#{worker_variant}");
+                        format!(" --model {}", shell_escape::escape(model_ref.into()))
+                    })
                     .unwrap_or_default();
                 let task_part = match &escaped_task {
                     Some(t) => format!(" '{}'", t),
                     None => String::new(),
                 };
                 if escaped_task.is_some() {
-                    format!(
-                        "{env_prefix}opencode run{yolo}{model_flag}{worker_variant_flag}{task_part}"
-                    )
+                    format!("{env_prefix}opencode run --standalone{yolo}{model_flag}{task_part}")
                 } else {
                     format!(
-                        "{env_prefix}opencode{yolo}{model_flag} --agent exomonad-{}",
+                        "{env_prefix}opencode{model_flag} --agent exomonad-{}",
                         companion.role
                     )
                 }
@@ -11451,10 +11475,27 @@ mod tests {
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_waiting"}}"#).unwrap();
         assert!(root_tl_needs_resume(dir.path()).unwrap());
 
+        std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_running"}}"#).unwrap();
+        assert!(root_tl_needs_resume(dir.path()).unwrap());
+
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
         assert!(!root_tl_needs_resume(dir.path()).unwrap());
 
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_failed"}}"#).unwrap();
+        assert!(!root_tl_needs_resume(dir.path()).unwrap());
+
+        std::fs::write(
+            root.join("run.json"),
+            r#"{"fsm":{"phase":"tl_failed"},"gates":[{"name":"tl-ordered-child-recovery-child-a","status":"approved"}],"slices":{"child-a":{"status":"failed"}}}"#,
+        )
+        .unwrap();
+        assert!(root_tl_needs_resume(dir.path()).unwrap());
+
+        std::fs::write(
+            root.join("run.json"),
+            r#"{"fsm":{"phase":"tl_failed"},"gates":[{"name":"tl-ordered-child-recovery-child-a","status":"approved"}],"slices":{"child-a":{"status":"pending"}}}"#,
+        )
+        .unwrap();
         assert!(!root_tl_needs_resume(dir.path()).unwrap());
 
         std::fs::write(root.join("run.json"), r#"{"phase":"done"}"#).unwrap();
@@ -11521,6 +11562,7 @@ mod tests {
         let phases = [
             "tl_planning",
             "tl_dispatching",
+            "tl_running",
             "tl_waiting",
             "tl_merging",
             "tl_all_merged",

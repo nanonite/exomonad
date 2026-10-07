@@ -224,8 +224,9 @@ def test_main_config_no_go_below_ceiling_forwards_findings_with_no_model_call(
     assert _effect_names(transport) == ["watcher_pr_state", "resume_pr"]
     resume = next(arguments for name, arguments in transport.calls if name == "resume_pr")
     assert resume["pr_number"] == 42
-    assert "The failure path is unhandled" in str(resume["context"])
-    assert resume["verify"] == ["just tl-loop-test"]
+    task = str(resume["task"])
+    assert "The failure path is unhandled" in task
+    assert "VERIFY" in task and "just tl-loop-test" in task
 
 
 def test_ci_failure_before_merge_forwards_failure_with_no_model_call_and_counts_a_round(
@@ -252,7 +253,7 @@ def test_ci_failure_before_merge_forwards_failure_with_no_model_call_and_counts_
     assert restored.review_rounds == 1
     assert _effect_names(transport) == ["watcher_pr_state", "resume_pr"]
     resume = next(arguments for name, arguments in transport.calls if name == "resume_pr")
-    assert "tests failed" in str(resume["context"])
+    assert "tests failed" in str(resume["task"])
 
 
 def test_ci_failure_at_the_round_ceiling_is_left_to_the_review_stuck_judgment(
@@ -360,10 +361,11 @@ def test_rounds_at_ceiling_make_one_tl_judgment_and_guide_resumes_with_fresh_bud
     assert restored.tl_intervention_attempts == 1
     assert restored.park_cause is None
     resume = next(arguments for name, arguments in transport.calls if name == "resume_pr")
-    assert resume["task"] == GUIDE["proposed_solution"]
-    assert "ROOT CAUSE: The failure path in src/leaf.py is never exercised" in str(
-        resume["context"]
-    )
+    task = str(resume["task"])
+    assert GUIDE["proposed_solution"] in task
+    assert "The failure path in src/leaf.py is never exercised" in task
+    assert resume["expected_head_sha"] == "head-a"
+    assert set(resume) == {"pr_number", "expected_head_sha", "task"}
     judged = _judged_events(transport)
     assert judged == [
         {

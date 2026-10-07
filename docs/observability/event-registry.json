@@ -60,6 +60,7 @@
     ],
     "sources": [
       "rust",
+      "control",
       "haskell",
       "lifecycle",
       "watcher",
@@ -101,6 +102,7 @@
     {"type": "agent.recovery.started", "payload_class": "aggregate_dimensions", "producers": ["tl_loop", "lifecycle"]},
     {"type": "agent.recovery.outcome", "payload_class": "aggregate_dimensions", "producers": ["tl_loop", "lifecycle"]},
     {"type": "agent.task_budget_exceeded", "payload_class": "aggregate_dimensions", "producers": ["tl_loop", "lifecycle"]},
+    {"type": "operator.task_budget_reset", "payload_class": "local_sensitive", "producers": ["rust"]},
     {"type": "tl.tool_unavailable", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "agent.guidance.delivery", "payload_class": "aggregate_dimensions", "producers": ["lifecycle", "rust"]},
     {"type": "tl.phase_changed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},

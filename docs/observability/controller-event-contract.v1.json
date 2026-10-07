@@ -302,6 +302,28 @@
         "stderr_tail"
       ]
     },
+    "operator.task_budget_reset": {
+      "fields": [
+        "run_id",
+        "child_run_id",
+        "slice_id",
+        "attempt",
+        "budget_charge_attempt",
+        "task_type",
+        "old_task_timeout_seconds",
+        "new_task_timeout_seconds",
+        "old_estimated_tokens",
+        "new_estimated_tokens",
+        "observed_tokens",
+        "operator_reason",
+        "idempotency_key",
+        "budget_source",
+        "parent_revision",
+        "child_revision",
+        "pr_number",
+        "applied"
+      ]
+    },
     "tl.tool_unavailable": {
       "fields": [
         "slice_id",

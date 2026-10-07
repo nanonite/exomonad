@@ -276,24 +276,17 @@ class EffectClient:
         self,
         *,
         pr_number: int,
+        expected_head_sha: str,
         task: str,
-        boundary: StringList | None = None,
-        context: str | None = None,
-        done_criteria: StringList | None = None,
-        read_first: StringList | None = None,
-        steps: StringList | None = None,
-        verify: StringList | None = None,
-        model: str | None = None,
     ) -> ToolResult:
-        arguments: JsonObject = {"pr_number": pr_number, "task": task}
-        _put_list(arguments, "boundary", boundary)
-        _put(arguments, "context", context)
-        _put_list(arguments, "done_criteria", done_criteria)
-        _put_list(arguments, "read_first", read_first)
-        _put_list(arguments, "steps", steps)
-        _put_list(arguments, "verify", verify)
-        _put(arguments, "model", model)
-        return self._call("resume_pr", arguments)
+        return self._call(
+            "resume_pr",
+            {
+                "pr_number": pr_number,
+                "expected_head_sha": expected_head_sha,
+                "task": task,
+            },
+        )
 
     def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
         return self._call("watcher_pr_state", {"pr_number": pr_number})
