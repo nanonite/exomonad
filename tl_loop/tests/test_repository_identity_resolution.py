@@ -241,6 +241,7 @@ def test_previously_blocked_slice_recovers_once_identity_becomes_available(
     assert final.slices[SLICE_ID].post_merge is not None
     assert final.slices[SLICE_ID].post_merge.phase is PostMergePhase.COMPLETE
     assert isinstance(final.recursive_fsm, RecursiveTLDone)
+    assert not final.gates
     # Exactly one merge, one Chainlink close, one changelog, one push --
     # recovery reused the existing owner/PR, it never re-dispatched or
     # re-merged.

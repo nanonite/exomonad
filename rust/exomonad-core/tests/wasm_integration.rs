@@ -1418,6 +1418,7 @@ async fn wasm_resume_pr_reports_verified_fresh_invocation_handoff() {
         "resume_pr",
         json!({
             "pr_number": 42,
+            "expected_head_sha": "abc123",
             "task": "Apply the requested review fix",
         }),
     )

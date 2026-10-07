@@ -337,7 +337,8 @@ url = "http://localhost:8080"
 # Opencode agent configuration.
 [opencode]
 use_embedded_key = true  # true = use embedded key in opencode binary, false = use OPENROUTER_API_KEY
-# tl_model/worker_model accept OpenCode model IDs; effort is sent as --variant.
+# tl_model/worker_model accept OpenCode model IDs; CLI effort uses the
+# provider/model#variant form.
 
 [reviewer]
 agent_type = "claude"     # claude | opencode | codex | shoal

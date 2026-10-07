@@ -2686,7 +2686,7 @@ mod tests {
             super::InvocationMode::Interactive,
         );
 
-        assert!(cmd.contains("--model opencode-go/deepseek-v4-pro#high"));
+        assert!(cmd.contains("--model 'opencode-go/deepseek-v4-pro#high'"));
         assert!(!cmd.contains("--variant"));
     }
 

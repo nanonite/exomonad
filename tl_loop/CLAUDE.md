@@ -181,7 +181,8 @@ regressed exactly that invariant during development. Failure to resolve
 opens the named `tl-repository-identity` gate rather than raising or
 guessing an owner/repo; the blocked slice recovers through this same
 lazy path on a later call once the effect succeeds, with no second post-merge
-entry point.
+entry point. Persisting the resolved identity also clears that recovery gate so
+it cannot suppress the remaining post-merge boundaries.
 
 ## Direct-leaf/worker scope draining
 

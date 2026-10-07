@@ -4575,12 +4575,16 @@ def _heal_missing_repository_identity(
     on the checkpoint. Persists it on success. On failure, opens the named
     REPOSITORY_IDENTITY_GATE_NAME gate rather than raising or guessing an
     owner/repo (#1062); the caller re-checks state.repository_identity to
-    decide whether to retry the adoption that triggered this healing.
+    decide whether to retry the adoption that triggered this healing. A
+    successful resolution also removes the now-resolved recovery gate.
     """
     resolved = _resolve_repository_identity(config, effects, effects_log)
     if resolved is None:
         return store.set_gate(REPOSITORY_IDENTITY_GATE_NAME)
-    return store.set_repository_identity(resolved)
+    state = store.set_repository_identity(resolved)
+    if any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in state.gates):
+        state = store.clear_gate(REPOSITORY_IDENTITY_GATE_NAME)
+    return state
 
 
 def _adopt_post_merge_slice(
