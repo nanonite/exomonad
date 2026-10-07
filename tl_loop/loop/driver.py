@@ -205,7 +205,6 @@ from tl_loop.select.agent_type import (
     selection_failure,
 )
 from tl_loop.select.capability import CapabilityMap, load_capability
-from tl_loop.select.classify import Difficulty
 from tl_loop.select.harness import HarnessRoute
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
@@ -4343,6 +4342,7 @@ def _record_confirmed_merge_reconciliation(
         return
 
     observed = merge_evidence or {}
+    watcher_observation = WatcherObservation.from_response(observed)
     watcher_snapshot = any(
         name in observed
         for name in ("head_branch", "publication_ownership_verified", "publication_ownership_error")
@@ -4387,12 +4387,12 @@ def _record_confirmed_merge_reconciliation(
     observed_head = observed.get("head_sha")
     if isinstance(observed_head, str) and observed_head:
         evidence["observed_head_sha"] = observed_head
-    ownership_verified = observed.get("publication_ownership_verified")
+    ownership_verified = watcher_observation.publication_ownership_verified
     if isinstance(ownership_verified, bool):
-        evidence["publication_ownership_verified"] = ownership_verified
-    ownership_error = observed.get("publication_ownership_error")
+        evidence.update(publication_ownership_verified=ownership_verified)
+    ownership_error = watcher_observation.publication_ownership_error
     if isinstance(ownership_error, str) and ownership_error:
-        evidence["publication_ownership_error"] = ownership_error
+        evidence.update(publication_ownership_error=ownership_error)
 
     old_record = entry.get("merge_reconciliation")
     old_record = old_record if isinstance(old_record, Mapping) else {}

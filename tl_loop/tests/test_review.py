@@ -406,6 +406,7 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
     merge_arguments = next(arguments for name, arguments in transport.calls if name == "merge_pr")
     assert merge_arguments == {
         "pr_number": 42,
+        "working_dir": ".",
         "expected_base_sha": "base-a",
         "expected_head_sha": "abc123",
         "expected_patch_digest": "patch-a",

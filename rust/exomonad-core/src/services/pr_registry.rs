@@ -1377,10 +1377,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(adoptions.len(), 1);
-        assert_eq!(
-            adoptions[0].succession.from_invocation_id,
-            "invocation-1"
-        );
+        assert_eq!(adoptions[0].succession.from_invocation_id, "invocation-1");
         let heads = read_published_heads(directory.path()).await.unwrap();
         assert_eq!(heads[0].invocation_id.as_deref(), Some("invocation-1"));
         assert_eq!(heads[0].invocation_succession.len(), 2);

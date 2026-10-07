@@ -115,9 +115,7 @@ pub enum InvocationStatus {
     TimedOut,
 }
 
-fn deserialize_optional_unix_seconds<'de, D>(
-    deserializer: D,
-) -> Result<Option<u64>, D::Error>
+fn deserialize_optional_unix_seconds<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

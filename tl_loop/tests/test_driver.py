@@ -6634,6 +6634,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
     assert next(arguments for name, arguments in transport.calls if name == "merge_pr") == {
         "pr_number": 43,
         "strategy": "merge",
+        "working_dir": ".",
         "expected_base_sha": "base-a",
         "expected_head_sha": "head-a",
         "expected_patch_digest": "patch-a",

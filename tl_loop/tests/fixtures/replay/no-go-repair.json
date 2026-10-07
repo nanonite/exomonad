@@ -505,7 +505,8 @@
         "branch": "main",
         "force": false,
         "include_dead": false,
-        "sweep": false
+        "sweep": false,
+        "working_dir": "."
       }
     },
     {
