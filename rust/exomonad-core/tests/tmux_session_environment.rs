@@ -18,8 +18,10 @@
 //! skipped when the `tmux` binary is unavailable.
 
 use exomonad_core::services::tmux_ipc::{TmuxIpc, WindowId};
+use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// The Codex home the tmux server under test captured when it was started.
@@ -88,16 +90,30 @@ fn global_codex_home() -> Option<String> {
 /// answers for the session and the window, both of which follow later `set-environment`
 /// writes, so it reports the value `init` wrote while the pane runs on another one.
 fn pane_process_codex_home(window: &str) -> Option<String> {
-    let pid: u32 = test_tmux_output(&["display-message", "-p", "-t", window, "#{pane_pid}"])
-        .parse()
-        .expect("tmux reported a pane pid");
-    let environ = std::fs::read(format!("/proc/{pid}/environ"))
-        .expect("/proc must expose the spawned pane's environment");
-    environ
-        .split(|byte| *byte == 0)
-        .filter_map(|entry| std::str::from_utf8(entry).ok())
-        .find_map(|entry| entry.strip_prefix("CODEX_HOME="))
-        .map(str::to_owned)
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let command = test_tmux_output(&[
+            "display-message",
+            "-p",
+            "-t",
+            window,
+            "#{pane_current_command}",
+        ]);
+        if command == "sh" || Instant::now() >= deadline {
+            let pid: u32 =
+                test_tmux_output(&["display-message", "-p", "-t", window, "#{pane_pid}"])
+                    .parse()
+                    .expect("tmux reported a pane pid");
+            let environ = std::fs::read(format!("/proc/{pid}/environ"))
+                .expect("/proc must expose the spawned pane's environment");
+            return environ
+                .split(|byte| *byte == 0)
+                .filter_map(|entry| std::str::from_utf8(entry).ok())
+                .find_map(|entry| entry.strip_prefix("CODEX_HOME="))
+                .map(str::to_owned);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A tmux server that captures a foreign `CODEX_HOME` and is killed when it goes out of
@@ -147,6 +163,15 @@ impl TestServer {
         assert!(
             status.success(),
             "the seed session could not start the test tmux server"
+        );
+        let socket_path = tmpdir
+            .path()
+            .join(format!("tmux-{}", tmpdir.path().metadata().unwrap().uid()))
+            .join(&socket);
+        assert!(
+            socket_path.exists(),
+            "the test tmux server socket must be inside TMUX_TMPDIR: {}",
+            socket_path.display()
         );
         // `new_session` spawns the server's default shell and these tests read that
         // shell's environment. Pin it to a shell that stays alive on a pane tty whatever
@@ -247,12 +272,27 @@ async fn the_first_window_pane_is_born_with_the_new_session_environment() {
     };
     let cwd = tempfile::tempdir().expect("temp dir");
     let session = TestSession::create("born", &cwd, &[("CODEX_HOME", SESSION_CODEX_HOME)]).await;
+    let observed = pane_process_codex_home(session.first_window.as_str());
+    let server_version = test_tmux_output(&["display-message", "-p", "#{version}"]);
 
     assert_eq!(
-        pane_process_codex_home(session.first_window.as_str()).as_deref(),
+        observed.as_deref(),
         Some(SESSION_CODEX_HOME),
         "a pane spawned with the session environment must not fall back to the tmux \
-         server's captured Codex home"
+         server's captured Codex home; TMPDIR={:?}, TMUX_TMPDIR={:?}, \
+         EXOMONAD_TMUX_SOCKET={:?}, TMUX={:?}, tmux={:?}, \
+         tmux server version={}, session CODEX_HOME={:?}, global CODEX_HOME={:?}",
+        std::env::var_os("TMPDIR"),
+        std::env::var_os("TMUX_TMPDIR"),
+        std::env::var_os("EXOMONAD_TMUX_SOCKET"),
+        std::env::var_os("TMUX"),
+        Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.stdout),
+        server_version,
+        session_codex_home(&session.name),
+        global_codex_home()
     );
     assert_eq!(
         session_codex_home(&session.name).as_deref(),

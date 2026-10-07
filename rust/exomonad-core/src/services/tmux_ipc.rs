@@ -306,6 +306,42 @@ impl TmuxIpc {
         Ok(status.success())
     }
 
+    /// Read the process id of a window's pane from the selected tmux server.
+    pub async fn pane_pid(window: &str) -> Result<Option<u32>> {
+        info!(window, "Reading tmux pane process id");
+        let output = tmux_command()
+            .args(["display-message", "-p", "-t", window, "#{pane_pid}"])
+            .output()
+            .await
+            .context("Failed to read tmux pane process id")?;
+        info!(
+            window,
+            success = output.status.success(),
+            "Read tmux pane process id"
+        );
+        if !output.status.success() {
+            warn!(
+                window,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "tmux could not read the pane process id"
+            );
+            return Ok(None);
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        match raw.trim().parse() {
+            Ok(pid) => Ok(Some(pid)),
+            Err(error) => {
+                warn!(
+                    window,
+                    output = %raw.trim(),
+                    %error,
+                    "tmux returned an invalid pane process id"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     pub async fn kill_session(name: &str) -> Result<()> {
         let output = tmux_command()
             .args(["kill-session", "-t", name])

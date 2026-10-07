@@ -4358,18 +4358,6 @@ fn first_window_environment(codex_home: Option<&str>) -> Vec<(&str, &str)> {
         .unwrap_or_default()
 }
 
-/// The pid of the process tmux spawned in a window's only pane.
-fn window_pane_pid(window: &str) -> Option<u32> {
-    let output = std::process::Command::new("tmux")
-        .args(["display-message", "-p", "-t", window, "#{pane_pid}"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
-}
-
 /// One variable out of a running process's own environment.
 ///
 /// `/proc/<pid>/environ` is the only place the disagreement this guards is visible: the
@@ -4422,13 +4410,25 @@ fn first_window_codex_home_verdict(expected: &str, observed: Option<&str>) -> Re
 ///
 /// This reads the spawned process rather than `tmux show-environment`: the session
 /// environment is written after the window exists and so agrees with `init` no matter
-/// what the pane actually inherited.
-fn verify_first_window_codex_home(window: &str, expected: Option<&str>) -> Result<()> {
+/// what the pane actually inherited. tmux returns from `new-session` after forking the
+/// pane process, before that child has installed its pane environment and exec'd its
+/// shell, so the check waits for the expected value to appear in `/proc`.
+async fn verify_first_window_codex_home(window: &str, expected: Option<&str>) -> Result<()> {
     let Some(expected) = expected else {
         return Ok(());
     };
     let observed =
-        window_pane_pid(window).and_then(|pid| process_environment_variable(pid, "CODEX_HOME"));
+        if let Some(pid) = exomonad_core::services::tmux_ipc::TmuxIpc::pane_pid(window).await? {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut observed = process_environment_variable(pid, "CODEX_HOME");
+            while observed.as_deref() != Some(expected) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                observed = process_environment_variable(pid, "CODEX_HOME");
+            }
+            observed
+        } else {
+            None
+        };
     first_window_codex_home_verdict(expected, observed.as_deref())
 }
 
@@ -6459,7 +6459,7 @@ pub async fn run(
         &first_window_environment(codex_home.as_deref()),
     )
     .await?;
-    verify_first_window_codex_home(server_window_id.as_str(), codex_home.as_deref())?;
+    verify_first_window_codex_home(server_window_id.as_str(), codex_home.as_deref()).await?;
 
     // Verify session
     if !TmuxIpc::has_session(&session).await? {
@@ -13037,8 +13037,10 @@ mod tests {
     /// An operator who never exported `CODEX_HOME` is on the host's own `~/.codex`,
     /// which is where that configuration is written. There is nothing to propagate and
     /// nothing to verify.
-    #[test]
-    fn no_exported_codex_home_skips_the_first_window_verification() {
-        verify_first_window_codex_home("@0", None).expect("nothing to verify");
+    #[tokio::test]
+    async fn no_exported_codex_home_skips_the_first_window_verification() {
+        verify_first_window_codex_home("@0", None)
+            .await
+            .expect("nothing to verify");
     }
 }
