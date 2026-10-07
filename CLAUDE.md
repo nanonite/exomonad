@@ -165,12 +165,15 @@ created afterwards. `init` therefore hands `CODEX_HOME` to `new-session` itself 
 `-e CODEX_HOME=<path>`, which makes the window it renames to `Server` — and so
 every agent `exomonad serve` spawns — resolve the run's Codex home even when a tmux
 server started by another process already exists. It then reads that pane's own
-`/proc/<pid>/environ` and refuses to start when it disagrees with the exported
-`CODEX_HOME`. tmux returns from `new-session` after forking the pane process but before
-that child execs its shell, so `init` waits up to one second for the expected value to
-appear in `/proc/<pid>/environ`. It reads the pane PID through the same selected tmux
-socket as session creation. `tmux show-environment` is not a substitute for that check:
-the session and window environments both follow later writes.
+process ID and the tmux server's process ID through the same selected socket, then
+waits until Linux reports a different `/proc/<pane-pid>/exe` from the server's
+`/proc/<server-pid>/exe`. The forked pane child keeps the tmux executable until it
+execs the pane command, so this is the startup boundary the check observes. After
+that boundary, `init` reads `/proc/<pane-pid>/environ` once and compares `CODEX_HOME`
+with the exported value. A bounded timeout before exec and a mismatch after exec both
+fail startup; the timeout reports the last observed executable and command name, plus
+`CODEX_HOME` when readable. `tmux show-environment` is not a substitute for that
+check: the session and window environments both follow later writes.
 
 The three init modes are explicit and recorded in `.exo/tl-loop/session-mode.json`
 and the run checkpoint. In this surface-only phase, omitting a mode retains the
@@ -747,12 +750,14 @@ It owns everything it creates and fails if anything outlives the run — see
 Python controller, a bare scratch remote, deterministic effect/review stubs,
 and the exact default TL-window command without creating an ExoMonad session.
 
-`just rust-test` is the fast library-only Rust loop. `just rust-test-all` runs
-the full Rust workspace test set, including native integration targets. Run the
-tmux first-window environment integration tests with
+`just test` builds the WASM plugins before running the full Rust workspace test
+set, so the WASM integration target has its plugin available. New Rust test
+targets must be reachable from `just test`. `just rust-test` is the fast
+library-only Rust loop. `just rust-test-all` runs the full Rust workspace test
+set, including native integration targets. New Rust tests must also remain
+reachable from `just rust-test-all`. Run the tmux first-window environment integration tests with
 `just tmux-session-environment-test [inside_nix] [tmpdir]`; the default is
-`true /tmp`. Pass `false` to use the host Rust toolchain and tmux binary. New
-Rust tests must be reachable from `just rust-test-all`.
+`true /tmp`. Pass `false` to use the host Rust toolchain and tmux binary.
 
 ### E2E Test Pattern
 

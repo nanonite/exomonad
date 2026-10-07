@@ -4358,52 +4358,26 @@ fn first_window_environment(codex_home: Option<&str>) -> Vec<(&str, &str)> {
         .unwrap_or_default()
 }
 
-/// One variable out of a running process's own environment.
-///
-/// `/proc/<pid>/environ` is the only place the disagreement this guards is visible: the
-/// tmux session environment and the tmux window environment both follow later
-/// `set-environment` writes, while the environment of the process tmux spawned keeps
-/// what it was handed at exec time.
-fn process_environment_variable(pid: u32, name: &str) -> Option<String> {
-    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    let prefix = format!("{name}=");
-    environ
-        .split(|byte| *byte == 0)
-        .filter_map(|entry| std::str::from_utf8(entry).ok())
-        .find_map(|entry| entry.strip_prefix(prefix.as_str()))
-        .map(str::to_owned)
-}
-
 /// Classify the Codex home the session's first window was actually born with.
-///
-/// `observed` is `None` when tmux named no process or `/proc` could not be read. An
-/// unreadable answer is not a mismatch, so it is reported and startup continues; a
-/// readable answer that disagrees is a leak the operator cannot see from the session
-/// environment, and continuing would seed this run's hook trust into one Codex home
-/// while every pane reads another.
 fn first_window_codex_home_verdict(expected: &str, observed: Option<&str>) -> Result<()> {
-    match observed {
-        Some(observed) if observed == expected => {
-            info!(
-                codex_home = %observed,
-                "tmux session's first window inherited the exported CODEX_HOME"
-            );
-            Ok(())
-        }
-        Some(observed) => anyhow::bail!(
-            "the tmux session's first window runs on CODEX_HOME={observed}, not {expected}. \
-             ExoMonad seeds this run's Codex hook trust into {expected}, so a pane on another home \
-             reports those hooks as untrusted and seeds no project trust. The tmux server that \
-             created this session was already running and captured a different CODEX_HOME."
-        ),
-        None => {
-            warn!(
-                "cannot verify the tmux session's first window was born with CODEX_HOME={expected}; \
-                 tmux named no pane process or /proc did not yield its environment"
-            );
-            Ok(())
-        }
+    let Some(observed) = observed else {
+        anyhow::bail!(
+            "the tmux session's first window did not expose CODEX_HOME after exec; expected {expected}"
+        );
+    };
+    if observed == expected {
+        info!(
+            codex_home = %observed,
+            "tmux session's first window inherited the exported CODEX_HOME"
+        );
+        return Ok(());
     }
+    anyhow::bail!(
+        "the tmux session's first window runs on CODEX_HOME={observed}, not {expected}. \
+         ExoMonad seeds this run's Codex hook trust into {expected}, so a pane on another home \
+         reports those hooks as untrusted and seeds no project trust. The tmux server that \
+         created this session was already running and captured a different CODEX_HOME."
+    )
 }
 
 /// Prove the session's first window can resolve the operator's Codex home.
@@ -4411,24 +4385,20 @@ fn first_window_codex_home_verdict(expected: &str, observed: Option<&str>) -> Re
 /// This reads the spawned process rather than `tmux show-environment`: the session
 /// environment is written after the window exists and so agrees with `init` no matter
 /// what the pane actually inherited. tmux returns from `new-session` after forking the
-/// pane process, before that child has installed its pane environment and exec'd its
-/// shell, so the check waits for the expected value to appear in `/proc`.
+/// pane process, before that child execs its pane command. The check waits until the
+/// pane's `/proc/<pid>/exe` differs from the tmux server's executable, then reads
+/// `CODEX_HOME` once and compares it.
 async fn verify_first_window_codex_home(window: &str, expected: Option<&str>) -> Result<()> {
     let Some(expected) = expected else {
         return Ok(());
     };
+    let pid =
+        exomonad_core::services::tmux_ipc::TmuxIpc::wait_for_pane_exec_boundary(window).await?;
     let observed =
-        if let Some(pid) = exomonad_core::services::tmux_ipc::TmuxIpc::pane_pid(window).await? {
-            let deadline = Instant::now() + Duration::from_secs(1);
-            let mut observed = process_environment_variable(pid, "CODEX_HOME");
-            while observed.as_deref() != Some(expected) && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                observed = process_environment_variable(pid, "CODEX_HOME");
-            }
-            observed
-        } else {
-            None
-        };
+        exomonad_core::services::tmux_ipc::process_environment_variable(pid, "CODEX_HOME")
+            .with_context(|| {
+                format!("failed to read CODEX_HOME from /proc/{pid}/environ after exec")
+            })?;
     first_window_codex_home_verdict(expected, observed.as_deref())
 }
 
@@ -12975,12 +12945,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_first_window_environment_is_not_a_mismatch() {
-        // No pane process named, or no `/proc` to read: nothing is known, and refusing
-        // startup over a missing observation would be a failure of this check, not of
-        // the session.
-        first_window_codex_home_verdict("/run/codex-home", None)
-            .expect("an unobserved pane must not stop init");
+    fn a_first_window_without_an_observable_codex_home_is_refused() {
+        let error = first_window_codex_home_verdict("/run/codex-home", None)
+            .expect_err("a pane that cannot expose CODEX_HOME cannot prove its environment")
+            .to_string();
+
+        assert!(
+            error.contains("did not expose CODEX_HOME after exec"),
+            "{error}"
+        );
+        assert!(error.contains("/run/codex-home"), "{error}");
     }
 
     /// A child process, killed and reaped when it goes out of scope so a failed
@@ -13014,7 +12988,10 @@ mod tests {
         // `/proc/<pid>/environ` only exists once it has.
         let deadline = Instant::now() + Duration::from_secs(5);
         let observed = loop {
-            if let Some(value) = process_environment_variable(pid, variable) {
+            if let Some(value) =
+                exomonad_core::services::tmux_ipc::process_environment_variable(pid, variable)
+                    .expect("read the environment probe")
+            {
                 break value;
             }
             assert!(Instant::now() < deadline, "the probe never exec'd");
@@ -13023,15 +13000,18 @@ mod tests {
 
         assert_eq!(observed, "/run/codex-home");
         assert_eq!(
-            process_environment_variable(pid, "EXOMONAD_TEST_UNSET_VARIABLE"),
+            exomonad_core::services::tmux_ipc::process_environment_variable(
+                pid,
+                "EXOMONAD_TEST_UNSET_VARIABLE"
+            )
+            .expect("read the environment probe"),
             None,
             "an absent variable reads as absent, not as an empty value"
         );
-        assert_eq!(
-            process_environment_variable(u32::MAX, variable),
-            None,
-            "a pid with no /proc entry reads as absent"
-        );
+        assert!(matches!(
+            exomonad_core::services::tmux_ipc::process_environment_variable(u32::MAX, variable),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ));
     }
 
     /// An operator who never exported `CODEX_HOME` is on the host's own `~/.codex`,

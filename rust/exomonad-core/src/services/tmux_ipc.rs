@@ -17,6 +17,8 @@ use crate::domain::RoutingInfo;
 const OWNER_AGENT_OPTION: &str = "@exomonad_owner_agent";
 const OWNER_INVOCATION_OPTION: &str = "@exomonad_owner_invocation";
 const OWNER_GENERATION_OPTION: &str = "@exomonad_owner_generation";
+const PANE_EXEC_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(1);
+const PANE_EXEC_BOUNDARY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Per-target injection locks. Uses Weak references so entries are automatically
 /// reclaimable when no inject_input call holds the Arc.
@@ -147,6 +149,79 @@ pub struct TmuxOwnership {
     pub agent_id: String,
     pub invocation_id: String,
     pub generation: u64,
+}
+
+struct ProcessExecutionState {
+    pane_exe: std::io::Result<std::path::PathBuf>,
+    pane_comm: std::io::Result<String>,
+    server_exe: std::io::Result<std::path::PathBuf>,
+    server_comm: std::io::Result<String>,
+}
+
+impl ProcessExecutionState {
+    fn read(pane_pid: u32, server_pid: u32) -> Self {
+        Self {
+            pane_exe: std::fs::read_link(format!("/proc/{pane_pid}/exe")),
+            pane_comm: read_process_comm(pane_pid),
+            server_exe: std::fs::read_link(format!("/proc/{server_pid}/exe")),
+            server_comm: read_process_comm(server_pid),
+        }
+    }
+
+    fn pane_execed(&self) -> bool {
+        matches!((&self.pane_exe, &self.server_exe), (Ok(pane), Ok(server)) if pane != server)
+    }
+}
+
+fn read_process_comm(pid: u32) -> std::io::Result<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).map(|comm| comm.trim().to_owned())
+}
+
+/// Read one variable from a process's environment as exposed by Linux procfs.
+pub fn process_environment_variable(pid: u32, name: &str) -> std::io::Result<Option<String>> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ"))?;
+    let prefix = format!("{name}=");
+    Ok(environ
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix(prefix.as_str()))
+        .map(str::to_owned))
+}
+
+/// Wait until tmux's forked pane process has crossed its `execve` boundary.
+///
+/// Linux keeps `/proc/<pid>/exe` pointed at the tmux server executable while the
+/// pane child is only forked. A different executable for that same pane PID is
+/// direct evidence that tmux has exec'd the pane command, unlike an environment
+/// value or elapsed delay, either of which may be observed before exec.
+async fn wait_for_process_exec_boundary(
+    pane_pid: u32,
+    server_pid: u32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last = ProcessExecutionState::read(pane_pid, server_pid);
+        if last.pane_execed() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let codex_home = process_environment_variable(pane_pid, "CODEX_HOME");
+            anyhow::bail!(
+                "tmux pane process {pane_pid} did not exec within {timeout:?}; last observed state: \
+                 pane exe={:?}, pane comm={:?}, server exe={:?}, server comm={:?}, CODEX_HOME={codex_home:?}",
+                last.pane_exe,
+                last.pane_comm,
+                last.server_exe,
+                last.server_comm
+            );
+        }
+        tokio::time::sleep(
+            PANE_EXEC_BOUNDARY_POLL_INTERVAL
+                .min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
 }
 
 fn settle_delay_for_payload(payload: &str) -> Duration {
@@ -340,6 +415,36 @@ impl TmuxIpc {
                 Ok(None)
             }
         }
+    }
+
+    /// Wait for a window's pane process to exec its pane command and return its PID.
+    pub async fn wait_for_pane_exec_boundary(window: &str) -> Result<u32> {
+        info!(window, "Waiting for tmux pane exec boundary");
+        let pane_pid = Self::pane_pid(window)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("tmux did not report a process id for pane {window}"))?;
+        let server_output = tmux_command()
+            .args(["display-message", "-p", "-t", window, "#{pid}"])
+            .output()
+            .await
+            .context("Failed to read tmux server process id")?;
+        if !server_output.status.success() {
+            anyhow::bail!(
+                "tmux could not read the server process id for pane {window}: {}",
+                String::from_utf8_lossy(&server_output.stderr).trim()
+            );
+        }
+        let raw_server_pid = String::from_utf8_lossy(&server_output.stdout);
+        let server_pid = raw_server_pid.trim().parse::<u32>().with_context(|| {
+            format!("invalid tmux server process id: {}", raw_server_pid.trim())
+        })?;
+
+        wait_for_process_exec_boundary(pane_pid, server_pid, PANE_EXEC_BOUNDARY_TIMEOUT).await?;
+        info!(
+            window,
+            pane_pid, server_pid, "Observed tmux pane exec boundary"
+        );
+        Ok(pane_pid)
     }
 
     pub async fn kill_session(name: &str) -> Result<()> {
@@ -1266,6 +1371,21 @@ mod tests {
             "no server running on /tmp/tmux-1000/default"
         ));
         assert!(!session_missing("usage: tmux list-windows"));
+    }
+
+    #[tokio::test]
+    async fn pane_exec_boundary_timeout_reports_the_last_process_state() {
+        let error = wait_for_process_exec_boundary(u32::MAX, u32::MAX - 1, Duration::ZERO)
+            .await
+            .expect_err("missing processes must not satisfy the exec boundary");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("last observed state"), "{message}");
+        assert!(message.contains("pane exe="), "{message}");
+        assert!(message.contains("pane comm="), "{message}");
+        assert!(message.contains("server exe="), "{message}");
+        assert!(message.contains("server comm="), "{message}");
+        assert!(message.contains("CODEX_HOME="), "{message}");
     }
 
     #[test]
