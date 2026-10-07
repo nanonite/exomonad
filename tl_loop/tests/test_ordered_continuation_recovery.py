@@ -78,8 +78,9 @@ def _failed_ordered_run(
     child_owner_branch: str | None = None,
     child_status: SliceStatus = SliceStatus.PENDING,
     child_publication: bool = False,
+    root_dir: Path | None = None,
 ) -> tuple[RunStore, WorkPlan, TLLoopConfig]:
-    state_root = tmp_path / "state"
+    state_root = root_dir or tmp_path / "state"
     child_plan = WorkPlan(leaves=(LeafTask("leaf", "implement the child change"),))
     plan = WorkPlan(sub_tls=(SubTLTask("child", child_plan, order=1),))
     config = TLLoopConfig(

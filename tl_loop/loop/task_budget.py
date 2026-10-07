@@ -21,6 +21,7 @@ from tl_loop.state.schema import (
     SliceState,
     SliceStatus,
 )
+from tl_loop.state.slice_transition import ActionChanged, SliceStatusChanged, slice_transition
 from tl_loop.state.store import CheckpointConflict, RunStore
 
 _TASK_TYPE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
@@ -212,16 +213,18 @@ def _apply_task_budget_reset(
         if target is None:
             raise TaskBudgetResetError(f"slice {request.slice_id!r} is missing from the child")
         _validate_parked_target(target, child, request)
+        updated_target = slice_transition(
+            slice_transition(target, SliceStatusChanged(SliceStatus.IN_REVIEW)),
+            ActionChanged(None),
+        )
         updated_target = replace(
-            target,
-            status=SliceStatus.IN_REVIEW,
+            updated_target,
             park_cause=None,
             park_issue_id=None,
             dispatch_started_at=time.time(),
             task_timeout_seconds=request.new_task_timeout_seconds,
             task_timeout_source="operator",
             task_budget_reset_key=request.idempotency_key,
-            action=None,
             dispatch_last_boundary=None,
             dispatch_error=None,
             dispatch_error_code=None,
