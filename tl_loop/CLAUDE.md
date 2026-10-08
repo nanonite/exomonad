@@ -665,13 +665,22 @@ stateless CLI call per request, in an empty scratch directory. `claude` runs
 and reads authoritative usage from the envelope; `codex` runs `codex exec --model
 <id> --sandbox read-only --ephemeral --ignore-user-config` and reads
 `--output-last-message`; `opencode` runs `opencode run --standalone -m <id>`
-(opencode has no flag that disables tools, so isolation is the empty working
-directory and the absence of `--auto`). Codex and opencode report no usage here,
-so the charge is the deterministic `ApproximateTokenCounter` estimate. Any other
+(OpenCode has no CLI flag that disables tools, so the backend sets
+`OPENCODE_PERMISSION={"*":"deny"}` for every call; it also uses an empty working
+directory and omits `--auto`). Codex and OpenCode report no usage here, so the
+charge is the deterministic `ApproximateTokenCounter` estimate. Any other
 harness, or a harness binary not on PATH, refuses startup. Each call logs the
 command and prompt size before it runs, and the exit code, response size, and on
 failure the stderr after. A call that exceeds `DEFAULT_CALL_TIMEOUT_SECONDS` (600)
 raises `RlmCallError`.
+
+`just tl-loop-live-smoke` runs one tiny addition judgment through each installed
+backend CLI and checks the parsed result and token charge. Set
+`EXOMONAD_TL_SMOKE_CLAUDE_MODEL`, `EXOMONAD_TL_SMOKE_CODEX_MODEL`, and
+`EXOMONAD_TL_SMOKE_OPENCODE_MODEL` for the installed harnesses before running it;
+the recipe validates all model settings before making any live calls. Codex's
+`--ignore-user-config` skips `$CODEX_HOME/config.toml` while retaining account
+authentication from `CODEX_HOME`; the live recipe exercises that exact invocation.
 
 ## Recursive sub-TL ownership
 

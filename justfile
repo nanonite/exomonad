@@ -77,6 +77,11 @@ haskell-test:
 tl-loop-test:
     {{py}} -m pytest -q tl_loop/tests
 
+# Run one real, tiny judgment per installed harness. Set the matching
+# EXOMONAD_TL_SMOKE_<HARNESS>_MODEL variable for every installed CLI first.
+tl-loop-live-smoke:
+    {{py}} -m tl_loop.rlm.live_smoke
+
 # Validate relative documentation links and executable ordered-plan examples.
 docs-check:
     python3 scripts/check-doc-links.py

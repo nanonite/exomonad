@@ -10,8 +10,8 @@ TL role are:
 * ``codex``: ``codex exec --model <id> --sandbox read-only --ephemeral
   --ignore-user-config``; the final message is read from ``--output-last-message``.
 * ``opencode``: ``opencode run --standalone -m <id>``; opencode has no flag
-  that disables tools, so isolation is the empty working directory and the
-  absence of ``--auto`` (no permission is ever auto-approved).
+  that disables tools, so the process receives ``OPENCODE_PERMISSION={"*":
+  "deny"}``, runs in an empty working directory, and never receives ``--auto``.
 
 Codex and opencode report no usage on this path, so their token charge is the
 deterministic ``ApproximateTokenCounter`` estimate over the prompt and the
@@ -48,6 +48,7 @@ LOGGER = logging.getLogger(__name__)
 SUPPORTED_BACKEND_HARNESSES = ("claude", "codex", "opencode")
 DEFAULT_CALL_TIMEOUT_SECONDS = 600.0
 _STDERR_LOG_LIMIT = 2000
+_OPENCODE_DENY_ALL_PERMISSIONS = json.dumps({"*": "deny"}, separators=(",", ":"))
 
 CommandRunner = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -148,6 +149,9 @@ class SubprocessRlmBackend:
                 len(prompt.encode("utf-8")),
             )
             started = time.monotonic()
+            environment = dict(os.environ)
+            if self.harness == "opencode":
+                environment["OPENCODE_PERMISSION"] = _OPENCODE_DENY_ALL_PERMISSIONS
             try:
                 completed = self._runner(
                     command,
@@ -157,7 +161,7 @@ class SubprocessRlmBackend:
                     cwd=str(workdir),
                     timeout=self._timeout,
                     check=False,
-                    env=dict(os.environ),
+                    env=environment,
                 )
             except subprocess.TimeoutExpired as error:
                 LOGGER.error(
