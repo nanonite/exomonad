@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Support optional slice-scoped Chainlink issue integration (#1165)
 - Resume recursive child handoff only after post-merge recovery completes, then continue the persisted parent plan order (#1165)
 - Resume the Beast slice with the deterministic review repair (#1164)
+- Fix the first tmux pane inheriting the wrong Codex home (#1172)
 - Fix broken Failure Atlas links in the sync plan (#1163)
 - tl_loop: deterministic worker<->reviewer inner loop; TL LLM judgment only on review-stuck (fail hard if roles.tl model unresolved) (#1158)
 - Make the worker<->reviewer review loop deterministic (reviewer NO-GO and pre-merge CI failure forward their findings verbatim to the same owner through `resume_pr`, no model call) and make one `roles.tl` guide/escalate judgment only when `reviewer_max_rounds` is reached, served by a tool-free harness subprocess backend; startup refuses when the `roles.tl` model cannot be resolved (#1158)

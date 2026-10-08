@@ -17,7 +17,8 @@
 //! `EXOMONAD_TMUX_SOCKET` are process-global, so the tests take turns. Every test is
 //! skipped when the `tmux` binary is unavailable.
 
-use exomonad_core::services::tmux_ipc::{TmuxIpc, WindowId};
+use exomonad_core::services::tmux_ipc::{process_environment_variable, TmuxIpc, WindowId};
+use std::os::unix::fs::MetadataExt;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
@@ -87,17 +88,13 @@ fn global_codex_home() -> Option<String> {
 /// This is the observation a session-environment read cannot make. `show-environment`
 /// answers for the session and the window, both of which follow later `set-environment`
 /// writes, so it reports the value `init` wrote while the pane runs on another one.
-fn pane_process_codex_home(window: &str) -> Option<String> {
-    let pid: u32 = test_tmux_output(&["display-message", "-p", "-t", window, "#{pane_pid}"])
-        .parse()
-        .expect("tmux reported a pane pid");
-    let environ = std::fs::read(format!("/proc/{pid}/environ"))
-        .expect("/proc must expose the spawned pane's environment");
-    environ
-        .split(|byte| *byte == 0)
-        .filter_map(|entry| std::str::from_utf8(entry).ok())
-        .find_map(|entry| entry.strip_prefix("CODEX_HOME="))
-        .map(str::to_owned)
+async fn pane_process_codex_home(window: &str, expected: &str) -> (u32, Option<String>) {
+    let (pid, _) = TmuxIpc::wait_for_pane_environment_variable(window, "CODEX_HOME", expected)
+        .await
+        .unwrap_or_else(|error| panic!("pane CODEX_HOME did not settle: {error:#}"));
+    let codex_home = process_environment_variable(pid, "CODEX_HOME")
+        .expect("read the pane process environment after the expected value was observed");
+    (pid, codex_home)
 }
 
 /// A tmux server that captures a foreign `CODEX_HOME` and is killed when it goes out of
@@ -147,6 +144,15 @@ impl TestServer {
         assert!(
             status.success(),
             "the seed session could not start the test tmux server"
+        );
+        let socket_path = tmpdir
+            .path()
+            .join(format!("tmux-{}", tmpdir.path().metadata().unwrap().uid()))
+            .join(&socket);
+        assert!(
+            socket_path.exists(),
+            "the test tmux server socket must be inside TMUX_TMPDIR: {}",
+            socket_path.display()
         );
         // `new_session` spawns the server's default shell and these tests read that
         // shell's environment. Pin it to a shell that stays alive on a pane tty whatever
@@ -229,8 +235,10 @@ async fn setting_the_session_environment_after_the_first_window_is_too_late() {
         Some(SESSION_CODEX_HOME),
         "the session environment reports the value that was written into it"
     );
+    let (_, observed) =
+        pane_process_codex_home(session.first_window.as_str(), SERVER_CODEX_HOME).await;
     assert_eq!(
-        pane_process_codex_home(session.first_window.as_str()).as_deref(),
+        observed.as_deref(),
         Some(SERVER_CODEX_HOME),
         "the first window's pane was spawned before set-environment ran, so it keeps the \
          tmux server's captured Codex home while the session environment reports another"
@@ -247,12 +255,42 @@ async fn the_first_window_pane_is_born_with_the_new_session_environment() {
     };
     let cwd = tempfile::tempdir().expect("temp dir");
     let session = TestSession::create("born", &cwd, &[("CODEX_HOME", SESSION_CODEX_HOME)]).await;
+    let (pane_pid, observed) =
+        pane_process_codex_home(session.first_window.as_str(), SESSION_CODEX_HOME).await;
+    let pane_exe = std::fs::read_link(format!("/proc/{pane_pid}/exe"));
+    let pane_comm = std::fs::read_to_string(format!("/proc/{pane_pid}/comm"));
+    let server_pid = test_tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        session.first_window.as_str(),
+        "#{pid}",
+    ]);
+    let server_exe = std::fs::read_link(format!("/proc/{server_pid}/exe"));
+    let server_comm = std::fs::read_to_string(format!("/proc/{server_pid}/comm"));
+    let server_version = test_tmux_output(&["display-message", "-p", "#{version}"]);
 
     assert_eq!(
-        pane_process_codex_home(session.first_window.as_str()).as_deref(),
+        observed.as_deref(),
         Some(SESSION_CODEX_HOME),
         "a pane spawned with the session environment must not fall back to the tmux \
-         server's captured Codex home"
+         server's captured Codex home; TMPDIR={:?}, TMUX_TMPDIR={:?}, \
+         EXOMONAD_TMUX_SOCKET={:?}, TMUX={:?}, tmux={:?}, \
+         tmux server version={}, pane pid={}, pane exe={pane_exe:?}, pane comm={pane_comm:?}, \
+         server pid={server_pid}, server exe={server_exe:?}, server comm={server_comm:?}, \
+         session CODEX_HOME={:?}, global CODEX_HOME={:?}",
+        std::env::var_os("TMPDIR"),
+        std::env::var_os("TMUX_TMPDIR"),
+        std::env::var_os("EXOMONAD_TMUX_SOCKET"),
+        std::env::var_os("TMUX"),
+        Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|output| output.stdout),
+        server_version,
+        pane_pid,
+        session_codex_home(&session.name),
+        global_codex_home()
     );
     assert_eq!(
         session_codex_home(&session.name).as_deref(),
@@ -279,8 +317,10 @@ async fn a_session_created_without_an_environment_is_unchanged() {
     let session = TestSession::create("bare", &cwd, &[]).await;
 
     test_tmux_output(&["has-session", "-t", &session.name]);
+    let (_, observed) =
+        pane_process_codex_home(session.first_window.as_str(), SERVER_CODEX_HOME).await;
     assert_eq!(
-        pane_process_codex_home(session.first_window.as_str()).as_deref(),
+        observed.as_deref(),
         Some(SERVER_CODEX_HOME),
         "no Codex home was requested, so the pane keeps resolving the tmux server's own \
          captured value rather than one invented for it"

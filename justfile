@@ -238,6 +238,25 @@ test-fast: rust-test
 rust-test-all:
     just rust-test true
 
+# Run the isolated tmux session-environment integration tests. `inside_nix` selects
+# the Nix development shell; `tmpdir` is applied after shell entry because Nix
+# normalizes TMPDIR while constructing the shell environment.
+tmux-session-environment-test inside_nix="true" tmpdir="/tmp":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{inside_nix}}" in
+        true)
+            nix develop --command env TMPDIR='{{tmpdir}}' cargo nextest run -p exomonad-core --test tmux_session_environment
+            ;;
+        false)
+            env TMPDIR='{{tmpdir}}' cargo nextest run -p exomonad-core --test tmux_session_environment
+            ;;
+        *)
+            echo "inside_nix must be true or false" >&2
+            exit 2
+            ;;
+    esac
+
 # Run every Rust test target through the dev shell
 test-cargo-all: rust-test-all
 
