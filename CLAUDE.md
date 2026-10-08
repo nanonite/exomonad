@@ -953,6 +953,12 @@ For a linked slice, the controller reads that exact issue before closing it,
 accepts an already-closed status with observation evidence, and reuses a
 confirmed close receipt on restart. Unavailable, timed-out, or rejected closes
 remain recoverable at the issue-close boundary without a fabricated receipt.
+The sub-TL that owns a slice's plan performs its mechanical close after merge
+adoption and parent-branch sync. The root only resumes the persisted plan order;
+it never substitutes its own issue ID or closes a child slice's issue. A child
+does not hand off until every merged PR in its scope has completed post-merge
+recovery. A slice without an explicit issue binding is a normal unlinked task
+and completes with a durable not-applicable outcome.
 
 Model calls are narrow structured judgments: `decompose`, `adjudicate_review`,
 `compose_repair` (post-merge integration repair only), and the `review_stuck`
@@ -962,6 +968,8 @@ state writer, not in a free-form prompt. The `roles.tl` judgment model resolves
 from `.exo/harness_policy.toml` and `.exo/model-catalog.json` at startup and is
 served by a tool-free harness subprocess backend (`claude`, `codex`, or
 `opencode`); see [tl_loop/CLAUDE.md](tl_loop/CLAUDE.md).
+The `review_stuck` judgment creates no Chainlink issue, does not reinterpret a
+slice binding as an epic, and never edits the live `plan.json`.
 
 ### Dispatch and convergence
 

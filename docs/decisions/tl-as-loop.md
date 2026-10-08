@@ -289,3 +289,20 @@ keeps model/provider calls outside the event log.
   the controller is the merge queue.
 - A future distributed deployment must reopen the inbox/broker decision and
   prove that its transport preserves the same durable semantics.
+
+### 2026-10-07 — Slice-scoped Chainlink ownership (#1165)
+
+`chainlink_issue_id` is optional metadata on one slice in the immutable recursive
+plan manifest. It is never inherited from a parent or sibling. The sub-TL that
+owns a scope performs issue closure mechanically, and only for the issue
+explicitly bound to that slice after merge adoption and parent-branch sync. The
+root controller orchestrates child handoff and persisted plan order; it never
+supplies its own issue ID or closes a child slice's issue.
+
+A slice without an issue binding is a first-class unlinked task for dynamic
+work. After parent-branch sync it records issue closure and changelog as not
+applicable, makes no Chainlink call, and remains eligible for normal completion.
+The parent accepts a child handoff only after every merged PR slice in that
+scope finishes durable post-merge recovery, then continues at the next persisted
+order. `review_stuck` is separate from issue lifecycle: it creates no Chainlink
+issue or epic and never edits the live `plan.json`.

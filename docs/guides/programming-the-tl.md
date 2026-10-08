@@ -386,6 +386,7 @@ The workhorse. One leaf owns one branch, one worktree, one PR.
 | `verify` | no | **Becomes the slice's `test_plan`** (falls back to `steps`) |
 | `done_criteria` | no | Becomes TL-owned reviewer acceptance criteria |
 | `context`, `read_first`, `steps` | no | Passed through to `spawn_leaf` as structured spec fields |
+| `chainlink_issue_id` | no | Binds this slice to one positive Chainlink issue ID |
 
 `boundary` and `verify` are doing double duty: they are both instructions to the
 leaf and the controller's own ownership and test-plan records. Two leaves whose
@@ -433,9 +434,39 @@ never mistake a request for the route that ran.
 { "name": "audit-deps", "task": "List every crate with a known advisory.", "agent_type": "codex" }
 ```
 
-Only `name`, `task`, and optional `agent_type`. Workers edit in place or
-research; they do not produce a PR. Use them for narrow work where a direct
-commit to the caller's worktree is acceptable.
+Workers accept `name`, `task`, optional `agent_type`, and optional
+`chainlink_issue_id`. Workers edit in place or research; they do not produce a
+PR. Use them for narrow work where a direct commit to the caller's worktree is
+acceptable.
+
+### `chainlink_issue_id` — bind one issue to one slice
+
+Add the positive integer `chainlink_issue_id` to the worker, leaf, or sub-TL
+entry that owns that issue:
+
+```json
+{
+  "leaves": [
+    {
+      "name": "token-refresh",
+      "task": "Implement token refresh.",
+      "chainlink_issue_id": 1169
+    }
+  ]
+}
+```
+
+The binding is optional and unique across the recursive plan. A sub-TL's ID
+binds to that sub-TL slice; it does not flow into leaves in its nested plan.
+Put an ID on a nested leaf when that leaf owns a separate issue. Omit the field
+for dynamic work that has no Chainlink task.
+
+The sub-TL that owns the slice closes its explicitly bound issue mechanically
+after merge adoption and parent-branch sync. The root only orchestrates child
+handoff and persisted plan order; it never substitutes a parent ID or closes a
+child issue. An unlinked slice completes normally with a durable
+not-applicable issue-integration outcome. The `review_stuck` judgment does not
+create issues or epics and never edits the live `plan.json`.
 
 ### `sub_tls` — recursion, and the only way to order work
 
@@ -459,9 +490,9 @@ serializes integration.
 ```
 
 Accepted keys: `name`, `plan` (or inline `workers`/`leaves`/`sub_tls`),
-`worktree`, `agent_id`, positive `order`, and optional `integration`. Missing
-`order` is backward-compatible shorthand for order 1; zero and negative values
-are invalid.
+`worktree`, `agent_id`, positive `order`, optional `integration`, and optional
+`chainlink_issue_id`. Missing `order` is backward-compatible shorthand for
+order 1; zero and negative values are invalid.
 
 A sub-TL has **no** `agent_type`. It is a nested controller process, not a
 model session, so a harness request on one was never a truthful field. Declare

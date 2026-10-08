@@ -141,7 +141,11 @@ local branch reachable and does not preserve remote history.
 ## Chainlink Coordination
 
 Issue shaping and observation are available to this role. Merge decisions and
-final close authority for controller-dispatched slices belong to `tl_loop`.
+slice issue closure for controller-dispatched work belong to `tl_loop`. The
+sub-TL that owns a slice closes only that slice's explicitly bound issue after
+merge adoption and parent-branch sync. The root only orchestrates child handoff
+and persisted plan order; it never supplies its own issue ID or closes a child
+slice issue. Unlinked slices are normal and do not require a Chainlink task.
 
 - Use `chainlink_issue_create` and `chainlink_subissue_create` to shape work before spawning.
 - Prefer dev leaves for work that needs PR review, CI, or non-trivial implementation.
@@ -149,9 +153,9 @@ final close authority for controller-dispatched slices belong to `tl_loop`.
 - Use `chainlink_timer_start` with the assigned issue id when assigning/spawning owned work.
 - Use `chainlink_timer_stop` with the same issue id after review, CI, and merge are complete. Timer stop is explicit per issue; do not infer a global active timer.
 - Use `chainlink_session_status` to observe whether child agents have started, attached to an issue, or ended with handoff notes.
-- Use `chainlink_issue_close` only for work you own directly, and only after merge, verification, and the implementing agent's session end are complete.
-- After closing a worker-owned Chainlink issue, stage and commit `CHANGELOG.md` in your worktree before spawning the next wave. Worker changes are already committed in-place; the issue close is what dirties the changelog.
-- Treat Chainlink `review-stuck` issues as human-clarification inputs. Do not automatically close, respawn, or replace the dev leaf that owns the PR worktree.
+- Do not close a slice issue from the root orchestration boundary. Bind the issue in that slice's `plan.json` entry and let its owning sub-TL close it after authoritative merge and parent-branch sync.
+- A `review_stuck` judgment does not create Chainlink issues or epics, reinterpret the slice's issue binding, or edit live `plan.json`.
+- Leave `chainlink_issue_id` off dynamic slices with no Chainlink task; their durable not-applicable outcome does not block parent handoff.
 
 The TL loop classifies raw timeout, stuck, and CI-blocked review observations as
 `dev_not_pushing`, `reviewer_not_responding`, `reviewer_never_started`, or

@@ -123,7 +123,7 @@ class IssueCreator(Protocol):
 class ParkResult:
     """The durable result of parking one slice and blocking its dependents."""
 
-    issue_id: int
+    issue_id: int | None
     parked_slice_id: str
     blocked_slice_ids: tuple[str, ...]
 
@@ -171,12 +171,13 @@ def park(
     issue_creator: IssueCreator | EffectClient | Callable[[str, str], int] | None = None,
     ledger: LedgerInput | None = None,
     audit: Mapping[str, object] | None = None,
+    create_issue: bool = True,
 ) -> SliceState | ParkResult:
     """Park a slice for a closed cause and block every pending dependent.
 
     Without a store this returns the pure parked state for classification tests.
-    With a store, issue creation and one state.write.apply call are required;
-    no dependent is spawned after the mutation.
+    With a store, one state.write.apply call is required. Issue creation may be
+    skipped when the controller persists its human question as a local gate.
     """
     parsed_cause = _cause(cause)
     parked_audit = _build_audit(slice, ledger, audit)
@@ -224,7 +225,7 @@ def park(
             if gate_created and isinstance(issue_creator, EffectClient):
                 _emit_gate_opened(issue_creator, store.run_id, gate_name, parsed_cause)
             return ParkResult(current_slice.park_issue_id, slice.id, ())
-    if issue_creator is None:
+    if create_issue and issue_creator is None:
         raise EscalationError("a needs-human issue creator is required for durable parking")
 
     # A legacy untagged issue (#816) is reused only through an operator-verified
@@ -257,16 +258,20 @@ def park(
                     f"slice_id={slice.id!r}, cause={parsed_cause!r}, attempt={attempt}, "
                     f"issue_id={recorded}, pr_number=..., head_sha=...)"
                 )
-    issue_id = _create_issue(
-        issue_creator,
-        slice,
-        parsed_cause,
-        parked_audit,
-        attempt=attempt,
-        pr_number=pr_number,
-        head_sha=bound_head,
-        store=store,
-        legacy_binding_id=legacy_binding_id,
+    issue_id = (
+        _create_issue(
+            issue_creator,
+            slice,
+            parsed_cause,
+            parked_audit,
+            attempt=attempt,
+            pr_number=pr_number,
+            head_sha=bound_head,
+            store=store,
+            legacy_binding_id=legacy_binding_id,
+        )
+        if create_issue
+        else None
     )
     blocked: list[str] = []
     blocked_statuses: dict[str, str] = {}

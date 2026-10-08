@@ -294,7 +294,11 @@ class _IssueTransport(ReviewRepairTransport):
 
 
 def _stuck_store(tmp_path: Path, **changes: object) -> RunStore:
-    store = _review_store(tmp_path)
+    issue_id = changes.get("chainlink_issue_id")
+    store = _review_store(
+        tmp_path,
+        chainlink_issue_id=issue_id if type(issue_id) is int else None,
+    )
     current = replace(
         store.load().slices["leaf-a"],
         verdict=Verdict.NO_GO,
@@ -401,6 +405,34 @@ def test_tl_escalate_opens_the_named_human_gate(tmp_path: Path) -> None:
     )
     assert "resume_pr" not in _effect_names(transport)
     assert [event["action"] for event in _judged_events(transport)] == ["escalate"]
+
+
+def test_review_stuck_keeps_slice_issue_binding_without_tracker_or_plan_effects(
+    tmp_path: Path,
+) -> None:
+    backend = ReviewBackend(
+        [RlmResponse({"action": "escalate", "reason": "the findings need human input"})]
+    )
+    transport = _IssueTransport()
+    store = _stuck_store(tmp_path / "run", chainlink_issue_id=1169)
+    project_root = tmp_path / "project"
+    plan_path = project_root / ".exo" / "tl-loop" / "plan.json"
+    plan_path.parent.mkdir(parents=True)
+    plan_bytes = b'{"plan":{"leaves":[{"name":"leaf-a","chainlink_issue_id":1169}]}}\n'
+    plan_path.write_bytes(plan_bytes)
+
+    result = _converge(
+        store,
+        replace(_stuck_config(backend), project_root=project_root),
+        transport,
+    )
+
+    assert result.slices["leaf-a"].chainlink_issue_id == 1169
+    assert plan_path.read_bytes() == plan_bytes
+    assert not any(name.startswith("chainlink_issue_") for name, _ in transport.calls), (
+        transport.calls
+    )
+    assert [request.name for request in backend.requests] == ["review_stuck"]
 
 
 def test_tl_intervention_ceiling_opens_the_gate_without_a_model_call(tmp_path: Path) -> None:
