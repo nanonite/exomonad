@@ -282,6 +282,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fix --worker flag ignored — spawn_worker falls back to hardcoded Codex (#36)
 
 ### Added
+- Operator per-slice task-budget reset for slices parked with task_budget_exceeded (#1166)
 - Improve Codex lifecycle isolation and complete plan-driven TL execution (#1121)
 - Add direct leaf dependency scheduling to plan manifests (#1130)
 - Add bounded plan authoring through typed TL decomposition (#1129)
