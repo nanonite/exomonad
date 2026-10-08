@@ -2433,7 +2433,7 @@ def _reopen_ordered_scope(
         complete = (
             _ordered_child_complete(task, current)
             if task is not None
-            else current.status is SliceStatus.MERGED
+            else _ordered_slice_complete(current)
         )
         if complete:
             completed[record.child_id] = record
@@ -4935,7 +4935,7 @@ def _advance_post_merge_boundary(
                 state, current, pr_number, evidence, config, effects, effects_log, store
             )
         if post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED:
-            issue_id = _required_issue_id(config.chainlink_issue_id)
+            issue_id = _post_merge_issue_id(config, current.id)
             intent_id = _post_merge_key(state, "issue_close", current.id, pr_number)
             return _checkpoint_post_merge_event(
                 store,
@@ -5075,6 +5075,17 @@ def _required_issue_id(issue_id: int | None) -> str:
     if type(issue_id) is not int or issue_id <= 0:
         raise ValueError("Chainlink issue ID is unavailable")
     return str(issue_id)
+
+
+def _post_merge_issue_id(config: TLLoopConfig, slice_id: str) -> str:
+    """Use the explicit issue ID or recover it from an issue-prefixed slice name."""
+    issue_id = config.chainlink_issue_id
+    if issue_id is None:
+        prefix, separator, suffix = slice_id.partition("-")
+        candidate = suffix.partition("-")[0]
+        if prefix == "issue" and separator and candidate.isascii() and candidate.isdecimal():
+            issue_id = int(candidate)
+    return _required_issue_id(issue_id)
 
 
 def _post_merge_key(

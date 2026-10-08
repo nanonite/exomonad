@@ -15,6 +15,7 @@ from tl_loop.loop.driver import (
     _advance_post_merge_boundary,
     _attach_forgejo_merge_evidence,
     _forgejo_merge_evidence,
+    _post_merge_issue_id,
     _reconcile_merged_slice,
     _refresh_post_merge_evidence,
     _remote_reconcile_effect,
@@ -77,6 +78,29 @@ def _squash_proof() -> dict[str, object]:
         "forgejo_merge_commit_tree_sha": "merged-tree",
         "forgejo_pr_number": 43,
     }
+
+
+def test_post_merge_issue_id_uses_issue_prefixed_slice_name() -> None:
+    assert (
+        _post_merge_issue_id(TLLoopConfig(), "issue-811-substitution-model-architecture")
+        == "811"
+    )
+
+
+def test_explicit_post_merge_issue_id_takes_precedence() -> None:
+    assert (
+        _post_merge_issue_id(
+            TLLoopConfig(chainlink_issue_id=812),
+            "issue-811-substitution-model-architecture",
+        )
+        == "812"
+    )
+
+
+@pytest.mark.parametrize("slice_id", ["slice-811", "issue-nope-task", "issue-0-task"])
+def test_post_merge_issue_id_rejects_unstructured_slice_names(slice_id: str) -> None:
+    with pytest.raises(ValueError, match="Chainlink issue ID is unavailable"):
+        _post_merge_issue_id(TLLoopConfig(), slice_id)
 
 
 def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) -> None:

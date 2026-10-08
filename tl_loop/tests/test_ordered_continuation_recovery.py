@@ -15,6 +15,7 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import TransportClient
 from tl_loop.events.envelope import EventEnvelope
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.scope import TLFailed, TLRunning
 from tl_loop.loop import driver
 from tl_loop.loop.driver import (
@@ -651,6 +652,59 @@ def test_continue_reopens_only_proven_failed_ordered_child(tmp_path: Path) -> No
     assert reopened.slices["child"].status is SliceStatus.SPAWNED
     assert reopened.slices["child"].dispatch_intent_id == "sub-tl-dispatch"
     assert reopened.integration.sub_tl_states["child"] is IntegrationLifecycle.RUNNING
+
+
+def test_recovery_keeps_merged_leaf_pending_until_post_merge_completes(
+    tmp_path: Path,
+) -> None:
+    parent_store, parent_plan, _ = _failed_ordered_run(
+        tmp_path,
+        child_status=SliceStatus.MERGED,
+    )
+    child_store = RunStore("child", parent_store.run_dir)
+    child_state = child_store.load()
+    leaf = replace(
+        child_state.slices["leaf"],
+        status=SliceStatus.MERGED,
+        pr_number=41,
+        post_merge=PostMergeState(
+            PostMergePhase.PARENT_BRANCH_SYNCED,
+            {
+                "child_id": "leaf",
+                "repository": "exomonad/beast-rs",
+                "parent_branch": "main.child",
+                "pr_number": "41",
+                "head_sha": "head-a",
+                "merge_journal_id": "merge-journal",
+                "lane_epoch": "1",
+                "parent_commit_sha": "parent-head",
+            },
+        ),
+    )
+    child_state = child_store.checkpoint(
+        child_state.recursive_fsm,
+        {"leaf": leaf},
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+        current_order=child_state.current_order,
+        integration=child_state.integration,
+    )
+
+    reopened = _reopen_ordered_scope(
+        child_state,
+        parent_plan.sub_tls[0].plan,
+        child_store,
+        None,
+    )
+
+    assert isinstance(reopened.recursive_fsm, TLRunning)
+    assert tuple(record.child_id for record in reopened.recursive_fsm.parallel_pending) == (
+        "leaf",
+    )
+    assert reopened.slices["leaf"].status is SliceStatus.MERGED
+    assert reopened.slices["leaf"].pr_number == 41
+    assert reopened.slices["leaf"].post_merge == leaf.post_merge
+    assert reopened.slices["leaf"].dispatch_intent_id == "leaf-dispatch"
 
 
 def test_continue_preserves_accepted_leaf_and_later_pr_evidence(tmp_path: Path) -> None:
