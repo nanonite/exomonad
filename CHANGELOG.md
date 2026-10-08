@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Support optional slice-scoped Chainlink issue integration (#1165)
 - Resume recursive child handoff only after post-merge recovery completes, then continue the persisted parent plan order (#1165)
 - Resume the Beast slice with the deterministic review repair (#1164)
 - Fix broken Failure Atlas links in the sync plan (#1163)
@@ -515,6 +516,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- 1165c: recursive handoff + Beast PR #45 regression + docs (#1169)
+- 1165b: post-merge issue close keyed by slice binding; durable not-applicable path for unlinked slices (#1168)
+- 1165a: optional slice-level Chainlink issue binding; remove run-scoped chainlink_issue_id and its inheritance (#1167)
 - Give the crash matrix a Forgejo per pass instead of one for all 28 cases (#1156)
 - Contract tests must create short socket roots inside their try/finally (#1143)
 - Tidy the #1137 follow-ups: dead assignment, private heartbeat imports, re-park docs (#1144)
