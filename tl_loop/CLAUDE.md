@@ -100,8 +100,10 @@ slice carries its exact manifest node ID and revision. A slice may also carry
 its own optional positive integer `chainlink_issue_id`; the binding is included
 in manifest identity and checkpoint state, so a revision cannot reassign an
 already dispatched issue. Older manifests and checkpoints without this field
-decode as unlinked. Recursive child runs receive no issue ID from their parent:
-each task must declare its own binding. Invalid or duplicate explicit bindings
+decode as unlinked. Issue identity comes only from this field; the controller
+does not infer IDs from run-level configuration or slice names. Recursive child
+runs receive no issue ID from their parent: each task must declare its own
+binding. Invalid or duplicate explicit bindings
 fail closed behind the `chainlink-issue-binding-reconciliation` gate. After
 parent-branch sync, an unlinked merged slice durably records issue closure and
 changelog as not applicable, makes no Chainlink call, and releases its lane.

@@ -944,8 +944,9 @@ ratings without widening an allowlist or ceiling.
 Each worker, leaf, or sub-TL may declare its own optional positive integer
 `chainlink_issue_id`. The binding belongs to that slice and is persisted in the
 recursive plan manifest and checkpoint; omitted IDs remain unlinked. The
-controller never infers an ID from a parent or sibling, and malformed or
-duplicate bindings stop plan admission with a reconciliation gate.
+controller never infers an ID from a parent, sibling, run-level configuration,
+or slice name; malformed or duplicate bindings stop plan admission with a
+reconciliation gate.
 After confirmed parent-branch sync, an unlinked merged slice records issue
 closure and changelog as not applicable, makes no Chainlink call, and releases
 its integration lane.

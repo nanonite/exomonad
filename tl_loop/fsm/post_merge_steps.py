@@ -337,21 +337,22 @@ def _parent_push_pending(state: PostMergeState, event: ParentPushPending) -> Pos
     _require_text(event.expected_base_sha, "parent push expected base SHA")
     _require_text(event.journal_id, "parent push journal ID")
     if state.phase is PostMergePhase.PARENT_PUSH_PENDING:
-        _require_same(
-            state, event, ("parent_push_intent_id", "push_journal_id", "expected_base_sha")
-        )
+        keys = ("parent_push_intent_id", "push_journal_id", "expected_base_sha")
+        if event.lane_epoch is not None:
+            keys = (*keys, "lane_epoch")
+        _require_same(state, event, keys)
         return state
     _require_phase(state, PostMergePhase.CHANGELOG_COMMITTED, "parent push pending")
     require_fresh_rebuild_push(state, event.intent_id, event.journal_id)
-    return _with_evidence(
-        state,
-        PostMergePhase.PARENT_PUSH_PENDING,
-        {
-            "parent_push_intent_id": event.intent_id,
-            "push_journal_id": event.journal_id,
-            "expected_base_sha": event.expected_base_sha,
-        },
-    )
+    additions = {
+        "parent_push_intent_id": event.intent_id,
+        "push_journal_id": event.journal_id,
+        "expected_base_sha": event.expected_base_sha,
+    }
+    if event.lane_epoch is not None:
+        _require_positive(event.lane_epoch, "parent push lane epoch")
+        additions["lane_epoch"] = str(event.lane_epoch)
+    return _with_evidence(state, PostMergePhase.PARENT_PUSH_PENDING, additions)
 
 
 def _with_evidence(

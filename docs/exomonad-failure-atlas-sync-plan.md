@@ -1085,11 +1085,10 @@ The plan is ready to implement when:
 
 - [`docs/exomonad-session-logging.md`](exomonad-session-logging.md) — current ExoMonad
   logging/event inventory.
-- [`Failure Atlas METHOD.md`](../../open-science/docs/experiments/failure-atlas/METHOD.md)
-  — local method reference when viewed from the workspace; the canonical source is
-  `/home/goya/agent-workspace/open-science/docs/experiments/failure-atlas/METHOD.md`.
-- [`Failure Atlas pipeline README`](../../open-science/docs/experiments/failure-atlas/pipeline/README.md)
-  — local SQLite/Python pipeline and privacy model.
+- [`Failure Atlas METHOD.md`](https://github.com/NimbleCoOrg/open-science/blob/36efd36d5e274f7f9fa471304d7a7219685bd3ec/docs/experiments/failure-atlas/METHOD.md)
+  — canonical method reference at the source revision used for this plan.
+- [`Failure Atlas pipeline README`](https://github.com/NimbleCoOrg/open-science/blob/36efd36d5e274f7f9fa471304d7a7219685bd3ec/docs/experiments/failure-atlas/pipeline/README.md)
+  — local SQLite/Python pipeline and privacy model at the same source revision.
 - [`rust/exomonad-core/src/services/event_log.rs`](../rust/exomonad-core/src/services/event_log.rs)
   — current EventLog envelope and append behavior.
 - [`rust/exomonad/src/serve.rs`](../rust/exomonad/src/serve.rs) — project run ID and

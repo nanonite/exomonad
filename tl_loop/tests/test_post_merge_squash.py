@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
 from tl_loop.client.effects import ToolResult
+from tl_loop.fsm.lane import LaneAbandoned, LanePhase, LaneReserved
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.loop.driver import (
     TLLoopConfig,
     _adopt_post_merge_slice,
@@ -18,12 +21,14 @@ from tl_loop.loop.driver import (
     _reconcile_merged_slice,
     _refresh_post_merge_evidence,
     _remote_reconcile_effect,
+    _run_issue_close,
     _validate_parent_sync_proof,
     _watcher_merge_evidence,
     _watcher_result_observation,
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observation import WatcherObservation
+from tl_loop.state.schema import SliceStatus
 from tl_loop.tests.test_startup_reconciliation import _load_state, _review_recovery_state
 
 
@@ -77,6 +82,146 @@ def _squash_proof() -> dict[str, object]:
         "forgejo_merge_commit_tree_sha": "merged-tree",
         "forgejo_pr_number": 43,
     }
+
+
+def test_issue_close_uses_explicit_slice_issue_id(tmp_path) -> None:
+    store, state = _load_state(tmp_path, chainlink_issue_id=811)
+    slice_id = "slice-a"
+    evidence = {
+        "child_id": slice_id,
+        "repository": "org/repo",
+        "parent_branch": "main",
+        "pr_number": "45",
+        "head_sha": "merged-head",
+        "merge_journal_id": "merge-journal",
+        "lane_epoch": "1",
+        "parent_commit_sha": "merge-commit",
+        "issue_id": "811",
+        "issue_close_intent_id": "close-intent",
+    }
+    current = replace(
+        state.slices[slice_id],
+        post_merge=PostMergeState(PostMergePhase.ISSUE_CLOSE_PENDING, evidence),
+    )
+    run_state = store.checkpoint(
+        state.fsm,
+        {**state.slices, slice_id: current},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    current = run_state.slices[slice_id]
+
+    class IssueCloseClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def chainlink_issue_show(self, *, issue_id: int) -> ToolResult:
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {"id": issue_id, "status": "open"},
+                }
+            )
+
+        def chainlink_issue_close(self, **arguments: object) -> ToolResult:
+            self.calls.append(arguments)
+            issue_id = arguments["issue_id"]
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {"issue_id": issue_id, "receipt_id": "close-receipt"},
+                }
+            )
+
+        def emit_controller_event(
+            self, *, event_type: str, payload: dict[str, object]
+        ) -> ToolResult:
+            return ToolResult.from_raw(
+                {"success": True, "result": {"event_type": event_type, "payload": payload}}
+            )
+
+    class MemoryStore:
+        def checkpoint(self, phase, slices, budgets, _offset, **kwargs):
+            return replace(
+                run_state,
+                fsm=phase,
+                slices=slices,
+                budgets=budgets,
+                integration=kwargs.get("integration", run_state.integration),
+            )
+
+    client = IssueCloseClient()
+    recovered = _run_issue_close(
+        run_state,
+        current,
+        evidence,
+        TLLoopConfig(active=True),
+        client,
+        [],
+        store,
+    )
+
+    assert client.calls[0]["issue_id"] == 811
+    assert recovered.slices[slice_id].post_merge.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED
+
+
+def test_parent_push_recovery_binds_new_lane_epoch(tmp_path) -> None:
+    store, state = _load_state(tmp_path)
+    evidence = {
+        "child_id": "slice-a",
+        "repository": "org/repo",
+        "parent_branch": "main",
+        "pr_number": "43",
+        "head_sha": "head-a",
+        "merge_journal_id": "merge-journal",
+        "lane_epoch": "1",
+        "parent_commit_sha": "merge-commit",
+        "issue_id": "811",
+        "issue_close_intent_id": "close-intent",
+        "issue_close_journal_id": "close-journal",
+        "changelog_intent_id": "changelog-intent",
+        "changelog_generation": "0",
+        "changelog_commit_sha": "changelog-commit",
+    }
+    current = replace(
+        state.slices["slice-a"],
+        status=SliceStatus.MERGED,
+        pr_number=43,
+        reconciliation={
+            "confirmed_stage": "merge",
+            "authoritative_evidence": [],
+            "missing_evidence": [],
+            "conflicts": [],
+            "next_action": "post_merge_recovery",
+            "remote_head_sha": "base-head",
+        },
+        post_merge=PostMergeState(PostMergePhase.CHANGELOG_COMMITTED, evidence),
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    state = store.transition_lane("org/repo", "main", LaneReserved("slice-a", 1, "base-head"))
+    state = store.transition_lane(
+        "org/repo", "main", LaneAbandoned("post_merge_gate", "previous retry")
+    )
+    state = store.transition_lane("org/repo", "main", LaneReserved("slice-a", 2, "base-head"))
+
+    advanced = _advance_post_merge_boundary(
+        state,
+        "slice-a",
+        43,
+        TLLoopConfig(active=False),
+        None,
+        [],
+        store,
+    )
+
+    assert advanced.slices["slice-a"].post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING
+    assert advanced.slices["slice-a"].post_merge.evidence["lane_epoch"] == "2"
+    assert advanced.integration.lanes["org/repo:main"].phase is LanePhase.BOOKKEEPING
 
 
 def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) -> None:

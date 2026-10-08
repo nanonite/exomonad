@@ -2538,7 +2538,7 @@ def _reopen_ordered_scope(
         complete = (
             _ordered_child_complete(task, current)
             if task is not None
-            else current.status is SliceStatus.MERGED
+            else _ordered_slice_complete(current)
         )
         if complete:
             completed[record.child_id] = record
@@ -5147,6 +5147,7 @@ def _advance_post_merge_boundary(
                 return state
             current = state.slices[slice_id]
             evidence = dict(current.post_merge.evidence) if current.post_merge else evidence
+            lane_epoch = _required_bookkeeping_lane_epoch(state, current)
             return _checkpoint_post_merge_event(
                 store,
                 state,
@@ -5156,6 +5157,7 @@ def _advance_post_merge_boundary(
                     intent_id,
                     _required_current_base(current),
                     journal_id,
+                    lane_epoch,
                 ),
                 lane_event=LaneBookkeepingStarted(
                     current.id,
@@ -11545,7 +11547,7 @@ def _ensure_bookkeeping_lane(
         )
         lane = state.integration.lanes[f"{repository}:{parent_branch}"]
     lane_epoch = _required_int(evidence, "lane_epoch", "lane epoch")
-    if lane.lane_epoch != lane_epoch:
+    if lane.lane_epoch is None or lane.lane_epoch < lane_epoch:
         return state, False
     if lane.phase is LanePhase.RESERVED:
         state, ready = _start_candidate_lane(
@@ -11572,6 +11574,21 @@ def _ensure_bookkeeping_lane(
     return state, state.integration.lanes[
         f"{repository}:{parent_branch}"
     ].phase is LanePhase.BOOKKEEPING
+
+
+def _required_bookkeeping_lane_epoch(state: RunState, current: SliceState) -> int:
+    """Return the epoch of the lane that owns this child's bookkeeping push."""
+    repository, parent_branch = _candidate_lane_key(state, current)
+    lane = state.integration.lanes.get(f"{repository}:{parent_branch}")
+    if (
+        lane is None
+        or lane.child_id != current.id
+        or lane.phase is not LanePhase.BOOKKEEPING
+        or type(lane.lane_epoch) is not int
+        or lane.lane_epoch <= 0
+    ):
+        raise ValueError("bookkeeping lane epoch is unavailable")
+    return lane.lane_epoch
 
 
 def _merge_result_is_authoritative(result: ToolResult | None) -> bool:

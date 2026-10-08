@@ -127,6 +127,7 @@ class ParentPushPending(TLOrchestrationEvent):
     intent_id: str
     expected_base_sha: str
     journal_id: str
+    lane_epoch: int | None = None
 
 
 @dataclass(frozen=True)
