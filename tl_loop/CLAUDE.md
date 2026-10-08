@@ -181,7 +181,8 @@ regressed exactly that invariant during development. Failure to resolve
 opens the named `tl-repository-identity` gate rather than raising or
 guessing an owner/repo; the blocked slice recovers through this same
 lazy path on a later call once the effect succeeds, with no second post-merge
-entry point.
+entry point. Persisting the resolved identity also clears that recovery gate so
+it cannot suppress the remaining post-merge boundaries.
 
 ## Direct-leaf/worker scope draining
 
@@ -716,6 +717,18 @@ same positive integer so one escalation reconciles against exactly one issue. A
 shape carrying two different positive ids raises `AmbiguousIssueId` instead of
 picking one, and `_issue_id` — the total reader used for stored records — treats
 the same shape as unprovable.
+
+## Operator task-budget reset
+
+`tl_loop.loop.task_budget.execute_task_budget_reset` applies an authenticated
+operator reset to one published slice parked with `task_budget_exceeded`. It
+compare-and-sets both the parent and child checkpoint revisions, the current
+attempt, timeout, and token reservation before changing the slice. The action
+journal returns the confirmed receipt on replay, and the manifest-based reopen
+preserves the existing scope and PR owner. A reset may adjust that slice's
+reservation and timeout; it does not edit the human-authored role or harness
+ceilings in `.exo/harness_policy.toml` or the project task timeout in
+`.exo/config.toml`.
 
 ## Learned dispatch policy
 

@@ -672,13 +672,9 @@ assertAcceptanceCriteriaContract = do
       resumeArgs =
         ResumePrArgs
           { rpaPrNumber = 104,
-            rpaTask = "Repair the reviewed PR",
-            rpaReadFirst = Nothing,
-            rpaSteps = Nothing,
-            rpaVerify = Nothing,
-            rpaBoundary = Nothing,
-            rpaContext = Nothing,
-            rpaDoneCriteria = Just ["Preserve this issue bullet verbatim"]
+            rpaExpectedHeadSha = "abc123",
+            rpaTask =
+              "Repair the reviewed PR\n\n## Acceptance Criteria\n- Preserve this issue bullet verbatim"
           }
       renderedResume = renderResumePrTask resumeArgs
       renderedReviewHandoff =
@@ -697,10 +693,9 @@ assertAcceptanceCriteriaContract = do
   assertContains "file_pr schema heading" heading filePrSchemaText
   assertContains "file_pr schema Definition of Done" "Definition-of-Done" filePrSchemaText
   assertContains "resume_pr description heading" heading resumePrDescription
-  assertContains "resume_pr description done criteria" "done_criteria" resumePrDescription
-  assertContains "resume_pr description preserve" "do not silently drop" resumePrDescription
-  assertContains "resume_pr schema heading" heading resumePrSchemaText
-  assertContains "resume_pr schema verbatim" "copy them verbatim" resumePrSchemaText
+  assertContains "resume_pr description complete handoff" "done criteria in task" resumePrDescription
+  assertContains "resume_pr description preserve" "preserve or update the PR body" resumePrDescription
+  assertContains "resume_pr schema exact head" "expected_head_sha" resumePrSchemaText
   assertContains "resume task heading" heading renderedResume
   assertContains "resume task done criteria" "Preserve this issue bullet verbatim" renderedResume
   assertContains "review handoff heading" heading reviewHandoffInstructions

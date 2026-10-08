@@ -4,7 +4,6 @@ module ExoMonad.Guest.Tools.ResumePrTest (resumePrTests) where
 
 import Data.Aeson (Value (Object), decode)
 import Data.Aeson.KeyMap qualified as KeyMap
-import Data.Text qualified as T
 import ExoMonad.Guest.Tool.Class (MCPTool (toolName))
 import ExoMonad.Guest.Tools.ResumePr
 import Test.Tasty (TestTree, testGroup)
@@ -18,49 +17,28 @@ resumePrTests =
         let args =
               ResumePrArgs
                 { rpaPrNumber = 104,
-                  rpaTask = "Address the requested review changes and update the existing PR",
-                  rpaReadFirst = Nothing,
-                  rpaSteps = Nothing,
-                  rpaVerify = Nothing,
-                  rpaBoundary = Nothing,
-                  rpaContext = Nothing,
-                  rpaDoneCriteria = Nothing,
-                  rpaModel = Nothing
+                  rpaExpectedHeadSha = "abc123",
+                  rpaTask = "Complete repair handoff for the existing PR"
                 }
-        (decode "{\"pr_number\":104,\"task\":\"Address the requested review changes and update the existing PR\"}" :: Maybe ResumePrArgs)
+        (decode "{\"pr_number\":104,\"expected_head_sha\":\"abc123\",\"task\":\"Complete repair handoff for the existing PR\"}" :: Maybe ResumePrArgs)
           @=? Just args,
-      testCase "schema exposes the PR task and handoff fields" $ do
+      testCase "schema exposes only host-approved resume fields" $ do
         let properties = case KeyMap.lookup "properties" resumePrSchema of
               Just (Object value) -> value
               _ -> mempty
         KeyMap.member "pr_number" properties @?= True
+        KeyMap.member "expected_head_sha" properties @?= True
         KeyMap.member "task" properties @?= True
-        KeyMap.member "branch_name" properties @?= False
-        KeyMap.member "agent_type" properties @?= False
         mapM_
-          (\field -> KeyMap.member field properties @?= True)
-          ["read_first", "steps", "verify", "boundary", "context", "done_criteria", "model"],
-      testCase "structured handoff fields render into the resumed task" $
-        do
-          let args =
-                ResumePrArgs
-                  { rpaPrNumber = 104,
-                    rpaTask = "Repair the reviewed PR",
-                    rpaReadFirst = Just ["src/lib.rs"],
-                    rpaSteps = Just ["Fix the root cause"],
-                    rpaVerify = Just ["cargo test"],
-                    rpaBoundary = Just ["Do not create a sibling branch"],
-                    rpaContext = Just "ROOT CAUSE: stale state",
-                    rpaDoneCriteria = Just ["Push the fix and report results"],
-                    rpaModel = Nothing
-                  }
-              rendered = renderResumePrTask args
-          if all
-            (\needle -> needle `T.isInfixOf` rendered)
-            ["## READ FIRST", "ROOT CAUSE: stale state", "cargo test"]
-            then pure ()
-            else fail "structured handoff rendering changed",
-      testCase
-        "tool name is resume_pr"
-        $ toolName @ResumePr @=? "resume_pr"
+          (\field -> KeyMap.member field properties @?= False)
+          ["read_first", "steps", "verify", "boundary", "context", "done_criteria", "model", "agent_type", "branch_name"],
+      testCase "complete handoff remains the exact resumed task" $
+        let args =
+              ResumePrArgs
+                { rpaPrNumber = 104,
+                  rpaExpectedHeadSha = "abc123",
+                  rpaTask = "ROOT CAUSE: stale state; VERIFY: cargo test; BOUNDARY: existing branch only"
+                }
+         in renderResumePrTask args @=? rpaTask args,
+      testCase "tool name is resume_pr" $ toolName @ResumePr @=? "resume_pr"
     ]

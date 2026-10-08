@@ -33,6 +33,7 @@ from tl_loop.state.slice_transition import (
 )
 
 REPEATED_ACTION_GATE_PREFIX = "tl-repeated-action-"
+REPOSITORY_IDENTITY_GATE_NAME = "tl-repository-identity"
 
 
 @dataclass(frozen=True)
@@ -399,6 +400,16 @@ def derive_next_action(
     independent of event arrival order.
     """
     if isinstance(persisted_state, RunState):
+        identity_gate = next(
+            (
+                gate
+                for gate in persisted_state.gates
+                if gate.name == REPOSITORY_IDENTITY_GATE_NAME
+            ),
+            None,
+        )
+        if identity_gate is not None and identity_gate.status is not GateStatus.APPROVED:
+            return Quiescent("await_repository_identity_gate")
         return _apply_repeated_action_gate(
             persisted_state,
             _derive_run_action(

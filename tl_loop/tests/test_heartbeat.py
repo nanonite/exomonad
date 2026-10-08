@@ -923,6 +923,13 @@ def test_task_budget_exceeded_is_journaled_killed_and_parked(tmp_path: Path) -> 
         state.budgets,
         state.events.last_consumed_offset,
     )
+    invocation_dir = tmp_path / ".exo" / "agents" / "agent-slice-a"
+    invocation_dir.mkdir(parents=True)
+    invocation_path = invocation_dir / "invocation.json"
+    invocation_path.write_text(
+        json.dumps({"slice_id": "slice-a", "status": "running"}),
+        encoding="utf-8",
+    )
     transport = HeartbeatTransport()
 
     result = heartbeat_once(
@@ -930,10 +937,13 @@ def test_task_budget_exceeded_is_journaled_killed_and_parked(tmp_path: Path) -> 
         store,
         EffectClient(transport),
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
-        now=10.0,
+        now=10.25,
         project_root=tmp_path,
     )
 
+    invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+    assert type(invocation["ended_at"]) is int
+    assert invocation["ended_at"] == 10
     parked = result.state.slices["slice-a"]
     assert parked.status is SliceStatus.PARKED
     assert parked.park_cause is ParkCause.TASK_BUDGET_EXCEEDED

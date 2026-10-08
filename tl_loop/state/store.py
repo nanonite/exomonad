@@ -187,6 +187,10 @@ class CorruptCheckpoint(ValueError):
     park_cause = ParkCause.CORRUPT_STATE
 
 
+class CheckpointConflict(RuntimeError):
+    """An optimistic checkpoint write observed a newer run revision."""
+
+
 class WorktreeClaimError(RuntimeError):
     """A live run already owns the requested worktree."""
 
@@ -250,6 +254,7 @@ class RunStore:
         integration: IntegrationInput | None = None,
         state_version: int | None = None,
         plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
     ) -> RunState:
         """Persist one checkpoint through the shared atomic mutation path."""
         return checkpoint(
@@ -263,6 +268,7 @@ class RunStore:
             integration=integration,
             state_version=state_version,
             plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
         )
 
     def set_plan_manifest(
@@ -925,6 +931,7 @@ def checkpoint(
     integration: IntegrationInput | None = None,
     state_version: int | None = None,
     plan_manifest: PlanManifest | None = None,
+    expected_revision: int | None = None,
 ) -> RunState:
     """Atomically update a run's FSM, slices, budget ledger, and event offset."""
     run_directory = _resolve_run_directory(run_id, path, root_dir)
@@ -936,6 +943,8 @@ def checkpoint(
     encoded_stages = _encode_ordered_stages(ordered_stages) if ordered_stages is not None else None
     encoded_integration = _encode_integration(integration) if integration is not None else None
     encoded_manifest = plan_manifest.to_document() if plan_manifest is not None else None
+    if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+        raise ValueError("expected_revision must be a non-negative integer")
     if current_order is not None and (type(current_order) is not int or current_order <= 0):
         raise ValueError("current_order must be a positive integer")
     if state_version is not None and (type(state_version) is not int or state_version < 0):
@@ -943,6 +952,13 @@ def checkpoint(
     _assert_encoded_consistent(run_directory / "run.json", encoded_fsm, encoded_slices)
 
     def mutate(document: dict[str, object]) -> dict[str, object]:
+        if expected_revision is not None:
+            current_revision = document.get("revision")
+            if type(current_revision) is not int or current_revision != expected_revision:
+                raise CheckpointConflict(
+                    f"checkpoint revision changed: expected {expected_revision}, "
+                    f"found {current_revision!r}"
+                )
         existing_fsm = document.get("fsm")
         legacy_terminal = isinstance(fsm, (TLDone, TLPRFiled, TLFailed))
         if (
@@ -1499,6 +1515,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["task_timeout_seconds"] = value.task_timeout_seconds
         if value.task_timeout_source is not None:
             record["task_timeout_source"] = value.task_timeout_source
+        if value.task_budget_reset_key is not None:
+            record["task_budget_reset_key"] = value.task_budget_reset_key
         if value.recovery is not None:
             record["recovery"] = encode_recovery(value.recovery)
         if value.suspended_dependency is not None:
@@ -2548,6 +2566,7 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         ),
         task_timeout_seconds=cast(float | None, value.get("task_timeout_seconds")),
         task_timeout_source=cast(str | None, value.get("task_timeout_source")),
+        task_budget_reset_key=cast(str | None, value.get("task_budget_reset_key")),
         recovery=decode_recovery(value.get("recovery")),
         suspended_dependency=_decode_suspended_dependency(value.get("suspended_dependency")),
         deadline_ledger=_decode_deadline_ledger(value.get("deadline_ledger")),

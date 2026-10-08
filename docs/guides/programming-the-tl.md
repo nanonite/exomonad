@@ -1279,7 +1279,7 @@ the only operator mutation; do not manually mark a stage merged.
 | `review_stuck` | The `roles.tl` review-stuck judgment failed (backend error, unusable guide, exhausted budget) or a repair dispatch failed | Read the PR and the slice's `dispatch_error`; fix `roles.tl` or the plan and resume |
 | `harness_switch_requested` | The configured harness could not proceed | Approve explicitly; set `EXOMONAD_ALLOW_HARNESS_SWITCH=1` |
 | `stall_detected` | Dead pane or no progress past the heartbeat threshold | Investigate the worker |
-| `task_budget_exceeded` | A declared slice execution ceiling elapsed | Inspect the deadline ledger and adjust the task budget or plan |
+| `task_budget_exceeded` | A declared wall-clock slice ceiling elapsed | Use the authenticated per-slice reset only after inspecting the parked task; it restarts that task clock and adjusts its token reservation without changing global ceilings |
 
 The controller does not retry past a ceiling, coax a model into continuing, or
 pick a different harness on its own. Every one of these becomes a durable,
@@ -1313,6 +1313,14 @@ for why the boundary sits here.
 | `GET` | `/control/runs/{run_id}/transitions` | Recent FSM transitions |
 | `POST` | `/control/runs/{run_id}/gates/{gate_name}` | Answer an **existing** named gate |
 | `POST` | `/control/runs/{run_id}/plan/proposals` | Propose a plan mutation — inert until confirmed |
+| `POST` | `/control/runs/{run_id}/children/{child_run_id}/slices/{slice_id}/task-budget` | Reset one nested slice with an existing PR parked for `task_budget_exceeded`; compare-and-set both run revisions and record the operator calibration event |
+
+The reset body carries `expected_parent_revision`, `expected_child_revision`,
+`expected_attempt`, and `expected_charge_attempt` from the latest read model. It
+also carries the current and selected task timeout, token estimate, a
+`task_type` label, an `operator_reason`, an `idempotency_key`, and optional
+`observed_tokens`. Equal timeout or token values are valid: resetting a stale
+clock does not imply the task consumed more tokens.
 
 ### A gate name is one percent-encoded path segment
 
@@ -1359,11 +1367,15 @@ carrying the control header is refused on `/agents`. Presenting both is refused
 everywhere. Co-location grants nothing — a process on the same host still needs
 the right credential.
 
-**The console can do exactly three things:** read projections, answer a gate
-that already exists, and propose a plan mutation that stays inert until
-confirmed. It cannot merge a PR, approve a review, set a verdict, alter the FSM
-phase, widen `harness_policy.toml`, or raise a budget ceiling. Those stay with
-the controller.
+**The console can read projections, answer an existing named gate, propose an
+inert plan mutation, and reset the budget of one parked slice. A reset requires
+expected parent and child revisions, the current attempt and budgets, a task
+class, an operator reason, and an idempotency key. It updates only that slice’s
+wall-clock limit and token reservation, canonically reopens its existing scope,
+and writes `operator.task_budget_reset` to the event ledger. The reset itself creates no PR. If the durable review already requires repair, the controller can resume the same PR owner; the reset key gives that authorized retry a distinct action-journal identity. The optional
+`observed_tokens` value is recorded separately from the new estimate. The
+endpoint cannot raise a global budget ceiling, merge a PR, approve a review, set
+a verdict, or widen `harness_policy.toml`.
 
 A plan proposal is validated by the same closed-key `WorkPlan` validator that
 `plan.json` uses, so a malformed proposal is rejected at the boundary rather

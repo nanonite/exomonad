@@ -358,7 +358,7 @@ pub enum AgentType {
     /// Custom binary agent (e.g., shoal-agent).
     Shoal,
 
-    /// OpenCode CLI (spawns with `opencode run "..."`).
+    /// OpenCode CLI (spawns with `opencode run --standalone "..."`).
     OpenCode,
 
     /// OpenAI Codex CLI.

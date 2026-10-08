@@ -686,18 +686,28 @@ pub async fn adopt_publication_for_invocation(
             || head.head_branch != head_branch
             || head.base_branch != base_branch
             || head.slice_id.as_deref() != Some(slice_id)
-            || head.invocation_id.as_deref() != Some(from_invocation_id)
+        {
+            continue;
+        }
+        let Some(original_invocation_id) = head.invocation_id.as_deref() else {
+            continue;
+        };
+        // Resumes can themselves be resumed. Accept only a previous invocation
+        // already reachable from the original publisher, then keep the registry's
+        // succession table as a fan-out from that stable provenance root.
+        if !invocation_succession_reaches_current(head, from_invocation_id)
+            || invocation_succession_reaches_current(head, to_invocation_id)
         {
             continue;
         }
         if head.invocation_succession.iter().any(|succession| {
-            succession.from_invocation_id == from_invocation_id
+            succession.from_invocation_id == original_invocation_id
                 && succession.to_invocation_id == to_invocation_id
         }) {
             continue;
         }
         let succession = InvocationSuccession {
-            from_invocation_id: from_invocation_id.to_string(),
+            from_invocation_id: original_invocation_id.to_string(),
             to_invocation_id: to_invocation_id.to_string(),
             reason: SuccessionReason::SessionRecreate,
             recorded_at,
@@ -1327,6 +1337,72 @@ mod tests {
                 .invocation_succession
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_adoption_continues_from_a_reachable_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut publication = publication("sha-1");
+        publication.provenance = PublicationProvenance::LedgerOwned;
+        publication.slice_id = Some("slice-a".to_string());
+        publish_verified_head(directory.path(), publication)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            adopt_publication_for_invocation(
+                directory.path(),
+                "feature-codex",
+                "main.feature-codex",
+                "main",
+                "slice-a",
+                "invocation-1",
+                "invocation-2",
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+        let adoptions = adopt_publication_for_invocation(
+            directory.path(),
+            "feature-codex",
+            "main.feature-codex",
+            "main",
+            "slice-a",
+            "invocation-2",
+            "invocation-3",
+        )
+        .await
+        .unwrap();
+        assert_eq!(adoptions.len(), 1);
+        assert_eq!(adoptions[0].succession.from_invocation_id, "invocation-1");
+        let heads = read_published_heads(directory.path()).await.unwrap();
+        assert_eq!(heads[0].invocation_id.as_deref(), Some("invocation-1"));
+        assert_eq!(heads[0].invocation_succession.len(), 2);
+        assert!(invocation_succession_reaches_current(
+            &heads[0],
+            "invocation-3"
+        ));
+
+        assert!(adopt_publication_for_invocation(
+            directory.path(),
+            "feature-codex",
+            "main.feature-codex",
+            "main",
+            "slice-a",
+            "invocation-2",
+            "invocation-3",
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            read_published_heads(directory.path()).await.unwrap()[0]
+                .invocation_succession
+                .len(),
+            2
         );
     }
 

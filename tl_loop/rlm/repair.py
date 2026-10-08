@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 from collections.abc import Callable, Mapping, Sequence
 from typing import cast
 
@@ -72,7 +71,6 @@ def compose_repair(
     model_choice: object | None = None,
     store: RunStore | None = None,
     slice_id: str | None = None,
-    model: str | None = None,
     dispatch: Callable[[JsonObject], object] | None = None,
 ) -> RepairHandoff:
     """Compose, validate, dispatch, and account for one existing-PR repair."""
@@ -102,7 +100,13 @@ def compose_repair(
             if attempt == attempts:
                 raise RepairHandoffRejected(attempts, feedback) from error
             continue
-        dispatch_resume(selected_client, number, handoff, model, dispatch=dispatch)
+        dispatch_resume(
+            selected_client,
+            number,
+            cast(str, watcher["head_sha"]),
+            handoff,
+            dispatch=dispatch,
+        )
         increment_attempts(pr, number, store, slice_id)
         return handoff
 
@@ -118,7 +122,6 @@ def forward_review_findings(
     test_plan: Sequence[str],
     store: RunStore | None = None,
     slice_id: str | None = None,
-    model: str | None = None,
     dispatch: Callable[[JsonObject], object] | None = None,
 ) -> RepairHandoff:
     """Forward a NO-GO's findings verbatim to the existing PR owner, with no model.
@@ -128,10 +131,12 @@ def forward_review_findings(
     plan supply the remaining sections, and ``resume_pr`` resumes the same owner.
     """
     number, paths = pr_identity(pr)
-    watch_existing_pr(client, number)
+    watcher = watch_existing_pr(client, number)
     reasons = review_inputs(verdict, review)
     handoff = findings_handoff(reasons, paths, test_plan)
-    dispatch_resume(client, number, handoff, model, dispatch=dispatch)
+    dispatch_resume(
+        client, number, cast(str, watcher["head_sha"]), handoff, dispatch=dispatch
+    )
     increment_attempts(pr, number, store, slice_id)
     return handoff
 
@@ -143,14 +148,15 @@ def dispatch_guide_handoff(
     client: EffectClient | object,
     store: RunStore | None = None,
     slice_id: str | None = None,
-    model: str | None = None,
     dispatch: Callable[[JsonObject], object] | None = None,
 ) -> RepairHandoff:
     """Dispatch a TL-authored handoff to the existing PR owner after boundary validation."""
     number, paths = pr_identity(pr)
-    watch_existing_pr(client, number)
+    watcher = watch_existing_pr(client, number)
     validate_owned_paths(handoff, paths)
-    dispatch_resume(client, number, handoff, model, dispatch=dispatch)
+    dispatch_resume(
+        client, number, cast(str, watcher["head_sha"]), handoff, dispatch=dispatch
+    )
     increment_attempts(pr, number, store, slice_id)
     return handoff
 
@@ -244,41 +250,22 @@ def _repair_inputs(
 def dispatch_resume(
     client: object,
     number: int,
+    expected_head_sha: str,
     handoff: RepairHandoff,
-    model: str | None,
     *,
     dispatch: Callable[[JsonObject], object] | None = None,
 ) -> None:
+    """Resume the existing owner using only the host-approved arguments."""
     resume = getattr(client, "resume_pr", None)
     if not callable(resume):
         raise RepairInputError("client has no resume_pr capability")
     kwargs: JsonObject = {
         "pr_number": number,
-        "task": handoff.proposed_solution,
-        "context": (
-            f"ROOT CAUSE: {handoff.root_cause}\n"
-            f"PROPOSED SOLUTION: {handoff.proposed_solution}"
-        ),
-        "read_first": list(handoff.read_first),
-        "steps": list(handoff.steps),
-        "verify": list(handoff.verify),
-        "boundary": list(handoff.boundary),
-        "done_criteria": list(handoff.done_criteria),
+        "expected_head_sha": expected_head_sha,
+        "task": _resume_task(handoff),
     }
-    if model is not None:
-        kwargs["model"] = model
     if dispatch is not None:
         outcome = dispatch(kwargs)
-        if isinstance(outcome, ToolResult) and outcome.success is False:
-            raise RepairDispatchError(outcome.error or "resume_pr failed")
-        if isinstance(outcome, Mapping) and outcome.get("success") is False:
-            raise RepairDispatchError(
-                cast(str, outcome.get("error") or "resume_pr failed")
-            )
-        return
-    parameters = inspect.signature(resume).parameters
-    if "handoff" in parameters and "task" not in parameters:
-        outcome = resume(number, handoff.to_mapping())
     else:
         outcome = resume(**kwargs)
     if isinstance(outcome, ToolResult) and outcome.success is False:
@@ -287,6 +274,25 @@ def dispatch_resume(
         raise RepairDispatchError(
             cast(str, outcome.get("error") or "resume_pr failed")
         )
+
+
+def _resume_task(handoff: RepairHandoff) -> str:
+    """Carry the complete validated handoff in the host's single task field."""
+    sections = (
+        ("ROOT CAUSE", (handoff.root_cause,)),
+        ("PROPOSED SOLUTION", (handoff.proposed_solution,)),
+        ("READ FIRST", handoff.read_first),
+        ("STEPS", handoff.steps),
+        ("VERIFY", handoff.verify),
+        ("BOUNDARY", handoff.boundary),
+        ("DONE CRITERIA", handoff.done_criteria),
+    )
+    rendered = ["Continue the existing PR owner on its current branch. Do not create another leaf or PR."]
+    rendered.extend(
+        f"{heading}:\n" + "\n".join(f"- {item}" for item in items)
+        for heading, items in sections
+    )
+    return "\n\n".join(rendered)
 
 
 __all__ = [

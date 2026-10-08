@@ -93,6 +93,13 @@ class PublicationObserved(TLEvent):
 
 
 @dataclass(frozen=True)
+class InboxNotificationObserved(TLEvent):
+    """Telemetry-only inbox delivery row; it does not alter TL orchestration state."""
+
+    event_type: str
+
+
+@dataclass(frozen=True)
 class AllChildrenDone(TLEvent):
     """All children have completed their lifecycle."""
 

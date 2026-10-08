@@ -36,6 +36,7 @@ class FakeBackend:
 class FakeClient:
     open_pr: bool = True
     merged: bool = False
+    state_field: str = "pr_state"
     calls: list[tuple[str, object]] = field(default_factory=list)
 
     def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
@@ -44,7 +45,7 @@ class FakeClient:
             raw={"success": True},
             success=True,
             result={
-                "state": "open" if self.open_pr else "closed",
+                self.state_field: "open" if self.open_pr else "closed",
                 "merged": self.merged,
                 "head_branch": "task/owned",
                 "head_sha": "head-a",
@@ -123,12 +124,32 @@ def test_valid_repair_round_trips_through_resume_pr() -> None:
     assert [name for name, _ in client.calls] == ["watcher_pr_state", "resume_pr"]
     resume_arguments = client.calls[1][1]
     assert isinstance(resume_arguments, dict)
-    assert resume_arguments["pr_number"] == 42
-    assert "name" not in resume_arguments
-    assert "branch" not in resume_arguments
-    assert "agent_type" not in resume_arguments
-    assert "model" not in resume_arguments
+    assert resume_arguments == {
+        "pr_number": 42,
+        "expected_head_sha": "head-a",
+        "task": resume_arguments["task"],
+    }
+    task = str(resume_arguments["task"])
+    assert all(
+        section in task
+        for section in ("ROOT CAUSE", "PROPOSED SOLUTION", "READ FIRST", "STEPS", "VERIFY", "BOUNDARY", "DONE CRITERIA")
+    )
+    assert "src/owned.py" in task and "just tl-loop-test" in task
     assert pr["attempts"] == 1
+
+
+def test_repair_accepts_legacy_watcher_state_field() -> None:
+    backend = FakeBackend([RlmResponse(_handoff())])
+    client = FakeClient(state_field="state")
+
+    compose_repair(
+        _pr(client),
+        Verdict.NO_GO,
+        _review(),
+        model_choice=_choice(backend),
+    )
+
+    assert [name for name, _ in client.calls] == ["watcher_pr_state", "resume_pr"]
 
 
 def test_repair_uses_supplied_dispatch_boundary() -> None:
@@ -151,23 +172,6 @@ def test_repair_uses_supplied_dispatch_boundary() -> None:
     assert len(dispatched) == 1
     assert dispatched[0]["pr_number"] == 42
     assert [name for name, _ in client.calls] == ["watcher_pr_state"]
-
-
-def test_repair_model_override_reaches_resume_pr() -> None:
-    backend = FakeBackend([RlmResponse(_handoff())])
-    client = FakeClient()
-    pr = _pr(client)
-
-    compose_repair(
-        pr,
-        Verdict.NO_GO,
-        _review(),
-        model_choice=_choice(backend),
-        model="gpt-5.5",
-    )
-
-    resume_arguments = client.calls[1][1]
-    assert resume_arguments["model"] == "gpt-5.5"
 
 
 def test_out_of_boundary_handoff_is_rejected_and_retried() -> None:

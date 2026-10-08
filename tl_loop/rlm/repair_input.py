@@ -57,7 +57,10 @@ def watch_existing_pr(client: object, number: int) -> JsonObject:
     result = watcher(pr_number=number)
     payload = _watcher_payload(result)
     open_value = payload.get("open")
-    is_open = open_value if isinstance(open_value, bool) else payload.get("state") == "open"
+    state = payload.get("pr_state")
+    if not isinstance(state, str):
+        state = payload.get("state")
+    is_open = open_value if isinstance(open_value, bool) else state == "open"
     if not is_open:
         raise RepairPRStateError(f"PR #{number} is not open")
     if payload.get("merged") is not False:

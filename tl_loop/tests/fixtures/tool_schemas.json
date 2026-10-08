@@ -34,7 +34,7 @@
             "type": "string"
           },
           "name": {
-            "description": "Branch name suffix (e.g., 'fix-clippy' → 'main.fix-clippy')",
+            "description": "Branch name suffix (e.g., 'fix-clippy' \u2192 'main.fix-clippy')",
             "type": "string"
           },
           "read_first": {
@@ -72,7 +72,7 @@
       "name": "spawn_leaf"
     },
     {
-      "description": "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch — no isolation, no PR, so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Workers are sequential per TL tab; wait for the active worker handoff before spawning another worker, or use spawn_leaf for parallel PR work. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF — worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately.",
+      "description": "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \u2014 no isolation, no PR, so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Workers are sequential per TL tab; wait for the active worker handoff before spawning another worker, or use spawn_leaf for parallel PR work. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \u2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately.",
       "inputSchema": {
         "properties": {
           "agent_type": {
@@ -248,59 +248,25 @@
       "name": "replace_close_pr"
     },
     {
-      "description": "Resume an existing open, unmerged PR by number. The host re-fetches its head SHA, resolves the exact owning agent, branch, and runtime, starts a fresh invocation, and verifies its exact tmux target is ready before reporting success. An already-running owner is an explicit failure, not a fresh resume. Provide the task summary plus optional read_first, steps, verify, boundary, context, and done_criteria fields for a complete review-fix handoff. On the resumed owner's next `file_pr` call, preserve or update the PR body with the literal heading `## Acceptance Criteria` and copy every issue Definition-of-Done bullet verbatim beneath it; use done_criteria as the handoff source and do not silently drop or paraphrase the heading. Never provide a leaf name or agent type. For closed or unrecoverable PRs, use the human-approved replace_close_pr workflow.",
+      "description": "Resume an existing open, unmerged PR using its number, the exact expected head SHA, and a complete task handoff. The host re-fetches the PR, verifies that head SHA, resolves the exact owning agent and branch, and starts a fresh invocation.",
       "inputSchema": {
         "properties": {
-          "boundary": {
-            "description": "Constraints and anti-patterns for the repair",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "context": {
-            "description": "Reviewer analysis, root cause, proposed solution, and relevant snippets",
-            "type": "string"
-          },
-          "done_criteria": {
-            "description": "Issue Definition-of-Done bullets for the repair; the resumed owner must copy them verbatim beneath the literal `## Acceptance Criteria` heading in the next file_pr body",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
           "pr_number": {
             "description": "Existing open, unmerged PR number to resume",
             "type": "integer"
           },
-          "read_first": {
-            "description": "Exact files or documents the leaf must read before editing",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "steps": {
-            "description": "Concrete implementation steps for the repair",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "task": {
-            "description": "Task summary for the owning agent to continue on the existing PR",
+          "expected_head_sha": {
+            "description": "Exact PR head SHA observed by the caller; the host rechecks it before resuming",
             "type": "string"
           },
-          "verify": {
-            "description": "Exact commands the leaf must run before reporting completion",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
+          "task": {
+            "description": "Complete repair handoff for the owning agent on the existing PR",
+            "type": "string"
           }
         },
         "required": [
           "pr_number",
+          "expected_head_sha",
           "task"
         ],
         "type": "object"
@@ -351,14 +317,38 @@
       "description": "Synchronize a merged child into its parent branch and return Git-verified remote-head and ancestry evidence.",
       "inputSchema": {
         "properties": {
-          "child_id": { "description": "Stable child slice identifier.", "type": "string" },
-          "pr_number": { "description": "Merged Forgejo pull request number.", "type": "integer" },
-          "repository": { "description": "Authoritative repository identity.", "type": "string" },
-          "parent_branch": { "description": "Direct parent integration branch.", "type": "string" },
-          "merged_head_sha": { "description": "Exact merged child head SHA.", "type": "string" },
-          "expected_base_sha": { "description": "Base SHA captured by the merge boundary.", "type": "string" },
-          "lane_epoch": { "description": "Durable integration-lane epoch.", "type": "integer" },
-          "working_dir": { "description": "Optional relative repository working directory.", "type": "string" }
+          "child_id": {
+            "description": "Stable child slice identifier.",
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "Merged Forgejo pull request number.",
+            "type": "integer"
+          },
+          "repository": {
+            "description": "Authoritative repository identity.",
+            "type": "string"
+          },
+          "parent_branch": {
+            "description": "Direct parent integration branch.",
+            "type": "string"
+          },
+          "merged_head_sha": {
+            "description": "Exact merged child head SHA.",
+            "type": "string"
+          },
+          "expected_base_sha": {
+            "description": "Base SHA captured by the merge boundary.",
+            "type": "string"
+          },
+          "lane_epoch": {
+            "description": "Durable integration-lane epoch.",
+            "type": "integer"
+          },
+          "working_dir": {
+            "description": "Optional relative repository working directory.",
+            "type": "string"
+          }
         },
         "required": [
           "child_id",
@@ -377,14 +367,38 @@
       "description": "Fetch an advanced parent branch and rebase local post-merge bookkeeping onto it, returning Git-verified rebuild evidence.",
       "inputSchema": {
         "properties": {
-          "child_id": { "description": "Stable child slice identifier.", "type": "string" },
-          "pr_number": { "description": "Merged Forgejo pull request number.", "type": "integer" },
-          "repository": { "description": "Authoritative repository identity.", "type": "string" },
-          "parent_branch": { "description": "Direct parent integration branch.", "type": "string" },
-          "merged_head_sha": { "description": "Exact merged child head SHA.", "type": "string" },
-          "expected_base_sha": { "description": "The stale parent base captured by the failed push.", "type": "string" },
-          "lane_epoch": { "description": "Durable integration-lane epoch.", "type": "integer" },
-          "working_dir": { "description": "Optional relative repository working directory.", "type": "string" }
+          "child_id": {
+            "description": "Stable child slice identifier.",
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "Merged Forgejo pull request number.",
+            "type": "integer"
+          },
+          "repository": {
+            "description": "Authoritative repository identity.",
+            "type": "string"
+          },
+          "parent_branch": {
+            "description": "Direct parent integration branch.",
+            "type": "string"
+          },
+          "merged_head_sha": {
+            "description": "Exact merged child head SHA.",
+            "type": "string"
+          },
+          "expected_base_sha": {
+            "description": "The stale parent base captured by the failed push.",
+            "type": "string"
+          },
+          "lane_epoch": {
+            "description": "Durable integration-lane epoch.",
+            "type": "integer"
+          },
+          "working_dir": {
+            "description": "Optional relative repository working directory.",
+            "type": "string"
+          }
         },
         "required": [
           "child_id",
@@ -403,14 +417,38 @@
       "description": "Commit the already prepared Chainlink changelog on the parent branch and return the resulting Git commit SHA.",
       "inputSchema": {
         "properties": {
-          "child_id": { "description": "Stable child slice identifier.", "type": "string" },
-          "issue_id": { "description": "Chainlink issue whose changelog entry was prepared.", "type": "integer" },
-          "repository": { "description": "Authoritative repository identity.", "type": "string" },
-          "parent_branch": { "description": "Direct parent integration branch.", "type": "string" },
-          "expected_base_sha": { "description": "Synchronized parent base SHA.", "type": "string" },
-          "generation": { "description": "Changelog recovery generation.", "type": "integer" },
-          "intent_id": { "description": "Durable changelog effect intent.", "type": "string" },
-          "working_dir": { "description": "Optional relative repository working directory.", "type": "string" }
+          "child_id": {
+            "description": "Stable child slice identifier.",
+            "type": "string"
+          },
+          "issue_id": {
+            "description": "Chainlink issue whose changelog entry was prepared.",
+            "type": "integer"
+          },
+          "repository": {
+            "description": "Authoritative repository identity.",
+            "type": "string"
+          },
+          "parent_branch": {
+            "description": "Direct parent integration branch.",
+            "type": "string"
+          },
+          "expected_base_sha": {
+            "description": "Synchronized parent base SHA.",
+            "type": "string"
+          },
+          "generation": {
+            "description": "Changelog recovery generation.",
+            "type": "integer"
+          },
+          "intent_id": {
+            "description": "Durable changelog effect intent.",
+            "type": "string"
+          },
+          "working_dir": {
+            "description": "Optional relative repository working directory.",
+            "type": "string"
+          }
         },
         "required": [
           "child_id",
@@ -429,15 +467,42 @@
       "description": "Push parent-branch bookkeeping with force-with-lease compare-and-swap and return a verified push receipt.",
       "inputSchema": {
         "properties": {
-          "child_id": { "description": "Stable child slice identifier.", "type": "string" },
-          "repository": { "description": "Authoritative repository identity.", "type": "string" },
-          "parent_branch": { "description": "Direct parent integration branch.", "type": "string" },
-          "lane_epoch": { "description": "Durable integration-lane epoch.", "type": "integer" },
-          "push_intent_id": { "description": "Durable parent-push effect intent.", "type": "string" },
-          "push_journal_id": { "description": "Durable parent-push journal identity.", "type": "string" },
-          "expected_base_sha": { "description": "Compare-and-swap expected remote base SHA.", "type": "string" },
-          "pushed_commit": { "description": "Changelog commit to publish.", "type": "string" },
-          "working_dir": { "description": "Optional relative repository working directory.", "type": "string" }
+          "child_id": {
+            "description": "Stable child slice identifier.",
+            "type": "string"
+          },
+          "repository": {
+            "description": "Authoritative repository identity.",
+            "type": "string"
+          },
+          "parent_branch": {
+            "description": "Direct parent integration branch.",
+            "type": "string"
+          },
+          "lane_epoch": {
+            "description": "Durable integration-lane epoch.",
+            "type": "integer"
+          },
+          "push_intent_id": {
+            "description": "Durable parent-push effect intent.",
+            "type": "string"
+          },
+          "push_journal_id": {
+            "description": "Durable parent-push journal identity.",
+            "type": "string"
+          },
+          "expected_base_sha": {
+            "description": "Compare-and-swap expected remote base SHA.",
+            "type": "string"
+          },
+          "pushed_commit": {
+            "description": "Changelog commit to publish.",
+            "type": "string"
+          },
+          "working_dir": {
+            "description": "Optional relative repository working directory.",
+            "type": "string"
+          }
         },
         "required": [
           "child_id",
@@ -776,7 +841,7 @@
       "name": "list_agents"
     },
     {
-      "description": "Create or update a pull request for the current branch. Idempotent — safe to call multiple times (updates existing PR). Pushes the branch automatically. The PR body must contain the literal heading `## Acceptance Criteria`, followed by every bullet from the issue's Definition of Done copied verbatim. Preserve that heading and update its bullets when updating an existing PR; do not file a body without it. Base branch auto-detected from dot-separated naming (e.g. main.foo.bar targets main.foo).",
+      "description": "Create or update a pull request for the current branch. Idempotent \u2014 safe to call multiple times (updates existing PR). Pushes the branch automatically. The PR body must contain the literal heading `## Acceptance Criteria`, followed by every bullet from the issue's Definition of Done copied verbatim. Preserve that heading and update its bullets when updating an existing PR; do not file a body without it. Base branch auto-detected from dot-separated naming (e.g. main.foo.bar targets main.foo).",
       "inputSchema": {
         "properties": {
           "base_branch": {
@@ -801,7 +866,7 @@
       "name": "file_pr"
     },
     {
-      "description": "Merge a GitHub pull request and fetch changes. Before merging, requires a Forgejo reviewer approval for the exact current PR head and passing CI (success or neutral) for that same head; stale approvals, review changes/comments, pending/failed/unknown CI, and missing evidence are rejected. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact.",
+      "description": "Merge a GitHub pull request and fetch changes. Before merging, requires a Forgejo reviewer approval for the exact current PR head and passing CI (success or neutral) for that same head; stale approvals, review changes/comments, pending/failed/unknown CI, and missing evidence are rejected. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md before the merge. After merging, verify the build \u2014 especially when merging multiple PRs in parallel, as changes may interact.",
       "inputSchema": {
         "properties": {
           "chainlink_issue_id": {
@@ -829,11 +894,11 @@
       "name": "merge_pr"
     },
     {
-      "description": "Send a message to your parent agent. Use for status updates, progress reports, or failure escalation. Messages are delivered as-is with lightweight attribution. For PR-based workflows, the system auto-notifies your parent when Copilot approves — you don't need to signal completion yourself.",
+      "description": "Send a message to your parent agent. Use for status updates, progress reports, or failure escalation. Messages are delivered as-is with lightweight attribution. For PR-based workflows, the system auto-notifies your parent when Copilot approves \u2014 you don't need to signal completion yourself.",
       "inputSchema": {
         "properties": {
           "message": {
-            "description": "The message to send. Be concise — one or two sentences.",
+            "description": "The message to send. Be concise \u2014 one or two sentences.",
             "type": "string"
           },
           "pr_number": {
@@ -1029,7 +1094,7 @@
             "type": "string"
           },
           "title": {
-            "description": "Issue title — should be a concise, changelog-ready description of the work",
+            "description": "Issue title \u2014 should be a concise, changelog-ready description of the work",
             "type": "string"
           }
         },
@@ -1107,7 +1172,7 @@
             "type": "string"
           },
           "title": {
-            "description": "Sub-issue title — should be a concise, changelog-ready description",
+            "description": "Sub-issue title \u2014 should be a concise, changelog-ready description",
             "type": "string"
           }
         },
@@ -1469,7 +1534,7 @@
       "name": "chainlink_issue_relate"
     },
     {
-      "description": "Show the falsification cascade for an issue — what downstream work would be affected if this issue's assumptions are wrong.",
+      "description": "Show the falsification cascade for an issue \u2014 what downstream work would be affected if this issue's assumptions are wrong.",
       "inputSchema": {
         "properties": {
           "issue_id": {

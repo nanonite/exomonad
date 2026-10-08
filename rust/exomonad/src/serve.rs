@@ -5,6 +5,7 @@ use crate::control_gate;
 use crate::control_plan;
 use crate::control_read_model;
 use crate::control_recovery;
+use crate::control_task_budget;
 use exomonad::config::{Config, REVIEWER_MAX_ROUNDS_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV};
 use exomonad::control_gate_name;
 use std::time::Duration;
@@ -1179,7 +1180,8 @@ async fn control_root() -> Json<serde_json::Value> {
             "retry_recovery",
             "wait_for_recovery",
             "approve_recovery_scope",
-            "abandon_recovery"
+            "abandon_recovery",
+            "reset_parked_task_budget"
         ],
         "forbidden_actions": [
             "merge_pr",
@@ -1336,6 +1338,37 @@ async fn control_recovery_command(
         Ok(value) => Json(value).into_response(),
         Err(error) => (
             control_recovery::status_code(&error),
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn control_reset_task_budget(
+    Path((run_id, child_run_id, slice_id)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<control_task_budget::ResetTaskBudgetRequest>,
+) -> Response {
+    let Some(event_log) = state.event_log.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "operator event log is unavailable"})),
+        )
+            .into_response();
+    };
+    match control_task_budget::execute(
+        &state.project_dir,
+        &run_id,
+        &child_run_id,
+        &slice_id,
+        request,
+        event_log,
+    )
+    .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            control_task_budget::status_code(&error),
             Json(serde_json::json!({"error": error.to_string()})),
         )
             .into_response(),
@@ -2170,6 +2203,10 @@ Run `exomonad recompile` first to build it.",
             "/runs/{run_id}/slices/{slice_id}/recovery",
             post(control_recovery_command),
         )
+        .route(
+            "/runs/{run_id}/children/{child_run_id}/slices/{slice_id}/task-budget",
+            post(control_reset_task_budget).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         .layer(middleware::from_fn_with_state(
             route_auth.clone(),
             control::require_control,
@@ -2362,7 +2399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_root_exposes_only_non_authoritative_actions() {
+    async fn control_root_exposes_bounded_operator_actions() {
         let Json(document) = control_root().await;
         assert_eq!(document["allowed_actions"][0], "read_projection");
         assert_eq!(document["allowed_actions"][1], "cleanup_plan_apply");
@@ -2373,6 +2410,7 @@ mod tests {
         assert_eq!(document["allowed_actions"][6], "wait_for_recovery");
         assert_eq!(document["allowed_actions"][7], "approve_recovery_scope");
         assert_eq!(document["allowed_actions"][8], "abandon_recovery");
+        assert_eq!(document["allowed_actions"][9], "reset_parked_task_budget");
         for action in [
             "merge_pr",
             "approve_review",

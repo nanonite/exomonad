@@ -633,6 +633,7 @@ SLICE_KEYS = frozenset(
         "legacy_manifest_migration",
         "task_timeout_seconds",
         "task_timeout_source",
+        "task_budget_reset_key",
         "recovery",
         "suspended_dependency",
         "deadline_ledger",
@@ -880,6 +881,7 @@ class SliceState:
     legacy_manifest_migration: Mapping[str, object] | None = None
     task_timeout_seconds: float | None = None
     task_timeout_source: str | None = None
+    task_budget_reset_key: str | None = None
     recovery: RecoveryState | None = None
     suspended_dependency: SuspendedDependencyState | None = None
     deadline_ledger: DeadlineLedger | None = None
@@ -1501,6 +1503,12 @@ def _validate_slice(
     _legacy_manifest_migration(value.get("legacy_manifest_migration"), path, errors)
     _nullable_number(value, "task_timeout_seconds", path, errors)
     _nullable_string(value, "task_timeout_source", path, errors)
+    _nullable_string(value, "task_budget_reset_key", path, errors)
+    reset_key = value.get("task_budget_reset_key")
+    if isinstance(reset_key, str) and len(reset_key) > 128:
+        errors.append(
+            (f"{path}.task_budget_reset_key", "must contain at most 128 characters")
+        )
     _validate_recovery(value.get("recovery"), path, errors)
     _validate_suspended_dependency(value.get("suspended_dependency"), path, errors)
     _validate_deadline_ledger(value.get("deadline_ledger"), path, errors)

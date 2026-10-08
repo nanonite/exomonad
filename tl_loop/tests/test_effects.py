@@ -267,16 +267,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         agent_type="codex",
         operator_context="approved",
     )
-    client.resume_pr(
-        pr_number=1,
-        task="resume",
-        boundary=["avoid"],
-        context="context",
-        done_criteria=["done"],
-        read_first=["README.md"],
-        steps=["step"],
-        verify=["just test"],
-    )
+    client.resume_pr(pr_number=1, expected_head_sha="abc123", task="resume")
     client.resolve_live_pr_for_slice(slice_id="slice-a")
     client.watcher_pr_state(pr_number=1)
     client.repository_identity()

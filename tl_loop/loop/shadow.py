@@ -18,6 +18,7 @@ from tl_loop.fsm.event import (
     ChildCompleted,
     ChildFailed,
     ChildSpawned,
+    InboxNotificationObserved,
     OwnPRFiled,
     PRFiled,
     PRHeadChanged,
@@ -220,6 +221,10 @@ class TLEventDecoder:
                 slice_id=event.slice_id,
                 verified=verified if type(verified) is bool else None,
             )
+        if event.kind in {EventKind.INBOX_MESSAGE, EventKind.INBOX_POKE}:
+            # Inbox delivery is consumed through the inbox API. These ledger
+            # rows are telemetry for the TL FSM, not phase transitions.
+            return InboxNotificationObserved(event.event_type)
         if event.kind is EventKind.PR_MERGED:
             return PRMerged(_positive_int(event.data, "pr_number", event.event_type), _agent(event))
         raise ShadowLoopError(f"no shadow FSM mapping for {event.event_type!r}")
@@ -361,9 +366,9 @@ class ShadowLoop:
                 self.source.acknowledge(event)
                 continue
             fsm_event = self.decoder.decode(event)
-            if isinstance(fsm_event, PublicationObserved):
-                # Telemetry-only: acknowledge without an FSM transition or slice
-                # mutation; a following pr.filed/pr.updated is applied normally.
+            if isinstance(fsm_event, (PublicationObserved, InboxNotificationObserved)):
+                # Telemetry-only rows are acknowledged without an FSM transition
+                # or slice mutation; the immutable ledger retains their payload.
                 self.source.acknowledge(event)
                 continue
             if isinstance(fsm_event, ChildSpawned) and not _shadow_spawn_matches(

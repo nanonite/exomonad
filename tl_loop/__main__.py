@@ -40,6 +40,11 @@ from tl_loop.loop.redispatch import (
     DEFAULT_ABANDONMENT_RETRY_CEILING,
     redispatch_slice,
 )
+from tl_loop.loop.task_budget import (
+    TaskBudgetResetError,
+    TaskBudgetResetRequest,
+    execute_task_budget_reset,
+)
 from tl_loop.plan_validation import (
     PlanValidationError,
     validate_plan_document,
@@ -87,6 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "redispatch",
         "plan-proposal",
         "recovery-command",
+        "task-budget-reset",
         "preflight",
         "-h",
         "--help",
@@ -125,6 +131,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "recovery-command":
             _recovery_command(args)
+        elif args.command == "task-budget-reset":
+            _task_budget_reset(args)
         elif args.command == "abandon":
             _abandon(args)
         elif args.command == "redispatch":
@@ -311,6 +319,13 @@ def _parser() -> argparse.ArgumentParser:
     _add_project_options(recovery_command)
     recovery_command.add_argument("--run-id", required=True)
     recovery_command.set_defaults(command="recovery-command")
+
+    task_budget_reset = subcommands.add_parser(
+        "task-budget-reset", help=argparse.SUPPRESS
+    )
+    _add_project_options(task_budget_reset)
+    task_budget_reset.add_argument("--run-id", required=True)
+    task_budget_reset.set_defaults(command="task-budget-reset")
 
     preflight = subcommands.add_parser("preflight", help="validate required TL controller files")
     _add_project_options(preflight)
@@ -933,6 +948,23 @@ def _recovery_command(args: argparse.Namespace) -> None:
         request = ResumeRecoveryRequest.from_mapping(payload)
         result = execute_recovery_command(args.project_root.expanduser().resolve(), request)
     except RecoveryCommandError as error:
+        raise LauncherError(str(error)) from error
+    print(json.dumps(result, sort_keys=True))
+
+
+def _task_budget_reset(args: argparse.Namespace) -> None:
+    try:
+        payload = json.load(sys.stdin)
+    except (OSError, json.JSONDecodeError) as error:
+        raise LauncherError(f"task budget reset input is not valid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise LauncherError("task budget reset input must be a JSON object")
+    if payload.get("run_id") != args.run_id:
+        raise LauncherError("task budget reset run_id does not match the control route")
+    try:
+        request = TaskBudgetResetRequest.from_mapping(payload)
+        result = execute_task_budget_reset(args.project_root.expanduser().resolve(), request)
+    except TaskBudgetResetError as error:
         raise LauncherError(str(error)) from error
     print(json.dumps(result, sort_keys=True))
 

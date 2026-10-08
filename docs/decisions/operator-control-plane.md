@@ -54,7 +54,7 @@ and its corollary that orchestration is server-side:
 `tl_loop` remains the single writer of run state. A console that could mutate
 `run.json` directly would rebuild the split brain M9 removed.
 
-### 2. The console may do exactly three things
+### 2. The console may do four bounded things
 
 1. **Read projections.** A hierarchical read model over run state and the
    ledger: scope path and role, manifest revision, current order, typed child
@@ -66,10 +66,21 @@ and its corollary that orchestration is server-side:
 3. **Propose plan mutations.** A proposal is validated by the same closed-key
    `WorkPlan` validator that `plan.json` uses, and is **inert until the
    operator confirms it** — zuihitsu's `MergeProposed` pattern.
+4. **Reset one parked task budget.** The authenticated operator may raise the
+   wall-clock limit and token reservation for one already-published slice parked
+   with `task_budget_exceeded`. The request compare-and-sets the parent and child
+   revisions, names the current attempt, records a task class and operator
+   reason, and may include observed token usage. The typed TL writer updates the
+   existing slice and canonically reopens its scope. If the existing review
+   requires repair, the controller resumes the same PR owner with a distinct
+   action-journal identity; no new PR is created. The server records
+   `operator.task_budget_reset` in the append-only event ledger. This does not
+   change role, harness, or global ceilings.
 
 Nothing else. In particular the console cannot merge a PR, approve a review,
-set a verdict, alter the FSM phase, widen `harness_policy.toml`, or raise a
-budget ceiling. Those remain typed ledger events and durable gates.
+set a verdict, alter an FSM phase directly, widen `harness_policy.toml`, or
+raise a global budget ceiling. Those remain with the controller and existing
+durable gates.
 
 ### 3. Natural language is a fourth RLM judgment
 

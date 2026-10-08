@@ -1731,7 +1731,6 @@ impl<
 
             // Store window_id for message delivery and cleanup
             let routing = RoutingInfo::window(window_id.clone());
-            let effective_birth = self.effective_birth_branch(Some(caller_bb));
             let identity_record = AgentIdentityRecord {
                 agent_name: agent_name.clone(),
                 slug: Slug::try_from_str(identity.slug())
@@ -1739,7 +1738,10 @@ impl<
                 agent_type: options.agent_type,
                 birth_branch: BirthBranch::try_from_str(branch_name.as_str())
                     .expect("validated string input is non-empty"),
-                parent_branch: effective_birth,
+                // The PR targets the explicitly selected base, which may be a
+                // nested branch below the caller's own parent branch.
+                parent_branch: BirthBranch::try_from_str(base.as_str())
+                    .context("spawn base branch was empty")?,
                 working_dir: worktree_path.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,
@@ -2423,7 +2425,7 @@ impl<
             let routing = match agent_type {
                 AgentType::OpenCode => {
                     // OpenCode workers run in a tmux window like Claude workers.
-                    // `build_agent_command` generates `opencode run "$(cat '<prompt_file>')"`.
+                    // `build_agent_command` generates `opencode run --standalone "$(cat '<prompt_file>')"`.
                     // MCP is configured via opencode.json in the worktree.
                     // Messages are delivered via tmux STDIN injection (same as all other agents).
                     let window_id = self.new_tmux_window_inner(
@@ -2611,6 +2613,10 @@ impl<
                 .unwrap_or(effective_birth.as_parent_branch());
             let current_branch = BranchName::try_from_str(parent_branch)
                 .context("effective birth branch was empty")?;
+            // The owner identity's direct parent is the branch the PR targets,
+            // even when resume_pr is called from a higher-level TL.
+            let identity_parent_branch = crate::domain::BirthBranch::try_from_str(parent_branch)
+                .context("effective leaf parent branch was empty")?;
 
             // Sanitize branch name and construct typed identity
             let slug = normalize_agent_slug(&options.branch_name);
@@ -2946,7 +2952,23 @@ impl<
                 "EXOMONAD_INVOCATION_EXIT_FILE".to_string(),
                 agent_config_dir.join("exit_code").display().to_string(),
             );
+            env_vars.insert(
+                "EXOMONAD_INVOCATION_STDERR_FILE".to_string(),
+                agent_config_dir.join("stderr_tail").display().to_string(),
+            );
             let _ = fs::remove_file(agent_config_dir.join("exit_code")).await;
+            let stderr_tail_file = agent_config_dir.join("stderr_tail");
+            let _ = fs::remove_file(&stderr_tail_file).await;
+            fs::write(&stderr_tail_file, b"").await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    &stderr_tail_file,
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .await?;
+            }
             let launch_result = async {
                 let prompt_file =
                     Self::write_prompt_file(self.project_dir(), &display_name, &task).await?;
@@ -3005,7 +3027,7 @@ impl<
                     .context("generated agent slug was empty")?,
                 agent_type,
                 birth_branch: child_birth,
-                parent_branch: effective_birth,
+                parent_branch: identity_parent_branch,
                 working_dir: worktree_path.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::WorktreePerAgent,

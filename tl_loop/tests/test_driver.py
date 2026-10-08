@@ -70,7 +70,6 @@ from tl_loop.loop.driver import (
     _record_review_event,
     _recover_tool_unavailable,
     _recursive_phase_after_slice_update,
-    _repair_model,
     _route_ci_event,
     _route_review_event,
     _run_live_sub_tl,
@@ -2615,7 +2614,9 @@ def test_reviewer_unknown_outcome_persists_gate_without_retry(tmp_path: Path) ->
     assert journal.pending_entries()[0]["status"] == "unknown"
 
 
-def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -> None:
+def test_binding_review_findings_adjudicate_and_resume_same_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     backend = ReviewBackend(
         [
             RlmResponse(
@@ -2639,6 +2640,23 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -
     store = _review_store(tmp_path)
     event = _review_event()
     state = store.load()
+    original = state.slices["leaf-a"]
+    state = store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "leaf-a": replace(
+                original,
+                dispatch_agent_id="leaf-a-opencode",
+                dispatch_started_at=1.0,
+                task_timeout_seconds=3600.0,
+                task_timeout_source="project",
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    monkeypatch.setattr("tl_loop.loop.driver.time.time", lambda: 2000.0)
     config = TLLoopConfig(
         active=True,
         review_model_choice=_review_choice(backend),
@@ -2677,11 +2695,14 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(tmp_path: Path) -
         "resume_pr",
     ]
     resume = next(arguments for name, arguments in transport.calls if name == "resume_pr")
-    assert "The failure path is unhandled" in str(resume["context"])
+    assert "The failure path is unhandled" in str(resume["task"])
     assert restored.status is SliceStatus.REPAIRING
     assert restored.reviewed_head == "head-a"
     assert restored.verdict is Verdict.NO_GO
     assert restored.repair_attempts == 1
+    assert restored.dispatch_started_at == 2000.0
+    assert restored.dispatch_agent_id == "leaf-a-opencode"
+    assert restored.dispatch_invocation_id is None
     assert restored.review_findings["head-a"][0]["path"] == "src/leaf.py"
     assert all(name != "spawn_leaf" for name, _ in transport.calls)
 
@@ -3307,67 +3328,6 @@ def _tl_choice(backend: ReviewBackend) -> RlmModelChoice:
         context_length=10_000,
     )
 
-
-def _repair_slice(*, attempts: int, model: str | None = None) -> SliceState:
-    return SliceState(
-        id="leaf-a",
-        status=SliceStatus.IN_REVIEW,
-        paths=("src/leaf.py",),
-        depends_on=(),
-        base_ref="main",
-        test_plan=("just tl-loop-test",),
-        agent_type="codex",
-        model=model,
-        branch=None,
-        worktree=None,
-        pr_number=42,
-        reviewed_head="head-a",
-        attempts=attempts,
-        verdict=Verdict.NO_GO,
-    )
-
-
-def _repair_config(
-    *, requested_model: str | None = None, escalate_after_attempts: int = 1
-) -> TLLoopConfig:
-    catalog = ModelCatalog.from_fixture(
-        Path(__file__).parent / "fixtures" / "model_catalog_scored.json"
-    )
-    policy = validate_policy(_selector_policy(escalate_after_attempts))
-    return TLLoopConfig(
-        catalog=catalog,
-        policy=policy,
-        role="worker",
-        requested_model=requested_model,
-    )
-
-
-def test_repair_model_preserves_current_model_below_threshold() -> None:
-    config = _repair_config(escalate_after_attempts=2)
-
-    assert _repair_model(_repair_slice(attempts=0, model="gpt-5-mini"), config) == "gpt-5-mini"
-    assert _repair_model(_repair_slice(attempts=1, model="gpt-5-mini"), config) == "gpt-5-mini"
-
-
-def test_repair_model_escalates_to_strongest_at_threshold() -> None:
-    config = _repair_config(escalate_after_attempts=1)
-
-    assert _repair_model(_repair_slice(attempts=0, model="gpt-5-mini"), config) == "gpt-5-mini"
-    assert _repair_model(_repair_slice(attempts=1, model="gpt-5-mini"), config) == "gpt-5.5"
-
-
-def test_repair_model_requested_model_wins_at_any_attempt() -> None:
-    config = _repair_config(requested_model="gpt-5-mini", escalate_after_attempts=1)
-
-    assert _repair_model(_repair_slice(attempts=0), config) == "gpt-5-mini"
-    assert _repair_model(_repair_slice(attempts=1), config) == "gpt-5-mini"
-
-
-def test_repair_model_without_catalog_preserves_current_model() -> None:
-    config = TLLoopConfig(role="worker")
-
-    assert _repair_model(_repair_slice(attempts=1, model="gpt-5-mini"), config) == "gpt-5-mini"
-    assert _repair_model(_repair_slice(attempts=1), config) is None
 
 
 def test_requested_model_requires_catalog() -> None:
@@ -6674,6 +6634,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
     assert next(arguments for name, arguments in transport.calls if name == "merge_pr") == {
         "pr_number": 43,
         "strategy": "merge",
+        "working_dir": ".",
         "expected_base_sha": "base-a",
         "expected_head_sha": "head-a",
         "expected_patch_digest": "patch-a",
