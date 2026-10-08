@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- tl_loop: charge roles.tl judgment tokens to the durable BudgetLedger (survives restart) (#1161)
 - Support optional slice-scoped Chainlink issue integration (#1165)
 - Resume recursive child handoff only after post-merge recovery completes, then continue the persisted parent plan order (#1165)
 - Resume the Beast slice with the deterministic review repair (#1164)
