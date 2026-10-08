@@ -75,6 +75,17 @@ base movement is `NEEDS_BASE_REVALIDATION`, not a reason to spawn a worker or
 rebase solely for freshness. A real conflict is `INTEGRATION_CONFLICT` and
 routes through same-owner `resume_pr`, preserving branch, worktree, and PR.
 
+### Slice-scoped Chainlink ownership
+
+`chainlink_issue_id` is optional metadata on one worker, leaf, or sub-TL slice
+in the immutable recursive manifest. A sub-TL owns issue integration for the
+slices in its scope and closes only an explicitly bound issue after merge
+adoption and parent-branch sync. The root orchestrator never supplies its own
+ID or closes a child slice's issue. An unlinked slice is a normal outcome: it
+records issue closure and changelog as not applicable, makes no Chainlink call,
+and can release its parent after post-merge recovery completes. The parent
+advances only through its persisted plan order after that child handoff.
+
 | Lifecycle | Authority | Recovery |
 |---|---|---|
 | `RUNNING` | Direct children are executing | Wait for child checkpoints |
@@ -198,7 +209,7 @@ any mutation; the dirty worktree is never discarded.
 | `chainlink_session_end` | x | x | x | | x |
 | `chainlink_timer_start` / `_stop` / `_status` | x | x | | | |
 
-Authority summary: **issue decomposition and lifecycle authority lives at the TL/root layer; dev and worker can read and comment but cannot create top-level issues, close them, or own timers.**
+Authority summary: **issue decomposition lives at the TL/root layer. For controller-dispatched work, the owning sub-TL closes only the issue explicitly bound to its slice after merge adoption and parent-branch sync; the root never closes a child slice issue. Dev and worker can read and comment but cannot create top-level issues, close them, or own timers.**
 
 ### Messaging inboxes
 
@@ -550,15 +561,15 @@ verifies post-merge state before advancing dependent slices.
 ## 6. Watcher Escalation Outputs
 
 Beyond per-PR events, the watcher surfaces health signals to the control plane. The
-controller may turn those observations into **chainlink `review-stuck` issues**
-rather than re-trying. These are human-clarification inputs — do not auto-close
-them and do not respawn the dev leaf.
+controller classifies review observations and uses the bounded `review_stuck`
+judgment or a named human gate. This path does not create Chainlink issues,
+reinterpret a slice's bound issue as an epic, or edit `plan.json`.
 
 | Watcher signal | Outcome |
 |----------------|---------|
-| `dev_not_pushing` | open chainlink `review-stuck` issue |
-| `reviewer_not_responding` | open chainlink `review-stuck` issue |
-| `reviewer_never_started` | open chainlink `review-stuck` issue |
+| `dev_not_pushing` | record the review-stuck observation and apply the bounded controller policy |
+| `reviewer_not_responding` | record the review-stuck observation and apply the bounded controller policy |
+| `reviewer_never_started` | record the review-stuck observation and apply the bounded controller policy |
 | `Stuck` (rounds exceeded) | `tl_loop` makes one `roles.tl` guide/escalate judgment; `escalate` or an exhausted intervention ceiling parks `review_rounds_exhausted` and opens a named gate; the watcher reports only review observations |
 
 ---

@@ -3344,12 +3344,31 @@ def test_requested_model_requires_catalog() -> None:
 
 
 def _review_store(
-    tmp_path: Path, *, verdict: Verdict | None = None, reviewed_head: str | None = "head-a"
+    tmp_path: Path,
+    *,
+    verdict: Verdict | None = None,
+    reviewed_head: str | None = "head-a",
+    chainlink_issue_id: int | None = None,
 ) -> RunStore:
     store = RunStore("review-run", tmp_path)
+    manifest = build_plan_manifest(
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "review leaf",
+                    "boundary": ["src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "chainlink_issue_id": chainlink_issue_id,
+                }
+            ]
+        },
+        scope_id="review-run",
+    )
     create(
         "review-run",
         {
+            "plan_manifest": manifest.to_document(),
             "repository_identity": {
                 "owner": "org",
                 "repo": "repo",
@@ -3376,6 +3395,7 @@ def _review_store(
                 reviewed_head=reviewed_head,
                 attempts=1,
                 verdict=verdict,
+                chainlink_issue_id=chainlink_issue_id,
             )
         },
         BudgetLedger(0, 0),

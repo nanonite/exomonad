@@ -178,6 +178,14 @@ needs its named gate approved and a fresh open-status observation. The outcome
 is also emitted as `tl.issue_close_outcome`. An unlinked slice records both
 issue closure and changelog as not applicable and makes no Chainlink call.
 
+`review_stuck` does not create a Chainlink issue, treat the bound slice issue as
+an epic, or edit the live `plan.json`. The linked issue remains metadata for
+that exact slice. After a child scope reports completion, its parent accepts
+the handoff only when each merged PR slice has reached `PostMergePhase.COMPLETE`;
+the parent then advances the persisted `current_order`. A checkpoint whose
+legacy phase says all merged while a direct slice still has pending post-merge
+recovery resumes that recovery before the handoff is accepted.
+
 ## Repository identity resolution
 
 `RunState.repository_identity` (owner, repo, base branch, forge host,
@@ -689,6 +697,11 @@ the attempted recursive slice with `schedule_deadlock` and raises
 Ledger readers may set `scope_run_id` and `scope_agent_id`. An agent scope
 includes the agent's own events and its directly spawned children, so a root
 reader does not consume a grandchild review event.
+
+Recursive completion is handed upward through durable child checkpoints. A
+sub-TL owns Chainlink integration for slices in its scope; the root orchestrator
+does not close their issues or supply an ID. An unlinked child remains eligible
+to complete and release the next plan stage once its post-merge recovery is done.
 
 ### Ordered-child recovery gate answers
 

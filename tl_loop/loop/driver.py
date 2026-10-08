@@ -520,6 +520,30 @@ def _ordered_slice_complete(current: SliceState) -> bool:
     )
 
 
+def _scope_post_merge_complete(state: RunState) -> bool:
+    """Reject handoff while a merged PR slice has unfinished post-merge work."""
+    return all(
+        current.pr_number is None
+        or current.status is not SliceStatus.MERGED
+        or current.post_merge is None
+        or current.post_merge.phase
+        in {PostMergePhase.NOT_REQUIRED, PostMergePhase.COMPLETE}
+        for current in state.slices.values()
+    )
+
+
+def _scope_has_pending_post_merge(state: RunState) -> bool:
+    """Find merged PR slices whose durable recovery still needs a boundary."""
+    return any(
+        current.status is SliceStatus.MERGED
+        and current.pr_number is not None
+        and current.post_merge is not None
+        and current.post_merge.phase
+        not in {PostMergePhase.NOT_REQUIRED, PostMergePhase.COMPLETE}
+        for current in state.slices.values()
+    )
+
+
 def _ordered_child_complete(task: SubTLTask, current: SliceState) -> bool:
     """Require aggregate post-merge recovery before releasing a child barrier."""
     if not task.integration.aggregate_pr_required:
@@ -2637,6 +2661,8 @@ def _maybe_finalize_root_scope(
     manifest = state.plan_manifest
     if manifest is None or manifest.role != "root":
         return state
+    if _scope_has_pending_post_merge(state):
+        return state
     if not isinstance(phase, (RecursiveTLAllMerged, RecursiveTLFinalizing)):
         return state
     evidence = {
@@ -2726,6 +2752,8 @@ def _maybe_finalize_non_root_scope(state: RunState, store: RunStore) -> RunState
     phase = state.recursive_fsm
     manifest = state.plan_manifest
     if manifest is None or manifest.role != "non_root":
+        return state
+    if _scope_has_pending_post_merge(state):
         return state
     if isinstance(phase, RecursiveTLAllMerged):
         evidence = _non_root_finalization_evidence(state, manifest)
@@ -2831,6 +2859,14 @@ def _run_loop(
     if state.goals.controller_started_at is None:
         state = store.set_goals(
             replace(state.goals, controller_started_at=diagnostics.controller_started_at)
+        )
+    if (
+        not plan.sub_tls
+        and not _source_has_pending(source)
+        and _scope_has_pending_post_merge(state)
+    ):
+        state = _drain_direct_scope_convergence(
+            state, convergence, store, config, effects, effects_log
         )
     before_finalization_phase = _phase_from_state(state)
     state = _maybe_finalize_scope(state, store, config, effects, effects_log)
@@ -3925,6 +3961,7 @@ def _open_review_stuck_gate(
             store=store,
             issue_creator=cast(EffectClient, effects),
             audit=audit,
+            create_issue=False,
         )
     else:
         parked = slice_transition(target, ReviewRoundsExhausted())
@@ -10566,11 +10603,7 @@ def _run_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
-            if child_phase in {
-                TLPhase.TLAllMerged,
-                TLPhase.TLDone,
-                TLPhase.TLPRFiled,
-            }:
+            if _child_handoff_ready(child_state, store.run_id):
                 return task, child_phase, child_state
             if child_phase is TLPhase.TLFailed and config.ordered_recovery_child != task.name:
                 return task, child_phase, child_state
@@ -10608,7 +10641,9 @@ def _child_completion_phase(state: RunState) -> TLPhase:
         and not manifest.nodes
     ):
         return TLPhase.TLDone
-    return state.fsm.phase
+    if recursive_fsm is None:
+        return state.fsm.phase
+    return _phase_tag(_phase_from_state(state))
 
 
 def _run_live_sub_tl_batch(
@@ -10632,12 +10667,7 @@ def _run_live_sub_tl_batch(
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
             if (
-                child_phase
-                in {
-                    TLPhase.TLAllMerged,
-                    TLPhase.TLDone,
-                    TLPhase.TLPRFiled,
-                }
+                _child_handoff_ready(child_state, store.run_id)
                 or _child_recovery_projection(child_state, store.run_id) is not None
             ):
                 existing[task.name] = (task, child_phase, child_state)
@@ -10809,7 +10839,10 @@ def _run_live_sub_tl(
         )
         result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
         final_state = getattr(result, "final_state", None)
-        if final_state is not None and not _child_handoff_ready(final_state, store.run_id):
+        if final_state is not None and not (
+            _child_handoff_ready(final_state, store.run_id)
+            or _child_recovery_projection(final_state, store.run_id) is not None
+        ):
             raise TLLoopError("sub-TL controller returned before authoritative resolution")
     except Exception as error:
         _persist_child_startup_failure(child_store, str(error))
@@ -10869,21 +10902,24 @@ def _child_source(
     return child_source, child_source
 
 
-def _child_handoff_ready(state: RunState, parent_run_id: str) -> bool:
-    """Accept only terminal or explicitly recoverable child handoffs."""
-    if _child_recovery_projection(state, parent_run_id) is not None:
+def _child_handoff_ready(state: RunState | None, parent_run_id: str) -> bool:
+    """Accept only child scopes whose direct merge work is complete."""
+    if state is None:
+        return False
+    del parent_run_id
+    recursive_fsm = getattr(state, "recursive_fsm", None)
+    if isinstance(recursive_fsm, (RecursiveTLFailed, RecursiveTLParked)):
         return True
     if isinstance(
-        getattr(state, "recursive_fsm", None),
-        (RecursiveTLAllMerged, RecursiveTLDone, RecursiveTLPRFiled, RecursiveTLFailed),
+        recursive_fsm,
+        (RecursiveTLAllMerged, RecursiveTLFinalizing, RecursiveTLPRFiled, RecursiveTLDone),
     ):
-        return True
-    return _child_completion_phase(state) in {
-        TLPhase.TLAllMerged,
-        TLPhase.TLDone,
-        TLPhase.TLPRFiled,
-        TLPhase.TLFailed,
-    }
+        return _scope_post_merge_complete(state)
+    if recursive_fsm is not None:
+        return False
+    if state.fsm.phase is TLPhase.TLAllMerged:
+        return _scope_post_merge_complete(state)
+    return state.fsm.phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
 
 
 def _exit_marker_matches_checkpoint(
@@ -10945,12 +10981,12 @@ def _complete_sub_tl_batch(
     candidate_records = dict(state.integration.candidates)
     canonical_phase = state.recursive_fsm
     for task, phase, child_state in outcomes:
-        child_handoff_ready = isinstance(
-            getattr(child_state, "recursive_fsm", None), RecursiveTLAllMerged
+        child_handoff_ready = (
+            phase is TLPhase.TLFailed
+            or _child_handoff_ready(child_state, state.run_id)
         )
         if (
-            phase not in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
-            and not child_handoff_ready
+            not child_handoff_ready
         ):
             current = updated_slices[task.name]
             updated_slices[task.name] = slice_transition(
