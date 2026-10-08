@@ -416,6 +416,44 @@ class RunStore:
         apply(self.run_dir, mutate)
         return self.load()
 
+    def charge_role_tokens(self, role: str, tokens: int) -> int:
+        """Atomically add actual RLM usage to the durable role budget counter."""
+        if not isinstance(role, str) or not role:
+            raise ValueError("role must be a non-empty string")
+        if type(tokens) is not int or tokens < 0:
+            raise ValueError("tokens must be a non-negative integer")
+        if tokens == 0:
+            state = self.load()
+            return state.budgets.role_spent.get(role, 0)
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            raw_budgets = document.get("budgets")
+            if not isinstance(raw_budgets, dict):
+                raise TypeError("run checkpoint has no budget ledger")
+            raw_ledger = raw_budgets.get("ledger")
+            if not isinstance(raw_ledger, dict):
+                raise TypeError("run checkpoint has no budget ledger")
+            raw_spent = raw_ledger.get("role_spent", {})
+            if not isinstance(raw_spent, dict):
+                raise TypeError("run checkpoint role_spent must be an object")
+            current = raw_spent.get(role, 0)
+            if type(current) is not int or current < 0:
+                raise ValueError(f"run checkpoint role_spent[{role!r}] is invalid")
+            ledger = copy.deepcopy(raw_ledger)
+            role_spent = dict(raw_spent)
+            role_spent[role] = current + tokens
+            ledger["role_spent"] = role_spent
+            budgets = copy.deepcopy(raw_budgets)
+            budgets["ledger"] = ledger
+            document["budgets"] = budgets
+            return document
+
+        updated = apply(self.run_dir, mutate)
+        updated_budgets = cast(dict[str, object], updated["budgets"])
+        updated_ledger = cast(dict[str, object], updated_budgets["ledger"])
+        updated_spent = cast(dict[str, object], updated_ledger["role_spent"])
+        return cast(int, updated_spent[role])
+
     def set_session_mode(self, mode: str | SessionMode) -> RunState:
         """Persist the host-selected lifecycle mode on the run checkpoint."""
         try:
@@ -793,9 +831,7 @@ class RunStore:
                 raise ValueError(f"gate {replacement!r} already exists")
             source["name"] = replacement
             state_version = document.get("state_version", 0)
-            document["state_version"] = (
-                state_version if type(state_version) is int else 0
-            ) + 1
+            document["state_version"] = (state_version if type(state_version) is int else 0) + 1
             return document
 
         apply(self.run_dir, mutate)
@@ -828,9 +864,7 @@ class RunStore:
                     # action's (target, state_version, action) key and would
                     # re-detect a repeat instead of retrying once.
                     current = document.get("state_version", 0)
-                    document["state_version"] = (
-                        current if type(current) is int else 0
-                    ) + 1
+                    document["state_version"] = (current if type(current) is int else 0) + 1
                     return document
             raise ValueError(f"gate {name!r} does not exist")
 
@@ -943,7 +977,9 @@ def checkpoint(
     encoded_stages = _encode_ordered_stages(ordered_stages) if ordered_stages is not None else None
     encoded_integration = _encode_integration(integration) if integration is not None else None
     encoded_manifest = plan_manifest.to_document() if plan_manifest is not None else None
-    if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
+    if expected_revision is not None and (
+        type(expected_revision) is not int or expected_revision < 0
+    ):
         raise ValueError("expected_revision must be a non-negative integer")
     if current_order is not None and (type(current_order) is not int or current_order <= 0):
         raise ValueError("current_order must be a positive integer")
@@ -1595,9 +1631,7 @@ def _bind_slice_records(
             # attached to an existing slice during the proven migration, but
             # a previously persisted binding is never rewritten.
             legacy_binding_migration = (
-                replace_node_binding
-                and binding is None
-                and node.chainlink_issue_id is not None
+                replace_node_binding and binding is None and node.chainlink_issue_id is not None
             )
             if legacy_binding_migration:
                 raw["chainlink_issue_id"] = node.chainlink_issue_id
@@ -2571,12 +2605,8 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         dispatch_error=cast(str | None, value.get("dispatch_error")),
         dispatch_error_code=cast(str | None, value.get("dispatch_error_code")),
         dispatch_retry_attempt=cast(int, value.get("dispatch_retry_attempt", 0)),
-        dispatch_next_attempt_at=cast(
-            float | None, value.get("dispatch_next_attempt_at")
-        ),
-        dispatch_retry_for_attempt=cast(
-            int, value.get("dispatch_retry_for_attempt", 0)
-        ),
+        dispatch_next_attempt_at=cast(float | None, value.get("dispatch_next_attempt_at")),
+        dispatch_retry_for_attempt=cast(int, value.get("dispatch_retry_for_attempt", 0)),
         dispatch_ledger_floor=cast(int, value.get("dispatch_ledger_floor", 0)),
         dispatch_agent_id=cast(str | None, value.get("dispatch_agent_id")),
         dispatch_invocation_id=cast(str | None, value.get("dispatch_invocation_id")),

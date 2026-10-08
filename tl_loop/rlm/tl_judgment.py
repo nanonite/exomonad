@@ -25,6 +25,7 @@ from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.select.harness import parse_harness_identifier
 from tl_loop.select.model import ModelCatalog, ModelResolutionError, select_model
 from tl_loop.select.policy import HarnessPolicy
+from tl_loop.state.store import RunStore
 
 from .call import rlm
 from .repair_contract import (
@@ -119,7 +120,7 @@ def resolve_tl_model_id(policy: HarnessPolicy, catalog: ModelCatalog | None) -> 
         raise TLModelResolutionError(
             f"roles.tl.allow entry {harness!r} pins no model and {CATALOG_FILE} does not "
             f"exist. Pin a model in {POLICY_FILE} (for example "
-            f"allow = [\"{route.agent_type}/<model-id>\"]) or add {CATALOG_FILE}."
+            f'allow = ["{route.agent_type}/<model-id>"]) or add {CATALOG_FILE}.'
         )
     try:
         return route.agent_type, select_model(route.agent_type, catalog, None).model_id
@@ -136,6 +137,7 @@ def build_tl_model_choice(
     catalog: ModelCatalog | None,
     *,
     backend: object | None = None,
+    run_store: RunStore | None = None,
 ) -> RlmModelChoice:
     """Resolve the TL judgment model and its tool-free backend, or refuse.
 
@@ -152,11 +154,22 @@ def build_tl_model_choice(
                 f"(file to fix: {POLICY_FILE})"
             ) from error
     role_policy = policy.roles[TL_ROLE]
+    ledger = RlmRoleLedger(budgets={TL_ROLE: role_policy.token_budget})
+    if run_store is not None:
+        spent = (
+            run_store.load().budgets.role_spent.get(TL_ROLE, 0) if run_store.path.exists() else 0
+        )
+        ledger.bind(
+            TL_ROLE,
+            spent=spent,
+            budget=role_policy.token_budget,
+            charge_callback=run_store.charge_role_tokens,
+        )
     return RlmModelChoice(
         model_id=model_id,
         backend=backend,
         role=TL_ROLE,
-        store=RlmCallStore(ledger=RlmRoleLedger(budgets={TL_ROLE: role_policy.token_budget})),
+        store=RlmCallStore(ledger=ledger),
         replay={},
         max_attempts=3,
         context_length=DEFAULT_TL_CONTEXT_LENGTH,

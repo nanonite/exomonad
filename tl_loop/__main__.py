@@ -320,9 +320,7 @@ def _parser() -> argparse.ArgumentParser:
     recovery_command.add_argument("--run-id", required=True)
     recovery_command.set_defaults(command="recovery-command")
 
-    task_budget_reset = subcommands.add_parser(
-        "task-budget-reset", help=argparse.SUPPRESS
-    )
+    task_budget_reset = subcommands.add_parser("task-budget-reset", help=argparse.SUPPRESS)
     _add_project_options(task_budget_reset)
     task_budget_reset.add_argument("--run-id", required=True)
     task_budget_reset.set_defaults(command="task-budget-reset")
@@ -392,9 +390,7 @@ def _run(args: argparse.Namespace) -> TLRunResult:
         plan_document: dict[str, object] = {"run_id": args.run_id}
         plan = None
     elif expected_plan_digest is not None and session_mode == "start":
-        plan_document, accepted_plan_bytes = _load_snapshot_plan(
-            project_root, expected_plan_digest
-        )
+        plan_document, accepted_plan_bytes = _load_snapshot_plan(project_root, expected_plan_digest)
         plan = _plan_from_document(plan_document)
     else:
         plan_document, accepted_plan_bytes = _load_plan(plan_path, args.wait_for_plan)
@@ -431,7 +427,11 @@ def _run(args: argparse.Namespace) -> TLRunResult:
             policy_path=project_root / ".exo" / "harness_policy.toml",
         )
         catalog = load_model_catalog(project_root / ".exo" / "model-catalog.json")
-        tl_model_choice = build_tl_model_choice(policy, catalog)
+        tl_model_choice = build_tl_model_choice(
+            policy,
+            catalog,
+            run_store=RunStore(run_id, state_root),
+        )
     except Exception as error:
         RunStore(run_id, state_root).record_exit_reason(str(error), error=error)
         raise
@@ -530,7 +530,9 @@ def _validate_captured_plan(project_root: Path, plan_bytes: bytes) -> None:
     )
 
 
-def _load_snapshot_plan(project_root: Path, expected_digest: str) -> tuple[dict[str, object], bytes]:
+def _load_snapshot_plan(
+    project_root: Path, expected_digest: str
+) -> tuple[dict[str, object], bytes]:
     path = project_root / ".exo" / "tl-loop" / "plan.snapshot"
     try:
         plan_bytes = path.read_bytes()
@@ -541,7 +543,9 @@ def _load_snapshot_plan(project_root: Path, expected_digest: str) -> tuple[dict[
     return _parse_plan_bytes(path, plan_bytes)
 
 
-def _load_recreate_plan(project_root: Path, expected_digest: str) -> tuple[dict[str, object], bytes]:
+def _load_recreate_plan(
+    project_root: Path, expected_digest: str
+) -> tuple[dict[str, object], bytes]:
     """Load Rust's accepted recreate bytes without rereading mutable plan.json."""
     return _load_snapshot_plan(project_root, expected_digest)
 
@@ -550,9 +554,7 @@ def _persist_plan_identity(project_root: Path, plan_bytes: bytes) -> None:
     """Ask Rust to record accepted bytes under the plan transition lock."""
     binary = os.environ.get("EXOMONAD_BINARY")
     if not binary:
-        raise LauncherError(
-            "EXOMONAD_BINARY is required to persist a waited plan identity"
-        )
+        raise LauncherError("EXOMONAD_BINARY is required to persist a waited plan identity")
     digest = hashlib.sha256(plan_bytes).hexdigest()
     try:
         result = subprocess.run(
@@ -594,9 +596,8 @@ def _recreate_plan_digest(
                 f"recreate plan identity {digest_path} is missing while {snapshot_path} exists"
             )
         if (
-            (project_root / ".exo" / "tl-loop" / "plan.json").is_file()
-            and not allow_unvalidated_plan
-        ):
+            project_root / ".exo" / "tl-loop" / "plan.json"
+        ).is_file() and not allow_unvalidated_plan:
             raise LauncherError(
                 "recreate plan identity is missing while plan.json exists; Rust validation did not complete"
             )
@@ -639,6 +640,7 @@ def _redispatch(args: argparse.Namespace) -> None:
         tl_model_choice = build_tl_model_choice(
             load_policy(project_root / ".exo" / "harness_policy.toml"),
             load_model_catalog(project_root / ".exo" / "model-catalog.json"),
+            run_store=store,
         )
     except Exception as error:
         store.record_exit_reason(str(error), error=error)
@@ -688,13 +690,9 @@ def _plan_authoring(args: argparse.Namespace) -> None:
     store = RunStore(args.run_id, project_root / ".exo" / "tl-loop")
     proposal = recorded_plan(store, args.run_id)
     if proposal is None:
-        raise LauncherError(
-            f"no plan-authoring proposal is recorded for run {args.run_id!r}"
-        )
+        raise LauncherError(f"no plan-authoring proposal is recorded for run {args.run_id!r}")
     if not args.install:
-        summary = proposal_summary(
-            proposal, status=gate_status_of(store.load(), proposal)
-        )
+        summary = proposal_summary(proposal, status=gate_status_of(store.load(), proposal))
         print(json.dumps(summary, sort_keys=True))
         return
     state = install_accepted_plan(store, proposal)

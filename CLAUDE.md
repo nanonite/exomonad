@@ -383,6 +383,12 @@ ceilings whose keys must be allowed), and `escalate_after_attempts` (a positive
 NO-GO threshold). A missing or invalid file is a startup error; the selector never
 creates a permissive default or widens these boundaries.
 
+`roles.tl.token_budget` covers model-authored plan proposals and review-stuck
+judgments across controller restarts. Their observed token usage is added to
+the run checkpoint's `budgets.ledger.role_spent.tl` counter before the result
+can drive another controller action; continuation restores that counter before
+allowing another roles.tl call.
+
 Task duration uses one explicit precedence: a slice's `task_timeout_seconds` in
 `plan.json` overrides the role's value in `.exo/harness_policy.toml`, which
 overrides project `tl_task_timeout_seconds`, which defaults to 3600 seconds.

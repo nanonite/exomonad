@@ -6,8 +6,14 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from tl_loop.rlm.call import JudgmentFailed, judgment_hash, rlm
-from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
+from tl_loop.rlm.call import BudgetExceeded, JudgmentFailed, judgment_hash, rlm
+from tl_loop.rlm.store import (
+    RlmCallStore,
+    RlmModelChoice,
+    RlmRequest,
+    RlmResponse,
+    RlmRoleLedger,
+)
 
 SCHEMA = {
     "type": "object",
@@ -55,6 +61,33 @@ def test_schema_valid_response_is_returned_and_logged() -> None:
     assert choice.store.events[0]["attempt"] == 1
 
 
+def test_realized_budget_overrun_is_persisted_before_raising() -> None:
+    durable = {"tl": 0}
+
+    def charge(role: str, tokens: int) -> int:
+        durable[role] += tokens
+        return durable[role]
+
+    backend = FakeBackend([RlmResponse({"decision": "go"}, 4, 6, 12)])
+    choice = RlmModelChoice(
+        model_id="claude-sonnet-4-6",
+        backend=backend,
+        role="tl",
+        store=RlmCallStore(ledger=RlmRoleLedger(budgets={"tl": 5}, charge_callback=charge)),
+        context_length=1000,
+    )
+    emitted: list[dict[str, object]] = []
+    choice.store.judgment_emitter = emitted.append
+
+    with pytest.raises(BudgetExceeded, match="10 > 5"):
+        rlm("review-evidence", INPUTS, SCHEMA, choice)
+
+    assert durable == {"tl": 10}
+    assert choice.store.ledger.spent == {"tl": 10}
+    assert choice.store.events[0]["total_tokens"] == 10
+    assert emitted[0]["tokens"] == 10
+
+
 @pytest.mark.parametrize(
     "name",
     ("decompose", "adjudicate_review", "compose_repair", "interpret_operator_intent"),
@@ -97,9 +130,7 @@ def test_aggregate_judgment_contains_only_redacted_bounded_result() -> None:
     }
     choice = RlmModelChoice(
         model_id="claude-sonnet-4-6",
-        backend=FakeBackend(
-            [RlmResponse({"safe": "ok", "api_token": "secret-value"}, 1, 1, 2)]
-        ),
+        backend=FakeBackend([RlmResponse({"safe": "ok", "api_token": "secret-value"}, 1, 1, 2)]),
         store=RlmCallStore(judgment_emitter=emitted.append),
         context_length=1000,
     )
@@ -107,9 +138,7 @@ def test_aggregate_judgment_contains_only_redacted_bounded_result() -> None:
     rlm("interpret_operator_intent", {"question": "ready?"}, schema, choice)
 
     aggregate = emitted[0]
-    assert aggregate["redacted_result"] == (
-        '{"api_token":"<redacted>","safe":"ok"}'
-    )
+    assert aggregate["redacted_result"] == ('{"api_token":"<redacted>","safe":"ok"}')
     assert "result" not in aggregate
     assert "input_hash" not in aggregate
 
@@ -126,9 +155,7 @@ def test_aggregate_judgment_emission_is_fail_open(caplog: pytest.LogCaptureFixtu
     )
 
     with caplog.at_level("WARNING"):
-        assert rlm("decompose", {"question": "ready?"}, SCHEMA, choice) == {
-            "decision": "go"
-        }
+        assert rlm("decompose", {"question": "ready?"}, SCHEMA, choice) == {"decision": "go"}
 
     assert len(choice.store.events) == 1
     assert "RLM judgment emission failed" in caplog.text
@@ -153,9 +180,7 @@ def test_invalid_response_retries_with_validation_error() -> None:
 
 
 def test_exhausted_retries_raise_judgment_failed() -> None:
-    backend = FakeBackend(
-        [RlmResponse({"unexpected": "value"}, 1, 1, 1) for _ in range(3)]
-    )
+    backend = FakeBackend([RlmResponse({"unexpected": "value"}, 1, 1, 1) for _ in range(3)])
     choice = _choice(backend)
 
     with pytest.raises(JudgmentFailed) as raised:

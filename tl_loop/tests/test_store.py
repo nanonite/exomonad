@@ -74,6 +74,19 @@ def test_mid_wave_resume_reconstructs_exact_local_state(tmp_path: Path) -> None:
     assert loaded.revision == 1
 
 
+def test_role_token_charges_survive_checkpoint_reload(tmp_path: Path) -> None:
+    create("run-1", {}, root_dir=tmp_path)
+    store = RunStore("run-1", tmp_path)
+
+    assert store.charge_role_tokens("tl", 17) == 17
+
+    resumed = RunStore("run-1", tmp_path).load()
+    assert resumed.budgets.role_spent == {"tl": 17}
+    assert resumed.budgets.tokens == 0
+    assert resumed.budgets.wall_seconds == 0
+    assert resumed.revision == 1
+
+
 def test_legacy_checkpoint_defaults_new_review_state(tmp_path: Path) -> None:
     store = RunStore("run-1", tmp_path)
     create("run-1", {}, root_dir=tmp_path)

@@ -15,6 +15,7 @@ from tl_loop.client.transport import JsonObject, JsonValue
 from .budget import CompactionResult, compact_inputs
 from .schema import OutputSchemaError, validate_output
 from .store import (
+    BudgetExceeded,
     RlmCallStore,
     RlmModelChoice,
     RlmRequest,
@@ -48,8 +49,7 @@ class JudgmentFailed(RlmError):
         self.name = name
         self.errors = errors
         super().__init__(
-            f"RLM judgment {name!r} failed after {len(errors)} attempt(s): "
-            + "; ".join(errors)
+            f"RLM judgment {name!r} failed after {len(errors)} attempt(s): " + "; ".join(errors)
         )
 
 
@@ -62,6 +62,7 @@ def rlm(
     """Perform one bounded, stateless, structured, tool-free LM judgment."""
     _validate_call_arguments(name, inputs, output_schema)
     choice = _coerce_model_choice(model_choice)
+    choice.store.ledger.ensure_budget_available(choice.role)
     original_inputs = copy.deepcopy(cast(JsonObject, dict(inputs)))
     request_schema = copy.deepcopy(dict(output_schema))
     compaction = compact_inputs(original_inputs, choice)
@@ -99,6 +100,7 @@ def rlm(
 
     errors: list[str] = []
     for attempt in range(1, choice.max_attempts + 1):
+        choice.store.ledger.ensure_budget_available(choice.role)
         request = RlmRequest(
             name=name,
             model_id=choice.model_id,
@@ -187,9 +189,7 @@ def judgment_hash(
             separators=(",", ":"),
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
-        raise RlmConfigurationError(
-            f"RLM inputs are not canonical JSON: {error}"
-        ) from error
+        raise RlmConfigurationError(f"RLM inputs are not canonical JSON: {error}") from error
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -223,9 +223,7 @@ def _coerce_model_choice(model_choice: object) -> RlmModelChoice:
     if backend is None and callable(model_choice):
         backend = model_choice
     if backend is None:
-        raise RlmConfigurationError(
-            "model_choice must provide a tool-free backend callable"
-        )
+        raise RlmConfigurationError("model_choice must provide a tool-free backend callable")
 
     store = _member(model_choice, "store")
     if not isinstance(store, RlmCallStore):
@@ -293,8 +291,10 @@ def _record_success(
         replayed=replayed,
         result=result,
     )
-    choice.store.commit(choice.role, response.total_tokens, event)
+    exceeded = choice.store.commit(choice.role, response.total_tokens, event)
     _emit_judgment(choice, event)
+    if exceeded:
+        raise _budget_exceeded(choice)
 
 
 def _record_failure(
@@ -322,8 +322,17 @@ def _record_failure(
         call_error=call_error,
     )
     tokens = response.total_tokens if response is not None else 0
-    choice.store.commit(choice.role, tokens, event)
+    exceeded = choice.store.commit(choice.role, tokens, event)
     _emit_judgment(choice, event)
+    if exceeded:
+        raise _budget_exceeded(choice)
+
+
+def _budget_exceeded(choice: RlmModelChoice) -> BudgetExceeded:
+    """Describe actual usage that was durably charged above the role ceiling."""
+    spent = choice.store.ledger.spent.get(choice.role, 0)
+    ceiling = choice.store.ledger.budgets.get(choice.role)
+    return BudgetExceeded(f"role {choice.role!r} budget exceeded: {spent} > {ceiling}")
 
 
 def _emit_judgment(choice: RlmModelChoice, event: JsonObject) -> None:
@@ -341,8 +350,7 @@ def _judgment_payload(event: JsonObject) -> JsonObject:
         "judgment": cast(str, event["name"]),
         "attempt": cast(int, event["attempt"]),
         "outcome": "failure"
-        if event.get("validation_error") is not None
-        or event.get("call_error") is not None
+        if event.get("validation_error") is not None or event.get("call_error") is not None
         else "success",
         "tokens": cast(int, event["total_tokens"]),
         "replayed": cast(bool, event["replayed"]),

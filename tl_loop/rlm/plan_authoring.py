@@ -28,6 +28,7 @@ from tl_loop.select.harness import parse_harness_identifier
 from tl_loop.select.model import ModelCatalog, select_model
 from tl_loop.select.policy import HarnessPolicy
 from tl_loop.state.plan_manifest import ManifestError, PlanManifest, build_plan_manifest
+from tl_loop.state.store import RunStore
 
 from .call import MAX_ATTEMPTS
 from .decompose import decompose
@@ -182,6 +183,7 @@ def author_plan(
     *,
     model_choice: RlmModelChoice,
     run_id: str,
+    run_store: RunStore | None = None,
     policy: HarnessPolicy | None = None,
     owned_branch: str = "main",
 ) -> AuthoredPlan:
@@ -189,8 +191,25 @@ def author_plan(
     if not isinstance(authoring, PlanAuthoringInput):
         raise TypeError("authoring must be a PlanAuthoringInput")
     if not isinstance(model_choice, RlmModelChoice):
-        raise TypeError(
-            "author_plan requires a policy-resolved RlmModelChoice, not a bare backend"
+        raise TypeError("author_plan requires a policy-resolved RlmModelChoice, not a bare backend")
+    if model_choice.role == AUTHORING_ROLE:
+        if run_store is None:
+            raise PlanAuthoringError(
+                "roles.tl plan authoring requires its RunStore for durable budget charges"
+            )
+        if run_store.run_id != run_id:
+            raise PlanAuthoringError("plan-authoring run id does not match its budget RunStore")
+        budget = model_choice.store.ledger.budgets.get(AUTHORING_ROLE)
+        if type(budget) is not int or budget <= 0:
+            raise PlanAuthoringError(
+                "roles.tl plan authoring requires a policy-resolved token budget"
+            )
+        state = run_store.load()
+        model_choice.store.ledger.bind(
+            AUTHORING_ROLE,
+            spent=state.budgets.role_spent.get(AUTHORING_ROLE, 0),
+            budget=budget,
+            charge_callback=run_store.charge_role_tokens,
         )
     _validate_harness_request(authoring, policy)
     slices = decompose(authoring_root_spec(authoring), model_choice)

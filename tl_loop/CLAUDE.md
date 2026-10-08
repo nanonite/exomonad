@@ -31,10 +31,14 @@ validated with closed-key output schemas; invalid responses retry at most three
 attempts and then raise JudgmentFailed.
 
 Each attempt is recorded with the model, input hash, token counts, latency,
-attempt number, replay flag, and redacted validated result. RlmCallStore
-commits the role token charge and event record together. Replay entries are
-keyed by the canonical hash of the judgment name, inputs, model, and output
-schema, so hermetic tests can avoid network access.
+attempt number, replay flag, and redacted validated result. For roles.tl calls,
+the RLM role ledger charges observed tokens through `RunStore.charge_role_tokens`
+into `budgets.ledger.role_spent` before the result can drive another controller
+action. A response that crosses the configured ceiling is still charged, then
+parks the judgment; a restored run refuses another call once spend has reached
+the ceiling. Replay entries are keyed by the canonical hash of the judgment
+name, inputs, model, and output schema, so hermetic tests can avoid network
+access.
 
 Every model choice supplies its resolved context_length. RLM reserves
 floor(context_length * 0.8) using integer arithmetic. Plain input mappings
@@ -650,7 +654,10 @@ the first `roles.tl.allow` entry in `.exo/harness_policy.toml`: a
 `.exo/model-catalog.json`. Neither resolving raises `TLModelResolutionError` naming
 the file to fix. The bare harness name is never used as a model id (plan
 authoring's `_catalog_model_id` keeps its own, separate behavior). The returned
-`RlmModelChoice` carries `RlmRoleLedger(budgets={"tl": token_budget})`.
+`RlmModelChoice` carries `RlmRoleLedger(budgets={"tl": token_budget})` bound to
+the run's restored `BudgetLedger`; each completed call checkpoints actual spend
+to `role_spent["tl"]`. Plan authoring uses that same charge path and requires
+the corresponding `RunStore` when the choice has role `tl`.
 
 `tl_loop.rlm.subprocess_backend.SubprocessRlmBackend` is the tool-free backend: one
 stateless CLI call per request, in an empty scratch directory. `claude` runs

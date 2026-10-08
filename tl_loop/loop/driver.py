@@ -526,8 +526,7 @@ def _scope_post_merge_complete(state: RunState) -> bool:
         current.pr_number is None
         or current.status is not SliceStatus.MERGED
         or current.post_merge is None
-        or current.post_merge.phase
-        in {PostMergePhase.NOT_REQUIRED, PostMergePhase.COMPLETE}
+        or current.post_merge.phase in {PostMergePhase.NOT_REQUIRED, PostMergePhase.COMPLETE}
         for current in state.slices.values()
     )
 
@@ -538,8 +537,7 @@ def _scope_has_pending_post_merge(state: RunState) -> bool:
         current.status is SliceStatus.MERGED
         and current.pr_number is not None
         and current.post_merge is not None
-        and current.post_merge.phase
-        not in {PostMergePhase.NOT_REQUIRED, PostMergePhase.COMPLETE}
+        and current.post_merge.phase not in {PostMergePhase.NOT_REQUIRED, PostMergePhase.COMPLETE}
         for current in state.slices.values()
     )
 
@@ -679,9 +677,7 @@ class DispatchAttempt:
         return cls("", 0.0, route.harness, agent_type=route.agent_type, model=route.model)
 
     @classmethod
-    def recorded_for(
-        cls, slice_state: SliceState, controller_epoch: str | None
-    ) -> DispatchAttempt:
+    def recorded_for(cls, slice_state: SliceState, controller_epoch: str | None) -> DispatchAttempt:
         """Rebuild the attempt one slice's dispatch provenance records.
 
         This is the only way an attempt is reconstructed from persisted state,
@@ -697,13 +693,8 @@ class DispatchAttempt:
         A slice that records no intent has no attempt to rebuild, and
         reconstruction fails closed rather than inventing one.
         """
-        if (
-            slice_state.dispatch_intent_id is None
-            or slice_state.dispatch_started_at is None
-        ):
-            raise TLLoopError(
-                f"slice {slice_state.id!r} records no dispatch intent to reconstruct"
-            )
+        if slice_state.dispatch_intent_id is None or slice_state.dispatch_started_at is None:
+            raise TLLoopError(f"slice {slice_state.id!r} records no dispatch intent to reconstruct")
         return cls(
             intent_id=slice_state.dispatch_intent_id,
             started_at=slice_state.dispatch_started_at,
@@ -862,9 +853,7 @@ class WorkerTask:
         _require_text(self.task, "worker task")
         _optional_text(self.agent_type, "worker agent_type")
         _validate_task_timeout(self.task_timeout_seconds, "worker task_timeout_seconds")
-        _validate_chainlink_issue_id(
-            self.chainlink_issue_id, "worker chainlink_issue_id"
-        )
+        _validate_chainlink_issue_id(self.chainlink_issue_id, "worker chainlink_issue_id")
 
 
 @dataclass(frozen=True)
@@ -1069,13 +1058,8 @@ class TLLoopConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
                 raise ValueError(f"{name} must be a non-negative number")
-        if (
-            self.dispatch_retry_max_delay_seconds
-            < self.dispatch_retry_base_delay_seconds
-        ):
-            raise ValueError(
-                "dispatch_retry_max_delay_seconds must be at least the base delay"
-            )
+        if self.dispatch_retry_max_delay_seconds < self.dispatch_retry_base_delay_seconds:
+            raise ValueError("dispatch_retry_max_delay_seconds must be at least the base delay")
         if self.wall_clock is not None and not callable(self.wall_clock):
             raise TypeError("wall_clock must be a zero-argument callable or null")
         if self.max_parallel_slices is not None and (
@@ -1241,9 +1225,7 @@ def run_tl_loop(
             plan = WorkPlan.from_mapping(plan)
         except ChainlinkIssueBindingError as error:
             if selected.active:
-                _record_chainlink_binding_gate(
-                    {"run_id": run_id, "plan": plan}, selected, error
-                )
+                _record_chainlink_binding_gate({"run_id": run_id, "plan": plan}, selected, error)
             raise TLLoopError(
                 f"{error}; resolve gate {CHAINLINK_BINDING_RECONCILIATION_GATE_NAME!r} "
                 "by correcting the explicit slice binding"
@@ -1325,7 +1307,9 @@ def run_tl_loop(
                     worktree=existing_state.owner_worktree or selected.worktree,
                 )
                 terminal_recovery_reopened = True
-        if selected.ordered_recovery and isinstance(existing_state.recursive_fsm, RecursiveTLFailed):
+        if selected.ordered_recovery and isinstance(
+            existing_state.recursive_fsm, RecursiveTLFailed
+        ):
             recovery_plan = (
                 plan
                 if isinstance(plan, WorkPlan)
@@ -2212,9 +2196,7 @@ def _ordered_child_recovery_reason(
         or parent_slice.dispatch_authoritative_event_seq is None
         or parent_slice.dispatch_last_boundary not in RECONCILED_SUB_TL_DISPATCH_BOUNDARIES
     ):
-        return _hard_failure(
-            "accepted ordered-child dispatch intent is not durably reconciled"
-        )
+        return _hard_failure("accepted ordered-child dispatch intent is not durably reconciled")
     expected_controller = _child_controller_name(task)
     if parent_slice.dispatch_agent_id != expected_controller:
         return _hard_failure(
@@ -2231,23 +2213,26 @@ def _ordered_child_recovery_reason(
     if not isinstance(child_state.recursive_fsm, RecursiveTLFailed):
         return _hard_failure("child checkpoint is not an authoritative recursive failure")
     if child_state.owner_branch != branch or child_state.owner_worktree != worktree:
-        return _hard_failure(
-            "child checkpoint owner branch or worktree conflicts with the parent"
-        )
-    if child_state.parent_run_id != parent_state.run_id or child_state.parent_branch != parent_branch:
+        return _hard_failure("child checkpoint owner branch or worktree conflicts with the parent")
+    if (
+        child_state.parent_run_id != parent_state.run_id
+        or child_state.parent_branch != parent_branch
+    ):
         return _hard_failure(
             "child checkpoint parent ownership does not match the current controller"
         )
     if child_state.plan_manifest is None or parent_state.plan_manifest is None:
         return _hard_failure("matching child plan manifest is missing")
     node = next(
-        (candidate for candidate in parent_state.plan_manifest.nodes if candidate.name == task.name),
+        (
+            candidate
+            for candidate in parent_state.plan_manifest.nodes
+            if candidate.name == task.name
+        ),
         None,
     )
     expected_child = (
-        parent_state.plan_manifest.child_manifests.get(node.node_id)
-        if node is not None
-        else None
+        parent_state.plan_manifest.child_manifests.get(node.node_id) if node is not None else None
     )
     if expected_child is None or child_state.plan_manifest.digest != expected_child.digest:
         return _hard_failure("child checkpoint plan manifest does not match the parent declaration")
@@ -2272,9 +2257,7 @@ def _ordered_child_recovery_reason(
         IntegrationLifecycle.INTEGRATION_VALIDATED,
         IntegrationLifecycle.MERGING,
     }:
-        return _hard_failure(
-            "child integration has completed or in-flight merge evidence"
-        )
+        return _hard_failure("child integration has completed or in-flight merge evidence")
     for slice_state in child_state.slices.values():
         if slice_state.status in {SliceStatus.FAILED, SliceStatus.PARKED, SliceStatus.BLOCKED}:
             return _hard_failure(f"child slice {slice_state.id!r} has an unsafe terminal status")
@@ -2285,7 +2268,9 @@ def _ordered_child_recovery_reason(
             ActionPhase.IN_FLIGHT,
             ActionPhase.UNKNOWN,
         }:
-            return _hard_failure(f"child slice {slice_state.id!r} has an unresolved action boundary")
+            return _hard_failure(
+                f"child slice {slice_state.id!r} has an unresolved action boundary"
+            )
         if slice_state.status in {
             SliceStatus.SPAWNED,
             SliceStatus.DISPATCH_UNCONFIRMED,
@@ -2327,10 +2312,7 @@ def _ordered_exit_diagnostic_binding_error(
         return "durable child exit diagnostic is missing"
     bound_revision = diagnostic.get("checkpoint_revision")
     if type(bound_revision) is not int or bound_revision != child_state.revision:
-        return (
-            "durable child exit diagnostic is not bound to the current child "
-            "checkpoint revision"
-        )
+        return "durable child exit diagnostic is not bound to the current child checkpoint revision"
     if not isinstance(child_state.recursive_fsm, RecursiveTLFailed):
         return "child checkpoint is not an authoritative recursive failure"
     bound_reason = diagnostic.get("checkpoint_failure_reason")
@@ -2407,10 +2389,13 @@ def _ordered_child_invocation_is_gone(store: RunStore, task_name: str) -> bool:
         child_state = child_store.load()
     except (OSError, ValueError):
         return False
-    if _ordered_exit_diagnostic_binding_error(
-        child_store.exit_diagnostics(),
-        child_state,
-    ) is not None:
+    if (
+        _ordered_exit_diagnostic_binding_error(
+            child_store.exit_diagnostics(),
+            child_state,
+        )
+        is not None
+    ):
         return False
     return isinstance(child_state.recursive_fsm, RecursiveTLFailed)
 
@@ -3127,9 +3112,7 @@ def _run_loop(
             # durable evidence its machine code is read from. There is no
             # transition to apply and no second decision to make here.
             diagnostics.correlated += 1
-            _checkpoint_and_ack(
-                store, source, event, state, phase, acknowledge=not replaying
-            )
+            _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
             if not replaying:
                 diagnostics.acknowledged += 1
             _release_replayed_event(store, event, replaying)
@@ -3248,9 +3231,7 @@ def _run_loop(
             # Telemetry-only rows are acknowledged without an FSM transition or
             # slice mutation; the immutable ledger retains their audit payload.
             diagnostics.correlated += 1
-            _checkpoint_and_ack(
-                store, source, event, state, phase, acknowledge=not replaying
-            )
+            _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
             if not replaying:
                 diagnostics.acknowledged += 1
             _release_replayed_event(store, event, replaying)
@@ -3343,9 +3324,7 @@ def _run_loop(
                         fsm_event.pr_number,
                         refusal,
                     )
-                _checkpoint_and_ack(
-                    store, source, event, state, phase, acknowledge=not replaying
-                )
+                _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
                 if not replaying:
                     diagnostics.acknowledged += 1
                 # The refusal is durable; only now drop a replayed pending row
@@ -3825,6 +3804,8 @@ def _judge_review_stuck(
             "review_rounds_exhausted requires config.tl_model_choice and config.policy; "
             "the controller must resolve roles.tl at startup"
         )
+    if choice.role != "tl":
+        raise TLLoopError("review_stuck judgments must use the roles.tl budget")
     ceiling = config.policy.roles["tl"].escalate_after_attempts
     if target.tl_intervention_attempts >= ceiling:
         LOGGER.info(
@@ -3848,6 +3829,12 @@ def _judge_review_stuck(
         ordered_stages=state.ordered_stages,
         integration=state.integration,
     )
+    choice.store.ledger.bind(
+        choice.role,
+        spent=state.budgets.role_spent.get(choice.role, 0),
+        budget=config.policy.roles["tl"].token_budget,
+        charge_callback=store.charge_role_tokens,
+    )
     spent_before = choice.store.ledger.spent.get(choice.role, 0)
     LOGGER.info(
         "[TL loop] review stuck slice=%s pr=%s rounds=%d intervention=%d/%d model=%s",
@@ -3866,6 +3853,10 @@ def _judge_review_stuck(
         )
     except (RlmError, RepairError, BudgetExceeded, ContextBudgetError) as error:
         LOGGER.error("[TL loop] review-stuck judgment failed slice=%s: %s", target.id, error)
+        state = store.load()
+        reserved = state.slices.get(target.id)
+        if reserved is None:
+            raise TLLoopError(f"review-stuck slice {target.id!r} disappeared from run state")
         return _park_repair_failed(
             store,
             state,
@@ -3876,6 +3867,10 @@ def _judge_review_stuck(
             effects,
             effects_log,
         )
+    state = store.load()
+    reserved = state.slices.get(target.id)
+    if reserved is None:
+        raise TLLoopError(f"review-stuck slice {target.id!r} disappeared from run state")
     _record_controller_event(
         target.id,
         "tl.review_stuck_judged",
@@ -4232,9 +4227,7 @@ def _execute_direct_reviewer_intent(
         # nested child that took the parent's sub-TL slice down with it, so the
         # leaf was never parked and never escalated. The action stays journaled
         # as rejected, so the attempt remains auditable.
-        return _apply_convergence(
-            rejected, tracker, store, config, effects, effects_log
-        )
+        return _apply_convergence(rejected, tracker, store, config, effects, effects_log)
     except BaseException as error:
         refreshed = store.load()
         unknown = _checkpoint_slice_action(
@@ -4954,8 +4947,7 @@ def _merge_result_matches_action(
         return False
     result_head = payload.get("head_sha")
     if result_head is not None and (
-        not isinstance(result_head, str)
-        or (result_head and result_head != action.head_sha)
+        not isinstance(result_head, str) or (result_head and result_head != action.head_sha)
     ):
         return False
     result_branch = payload.get("branch_name")
@@ -5173,7 +5165,9 @@ def _advance_post_merge_boundary(
         if post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING:
             return _run_parent_push(state, current, evidence, config, effects, effects_log, store)
     except IssueCloseRecoveryError as error:
-        return _record_issue_close_failure(store, state, slice_id, error, config, effects, effects_log)
+        return _record_issue_close_failure(
+            store, state, slice_id, error, config, effects, effects_log
+        )
     except (EffectFailed, TLLoopError, ToolUnavailableError, TypeError, ValueError) as error:
         return _block_post_merge_recovery(store, state, slice_id, str(error))
     return state
@@ -5427,7 +5421,9 @@ def _validate_structured_merge_proof(
     if proof.get("prospective_merge_tree_sha") != prospective_tree:
         raise ValueError(f"{operation} squash proof prospective tree mismatch")
     if authoritative_tree != prospective_tree:
-        raise ValueError(f"{operation} squash proof found divergent prospective and authoritative merge trees")
+        raise ValueError(
+            f"{operation} squash proof found divergent prospective and authoritative merge trees"
+        )
 
 
 def _relative_process_working_dir(config: TLLoopConfig) -> str:
@@ -5654,12 +5650,15 @@ def _run_issue_close(
                 default=0,
             )
             if current_failure != attempt:
-                failure_generation = _evidence_int(
-                    evidence,
-                    "issue_close_failure_generation",
-                    "issue-close failure generation",
-                    default=0,
-                ) + 1
+                failure_generation = (
+                    _evidence_int(
+                        evidence,
+                        "issue_close_failure_generation",
+                        "issue-close failure generation",
+                        default=0,
+                    )
+                    + 1
+                )
                 return _record_issue_close_failure(
                     store,
                     state,
@@ -5970,7 +5969,11 @@ def _resolve_issue_close_entry(
     effects_log.resolve_by_key(
         key,
         status="reconciled",
-        resolution={"kind": "chainlink_issue_show", "issue_id": int(issue_id), "status": observed_status},
+        resolution={
+            "kind": "chainlink_issue_show",
+            "issue_id": int(issue_id),
+            "status": observed_status,
+        },
     )
 
 
@@ -6634,9 +6637,7 @@ def _execute_direct_merge_intent(
     if evidence is None:
         return _clear_action_for_reduction(store, state, current.id)
     if state.repository_identity is None:
-        state = _heal_missing_repository_identity(
-            state, config, effects, effects_log, store
-        )
+        state = _heal_missing_repository_identity(state, config, effects, effects_log, store)
         if state.repository_identity is None:
             return state
         current = state.slices[current.id]
@@ -7607,9 +7608,7 @@ def _record_ambiguous_dispatch_outcome(
         and current.dispatch_intent_id == attempt.intent_id
     ):
         return state
-    updated = slice_transition(
-        current, SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED)
-    )
+    updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED))
     updated = replace(
         updated,
         park_cause=ParkCause.DISPATCH_UNCONFIRMED,
@@ -7809,9 +7808,7 @@ def _record_dispatch_retry_scheduled(
         config.dispatch_retry_max_delay_seconds,
     )
     next_attempt_at = _wall_clock(config) + delay
-    updated = slice_transition(
-        current, SliceStatusChanged(SliceStatus.DISPATCH_RETRY_SCHEDULED)
-    )
+    updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCH_RETRY_SCHEDULED))
     updated = replace(
         updated,
         park_cause=None,
@@ -7847,9 +7844,7 @@ def _record_dispatch_retry_scheduled(
     _record_controller_event(
         slice_id,
         "tl.dispatch_retry_scheduled",
-        _dispatch_retry_payload(
-            slice_id, attempt, reason, code, retry_attempt, next_attempt_at
-        ),
+        _dispatch_retry_payload(slice_id, attempt, reason, code, retry_attempt, next_attempt_at),
         config,
         effects,
         effects_log,
@@ -8296,8 +8291,7 @@ def _reviewer_effect_pending(
     if not isinstance(effects_log, EffectJournal):
         return False
     return any(
-        entry.get("operation") == "spawn_reviewer"
-        and entry.get("target") == slice_id
+        entry.get("operation") == "spawn_reviewer" and entry.get("target") == slice_id
         for entry in effects_log.pending_entries()
     )
 
@@ -8840,9 +8834,7 @@ def _merge_journal_is_exact(current: SliceState, merge_entry: Mapping[str, objec
     return persisted_head is not None and expected_head == persisted_head
 
 
-def _merge_action_is_exact(
-    current: SliceState, merge_evidence: Mapping[str, object]
-) -> bool:
+def _merge_action_is_exact(current: SliceState, merge_evidence: Mapping[str, object]) -> bool:
     """Whether the durable unknown-merge action head matches the observed head."""
     action = current.action
     if action is None or not action.intent_id or not action.head_sha:
@@ -9515,9 +9507,7 @@ def _dispatch_retry_payload(
     The machine code is its own dimension so a reader can classify a retry
     without parsing the operator-facing error text.
     """
-    payload = _dispatch_payload(
-        slice_id, attempt, "dispatch_retry_scheduled", error=reason
-    )
+    payload = _dispatch_payload(slice_id, attempt, "dispatch_retry_scheduled", error=reason)
     payload["machine_code"] = code
     payload["retry_attempt"] = retry_attempt
     payload["next_attempt_at"] = next_attempt_at
@@ -9977,7 +9967,8 @@ def _held_by_dispatch_park(state: RunState) -> bool:
         slice_state.status is SliceStatus.DISPATCH_FAILED
         and slice_state.park_cause is ParkCause.DISPATCH_FAILED
         and any(
-            gate.name == _dispatch_failure_gate_name(slice_state.id, slice_state.dispatch_error_code)
+            gate.name
+            == _dispatch_failure_gate_name(slice_state.id, slice_state.dispatch_error_code)
             and gate.status is GateStatus.PENDING
             for gate in state.gates
         )
@@ -10786,7 +10777,9 @@ def _supervise_live_sub_tl(
             }
             and not empty_scope
         ):
-            reason = f"sub-TL controller exited before authoritative resolution with code {exitcode}"
+            reason = (
+                f"sub-TL controller exited before authoritative resolution with code {exitcode}"
+            )
             _persist_child_startup_failure(child_store, reason)
             _record_child_exit_reason(child_store, reason)
             return None
@@ -10983,13 +10976,10 @@ def _complete_sub_tl_batch(
     candidate_records = dict(state.integration.candidates)
     canonical_phase = state.recursive_fsm
     for task, phase, child_state in outcomes:
-        child_handoff_ready = (
-            phase is TLPhase.TLFailed
-            or _child_handoff_ready(child_state, state.run_id)
+        child_handoff_ready = phase is TLPhase.TLFailed or _child_handoff_ready(
+            child_state, state.run_id
         )
-        if (
-            not child_handoff_ready
-        ):
+        if not child_handoff_ready:
             current = updated_slices[task.name]
             updated_slices[task.name] = slice_transition(
                 current, SliceStatusChanged(SliceStatus.SPAWNED)
@@ -11594,9 +11584,7 @@ def _required_bookkeeping_lane_epoch(state: RunState, current: SliceState) -> in
 def _merge_result_is_authoritative(result: ToolResult | None) -> bool:
     """Accept the typed merge response's successful operation outcome."""
     payload = _merge_result_payload(result)
-    return payload is not None and (
-        payload.get("merged") is True or payload.get("success") is True
-    )
+    return payload is not None and (payload.get("merged") is True or payload.get("success") is True)
 
 
 def _merge_failure_classification(result: ToolResult | None) -> str | None:
@@ -13041,9 +13029,7 @@ _SELECTION_PARK_CAUSES: MappingProxyType = MappingProxyType(
         SelectionFailure.NO_CAPABLE_HARNESS: ParkCause.NO_CAPABLE_HARNESS,
         SelectionFailure.REQUEST_NOT_ALLOWED: ParkCause.HARNESS_REQUEST_NOT_ALLOWED,
         SelectionFailure.REQUEST_NOT_CAPABLE: ParkCause.NO_CAPABLE_HARNESS,
-        SelectionFailure.REQUEST_SUPERSEDED_BY_ESCALATION: (
-            ParkCause.HARNESS_REQUEST_SUPERSEDED
-        ),
+        SelectionFailure.REQUEST_SUPERSEDED_BY_ESCALATION: (ParkCause.HARNESS_REQUEST_SUPERSEDED),
     }
 )
 
@@ -13147,7 +13133,9 @@ def _prepare_spawn(
                 store=store,
                 issue_creator=live,
                 ledger=state.budgets,
-                audit={"reason": _selection_refusal(failure, requested, config.role, config.policy)},
+                audit={
+                    "reason": _selection_refusal(failure, requested, config.role, config.policy)
+                },
             )
         raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}; slice parked")
     route = parse_harness_identifier(choice.harness)
@@ -13258,9 +13246,7 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
     )
 
 
-def _controller_epoch(
-    root_dir: Path, run_id: str, parent_generation_id: str | None = None
-) -> str:
+def _controller_epoch(root_dir: Path, run_id: str, parent_generation_id: str | None = None) -> str:
     """Read the init-owned epoch marker, with a deterministic first-run value.
 
     A nested run is never ``init``-launched, so its first epoch is minted here
@@ -14185,9 +14171,9 @@ def _route_repair(
                         reset_key or "",
                     )
                 )
-                recovery_generation = hashlib.sha256(
-                    generation_seed.encode("utf-8")
-                ).hexdigest()[:16]
+                recovery_generation = hashlib.sha256(generation_seed.encode("utf-8")).hexdigest()[
+                    :16
+                ]
                 recovery_kind = (
                     "Operator-authorized execution-budget recovery"
                     if reset_key is not None
@@ -14888,9 +14874,7 @@ def _pr_event_target(
     return matches[0] if len(matches) == 1 else None
 
 
-def _quarantine_historical_publication(
-    store: RunStore, event: EventEnvelope, reason: str
-) -> None:
+def _quarantine_historical_publication(store: RunStore, event: EventEnvelope, reason: str) -> None:
     """Retain a refused historical publication event permanently for audit.
 
     This is deliberately the audit log, not the pending event-quarantine
@@ -14954,9 +14938,7 @@ def _migrate_audit_marked_quarantine(store: RunStore) -> None:
         except QuarantineStorageError as error:
             # A conflicting permanent row already exists for this run_seq.
             # Retain the pending row rather than releasing it into a conflict.
-            LOGGER.warning(
-                "[TL loop] retaining conflicting audit-marked pending row: %s", error
-            )
+            LOGGER.warning("[TL loop] retaining conflicting audit-marked pending row: %s", error)
             continue
         run_seq = document.get("run_seq")
         if isinstance(run_seq, int):
@@ -15238,9 +15220,7 @@ def _record_chainlink_binding_gate(
     error: ChainlinkIssueBindingError,
 ) -> None:
     raw_run_id = (
-        root_spec.get("run_id", config.run_id)
-        if isinstance(root_spec, Mapping)
-        else config.run_id
+        root_spec.get("run_id", config.run_id) if isinstance(root_spec, Mapping) else config.run_id
     )
     if not isinstance(raw_run_id, str) or not raw_run_id:
         raise TLLoopError(f"invalid Chainlink binding cannot be gated: {error}") from error
@@ -15255,7 +15235,12 @@ def _record_chainlink_binding_gate(
     }
     plan_value = root_spec.get("plan", root_spec) if isinstance(root_spec, Mapping) else {}
     has_sub_tls = isinstance(plan_value, Mapping) and bool(plan_value.get("sub_tls"))
-    if has_sub_tls or config.parent_branch is not None or config.worktree is not None or config.depth > 0:
+    if (
+        has_sub_tls
+        or config.parent_branch is not None
+        or config.worktree is not None
+        or config.depth > 0
+    ):
         initial.update(
             {
                 "owner_branch": config.branch,
@@ -15317,9 +15302,7 @@ def derive_child_worktree(parent_worktree: str | Path, name: str) -> Path:
     return Path(parent_worktree) / name
 
 
-def _sub_tl_worktree(
-    config: TLLoopConfig, root_dir: Path, run_id: str, task: SubTLTask
-) -> Path:
+def _sub_tl_worktree(config: TLLoopConfig, root_dir: Path, run_id: str, task: SubTLTask) -> Path:
     """Use the server-owned worktree namespace for live controllers."""
     if task.worktree is not None:
         return Path(task.worktree)
@@ -16155,9 +16138,7 @@ def _leaf(value: object) -> LeafTask:
     )
 
 
-def _reject_unknown_task_keys(
-    value: Mapping[str, object], allowed: set[str], kind: str
-) -> None:
+def _reject_unknown_task_keys(value: Mapping[str, object], allowed: set[str], kind: str) -> None:
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise ValueError(f"{kind} contains unknown keys: {', '.join(unknown)}")

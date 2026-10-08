@@ -13,6 +13,7 @@ from tl_loop.client.transport import JsonObject
 
 LOGGER = logging.getLogger(__name__)
 JudgmentEmitter = Callable[[JsonObject], object]
+RoleCharge = Callable[[str, int], int]
 
 
 @dataclass(frozen=True)
@@ -69,20 +70,59 @@ class RlmRoleLedger:
 
     spent: dict[str, int] = field(default_factory=dict)
     budgets: Mapping[str, int] = field(default_factory=dict)
+    charge_callback: RoleCharge | None = None
 
-    def charge(self, role: str, tokens: int) -> None:
-        """Charge one completed attempt, enforcing an optional role ceiling."""
+    def bind(
+        self,
+        role: str,
+        *,
+        spent: int,
+        budget: int,
+        charge_callback: RoleCharge,
+    ) -> None:
+        """Bind a role to its restored durable spend and checkpoint charge path."""
+        if not role:
+            raise ValueError("role must be non-empty")
+        if type(spent) is not int or spent < 0:
+            raise ValueError("spent must be a non-negative integer")
+        if type(budget) is not int or budget <= 0:
+            raise ValueError("budget must be a positive integer")
+        if not callable(charge_callback):
+            raise TypeError("charge_callback must be callable")
+        self.spent[role] = spent
+        self.budgets = {**self.budgets, role: budget}
+        self.charge_callback = charge_callback
+
+    def ensure_budget_available(self, role: str) -> None:
+        """Reject another call once restored or current spend has reached its ceiling."""
+        if not role:
+            raise ValueError("role must be non-empty")
+        current = self.spent.get(role, 0)
+        ceiling = self.budgets.get(role)
+        if ceiling is not None and current >= ceiling:
+            raise BudgetExceeded(f"role {role!r} budget exhausted: {current} >= {ceiling}")
+
+    def charge(self, role: str, tokens: int) -> bool:
+        """Persist one completed attempt and report whether actual use exceeded its ceiling."""
         if not role:
             raise ValueError("role must be non-empty")
         if type(tokens) is not int or tokens < 0:
             raise ValueError("tokens must be a non-negative integer")
         current = self.spent.get(role, 0)
         ceiling = self.budgets.get(role)
-        if ceiling is not None and current + tokens > ceiling:
-            raise BudgetExceeded(
-                f"role {role!r} budget exceeded: {current + tokens} > {ceiling}"
-            )
-        self.spent[role] = current + tokens
+        if ceiling is not None and current >= ceiling:
+            raise BudgetExceeded(f"role {role!r} budget exhausted: {current} >= {ceiling}")
+        if tokens == 0:
+            return False
+        updated = (
+            self.charge_callback(role, tokens)
+            if self.charge_callback is not None
+            else current + tokens
+        )
+        if type(updated) is not int or updated < current + tokens:
+            raise ValueError("durable role charge returned an invalid total")
+        self.spent[role] = updated
+        return ceiling is not None and updated > ceiling
 
 
 class BudgetExceeded(ValueError):
@@ -98,19 +138,20 @@ class RlmCallStore:
     judgment_emitter: JudgmentEmitter | None = None
     _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
-    def commit(self, role: str, tokens: int, event: JsonObject) -> None:
-        """Commit charge and event together, rolling back if either write fails."""
+    def commit(self, role: str, tokens: int, event: JsonObject) -> bool:
+        """Record one attempt and report a realized over-budget response."""
         with self._lock:
             before_spent = dict(self.ledger.spent)
             before_events = len(self.events)
             try:
-                self.ledger.charge(role, tokens)
+                exceeded = self.ledger.charge(role, tokens)
                 self.events.append(copy.deepcopy(event))
             except BaseException:
                 self.ledger.spent.clear()
                 self.ledger.spent.update(before_spent)
                 del self.events[before_events:]
                 raise
+            return exceeded
 
     def emit_judgment(self, payload: JsonObject) -> None:
         """Best-effort delivery of an aggregate judgment outside the local store."""

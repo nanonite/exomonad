@@ -20,6 +20,7 @@ from tl_loop.loop.driver import (
     TLLoopConfig,
     WorkPlan,
     _apply_convergence,
+    _judge_review_stuck,
     _route_ci_event,
     _route_review_event,
 )
@@ -78,7 +79,8 @@ def _project(tmp_path: Path, *, tl_allow: str = "codex/gpt-test", catalog: bool 
     )
     (exo / "harness_policy.toml").write_text(
         "".join(
-            f"[roles.{name}]\n" + role.format(allow=f'"{tl_allow if name == "tl" else "codex/gpt-test"}"')
+            f"[roles.{name}]\n"
+            + role.format(allow=f'"{tl_allow if name == "tl" else "codex/gpt-test"}"')
             for name in ("tl", "worker", "reviewer")
         ),
         encoding="utf-8",
@@ -122,9 +124,7 @@ def _patch_launcher(monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]
     monkeypatch.setattr(launcher, "LedgerQueue", lambda *a, **kw: _EmptySource())
     monkeypatch.setattr(launcher, "EffectClient", lambda *a, **kw: object())
     monkeypatch.setattr(launcher, "LedgerReader", lambda *a, **kw: object())
-    monkeypatch.setattr(
-        launcher, "_load_plan", lambda path, wait: ({"plan": {}}, b'{"plan":{}}')
-    )
+    monkeypatch.setattr(launcher, "_load_plan", lambda path, wait: ({"plan": {}}, b'{"plan":{}}'))
     monkeypatch.setattr(launcher, "_record_plan_snapshot", lambda root, plan, data: None)
     monkeypatch.setattr(launcher, "_plan_from_document", lambda document: object())
     monkeypatch.setattr(launcher, "_authoritative_ledger_run_id", lambda root: None)
@@ -203,7 +203,9 @@ def test_main_config_no_go_below_ceiling_forwards_findings_with_no_model_call(
     assert config.review_model_choice is None
     transport = ReviewRepairTransport()
     store = _owned_store(tmp_path / "run")
-    config = replace(config, review_policy_path=_project(tmp_path / "policy") / ".exo" / "review-policy.toml")
+    config = replace(
+        config, review_policy_path=_project(tmp_path / "policy") / ".exo" / "review-policy.toml"
+    )
 
     _route_review_event(
         _plan(),
@@ -282,9 +284,7 @@ def test_ci_failure_at_the_round_ceiling_is_left_to_the_review_stuck_judgment(
 
 @dataclass
 class _IssueTransport(ReviewRepairTransport):
-    def call_tool(
-        self, role: str, name: str, tool_name: str, arguments: JsonObject
-    ) -> JsonObject:
+    def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
         if tool_name == "chainlink_issue_create":
             self.calls.append((tool_name, arguments))
             return {"success": True, "result": {"issue_id": 1010}}
@@ -311,10 +311,17 @@ def _stuck_store(tmp_path: Path, **changes: object) -> RunStore:
     return store
 
 
-def _stuck_config(backend: ReviewBackend, *, escalate_after: int = 1) -> TLLoopConfig:
+def _stuck_config(
+    backend: ReviewBackend,
+    *,
+    escalate_after: int = 1,
+    token_budget: int = 120_000,
+) -> TLLoopConfig:
+    policy = _selector_policy(escalate_after)
+    policy["roles"]["tl"]["token_budget"] = token_budget  # type: ignore[index]
     return TLLoopConfig(
         active=True,
-        policy=validate_policy(_selector_policy(escalate_after)),
+        policy=validate_policy(policy),
         tl_model_choice=RlmModelChoice(
             model_id="tl-model",
             backend=backend,
@@ -350,8 +357,13 @@ def test_rounds_at_ceiling_make_one_tl_judgment_and_guide_resumes_with_fresh_bud
     tmp_path: Path,
 ) -> None:
     backend = ReviewBackend(
-        [RlmResponse({"action": "guide", "reason": "a concrete repair exists", "handoff": GUIDE},
-                     input_tokens=10, output_tokens=5)]
+        [
+            RlmResponse(
+                {"action": "guide", "reason": "a concrete repair exists", "handoff": GUIDE},
+                input_tokens=10,
+                output_tokens=5,
+            )
+        ]
     )
     transport = _IssueTransport()
     store = _stuck_store(tmp_path)
@@ -383,6 +395,71 @@ def test_rounds_at_ceiling_make_one_tl_judgment_and_guide_resumes_with_fresh_bud
             "tokens": 15,
         }
     ]
+
+
+def test_review_stuck_budget_is_restored_and_blocks_calls_after_continue(
+    tmp_path: Path,
+) -> None:
+    first_backend = ReviewBackend(
+        [RlmResponse({"action": "guide", "reason": "a repair fits", "handoff": GUIDE}, 10, 5)]
+    )
+    transport = _IssueTransport()
+    store = _stuck_store(tmp_path)
+    state = store.load()
+    config = _stuck_config(first_backend, escalate_after=2, token_budget=15)
+
+    _judge_review_stuck(
+        state,
+        state.slices["leaf-a"],
+        store,
+        config,
+        EffectClient(transport),
+        [],
+        2,
+    )
+
+    assert store.load().budgets.role_spent["tl"] == 15
+    resumed_store = RunStore(store.run_id, store.root_dir)
+    resumed = resumed_store.load()
+    next_review = replace(
+        resumed.slices["leaf-a"],
+        status=SliceStatus.IN_REVIEW,
+        verdict=Verdict.NO_GO,
+        review_rounds=2,
+        park_cause=None,
+        dispatch_error=None,
+    )
+    resumed_store.checkpoint(
+        resumed.fsm,
+        {**resumed.slices, "leaf-a": next_review},
+        resumed.budgets,
+        resumed.events.last_consumed_offset,
+    )
+    second_backend = ReviewBackend([])
+    second_config = _stuck_config(second_backend, escalate_after=2, token_budget=15)
+    second_config = replace(
+        second_config,
+        tl_model_choice=build_tl_model_choice(
+            second_config.policy,
+            None,
+            backend=second_backend,
+            run_store=resumed_store,
+        ),
+    )
+    assert second_config.tl_model_choice.store.ledger.spent["tl"] == 15
+    result = _judge_review_stuck(
+        resumed_store.load(),
+        next_review,
+        resumed_store,
+        second_config,
+        EffectClient(transport),
+        [],
+        2,
+    )
+
+    assert second_backend.requests == []
+    assert result.budgets.role_spent["tl"] == 15
+    assert result.slices["leaf-a"].park_cause is ParkCause.REVIEW_STUCK
 
 
 def test_tl_escalate_opens_the_named_human_gate(tmp_path: Path) -> None:
@@ -623,7 +700,9 @@ def _request() -> RlmRequest:
     )
 
 
-def _backend(harness: str, runner: _Runner, monkeypatch: pytest.MonkeyPatch) -> SubprocessRlmBackend:
+def _backend(
+    harness: str, runner: _Runner, monkeypatch: pytest.MonkeyPatch
+) -> SubprocessRlmBackend:
     monkeypatch.setattr(
         "tl_loop.rlm.subprocess_backend.shutil.which", lambda name: f"/usr/bin/{name}"
     )

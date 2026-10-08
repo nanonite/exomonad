@@ -1102,12 +1102,15 @@ request = PlanAuthoringInput.from_mapping(
     }
 )
 
+# Open the existing run checkpoint before authoring so roles.tl spend is charged
+# to the same durable budget used by review-stuck judgments.
+store = RunStore("root", ".exo/tl-loop")
+
 # The model is resolved from harness_policy.toml, never from the request.
 choice = resolve_authoring_model_choice(load_policy(), backend=backend)
 
-proposal = author_plan(request, model_choice=choice, run_id="root")
+proposal = author_plan(request, model_choice=choice, run_id="root", run_store=store)
 
-store = RunStore("root", ".exo/tl-loop")
 open_acceptance_gate(store, proposal)
 print(acceptance_gate_name(proposal))
 ```

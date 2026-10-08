@@ -26,7 +26,6 @@ from tl_loop.rlm.plan_acceptance import (
     PlanRejected,
     acceptance_gate_name,
     acceptance_status,
-    gate_status_of,
     install_accepted_plan,
     open_acceptance_gate,
     plan_from_record,
@@ -38,17 +37,17 @@ from tl_loop.rlm.plan_acceptance import (
 from tl_loop.rlm.plan_authoring import (
     AuthoredPlan,
     PlanAuthoringError,
-    build_authoring_manifest,
     PlanAuthoringInput,
     PlanAuthoringInputError,
     author_plan,
     authoring_root_spec,
+    build_authoring_manifest,
     judgment_audit,
     resolve_authoring_model_choice,
     slices_to_plan_document,
 )
 from tl_loop.rlm.slice_spec import SliceSpec
-from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest
+from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.model import ModelCatalog, select_model
 from tl_loop.select.policy import HarnessPolicy, validate_policy
 from tl_loop.state.schema import GateStatus, SliceStatus
@@ -150,10 +149,7 @@ def _request(**overrides: object) -> PlanAuthoringInput:
 def _authored(responses: list[object], **overrides: object) -> tuple[AuthoredPlan, FakeBackend]:
     backend = FakeBackend(responses)
     plan = author_plan(
-        _request(**overrides),
-        model_choice=_choice(backend),
-        run_id="root",
-        policy=_policy()
+        _request(**overrides), model_choice=_choice(backend), run_id="root", policy=_policy()
     )
     return plan, backend
 
@@ -200,7 +196,9 @@ def _dispatch(store: RunStore, slice_id: str) -> None:
 
 
 def test_valid_authoring_produces_a_validated_inert_plan() -> None:
-    plan, backend = _authored([_output(_slice("api", "src/api.py"), _slice("tests", "tests/api.py"))])
+    plan, _backend = _authored(
+        [_output(_slice("api", "src/api.py"), _slice("tests", "tests/api.py"))]
+    )
 
     assert plan.requires_acceptance is True
     assert plan.run_id == "root"
@@ -215,7 +213,16 @@ def test_valid_authoring_produces_a_validated_inert_plan() -> None:
 
 def test_authored_test_plan_survives_into_the_leaf_verification() -> None:
     plan, _ = _authored(
-        [_output(_slice("api", "src/api.py", test_plan=["just tl-loop-replay"], verify=["just tl-loop-lint"]))]
+        [
+            _output(
+                _slice(
+                    "api",
+                    "src/api.py",
+                    test_plan=["just tl-loop-replay"],
+                    verify=["just tl-loop-lint"],
+                )
+            )
+        ]
     )
 
     leaves = cast(list[JsonObject], cast(JsonObject, plan.plan_mapping())["leaves"])
@@ -277,6 +284,29 @@ def test_model_choice_is_resolved_from_the_policy_allowlist() -> None:
     assert choice.model_id == "gpt-luna"
     assert choice.role == "tl"
     assert choice.store.ledger.budgets == {"tl": 1_000_000}
+
+
+def test_tl_plan_authoring_charges_the_run_budget_and_restores_it(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    backend = FakeBackend(
+        [RlmResponse(_output(_slice("api", "src/api.py")), input_tokens=4, output_tokens=6)]
+    )
+    choice = resolve_authoring_model_choice(_policy(), backend=backend)
+
+    author_plan(_request(), model_choice=choice, run_id="root", run_store=store)
+
+    assert store.load().budgets.role_spent["tl"] == 10
+    assert RunStore("root", tmp_path).load().budgets.role_spent["tl"] == 10
+
+
+def test_tl_plan_authoring_requires_a_run_store_before_calling_the_model() -> None:
+    backend = FakeBackend([_output(_slice("api", "src/api.py"))])
+    choice = resolve_authoring_model_choice(_policy(), backend=backend)
+
+    with pytest.raises(PlanAuthoringError, match="requires its RunStore"):
+        author_plan(_request(), model_choice=choice, run_id="root")
+
+    assert backend.requests == []
 
 
 def test_bare_agent_type_policy_defers_the_model_to_the_catalog() -> None:
@@ -421,9 +451,6 @@ def test_context_overflow_is_refused_rather_than_truncated() -> None:
     assert backend.requests == []
 
 
-
-
-
 # --------------------------------------------------------------------------
 # Cycle and ownership rejection
 # --------------------------------------------------------------------------
@@ -562,7 +589,7 @@ def test_harness_request_outside_the_allowlist_is_refused_before_the_judgment() 
             _request(agent_type="codex/gpt-other"),
             model_choice=_choice(backend),
             run_id="root",
-            policy=_policy()
+            policy=_policy(),
         )
     assert backend.requests == []
 
@@ -640,9 +667,7 @@ def test_approval_installs_the_validated_manifest(tmp_path: Path) -> None:
     assert state.plan_manifest is not None
     assert state.plan_manifest.digest == plan.digest
     assert sorted(state.slices) == ["api", "tests"]
-    assert all(
-        slice_state.status is SliceStatus.PENDING for slice_state in state.slices.values()
-    )
+    assert all(slice_state.status is SliceStatus.PENDING for slice_state in state.slices.values())
 
 
 def test_approving_one_proposal_does_not_accept_another(tmp_path: Path) -> None:
