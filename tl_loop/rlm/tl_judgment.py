@@ -1,12 +1,13 @@
-"""The roles.tl model resolution and the review-stuck judgment.
+"""The roles.tl model resolution and bounded TL judgments.
 
-The deterministic worker<->reviewer loop makes no model call. When a slice
-reaches ``reviewer_max_rounds`` without converging, the controller makes ONE
-``roles.tl`` judgment with a closed two-action schema:
+The deterministic worker<->reviewer loop makes no model call. At the review
+round ceiling, or at a parent integration failure, the controller makes one
+bounded ``roles.tl`` judgment with a closed action schema:
 
-* ``guide``: a seven-section ``RepairHandoff`` (the ``compose_repair`` schema and
-  its owned-path validation) dispatched through ``resume_pr`` to the same owner;
-* ``escalate``: open the named human gate.
+* ``review_stuck`` chooses ``guide`` or ``escalate``;
+* ``integration_failure`` chooses ``delegate`` or ``escalate``. Both repair
+  actions carry a seven-section ``RepairHandoff`` validated against owned paths
+  and dispatched through ``resume_pr`` to the same owner.
 
 The model resolves from ``roles.tl`` in ``.exo/harness_policy.toml`` and
 ``.exo/model-catalog.json``. A model-qualified allow entry pins the model; a bare
@@ -40,6 +41,8 @@ from .subprocess_backend import SubprocessRlmBackend
 TL_ROLE = "tl"
 REVIEW_STUCK_JUDGMENT = "review_stuck"
 REVIEW_STUCK_ACTIONS = ("guide", "escalate")
+INTEGRATION_FAILURE_JUDGMENT = "integration_failure"
+INTEGRATION_FAILURE_ACTIONS = ("delegate", "escalate")
 DEFAULT_TL_CONTEXT_LENGTH = 128_000
 POLICY_FILE = ".exo/harness_policy.toml"
 CATALOG_FILE = ".exo/model-catalog.json"
@@ -82,6 +85,46 @@ DONE CRITERIA
 - Return only the schema object.
 """
 
+INTEGRATION_FAILURE_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": list(INTEGRATION_FAILURE_ACTIONS)},
+        "reason": {"type": "string", "minLength": 1},
+        "handoff": REPAIR_HANDOFF_SCHEMA,
+    },
+    "required": ["action", "reason"],
+    "additionalProperties": False,
+}
+
+INTEGRATION_FAILURE_PROMPT = """A child integration failed against its parent branch.
+Decide whether the existing aggregate owner can repair it, or whether a human
+must resolve the integration.
+
+ANTI-PATTERNS (FIRST)
+- Do not create a new branch, leaf name, agent type, or PR.
+- Do not propose edits outside the supplied slice-owned paths.
+- Do not return prose outside the schema.
+- Do not delegate an ambiguous failure or one requiring a plan or policy change.
+
+READ FIRST
+- The integration failure and parent/head evidence are the primary diagnosis.
+- The supplied slice paths bound every path the handoff may name.
+
+STEPS
+- Choose "delegate" when a concrete repair within the existing aggregate
+  owner's boundary can resolve the failure. Return a complete "handoff" with
+  root_cause, proposed_solution, read_first, steps, verify, boundary, and
+  done_criteria, all non-empty.
+- Choose "escalate" otherwise. Return only "reason"; omit "handoff".
+
+VERIFY
+- "delegate" carries a complete handoff and "escalate" carries none.
+- The controller resumes the existing owner and validates the handoff paths.
+
+DONE CRITERIA
+- Return only the schema object.
+"""
+
 
 class TLModelResolutionError(RuntimeError):
     """The roles.tl judgment model cannot be resolved; the message names the file."""
@@ -94,6 +137,19 @@ class ReviewStuckJudgmentError(RepairError):
 @dataclass(frozen=True)
 class ReviewStuckDecision:
     """One validated review-stuck judgment."""
+
+    action: str
+    reason: str
+    handoff: RepairHandoff | None = None
+
+
+class IntegrationFailureJudgmentError(RepairError):
+    """The integration-failure judgment is unusable or violates its contract."""
+
+
+@dataclass(frozen=True)
+class IntegrationFailureDecision:
+    """One validated delegate/escalate judgment for an integration failure."""
 
     action: str
     reason: str
@@ -229,15 +285,73 @@ def judge_review_stuck(
     return ReviewStuckDecision("guide", reason, handoff)
 
 
+def judge_integration_failure(
+    choice: RlmModelChoice,
+    *,
+    evidence: Mapping[str, object],
+    owned_paths: Sequence[str],
+) -> IntegrationFailureDecision:
+    """Make one roles.tl integration judgment and validate its closed result."""
+    inputs: JsonObject = {
+        "sections": cast(
+            JsonValue,
+            [
+                {
+                    "name": "instructions",
+                    "content": INTEGRATION_FAILURE_PROMPT,
+                    "priority": 140,
+                    "required": True,
+                },
+                {
+                    "name": "slice_boundary",
+                    "content": list(owned_paths),
+                    "priority": 130,
+                    "required": True,
+                },
+                {
+                    "name": "integration_failure",
+                    "content": cast(JsonValue, dict(evidence)),
+                    "priority": 120,
+                    "required": True,
+                },
+            ],
+        )
+    }
+    output = rlm(INTEGRATION_FAILURE_JUDGMENT, inputs, INTEGRATION_FAILURE_SCHEMA, choice)
+    action = cast(str, output["action"])
+    reason = cast(str, output["reason"]).strip()
+    handoff_value = output.get("handoff")
+    if action == "escalate":
+        if handoff_value is not None:
+            raise IntegrationFailureJudgmentError("an escalate judgment must not carry a handoff")
+        return IntegrationFailureDecision("escalate", reason)
+    if action != "delegate":
+        raise IntegrationFailureJudgmentError(f"unsupported integration action {action!r}")
+    if not isinstance(handoff_value, Mapping):
+        raise IntegrationFailureJudgmentError("a delegate judgment must carry a handoff")
+    try:
+        handoff = RepairHandoff.from_mapping(handoff_value)
+    except RepairInputError as error:
+        raise IntegrationFailureJudgmentError(f"delegate handoff rejected: {error}") from error
+    return IntegrationFailureDecision("delegate", reason, handoff)
+
+
 __all__ = [
     "CATALOG_FILE",
+    "INTEGRATION_FAILURE_ACTIONS",
+    "INTEGRATION_FAILURE_JUDGMENT",
+    "INTEGRATION_FAILURE_PROMPT",
+    "INTEGRATION_FAILURE_SCHEMA",
     "POLICY_FILE",
     "REVIEW_STUCK_JUDGMENT",
     "REVIEW_STUCK_SCHEMA",
+    "IntegrationFailureDecision",
+    "IntegrationFailureJudgmentError",
     "ReviewStuckDecision",
     "ReviewStuckJudgmentError",
     "TLModelResolutionError",
     "build_tl_model_choice",
+    "judge_integration_failure",
     "judge_review_stuck",
     "resolve_tl_model_id",
 ]

@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
+
 ### Fixed
 - tl_loop: charge roles.tl judgment tokens to the durable BudgetLedger (survives restart) (#1161)
 - Support optional slice-scoped Chainlink issue integration (#1165)

@@ -252,9 +252,30 @@
         "slice_id",
         "pr_number",
         "owner_id",
+        "failure_kind",
         "reason",
         "repair_attempt"
       ]
+    },
+    "tl.integration_failure_judged": {
+      "fields": [
+        "slice_id",
+        "pr_number",
+        "head_sha",
+        "failure_kind",
+        "action",
+        "reason",
+        "intervention",
+        "ceiling",
+        "model",
+        "tokens"
+      ]
+    },
+    "tl.integration_failure_ceiling_reached": {
+      "fields": ["slice_id", "failure_kind", "interventions", "ceiling", "reason"]
+    },
+    "tl.integration_failure_judgment_failed": {
+      "fields": ["slice_id", "failure_kind", "intervention", "ceiling", "model", "error"]
     },
     "tl.integration_revalidated": {
       "fields": [

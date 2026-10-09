@@ -119,9 +119,10 @@ The conceptual hylomorphism remains useful: a plan and checkpoint are the
 unfold boundary, while event-driven review, merge, and upward PR effects are
 the fold boundary. The controller makes those transitions executable and
 testable; the model supplies only bounded structured judgments
-(`decompose`, the `review_stuck` guide/escalate judgment, and, for post-merge
-integration repair, `compose_repair`; `adjudicate_review` applies only to review
-events that carry no reviewer verdict).
+(`decompose`, the `review_stuck` guide/escalate judgment, the
+`integration_failure` delegate/escalate judgment at the parent integration
+boundary, and `adjudicate_review` for review events that carry no reviewer
+verdict).
 
 ### 2026-10-06: Inner/outer review loop
 
@@ -136,7 +137,7 @@ model judgment only where slices interact or one cannot converge on its own.
 | Pre-merge CI failure on the PR head | inner loop: the failure to the same owner through `resume_pr`; counts as a round | none |
 | Reviewer GO with same-head CI green | the reviewer's decision; the controller performs `merge_pr` mechanically | none |
 | Review stuck (rounds exhausted) | one `roles.tl` judgment, `guide` or `escalate` | `roles.tl` |
-| Post-merge integration failure (parent-branch CI/build after merge) | `roles.tl` judgment: delegate or escalate | `roles.tl`; implemented by the follow-up issue #1160, not by this change |
+| Parent integration failure (aggregate PR CI after child merges, or merge conflict against its parent) | one `roles.tl` judgment: delegate to the existing aggregate owner or escalate | `roles.tl` (`integration_failure`); implemented in #1160, bounded, journaled, and charged to its role budget |
 
 **Why.** A beast-workspace run parked a leaf as `REVIEW_STUCK` on reviewer round 1
 with `compose_repair requires an effect client and resolved model choice`. The

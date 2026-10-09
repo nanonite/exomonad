@@ -34,13 +34,14 @@ from tl_loop.loop.driver import (
     DISPATCH_CORRELATED,
     DISPATCH_HISTORICAL_AUDIT,
     DISPATCH_INTEGRITY_CONFLICT,
+    INTEGRATION_FAILURE_GATE_NAME,
+    REPEATED_ACTION_GATE_PREFIX,
     DepthLimitExceeded,
     DispatchAttempt,
     EffectIntent,
     EventDiagnostics,
     LoopCancelled,
     LoopLimitExceeded,
-    REPEATED_ACTION_GATE_PREFIX,
     SubTLTask,
     TLLoopConfig,
     TLLoopError,
@@ -62,14 +63,14 @@ from tl_loop.loop.driver import (
     _migrate_audit_marked_quarantine,
     _new_dispatch_attempt,
     _ordered_child_complete,
-    _publication_from_watcher,
-    _reconcile_pending_merge_entry,
-    _replayable_quarantine_documents,
     _park_repeated_action,
     _phase_after_slice_merge,
+    _publication_from_watcher,
+    _reconcile_pending_merge_entry,
     _record_review_event,
     _recover_tool_unavailable,
     _recursive_phase_after_slice_update,
+    _replayable_quarantine_documents,
     _route_ci_event,
     _route_review_event,
     _run_live_sub_tl,
@@ -115,7 +116,6 @@ from tl_loop.state.schema import (
     BudgetLedger,
     DurableReviewEvidence,
     FSMState,
-    RunState,
     GateState,
     GateStatus,
     HandoffEvidence,
@@ -125,6 +125,7 @@ from tl_loop.state.schema import (
     ParkCause,
     PublicationBinding,
     RepositoryIdentity,
+    RunState,
     SliceState,
     SliceStatus,
     Verdict,
@@ -5500,6 +5501,197 @@ def _ci_failure_event() -> EventEnvelope:
     )
 
 
+def _aggregate_ci_store(tmp_path: Path, *, interventions: int = 0) -> RunStore:
+    """Seed one aggregate PR whose parent-branch CI can fail after child merges."""
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    state = store.load()
+    current = replace(
+        state.slices["leaf-a"],
+        dispatch_agent_id="review-run:leaf-a:integration",
+        dispatch_last_boundary="aggregate_pr_open",
+        ci_state={"head-a": "success"},
+    )
+    candidate = IntegrationCandidateState(
+        lifecycle=IntegrationLifecycle.CODE_REVIEWED,
+        aggregate_pr_number=42,
+        aggregate_head_sha="head-a",
+        aggregate_patch_digest="patch-a",
+        aggregate_original_base_sha="main",
+        integration_owner_id="review-run:leaf-a:integration",
+        integration_owner_run_id="leaf-a",
+        integration_owner_branch="main.leaf-a",
+        integration_owner_worktree=".worktrees/leaf-a",
+        head_sha="head-a",
+        patch_digest="patch-a",
+        ci_status="success",
+        tl_intervention_attempts=interventions,
+    )
+    store.checkpoint(
+        state.fsm,
+        {"leaf-a": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+        integration=IntegrationRuntimeState(
+            lifecycle=IntegrationLifecycle.CODE_REVIEWED,
+            sub_tl_states={"leaf-a": IntegrationLifecycle.CODE_REVIEWED},
+            candidates={"leaf-a": candidate},
+        ),
+    )
+    return store
+
+
+def _integration_judgment_config(backend: ReviewBackend, *, ceiling: int = 1) -> TLLoopConfig:
+    return TLLoopConfig(
+        active=True,
+        policy=validate_policy(_selector_policy(ceiling)),
+        tl_model_choice=_tl_choice(backend),
+    )
+
+
+def test_parent_branch_ci_failure_judges_once_and_resumes_aggregate_owner(
+    tmp_path: Path,
+) -> None:
+    backend = ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "action": "delegate",
+                    "reason": "The existing aggregate owner can fix this within its boundary",
+                    "handoff": {
+                        "root_cause": "The integrated parent branch fails its test",
+                        "proposed_solution": "Fix the failing test on the aggregate PR",
+                        "read_first": ["src/leaf.py"],
+                        "steps": ["Repair the failing test"],
+                        "verify": ["just tl-loop-test"],
+                        "boundary": ["Only edit src/leaf.py"],
+                        "done_criteria": ["Parent branch CI passes"],
+                    },
+                },
+                input_tokens=10,
+                output_tokens=5,
+            )
+        ]
+    )
+    transport = ReviewRepairTransport()
+    store = _aggregate_ci_store(tmp_path)
+
+    _route_ci_event(
+        store,
+        store.load(),
+        TLPlanning(),
+        _ci_failure_event(),
+        1,
+        _integration_judgment_config(backend),
+        EffectClient(transport),
+        [],
+    )
+    _route_ci_event(
+        store,
+        store.load(),
+        TLPlanning(),
+        _ci_failure_event(),
+        2,
+        _integration_judgment_config(backend),
+        EffectClient(transport),
+        [],
+    )
+
+    restored = store.load()
+    assert [request.name for request in backend.requests] == ["integration_failure"]
+    assert restored.slices["leaf-a"].status is SliceStatus.REPAIRING
+    assert restored.integration.candidates["leaf-a"].lifecycle is (
+        IntegrationLifecycle.REPAIRING_AGGREGATE
+    )
+    assert restored.integration.candidates["leaf-a"].tl_intervention_attempts == 1
+    assert restored.budgets.role_spent["tl"] == 15
+    assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
+
+
+def test_aggregate_ci_recovery_resets_intervention_allowance(tmp_path: Path) -> None:
+    store = _aggregate_ci_store(tmp_path, interventions=1)
+    success = project(
+        {
+            "type": "ci.status_changed",
+            "run_seq": 2,
+            "run_id": "review-run",
+            "agent_id": "leaf-a",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-12T00:00:01Z",
+            "data": {
+                "slice_id": "leaf-a",
+                "pr_number": 42,
+                "head_sha": "head-a",
+                "status": "success",
+            },
+        }
+    )
+
+    _route_ci_event(
+        store,
+        store.load(),
+        TLPlanning(),
+        success,
+        2,
+        TLLoopConfig(active=True),
+        EffectClient(RecordingTransport()),
+        [],
+    )
+
+    assert store.load().integration.candidates["leaf-a"].tl_intervention_attempts == 0
+
+
+def test_parent_branch_ci_failure_escalates_to_named_gate(tmp_path: Path) -> None:
+    backend = ReviewBackend(
+        [RlmResponse({"action": "escalate", "reason": "The failure crosses the slice boundary"})]
+    )
+    transport = RecordingTransport()
+    store = _aggregate_ci_store(tmp_path)
+
+    _route_ci_event(
+        store,
+        store.load(),
+        TLPlanning(),
+        _ci_failure_event(),
+        1,
+        _integration_judgment_config(backend),
+        EffectClient(transport),
+        [],
+    )
+
+    restored = store.load()
+    assert [request.name for request in backend.requests] == ["integration_failure"]
+    assert GateState(name=INTEGRATION_FAILURE_GATE_NAME, status=GateStatus.PENDING) in (
+        restored.gates
+    )
+    assert not any(name == "resume_pr" for name, _ in transport.calls)
+
+
+def test_parent_branch_ci_failure_ceiling_opens_gate_without_another_judgment(
+    tmp_path: Path,
+) -> None:
+    backend = ReviewBackend([])
+    transport = RecordingTransport()
+    store = _aggregate_ci_store(tmp_path, interventions=1)
+
+    _route_ci_event(
+        store,
+        store.load(),
+        TLPlanning(),
+        _ci_failure_event(),
+        1,
+        _integration_judgment_config(backend, ceiling=1),
+        EffectClient(transport),
+        [],
+    )
+
+    restored = store.load()
+    assert backend.requests == []
+    assert GateState(name=INTEGRATION_FAILURE_GATE_NAME, status=GateStatus.PENDING) in (
+        restored.gates
+    )
+    assert restored.integration.candidates["leaf-a"].tl_intervention_attempts == 1
+
+
 def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> None:
     transport = RecordingTransport()
     run_id = "selector-run"
@@ -7054,7 +7246,6 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
     )
     config = TLLoopConfig(
         max_parallel_slices=1,
-        max_integration_repairs=0,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
     )
@@ -7138,14 +7329,20 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
         [
             RlmResponse(
                 {
-                    "root_cause": "The aggregate PR conflicts with the parent base",
-                    "proposed_solution": "Rebase the existing aggregate PR and resolve the conflict",
-                    "read_first": ["tl-loop/aggregate-child"],
-                    "steps": ["Resolve the aggregate conflict"],
-                    "verify": ["just tl-loop-test"],
-                    "boundary": ["Only edit tl-loop/aggregate-child"],
-                    "done_criteria": ["The aggregate PR applies cleanly"],
-                }
+                    "action": "delegate",
+                    "reason": "The merge conflict has a bounded repair in the aggregate slice",
+                    "handoff": {
+                        "root_cause": "The aggregate PR conflicts with the parent base",
+                        "proposed_solution": "Resolve the conflict on the existing aggregate PR",
+                        "read_first": ["tl-loop/aggregate-child"],
+                        "steps": ["Resolve the aggregate conflict"],
+                        "verify": ["just tl-loop-test"],
+                        "boundary": ["Only edit tl-loop/aggregate-child"],
+                        "done_criteria": ["The aggregate PR applies cleanly"],
+                    },
+                },
+                input_tokens=10,
+                output_tokens=5,
             )
         ]
     )
@@ -7188,7 +7385,8 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
-        review_model_choice=_review_choice(backend),
+        policy=validate_policy(_selector_policy()),
+        tl_model_choice=_tl_choice(backend),
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
@@ -7235,6 +7433,12 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
     assert current.dispatch_agent_id == "conflict-run:aggregate-child:integration"
     assert result.final_state.integration.lifecycle is IntegrationLifecycle.REPAIRING_AGGREGATE
     assert result.final_state.integration.head_sha is None
+    assert [request.name for request in backend.requests] == ["integration_failure"]
+    assert (
+        result.final_state.integration.candidates["aggregate-child"].tl_intervention_attempts
+        == 1
+    )
+    assert result.final_state.budgets.role_spent["tl"] == 15
     assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
     assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
 
@@ -7260,6 +7464,9 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
         },
         child_state.budgets,
         child_state.events.last_consumed_offset,
+    )
+    backend = ReviewBackend(
+        [RlmResponse({"action": "escalate", "reason": "The repair needs a human choice"})]
     )
     transport = IntegrationTransport(
         snapshots=[
@@ -7292,9 +7499,10 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
-        max_integration_repairs=0,
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("org", "repo", "main"),
+        policy=validate_policy(_selector_policy()),
+        tl_model_choice=_tl_choice(backend),
     )
     run_tl_loop(
         "gate-run",
@@ -7339,6 +7547,7 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
     )
     assert result.final_state.integration.lifecycle is IntegrationLifecycle.INTEGRATION_CONFLICT
     assert result.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+    assert [request.name for request in backend.requests] == ["integration_failure"]
     assert not any(name == "resume_pr" for name, _ in transport.calls)
 
 

@@ -248,6 +248,7 @@ def test_ordered_runtime_state_is_closed_and_validated() -> None:
                 "ci_status": "success",
                 "merge_attempts": 0,
                 "base_revalidation_count": 1,
+                "tl_intervention_attempts": 1,
                 "stage_verification": "passed",
             },
         }
@@ -270,6 +271,7 @@ def test_ordered_runtime_state_is_closed_and_validated() -> None:
             "ci_status": "success",
             "merge_attempts": 1,
             "base_revalidation_count": 0,
+            "tl_intervention_attempts": 2,
             "stage_verification": "passed",
         },
         "docs": {
@@ -287,11 +289,19 @@ def test_ordered_runtime_state_is_closed_and_validated() -> None:
             "ci_status": "success",
             "merge_attempts": 1,
             "base_revalidation_count": 0,
+            "tl_intervention_attempts": 0,
             "stage_verification": "passed",
         },
     }
     cast(dict[str, object], document["integration"])["candidates"] = candidates
     validate(document)
+
+    invalid_attempts = deepcopy(document)
+    candidate_map = cast(
+        dict[str, object], cast(dict[str, object], invalid_attempts["integration"])["candidates"]
+    )
+    cast(dict[str, object], candidate_map["auth"])["tl_intervention_attempts"] = -1
+    _assert_rejected(invalid_attempts, "tl_intervention_attempts")
 
     invalid_candidate = deepcopy(document)
     candidate_map = cast(

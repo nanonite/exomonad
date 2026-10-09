@@ -27,7 +27,7 @@ The coordinator is not one of them. `tl_loop` is a Python controller process —
 
 | Actor | Model | Spawns | Files PR | Merges PR | Lifecycle |
 |-------|-------|--------|----------|-----------|-----------|
-| `tl_loop` controller | n/a — Python; calls a model only for `decompose`, the `roles.tl` `review_stuck` guide/escalate judgment, `compose_repair` (post-merge integration repair only), and `adjudicate_review` (review events without a reviewer verdict only) | yes | via children | yes | one per run; resumable from `.exo/tl-loop/<run_id>/run.json` |
+| `tl_loop` controller | n/a — Python; calls a model only for `decompose`, the `roles.tl` `review_stuck` and `integration_failure` judgments, and `adjudicate_review` (review events without a reviewer verdict only) | yes | via children | yes | one per run; resumable from `.exo/tl-loop/<run_id>/run.json` |
 | `root` / `tl` roles | policy-selected from `[roles.tl]` | yes | yes | yes | RPC surface + branch coordinates; an active sub-TL is an isolated controller process, not an interactive session |
 | `dev` | policy-selected from `[roles.worker]` | no | yes | no | one assignment per invocation, exits after handoff |
 | `reviewer` | policy-selected from `[roles.reviewer]` | no | no | no | ephemeral per review round |
@@ -398,7 +398,7 @@ own. The full responsibility split:
 | Pre-merge CI failure on the PR head | inner loop: the failure to the same owner through `resume_pr`; counts as a round | none |
 | Reviewer GO with same-head CI green | the reviewer's decision; the controller performs `merge_pr` mechanically | none |
 | Review stuck (rounds exhausted) | one `roles.tl` judgment: `guide` or `escalate` | `roles.tl` |
-| Post-merge integration failure | `roles.tl` judgment: delegate or escalate | `roles.tl`; implemented by the follow-up issue #1160, not by this change |
+| Parent integration failure (aggregate PR CI after child merges, or merge conflict against its parent) | one `roles.tl` judgment: delegate to the existing aggregate owner or escalate | `roles.tl` (`integration_failure`); implemented in #1160, bounded by policy, and charged to its role budget |
 
 The inner loops are per slice and independent, so slices converge in parallel
 with no TL model call on the critical path. The TL intervenes only where slices

@@ -288,8 +288,16 @@ judgment cannot be made (backend failure, malformed or out-of-boundary guide,
 exhausted budget) the slice parks as `review_stuck` with the error in its
 `dispatch_error`; nothing falls back.
 
-`compose_repair` (a model-composed handoff) is used only for post-merge
-integration repair.
+**Parent integration failures use one `roles.tl` judgment.** CI failures on a
+persisted aggregate PR after child merges and conflicts while merging that
+aggregate into its parent both enter `integration_failure`. `delegate` carries
+a complete handoff that is checked against the aggregate slice's owned paths
+and resumes its existing PR owner; `escalate` opens a named human gate. The
+candidate stores the intervention count, `roles.tl.escalate_after_attempts`
+bounds calls, and `roles.tl.token_budget` records their cost. At the ceiling or
+on a malformed/backend-failed judgment, the controller opens the gate without
+falling back to a different repair path. Direct leaf CI failures still go
+straight to that leaf's owner through the deterministic inner loop.
 
 ### Making the gates stricter
 
@@ -806,9 +814,9 @@ integration_allowed =
 ~~~
 
 The parent adjudicates the child result and owns the aggregate PR. A review
-NO-GO uses compose_repair and resume_pr for that same aggregate owner, branch,
-worktree, and PR. It does not spawn a worker, create a replacement PR, or
-rebase a reviewed head solely because the parent base moved.
+NO-GO forwards the findings to that same aggregate owner through `resume_pr`.
+An integration failure uses the bounded `roles.tl` judgment described above.
+Neither path creates a replacement PR or changes the owner.
 
 The integration lifecycle shown in `status` and `/control` is:
 

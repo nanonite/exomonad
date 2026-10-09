@@ -629,7 +629,7 @@ repair creates a branch, leaf name, or agent type. This path needs no
 the human gate opens with no model call. Otherwise the intervention is
 checkpointed first, then `tl_loop.rlm.tl_judgment.judge_review_stuck` makes one
 `review_stuck` judgment whose closed schema is `{action: guide|escalate, reason,
-handoff?}`. `guide` carries a `RepairHandoff` (the compose_repair schema);
+handoff?}`. `guide` carries a `RepairHandoff`;
 `dispatch_guide_handoff` validates it against the slice's owned paths and
 dispatches it through resume_pr, and the slice's `review_rounds` is reset to 0
 (`ReviewRoundsReset`). `escalate` parks the slice with `review_rounds_exhausted`
@@ -640,9 +640,17 @@ falls back. Each judgment emits `tl.review_stuck_judged`. A shadow (inactive)
 controller only records the gate. An active controller without
 `tl_model_choice` or `policy` raises.
 
-**compose_repair.** `tl_loop.rlm.repair.compose_repair` (a model-composed handoff)
-remains only for post-merge integration repair (`_handle_integration_conflict`),
-which still requires `review_model_choice`.
+**Parent integration failure.** A CI failure on a persisted aggregate PR after
+its child integrations, or a conflict merging that aggregate into its parent,
+uses one `roles.tl` `integration_failure` judgment. `delegate` must carry a
+complete `RepairHandoff`; `dispatch_guide_handoff` validates it against the
+aggregate slice's owned paths and resumes the existing owner through
+`resume_pr`. `escalate` opens `tl-integration-failure` for aggregate CI or
+`tl-integration-conflict` for a parent merge conflict. The counter is stored on
+the integration candidate and bounded by `roles.tl.escalate_after_attempts`;
+each call is charged to `roles.tl.token_budget`. Reaching the ceiling or
+failing to produce a valid judgment opens the human gate without a fallback.
+Direct leaf CI failures stay in the deterministic inner loop.
 
 ### roles.tl model resolution and backend
 

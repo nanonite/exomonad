@@ -978,8 +978,9 @@ recovery. A slice without an explicit issue binding is a normal unlinked task
 and completes with a durable not-applicable outcome.
 
 Model calls are narrow structured judgments: `decompose`, `adjudicate_review`,
-`compose_repair` (post-merge integration repair only), and the `review_stuck`
-guide/escalate judgment. Their schemas, context budgets, attempts, token
+the `review_stuck` guide/escalate judgment, and the `integration_failure`
+delegate/escalate judgment at the parent integration boundary. Their schemas,
+context budgets, attempts, token
 charges, and replay records are explicit. Control flow stays in Python and the
 state writer, not in a free-form prompt. The `roles.tl` judgment model resolves
 from `.exo/harness_policy.toml` and `.exo/model-catalog.json` at startup and is

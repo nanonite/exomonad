@@ -1879,6 +1879,8 @@ def _encode_integration(value: IntegrationInput) -> dict[str, object]:
         }
         if value.integration_evidence_at is not None:
             record["integration_evidence_at"] = value.integration_evidence_at
+        if value.tl_intervention_attempts:
+            record["tl_intervention_attempts"] = value.tl_intervention_attempts
         return record
     if not isinstance(value, Mapping):
         raise TypeError("integration must be an IntegrationRuntimeState or object")
@@ -1886,7 +1888,7 @@ def _encode_integration(value: IntegrationInput) -> dict[str, object]:
 
 
 def _encode_integration_candidate(value: IntegrationCandidateState) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "lifecycle": value.lifecycle.value,
         "aggregate_pr_number": value.aggregate_pr_number,
         "aggregate_head_sha": value.aggregate_head_sha,
@@ -1906,6 +1908,9 @@ def _encode_integration_candidate(value: IntegrationCandidateState) -> dict[str,
         "base_revalidation_count": value.base_revalidation_count,
         "stage_verification": value.stage_verification,
     }
+    if value.tl_intervention_attempts:
+        record["tl_intervention_attempts"] = value.tl_intervention_attempts
+    return record
 
 
 def _encode_lane(value: LaneState) -> dict[str, object]:
@@ -2357,6 +2362,7 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
         ci_status=cast(str, value.get("ci_status", "unknown")),
         merge_attempts=cast(int, value.get("merge_attempts", 0)),
         base_revalidation_count=cast(int, value.get("base_revalidation_count", 0)),
+        tl_intervention_attempts=cast(int, value.get("tl_intervention_attempts", 0)),
         stage_verification=cast(str, value.get("stage_verification", "pending")),
         candidates=MappingProxyType(
             {
@@ -2443,6 +2449,7 @@ def _decode_integration_candidate(value: dict[str, object]) -> IntegrationCandid
         ci_status=cast(str, value.get("ci_status", "unknown")),
         merge_attempts=cast(int, value.get("merge_attempts", 0)),
         base_revalidation_count=cast(int, value.get("base_revalidation_count", 0)),
+        tl_intervention_attempts=cast(int, value.get("tl_intervention_attempts", 0)),
         stage_verification=cast(str, value.get("stage_verification", "pending")),
     )
 

@@ -510,6 +510,7 @@ INTEGRATION_KEYS = frozenset(
         "ci_status",
         "merge_attempts",
         "base_revalidation_count",
+        "tl_intervention_attempts",
         "stage_verification",
         "lanes",
     }
@@ -562,6 +563,7 @@ INTEGRATION_CANDIDATE_KEYS = frozenset(
         "ci_status",
         "merge_attempts",
         "base_revalidation_count",
+        "tl_intervention_attempts",
         "stage_verification",
     }
 )
@@ -992,6 +994,7 @@ class IntegrationCandidateState:
     ci_status: str = "unknown"
     merge_attempts: int = 0
     base_revalidation_count: int = 0
+    tl_intervention_attempts: int = 0
     stage_verification: str = "pending"
 
 
@@ -1018,6 +1021,7 @@ class IntegrationRuntimeState:
     ci_status: str = "unknown"
     merge_attempts: int = 0
     base_revalidation_count: int = 0
+    tl_intervention_attempts: int = 0
     stage_verification: str = "pending"
     candidates: Mapping[str, IntegrationCandidateState] = field(default_factory=dict)
     lanes: Mapping[str, LaneState] = field(default_factory=dict)
@@ -1292,6 +1296,8 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
         errors.append(("run.integration.ci_status", "is not a recognised CI status"))
     _non_negative_int(integration, "merge_attempts", "run.integration", errors)
     _non_negative_int(integration, "base_revalidation_count", "run.integration", errors)
+    if "tl_intervention_attempts" in integration:
+        _non_negative_int(integration, "tl_intervention_attempts", "run.integration", errors)
     if integration.get("stage_verification") not in INTEGRATION_VERIFICATION_VALUES:
         errors.append(
             ("run.integration.stage_verification", "is not a recognised verification result")
@@ -1332,6 +1338,8 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
                     errors.append((f"{path}.ci_status", "is not a recognised CI status"))
                 _non_negative_int(candidate, "merge_attempts", path, errors)
                 _non_negative_int(candidate, "base_revalidation_count", path, errors)
+                if "tl_intervention_attempts" in candidate:
+                    _non_negative_int(candidate, "tl_intervention_attempts", path, errors)
                 if candidate.get("stage_verification") not in INTEGRATION_VERIFICATION_VALUES:
                     errors.append(
                         (f"{path}.stage_verification", "is not a recognised verification result")

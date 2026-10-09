@@ -204,12 +204,11 @@ from tl_loop.rlm.call import RlmError
 from tl_loop.rlm.repair import (
     RepairError,
     RepairHandoff,
-    compose_repair,
     dispatch_guide_handoff,
     forward_review_findings,
 )
 from tl_loop.rlm.store import BudgetExceeded, RlmModelChoice
-from tl_loop.rlm.tl_judgment import judge_review_stuck
+from tl_loop.rlm.tl_judgment import judge_integration_failure, judge_review_stuck
 from tl_loop.select.agent_type import (
     SelectionFailure,
     parse_harness_identifier,
@@ -221,7 +220,7 @@ from tl_loop.select.harness import HarnessRoute
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
-from tl_loop.select.policy import HarnessPolicy, load_policy
+from tl_loop.select.policy import HarnessPolicy, RolePolicy, load_policy
 from tl_loop.state.legacy_manifest import (
     LegacyManifestReconciliation,
     reconcile_legacy_manifest,
@@ -347,6 +346,7 @@ LEGACY_DISPATCH_GATES = {
 }
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
+INTEGRATION_FAILURE_GATE_NAME = "tl-integration-failure"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 CHAINLINK_BINDING_RECONCILIATION_GATE_NAME = "chainlink-issue-binding-reconciliation"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
@@ -438,6 +438,7 @@ def _candidate_runtime(
         ci_status=candidate.ci_status,
         merge_attempts=candidate.merge_attempts,
         base_revalidation_count=candidate.base_revalidation_count,
+        tl_intervention_attempts=candidate.tl_intervention_attempts,
         stage_verification=candidate.stage_verification,
         candidates={},
     )
@@ -468,6 +469,7 @@ def _persist_candidate_runtime(
         ci_status=candidate.ci_status,
         merge_attempts=candidate.merge_attempts,
         base_revalidation_count=candidate.base_revalidation_count,
+        tl_intervention_attempts=candidate.tl_intervention_attempts,
         stage_verification=candidate.stage_verification,
     )
     # Keep legacy fields as a compatibility view; all ordered production reads
@@ -994,7 +996,6 @@ class TLLoopConfig:
     task_timeout_seconds: float | None = 3600.0
     task_timeout_source: str = "built_in"
     max_base_revalidations: int = 3
-    max_integration_repairs: int = 3
     dispatch_retry_limit: int = DEFAULT_RETRY_LIMIT
     dispatch_retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
     dispatch_retry_max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
@@ -1045,7 +1046,6 @@ class TLLoopConfig:
             "max_leaves",
             "max_events",
             "max_base_revalidations",
-            "max_integration_repairs",
             "dispatch_retry_limit",
         ):
             value = getattr(self, name)
@@ -11073,6 +11073,7 @@ def _complete_sub_tl_batch(
             ci_status=candidate_runtime.ci_status,
             merge_attempts=candidate_runtime.merge_attempts,
             base_revalidation_count=candidate_runtime.base_revalidation_count,
+            tl_intervention_attempts=candidate_runtime.tl_intervention_attempts,
             stage_verification=candidate_runtime.stage_verification,
         )
     integration = replace(
@@ -11656,14 +11657,19 @@ def _watcher_result_observation(result: ToolResult | None) -> WatcherObservation
 
 def _integration_gate_pending(state: RunState) -> bool:
     return any(
-        gate.name in {INTEGRATION_REVALIDATION_GATE_NAME, INTEGRATION_CONFLICT_GATE_NAME}
+        gate.name
+        in {
+            INTEGRATION_REVALIDATION_GATE_NAME,
+            INTEGRATION_CONFLICT_GATE_NAME,
+            INTEGRATION_FAILURE_GATE_NAME,
+        }
         and gate.status is GateStatus.PENDING
         for gate in state.gates
     )
 
 
 def _open_integration_gate(
-    task: SubTLTask,
+    task: SubTLTask | str,
     state: RunState,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
@@ -11674,10 +11680,11 @@ def _open_integration_gate(
     lifecycle: IntegrationLifecycle,
     reason: str,
 ) -> RunState:
-    current = state.slices[task.name]
+    slice_id = task if isinstance(task, str) else task.name
+    current = state.slices[slice_id]
     sub_states = dict(state.integration.sub_tl_states)
-    sub_states[task.name] = lifecycle
-    candidate_runtime = _candidate_runtime(state.integration, task.name)
+    sub_states[slice_id] = lifecycle
+    candidate_runtime = _candidate_runtime(state.integration, slice_id)
     updated = slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW))
     updated = slice_transition(updated, ActionChanged(None))
     updated = replace(
@@ -11706,14 +11713,14 @@ def _open_integration_gate(
         ),
     )
     integration = _persist_candidate_runtime(
-        replace(state.integration, sub_tl_states=sub_states), task.name, candidate_runtime
+        replace(state.integration, sub_tl_states=sub_states), slice_id, candidate_runtime
     )
     integration = _abandon_owned_lane_integration(
         state, updated, integration, "integration_gate", reason
     )
     state = store.checkpoint(
         _phase_from_state(state),
-        {**state.slices, task.name: updated},
+        {**state.slices, slice_id: updated},
         state.budgets,
         state.events.last_consumed_offset,
         current_order=state.current_order,
@@ -11857,25 +11864,68 @@ def _handle_integration_conflict(
     head_sha: str,
     reason: str,
 ) -> RunState:
-    current = state.slices[task.name]
-    if (
-        current.repair_attempts >= config.max_integration_repairs
-        or config.review_model_choice is None
-    ):
-        return _open_integration_gate(
-            task,
+    return _judge_integration_failure(
+        task.name,
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        failure_kind="parent_merge_conflict",
+        reason=reason,
+        gate_name=INTEGRATION_CONFLICT_GATE_NAME,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        increment_merge_attempt=True,
+    )
+
+
+def _judge_integration_failure(
+    slice_id: str,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    failure_kind: str,
+    reason: str,
+    gate_name: str,
+    head_sha: str,
+    base_sha: str | None = None,
+    parent_branch: str | None = None,
+    increment_merge_attempt: bool = False,
+) -> RunState:
+    """Reserve, judge, and route one bounded parent integration failure."""
+    choice = config.tl_model_choice
+    if choice is None or config.policy is None:
+        raise TLLoopError(
+            "integration_failure requires config.tl_model_choice and config.policy; "
+            "the controller must resolve roles.tl at startup"
+        )
+    if choice.role != "tl":
+        raise TLLoopError("integration_failure judgments must use the roles.tl budget")
+    role_policy = config.policy.roles["tl"]
+    ceiling = role_policy.escalate_after_attempts
+    current = state.slices[slice_id]
+    candidate = _candidate_runtime(state.integration, slice_id)
+    if candidate.tl_intervention_attempts >= ceiling:
+        return _open_integration_failure_ceiling(
+            slice_id,
             state,
             config,
             effects,
             store,
             effects_log,
-            gate_name=INTEGRATION_CONFLICT_GATE_NAME,
-            lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
-            reason=reason,
+            failure_kind,
+            reason,
+            gate_name,
+            candidate.tl_intervention_attempts,
+            ceiling,
         )
-    candidate_runtime = _candidate_runtime(state.integration, task.name)
-    conflict = replace(
-        candidate_runtime,
+    attempt = candidate.tl_intervention_attempts + 1
+    reserved = replace(
+        candidate,
         lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
         head_sha=head_sha,
         patch_digest=current.review_patch_digests.get(head_sha),
@@ -11884,59 +11934,10 @@ def _handle_integration_conflict(
         ci_status="failure",
         integration_evidence_at=None,
         stage_verification="failed",
-        merge_attempts=candidate_runtime.merge_attempts + 1,
+        merge_attempts=candidate.merge_attempts + int(increment_merge_attempt),
+        tl_intervention_attempts=attempt,
     )
-    conflicted = slice_transition(current, RepairQueued())
-    conflicted = replace(
-        conflicted,
-        dispatch_last_boundary="integration_conflict",
-        dispatch_error=reason[:500],
-    )
-    state = store.checkpoint(
-        _phase_from_state(state),
-        {**state.slices, task.name: conflicted},
-        state.budgets,
-        state.events.last_consumed_offset,
-        current_order=state.current_order,
-        ordered_stages=state.ordered_stages,
-        integration=_persist_candidate_runtime(state.integration, task.name, conflict),
-    )
-    _record_controller_event(
-        task.name,
-        "tl.integration_conflict",
-        {
-            "slice_id": task.name,
-            "pr_number": current.pr_number,
-            "base_sha": base_sha,
-            "head_sha": head_sha,
-            "reason": reason[:500],
-            "repair_attempt": current.repair_attempts + 1,
-        },
-        config,
-        effects,
-        effects_log,
-    )
-    _record_controller_event(
-        task.name,
-        "tl.integration_repair_requested",
-        {
-            "slice_id": task.name,
-            "pr_number": current.pr_number,
-            "owner_id": current.dispatch_agent_id,
-            "reason": reason[:500],
-            "repair_attempt": current.repair_attempts + 1,
-        },
-        config,
-        effects,
-        effects_log,
-    )
-    repairing = replace(
-        conflict,
-        lifecycle=IntegrationLifecycle.REPAIRING_AGGREGATE,
-        head_sha=None,
-        patch_digest=None,
-        validated_base_sha=None,
-    )
+    sub_states = {**state.integration.sub_tl_states, slice_id: reserved.lifecycle}
     state = store.checkpoint(
         _phase_from_state(state),
         state.slices,
@@ -11944,32 +11945,292 @@ def _handle_integration_conflict(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=repairing,
+        integration=_persist_candidate_runtime(
+            replace(state.integration, sub_tl_states=sub_states), slice_id, reserved
+        ),
+    )
+    return _call_integration_judgment(
+        slice_id,
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        failure_kind,
+        reason,
+        gate_name,
+        head_sha,
+        base_sha,
+        parent_branch,
+        choice,
+        role_policy,
+        attempt,
+        ceiling,
+    )
+
+
+def _call_integration_judgment(
+    slice_id: str,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    failure_kind: str,
+    reason: str,
+    gate_name: str,
+    head_sha: str,
+    base_sha: str | None,
+    parent_branch: str | None,
+    choice: RlmModelChoice,
+    role_policy: RolePolicy,
+    attempt: int,
+    ceiling: int,
+) -> RunState:
+    """Run one already-reserved roles.tl integration judgment."""
+    choice.store.ledger.bind(
+        choice.role,
+        spent=state.budgets.role_spent.get(choice.role, 0),
+        budget=role_policy.token_budget,
+        charge_callback=store.charge_role_tokens,
+    )
+    spent_before = choice.store.ledger.spent.get(choice.role, 0)
+    current = state.slices[slice_id]
+    try:
+        decision = judge_integration_failure(
+            choice,
+            evidence={
+                "failure_kind": failure_kind,
+                "reason": reason[:500],
+                "pr_number": current.pr_number,
+                "base_sha": base_sha,
+                "parent_branch": parent_branch,
+                "head_sha": head_sha,
+                "attempt": attempt,
+                "ceiling": ceiling,
+            },
+            owned_paths=current.paths,
+        )
+    except (RlmError, RepairError, BudgetExceeded, ContextBudgetError) as error:
+        state = store.load()
+        return _integration_judgment_failed(
+            slice_id,
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            failure_kind,
+            reason,
+            gate_name,
+            error,
+            choice.model_id,
+            attempt,
+            ceiling,
+        )
+    state = store.load()
+    _record_controller_event(
+        slice_id,
+        "tl.integration_failure_judged",
+        {
+            "slice_id": slice_id,
+            "pr_number": current.pr_number,
+            "head_sha": head_sha,
+            "failure_kind": failure_kind,
+            "action": decision.action,
+            "reason": decision.reason[:500],
+            "intervention": attempt,
+            "ceiling": ceiling,
+            "model": choice.model_id,
+            "tokens": choice.store.ledger.spent.get(choice.role, 0) - spent_before,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    if decision.action == "escalate":
+        return _open_integration_gate(
+            slice_id,
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            gate_name=gate_name,
+            lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+            reason=f"{reason}; roles.tl escalated: {decision.reason[:300]}",
+        )
+    return _dispatch_integration_repair(
+        slice_id,
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        failure_kind,
+        reason,
+        decision.handoff,
+    )
+
+
+def _open_integration_failure_ceiling(
+    slice_id: str,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    failure_kind: str,
+    reason: str,
+    gate_name: str,
+    attempts: int,
+    ceiling: int,
+) -> RunState:
+    """Open a human gate without making a judgment past the configured ceiling."""
+    _record_controller_event(
+        slice_id,
+        "tl.integration_failure_ceiling_reached",
+        {
+            "slice_id": slice_id,
+            "failure_kind": failure_kind,
+            "interventions": attempts,
+            "ceiling": ceiling,
+            "reason": reason[:500],
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return _open_integration_gate(
+        slice_id,
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        gate_name=gate_name,
+        lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+        reason=f"{reason}; roles.tl integration judgment ceiling {ceiling} reached",
+    )
+
+
+def _integration_judgment_failed(
+    slice_id: str,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    failure_kind: str,
+    reason: str,
+    gate_name: str,
+    error: Exception,
+    model_id: str,
+    attempt: int,
+    ceiling: int,
+) -> RunState:
+    """Fail closed to a human gate when the bounded judgment cannot be used."""
+    failure_reason = f"{reason}; roles.tl judgment failed: {error}"
+    _record_controller_event(
+        slice_id,
+        "tl.integration_failure_judgment_failed",
+        {
+            "slice_id": slice_id,
+            "failure_kind": failure_kind,
+            "intervention": attempt,
+            "ceiling": ceiling,
+            "model": model_id,
+            "error": str(error)[:500],
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return _open_integration_gate(
+        slice_id,
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        gate_name=gate_name,
+        lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+        reason=failure_reason,
+    )
+
+
+def _dispatch_integration_repair(
+    slice_id: str,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    failure_kind: str,
+    reason: str,
+    handoff: RepairHandoff | None,
+) -> RunState:
+    """Resume the existing aggregate owner with the validated TL handoff."""
+    if handoff is None:
+        raise TLLoopError("delegate integration judgment has no validated handoff")
+    current = state.slices[slice_id]
+    candidate = replace(
+        _candidate_runtime(state.integration, slice_id),
+        lifecycle=IntegrationLifecycle.REPAIRING_AGGREGATE,
+        head_sha=None,
+        patch_digest=None,
+        validated_base_sha=None,
+        merge_tree_sha=None,
+        integration_evidence_at=None,
+        ci_status="unknown",
+        stage_verification="pending",
+    )
+    sub_states = {**state.integration.sub_tl_states, slice_id: candidate.lifecycle}
+    updated = replace(
+        current,
+        dispatch_last_boundary="integration_failure",
+        dispatch_error=reason[:500],
+    )
+    state = store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, slice_id: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=_persist_candidate_runtime(
+            replace(state.integration, sub_tl_states=sub_states), slice_id, candidate
+        ),
+    )
+    _record_controller_event(
+        slice_id,
+        "tl.integration_repair_requested",
+        {
+            "slice_id": slice_id,
+            "pr_number": current.pr_number,
+            "owner_id": current.dispatch_agent_id,
+            "failure_kind": failure_kind,
+            "reason": reason[:500],
+            "repair_attempt": current.repair_attempts + 1,
+        },
+        config,
+        effects,
+        effects_log,
     )
     return _route_repair(
         store,
         state,
         _phase_from_state(state),
         state.events.last_consumed_offset,
-        task.name,
+        slice_id,
         config,
         effects,
         effects_log,
-        _model_repair(
-            {
-                "verdict": Verdict.NO_GO.value,
-                "reasons": [
-                    {
-                        "severity": "blocking",
-                        "file": "integration",
-                        "line": 0,
-                        "claim": reason[:500],
-                    }
-                ],
-            },
-            config,
-            store,
-            task.name,
+        _guide_repair(handoff, store, slice_id),
+        gate_name_on_failure=(
+            INTEGRATION_CONFLICT_GATE_NAME
+            if failure_kind == "parent_merge_conflict"
+            else INTEGRATION_FAILURE_GATE_NAME
         ),
     )
 
@@ -12158,15 +12419,15 @@ def _integrate_one_candidate(
         )
     except IntegrationEvidenceMismatch as error:
         if error.field in {"head_sha", "patch_digest"}:
-            return _handle_integration_conflict(
+            return _open_integration_gate(
                 task,
                 state,
                 config,
                 effects,
                 store,
                 effects_log,
-                base_sha=base_sha,
-                head_sha=live_head_sha,
+                gate_name=INTEGRATION_CONFLICT_GATE_NAME,
+                lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
                 reason=str(error),
             )
         return _handle_integration_revalidation(
@@ -12394,6 +12655,7 @@ def _checkpoint_aggregate_merged(
                     ci_status="unknown",
                     merge_attempts=sibling_runtime.merge_attempts,
                     base_revalidation_count=sibling_runtime.base_revalidation_count,
+                    tl_intervention_attempts=sibling_runtime.tl_intervention_attempts,
                     stage_verification="pending",
                 )
     merged_integration = replace(
@@ -14050,7 +14312,32 @@ def _route_ci_event(
         and current.status is not SliceStatus.REPAIRING
         and current.ci_state.get(head_sha) != "failure"
     )
-    if not should_repair or _review_rounds_exhausted(state, state.slices[slice_id], config):
+    if (
+        not should_repair
+        and status in {"success", "neutral"}
+        and current.status is not SliceStatus.REPAIRING
+        and current.reviewed_head == head_sha
+        and _is_aggregate_slice(current)
+    ):
+        return _reset_integration_failure_attempts(store, state, slice_id)
+    if not should_repair:
+        return state
+    if _is_aggregate_slice(current):
+        parent_branch = event.data.get("branch")
+        return _judge_integration_failure(
+            slice_id,
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            failure_kind="parent_branch_ci_failure",
+            reason=_ci_reason(event),
+            gate_name=INTEGRATION_FAILURE_GATE_NAME,
+            head_sha=head_sha,
+            parent_branch=parent_branch if isinstance(parent_branch, str) else None,
+        )
+    if _review_rounds_exhausted(state, state.slices[slice_id], config):
         return state
     reason = {
         "severity": "blocking",
@@ -14072,6 +14359,25 @@ def _route_ci_event(
             store,
             state.slices[slice_id],
         ),
+    )
+
+
+def _reset_integration_failure_attempts(
+    store: RunStore, state: RunState, slice_id: str
+) -> RunState:
+    """Start a fresh intervention allowance after aggregate CI recovers."""
+    candidate = _candidate_runtime(state.integration, slice_id)
+    if candidate.tl_intervention_attempts == 0:
+        return state
+    reset = replace(candidate, tl_intervention_attempts=0)
+    return store.checkpoint(
+        _phase_from_state(state),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=_persist_candidate_runtime(state.integration, slice_id, reset),
     )
 
 
@@ -14106,12 +14412,14 @@ def _route_repair(
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
     repair_with: RepairWith,
+    *,
+    gate_name_on_failure: str | None = None,
 ) -> RunState:
     """Resume the slice's existing PR owner through ``repair_with``.
 
     ``repair_with`` decides what the handoff says; the same-owner ``resume_pr``
-    dispatch, the REPAIRING checkpoint, and the REVIEW_STUCK parking on a
-    failed dispatch are shared by every repair path.
+    dispatch and the REPAIRING checkpoint are shared by every repair path.
+    Integration judgments can route a failed dispatch to their own gate.
     """
     current = state.slices.get(slice_id)
     if current is None or current.pr_number is None:
@@ -14197,6 +14505,18 @@ def _route_repair(
 
         repair_with(pr, live, dispatch_resume)
     except (RepairError, ValueError) as error:
+        if gate_name_on_failure is not None:
+            return _open_integration_gate(
+                slice_id,
+                state,
+                config,
+                effects,
+                store,
+                effects_log,
+                gate_name=gate_name_on_failure,
+                lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+                reason=f"integration repair dispatch failed: {error}",
+            )
         return _park_repair_failed(
             store, state, current, event_seq, error, config, effects, effects_log
         )
@@ -14274,33 +14594,6 @@ def _park_repair_failed(
         effects_log,
     )
     return state
-
-
-def _model_repair(
-    review: object,
-    config: TLLoopConfig,
-    store: RunStore,
-    slice_id: str,
-) -> RepairWith:
-    """Compose the handoff with the review model (post-merge integration repair only)."""
-
-    def repair(
-        pr: Mapping[str, object],
-        live: EffectClient,
-        dispatch: Callable[[JsonObject], object],
-    ) -> object:
-        return compose_repair(
-            pr,
-            Verdict.NO_GO,
-            review,
-            client=live,
-            model_choice=config.review_model_choice,
-            store=store,
-            slice_id=slice_id,
-            dispatch=dispatch,
-        )
-
-    return repair
 
 
 def _forward_findings_repair(

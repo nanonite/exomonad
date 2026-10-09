@@ -272,6 +272,7 @@ def test_ordered_state_round_trips_and_resume_preserves_progress(tmp_path: Path)
         ci_status="success",
         merge_attempts=1,
         base_revalidation_count=2,
+        tl_intervention_attempts=1,
         stage_verification="passed",
         candidates={
             "auth": IntegrationCandidateState(
@@ -289,6 +290,7 @@ def test_ordered_state_round_trips_and_resume_preserves_progress(tmp_path: Path)
                 ci_status="success",
                 merge_attempts=1,
                 stage_verification="passed",
+                tl_intervention_attempts=2,
             ),
             "sessions": IntegrationCandidateState(
                 lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
@@ -319,7 +321,9 @@ def test_ordered_state_round_trips_and_resume_preserves_progress(tmp_path: Path)
     assert resumed.ordered_stages == stages
     assert resumed.integration == integration
     assert resumed.integration.candidates["auth"].head_sha == "head-auth"
+    assert resumed.integration.candidates["auth"].tl_intervention_attempts == 2
     assert resumed.integration.candidates["sessions"].head_sha == "head-sessions"
+    assert resumed.integration.tl_intervention_attempts == 1
 
 
 def test_legacy_run_defaults_ordered_state_without_rewrite(tmp_path: Path) -> None:
