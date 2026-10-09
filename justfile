@@ -77,10 +77,11 @@ haskell-test:
 tl-loop-test:
     {{py}} -m pytest -q tl_loop/tests
 
-# Run one real, tiny judgment per installed harness. Set the matching
-# EXOMONAD_TL_SMOKE_<HARNESS>_MODEL variable for every installed CLI first.
-tl-loop-live-smoke:
-    {{py}} -m tl_loop.rlm.live_smoke
+# Run tiny judgments against installed harnesses. Claude/Codex need explicit
+# model IDs; OpenCode cycles through its published free Zen/Go model IDs.
+# Pass --harness opencode to avoid calling the other installed CLIs.
+tl-loop-live-smoke *ARGS:
+    {{py}} -m tl_loop.rlm.live_smoke {{ARGS}}
 
 # Validate relative documentation links and executable ordered-plan examples.
 docs-check:

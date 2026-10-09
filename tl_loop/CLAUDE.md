@@ -674,11 +674,15 @@ command and prompt size before it runs, and the exit code, response size, and on
 failure the stderr after. A call that exceeds `DEFAULT_CALL_TIMEOUT_SECONDS` (600)
 raises `RlmCallError`.
 
-`just tl-loop-live-smoke` runs one tiny addition judgment through each installed
-backend CLI and checks the parsed result and token charge. Set
-`EXOMONAD_TL_SMOKE_CLAUDE_MODEL`, `EXOMONAD_TL_SMOKE_CODEX_MODEL`, and
-`EXOMONAD_TL_SMOKE_OPENCODE_MODEL` for the installed harnesses before running it;
-the recipe validates all model settings before making any live calls. Codex's
+`just tl-loop-live-smoke` runs tiny addition judgments through the installed
+backend CLIs and checks the parsed result and token charge. Claude and Codex need
+`EXOMONAD_TL_SMOKE_CLAUDE_MODEL` and `EXOMONAD_TL_SMOKE_CODEX_MODEL`. OpenCode
+defaults to the published free text models from both Zen (`opencode/`) and Go
+(`opencode-go/`), trying each provider's list until one model passes. Override
+the list with comma-separated `EXOMONAD_TL_SMOKE_OPENCODE_MODELS`; only cataloged
+free IDs are accepted, so paid Zen/Go models cannot be selected accidentally.
+Use `just tl-loop-live-smoke --harness opencode` to run only OpenCode. The free
+Go preview models are time-limited; the catalogs can change. Codex's
 `--ignore-user-config` skips `$CODEX_HOME/config.toml` while retaining account
 authentication from `CODEX_HOME`; the live recipe exercises that exact invocation.
 
