@@ -7,9 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- TL judgment: verify CHANGELOG captured unlinked slices' merged work (#1170)
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Stale tl.integration_conflict entries fail validate-observability-contracts on main (#1173)
 - tl_loop: charge roles.tl judgment tokens to the durable BudgetLedger (survives restart) (#1161)
 - Support optional slice-scoped Chainlink issue integration (#1165)
 - Resume recursive child handoff only after post-merge recovery completes, then continue the persisted parent plan order (#1165)
