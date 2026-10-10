@@ -94,11 +94,48 @@ class IssueCloseAlreadyClosed(TLOrchestrationEvent):
     observed_status: str
 
 
+UNLINKED_CHANGELOG_DECISIONS = ("captured", "add_entry", "no_changelog", "judgment_failed")
+"""What the controller decided for an unlinked slice's CHANGELOG coverage.
+
+``captured`` and ``add_entry`` are the roles.tl judgment's own actions;
+``no_changelog`` means the parent has no CHANGELOG.md (no model call), and
+``judgment_failed`` means the context read or the judgment itself failed.
+"""
+
+UNLINKED_CHANGELOG_OUTCOMES = (
+    "captured",
+    "no_changelog",
+    "judgment_failed",
+    "entry_added",
+    "entry_write_failed",
+    "entry_push_failed",
+)
+"""The durable changelog outcome a completed unlinked slice records."""
+
+
 @dataclass(frozen=True)
-class PostMergeNotApplicable(TLOrchestrationEvent):
-    """Record that an unlinked slice has no issue or changelog work to do."""
+class UnlinkedChangelogJudged(TLOrchestrationEvent):
+    """Persist the changelog-coverage decision before any entry is written."""
 
     child_id: str
+    intent_id: str
+    decision: str
+    reason: str
+    section: str = ""
+    entry: str = ""
+    model: str = ""
+    tokens: int = 0
+
+
+@dataclass(frozen=True)
+class PostMergeNotApplicable(TLOrchestrationEvent):
+    """Complete an unlinked slice: no issue to close, with its changelog outcome."""
+
+    child_id: str
+    changelog_outcome: str
+    changelog_detail: str = ""
+    changelog_commit_sha: str = ""
+    observed_remote_head: str = ""
 
 
 @dataclass(frozen=True)
@@ -157,6 +194,8 @@ class PostMergeRebuildRequested(TLOrchestrationEvent):
 
 
 __all__ = [
+    "UNLINKED_CHANGELOG_DECISIONS",
+    "UNLINKED_CHANGELOG_OUTCOMES",
     "ChangelogCommitted",
     "ChangelogPending",
     "IssueCloseAlreadyClosed",
@@ -171,4 +210,5 @@ __all__ = [
     "PostMergeComplete",
     "PostMergeNotApplicable",
     "PostMergeRebuildRequested",
+    "UnlinkedChangelogJudged",
 ]

@@ -145,7 +145,9 @@ slice issue closure for controller-dispatched work belong to `tl_loop`. The
 sub-TL that owns a slice closes only that slice's explicitly bound issue after
 merge adoption and parent-branch sync. The root only orchestrates child handoff
 and persisted plan order; it never supplies its own issue ID or closes a child
-slice issue. Unlinked slices are normal and do not require a Chainlink task.
+slice issue. Unlinked slices are normal and do not require a Chainlink task;
+after they merge, the controller makes one `roles.tl` judgment that keeps the
+CHANGELOG `[Unreleased]` section covering their work.
 
 - Use `chainlink_issue_create` and `chainlink_subissue_create` to shape work before spawning.
 - Prefer dev leaves for work that needs PR review, CI, or non-trivial implementation.

@@ -120,6 +120,8 @@ TOOL_METHODS: tuple[str, ...] = (
     "post_merge_parent_sync",
     "post_merge_remote_reconcile",
     "post_merge_changelog",
+    "post_merge_changelog_context",
+    "post_merge_changelog_entry",
     "post_merge_push",
     "root_branch_finalize",
     "close_worker_pane",
@@ -619,6 +621,52 @@ class EffectClient:
         _put(arguments, "working_dir", working_dir)
         return self._call("post_merge_changelog", arguments)
 
+    def post_merge_changelog_context(
+        self,
+        *,
+        child_id: str,
+        parent_branch: str,
+        expected_base_sha: str,
+        pr_number: int,
+        merge_commit_sha: str | None = None,
+        working_dir: str | None = None,
+    ) -> ToolResult:
+        """Read the CHANGELOG, changed paths, and PR text for an unlinked merged slice."""
+        arguments: JsonObject = {
+            "child_id": child_id,
+            "parent_branch": parent_branch,
+            "expected_base_sha": expected_base_sha,
+            "pr_number": pr_number,
+        }
+        _put(arguments, "merge_commit_sha", merge_commit_sha)
+        _put(arguments, "working_dir", working_dir)
+        return self._call("post_merge_changelog_context", arguments)
+
+    def post_merge_changelog_entry(
+        self,
+        *,
+        child_id: str,
+        repository: str,
+        parent_branch: str,
+        expected_base_sha: str,
+        intent_id: str,
+        section: str,
+        entry: str,
+        working_dir: str | None = None,
+    ) -> ToolResult:
+        """Write, commit, and push one CHANGELOG entry for an unlinked merged slice."""
+        arguments: JsonObject = {
+            "child_id": child_id,
+            "repository": repository,
+            "parent_branch": parent_branch,
+            "expected_base_sha": expected_base_sha,
+            "intent_id": intent_id,
+            "section": section,
+            "entry": entry,
+        }
+        _put(arguments, "working_dir", working_dir)
+        return self._call("post_merge_changelog_entry", arguments)
+
     def post_merge_push(
         self,
         *,
@@ -705,7 +753,7 @@ class EffectClient:
             "delete_remote_branch": delete_remote_branch,
         }
         _put(arguments, "name", name)
-        _put(arguments, "reason", reason);
+        _put(arguments, "reason", reason)
         return self._call("cleanup_leaf", arguments)
 
     def chainlink_timer_start(self, *, issue_id: int) -> ToolResult:

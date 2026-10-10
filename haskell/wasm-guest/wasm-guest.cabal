@@ -85,6 +85,7 @@ library wasm-guest-internal
         ExoMonad.Guest.Tools.Tasks
         ExoMonad.Guest.Tools.Chainlink
         ExoMonad.Guest.Tools.PostMergeRecovery
+        ExoMonad.Guest.Tools.UnlinkedChangelog
         ExoMonad.Guest.Tools.RootBranchFinalize
         ExoMonad.Guest.Tools.CloseIssueAndCleanup
         ExoMonad.Guest.Tools.ReplaceClosedPr
@@ -166,6 +167,7 @@ test-suite wasm-guest-tests
         ExoMonad.Guest.Tools.ResumeBlockedLeafTest
         ExoMonad.Guest.Tools.MergePRTest
         ExoMonad.Guest.Tools.PostMergeRecoveryTest
+        ExoMonad.Guest.Tools.UnlinkedChangelogTest
         ExoMonad.Guest.Tools.RootBranchFinalizeTest
         ExoMonad.Guest.Tools.WatcherPrStateTest
         ExoMonad.Guest.Tools.RepositoryIdentityTest

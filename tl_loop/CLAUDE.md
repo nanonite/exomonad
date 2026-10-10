@@ -109,8 +109,9 @@ does not infer IDs from run-level configuration or slice names. Recursive child
 runs receive no issue ID from their parent: each task must declare its own
 binding. Invalid or duplicate explicit bindings
 fail closed behind the `chainlink-issue-binding-reconciliation` gate. After
-parent-branch sync, an unlinked merged slice durably records issue closure and
-changelog as not applicable, makes no Chainlink call, and releases its lane.
+parent-branch sync, an unlinked merged slice durably records issue closure as
+not applicable, makes no Chainlink call, resolves its CHANGELOG coverage (see
+Durable post-merge recovery boundaries), and releases its lane.
 Once a run exists,
 external `plan.json` is only a candidate: an equal canonical digest is
 accepted, a changed plan requires an explicit monotonic revision, and a
@@ -181,8 +182,44 @@ receipt after restart. Unavailable, timed-out, rejected, or unclassifiable
 results remain in `ISSUE_CLOSE_PENDING` with a typed failure kind and the
 original issue and close-intent identity; they never create a receipt. A retry
 needs its named gate approved and a fresh open-status observation. The outcome
-is also emitted as `tl.issue_close_outcome`. An unlinked slice records both
-issue closure and changelog as not applicable and makes no Chainlink call.
+is also emitted as `tl.issue_close_outcome`.
+
+An unlinked slice makes no Chainlink call and records issue closure as not
+applicable. Its CHANGELOG coverage is resolved at `PARENT_BRANCH_SYNCED`
+(`_resolve_unlinked_changelog` in `loop/driver.py`):
+
+1. `post_merge_changelog_context` (read-only WASM tool) returns the `[Unreleased]`
+   section at the synchronized parent head, the merge commit's first-parent
+   changed paths, whether the PR edited `CHANGELOG.md`, and the PR title and
+   body. No `CHANGELOG.md` or no `[Unreleased]` section records `no_changelog`
+   with no model call; an unreadable context records `judgment_failed`.
+2. One `roles.tl` `changelog_coverage` judgment
+   (`tl_loop.rlm.tl_judgment.judge_changelog_coverage`) returns the closed
+   `{action: captured|add_entry, reason, section?, entry?}`. Backend, budget,
+   context-overflow, and contract failures record `judgment_failed`.
+3. The decision is checkpointed as `UnlinkedChangelogJudged` before anything is
+   written, with the model and charged tokens, so a restart writes the judged
+   entry instead of judging again.
+4. `add_entry` calls `post_merge_changelog_entry`, which inserts the line under
+   the judged Keep a Changelog section, commits only `CHANGELOG.md` with an
+   `Exomonad-Changelog-Intent` trailer, and pushes with the parent-push
+   `force-with-lease`. A retry recognizes its own already-pushed commit by that
+   trailer. A failed write restores `CHANGELOG.md`, a failed push runs
+   `git reset --keep` back to the synchronized head, and both return a typed
+   `entry_write_failed` / `entry_push_failed` result.
+5. `PostMergeNotApplicable` completes the slice with `changelog_outcome`
+   (`captured`, `no_changelog`, `judgment_failed`, `entry_added`,
+   `entry_write_failed`, `entry_push_failed`; `entry_added` also records
+   `changelog_commit_sha` and `observed_remote_head`), releases the lane, and
+   emits `tl.unlinked_changelog_resolved`.
+
+None of these outcomes parks or blocks the run. An active controller without a
+resolved `tl_model_choice` raises and blocks the slice on `tl-post-merge-<slice>`,
+like the other roles.tl judgments; a transport failure of the entry tool also
+blocks there, because the parent branch may hold an unpushed entry commit that
+the idempotent retry must reconcile. A shadow controller neither judges nor
+writes. Checkpoints that completed before this judgment existed keep
+`changelog_outcome=not_applicable` and still decode.
 
 `review_stuck` does not create a Chainlink issue, treat the bound slice issue as
 an epic, or edit the live `plan.json`. The linked issue remains metadata for

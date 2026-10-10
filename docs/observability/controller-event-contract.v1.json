@@ -29,6 +29,9 @@
         "tokens"
       ]
     },
+    "tl.unlinked_changelog_resolved": {
+      "fields": ["slice_id", "pr_number", "decision", "outcome", "model", "tokens"]
+    },
     "tl.repeated_action_parked": {
       "fields": ["gate_name", "invariant", "action_key", "action", "target_id", "reason"]
     },

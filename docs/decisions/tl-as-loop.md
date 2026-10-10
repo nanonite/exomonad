@@ -301,8 +301,14 @@ root controller orchestrates child handoff and persisted plan order; it never
 supplies its own issue ID or closes a child slice's issue.
 
 A slice without an issue binding is a first-class unlinked task for dynamic
-work. After parent-branch sync it records issue closure and changelog as not
-applicable, makes no Chainlink call, and remains eligible for normal completion.
+work. After parent-branch sync it records issue closure as not applicable and
+makes no Chainlink call. Because no `chainlink close` writes its CHANGELOG entry,
+the controller makes one bounded `roles.tl` `changelog_coverage` judgment
+(2026-10-10, #1170): `captured` when `[Unreleased]` already records the work,
+otherwise `add_entry`, which the controller writes, commits, and pushes with a
+compare-and-swap lease. The judgment never blocks the run: a missing CHANGELOG,
+a failed judgment, or a failed write or push is recorded as a typed outcome and
+the slice remains eligible for normal completion.
 The parent accepts a child handoff only after every merged PR slice in that
 scope finishes durable post-merge recovery, then continues at the next persisted
 order. `review_stuck` is separate from issue lifecycle: it creates no Chainlink

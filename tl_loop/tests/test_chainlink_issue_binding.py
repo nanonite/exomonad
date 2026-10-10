@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
-from dataclasses import replace
 
 import pytest
 
-from tl_loop.client.effects import EffectClient
-from tl_loop.client.effects import ToolResult
+from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import ServerTimeout
 from tl_loop.fsm.lane import LanePhase, LaneState
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
@@ -165,95 +163,6 @@ def test_old_manifest_and_checkpoint_decode_as_unlinked(tmp_path: Path) -> None:
     assert "chainlink_issue_id" not in node.to_document()
     assert restored.slices["leaf"].chainlink_issue_id is None
     assert restored.plan_manifest == manifest
-
-
-def test_unlinked_post_merge_persists_not_applicable_without_effects(tmp_path: Path) -> None:
-    class Transport:
-        calls: list[tuple[str, dict[str, object]]]
-
-        def __init__(self) -> None:
-            self.calls = []
-
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
-            del role, name
-            self.calls.append((tool_name, arguments))
-            raise AssertionError("unlinked completion must make no effect calls")
-
-    plan = {"leaves": [{"name": "leaf", "task": "work"}]}
-    manifest = build_plan_manifest(plan, scope_id="unlinked")
-    identity = RepositoryIdentity("org", "repo", "main")
-    create(
-        "unlinked",
-        {
-            "plan_manifest": manifest.to_document(),
-            "repository_identity": {
-                "owner": identity.owner,
-                "repo": identity.repo,
-                "base_branch": identity.base_branch,
-            },
-        },
-        root_dir=tmp_path,
-    )
-    store = RunStore("unlinked", tmp_path)
-    state = store.load()
-    current = replace(
-        state.slices["leaf"],
-        status=SliceStatus.MERGED,
-        base_ref="main",
-        pr_number=42,
-        post_merge=PostMergeState(
-            PostMergePhase.PARENT_BRANCH_SYNCED,
-            {
-                "child_id": "leaf",
-                "repository": "org/repo",
-                "parent_branch": "main",
-                "pr_number": "42",
-                "head_sha": "head-a",
-                "merge_journal_id": "merge-journal",
-                "lane_epoch": "1",
-                "parent_commit_sha": "parent-commit",
-            },
-        ),
-    )
-    integration = replace(
-        state.integration,
-        lanes={
-            "org/repo:main": LaneState(
-                "org/repo",
-                "main",
-                phase=LanePhase.INTEGRATING,
-                child_id="leaf",
-                lane_epoch=1,
-                head_sha="head-a",
-            )
-        },
-    )
-    state = store.checkpoint(
-        state.fsm,
-        {**state.slices, "leaf": current},
-        state.budgets,
-        state.events.last_consumed_offset,
-        integration=integration,
-        plan_manifest=manifest,
-    )
-    transport = Transport()
-
-    completed = _advance_post_merge_boundary(
-        state,
-        "leaf",
-        42,
-        TLLoopConfig(repository_identity=identity),
-        EffectClient(transport),
-        [],
-        store,
-    )
-
-    final = completed.slices["leaf"].post_merge
-    assert final is not None and final.phase is PostMergePhase.COMPLETE
-    assert final.evidence["issue_close_outcome"] == "not_applicable"
-    assert final.evidence["changelog_outcome"] == "not_applicable"
-    assert completed.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
-    assert transport.calls == []
 
 
 class IssueCloseTransport:

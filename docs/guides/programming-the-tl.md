@@ -472,8 +472,18 @@ for dynamic work that has no Chainlink task.
 The sub-TL that owns the slice closes its explicitly bound issue mechanically
 after merge adoption and parent-branch sync. The root only orchestrates child
 handoff and persisted plan order; it never substitutes a parent ID or closes a
-child issue. An unlinked slice completes normally with a durable
-not-applicable issue-integration outcome. The `review_stuck` judgment does not
+child issue. An unlinked slice has no issue to close, so the CHANGELOG would
+otherwise miss its work: after parent-branch sync the controller makes one
+`roles.tl` `changelog_coverage` judgment over the `[Unreleased]` section, the
+merged paths, and the PR title and body. `captured` writes nothing; `add_entry`
+inserts one line under the judged Keep a Changelog section, commits it on the
+parent branch, and pushes it with the same compare-and-swap lease as a linked
+slice. A missing CHANGELOG, a failed judgment, or a failed write or push becomes
+a typed `changelog_outcome` (`no_changelog`, `judgment_failed`,
+`entry_write_failed`, `entry_push_failed`) and the slice still completes; a
+failed write or push first returns the local parent to its synchronized head.
+Each judgment is charged to `roles.tl.token_budget` and emits
+`tl.unlinked_changelog_resolved`. The `review_stuck` judgment does not
 create issues or epics and never edits the live `plan.json`.
 
 ### `sub_tls` — recursion, and the only way to order work
@@ -1478,6 +1488,7 @@ repair prose, or plan documents:
 | `tl.aggregate_pr_opened` | An aggregate PR is created for a child sub-TL |
 | `tl.integration_validated` / `tl.integration_revalidated` | Base-bound integration evidence is accepted or refreshed |
 | `tl.integration_base_invalidated` | The integration base changed and evidence must be refreshed |
+| `tl.unlinked_changelog_resolved` | An unlinked merged slice completed with its CHANGELOG decision and outcome |
 | `tl.integration_failure_judged` | One roles.tl judgment chose `delegate` or `escalate` for an aggregate CI failure or parent merge conflict |
 | `tl.integration_repair_requested` | Same-owner repair was requested |
 | `tl.merge_reconciled` | Restart observed that a persisted merge already completed |

@@ -92,6 +92,7 @@ from tl_loop.fsm.post_merge_events import (
     PostMergeComplete,
     PostMergeNotApplicable,
     PostMergeRebuildRequested,
+    UnlinkedChangelogJudged,
 )
 from tl_loop.fsm.post_merge_evidence import PushReceipt
 from tl_loop.fsm.recovery import (
@@ -208,7 +209,12 @@ from tl_loop.rlm.repair import (
     forward_review_findings,
 )
 from tl_loop.rlm.store import BudgetExceeded, RlmModelChoice
-from tl_loop.rlm.tl_judgment import judge_integration_failure, judge_review_stuck
+from tl_loop.rlm.tl_judgment import (
+    ChangelogCoverageJudgmentError,
+    judge_changelog_coverage,
+    judge_integration_failure,
+    judge_review_stuck,
+)
 from tl_loop.select.agent_type import (
     SelectionFailure,
     parse_harness_identifier,
@@ -5046,17 +5052,8 @@ def _advance_post_merge_boundary(
             )
         if post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED:
             if current.chainlink_issue_id is None:
-                lane_event: object | None = None
-                repository, parent_branch = _candidate_lane_key(state, current)
-                lane_key = f"{repository}:{parent_branch}"
-                if lane_key in state.integration.lanes:
-                    lane_event = LaneBookkeepingNotRequired(current.id)
-                return _checkpoint_post_merge_event(
-                    store,
-                    state,
-                    slice_id,
-                    PostMergeNotApplicable(current.id),
-                    lane_event=lane_event,
+                return _resolve_unlinked_changelog(
+                    state, current, pr_number, evidence, config, effects, effects_log, store
                 )
             issue_id = _required_issue_id(current.chainlink_issue_id)
             intent_id = _post_merge_key(state, "issue_close", current.id, pr_number)
@@ -5171,6 +5168,319 @@ def _advance_post_merge_boundary(
     except (EffectFailed, TLLoopError, ToolUnavailableError, TypeError, ValueError) as error:
         return _block_post_merge_recovery(store, state, slice_id, str(error))
     return state
+
+
+def _resolve_unlinked_changelog(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    """Judge an unlinked slice's CHANGELOG coverage, write any entry, and complete it.
+
+    The decision is checkpointed before anything is written, so a restart writes
+    the judged entry instead of judging again. Every judgment or write failure
+    becomes a typed changelog outcome; the slice still completes. A shadow
+    controller makes no model call and writes nothing.
+    """
+    if not config.active:
+        return state
+    decision = evidence.get("changelog_decision")
+    if decision is None:
+        return _judge_unlinked_changelog(
+            state, current, pr_number, evidence, config, effects, effects_log, store
+        )
+    if decision != "add_entry":
+        detail = (
+            str(evidence.get("changelog_decision_reason", "")) if decision != "captured" else ""
+        )
+        return _complete_unlinked_changelog(
+            store,
+            state,
+            current,
+            pr_number,
+            evidence,
+            str(decision),
+            detail,
+            config,
+            effects,
+            effects_log,
+        )
+    arguments = {
+        "child_id": current.id,
+        "repository": _required_merge_identity(evidence, ("repository",), "repository"),
+        "parent_branch": _required_merge_identity(evidence, ("parent_branch",), "parent branch"),
+        "expected_base_sha": _required_merge_identity(
+            evidence, ("parent_commit_sha",), "synchronized parent head"
+        ),
+        "intent_id": _required_merge_identity(
+            evidence, ("changelog_judgment_intent_id",), "changelog judgment intent"
+        ),
+        "section": _required_merge_identity(
+            evidence, ("changelog_entry_section",), "changelog entry section"
+        ),
+        "entry": _required_merge_identity(evidence, ("changelog_entry",), "changelog entry"),
+        "working_dir": _relative_process_working_dir(config),
+    }
+    result = _post_merge_effect(
+        "post_merge_changelog_entry",
+        current.id,
+        arguments,
+        effects,
+        effects_log,
+        "post_merge_changelog_entry",
+        active=config.active,
+    )
+    payload = _merge_result_payload(result)
+    if payload is None:
+        # The tool reports every Git outcome as a result; only its argument
+        # validation fails, which happens before any write.
+        error = result.error if result is not None else None
+        return _complete_unlinked_changelog(
+            store,
+            state,
+            current,
+            pr_number,
+            evidence,
+            "entry_write_failed",
+            error or "changelog entry tool returned no result",
+            config,
+            effects,
+            effects_log,
+        )
+    outcome = payload.get("outcome")
+    if outcome not in {"entry_added", "entry_write_failed", "entry_push_failed"}:
+        raise ValueError(f"changelog entry tool returned an unknown outcome {outcome!r}")
+    _require_matching_text(payload, arguments, "child_id", "parent_branch", "intent_id")
+    commit_sha = payload.get("commit_sha") if outcome == "entry_added" else None
+    remote_head = payload.get("observed_remote_head") if outcome == "entry_added" else None
+    return _complete_unlinked_changelog(
+        store,
+        state,
+        current,
+        pr_number,
+        evidence,
+        str(outcome),
+        str(payload.get("detail") or ""),
+        config,
+        effects,
+        effects_log,
+        commit_sha=commit_sha if isinstance(commit_sha, str) else "",
+        remote_head=remote_head if isinstance(remote_head, str) else "",
+    )
+
+
+def _judge_unlinked_changelog(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    """Read the evidence, make the one roles.tl judgment, and checkpoint the decision."""
+    choice = config.tl_model_choice
+    if choice is None or config.policy is None:
+        raise TLLoopError(
+            "changelog_coverage requires config.tl_model_choice and config.policy; "
+            "the controller must resolve roles.tl at startup"
+        )
+    if choice.role != "tl":
+        raise TLLoopError("changelog_coverage judgments must use the roles.tl budget")
+    intent_id = _post_merge_key(state, "unlinked_changelog", current.id, pr_number)
+    merge_commit = evidence.get("forgejo_merge_commit_sha")
+    arguments: dict[str, object] = {
+        "child_id": current.id,
+        "parent_branch": _required_merge_identity(evidence, ("parent_branch",), "parent branch"),
+        "expected_base_sha": _required_merge_identity(
+            evidence, ("parent_commit_sha",), "synchronized parent head"
+        ),
+        "pr_number": pr_number,
+        "working_dir": _relative_process_working_dir(config),
+    }
+    if isinstance(merge_commit, str) and merge_commit:
+        arguments["merge_commit_sha"] = merge_commit
+    try:
+        result = _post_merge_effect(
+            "post_merge_changelog_context",
+            current.id,
+            arguments,
+            effects,
+            effects_log,
+            "post_merge_changelog_context",
+            active=config.active,
+        )
+    except (EffectFailed, ToolUnavailableError) as error:
+        return _record_unlinked_decision(
+            store, state, current, intent_id, "judgment_failed", f"context read failed: {error}"
+        )
+    context = _merge_result_payload(result)
+    if context is None:
+        context_error = result.error if result is not None else None
+        return _record_unlinked_decision(
+            store,
+            state,
+            current,
+            intent_id,
+            "judgment_failed",
+            f"context read failed: {context_error or 'no result'}",
+        )
+    if context.get("changelog_present") is not True:
+        return _record_unlinked_decision(
+            store,
+            state,
+            current,
+            intent_id,
+            "no_changelog",
+            "the parent branch has no CHANGELOG.md",
+        )
+    if context.get("unreleased_present") is not True:
+        return _record_unlinked_decision(
+            store,
+            state,
+            current,
+            intent_id,
+            "no_changelog",
+            "CHANGELOG.md has no [Unreleased] section",
+        )
+    role_policy = config.policy.roles["tl"]
+    choice.store.ledger.bind(
+        choice.role,
+        spent=state.budgets.role_spent.get(choice.role, 0),
+        budget=role_policy.token_budget,
+        charge_callback=store.charge_role_tokens,
+    )
+    spent_before = choice.store.ledger.spent.get(choice.role, 0)
+    judgment_evidence = {
+        "pr_number": pr_number,
+        "pr_title": context.get("pr_title"),
+        "pr_body": context.get("pr_body"),
+        "pr_lookup_error": context.get("pr_lookup_error"),
+        "changed_paths": context.get("changed_paths"),
+        "changed_paths_error": context.get("changed_paths_error"),
+        "pr_edited_changelog": context.get("pr_edited_changelog"),
+        "unreleased_section": context.get("unreleased_section"),
+    }
+    try:
+        decision = judge_changelog_coverage(choice, evidence=judgment_evidence)
+    except (
+        RlmError,
+        ChangelogCoverageJudgmentError,
+        BudgetExceeded,
+        ContextBudgetError,
+    ) as error:
+        state = store.load()
+        return _record_unlinked_decision(
+            store,
+            state,
+            current,
+            intent_id,
+            "judgment_failed",
+            f"{type(error).__name__}: {error}",
+            model=choice.model_id,
+            tokens=choice.store.ledger.spent.get(choice.role, 0) - spent_before,
+        )
+    state = store.load()
+    return _record_unlinked_decision(
+        store,
+        state,
+        current,
+        intent_id,
+        decision.action,
+        decision.reason,
+        section=decision.section or "",
+        entry=decision.entry or "",
+        model=choice.model_id,
+        tokens=choice.store.ledger.spent.get(choice.role, 0) - spent_before,
+    )
+
+
+def _record_unlinked_decision(
+    store: RunStore,
+    state: RunState,
+    current: SliceState,
+    intent_id: str,
+    decision: str,
+    reason: str,
+    *,
+    section: str = "",
+    entry: str = "",
+    model: str | None = None,
+    tokens: int = 0,
+) -> RunState:
+    LOGGER.info(
+        "[TL loop] unlinked changelog slice=%s decision=%s model=%s tokens=%d",
+        current.id,
+        decision,
+        model,
+        tokens,
+    )
+    return _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        UnlinkedChangelogJudged(
+            current.id,
+            intent_id,
+            decision,
+            reason or decision,
+            section,
+            entry,
+            model or "",
+            tokens,
+        ),
+    )
+
+
+def _complete_unlinked_changelog(
+    store: RunStore,
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    outcome: str,
+    detail: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    *,
+    commit_sha: str = "",
+    remote_head: str = "",
+) -> RunState:
+    """Release the lane and complete the slice with its typed changelog outcome."""
+    lane_event: object | None = None
+    repository, parent_branch = _candidate_lane_key(state, current)
+    if f"{repository}:{parent_branch}" in state.integration.lanes:
+        lane_event = LaneBookkeepingNotRequired(current.id)
+    completed = _checkpoint_post_merge_event(
+        store,
+        state,
+        current.id,
+        PostMergeNotApplicable(current.id, outcome, detail, commit_sha, remote_head),
+        lane_event=lane_event,
+    )
+    _record_controller_event(
+        current.id,
+        "tl.unlinked_changelog_resolved",
+        {
+            "slice_id": current.id,
+            "pr_number": pr_number,
+            "decision": str(evidence.get("changelog_decision", "")),
+            "outcome": outcome,
+            "model": str(evidence.get("changelog_judgment_model", "")),
+            "tokens": int(str(evidence.get("changelog_judgment_tokens", "0"))),
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return completed
 
 
 def _drain_post_merge_recovery(

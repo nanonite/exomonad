@@ -23,6 +23,7 @@ from .post_merge_events import (
     PostMergeComplete,
     PostMergeNotApplicable,
     PostMergeRebuildRequested,
+    UnlinkedChangelogJudged,
 )
 from .post_merge_evidence import PushReceipt
 
@@ -171,12 +172,14 @@ class PostMergeState:
 
 
 def _required_evidence(phase: PostMergePhase, evidence: Mapping[str, str]) -> tuple[str, ...]:
-    """Return phase requirements, including the durable unlinked outcome."""
-    if phase is PostMergePhase.COMPLETE and (
-        evidence.get("issue_close_outcome") == "not_applicable"
-        and evidence.get("changelog_outcome") == "not_applicable"
-    ):
-        return _cumulative(
+    """Return phase requirements, including the durable unlinked outcome.
+
+    An unlinked slice completes with ``issue_close_outcome=not_applicable`` and
+    its changelog outcome. Checkpoints written before the changelog judgment
+    existed carry ``changelog_outcome=not_applicable`` and remain valid.
+    """
+    if phase is PostMergePhase.COMPLETE and evidence.get("issue_close_outcome") == "not_applicable":
+        unlinked = _cumulative(
             "repository",
             "parent_branch",
             "pr_number",
@@ -187,6 +190,9 @@ def _required_evidence(phase: PostMergePhase, evidence: Mapping[str, str]) -> tu
             "issue_close_outcome",
             "changelog_outcome",
         )
+        if evidence.get("changelog_outcome") == "entry_added":
+            return (*unlinked, "changelog_commit_sha", "observed_remote_head")
+        return unlinked
     required = _REQUIRED_EVIDENCE.get(phase, ())
     if phase in {
         PostMergePhase.ISSUE_CLOSE_CONFIRMED,
@@ -222,4 +228,5 @@ __all__ = [
     "PostMergeRebuildRequested",
     "PostMergeState",
     "PushReceipt",
+    "UnlinkedChangelogJudged",
 ]

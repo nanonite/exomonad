@@ -1,13 +1,14 @@
-"""Recursive handoff and unlinked post-merge replay regressions for #1169."""
+"""Recursive handoff and unlinked post-merge replay regressions for #1169 and #1170."""
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tl_loop.client.effects import EffectClient
-from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
+from tl_loop.client.transport import JsonObject
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
 from tl_loop.fsm.scope import TLDone as RecursiveTLDone
 from tl_loop.loop.driver import (
@@ -21,9 +22,16 @@ from tl_loop.loop.driver import (
     derive_child_branch,
     run_tl_loop,
 )
+from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse
+from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import RepositoryIdentity, SliceStatus
 from tl_loop.state.store import RunStore, create
-from tl_loop.tests.test_driver import RecordingTransport, SyntheticQueue
+from tl_loop.tests.test_driver import (
+    RecordingTransport,
+    ReviewBackend,
+    SyntheticQueue,
+    _selector_policy,
+)
 
 ROOT_RUN_ID = "root"
 CHILD_RUN_ID = "implementation"
@@ -32,6 +40,31 @@ MERGED_PR = 45
 HEAD_SHA = "a" * 40
 PARENT_COMMIT_SHA = "b" * 40
 REPOSITORY_IDENTITY = RepositoryIdentity("org", "repo", "main")
+
+
+@dataclass
+class ChangelogRecordingTransport(RecordingTransport):
+    """Answers the unlinked CHANGELOG context read for the merged child slice."""
+
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        if tool_name == "post_merge_changelog_context":
+            self.calls.append((tool_name, arguments))
+            return {
+                "success": True,
+                "result": {
+                    "child_id": arguments["child_id"],
+                    "changelog_present": True,
+                    "unreleased_present": True,
+                    "unreleased_section": "### Added\n- Complete the merged work (#45)",
+                    "changed_paths": ["src/feature.rs"],
+                    "pr_edited_changelog": True,
+                    "pr_title": "Complete merged work",
+                    "pr_body": "",
+                },
+            }
+        return super().call_tool(role, name, tool_name, arguments)
 
 
 def _recursive_plan() -> tuple[dict[str, object], WorkPlan]:
@@ -61,11 +94,22 @@ def _seed_parent_and_captured_child(tmp_path: Path) -> tuple[WorkPlan, TLLoopCon
     config = TLLoopConfig(
         run_id=ROOT_RUN_ID,
         root_dir=tmp_path,
+        project_root=tmp_path,
         active=True,
         branch="main",
         max_parallel_slices=1,
         keep_alive_on_waiting=False,
         repository_identity=REPOSITORY_IDENTITY,
+        policy=validate_policy(_selector_policy()),
+        tl_model_choice=RlmModelChoice(
+            model_id="tl-model",
+            backend=ReviewBackend(
+                [RlmResponse({"action": "captured", "reason": "the PR added its own entry"})]
+            ),
+            role="tl",
+            store=RlmCallStore(),
+            context_length=20_000,
+        ),
     )
     parent_manifest = _manifest_for_plan(plan, ROOT_RUN_ID, config)
     parent_slices = _bind_initial_slices(
@@ -178,7 +222,7 @@ def test_merged_but_unfinished_child_is_not_ready_for_parent_handoff(tmp_path: P
     assert child_state.slices[LEAF_ID].chainlink_issue_id is None
     assert not _child_handoff_ready(child_state, ROOT_RUN_ID)
 
-    transport = RecordingTransport()
+    transport = ChangelogRecordingTransport()
     result = run_tl_loop(
         ROOT_RUN_ID,
         plan,
@@ -200,13 +244,15 @@ def test_merged_but_unfinished_child_is_not_ready_for_parent_handoff(tmp_path: P
     assert completed_slice.post_merge is not None
     assert completed_slice.post_merge.phase is PostMergePhase.COMPLETE
     assert completed_slice.post_merge.evidence["issue_close_outcome"] == "not_applicable"
-    assert completed_slice.post_merge.evidence["changelog_outcome"] == "not_applicable"
+    assert completed_slice.post_merge.evidence["changelog_outcome"] == "captured"
     assert completed_slice.chainlink_issue_id is None
 
     effect_names = [name for name, _ in transport.calls]
     assert "chainlink_issue_close" not in effect_names
     assert "chainlink_issue_create" not in effect_names
     assert "post_merge_changelog" not in effect_names
+    assert "post_merge_changelog_entry" not in effect_names
+    assert effect_names.count("post_merge_changelog_context") == 1
     assert "merge_pr" not in effect_names
     assert "file_pr" not in effect_names
     assert "spawn_leaf" not in effect_names

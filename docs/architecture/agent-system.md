@@ -82,8 +82,11 @@ in the immutable recursive manifest. A sub-TL owns issue integration for the
 slices in its scope and closes only an explicitly bound issue after merge
 adoption and parent-branch sync. The root orchestrator never supplies its own
 ID or closes a child slice's issue. An unlinked slice is a normal outcome: it
-records issue closure and changelog as not applicable, makes no Chainlink call,
-and can release its parent after post-merge recovery completes. The parent
+records issue closure as not applicable, makes no Chainlink call, and gets one
+`roles.tl` `changelog_coverage` judgment that either confirms CHANGELOG
+`[Unreleased]` already captures the work or writes and pushes one entry; any
+failure there is a typed changelog outcome, and the slice can release its parent
+after post-merge recovery completes. The parent
 advances only through its persisted plan order after that child handoff.
 
 | Lifecycle | Authority | Recovery |
@@ -141,6 +144,8 @@ raw ledger payloads. `NEEDS_BASE_REVALIDATION` refreshes base-bound evidence;
 | `post_merge_parent_sync` | x | x | | | |
 | `post_merge_remote_reconcile` | x | x | | | |
 | `post_merge_changelog` | x | x | | | |
+| `post_merge_changelog_context` | x | x | | | |
+| `post_merge_changelog_entry` | x | x | | | |
 | `post_merge_push` | x | x | | | |
 | `root_branch_finalize` | x | x | | | |
 | `file_pr` | | x | x | | |

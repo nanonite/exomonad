@@ -9,6 +9,10 @@ bounded ``roles.tl`` judgment with a closed action schema:
   actions carry a seven-section ``RepairHandoff`` validated against owned paths
   and dispatched through ``resume_pr`` to the same owner.
 
+After an unlinked slice (no Chainlink issue) merges, one ``changelog_coverage``
+judgment decides whether CHANGELOG ``[Unreleased]`` already captures the merged
+work (``captured``) or needs one entry (``add_entry``).
+
 The model resolves from ``roles.tl`` in ``.exo/harness_policy.toml`` and
 ``.exo/model-catalog.json``. A model-qualified allow entry pins the model; a bare
 agent type defers to the catalog. When neither yields a model, resolution
@@ -43,6 +47,10 @@ REVIEW_STUCK_JUDGMENT = "review_stuck"
 REVIEW_STUCK_ACTIONS = ("guide", "escalate")
 INTEGRATION_FAILURE_JUDGMENT = "integration_failure"
 INTEGRATION_FAILURE_ACTIONS = ("delegate", "escalate")
+CHANGELOG_COVERAGE_JUDGMENT = "changelog_coverage"
+CHANGELOG_COVERAGE_ACTIONS = ("captured", "add_entry")
+CHANGELOG_SECTIONS = ("Added", "Changed", "Deprecated", "Removed", "Fixed", "Security")
+CHANGELOG_ENTRY_MAX_LENGTH = 300
 DEFAULT_TL_CONTEXT_LENGTH = 128_000
 POLICY_FILE = ".exo/harness_policy.toml"
 CATALOG_FILE = ".exo/model-catalog.json"
@@ -126,6 +134,50 @@ DONE CRITERIA
 """
 
 
+CHANGELOG_COVERAGE_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": list(CHANGELOG_COVERAGE_ACTIONS)},
+        "reason": {"type": "string", "minLength": 1},
+        "section": {"type": "string", "enum": list(CHANGELOG_SECTIONS)},
+        "entry": {"type": "string", "minLength": 1, "maxLength": CHANGELOG_ENTRY_MAX_LENGTH},
+    },
+    "required": ["action", "reason"],
+    "additionalProperties": False,
+}
+
+CHANGELOG_COVERAGE_PROMPT = """A slice with no Chainlink issue has merged into its parent branch.
+Decide whether the CHANGELOG [Unreleased] section already records this work.
+
+ANTI-PATTERNS (FIRST)
+- Do not invent work the evidence does not show.
+- Do not rewrite, reorder, or remove existing entries.
+- Do not add an entry when an existing one already describes this change, even
+  in different words.
+- Do not return prose outside the schema.
+
+READ FIRST
+- The pull request title and body describe the intent of the change.
+- The changed paths show what the merge touched; pr_edited_changelog says
+  whether the pull request already edited CHANGELOG.md.
+- The [Unreleased] section is what the CHANGELOG records today.
+
+STEPS
+- Choose "captured" when an existing [Unreleased] entry covers this change, or
+  the change is not user-visible (tests, CI, refactors with no behavior change).
+  Return only "reason".
+- Choose "add_entry" otherwise. Return "section" (one of Added, Changed,
+  Deprecated, Removed, Fixed, Security) and "entry": one line, in the style of
+  the existing entries, without a leading "- " marker, at most 300 characters.
+
+VERIFY
+- "captured" carries neither "section" nor "entry"; "add_entry" carries both.
+
+DONE CRITERIA
+- Return only the schema object.
+"""
+
+
 class TLModelResolutionError(RuntimeError):
     """The roles.tl judgment model cannot be resolved; the message names the file."""
 
@@ -154,6 +206,20 @@ class IntegrationFailureDecision:
     action: str
     reason: str
     handoff: RepairHandoff | None = None
+
+
+class ChangelogCoverageJudgmentError(RuntimeError):
+    """The changelog-coverage judgment violates its closed contract."""
+
+
+@dataclass(frozen=True)
+class ChangelogCoverageDecision:
+    """One validated captured/add_entry judgment for an unlinked merged slice."""
+
+    action: str
+    reason: str
+    section: str | None = None
+    entry: str | None = None
 
 
 def resolve_tl_model_id(policy: HarnessPolicy, catalog: ModelCatalog | None) -> tuple[str, str]:
@@ -336,8 +402,67 @@ def judge_integration_failure(
     return IntegrationFailureDecision("delegate", reason, handoff)
 
 
+def judge_changelog_coverage(
+    choice: RlmModelChoice,
+    *,
+    evidence: Mapping[str, object],
+) -> ChangelogCoverageDecision:
+    """Make one roles.tl changelog-coverage judgment and validate its closed result."""
+    inputs: JsonObject = {
+        "sections": cast(
+            JsonValue,
+            [
+                {
+                    "name": "instructions",
+                    "content": CHANGELOG_COVERAGE_PROMPT,
+                    "priority": 140,
+                    "required": True,
+                },
+                {
+                    "name": "merged_slice",
+                    "content": cast(JsonValue, dict(evidence)),
+                    "priority": 120,
+                    "required": True,
+                },
+            ],
+        )
+    }
+    output = rlm(CHANGELOG_COVERAGE_JUDGMENT, inputs, CHANGELOG_COVERAGE_SCHEMA, choice)
+    action = cast(str, output["action"])
+    reason = cast(str, output["reason"]).strip()
+    section = output.get("section")
+    entry = output.get("entry")
+    if action == "captured":
+        if section is not None or entry is not None:
+            raise ChangelogCoverageJudgmentError("a captured judgment must not carry an entry")
+        return ChangelogCoverageDecision("captured", reason)
+    if action != "add_entry":
+        raise ChangelogCoverageJudgmentError(f"unsupported changelog action {action!r}")
+    if not isinstance(section, str) or section not in CHANGELOG_SECTIONS:
+        raise ChangelogCoverageJudgmentError("an add_entry judgment must name a CHANGELOG section")
+    if not isinstance(entry, str):
+        raise ChangelogCoverageJudgmentError("an add_entry judgment must carry an entry")
+    if (
+        entry != entry.strip()
+        or not entry
+        or "\n" in entry
+        or "\r" in entry
+        or entry.startswith(("- ", "#"))
+        or len(entry) > CHANGELOG_ENTRY_MAX_LENGTH
+    ):
+        raise ChangelogCoverageJudgmentError(
+            "an add_entry judgment must carry one unmarked line of at most 300 characters"
+        )
+    return ChangelogCoverageDecision("add_entry", reason, section, entry)
+
+
 __all__ = [
     "CATALOG_FILE",
+    "CHANGELOG_COVERAGE_ACTIONS",
+    "CHANGELOG_COVERAGE_JUDGMENT",
+    "CHANGELOG_COVERAGE_PROMPT",
+    "CHANGELOG_COVERAGE_SCHEMA",
+    "CHANGELOG_SECTIONS",
     "INTEGRATION_FAILURE_ACTIONS",
     "INTEGRATION_FAILURE_JUDGMENT",
     "INTEGRATION_FAILURE_PROMPT",
@@ -345,12 +470,15 @@ __all__ = [
     "POLICY_FILE",
     "REVIEW_STUCK_JUDGMENT",
     "REVIEW_STUCK_SCHEMA",
+    "ChangelogCoverageDecision",
+    "ChangelogCoverageJudgmentError",
     "IntegrationFailureDecision",
     "IntegrationFailureJudgmentError",
     "ReviewStuckDecision",
     "ReviewStuckJudgmentError",
     "TLModelResolutionError",
     "build_tl_model_choice",
+    "judge_changelog_coverage",
     "judge_integration_failure",
     "judge_review_stuck",
     "resolve_tl_model_id",

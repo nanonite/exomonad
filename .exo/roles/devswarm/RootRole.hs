@@ -48,6 +48,7 @@ import ExoMonad.Guest.Tools.DisposeLeaf (DisposeLeaf (..))
 import ExoMonad.Guest.Tools.Memory (ContinuationBrief (..), MemoryAppend (..), MemoryList (..))
 import ExoMonad.Guest.Tools.MergePR (MergePRArgs (..), MergePROutput (..), extractAgentName, mergePRCore, mergePRDescription, mergePRRender, mergePRSchema)
 import ExoMonad.Guest.Tools.PollWorkers (PollWorkers (..))
+import ExoMonad.Guest.Tools.UnlinkedChangelog (UnlinkedChangelogContext, UnlinkedChangelogEntry)
 import ExoMonad.Guest.Tools.PostMergeRecovery
   ( PostMergeChangelog,
     PostMergeParentSync,
@@ -185,6 +186,8 @@ data Tools mode = Tools
     postMergeParentSync :: mode :- PostMergeParentSync,
     postMergeRemoteReconcile :: mode :- PostMergeRemoteReconcile,
     postMergeChangelog :: mode :- PostMergeChangelog,
+    postMergeChangelogContext :: mode :- UnlinkedChangelogContext,
+    postMergeChangelogEntry :: mode :- UnlinkedChangelogEntry,
     postMergePush :: mode :- PostMergePush,
     rootBranchFinalize :: mode :- RootBranchFinalize,
     closeWorkerPane :: mode :- RootCloseWorkerPane,
@@ -245,6 +248,8 @@ config =
             postMergeParentSync = mkHandler @PostMergeParentSync,
             postMergeRemoteReconcile = mkHandler @PostMergeRemoteReconcile,
             postMergeChangelog = mkHandler @PostMergeChangelog,
+            postMergeChangelogContext = mkHandler @UnlinkedChangelogContext,
+            postMergeChangelogEntry = mkHandler @UnlinkedChangelogEntry,
             postMergePush = mkHandler @PostMergePush,
             rootBranchFinalize = mkHandler @RootBranchFinalize,
             closeWorkerPane = mkHandler @RootCloseWorkerPane,

@@ -18,6 +18,7 @@ from .post_merge_events import (
     PostMergeComplete,
     PostMergeNotApplicable,
     PostMergeRebuildRequested,
+    UnlinkedChangelogJudged,
 )
 from .post_merge_recovery import (
     complete_post_merge,
@@ -49,6 +50,7 @@ def advance_post_merge(state: PostMergeState, event: object) -> PostMergeState:
         PostMergeComplete,
         PostMergeNotApplicable,
         PostMergeRebuildRequested,
+        UnlinkedChangelogJudged,
     )
     if not isinstance(event, supported):
         raise TypeError(f"unsupported post-merge event {type(event).__name__}")

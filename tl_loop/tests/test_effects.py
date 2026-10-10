@@ -298,6 +298,22 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         generation=0,
         intent_id="changelog-intent",
     )
+    client.post_merge_changelog_context(
+        child_id="child",
+        parent_branch="main",
+        expected_base_sha="base",
+        pr_number=7,
+        merge_commit_sha="merge",
+    )
+    client.post_merge_changelog_entry(
+        child_id="child",
+        repository="org/repo",
+        parent_branch="main",
+        expected_base_sha="base",
+        intent_id="entry-intent",
+        section="Fixed",
+        entry="Fix a thing",
+    )
     client.post_merge_push(
         child_id="child",
         repository="org/repo",

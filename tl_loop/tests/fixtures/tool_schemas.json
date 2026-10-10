@@ -464,6 +464,95 @@
       "name": "post_merge_changelog"
     },
     {
+      "description": "Read the CHANGELOG [Unreleased] section at the synchronized parent head, the paths a merged unlinked slice changed, and its pull request title and body.",
+      "inputSchema": {
+        "properties": {
+          "child_id": {
+            "description": "Stable child slice identifier.",
+            "type": "string"
+          },
+          "parent_branch": {
+            "description": "Direct parent integration branch, which must be checked out.",
+            "type": "string"
+          },
+          "expected_base_sha": {
+            "description": "Synchronized parent head the evidence is read from.",
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "Merged pull request number.",
+            "type": "integer"
+          },
+          "merge_commit_sha": {
+            "description": "Authoritative merge commit; its first-parent diff gives the changed paths.",
+            "type": "string"
+          },
+          "working_dir": {
+            "description": "Optional relative repository working directory.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "child_id",
+          "parent_branch",
+          "expected_base_sha",
+          "pr_number"
+        ],
+        "type": "object"
+      },
+      "name": "post_merge_changelog_context"
+    },
+    {
+      "description": "Insert one CHANGELOG [Unreleased] entry for a merged unlinked slice, commit it on the parent branch, and push it with a compare-and-swap lease; every failure is returned as a typed outcome after the local parent is restored.",
+      "inputSchema": {
+        "properties": {
+          "child_id": {
+            "description": "Stable child slice identifier.",
+            "type": "string"
+          },
+          "repository": {
+            "description": "Authoritative repository identity.",
+            "type": "string"
+          },
+          "parent_branch": {
+            "description": "Direct parent integration branch, which must be checked out.",
+            "type": "string"
+          },
+          "expected_base_sha": {
+            "description": "Synchronized parent head; the push lease expects the remote here.",
+            "type": "string"
+          },
+          "intent_id": {
+            "description": "Durable entry intent, recorded as a commit trailer.",
+            "type": "string"
+          },
+          "section": {
+            "description": "Keep a Changelog section: Added, Changed, Deprecated, Removed, Fixed, or Security.",
+            "type": "string"
+          },
+          "entry": {
+            "description": "One-line entry text without the leading list marker.",
+            "type": "string"
+          },
+          "working_dir": {
+            "description": "Optional relative repository working directory.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "child_id",
+          "repository",
+          "parent_branch",
+          "expected_base_sha",
+          "intent_id",
+          "section",
+          "entry"
+        ],
+        "type": "object"
+      },
+      "name": "post_merge_changelog_entry"
+    },
+    {
       "description": "Push parent-branch bookkeeping with force-with-lease compare-and-swap and return a verified push receipt.",
       "inputSchema": {
         "properties": {

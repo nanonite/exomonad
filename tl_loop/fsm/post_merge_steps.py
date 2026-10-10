@@ -8,6 +8,8 @@ from .evidence import require_positive as _require_positive
 from .evidence import require_text as _require_text
 from .post_merge import PostMergePhase, PostMergeState
 from .post_merge_events import (
+    UNLINKED_CHANGELOG_DECISIONS,
+    UNLINKED_CHANGELOG_OUTCOMES,
     ChangelogCommitted,
     ChangelogPending,
     IssueCloseAlreadyClosed,
@@ -20,6 +22,7 @@ from .post_merge_events import (
     ParentBranchSynced,
     ParentPushPending,
     PostMergeNotApplicable,
+    UnlinkedChangelogJudged,
 )
 from .post_merge_recovery import require_fresh_rebuild_push
 
@@ -30,6 +33,8 @@ def advance_standard_post_merge(state: PostMergeState, event: object) -> PostMer
         return _merge_adopted(state, event)
     if isinstance(event, ParentBranchSynced):
         return _parent_branch_synced(state, event)
+    if isinstance(event, UnlinkedChangelogJudged):
+        return _unlinked_changelog_judged(state, event)
     if isinstance(event, PostMergeNotApplicable):
         return _post_merge_not_applicable(state, event)
     if isinstance(event, IssueClosePending):
@@ -125,14 +130,53 @@ def _issue_close_pending(state: PostMergeState, event: IssueClosePending) -> Pos
     )
 
 
+def _unlinked_changelog_judged(
+    state: PostMergeState, event: UnlinkedChangelogJudged
+) -> PostMergeState:
+    _require_text(event.child_id, "post-merge child ID")
+    _require_text(event.intent_id, "changelog judgment intent ID")
+    _require_text(event.reason, "changelog judgment reason")
+    if event.decision not in UNLINKED_CHANGELOG_DECISIONS:
+        raise ValueError(f"unknown unlinked changelog decision {event.decision!r}")
+    if event.decision == "add_entry":
+        _require_text(event.section, "changelog entry section")
+        _require_text(event.entry, "changelog entry")
+    elif event.section or event.entry:
+        raise ValueError("only an add_entry decision carries a changelog entry")
+    _require_phase(state, PostMergePhase.PARENT_BRANCH_SYNCED, "unlinked changelog judgment")
+    if "issue_id" in state.evidence:
+        raise ValueError("a bound Chainlink issue has no unlinked changelog judgment")
+    if event.tokens < 0:
+        raise ValueError("changelog judgment tokens must not be negative")
+    additions = {
+        "changelog_judgment_intent_id": event.intent_id,
+        "changelog_decision": event.decision,
+        "changelog_decision_reason": event.reason[:500],
+        "changelog_judgment_tokens": str(event.tokens),
+    }
+    if event.model:
+        additions["changelog_judgment_model"] = event.model
+    if event.decision == "add_entry":
+        additions["changelog_entry_section"] = event.section
+        additions["changelog_entry"] = event.entry
+    if "changelog_decision" in state.evidence:
+        for key, value in additions.items():
+            _require_evidence(state, key, value)
+        return state
+    return _with_evidence(state, PostMergePhase.PARENT_BRANCH_SYNCED, additions)
+
+
 def _post_merge_not_applicable(
     state: PostMergeState, event: PostMergeNotApplicable
 ) -> PostMergeState:
     _require_text(event.child_id, "post-merge child ID")
+    outcome = event.changelog_outcome
+    if outcome not in UNLINKED_CHANGELOG_OUTCOMES:
+        raise ValueError(f"unknown unlinked changelog outcome {outcome!r}")
     if state.phase is PostMergePhase.COMPLETE:
         if (
             state.evidence.get("issue_close_outcome") == "not_applicable"
-            and state.evidence.get("changelog_outcome") == "not_applicable"
+            and state.evidence.get("changelog_outcome") == outcome
         ):
             _require_evidence(state, "child_id", event.child_id)
             return state
@@ -140,14 +184,26 @@ def _post_merge_not_applicable(
     _require_phase(state, PostMergePhase.PARENT_BRANCH_SYNCED, "unlinked post-merge completion")
     if "issue_id" in state.evidence:
         raise ValueError("a bound Chainlink issue cannot be marked not applicable")
-    return _with_evidence(
-        state,
-        PostMergePhase.COMPLETE,
-        {
-            "issue_close_outcome": "not_applicable",
-            "changelog_outcome": "not_applicable",
-        },
-    )
+    decision = state.evidence.get("changelog_decision")
+    if decision is None:
+        raise ValueError("unlinked completion requires a recorded changelog decision")
+    expected_decision = "add_entry" if outcome.startswith("entry_") else outcome
+    if decision != expected_decision:
+        raise ValueError(f"changelog outcome {outcome!r} contradicts decision {decision!r}")
+    additions = {
+        "issue_close_outcome": "not_applicable",
+        "changelog_outcome": outcome,
+    }
+    if event.changelog_detail:
+        additions["changelog_outcome_detail"] = event.changelog_detail[:500]
+    if outcome == "entry_added":
+        _require_text(event.changelog_commit_sha, "changelog entry commit SHA")
+        _require_text(event.observed_remote_head, "changelog entry remote head")
+        additions["changelog_commit_sha"] = event.changelog_commit_sha
+        additions["observed_remote_head"] = event.observed_remote_head
+    elif event.changelog_commit_sha or event.observed_remote_head:
+        raise ValueError("only entry_added records a changelog commit")
+    return _with_evidence(state, PostMergePhase.COMPLETE, additions)
 
 
 def _issue_close_confirmed(state: PostMergeState, event: IssueCloseConfirmed) -> PostMergeState:
@@ -227,9 +283,7 @@ def _issue_close_failed(state: PostMergeState, event: IssueCloseFailed) -> PostM
         f"issue_close_failure_{generation_key}_detail": event.detail[:500],
     }
     if event.observed_status is not None:
-        additions[f"issue_close_failure_{generation_key}_observed_status"] = (
-            event.observed_status
-        )
+        additions[f"issue_close_failure_{generation_key}_observed_status"] = event.observed_status
     return _with_evidence(state, PostMergePhase.ISSUE_CLOSE_PENDING, additions)
 
 

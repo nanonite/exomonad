@@ -39,6 +39,7 @@ from .post_merge_events import (
     PostMergeComplete,
     PostMergeNotApplicable,
     PostMergeRebuildRequested,
+    UnlinkedChangelogJudged,
 )
 from .post_merge_evidence import PushReceipt
 from .scope import (
@@ -166,6 +167,7 @@ def transition(phase: PhaseValue, event: TLOrchestrationEvent) -> PhaseValue:
                 PostMergeComplete,
                 PostMergeNotApplicable,
                 PostMergeRebuildRequested,
+                UnlinkedChangelogJudged,
             ),
         ):
             return post_merge_transition(phase, event)
@@ -273,6 +275,7 @@ __all__ = [
     "TLParked",
     "TLPlanning",
     "TLRunning",
+    "UnlinkedChangelogJudged",
     "WorkerCompleted",
     "stable_integration_order",
     "transition",

@@ -37,6 +37,11 @@ module ExoMonad.Guest.Tools.PostMergeRecovery
     postMergePushDescription,
     postMergePushSchema,
     interpretGitResult,
+    runGitAt,
+    parseRemoteHead,
+    refName,
+    validToken,
+    logInfo,
   )
 where
 

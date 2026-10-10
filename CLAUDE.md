@@ -963,9 +963,12 @@ recursive plan manifest and checkpoint; omitted IDs remain unlinked. The
 controller never infers an ID from a parent, sibling, run-level configuration,
 or slice name; malformed or duplicate bindings stop plan admission with a
 reconciliation gate.
-After confirmed parent-branch sync, an unlinked merged slice records issue
-closure and changelog as not applicable, makes no Chainlink call, and releases
-its integration lane.
+After confirmed parent-branch sync, an unlinked merged slice makes no Chainlink
+call and gets one `roles.tl` `changelog_coverage` judgment: it reads the
+CHANGELOG `[Unreleased]` section, the merged paths, and the PR title and body,
+then records `captured` or writes, commits, and compare-and-swap pushes one
+entry. Every judgment or write failure is a typed changelog outcome, so the
+slice still completes and releases its integration lane.
 For a linked slice, the controller reads that exact issue before closing it,
 accepts an already-closed status with observation evidence, and reuses a
 confirmed close receipt on restart. Unavailable, timed-out, or rejected closes
@@ -975,11 +978,12 @@ adoption and parent-branch sync. The root only resumes the persisted plan order;
 it never substitutes its own issue ID or closes a child slice's issue. A child
 does not hand off until every merged PR in its scope has completed post-merge
 recovery. A slice without an explicit issue binding is a normal unlinked task
-and completes with a durable not-applicable outcome.
+and completes with a durable changelog outcome.
 
 Model calls are narrow structured judgments: `decompose`, `adjudicate_review`,
-the `review_stuck` guide/escalate judgment, and the `integration_failure`
-delegate/escalate judgment at the parent integration boundary. Their schemas,
+the `review_stuck` guide/escalate judgment, the `integration_failure`
+delegate/escalate judgment at the parent integration boundary, and the
+`changelog_coverage` captured/add_entry judgment for an unlinked merged slice. Their schemas,
 context budgets, attempts, token
 charges, and replay records are explicit. Control flow stays in Python and the
 state writer, not in a free-form prompt. The `roles.tl` judgment model resolves
