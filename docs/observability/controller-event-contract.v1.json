@@ -234,16 +234,6 @@
     "tl.integration_base_invalidated": {
       "fields": ["slice_id", "base_sha", "head_sha", "reason"]
     },
-    "tl.integration_conflict": {
-      "fields": [
-        "slice_id",
-        "pr_number",
-        "base_sha",
-        "head_sha",
-        "reason",
-        "repair_attempt"
-      ]
-    },
     "tl.integration_evidence_invalidated": {
       "fields": ["slice_id", "base_sha", "head_sha", "reason"]
     },

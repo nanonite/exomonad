@@ -132,7 +132,6 @@
     {"type": "tl.stage_completed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.aggregate_pr_opened", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.integration_base_invalidated", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
-    {"type": "tl.integration_conflict", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.integration_evidence_invalidated", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.integration_repair_requested", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.integration_failure_judged", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},

@@ -1478,7 +1478,7 @@ repair prose, or plan documents:
 | `tl.aggregate_pr_opened` | An aggregate PR is created for a child sub-TL |
 | `tl.integration_validated` / `tl.integration_revalidated` | Base-bound integration evidence is accepted or refreshed |
 | `tl.integration_base_invalidated` | The integration base changed and evidence must be refreshed |
-| `tl.integration_conflict` | Aggregate integration needs conflict repair |
+| `tl.integration_failure_judged` | One roles.tl judgment chose `delegate` or `escalate` for an aggregate CI failure or parent merge conflict |
 | `tl.integration_repair_requested` | Same-owner repair was requested |
 | `tl.merge_reconciled` | Restart observed that a persisted merge already completed |
 
