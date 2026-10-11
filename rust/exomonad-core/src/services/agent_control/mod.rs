@@ -92,6 +92,25 @@ fn bounded_stderr_tail(bytes: &[u8]) -> String {
     text[start..].trim().to_string()
 }
 
+fn live_invocation_matches(
+    record: &InvocationRecord,
+    routing: &RoutingInfo,
+    runtime: AgentType,
+    mode: InvocationMode,
+    identity: Option<&InvocationIdentityContext>,
+) -> bool {
+    let Some(identity) = identity else {
+        return false;
+    };
+    record.runtime == runtime
+        && record.mode == mode
+        && record.routing.same_delivery_target(routing)
+        && record.runtime_agent_id == identity.runtime_agent_id
+        && record.slice_id == identity.slice_id
+        && record.branch == identity.branch
+        && record.worktree == identity.worktree
+}
+
 /// Push the parent branch to the remote so child PRs can reference it as
 /// their base. Non-fatal: warns on failure (supports local/airgapped setups
 /// where no remote or non-GitHub remote is configured).
@@ -905,6 +924,8 @@ pub struct AgentControlService<C> {
     pub(crate) tmux_session: Option<String>,
     /// Direct tmux IPC client.
     pub(crate) tmux_ipc: Option<super::tmux_ipc::TmuxIpc>,
+    #[cfg(test)]
+    pub(crate) ordered_sub_tl_routing_override: Option<RoutingInfo>,
     /// This agent's birth-branch (git identity). Root TL = "main".
     pub(crate) birth_branch: BirthBranch,
     /// Legacy compatibility flag; no longer changes harness behavior.
@@ -952,6 +973,8 @@ impl<
             ordered_sub_tl_provision_lock: Arc::new(tokio::sync::Mutex::new(())),
             tmux_session: None,
             tmux_ipc: None,
+            #[cfg(test)]
+            ordered_sub_tl_routing_override: None,
             birth_branch: BirthBranch::try_from_str("unset")
                 .expect("literal validated string is non-empty"),
             yolo: false,
@@ -985,6 +1008,12 @@ impl<
     pub fn with_tmux_session(mut self, session: String) -> Self {
         self.tmux_ipc = Some(super::tmux_ipc::TmuxIpc::new(&session));
         self.tmux_session = Some(session);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ordered_sub_tl_routing_for_test(mut self, routing: RoutingInfo) -> Self {
+        self.ordered_sub_tl_routing_override = Some(routing);
         self
     }
 
@@ -1239,6 +1268,7 @@ impl<
                 recovery_lineage: None,
                 mode,
             },
+            false,
         )
         .await
     }
@@ -1249,6 +1279,7 @@ impl<
         routing: RoutingInfo,
         identity: Option<AgentIdentityRecord>,
         metadata: InvocationMetadata,
+        reuse_live_invocation: bool,
     ) -> Result<PathBuf> {
         let agent_config_dir = self
             .project_dir()
@@ -1261,7 +1292,6 @@ impl<
                 agent_name
             ));
         }
-        routing.write_to_dir(&agent_config_dir).await?;
         let prior_invocation = read_invocation_conservatively(&agent_config_dir).await;
         let adoption_identity = identity.as_ref().map(|record| {
             (
@@ -1282,6 +1312,44 @@ impl<
                     .map(|record| record.working_dir.to_string_lossy().into_owned()),
             })
         });
+        if reuse_live_invocation {
+            if let Some(previous) = prior_invocation.as_ref().filter(|record| record.is_live()) {
+                if !live_invocation_matches(
+                    previous,
+                    &routing,
+                    metadata.runtime,
+                    metadata.mode,
+                    identity_context.as_ref(),
+                ) {
+                    return Err(anyhow!(
+                        "refusing to replace conflicting live invocation for {agent_name}"
+                    ));
+                }
+                let routing_path = agent_config_dir.join("routing.json");
+                match RoutingInfo::read_from_dir(&agent_config_dir).await {
+                    Ok(persisted) if persisted.same_delivery_target(&routing) => {}
+                    Ok(_) => {
+                        return Err(anyhow!(
+                            "refusing to replace conflicting live routing for {agent_name}"
+                        ));
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        previous.routing.write_to_dir(&agent_config_dir).await?;
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("failed to read {}", routing_path.display()))
+                    }
+                }
+                info!(agent = %agent_name, invocation_id = %previous.invocation_id, "Reusing existing ordered sub-TL invocation");
+                return Ok(agent_config_dir);
+            }
+        }
+        routing.write_to_dir(&agent_config_dir).await?;
         let invocation = invocation::start_invocation_with_provenance_and_context_and_mode(
             &agent_config_dir,
             metadata.runtime,
@@ -1320,23 +1388,37 @@ impl<
         let effective_routing = RoutingInfo::read_from_dir(&agent_config_dir).await?;
         if effective_routing.window_id.is_some() || effective_routing.pane_id.is_some() {
             match self.tmux() {
-                Ok(tmux) => {
-                    if let Err(error) = tmux
-                        .set_routing_owner(
-                            &effective_routing,
-                            agent_name.as_str(),
-                            &invocation.invocation_id,
-                            invocation.generation,
-                        )
-                        .await
-                    {
-                        warn!(
+                Ok(tmux) => match tmux.routing_owner(&effective_routing).await {
+                    Ok(Some(owner)) if owner.agent_id != agent_name.as_str() => {
+                        debug!(
                             agent = %agent_name,
-                            %error,
-                            "Could not persist tmux ownership; cleanup will remain conservative"
+                            existing_owner = %owner.agent_id,
+                            "Retaining tmux ownership held by another agent"
                         );
                     }
-                }
+                    Ok(_) => {
+                        if let Err(error) = tmux
+                            .set_routing_owner(
+                                &effective_routing,
+                                agent_name.as_str(),
+                                &invocation.invocation_id,
+                                invocation.generation,
+                            )
+                            .await
+                        {
+                            warn!(
+                                agent = %agent_name,
+                                %error,
+                                "Could not persist tmux ownership; cleanup will remain conservative"
+                            );
+                        }
+                    }
+                    Err(error) => warn!(
+                        agent = %agent_name,
+                        %error,
+                        "Could not read tmux ownership; cleanup will remain conservative"
+                    ),
+                },
                 Err(error) => warn!(
                     agent = %agent_name,
                     %error,

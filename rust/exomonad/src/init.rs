@@ -9,14 +9,15 @@ use exomonad_core::services::runtime_manifest::{
 };
 use exomonad_core::services::{
     agent_control::{
-        codex_lifecycle, read_invocation_conservatively, CapturedCodexTrust, InvocationRecord,
+        codex_lifecycle, read_invocation, read_invocation_conservatively, CapturedCodexTrust,
+        InvocationRecord,
     },
     pr_registry::{
         invocation_succession_reaches_current, read_published_heads,
         remove_published_heads_for_prs, PublishedHead,
     },
     repo::{get_repo_info, RepoInfo},
-    AgentType, ForgejoClient, GitWorktreeService,
+    AgentIdentityRecord, AgentType, ForgejoClient, GitWorktreeService,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -101,10 +102,26 @@ struct ProtectedPr {
 struct OrderedBranchSpec {
     branch: String,
     parent_branch: String,
+    parent_agent: String,
     agent_name: String,
     slice_id: String,
     identity_worktree: PathBuf,
     worktree: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderedSubTLProvisionRequest {
+    agent_name: String,
+    birth_branch: String,
+    parent_branch: String,
+    working_dir: PathBuf,
+    slice_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderedSubTLProvisionResponse {
+    provisioned: bool,
+    agent_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -504,6 +521,7 @@ fn collect_ordered_branch_specs(
     project_dir: &Path,
     plan: &Value,
     parent_branch: &str,
+    parent_agent: &str,
     parent_worktree: &Path,
     specs: &mut Vec<OrderedBranchSpec>,
 ) -> Result<()> {
@@ -533,6 +551,7 @@ fn collect_ordered_branch_specs(
         specs.push(OrderedBranchSpec {
             branch: branch.clone(),
             parent_branch: parent_branch.to_owned(),
+            parent_agent: parent_agent.to_owned(),
             agent_name: agent_name.to_owned(),
             slice_id: name.to_owned(),
             identity_worktree: worktree.clone(),
@@ -547,7 +566,7 @@ fn collect_ordered_branch_specs(
             }
             Value::Object(inline)
         });
-        collect_ordered_branch_specs(project_dir, &nested, &branch, &worktree, specs)?;
+        collect_ordered_branch_specs(project_dir, &nested, &branch, agent_name, &worktree, specs)?;
     }
     Ok(())
 }
@@ -584,6 +603,7 @@ fn ordered_branch_specs(project_dir: &Path) -> Result<Vec<OrderedBranchSpec>> {
         project_dir,
         plan,
         &root_branch,
+        "root",
         &project_dir.join(".exo/worktrees"),
         &mut specs,
     )?;
@@ -3529,7 +3549,16 @@ fn publication_matches_agent(
     branch_matches && slice_matches
 }
 
+#[cfg(test)]
 fn classify_agent(agent_dir: &Path, registry: &[PublishedHead]) -> AgentContinuation {
+    classify_agent_with_ordered_spec(agent_dir, registry, None)
+}
+
+fn classify_agent_with_ordered_spec(
+    agent_dir: &Path,
+    registry: &[PublishedHead],
+    ordered_spec: Option<&OrderedBranchSpec>,
+) -> AgentContinuation {
     let agent_name = agent_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -3567,9 +3596,10 @@ fn classify_agent(agent_dir: &Path, registry: &[PublishedHead]) -> AgentContinua
             reason: "invocation record has an empty invocation_id",
         };
     }
-    if registry
-        .iter()
-        .any(|publication| publication_matches_agent(agent_name, &record, publication))
+    if ordered_spec.is_some_and(|spec| ordered_invocation_matches_spec(&record, spec))
+        || registry
+            .iter()
+            .any(|publication| publication_matches_agent(agent_name, &record, publication))
     {
         AgentContinuation::Preserve {
             invocation_id: record.invocation_id,
@@ -3579,6 +3609,42 @@ fn classify_agent(agent_dir: &Path, registry: &[PublishedHead]) -> AgentContinua
             reason: "invocation has no matching verified publication ownership",
         }
     }
+}
+
+fn ordered_invocation_matches_spec(record: &InvocationRecord, spec: &OrderedBranchSpec) -> bool {
+    record.runtime == AgentType::Codex
+        && record.mode == exomonad_core::services::agent_control::InvocationMode::Interactive
+        && matches!(
+            record.trigger,
+            exomonad_core::services::agent_control::InvocationTrigger::Spawn
+                | exomonad_core::services::agent_control::InvocationTrigger::ResumePr
+        )
+        && record.runtime_agent_id.as_deref() == Some(spec.agent_name.as_str())
+        && record.slice_id.as_deref() == Some(spec.slice_id.as_str())
+        && record.branch.as_deref() == Some(spec.branch.as_str())
+        && record.worktree.as_deref() == Some(spec.identity_worktree.to_string_lossy().as_ref())
+        && record.routing.has_delivery_target()
+}
+
+fn recordless_ordered_sub_tl_specs(project_dir: &Path) -> Result<Vec<OrderedBranchSpec>> {
+    ordered_branch_specs(project_dir).map(|specs| {
+        specs
+            .into_iter()
+            .filter(|spec| {
+                if ordered_identity_state(project_dir, spec).ok()
+                    != Some(OrderedIdentityState::Matching)
+                {
+                    return false;
+                }
+                let invocation_path = project_dir
+                    .join(".exo/agents")
+                    .join(&spec.agent_name)
+                    .join(exomonad_core::services::agent_control::INVOCATION_FILENAME);
+                std::fs::symlink_metadata(invocation_path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            })
+            .collect()
+    })
 }
 
 fn write_continuation_decision(agent_dir: &Path, decision: &AgentContinuation) -> Result<()> {
@@ -3611,6 +3677,7 @@ async fn reconcile_agent_continuations(project_dir: &Path) -> Result<(usize, usi
         return Ok((0, 0));
     }
     let registry = read_published_heads(project_dir).await?;
+    let ordered_specs = ordered_branch_specs(project_dir)?;
     let mut agents = std::fs::read_dir(&agents_dir)?
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
@@ -3621,7 +3688,23 @@ async fn reconcile_agent_continuations(project_dir: &Path) -> Result<(usize, usi
     let mut preserved = 0;
     let mut recreated = 0;
     for entry in agents {
-        let decision = classify_agent(&entry.path(), &registry);
+        let agent_dir = entry.path();
+        let agent_name = entry.file_name().to_string_lossy().into_owned();
+        let ordered_spec = ordered_specs.iter().find(|spec| {
+            spec.agent_name == agent_name
+                && ordered_identity_state(project_dir, spec)
+                    .is_ok_and(|state| state == OrderedIdentityState::Matching)
+        });
+        if ordered_spec.is_some()
+            && std::fs::symlink_metadata(
+                agent_dir.join(exomonad_core::services::agent_control::INVOCATION_FILENAME),
+            )
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            info!(agent = %agent_name, "Deferring ordered sub-TL classification until invocation provenance is repaired");
+            continue;
+        }
+        let decision = classify_agent_with_ordered_spec(&agent_dir, &registry, ordered_spec);
         match &decision {
             AgentContinuation::Preserve { invocation_id } => {
                 preserved += 1;
@@ -3643,6 +3726,120 @@ async fn reconcile_agent_continuations(project_dir: &Path) -> Result<(usize, usi
         write_continuation_decision(&entry.path(), &decision)?;
     }
     Ok((preserved, recreated))
+}
+
+fn unique_ordered_tl_window(
+    windows: &[exomonad_core::services::tmux_ipc::WindowInfo],
+) -> Result<&exomonad_core::services::tmux_ipc::WindowInfo> {
+    let mut matches = windows.iter().filter(|window| window.window_name == "TL");
+    let window = matches
+        .next()
+        .context("cannot repair ordered sub-TL invocation without an existing TL window")?;
+    if matches.next().is_some() {
+        anyhow::bail!("cannot repair ordered sub-TL invocation with ambiguous TL windows");
+    }
+    Ok(window)
+}
+
+async fn repair_ordered_sub_tl_invocations(
+    project_dir: &Path,
+    socket_path: &Path,
+    windows: &[exomonad_core::services::tmux_ipc::WindowInfo],
+) -> Result<usize> {
+    let specs = recordless_ordered_sub_tl_specs(project_dir)?;
+    if specs.is_empty() {
+        return Ok(0);
+    }
+    let expected_routing = exomonad_core::domain::RoutingInfo::window(
+        unique_ordered_tl_window(windows)?.window_id.clone(),
+    );
+    let client = uds_client::ServerClient::new(socket_path.to_path_buf());
+    for spec in &specs {
+        repair_one_ordered_sub_tl_invocation(project_dir, &client, spec, &expected_routing).await?;
+    }
+    Ok(specs.len())
+}
+
+async fn repair_one_ordered_sub_tl_invocation(
+    project_dir: &Path,
+    client: &uds_client::ServerClient,
+    spec: &OrderedBranchSpec,
+    expected_routing: &exomonad_core::domain::RoutingInfo,
+) -> Result<()> {
+    if ordered_identity_state(project_dir, spec)? != OrderedIdentityState::Matching {
+        anyhow::bail!("ordered sub-TL identity changed before invocation repair");
+    }
+    let agent_dir = project_dir.join(".exo/agents").join(&spec.agent_name);
+    let identity_path = agent_dir.join("identity.json");
+    let identity: AgentIdentityRecord = serde_json::from_slice(
+        &tokio::fs::read(&identity_path)
+            .await
+            .with_context(|| format!("failed to read {}", identity_path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", identity_path.display()))?;
+    let slice_id = identity
+        .slice_id
+        .clone()
+        .filter(|slice_id| !slice_id.trim().is_empty())
+        .context("ordered sub-TL identity is missing its slice ID")?;
+    let endpoint = format!("/agents/tl/{}/provision-sub-tl", spec.parent_agent);
+    let response: OrderedSubTLProvisionResponse = client
+        .post_agent_json(
+            &endpoint,
+            &OrderedSubTLProvisionRequest {
+                agent_name: identity.agent_name.to_string(),
+                birth_branch: identity.birth_branch.to_string(),
+                parent_branch: identity.parent_branch.to_string(),
+                working_dir: identity.working_dir.clone(),
+                slice_id,
+            },
+        )
+        .await
+        .with_context(|| format!("failed to repair ordered sub-TL {}", spec.agent_name))?;
+    if !response.provisioned || response.agent_name != spec.agent_name {
+        anyhow::bail!(
+            "ordered sub-TL invocation repair returned an unexpected identity for {}",
+            spec.agent_name
+        );
+    }
+    verify_repaired_ordered_sub_tl(project_dir, spec, expected_routing).await?;
+    info!(agent = %spec.agent_name, endpoint, "Repaired missing ordered sub-TL invocation through server provisioning");
+    Ok(())
+}
+
+async fn verify_repaired_ordered_sub_tl(
+    project_dir: &Path,
+    spec: &OrderedBranchSpec,
+    expected_routing: &exomonad_core::domain::RoutingInfo,
+) -> Result<()> {
+    if ordered_identity_state(project_dir, spec)? != OrderedIdentityState::Matching {
+        anyhow::bail!("ordered sub-TL identity changed during invocation repair");
+    }
+    let agent_dir = project_dir.join(".exo/agents").join(&spec.agent_name);
+    let invocation = read_invocation(&agent_dir)
+        .await?
+        .context("ordered sub-TL provision endpoint returned without an invocation record")?;
+    let expected_worktree = spec.identity_worktree.to_string_lossy();
+    let invocation_matches = invocation.is_live()
+        && !invocation.invocation_id.trim().is_empty()
+        && invocation.runtime == AgentType::Codex
+        && invocation.trigger
+            == exomonad_core::services::agent_control::InvocationTrigger::ResumePr
+        && invocation.mode == exomonad_core::services::agent_control::InvocationMode::Interactive
+        && invocation.generation > 0
+        && invocation.runtime_agent_id.as_deref() == Some(spec.agent_name.as_str())
+        && invocation.slice_id.as_deref() == Some(spec.slice_id.as_str())
+        && invocation.branch.as_deref() == Some(spec.branch.as_str())
+        && invocation.worktree.as_deref() == Some(expected_worktree.as_ref())
+        && invocation.routing.same_delivery_target(expected_routing);
+    if !invocation_matches {
+        anyhow::bail!("ordered sub-TL invocation does not match its plan identity and TL route");
+    }
+    let routing = exomonad_core::domain::RoutingInfo::read_from_dir(&agent_dir).await?;
+    if !routing.same_delivery_target(expected_routing) {
+        anyhow::bail!("ordered sub-TL routing record does not match its existing TL window");
+    }
+    Ok(())
 }
 
 const WATCHER_WINDOW_NAME: &str = "Watcher";
@@ -5348,31 +5545,67 @@ async fn launch_tl_recovery(
     tl_loop_root: &Path,
     config: &Config,
     controller_plan_digest: Option<&str>,
+    continue_mode: bool,
 ) -> Result<()> {
     if let Some(expected_digest) = controller_plan_digest {
         ensure_snapshot_digest_matches(project_dir, expected_digest)?;
     }
     let controller_epoch = prepare_controller_spawn(project_dir)?;
-    let tl_window = ipc
-        .new_window(
-            "TL",
-            project_dir,
-            shell,
-            &tl_loop_command(
-                project_dir,
-                tl_loop_root,
-                &TlLoopTimeouts::from(config),
-                controller_plan_digest,
-            ),
-        )
-        .await?;
+    let command = tl_loop_command(
+        project_dir,
+        tl_loop_root,
+        &TlLoopTimeouts::from(config),
+        controller_plan_digest,
+    );
+    let command = if continue_mode {
+        gate_controller_start(&command)
+    } else {
+        command
+    };
+    let tl_window = ipc.new_window("TL", project_dir, shell, &command).await?;
     ipc.set_window_remain_on_exit(&tl_window, true).await?;
+    if continue_mode {
+        if let Err(error) = reconcile_continue_state_before_controller(project_dir, ipc).await {
+            if let Err(kill_error) = ipc.kill_window(&tl_window).await {
+                warn!(window = %tl_window, error = %kill_error, "Failed to remove gated TL window after continuation repair failed");
+            }
+            return Err(error);
+        }
+        if let Err(error) = ipc
+            .inject_input(tl_window.as_str(), "start-controller", true, true)
+            .await
+        {
+            if let Err(kill_error) = ipc.kill_window(&tl_window).await {
+                warn!(window = %tl_window, error = %kill_error, "Failed to remove gated TL window after release failed");
+            }
+            return Err(error).context("failed to release the repaired TL controller");
+        }
+    }
     let startup =
         wait_for_tl_controller_startup(ipc, project_dir, &tl_window, &controller_epoch).await;
     if startup.is_ok() {
         ipc.set_window_remain_on_exit(&tl_window, false).await?;
     }
     startup
+}
+
+fn gate_controller_start(command: &str) -> String {
+    format!("read -r __exomonad_start_controller && {command}")
+}
+
+async fn reconcile_continue_state_before_controller(
+    project_dir: &Path,
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+) -> Result<()> {
+    let windows = ipc.list_windows().await?;
+    let socket_path = project_dir.join(".exo/server.sock");
+    let repaired = repair_ordered_sub_tl_invocations(project_dir, &socket_path, &windows).await?;
+    let (preserved, recreated) = reconcile_agent_continuations(project_dir).await?;
+    info!(
+        repaired,
+        preserved, recreated, "Reconciled agent provenance before TL controller startup"
+    );
+    Ok(())
 }
 
 /// Serializes concurrent `exomonad init` invocations against the same
@@ -5408,6 +5641,7 @@ async fn reconcile_existing_session(
     verbose: bool,
     restart_tl: bool,
     controller_plan_digest: Option<&str>,
+    continue_mode: bool,
 ) -> Result<()> {
     // Held for the whole inspect-then-create sequence below so a second
     // concurrent `init` cannot observe the same dead window and race to
@@ -5458,6 +5692,18 @@ async fn reconcile_existing_session(
         tl_window_recovery_action(restart_tl, tl_alive, root_needs_resume),
         TlWindowRecoveryAction::Keep
     ) {
+        if continue_mode {
+            let socket_path = project_dir.join(".exo/server.sock");
+            let repaired =
+                repair_ordered_sub_tl_invocations(project_dir, &socket_path, &windows).await?;
+            let (preserved, recreated) = reconcile_agent_continuations(project_dir).await?;
+            info!(
+                repaired,
+                preserved,
+                recreated,
+                "Reconciled continuation provenance for the existing TL window"
+            );
+        }
         return Ok(());
     }
 
@@ -5477,6 +5723,7 @@ async fn reconcile_existing_session(
         tl_loop_root,
         config,
         controller_plan_digest,
+        continue_mode,
     )
     .await
 }
@@ -6230,6 +6477,7 @@ pub async fn run(
             verbose,
             mode == SessionMode::Start,
             controller_plan_digest.as_deref(),
+            mode == SessionMode::Continue,
         )
         .await?;
         if mode == SessionMode::Continue {
@@ -6673,6 +6921,11 @@ pub async fn run(
         &TlLoopTimeouts::from(&config),
         controller_plan_digest.as_deref(),
     );
+    let base_command = if mode == SessionMode::Continue {
+        gate_controller_start(&base_command)
+    } else {
+        base_command
+    };
 
     let tl_command = match config.shell_command {
         Some(ref sc) => format!("{} -c \"{}\"", sc, base_command.replace('"', "\\\"")),
@@ -6682,6 +6935,23 @@ pub async fn run(
     let controller_epoch = prepare_controller_spawn(&cwd)?;
     let tl_window = ipc.new_window("TL", &tl_cwd, &shell, &tl_command).await?;
     ipc.set_window_remain_on_exit(&tl_window, true).await?;
+    if mode == SessionMode::Continue {
+        if let Err(error) = reconcile_continue_state_before_controller(&cwd, &ipc).await {
+            if let Err(kill_error) = ipc.kill_window(&tl_window).await {
+                warn!(window = %tl_window, error = %kill_error, "Failed to remove gated TL window after continuation repair failed");
+            }
+            return Err(error);
+        }
+        if let Err(error) = ipc
+            .inject_input(tl_window.as_str(), "start-controller", true, true)
+            .await
+        {
+            if let Err(kill_error) = ipc.kill_window(&tl_window).await {
+                warn!(window = %tl_window, error = %kill_error, "Failed to remove gated TL window after release failed");
+            }
+            return Err(error).context("failed to release the repaired TL controller");
+        }
+    }
     let startup = wait_for_tl_controller_startup(&ipc, &cwd, &tl_window, &controller_epoch).await;
     if startup.is_ok() {
         ipc.set_window_remain_on_exit(&tl_window, false).await?;
@@ -8260,6 +8530,146 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn continue_repairs_a_recordless_ordered_sub_tl_before_classification() {
+        use exomonad_core::services::agent_control::{
+            start_invocation_with_provenance_and_context_and_mode, InvocationIdentityContext,
+            InvocationMode, InvocationTrigger,
+        };
+        use exomonad_core::services::tmux_ipc::{PaneId, WindowId, WindowInfo};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path();
+        let exo_dir = project_dir.join(".exo");
+        std::fs::create_dir_all(exo_dir.join("agents/root")).unwrap();
+        std::fs::create_dir_all(exo_dir.join("tl-loop")).unwrap();
+        std::fs::write(
+            exo_dir.join("agents/root/identity.json"),
+            r#"{"birth_branch":"main"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            exo_dir.join("tl-loop/plan.snapshot"),
+            br#"{"plan":{"sub_tls":[{"name":"stage","agent_id":"stage","plan":{}}]}}"#,
+        )
+        .unwrap();
+        let spec = ordered_branch_specs(project_dir).unwrap().remove(0);
+        write_matching_ordered_identity(project_dir, &spec);
+        let agent_dir = exo_dir.join("agents/stage");
+        assert!(!agent_dir.join("invocation.json").exists());
+        let (preserved, recreated) = reconcile_agent_continuations(project_dir).await.unwrap();
+        assert_eq!((preserved, recreated), (0, 0));
+        assert!(!agent_dir.join("continuation.json").exists());
+
+        let socket_path = exo_dir.join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let project_for_server = project_dir.to_path_buf();
+        let expected_worktree = spec.identity_worktree.to_string_lossy().into_owned();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let body_start = loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "client closed before completing its request");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..body_start]).to_ascii_lowercase();
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap();
+            while request.len() < body_start + content_length {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "client closed before completing its request body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.starts_with("POST /agents/tl/root/provision-sub-tl "));
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[body_start..body_start + content_length]).unwrap();
+            assert_eq!(body["agent_name"], "stage");
+            assert_eq!(body["birth_branch"], "main.stage");
+            assert_eq!(body["parent_branch"], "main");
+            assert_eq!(body["slice_id"], "stage");
+            assert_eq!(
+                body["working_dir"],
+                project_for_server
+                    .join(".exo/worktrees/stage")
+                    .to_string_lossy()
+                    .as_ref()
+            );
+
+            let routing =
+                exomonad_core::domain::RoutingInfo::window(WindowId::parse("@71").unwrap());
+            start_invocation_with_provenance_and_context_and_mode(
+                &project_for_server.join(".exo/agents/stage"),
+                AgentType::Codex,
+                InvocationTrigger::ResumePr,
+                routing,
+                None,
+                None,
+                None,
+                None,
+                Some(InvocationIdentityContext {
+                    runtime_agent_id: Some("stage".to_owned()),
+                    slice_id: Some("stage".to_owned()),
+                    branch: Some("main.stage".to_owned()),
+                    worktree: Some(expected_worktree),
+                }),
+                None,
+                InvocationMode::Interactive,
+            )
+            .await
+            .unwrap();
+            let response = br#"{"provisioned":true,"agent_name":"stage"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let windows = [WindowInfo {
+            window_id: WindowId::parse("@71").unwrap(),
+            window_name: "TL".to_owned(),
+            pane_id: PaneId::parse("%71").unwrap(),
+        }];
+        assert_eq!(
+            repair_ordered_sub_tl_invocations(project_dir, &socket_path, &windows)
+                .await
+                .unwrap(),
+            1
+        );
+        server.await.unwrap();
+
+        let invocation = read_invocation_conservatively(&agent_dir)
+            .await
+            .expect("repair must leave a valid invocation record");
+        assert_eq!(invocation.trigger, InvocationTrigger::ResumePr);
+        assert_eq!(invocation.mode, InvocationMode::Interactive);
+        assert_eq!(invocation.generation, 1);
+        let (preserved, recreated) = reconcile_agent_continuations(project_dir).await.unwrap();
+        assert_eq!((preserved, recreated), (1, 0));
+        let continuation: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(agent_dir.join("continuation.json")).unwrap())
+                .unwrap();
+        assert_eq!(continuation["classification"], "preserve");
+        assert_eq!(continuation["invocation_id"], invocation.invocation_id);
+        assert!(!project_dir.join(".exo/tl-loop/plan.json").exists());
+    }
+
     #[test]
     fn continue_accepts_invocation_succession_without_rewriting_current_id() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9081,6 +9491,15 @@ mod tests {
         OrderedBranchSpec {
             branch: branch.to_owned(),
             parent_branch: parent_branch.to_owned(),
+            parent_agent: if parent_branch == "main" {
+                "root".to_owned()
+            } else {
+                parent_branch
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("root")
+                    .to_owned()
+            },
             agent_name: agent_name.to_owned(),
             slice_id: agent_name.to_owned(),
             identity_worktree: worktree.clone(),
@@ -9256,6 +9675,7 @@ mod tests {
         OrderedBranchSpec {
             branch: branch.to_owned(),
             parent_branch: "main".to_owned(),
+            parent_agent: "root".to_owned(),
             slice_id: agent_name.clone(),
             identity_worktree: project_dir.join(".exo/worktrees").join(&agent_name),
             worktree: project_dir.join(".exo/worktrees").join(&agent_name),
@@ -9380,6 +9800,7 @@ mod tests {
         let spec = OrderedBranchSpec {
             branch: "main.stage".to_owned(),
             parent_branch: "main".to_owned(),
+            parent_agent: "root".to_owned(),
             agent_name: "stage".to_owned(),
             slice_id: "stage".to_owned(),
             identity_worktree: temp.path().join(".exo/worktrees/stage"),
@@ -9440,6 +9861,7 @@ mod tests {
         let first = OrderedBranchSpec {
             branch: "main.first".to_owned(),
             parent_branch: "main".to_owned(),
+            parent_agent: "root".to_owned(),
             agent_name: "first".to_owned(),
             slice_id: "first".to_owned(),
             identity_worktree: temp.path().join(".exo/worktrees/first"),
@@ -9448,6 +9870,7 @@ mod tests {
         let second = OrderedBranchSpec {
             branch: "main.second".to_owned(),
             parent_branch: "main".to_owned(),
+            parent_agent: "root".to_owned(),
             agent_name: "second".to_owned(),
             slice_id: "second".to_owned(),
             identity_worktree: temp.path().join(".exo/worktrees/second"),
@@ -9504,6 +9927,7 @@ mod tests {
         let spec = OrderedBranchSpec {
             branch: "main.stage".to_owned(),
             parent_branch: "main".to_owned(),
+            parent_agent: "root".to_owned(),
             agent_name: "stage".to_owned(),
             slice_id: "stage".to_owned(),
             identity_worktree: temp.path().join(".exo/worktrees/stage"),
@@ -10053,6 +10477,7 @@ mod tests {
             spec: OrderedBranchSpec {
                 branch: "main.stage".to_owned(),
                 parent_branch: "main".to_owned(),
+                parent_agent: "root".to_owned(),
                 agent_name: "stage".to_owned(),
                 slice_id: "stage".to_owned(),
                 identity_worktree: project.join(".exo/agents/stage"),
@@ -11930,7 +12355,7 @@ mod tests {
             .find("run_tl_loop_preflight(&cwd")
             .expect("init must run TL preflight");
         let tl_window = source
-            .find("ipc.new_window(\"TL\"")
+            .rfind("ipc.new_window(\"TL\"")
             .expect("init must create the TL window");
         assert!(
             preflight < tl_window,
@@ -11945,7 +12370,7 @@ mod tests {
             .find("wait_for_server_startup(&cwd, ServerProcessProbe::ShellOnly")
             .expect("init must wait for the server before continuing");
         let tl_window = source
-            .find("ipc.new_window(\"TL\"")
+            .rfind("ipc.new_window(\"TL\"")
             .expect("init must create the TL window");
         assert!(
             server_wait < tl_window,
@@ -12548,7 +12973,7 @@ mod tests {
             .find("complete_recreate_plan_transition_locked(&cwd")
             .expect("recreate must archive the prior root checkpoint");
         let tl_window = source
-            .find("ipc.new_window(\"TL\"")
+            .rfind("ipc.new_window(\"TL\"")
             .expect("init must create the TL window");
 
         assert!(archive < tl_window);

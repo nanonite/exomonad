@@ -460,6 +460,26 @@ agent.spawned/agent.resumed events carry the same bounded model, effort,
 topology, branch, and spawn-type provenance. Prompts and secrets are never
 copied into these provenance fields.
 
+### Ordered sub-TL invocation provisioning
+
+`provision_ordered_sub_tl` first ensures the plan-owned identity and worktree,
+then resolves exactly one existing `TL` window from the configured tmux
+session. It fails closed with a warning when that delivery target is missing
+or ambiguous; it never guesses a pane or creates a second routing writer. The
+resolved target and the durable `identity.json` fields go through
+`finalize_spawn_with_invocation`, with `spawn` for a new owner and `resume_pr`
+for reattachment, always in `interactive` mode. A matching live invocation is
+reused without replacing its ID or adding another monitor. Conflicting live
+provenance is an error, and tmux routing ownership already held by another
+agent is retained.
+
+During `init --continue`, only an ordered sub-TL whose identity exactly matches
+the persisted plan and whose invocation file is absent is eligible for repair.
+After an existing or gated `TL` window and the server are ready, init calls the
+same `/agents/tl/{parent}/provision-sub-tl` endpoint and verifies the resulting
+invocation and routing records before the controller starts. Other agents
+retain the publication-backed continuation classification.
+
 ### Harness selection guardrail
 
 A coding spawn inherits the configured worker harness. Retrying or calling

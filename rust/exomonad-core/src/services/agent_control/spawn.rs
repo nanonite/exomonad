@@ -2545,6 +2545,7 @@ impl<
                     identity: None,
                     mode: InvocationMode::from_role(options.role.as_ref().map(|role| role.as_str())),
                 },
+                false,
             )
                 .await?;
 
@@ -3057,6 +3058,7 @@ impl<
                       identity: None,
                       mode: InvocationMode::from_role(options.role.as_ref().map(|role| role.as_str())),
                   },
+                false,
             )
                 .await
             {

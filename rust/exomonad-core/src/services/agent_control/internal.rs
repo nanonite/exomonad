@@ -13,6 +13,21 @@ fn opencode_model_ref(model: &str, variant: Option<&str>) -> String {
     }
 }
 
+fn select_ordered_sub_tl_window(
+    windows: &[super::tmux_ipc::WindowInfo],
+) -> Result<&super::tmux_ipc::WindowInfo> {
+    let mut matching = windows.iter().filter(|window| window.window_name == "TL");
+    let window = matching
+        .next()
+        .ok_or_else(|| anyhow!("no existing TL tmux window can route an ordered sub-TL"))?;
+    if matching.next().is_some() {
+        return Err(anyhow!(
+            "multiple TL tmux windows make ordered sub-TL routing ambiguous"
+        ));
+    }
+    Ok(window)
+}
+
 fn generate_opencode_agent_settings(
     agent_name: &str,
     role: &str,
@@ -145,7 +160,8 @@ impl<
             ));
         }
 
-        if worktree_path.exists() {
+        let worktree_preexisting = worktree_path.exists();
+        if worktree_preexisting {
             let git_wt = self.git_wt().clone();
             let path = worktree_path.clone();
             let current_branch =
@@ -160,37 +176,114 @@ impl<
         self.agent_resolver()
             .ensure_ordered_sub_tl_identity(record.clone())
             .await?;
-        if worktree_path.exists() {
-            return Ok(());
+        if !worktree_preexisting {
+            let git_wt = self.git_wt().clone();
+            let path = worktree_path.clone();
+            let branch = branch.clone();
+            let parent = BranchName::try_from_str(record.parent_branch.as_str())?;
+            let result = tokio::task::spawn_blocking(move || {
+                if branch_exists {
+                    git_wt.create_workspace_from_existing_branch(&path, &branch)
+                } else {
+                    git_wt.create_workspace(&path, &branch, &parent)
+                }
+            })
+            .await
+            .context("ordered sub-TL worktree creation failed")?;
+            result.map_err(|error| anyhow::Error::from(EffectError::from(error)))?;
+
+            let git_wt = self.git_wt().clone();
+            let path = worktree_path.clone();
+            let expected = record.birth_branch.to_string();
+            let actual = tokio::task::spawn_blocking(move || git_wt.get_workspace_bookmark(&path))
+                .await
+                .context("ordered sub-TL worktree verification failed")??;
+            if actual.as_deref() != Some(expected.as_str()) {
+                return Err(anyhow!(
+                    "ordered sub-TL worktree branch verification failed"
+                ));
+            }
         }
 
-        let git_wt = self.git_wt().clone();
-        let path = worktree_path.clone();
-        let branch = branch.clone();
-        let parent = BranchName::try_from_str(record.parent_branch.as_str())?;
-        let result = tokio::task::spawn_blocking(move || {
-            if branch_exists {
-                git_wt.create_workspace_from_existing_branch(&path, &branch)
-            } else {
-                git_wt.create_workspace(&path, &branch, &parent)
-            }
-        })
-        .await
-        .context("ordered sub-TL worktree creation failed")?;
-        result.map_err(|error| anyhow::Error::from(EffectError::from(error)))?;
-
-        let git_wt = self.git_wt().clone();
-        let path = worktree_path;
-        let expected = record.birth_branch.to_string();
-        let actual = tokio::task::spawn_blocking(move || git_wt.get_workspace_bookmark(&path))
-            .await
-            .context("ordered sub-TL worktree verification failed")??;
-        if actual.as_deref() != Some(expected.as_str()) {
+        let identity_path = self
+            .project_dir()
+            .join(".exo/agents")
+            .join(agent_name.as_str())
+            .join("identity.json");
+        let durable_identity: AgentIdentityRecord =
+            serde_json::from_slice(&fs::read(&identity_path).await.with_context(|| {
+                format!(
+                    "failed to read ordered sub-TL identity {}",
+                    identity_path.display()
+                )
+            })?)
+            .with_context(|| {
+                format!(
+                    "failed to parse ordered sub-TL identity {}",
+                    identity_path.display()
+                )
+            })?;
+        if durable_identity != record {
             return Err(anyhow!(
-                "ordered sub-TL worktree branch verification failed"
+                "ordered sub-TL identity changed during provisioning"
             ));
         }
+
+        let routing = match self.ordered_sub_tl_routing().await {
+            Ok(routing) => routing,
+            Err(error) => {
+                warn!(agent = %agent_name, error = %error, "Ordered sub-TL has no verifiable tmux delivery target");
+                return Err(error);
+            }
+        };
+        let trigger = if existing_identity.is_some() || worktree_preexisting {
+            invocation::InvocationTrigger::ResumePr
+        } else {
+            invocation::InvocationTrigger::Spawn
+        };
+        let identity_context = InvocationIdentityContext {
+            runtime_agent_id: Some(agent_name.to_string()),
+            slice_id: durable_identity.slice_id.clone(),
+            branch: Some(durable_identity.birth_branch.to_string()),
+            worktree: Some(durable_identity.working_dir.to_string_lossy().into_owned()),
+        };
+        self.finalize_spawn_with_invocation(
+            &agent_name,
+            routing,
+            Some(durable_identity.clone()),
+            InvocationMetadata {
+                runtime: durable_identity.agent_type,
+                trigger,
+                pr_number: None,
+                head_sha: None,
+                model: durable_identity.model.clone(),
+                effort: durable_identity.effort.clone(),
+                identity: Some(identity_context),
+                recovery_lineage: None,
+                mode: InvocationMode::Interactive,
+            },
+            true,
+        )
+        .await?;
         Ok(())
+    }
+
+    async fn ordered_sub_tl_routing(&self) -> Result<RoutingInfo> {
+        #[cfg(test)]
+        if let Some(routing) = self.ordered_sub_tl_routing_override.as_ref() {
+            return Ok(routing.clone());
+        }
+        let tmux = self
+            .tmux()
+            .context("ordered sub-TL tmux session is unavailable")?;
+        let windows = tmux
+            .list_windows()
+            .await
+            .context("failed to list windows for ordered sub-TL routing")?;
+        match select_ordered_sub_tl_window(&windows) {
+            Ok(window) => Ok(RoutingInfo::window(window.window_id.clone())),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn runtime_role_context(&self, role: &crate::domain::Role) -> Result<String> {
@@ -1725,6 +1818,36 @@ mod tests {
         Arc::new(services)
     }
 
+    #[test]
+    fn ordered_sub_tl_route_requires_one_existing_tl_window() {
+        use super::super::tmux_ipc::{PaneId, WindowId, WindowInfo};
+
+        let make_window = |id: &str, name: &str| WindowInfo {
+            window_id: WindowId::parse(id).unwrap(),
+            window_name: name.to_owned(),
+            pane_id: PaneId::parse("%7").unwrap(),
+        };
+        let one = vec![make_window("@1", "TL"), make_window("@2", "Server")];
+        assert_eq!(
+            select_ordered_sub_tl_window(&one)
+                .unwrap()
+                .window_id
+                .as_str(),
+            "@1"
+        );
+        assert!(select_ordered_sub_tl_window(&[])
+            .err()
+            .expect("missing TL window is rejected")
+            .to_string()
+            .contains("no existing TL tmux window"));
+        let ambiguous = vec![make_window("@1", "TL"), make_window("@2", "TL")];
+        assert!(select_ordered_sub_tl_window(&ambiguous)
+            .err()
+            .expect("multiple TL windows are rejected")
+            .to_string()
+            .contains("ambiguous"));
+    }
+
     #[tokio::test]
     async fn ordered_sub_tl_provisioning_is_idempotent_and_rejects_conflicts() {
         let temp = tempfile::tempdir().unwrap();
@@ -1754,7 +1877,10 @@ mod tests {
             project_dir.clone(),
         ));
         services.agent_resolver = resolver;
-        let service = AgentControlService::new(Arc::new(services));
+        let expected_window = super::super::tmux_ipc::WindowId::parse("@71").unwrap();
+        let expected_routing = RoutingInfo::window(expected_window.clone());
+        let service = AgentControlService::new(Arc::new(services))
+            .with_ordered_sub_tl_routing_for_test(expected_routing.clone());
         let agent_name = AgentName::try_from_str("ordered-child").unwrap();
         let record = AgentIdentityRecord {
             agent_name: agent_name.clone(),
@@ -1775,11 +1901,69 @@ mod tests {
             .provision_ordered_sub_tl(record.clone())
             .await
             .unwrap();
+        let agent_dir = project_dir.join(".exo/agents/ordered-child");
+        let invocation = read_invocation_conservatively(&agent_dir)
+            .await
+            .expect("ordered provisioning writes a readable invocation");
+        assert_eq!(invocation.runtime, AgentType::Codex);
+        assert_eq!(invocation.trigger, InvocationTrigger::Spawn);
+        assert_eq!(invocation.mode, InvocationMode::Interactive);
+        assert_eq!(invocation.generation, 1);
+        assert_eq!(
+            invocation.runtime_agent_id.as_deref(),
+            Some("ordered-child")
+        );
+        assert_eq!(invocation.slice_id.as_deref(), Some("ordered-child"));
+        assert_eq!(invocation.branch.as_deref(), Some("main.ordered-child"));
+        assert_eq!(
+            invocation.worktree.as_deref(),
+            Some(record.working_dir.to_string_lossy().as_ref())
+        );
+        let routing = RoutingInfo::read_from_dir(&agent_dir).await.unwrap();
+        assert_eq!(routing.window_id.as_ref(), Some(&expected_window));
+        assert!(routing.has_delivery_target());
+        let invocation_id = invocation.invocation_id.clone();
         service
             .provision_ordered_sub_tl(record.clone())
             .await
             .unwrap();
+        let reused = read_invocation_conservatively(&agent_dir)
+            .await
+            .expect("live invocation remains readable");
+        assert_eq!(reused.invocation_id, invocation_id);
+        assert_eq!(reused.generation, 1);
         assert!(record.working_dir.join(".git").exists());
+
+        let mut no_route_services = crate::services::Services::test();
+        no_route_services.project_dir = project_dir.clone();
+        no_route_services.git_wt = Arc::new(
+            crate::services::git_worktree::GitWorktreeService::new(project_dir.clone()),
+        );
+        no_route_services.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let error = AgentControlService::new(Arc::new(no_route_services))
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect_err("provisioning without an existing delivery route must fail closed");
+        assert!(error.to_string().contains("tmux session is unavailable"));
+        let after_missing_route = read_invocation_conservatively(&agent_dir)
+            .await
+            .expect("missing route must not erase existing provenance");
+        assert_eq!(after_missing_route.invocation_id, invocation_id);
+
+        let invocation_path = agent_dir.join("invocation.json");
+        let original_invocation = std::fs::read(&invocation_path).unwrap();
+        let mut conflicting_invocation: serde_json::Value =
+            serde_json::from_slice(&original_invocation).unwrap();
+        conflicting_invocation["branch"] = serde_json::json!("different.branch");
+        let conflicting_bytes = serde_json::to_vec_pretty(&conflicting_invocation).unwrap();
+        std::fs::write(&invocation_path, &conflicting_bytes).unwrap();
+        let error = service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect_err("conflicting live invocation provenance must not be replaced");
+        assert!(error.to_string().contains("conflicting live invocation"));
+        assert_eq!(std::fs::read(&invocation_path).unwrap(), conflicting_bytes);
+        std::fs::write(&invocation_path, original_invocation).unwrap();
 
         let mut restarted = crate::services::Services::test();
         restarted.project_dir = project_dir.clone();
@@ -1788,6 +1972,7 @@ mod tests {
         ));
         restarted.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
         AgentControlService::new(Arc::new(restarted))
+            .with_ordered_sub_tl_routing_for_test(expected_routing)
             .provision_ordered_sub_tl(record.clone())
             .await
             .unwrap();

@@ -133,6 +133,31 @@ impl ServerClient {
             .with_context(|| format!("Failed to deserialize response from {}", path))
     }
 
+    /// POST typed JSON to an authenticated agent route.
+    pub async fn post_agent_json<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<R> {
+        let body_bytes = serde_json::to_vec(body).context("Failed to serialize request")?;
+        let credential = std::env::var(crate::control::AGENT_CREDENTIAL_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let credential_header = crate::control::AGENT_CREDENTIAL_HEADER.clone();
+        let headers = credential
+            .as_deref()
+            .map(|value| vec![(credential_header.as_str(), value)])
+            .unwrap_or_default();
+        let response = self
+            .raw_request_with_status(hyper::Method::POST, path, Some(&body_bytes), &headers)
+            .await?;
+        if !(200..300).contains(&response.status) {
+            return Err(ControlRequestError::from_response(path, response).into());
+        }
+        serde_json::from_slice(&response.body)
+            .with_context(|| format!("Failed to deserialize response from {}", path))
+    }
+
     /// POST typed JSON to an authenticated control endpoint.
     ///
     /// Control requests deliberately use their own credential header and do
