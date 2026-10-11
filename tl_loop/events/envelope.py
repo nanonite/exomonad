@@ -58,6 +58,7 @@ class EventKind(str, Enum):
     INBOX_MESSAGE = "inbox.message"
     INBOX_POKE = "inbox.poke"
     SLICE_ABANDONED = "tl.slice_abandoned"
+    GATE_ANSWERED = "tl.gate_answered"
     WATCHER_PR_OBSERVATION = "watcher.pr_observation"
     WATCHER_OWNERSHIP_UNRESOLVED = "watcher.ownership_unresolved"
     WATCHER_POLL_CYCLE = "watcher.poll_cycle"

@@ -141,6 +141,7 @@ class ParkCause(str, Enum):
     PR_CLOSED_UNMERGED = "pr_closed_unmerged"
     PR_HEAD_UNREACHABLE = "pr_head_unreachable"
     PUBLICATION_OWNERSHIP_UNRESOLVED = "publication_ownership_unresolved"
+    PUBLICATION_BLOCKED = "publication_blocked"
     DISPATCH_UNCONFIRMED = "dispatch_unconfirmed"
     DISPATCH_FAILED = "dispatch_failed"
     REPEATED_ACTION_NO_PROGRESS = "repeated_action_no_progress"
@@ -709,6 +710,10 @@ PARK_AUDIT_KEYS = frozenset(
         "action_key",
         "action",
         "target_id",
+        "error",
+        "error_kind",
+        "publication_attempt",
+        "publication_approval_consumed",
     }
 )
 RECOVERY_KEYS = frozenset(
@@ -1679,6 +1684,8 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
         _nullable_enum_value(audit, "verdict", f"{path}.park_audit", Verdict, errors)
     if "attempt" in audit:
         _non_negative_int(audit, "attempt", f"{path}.park_audit", errors)
+    if "publication_attempt" in audit:
+        _non_negative_int(audit, "publication_attempt", f"{path}.park_audit", errors)
     for key in (
         "gate_name",
         "recovery_action",
@@ -1690,7 +1697,7 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
     ):
         if key in audit:
             _nullable_string(audit, key, f"{path}.park_audit", errors)
-    for key in ("needs_human", "retryable"):
+    for key in ("needs_human", "retryable", "publication_approval_consumed"):
         if key in audit:
             _boolean(audit, key, f"{path}.park_audit", errors)
     for key in (
@@ -1704,6 +1711,8 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
         "action_key",
         "action",
         "target_id",
+        "error",
+        "error_kind",
     ):
         if key in audit:
             _nullable_string(audit, key, f"{path}.park_audit", errors)

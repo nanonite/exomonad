@@ -161,6 +161,24 @@ merged, or its head became reachable again -- is left exactly as it is.
 Reconciliation never resurrects a parked slice on an observation that no longer
 supports the decision.
 
+## Aggregate publication block gate
+
+When a completed ordered sub-TL needs an aggregate PR and `file_pr` returns a
+rejection, only that parent slice is parked with
+`ParkCause.PUBLICATION_BLOCKED`. Its durable audit stores the tool error,
+error kind, publication attempt, and whether an approval has been consumed.
+The controller opens `tl-aggregate-publication-blocked-<slice>` and records
+`tl.transition_invariant_failed` against the controller target. It does not
+fail the root scope; other sub-TLs in the same ordered stage continue.
+
+`InvalidInput`-style rejections are marked as needing operator action and are
+never automatically retried. After the operator repairs the cause and approves
+the gate, the controller checkpoints the consumed approval before calling
+`file_pr` again. The publication attempt is part of the effect-journal identity,
+so a restart replays that one approved attempt instead of issuing it twice. A
+rejected retry reopens the same gate for a later explicit approval. A successful
+publication clears the park and gate and resumes normal aggregate review.
+
 ## Durable post-merge recovery boundaries
 
 Remote merge adoption opens a per-slice recovery FSM; it does not complete the

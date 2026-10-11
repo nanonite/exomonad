@@ -541,5 +541,28 @@
       "intent_id": "intent-slice-a-1",
       "source": "rust"
     }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "gate-answered-event",
+    "id": "gate-answered-event",
+    "event_time": "2026-08-12T15:07:00Z",
+    "observed_at": "2026-08-12T15:07:00Z",
+    "run_seq": 106,
+    "type": "tl.gate_answered",
+    "agent_id": "root",
+    "run_id": "run-a",
+    "session_id": "session-a",
+    "invocation_id": null,
+    "generation": null,
+    "harness": null,
+    "role": "tl",
+    "source": "controller",
+    "lifecycle_state": "emitted",
+    "data": {
+      "gate_name": "tl-aggregate-publication-blocked-slice-a",
+      "decision": "approved",
+      "source": "operator"
+    }
   }
 ]

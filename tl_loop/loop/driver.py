@@ -353,6 +353,7 @@ LEGACY_DISPATCH_GATES = {
 INTEGRATION_REVALIDATION_GATE_NAME = "tl-integration-revalidation"
 INTEGRATION_CONFLICT_GATE_NAME = "tl-integration-conflict"
 INTEGRATION_FAILURE_GATE_NAME = "tl-integration-failure"
+AGGREGATE_PUBLICATION_GATE_PREFIX = "tl-aggregate-publication-blocked-"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 CHAINLINK_BINDING_RECONCILIATION_GATE_NAME = "chainlink-issue-binding-reconciliation"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
@@ -592,6 +593,28 @@ class ChainlinkIssueBindingError(ValueError):
 
 class EffectFailed(TLLoopError):
     """An active effect returned an explicit failure."""
+
+
+class AggregatePublicationRejected(TLLoopError):
+    """One aggregate file_pr attempt returned a durable rejection."""
+
+    def __init__(
+        self,
+        task_name: str,
+        detail: str,
+        error_kind: str | None,
+        attempt: int,
+        *,
+        needs_human: bool,
+        retryable: bool,
+    ) -> None:
+        super().__init__(detail)
+        self.task_name = task_name
+        self.detail = detail
+        self.error_kind = error_kind
+        self.attempt = attempt
+        self.needs_human = needs_human
+        self.retryable = retryable
 
 
 class IssueCloseRecoveryError(RuntimeError):
@@ -3054,6 +3077,26 @@ def _run_loop(
                 run_id,
                 event_seq,
             )
+            continue
+        gate_name = event.data.get("gate_name")
+        if (
+            event.event_type == "tl.gate_answered"
+            and isinstance(gate_name, str)
+            and gate_name.startswith(AGGREGATE_PUBLICATION_GATE_PREFIX)
+        ):
+            _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
+            if not replaying:
+                diagnostics.acknowledged += 1
+            diagnostics.correlated += 1
+            state = store.load()
+            if event.data.get("decision") == GateStatus.APPROVED.value and plan.sub_tls:
+                state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
+                phase = _phase_from_state(state)
+                state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+                phase = _phase_from_state(state)
+            _release_replayed_event(store, event, replaying)
+            if _is_terminal_phase(phase):
+                break
             continue
         resolution = resolve_event_slice(event, state, allowed_ids=expected)
         if not _event_belongs_to_plan(event, expected, state):
@@ -10532,6 +10575,9 @@ def _run_sub_tls(
     """Run recursive children in deterministic, bounded order batches."""
     if not plan.sub_tls:
         return state
+    state = _reconcile_aggregate_publication_gates(
+        plan.sub_tls, state, config, effects, store, effects_log
+    )
     tasks_by_name = {task.name: task for task in plan.sub_tls}
     current_order = state.current_order or 1
     for stage in plan.ordered_stages:
@@ -10567,7 +10613,11 @@ def _run_sub_tls(
         state = store.load()
         stage_states = [state.slices.get(task.name) for task in stage_tasks]
         if any(
-            current.status in {SliceStatus.FAILED, SliceStatus.PARKED}
+            current.status is SliceStatus.FAILED
+            or (
+                current.status is SliceStatus.PARKED
+                and current.park_cause is not ParkCause.PUBLICATION_BLOCKED
+            )
             for current in stage_states
             if current is not None
         ):
@@ -10580,6 +10630,10 @@ def _run_sub_tls(
             for task, current in zip(stage_tasks, stage_states)
             if current is not None
             and current.status not in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
+            and not (
+                current.status is SliceStatus.PARKED
+                and current.park_cause is ParkCause.PUBLICATION_BLOCKED
+            )
             and not _ordered_child_complete(task, current)
         )
         if not pending:
@@ -11285,6 +11339,7 @@ def _complete_sub_tl_batch(
     sub_tl_recovery = dict(state.integration.sub_tl_recovery)
     candidate_records = dict(state.integration.candidates)
     canonical_phase = state.recursive_fsm
+    publication_failures: list[AggregatePublicationRejected] = []
     for task, phase, child_state in outcomes:
         child_handoff_ready = phase is TLPhase.TLFailed or _child_handoff_ready(
             child_state, state.run_id
@@ -11305,20 +11360,35 @@ def _complete_sub_tl_batch(
         if isinstance(previous_lifecycle, SubTLLifecycle):
             previous_lifecycle = IntegrationLifecycle.RUNNING
         sub_tl_recovery.pop(task.name, None)
-        lifecycle = _transition_sub_tl_lifecycle(
-            previous_lifecycle,
-            (
-                IntegrationTransition.CHILDREN_MERGED
-                if status is SliceStatus.MERGED
-                else IntegrationTransition.FAILED
-            ),
+        lifecycle = (
+            previous_lifecycle
+            if status is SliceStatus.MERGED
+            and previous_lifecycle is IntegrationLifecycle.CHILDREN_MERGED
+            else _transition_sub_tl_lifecycle(
+                previous_lifecycle,
+                (
+                    IntegrationTransition.CHILDREN_MERGED
+                    if status is SliceStatus.MERGED
+                    else IntegrationTransition.FAILED
+                ),
+            )
         )
         current = updated_slices[task.name]
         candidate_runtime = _candidate_runtime(state.integration, task.name)
         if status is SliceStatus.MERGED:
-            candidate = _ensure_aggregate_candidate(
-                task, child_state, config, effects, store, effects_log
-            )
+            try:
+                candidate = _ensure_aggregate_candidate(
+                    task, child_state, config, effects, store, effects_log
+                )
+            except AggregatePublicationRejected as error:
+                if error.task_name != task.name:
+                    raise
+                current = _park_aggregate_publication(current, error)
+                status = SliceStatus.PARKED
+                lifecycle = IntegrationLifecycle.CHILDREN_MERGED
+                candidate_runtime = replace(candidate_runtime, lifecycle=lifecycle)
+                publication_failures.append(error)
+                candidate = None
             if candidate is not None:
                 owner_id = f"{store.run_id}:{task.name}:integration"
                 owner_branch = (
@@ -11331,6 +11401,14 @@ def _complete_sub_tl_batch(
                     if child_state is not None and child_state.owner_worktree
                     else str(_sub_tl_worktree(config, store.root_dir, store.run_id, task))
                 )
+                if current.park_cause is ParkCause.PUBLICATION_BLOCKED:
+                    current = replace(
+                        current,
+                        park_cause=None,
+                        park_issue_id=None,
+                        park_audit=None,
+                        blocked_by=None,
+                    )
                 current = slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW))
                 current = slice_transition(
                     current,
@@ -11363,7 +11441,11 @@ def _complete_sub_tl_batch(
                     head_sha=candidate.head_sha,
                     patch_digest=candidate.patch_digest,
                 )
-        updated_slices[task.name] = slice_transition(current, SliceStatusChanged(status))
+        updated_slices[task.name] = (
+            current
+            if status is SliceStatus.PARKED
+            else slice_transition(current, SliceStatusChanged(status))
+        )
         sub_tl_states[task.name] = lifecycle
         candidate_records[task.name] = IntegrationCandidateState(
             lifecycle=candidate_runtime.lifecycle,
@@ -11411,6 +11493,354 @@ def _complete_sub_tl_batch(
         integration=integration,
     )
     _emit_slice_status_changes(previous_slices, state.slices, config, effects, effects_log)
+    for failure in publication_failures:
+        state = _open_aggregate_publication_gate(
+            state,
+            failure.task_name,
+            failure.detail,
+            config,
+            effects,
+            store,
+            effects_log,
+            rearm=True,
+        )
+        _emit_aggregate_publication_failure(state, failure, config, effects, effects_log)
+    for task, _, _ in outcomes:
+        current = state.slices[task.name]
+        if current.park_cause is not ParkCause.PUBLICATION_BLOCKED:
+            gate_name = _aggregate_publication_gate_name(task.name)
+            if any(gate.name == gate_name for gate in state.gates):
+                state = store.clear_gate(gate_name)
+    return state
+
+
+def _aggregate_publication_gate_name(slice_id: str) -> str:
+    """Return the stable operator gate for one aggregate publication."""
+    return f"{AGGREGATE_PUBLICATION_GATE_PREFIX}{slice_id}"
+
+
+def _park_aggregate_publication(
+    current: SliceState,
+    failure: AggregatePublicationRejected,
+) -> SliceState:
+    """Persist the rejection details on its owning sub-TL slice."""
+    parked = (
+        current
+        if current.status is SliceStatus.PARKED
+        else slice_transition(current, SliceStatusChanged(SliceStatus.PARKED))
+    )
+    return replace(
+        parked,
+        park_cause=ParkCause.PUBLICATION_BLOCKED,
+        park_issue_id=None,
+        park_audit=_aggregate_publication_audit(current, failure),
+        blocked_by=None,
+    )
+
+
+def _aggregate_publication_audit(
+    current: SliceState,
+    failure: AggregatePublicationRejected,
+) -> dict[str, object]:
+    """Build the closed-key audit payload for one rejected publication."""
+    audit = dict(current.park_audit or {})
+    audit.update(
+        {
+            "gate_name": _aggregate_publication_gate_name(failure.task_name),
+            "reason": failure.detail,
+            "error": failure.detail,
+            "error_kind": failure.error_kind or "unknown",
+            "needs_human": failure.needs_human,
+            "retryable": failure.retryable,
+            "publication_attempt": failure.attempt,
+            "publication_approval_consumed": False,
+        }
+    )
+    return audit
+
+
+def _open_aggregate_publication_gate(
+    state: RunState,
+    slice_id: str,
+    reason: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    rearm: bool = False,
+) -> RunState:
+    """Create or re-arm a pending gate without overwriting an operator rejection."""
+    gate_name = _aggregate_publication_gate_name(slice_id)
+    existing = next((gate for gate in state.gates if gate.name == gate_name), None)
+    if existing is not None and not (rearm and existing.status is GateStatus.APPROVED):
+        return state
+    state = store.set_gate(gate_name, GateStatus.PENDING)
+    _emit_aggregate_gate_opened(state, gate_name, reason, config, effects, effects_log)
+    return state
+
+
+def _emit_aggregate_gate_opened(
+    state: RunState,
+    gate_name: str,
+    reason: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Publish the open boundary for one aggregate publication gate."""
+    _record_controller_event(
+        "controller",
+        "tl.gate_opened",
+        {"gate_name": gate_name, "run_id": state.run_id, "reason": reason},
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _emit_aggregate_publication_failure(
+    state: RunState,
+    failure: AggregatePublicationRejected,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Record a slice-scoped startup reconciliation failure for operators."""
+    kind = (failure.error_kind or "unknown").strip().lower().replace("-", "_")
+    _record_controller_event(
+        "controller",
+        "tl.transition_invariant_failed",
+        {
+            "run_id": state.run_id,
+            "target_id": "controller",
+            "state_version": state.state_version,
+            "invariant": f"aggregate_publication:{failure.task_name}:{kind}",
+            "action_key": (
+                f"{state.run_id}:{failure.task_name}:aggregate-publication:{failure.attempt}"
+            ),
+        },
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _reconcile_aggregate_publication_gates(
+    tasks: Sequence[SubTLTask],
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Repair missing gates and resume only operator-approved publications."""
+    state = store.load()
+    for task in tasks:
+        state = _reconcile_aggregate_publication_gate(
+            task, state, config, effects, store, effects_log
+        )
+    return state
+
+
+def _reconcile_aggregate_publication_gate(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Reconcile one sub-TL's publication park and approval gate."""
+    current = state.slices.get(task.name)
+    if current is None:
+        return state
+    gate_name = _aggregate_publication_gate_name(task.name)
+    gate = next((item for item in state.gates if item.name == gate_name), None)
+    if current.park_cause is not ParkCause.PUBLICATION_BLOCKED:
+        return store.clear_gate(gate_name) if gate is not None else state
+    if gate is None:
+        state = _restore_aggregate_publication_gate(
+            task.name, current, state, config, effects, store, effects_log
+        )
+        gate = next((item for item in state.gates if item.name == gate_name), None)
+    if config.active and gate is not None and gate.status is GateStatus.APPROVED:
+        return _retry_aggregate_publication(task, state, config, effects, store, effects_log)
+    return state
+
+
+def _restore_aggregate_publication_gate(
+    slice_id: str,
+    current: SliceState,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Recreate a lost pending gate from its durable slice park."""
+    return _open_aggregate_publication_gate(
+        state,
+        slice_id,
+        _aggregate_publication_reason(current),
+        config,
+        effects,
+        store,
+        effects_log,
+    )
+
+
+def _aggregate_publication_reason(current: SliceState) -> str:
+    """Return the persisted operator-facing reason for a parked publication."""
+    reason = current.park_audit.get("reason") if current.park_audit is not None else None
+    return reason if isinstance(reason, str) and reason else "aggregate publication is blocked"
+
+
+def _retry_aggregate_publication(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Consume one approved gate and retry its journaled publication once."""
+    current = state.slices.get(task.name)
+    if current is None or not _aggregate_publication_is_approved(task.name, current, state):
+        return state
+    if not config.active:
+        return state
+    claimed = _claim_aggregate_publication_approval(task.name, current, state, store)
+    if claimed is None:
+        return state
+    state, attempt = claimed
+    return _execute_aggregate_publication_retry(
+        task, state, attempt, config, effects, store, effects_log
+    )
+
+
+def _aggregate_publication_is_approved(
+    slice_id: str,
+    current: SliceState,
+    state: RunState,
+) -> bool:
+    """Check both the typed park cause and its exact durable gate answer."""
+    gate = next(
+        (item for item in state.gates if item.name == _aggregate_publication_gate_name(slice_id)),
+        None,
+    )
+    return current.park_cause is ParkCause.PUBLICATION_BLOCKED and (
+        gate is not None and gate.status is GateStatus.APPROVED
+    )
+
+
+def _claim_aggregate_publication_approval(
+    slice_id: str,
+    current: SliceState,
+    state: RunState,
+    store: RunStore,
+) -> tuple[RunState, int] | None:
+    """Checkpoint one approval and return its stable attempt ordinal."""
+    audit = dict(current.park_audit or {})
+    previous_attempt = audit.get("publication_attempt", 1)
+    consumed = audit.get("publication_approval_consumed", False)
+    if type(previous_attempt) is not int or previous_attempt < 1 or type(consumed) is not bool:
+        return None
+    if consumed:
+        return state, previous_attempt
+    attempt = previous_attempt + 1
+    audit.update(publication_attempt=attempt, publication_approval_consumed=True)
+    state = _checkpoint_slice_action(
+        store, state, slice_id, None, slice_state=replace(current, park_audit=audit)
+    )
+    return state, attempt
+
+
+def _execute_aggregate_publication_retry(
+    task: SubTLTask,
+    state: RunState,
+    attempt: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Run the journaled retry and checkpoint its parent candidate."""
+    try:
+        return _publish_aggregate_retry_candidate(
+            task, state, attempt, config, effects, store, effects_log
+        )
+    except AggregatePublicationRejected as failure:
+        return _record_aggregate_publication_retry_failure(
+            task.name, failure, config, effects, store, effects_log
+        )
+
+
+def _publish_aggregate_retry_candidate(
+    task: SubTLTask,
+    state: RunState,
+    attempt: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Request one candidate and finish its parent checkpoint."""
+    candidate = _request_aggregate_retry_candidate(
+        task, attempt, config, effects, store, effects_log
+    )
+    if candidate is None:
+        raise AggregatePublicationRejected(
+            task.name,
+            "aggregate publication candidate is still unavailable",
+            "missing_candidate",
+            attempt,
+            needs_human=True,
+            retryable=False,
+        )
+    refreshed_child = RunStore(task.name, store.run_dir).load()
+    return _complete_sub_tl_batch(
+        (task,), ((task, None, refreshed_child),), state, config, effects, store, effects_log
+    )
+
+
+def _request_aggregate_retry_candidate(
+    task: SubTLTask,
+    attempt: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> AggregateCandidate | None:
+    """Request or replay the candidate for one approved publication attempt."""
+    child_state = RunStore(task.name, store.run_dir).load()
+    return _ensure_aggregate_candidate(
+        task,
+        child_state,
+        config,
+        effects,
+        store,
+        effects_log,
+        publication_attempt=attempt,
+    )
+
+
+def _record_aggregate_publication_retry_failure(
+    slice_id: str,
+    failure: AggregatePublicationRejected,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Re-park a rejected retry and require a fresh gate approval."""
+    state = store.load()
+    parked = _park_aggregate_publication(state.slices[slice_id], failure)
+    state = _checkpoint_slice_action(store, state, slice_id, None, slice_state=parked)
+    state = _open_aggregate_publication_gate(
+        state, slice_id, failure.detail, config, effects, store, effects_log, rearm=True
+    )
+    _emit_aggregate_publication_failure(state, failure, config, effects, effects_log)
     return state
 
 
@@ -11421,6 +11851,8 @@ def _ensure_aggregate_candidate(
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
     effects_log: list[EffectIntent],
+    *,
+    publication_attempt: int = 1,
 ) -> AggregateCandidate | None:
     """Publish one resumable aggregate PR, reusing the child checkpoint on restart."""
     if (
@@ -11479,7 +11911,11 @@ def _ensure_aggregate_candidate(
         result = _invoke(
             "file_pr",
             task.name,
-            {"title": f"Aggregate {task.name} into {config.branch}", "base_branch": config.branch},
+            {
+                "title": f"Aggregate {task.name} into {config.branch}",
+                "base_branch": config.branch,
+                "publication_attempt": publication_attempt,
+            },
             config.active,
             cast(EffectClient | None, owner_effects),
             lambda client: client.file_pr(
@@ -11488,7 +11924,24 @@ def _ensure_aggregate_candidate(
                 base_branch=config.branch,
             ),
             effects_log,
+            raise_on_failure=False,
         )
+        if result is not None and result.success is False:
+            error_kind = result.error_kind
+            normalized_kind = error_kind.strip().lower().replace("-", "_") if error_kind else ""
+            needs_human = normalized_kind in {"invalid_input", "invalidinput"}
+            raise AggregatePublicationRejected(
+                task.name,
+                result.error or "aggregate file_pr was rejected",
+                error_kind,
+                publication_attempt,
+                needs_human=needs_human,
+                retryable=not needs_human,
+            )
+        if result is None:
+            raise TLLoopError(
+                f"aggregate publication for {task.name!r} returned no authoritative PR number"
+            )
         result_data = (
             result.result if result is not None and isinstance(result.result, Mapping) else {}
         )
@@ -11571,6 +12024,11 @@ def _integrate_stage_candidates(
     for task in sorted(tasks, key=lambda item: item.name):
         current = state.slices[task.name]
         if _ordered_child_complete(task, current):
+            continue
+        if (
+            current.status is SliceStatus.PARKED
+            and current.park_cause is ParkCause.PUBLICATION_BLOCKED
+        ):
             continue
         if (
             current.status is not SliceStatus.IN_REVIEW

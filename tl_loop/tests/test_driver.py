@@ -30,6 +30,7 @@ from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
 from tl_loop.loop.driver import (
+    AGGREGATE_PUBLICATION_GATE_PREFIX,
     DISPATCH_ALREADY_CONFIRMED,
     DISPATCH_CORRELATED,
     DISPATCH_HISTORICAL_AUDIT,
@@ -6763,6 +6764,177 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     assert candidate.integration_owner_run_id == "aggregate-child"
     assert candidate.integration_owner_branch == "main.aggregate-child"
     assert candidate.integration_owner_worktree == child.integration.integration_owner_worktree
+
+
+def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approval(
+    tmp_path: Path,
+) -> None:
+    child_plan = _plan()
+    parent_dir = tmp_path / "blocked-aggregate-run"
+    for child_name in ("aggregate-child", "sibling-child"):
+        run_tl_loop(
+            child_name,
+            child_plan,
+            SyntheticQueue(_lifecycle_events(child_name)),
+            EffectClient(RecordingTransport()),
+            config=replace(
+                _config(),
+                branch=f"main.{child_name}",
+                parent_branch="main",
+                parent_run_id="blocked-aggregate-run",
+                depth=1,
+                keep_alive_on_waiting=False,
+            ),
+            root_dir=parent_dir,
+        )
+        child_store = RunStore(child_name, parent_dir)
+        child_state = child_store.load()
+        child_slices = dict(child_state.slices)
+        child_slices["leaf-a"] = replace(
+            child_slices["leaf-a"], pr_number=42, reviewed_head="head-a"
+        )
+        child_store.checkpoint(
+            child_state.fsm,
+            child_slices,
+            child_state.budgets,
+            child_state.events.last_consumed_offset,
+        )
+
+    class RejectFirstTransport(RecordingTransport):
+        aggregate_publication_calls = 0
+
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            title = str(arguments.get("title", ""))
+            if tool_name == "file_pr" and "Aggregate aggregate-child" in title:
+                self.calls.append((tool_name, arguments))
+                self.aggregate_publication_calls += 1
+                if self.aggregate_publication_calls == 1:
+                    return {
+                        "success": False,
+                        "error": "missing invocation record",
+                        "error_kind": "InvalidInput",
+                    }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = RejectFirstTransport()
+    parent_plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),
+            SubTLTask("sibling-child", child_plan, source=SyntheticQueue([]), order=1),
+            SubTLTask("later-stage", WorkPlan(), order=2),
+        )
+    )
+    config = replace(_config(), keep_alive_on_waiting=False)
+
+    initial = run_tl_loop(
+        "blocked-aggregate-run",
+        parent_plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    blocked = initial.final_state.slices["aggregate-child"]
+    gate_name = f"{AGGREGATE_PUBLICATION_GATE_PREFIX}aggregate-child"
+    assert initial.final_state.fsm.phase is TLPhase.TLWaiting
+    assert blocked.status is SliceStatus.PARKED
+    assert blocked.park_cause is ParkCause.PUBLICATION_BLOCKED
+    assert blocked.park_audit is not None
+    assert blocked.park_audit["error_kind"] == "InvalidInput"
+    assert blocked.park_audit["needs_human"] is True
+    assert blocked.park_audit["retryable"] is False
+    assert blocked.park_audit["publication_attempt"] == 1
+    assert initial.final_state.slices["sibling-child"].status is SliceStatus.IN_REVIEW
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.PENDING
+        for gate in initial.final_state.gates
+    )
+    invariant_events = [
+        arguments["payload"]
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.transition_invariant_failed"
+    ]
+    assert len(invariant_events) == 1
+    assert invariant_events[0]["target_id"] == "controller"
+
+    store = RunStore("blocked-aggregate-run", tmp_path)
+    store.clear_gate(gate_name)
+    recovered = run_tl_loop(
+        "blocked-aggregate-run",
+        parent_plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert recovered.final_state.slices["aggregate-child"].status is SliceStatus.PARKED
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.PENDING
+        for gate in recovered.final_state.gates
+    )
+    assert transport.aggregate_publication_calls == 1
+
+    class GateAnswerQueue(SyntheticQueue):
+        answered = False
+
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            if not self.answered:
+                self.answered = True
+                store.answer_gate(gate_name, GateStatus.APPROVED)
+            return super().get(timeout)
+
+    approval = project(
+        cast(
+            dict[str, object],
+            {
+                "schema_version": 1,
+                "event_id": "aggregate-publication-approved",
+                "id": "aggregate-publication-approved",
+                "event_time": "2026-10-11T00:00:00Z",
+                "observed_at": "2026-10-11T00:00:00Z",
+                "run_seq": 1,
+                "type": "tl.gate_answered",
+                "agent_id": "controller",
+                "run_id": "blocked-aggregate-run",
+                "session_id": "session-1",
+                "lifecycle_state": "emitted",
+                "data": {
+                    "gate_name": gate_name,
+                    "decision": GateStatus.APPROVED.value,
+                    "source": "operator",
+                },
+            },
+        )
+    )
+    resumed = run_tl_loop(
+        "blocked-aggregate-run",
+        parent_plan,
+        GateAnswerQueue([approval]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert resumed.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+    assert not any(gate.name == gate_name for gate in resumed.final_state.gates)
+    assert transport.aggregate_publication_calls == 2
+
+    run_tl_loop(
+        "blocked-aggregate-run",
+        parent_plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert transport.aggregate_publication_calls == 2
 
 
 def test_parent_serializes_aggregate_merge_after_base_recheck(
