@@ -49,6 +49,8 @@ from tl_loop.loop.driver import (
     TLRunResult,
     WorkerTask,
     WorkPlan,
+    _aggregate_pr_body,
+    _aggregate_pr_title,
     _apply_convergence,
     _apply_reconciliation_observations,
     _bind_publication_evidence,
@@ -60,6 +62,7 @@ from tl_loop.loop.driver import (
     _initial_slices,
     _integrate_one_candidate,
     _is_aggregate_slice,
+    _LeafIssueProvenance,
     _merge_result_is_authoritative,
     _migrate_audit_marked_quarantine,
     _new_dispatch_attempt,
@@ -6679,6 +6682,10 @@ def test_ordered_sub_tl_restart_adopts_terminal_child_checkpoint(
 def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) -> None:
     transport = NamedRecordingTransport()
     child_plan = _plan()
+    child_plan = replace(
+        child_plan,
+        leaves=(replace(child_plan.leaves[0], chainlink_issue_id=811),),
+    )
     parent_dir = tmp_path / "aggregate-run"
     run_tl_loop(
         "aggregate-child",
@@ -6698,7 +6705,7 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     child_store = RunStore("aggregate-child", parent_dir)
     child_state = child_store.load()
     child_slices = dict(child_state.slices)
-    child_slices["leaf-a"] = replace(child_slices["leaf-a"], pr_number=42, reviewed_head="head-a")
+    child_slices["leaf-a"] = replace(child_slices["leaf-a"], pr_number=45, reviewed_head="head-a")
     child_store.checkpoint(
         child_state.fsm,
         child_slices,
@@ -6748,6 +6755,10 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
         (role, name) for role, name, tool_name in transport.identities if tool_name == "file_pr"
     ] == [("tl", "child-service")]
     assert file_pr_calls[0]["base_branch"] == "main"
+    assert "Refs #811" in str(file_pr_calls[0]["body"])
+    assert "Related PR: #45" in str(file_pr_calls[0]["body"])
+    assert "Closes #811" not in str(file_pr_calls[0]["body"])
+    assert "Refs #1052" not in str(file_pr_calls[0]["body"])
     assert first.final_state.fsm.phase is TLPhase.TLWaiting
     assert second.final_state.fsm.phase is TLPhase.TLWaiting
     parent_slice = second.final_state.slices["aggregate-child"]
@@ -6766,6 +6777,59 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     assert candidate.integration_owner_run_id == "aggregate-child"
     assert candidate.integration_owner_branch == "main.aggregate-child"
     assert candidate.integration_owner_worktree == child.integration.integration_owner_worktree
+
+
+@pytest.mark.parametrize(
+    ("references", "expected_lines"),
+    [
+        (
+            (_LeafIssueProvenance(811, 45),),
+            ("- Refs #811 · Related PR: #45",),
+        ),
+        (
+            (_LeafIssueProvenance(812, 46), _LeafIssueProvenance(811, 45)),
+            (
+                "- Refs #811 · Related PR: #45",
+                "- Refs #812 · Related PR: #46",
+            ),
+        ),
+        ((_LeafIssueProvenance(811, None),), ("- Refs #811",)),
+        ((_LeafIssueProvenance(None, 45),), ("- Related PR: #45",)),
+        ((), ()),
+    ],
+    ids=(
+        "single-leaf",
+        "sorted-multiple-leaves",
+        "closed-issue-reference",
+        "pr-only",
+        "no-issues",
+    ),
+)
+def test_aggregate_pr_body_preserves_non_closing_leaf_provenance(
+    references: tuple[_LeafIssueProvenance, ...],
+    expected_lines: tuple[str, ...],
+) -> None:
+    body = _aggregate_pr_body(
+        "architecture-stage", "main", "owner", "head-sha", "digest", references
+    )
+
+    rendered_lines = tuple(line for line in body.splitlines() if line.startswith("- "))
+    assert rendered_lines == expected_lines
+    assert not any(keyword in body for keyword in ("Closes #", "Fixes #", "Resolves #"))
+    if not references:
+        assert "Leaf issue references:" not in body
+        assert "Refs #" not in body
+
+
+def test_aggregate_pr_title_and_body_escape_supplied_text_without_credentials() -> None:
+    task_name = "stage`\nCloses #999"
+    title = _aggregate_pr_title(task_name, "main`\nbranch")
+    body = _aggregate_pr_body(task_name, "main", "owner", "head-sha", "patch-digest", ())
+
+    assert "\n" not in title
+    assert "``stage` Closes #999``" in body
+    assert "ghp_test_secret" not in title + body
+    assert "Authorization" not in title + body
 
 
 def test_aggregate_file_pr_journal_replays_after_checkpoint_crash(

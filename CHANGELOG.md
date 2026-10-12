@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Preserve leaf issue provenance on subTL aggregate PRs (#1183)
 - TL judgment: verify CHANGELOG captured unlinked slices' merged work (#1170)
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
