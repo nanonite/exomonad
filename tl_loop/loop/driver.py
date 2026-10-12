@@ -597,6 +597,16 @@ class EffectFailed(TLLoopError):
     """An active effect returned an explicit failure."""
 
 
+@dataclass(frozen=True)
+class _AggregatePublicationIdentity:
+    owner_id: str
+    branch: str
+    owner_worktree: str
+    owner_agent: str
+    parent_slice: SliceState | None
+    invocation_id: str | None
+
+
 class AggregatePublicationRejected(TLLoopError):
     """One aggregate file_pr attempt returned a durable rejection."""
 
@@ -609,6 +619,7 @@ class AggregatePublicationRejected(TLLoopError):
         *,
         needs_human: bool,
         retryable: bool,
+        missing_evidence: Sequence[str] = (),
     ) -> None:
         super().__init__(detail)
         self.task_name = task_name
@@ -617,6 +628,7 @@ class AggregatePublicationRejected(TLLoopError):
         self.attempt = attempt
         self.needs_human = needs_human
         self.retryable = retryable
+        self.missing_evidence = tuple(missing_evidence)
 
 
 class IssueCloseRecoveryError(RuntimeError):
@@ -8330,6 +8342,11 @@ def _reconcile_action_journal(
     for entry in effects_log.pending_entries():
         if entry.get("operation") == "post_merge_issue_close":
             continue
+        if _is_aggregate_file_pr_entry(entry, state):
+            # Aggregate file_pr is an idempotent upsert by its durable head
+            # branch. Its owner reconciles the exact PR identity before retry;
+            # a generic approval gate would prevent that recovery from running.
+            continue
         key = entry.get("key")
         if not isinstance(key, str) or not key:
             continue
@@ -8380,6 +8397,20 @@ def _reconcile_action_journal(
                 },
             )
     return state
+
+
+def _is_aggregate_file_pr_entry(entry: Mapping[str, object], state: RunState) -> bool:
+    """Recognize aggregate publication journal entries for owner recovery."""
+    if entry.get("operation") != "file_pr":
+        return False
+    target = entry.get("target")
+    arguments = entry.get("arguments")
+    if not isinstance(target, str) or target not in state.slices:
+        return False
+    if not isinstance(arguments, Mapping):
+        return False
+    title = arguments.get("title")
+    return isinstance(title, str) and title.startswith("Aggregate ")
 
 
 def _reconcile_confirmed_repair_actions(
@@ -10927,6 +10958,7 @@ def _prepare_sub_tl_stage(
                 authoritative_seq = state.events.last_consumed_offset
             updated_slices[task.name] = replace(
                 slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED)),
+                attempts=internal_attempt.attempt,
                 base_ref=config.branch,
                 branch=branch,
                 worktree=worktree,
@@ -11426,6 +11458,8 @@ def _complete_sub_tl_batch(
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
     effects_log: list[EffectIntent],
+    *,
+    prepublished_candidates: Mapping[str, AggregateCandidate] | None = None,
 ) -> RunState:
     """Apply a batch atomically after all same-order children finish."""
     del tasks
@@ -11471,20 +11505,23 @@ def _complete_sub_tl_batch(
         current = updated_slices[task.name]
         candidate_runtime = _candidate_runtime(state.integration, task.name)
         if status is SliceStatus.MERGED:
-            try:
-                candidate = _ensure_aggregate_candidate(
-                    task, child_state, config, effects, store, effects_log
-                )
-            except AggregatePublicationRejected as error:
-                if error.task_name != task.name:
-                    raise
-                current = _park_aggregate_publication(current, error)
-                status = SliceStatus.PARKED
-                lifecycle = IntegrationLifecycle.CHILDREN_MERGED
-                candidate_runtime = replace(candidate_runtime, lifecycle=lifecycle)
-                publication_failures.append(error)
-                candidate = None
+            candidate = (prepublished_candidates or {}).get(task.name)
+            if candidate is None:
+                try:
+                    candidate = _ensure_aggregate_candidate(
+                        task, child_state, config, effects, store, effects_log
+                    )
+                except AggregatePublicationRejected as error:
+                    if error.task_name != task.name:
+                        raise
+                    current = _park_aggregate_publication(current, error)
+                    status = SliceStatus.PARKED
+                    lifecycle = IntegrationLifecycle.CHILDREN_MERGED
+                    candidate_runtime = replace(candidate_runtime, lifecycle=lifecycle)
+                    publication_failures.append(error)
+                    candidate = None
             if candidate is not None:
+                current = store.load().slices.get(task.name, current)
                 owner_id = f"{store.run_id}:{task.name}:integration"
                 owner_branch = (
                     child_state.owner_branch
@@ -11647,6 +11684,7 @@ def _aggregate_publication_audit(
             "error_kind": failure.error_kind or "unknown",
             "needs_human": failure.needs_human,
             "retryable": failure.retryable,
+            "missing_evidence": list(failure.missing_evidence),
             "publication_attempt": failure.attempt,
             "publication_approval_consumed": False,
         }
@@ -11754,6 +11792,15 @@ def _reconcile_aggregate_publication_gate(
     gate = next((item for item in state.gates if item.name == gate_name), None)
     if current.park_cause is not ParkCause.PUBLICATION_BLOCKED:
         return store.clear_gate(gate_name) if gate is not None else state
+    if config.active:
+        recovered_state = _recover_parked_aggregate_candidate(
+            task, state, config, effects, store, effects_log
+        )
+        if recovered_state is not None:
+            state = recovered_state
+            current = state.slices.get(task.name)
+            if current is not None and current.park_cause is not ParkCause.PUBLICATION_BLOCKED:
+                return store.clear_gate(gate_name)
     if gate is None:
         state = _restore_aggregate_publication_gate(
             task.name, current, state, config, effects, store, effects_log
@@ -11762,6 +11809,39 @@ def _reconcile_aggregate_publication_gate(
     if config.active and gate is not None and gate.status is GateStatus.APPROVED:
         return _retry_aggregate_publication(task, state, config, effects, store, effects_log)
     return state
+
+
+def _recover_parked_aggregate_candidate(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState | None:
+    """Adopt a watcher publication and resume a previously parked slice."""
+    child_state = RunStore(task.name, store.run_dir).load()
+    if not _child_handoff_ready(child_state, state.run_id):
+        return None
+    try:
+        candidate = _ensure_aggregate_candidate(
+            task, child_state, config, effects, store, effects_log, publish=False
+        )
+    except AggregatePublicationRejected:
+        return None
+    if candidate is None:
+        return None
+    child_state = RunStore(task.name, store.run_dir).load()
+    return _complete_sub_tl_batch(
+        (task,),
+        ((task, _child_completion_phase(child_state), child_state),),
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        prepublished_candidates={task.name: candidate},
+    )
 
 
 def _restore_aggregate_publication_gate(
@@ -11895,7 +11975,14 @@ def _publish_aggregate_retry_candidate(
         )
     refreshed_child = RunStore(task.name, store.run_dir).load()
     return _complete_sub_tl_batch(
-        (task,), ((task, None, refreshed_child),), state, config, effects, store, effects_log
+        (task,),
+        ((task, None, refreshed_child),),
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        prepublished_candidates={task.name: candidate},
     )
 
 
@@ -11948,6 +12035,7 @@ def _ensure_aggregate_candidate(
     effects_log: list[EffectIntent],
     *,
     publication_attempt: int = 1,
+    publish: bool = True,
 ) -> AggregateCandidate | None:
     """Publish one resumable aggregate PR, reusing the child checkpoint on restart."""
     if (
@@ -11960,105 +12048,257 @@ def _ensure_aggregate_candidate(
         return None
     child_integration = child_state.integration
     own_candidate = child_integration.candidates.get(task.name)
-    owner_id = (
-        own_candidate.integration_owner_id if own_candidate is not None else None
-    ) or f"{store.run_id}:{task.name}:integration"
+    identity = _aggregate_publication_identity(
+        task,
+        child_state,
+        own_candidate,
+        config,
+        store,
+        publication_attempt,
+    )
+    candidate = _find_aggregate_candidate(
+        task,
+        child_state,
+        own_candidate,
+        identity,
+        publication_attempt,
+        publish,
+        config,
+        effects,
+        store,
+        effects_log,
+    )
+    if candidate is None:
+        return None
+    _validate_aggregate_candidate(task.name, candidate, publication_attempt)
+    _persist_aggregate_candidate(
+        task,
+        child_state,
+        child_integration,
+        identity,
+        candidate,
+        config,
+        effects,
+        store,
+        effects_log,
+    )
+    return candidate
+
+
+def _aggregate_publication_identity(
+    task: SubTLTask,
+    child_state: RunState,
+    own_candidate: IntegrationCandidateState | None,
+    config: TLLoopConfig,
+    store: RunStore,
+    publication_attempt: int,
+) -> _AggregatePublicationIdentity:
+    """Resolve the branch, agent, and invocation that own the publication."""
     branch = child_state.owner_branch or derive_child_branch(
         config.branch, _child_controller_name(task)
     )
-    owner_worktree = child_state.owner_worktree or str(
-        _sub_tl_worktree(config, store.root_dir, store.run_id, task)
+    owner_agent = task.agent_id or task.name
+    parent_slice = store.load().slices.get(task.name)
+    parent_slice, invocation_id = _registered_aggregate_invocation(
+        task, parent_slice, branch, owner_agent, config, store, publication_attempt
     )
-    fallback_head = _child_head_sha(child_state, branch)
-    fallback_patch = _child_patch_digest(child_state)
-    fallback_base = (
-        own_candidate.aggregate_original_base_sha if own_candidate is not None else None
-    ) or config.branch
-    if own_candidate is not None and own_candidate.aggregate_pr_number is not None:
-        candidate = AggregateCandidate(
-            task.name,
-            own_candidate.aggregate_pr_number,
-            own_candidate.aggregate_head_sha or fallback_head,
-            own_candidate.aggregate_patch_digest or fallback_patch,
-            fallback_base,
+    return _AggregatePublicationIdentity(
+        owner_id=(own_candidate.integration_owner_id if own_candidate else None)
+        or f"{store.run_id}:{task.name}:integration",
+        branch=branch,
+        owner_worktree=child_state.owner_worktree
+        or str(_sub_tl_worktree(config, store.root_dir, store.run_id, task)),
+        owner_agent=owner_agent,
+        parent_slice=parent_slice,
+        invocation_id=invocation_id,
+    )
+
+
+def _registered_aggregate_invocation(
+    task: SubTLTask,
+    parent_slice: SliceState | None,
+    branch: str,
+    owner_agent: str,
+    config: TLLoopConfig,
+    store: RunStore,
+    publication_attempt: int,
+) -> tuple[SliceState | None, str | None]:
+    """Rehydrate an invocation when possible and reject unsafe publication."""
+    invocation_id = parent_slice.dispatch_invocation_id if parent_slice is not None else None
+    if config.project_root is not None and not invocation_id:
+        invocation_id = _rehydrate_aggregate_invocation(
+            task, owner_agent, branch, config.project_root, store
         )
-    elif (
-        own_candidate is None
-        and child_integration.aggregate_pr_number is not None
-        and child_integration.aggregate_head_sha
-        and child_integration.integration_owner_run_id == task.name
+        parent_slice = store.load().slices.get(task.name)
+        invocation_id = parent_slice.dispatch_invocation_id if parent_slice else None
+    durable = config.project_root is None or _durable_sub_tl_invocation_matches(
+        config.project_root,
+        owner_agent,
+        task.name,
+        branch,
+        invocation_id,
+    )
+    if not durable:
+        raise AggregatePublicationRejected(
+            task.name,
+            "aggregate publication stopped before file_pr: the sub-TL invocation record is "
+            "missing or does not match its persisted slice and branch identity",
+            "missing_invocation_registration",
+            publication_attempt,
+            needs_human=True,
+            retryable=False,
+            missing_evidence=("invocation_id", "slice_id", "head_branch"),
+        )
+    return parent_slice, invocation_id
+
+
+def _rehydrate_aggregate_invocation(
+    task: SubTLTask,
+    owner_agent: str,
+    branch: str,
+    project_root: str | Path,
+    store: RunStore,
+) -> str | None:
+    """Checkpoint a matching host invocation record into the parent slice."""
+    record = _read_durable_sub_tl_invocation(project_root, owner_agent)
+    invocation_id = record.get("invocation_id") if record else None
+    if not (
+        isinstance(invocation_id, str)
+        and record.get("slice_id") == task.name
+        and record.get("branch") == branch
     ):
-        candidate = AggregateCandidate(
-            task.name,
-            child_integration.aggregate_pr_number,
-            child_integration.aggregate_head_sha,
-            child_integration.aggregate_patch_digest or fallback_patch,
-            child_integration.aggregate_original_base_sha or fallback_base,
+        return None
+    try:
+        _checkpoint_ordered_sub_tl_invocation(store, task.name, invocation_id)
+    except TLLoopError:
+        return None
+    return invocation_id
+
+
+def _find_aggregate_candidate(
+    task: SubTLTask,
+    child_state: RunState,
+    own_candidate: IntegrationCandidateState | None,
+    identity: _AggregatePublicationIdentity,
+    publication_attempt: int,
+    publish: bool,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> AggregateCandidate | None:
+    """Reuse durable evidence, observe the watcher, then publish if needed."""
+    if own_candidate is not None and own_candidate.aggregate_pr_number is not None:
+        return _persisted_aggregate_candidate(task.name, own_candidate)
+    candidate = _aggregate_candidate_from_watcher(
+        task,
+        identity.parent_slice,
+        identity.branch,
+        identity.owner_agent,
+        identity.invocation_id,
+        config,
+        effects,
+        effects_log,
+    )
+    if candidate is None and publish:
+        return _request_aggregate_candidate(
+            task, child_state, identity, publication_attempt, config, effects, store, effects_log
         )
-    else:
-        body = (
-            f"Aggregate sub-TL `{task.name}` into `{config.branch}`.\n"
-            f"Owner: `{owner_id}`\n"
-            f"Head: `{fallback_head}`\n"
-            f"Patch: `{fallback_patch}`"
+    return candidate
+
+
+def _request_aggregate_candidate(
+    task: SubTLTask,
+    child_state: RunState,
+    identity: _AggregatePublicationIdentity,
+    publication_attempt: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> AggregateCandidate:
+    """Build and publish one sub-TL aggregate candidate."""
+    title = f"Aggregate {task.name} into {config.branch}"
+    body = _aggregate_publication_body(task, child_state, identity, config)
+    arguments = {
+        "title": title,
+        "base_branch": config.branch,
+        "publication_attempt": publication_attempt,
+        "publication_identity": {
+            "slice_id": task.name,
+            "invocation_id": identity.invocation_id,
+            "author_agent": identity.owner_agent,
+            "head_branch": identity.branch,
+            "base_branch": config.branch,
+        },
+    }
+    return _publish_aggregate_candidate(
+        task,
+        title,
+        body,
+        identity,
+        arguments,
+        publication_attempt,
+        config,
+        effects,
+        store,
+        effects_log,
+    )
+
+
+def _aggregate_publication_body(
+    task: SubTLTask,
+    child_state: RunState,
+    identity: _AggregatePublicationIdentity,
+    config: TLLoopConfig,
+) -> str:
+    """Format the credential-free aggregate PR description."""
+    return (
+        f"Aggregate sub-TL `{task.name}` into `{config.branch}`.\n"
+        f"Owner: `{identity.owner_id}`\n"
+        f"Head: `{_child_head_sha(child_state, identity.branch)}`\n"
+        f"Patch: `{_child_patch_digest(child_state)}`"
+    )
+
+
+def _validate_aggregate_candidate(
+    task_name: str,
+    candidate: AggregateCandidate,
+    publication_attempt: int,
+) -> None:
+    """Reject aggregate evidence before it can enter the parent checkpoint."""
+    if all(
+        (
+            candidate.pr_number > 0,
+            candidate.head_sha,
+            candidate.patch_digest,
+            candidate.original_base_sha,
         )
-        owner_effects = _owner_effect_client(effects, task.agent_id or task.name)
-        result = _invoke(
-            "file_pr",
-            task.name,
-            {
-                "title": f"Aggregate {task.name} into {config.branch}",
-                "base_branch": config.branch,
-                "publication_attempt": publication_attempt,
-            },
-            config.active,
-            cast(EffectClient | None, owner_effects),
-            lambda client: client.file_pr(
-                title=f"Aggregate {task.name} into {config.branch}",
-                body=body,
-                base_branch=config.branch,
-            ),
-            effects_log,
-            raise_on_failure=False,
-        )
-        if result is not None and result.success is False:
-            error_kind = result.error_kind
-            normalized_kind = error_kind.strip().lower().replace("-", "_") if error_kind else ""
-            needs_human = normalized_kind in {"invalid_input", "invalidinput"}
-            raise AggregatePublicationRejected(
-                task.name,
-                result.error or "aggregate file_pr was rejected",
-                error_kind,
-                publication_attempt,
-                needs_human=needs_human,
-                retryable=not needs_human,
-            )
-        if result is None:
-            raise TLLoopError(
-                f"aggregate publication for {task.name!r} returned no authoritative PR number"
-            )
-        result_data = (
-            result.result if result is not None and isinstance(result.result, Mapping) else {}
-        )
-        pr_number = _positive_result_int(result_data, "pr_number")
-        if pr_number is None:
-            raise TLLoopError(
-                f"aggregate publication for {task.name!r} returned no authoritative PR number"
-            )
-        head_sha = _result_text(result_data, "head_sha")
-        patch_digest = _result_text(result_data, "patch_digest")
-        base_sha = _result_text(result_data, "base_sha")
-        if not head_sha or not patch_digest or not base_sha:
-            raise TLLoopError(
-                f"aggregate publication for {task.name!r} returned incomplete evidence"
-            )
-        candidate = AggregateCandidate(
-            task.name,
-            pr_number,
-            head_sha,
-            patch_digest,
-            base_sha,
-        )
+    ):
+        return
+    raise AggregatePublicationRejected(
+        task_name,
+        "aggregate publication candidate is missing authoritative PR evidence",
+        "incomplete_evidence",
+        publication_attempt,
+        needs_human=False,
+        retryable=True,
+        missing_evidence=("pr_number", "head_sha", "base_sha", "patch_digest"),
+    )
+
+
+def _persist_aggregate_candidate(
+    task: SubTLTask,
+    child_state: RunState,
+    child_integration: IntegrationRuntimeState,
+    identity: _AggregatePublicationIdentity,
+    candidate: AggregateCandidate,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Persist verified publication evidence in the child handoff checkpoint."""
     updated_integration = replace(
         child_integration,
         lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
@@ -12066,18 +12306,16 @@ def _ensure_aggregate_candidate(
         aggregate_head_sha=candidate.head_sha,
         aggregate_patch_digest=candidate.patch_digest,
         aggregate_original_base_sha=candidate.original_base_sha,
-        integration_owner_id=owner_id,
+        integration_owner_id=identity.owner_id,
         integration_owner_run_id=task.name,
-        integration_owner_branch=branch,
-        integration_owner_worktree=owner_worktree,
+        integration_owner_branch=identity.branch,
+        integration_owner_worktree=identity.owner_worktree,
         head_sha=candidate.head_sha,
         patch_digest=candidate.patch_digest,
     )
     child_store = RunStore(task.name, store.run_dir)
     updated_child_state = child_store.set_ordered_state(
-        child_state.current_order,
-        child_state.ordered_stages,
-        updated_integration,
+        child_state.current_order, child_state.ordered_stages, updated_integration
     )
     _persist_non_root_handoff(
         updated_child_state,
@@ -12087,22 +12325,490 @@ def _ensure_aggregate_candidate(
         parent_branch=config.branch,
     )
     if child_integration.aggregate_pr_number is None:
-        _record_controller_event(
+        _record_aggregate_open_event(task, candidate, identity, config, effects, effects_log)
+
+
+def _record_aggregate_open_event(
+    task: SubTLTask,
+    candidate: AggregateCandidate,
+    identity: _AggregatePublicationIdentity,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Record the verified aggregate publication without sensitive fields."""
+    _record_controller_event(
+        task.name,
+        "tl.aggregate_pr_opened",
+        {
+            "sub_tl_id": task.name,
+            "pr_number": candidate.pr_number,
+            "head_sha": candidate.head_sha,
+            "patch_digest": candidate.patch_digest,
+            "original_base_sha": candidate.original_base_sha,
+            "integration_owner_id": identity.owner_id,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _persisted_aggregate_candidate(
+    task_name: str,
+    candidate: IntegrationCandidateState,
+) -> AggregateCandidate:
+    """Decode a previously checkpointed candidate without filling evidence from guesses."""
+    return AggregateCandidate(
+        task_name,
+        candidate.aggregate_pr_number or 0,
+        candidate.aggregate_head_sha or "",
+        candidate.aggregate_patch_digest or "",
+        candidate.aggregate_original_base_sha or "",
+    )
+
+
+def _durable_sub_tl_invocation_matches(
+    project_root: str | Path,
+    owner_agent: str,
+    slice_id: str,
+    branch: str,
+    invocation_id: str | None,
+) -> bool:
+    """Require the exact server-owned invocation record before publication."""
+    record = _read_durable_sub_tl_invocation(project_root, owner_agent)
+    return bool(
+        invocation_id
+        and record is not None
+        and record.get("invocation_id") == invocation_id
+        and record.get("slice_id") == slice_id
+        and record.get("branch") == branch
+    )
+
+
+def _read_durable_sub_tl_invocation(
+    project_root: str | Path,
+    owner_agent: str,
+) -> Mapping[str, object] | None:
+    """Read the exact invocation file consumed by the host file_pr handler."""
+    path = Path(project_root) / ".exo" / "agents" / owner_agent / "invocation.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return record if isinstance(record, Mapping) else None
+
+
+def _aggregate_candidate_from_watcher(
+    task: SubTLTask,
+    parent_slice: SliceState | None,
+    branch: str,
+    owner_agent: str,
+    invocation_id: str | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> AggregateCandidate | None:
+    """Adopt an aggregate PR only when watcher identity and evidence are complete."""
+    if parent_slice is None:
+        return None
+    observation = _watcher_snapshot_for_slice(task.name, config, effects, effects_log)
+    if observation is None or observation.ownership_status()[0] is not True:
+        return None
+    if not _aggregate_watcher_identity_matches(
+        task, parent_slice, observation, branch, owner_agent, invocation_id, config.branch
+    ):
+        return None
+    return AggregateCandidate(
+        task.name,
+        observation.pr_number,
+        cast(str, observation.head_sha),
+        cast(str, observation.patch_digest),
+        cast(str, observation.base_sha),
+    )
+
+
+def _aggregate_watcher_identity_matches(
+    task: SubTLTask,
+    parent_slice: SliceState,
+    observation: WatcherObservation,
+    branch: str,
+    owner_agent: str,
+    invocation_id: str | None,
+    base_branch: str,
+) -> bool:
+    """Verify immutable watcher evidence against the exact publication owner."""
+    binding = accepted_publication_from_watcher(
+        parent_slice, observation, observation.head_sha, owner_agent
+    )
+    publication = observation.publication
+    evidence = (
+        observation.head_sha,
+        observation.base_sha,
+        observation.patch_digest,
+        observation.head_branch,
+        observation.base_branch,
+    )
+    return bool(
+        binding is not None
+        and all(isinstance(value, str) and value for value in evidence)
+        and type(observation.pr_number) is int
+        and observation.pr_number > 0
+        and observation.head_branch == branch
+        and observation.base_branch == base_branch
+        and publication is not None
+        and publication.slice_id == task.name
+        and publication.invocation_id == invocation_id
+        and publication.author_agent == owner_agent
+    )
+
+
+def _publish_aggregate_candidate(
+    task: SubTLTask,
+    title: str,
+    body: str,
+    identity: _AggregatePublicationIdentity,
+    arguments: Mapping[str, object],
+    publication_attempt: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> AggregateCandidate:
+    """Run or replay one idempotent aggregate publication and checkpoint its evidence."""
+    if not config.active:
+        raise _aggregate_publication_failure(
             task.name,
-            "tl.aggregate_pr_opened",
-            {
-                "sub_tl_id": task.name,
-                "pr_number": candidate.pr_number,
-                "head_sha": candidate.head_sha,
-                "patch_digest": candidate.patch_digest,
-                "original_base_sha": candidate.original_base_sha,
-                "integration_owner_id": owner_id,
-            },
-            config,
-            effects,
-            effects_log,
+            "aggregate publication was not dispatched because the loop is inactive",
+            "not_dispatched",
+            publication_attempt,
+            ("pr_number", "head_sha", "base_sha", "patch_digest"),
         )
+    intent = EffectIntent("file_pr", task.name, arguments, config.active)
+    journal = effects_log if isinstance(effects_log, EffectJournal) else None
+    _prepare_aggregate_file_pr_replay(intent, journal, task.name, identity, config.branch)
+    owner_effects = _owner_effect_client(effects, identity.owner_agent)
+    response = _invoke_aggregate_file_pr(
+        task,
+        title,
+        body,
+        arguments,
+        identity,
+        publication_attempt,
+        config,
+        cast(EffectClient | None, owner_effects),
+        effects,
+        effects_log,
+        journal,
+    )
+    if isinstance(response, AggregateCandidate):
+        return response
+    result_data = response.result if response and isinstance(response.result, Mapping) else {}
+    candidate, missing = _aggregate_candidate_from_result(
+        task.name,
+        result_data,
+        identity.branch,
+        config.branch,
+        identity.owner_agent,
+        identity.invocation_id,
+    )
+    if candidate is not None:
+        result = _candidate_result(
+            candidate,
+            task.name,
+            identity.branch,
+            config.branch,
+            identity.owner_agent,
+            identity.invocation_id,
+        )
+        _resolve_aggregate_file_pr_entries(journal, task.name, title, config.branch, result)
+        return candidate
+    recovered = _adopt_aggregate_watcher_candidate(
+        task, title, identity, config, effects, effects_log, journal
+    )
+    if recovered is not None:
+        return recovered
+    raise _aggregate_publication_failure(
+        task.name,
+        "aggregate file_pr returned incomplete or mismatched authoritative evidence; "
+        f"missing evidence: {', '.join(missing) if missing else 'publication identity'}",
+        "incomplete_evidence",
+        publication_attempt,
+        missing or ("publication_identity",),
+    )
+
+
+def _prepare_aggregate_file_pr_replay(
+    intent: EffectIntent,
+    journal: EffectJournal | None,
+    task_name: str,
+    identity: _AggregatePublicationIdentity,
+    base_branch: str,
+) -> None:
+    """Mark ambiguous file_pr calls replayable after watcher reconciliation."""
+    if journal is None:
+        return
+    probe = journal.probe(intent)
+    incomplete_confirmation = probe.status == "confirmed" and not _aggregate_result_is_complete(
+        probe.result,
+        task_name,
+        identity.branch,
+        base_branch,
+        identity.owner_agent,
+        identity.invocation_id,
+    )
+    if probe.status in {"intended", "unknown"} or incomplete_confirmation:
+        journal.resolve_by_key(journal.key_for(intent), status="compensated")
+
+
+def _invoke_aggregate_file_pr(
+    task: SubTLTask,
+    title: str,
+    body: str,
+    arguments: Mapping[str, object],
+    identity: _AggregatePublicationIdentity,
+    publication_attempt: int,
+    config: TLLoopConfig,
+    owner_effects: EffectClient | None,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    journal: EffectJournal | None,
+) -> ToolResult | AggregateCandidate | None:
+    """Invoke file_pr and recover publication results at ambiguous boundaries."""
+    def call_file_pr(client: EffectClient) -> ToolResult:
+        return client.file_pr(title=title, body=body, base_branch=config.branch)
+
+    try:
+        result = _invoke(
+            "file_pr",
+            task.name,
+            arguments,
+            config.active,
+            owner_effects,
+            call_file_pr,
+            effects_log,
+            raise_on_failure=False,
+        )
+    except Exception as error:
+        recovered = _adopt_aggregate_watcher_candidate(
+            task, title, identity, config, effects, effects_log, journal
+        )
+        if recovered is not None:
+            return recovered
+        raise _aggregate_publication_failure(
+            task.name,
+            f"aggregate file_pr outcome is unknown and no matching publication evidence was "
+            f"recoverable: {error}",
+            "publication_outcome_unknown",
+            publication_attempt,
+            ("pr_number", "head_sha", "base_sha", "patch_digest", "invocation_id"),
+        ) from error
+    if result is not None and result.success is False:
+        return _recover_rejected_aggregate_file_pr(
+            task, title, identity, result, publication_attempt, config, effects, effects_log, journal
+        )
+    return result
+
+
+def _recover_rejected_aggregate_file_pr(
+    task: SubTLTask,
+    title: str,
+    identity: _AggregatePublicationIdentity,
+    result: ToolResult,
+    publication_attempt: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    journal: EffectJournal | None,
+) -> AggregateCandidate:
+    """Adopt a completed PR or park the explicit file_pr rejection."""
+    recovered = _adopt_aggregate_watcher_candidate(
+        task, title, identity, config, effects, effects_log, journal
+    )
+    if recovered is not None:
+        return recovered
+    error_kind = result.error_kind
+    normalized_kind = error_kind.strip().lower().replace("-", "_") if error_kind else ""
+    missing_invocation = (
+        normalized_kind in {"invalid_input", "invalidinput"}
+        and "durable invocation record" in (result.error or "").lower()
+    )
+    needs_human = normalized_kind in {"invalid_input", "invalidinput"}
+    raise AggregatePublicationRejected(
+        task.name,
+        result.error or "aggregate file_pr was rejected",
+        "missing_invocation_registration" if missing_invocation else error_kind,
+        publication_attempt,
+        needs_human=needs_human,
+        retryable=not needs_human,
+        missing_evidence=(
+            ("durable_invocation_record",)
+            if missing_invocation
+            else ("pr_number", "head_sha", "base_sha", "patch_digest", "publication_identity")
+        ),
+    )
+
+
+def _adopt_aggregate_watcher_candidate(
+    task: SubTLTask,
+    title: str,
+    identity: _AggregatePublicationIdentity,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    journal: EffectJournal | None,
+) -> AggregateCandidate | None:
+    """Adopt watcher evidence and resolve its matching ambiguous journal rows."""
+    candidate = _aggregate_candidate_from_watcher(
+        task,
+        identity.parent_slice,
+        identity.branch,
+        identity.owner_agent,
+        identity.invocation_id,
+        config,
+        effects,
+        effects_log,
+    )
+    if candidate is not None:
+        result = _candidate_result(
+            candidate,
+            task.name,
+            identity.branch,
+            config.branch,
+            identity.owner_agent,
+            identity.invocation_id,
+        )
+        _resolve_aggregate_file_pr_entries(journal, task.name, title, config.branch, result)
     return candidate
+
+
+def _aggregate_result_is_complete(
+    result: ToolResult | None,
+    task_name: str,
+    branch: str,
+    base_branch: str,
+    owner_agent: str,
+    invocation_id: str | None,
+) -> bool:
+    """Check a journal replay has all evidence and exact publication correlation."""
+    if result is None or not isinstance(result.result, Mapping):
+        return False
+    candidate, missing = _aggregate_candidate_from_result(
+        task_name, result.result, branch, base_branch, owner_agent, invocation_id
+    )
+    return candidate is not None and not missing
+
+
+def _aggregate_candidate_from_result(
+    task_name: str,
+    data: Mapping[str, object],
+    branch: str,
+    base_branch: str,
+    owner_agent: str,
+    invocation_id: str | None,
+) -> tuple[AggregateCandidate | None, tuple[str, ...]]:
+    """Decode the authoritative FilePr evidence and its invocation correlation."""
+    fields = {
+        "pr_number": _positive_result_int(data, "pr_number"),
+        "head_sha": _result_text(data, "head_sha"),
+        "base_sha": _result_text(data, "base_sha"),
+        "patch_digest": _result_text(data, "patch_digest"),
+        "head_branch": _result_text(data, "head_branch"),
+        "base_branch": _result_text(data, "base_branch"),
+        "slice_id": _result_text(data, "slice_id"),
+        "invocation_id": _result_text(data, "invocation_id"),
+        "author_agent": _result_text(data, "author_agent"),
+    }
+    missing = tuple(key for key, value in fields.items() if value is None)
+    if missing:
+        return None, missing
+    expected = {
+        "head_branch": branch,
+        "base_branch": base_branch,
+        "slice_id": task_name,
+        "author_agent": owner_agent,
+    }
+    if any(fields[key] != value for key, value in expected.items()):
+        return None, ("publication_identity_mismatch",)
+    if invocation_id is not None and fields["invocation_id"] != invocation_id:
+        return None, ("invocation_id_mismatch",)
+    return (
+        AggregateCandidate(
+            task_name,
+            cast(int, fields["pr_number"]),
+            cast(str, fields["head_sha"]),
+            cast(str, fields["patch_digest"]),
+            cast(str, fields["base_sha"]),
+        ),
+        (),
+    )
+
+
+def _candidate_result(
+    candidate: AggregateCandidate,
+    task_name: str,
+    branch: str,
+    base_branch: str,
+    owner_agent: str,
+    invocation_id: str | None,
+) -> dict[str, object]:
+    """Build a credential-free authoritative result from a verified candidate."""
+    return {
+        "pr_number": candidate.pr_number,
+        "head_sha": candidate.head_sha,
+        "base_sha": candidate.original_base_sha,
+        "patch_digest": candidate.patch_digest,
+        "head_branch": branch,
+        "base_branch": base_branch,
+        "slice_id": task_name,
+        "author_agent": owner_agent,
+        "invocation_id": invocation_id,
+    }
+
+
+def _resolve_aggregate_file_pr_entries(
+    journal: EffectJournal | None,
+    task_name: str,
+    title: str,
+    base_branch: str,
+    result: Mapping[str, object],
+) -> None:
+    """Close stale ambiguous aggregate entries after publication is authoritative."""
+    if journal is None:
+        return
+    raw = {"success": True, "result": dict(result)}
+    for entry in journal.snapshot():
+        arguments = entry.get("arguments")
+        if (
+            entry.get("operation") == "file_pr"
+            and entry.get("target") == task_name
+            and isinstance(arguments, Mapping)
+            and arguments.get("title") == title
+            and arguments.get("base_branch") == base_branch
+            and entry.get("status") in {"intended", "unknown", "compensated"}
+        ):
+            key = entry.get("key")
+            if isinstance(key, str):
+                journal.resolve_by_key(key, status="confirmed", result=raw)
+
+
+def _aggregate_publication_failure(
+    task_name: str,
+    detail: str,
+    error_kind: str,
+    attempt: int,
+    missing_evidence: Sequence[str],
+) -> AggregatePublicationRejected:
+    """Build the retryable parked result for publication evidence failures."""
+    return AggregatePublicationRejected(
+        task_name,
+        detail,
+        error_kind,
+        attempt,
+        needs_human=False,
+        retryable=True,
+        missing_evidence=missing_evidence,
+    )
 
 
 def _integrate_stage_candidates(

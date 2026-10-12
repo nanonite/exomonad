@@ -27,6 +27,18 @@ message FilePrResponse {
   string base_branch = 4;
   // True if newly created, false if already existed.
   bool created = 5;
+  // Published commit recorded by Forgejo.
+  string head_sha = 6;
+  // Authoritative target branch commit used to calculate the patch digest.
+  string base_sha = 7;
+  // SHA-256 of the binary diff from base_sha to head_sha.
+  string patch_digest = 8;
+  // Durable invocation that owns this publication.
+  string invocation_id = 9;
+  // Server-owned slice represented by this publication.
+  string slice_id = 10;
+  // Agent identity recorded as the publication author.
+  string author_agent = 11;
 }
 
 // ============================================================================

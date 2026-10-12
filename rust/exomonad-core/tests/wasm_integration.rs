@@ -662,6 +662,12 @@ impl EffectHandler for MockFilePRHandler {
                 head_branch: "mock-main".into(),
                 base_branch: "main".into(),
                 created: true,
+                head_sha: "head-sha".into(),
+                base_sha: "base-sha".into(),
+                patch_digest: "patch-digest".into(),
+                invocation_id: "invocation-42".into(),
+                slice_id: "slice-42".into(),
+                author_agent: "agent-42".into(),
             }
             .encode_to_vec()),
             _ => Err(EffectError::not_found(format!(

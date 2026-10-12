@@ -170,6 +170,16 @@ impl<
         let disposition = publish_verified_head(self.ctx.project_dir(), publication)
             .await
             .effect_err("file_pr")?;
+        let evidence_dir = working_dir.to_string_lossy().into_owned();
+        let evidence = crate::services::merge_pr::observe_published_pr_evidence(
+            &evidence_dir,
+            output.base_branch.as_str(),
+            output.head_sha.as_str(),
+            output.pr_number.as_u64(),
+        )
+        .await
+        .effect_err("file_pr")?;
+        let author_agent = ctx.agent_name.to_string();
 
         if let Some(log) = self.ctx.event_log() {
             if let Err(error) = log.append(
@@ -181,6 +191,8 @@ impl<
                     "head_branch": output.head_branch.to_string(),
                     "base_branch": output.base_branch.to_string(),
                     "head_sha": output.head_sha.clone(),
+                    "base_sha": evidence.base_sha.clone(),
+                    "patch_digest": evidence.patch_digest.clone(),
                     "publication": format!("{:?}", disposition),
                     "invocation_id": &invocation.invocation_id,
                 }),
@@ -234,7 +246,7 @@ impl<
                 ctx.agent_name.as_ref(),
                 &serde_json::json!({
                     "agent_id": ctx.agent_name.to_string(),
-                    "slice_id": slice_id,
+                    "slice_id": slice_id.clone(),
                     // The exact publishing invocation is durable provenance: a
                     // recreated controller binds publications by this identity,
                     // never by the reused agent name or swarm run_id.
@@ -242,7 +254,7 @@ impl<
                     "invocation_trigger": format!("{:?}", invocation.trigger).to_ascii_lowercase(),
                     "invocation_runtime": format!("{:?}", invocation.runtime).to_ascii_lowercase(),
                     "pr_number": output.pr_number.as_u64(),
-                    "pr_url": output.pr_url,
+                    "pr_url": output.pr_url.clone(),
                     "head_branch": output.head_branch.to_string(),
                     "base_branch": output.base_branch.to_string(),
                     "head_sha": output.head_sha.clone(),
@@ -261,6 +273,12 @@ impl<
             head_branch: output.head_branch.to_string(),
             base_branch: output.base_branch.to_string(),
             created: output.created,
+            head_sha: output.head_sha,
+            base_sha: evidence.base_sha,
+            patch_digest: evidence.patch_digest,
+            invocation_id: invocation.invocation_id,
+            slice_id,
+            author_agent,
         })
     }
 
@@ -499,12 +517,24 @@ mod tests {
             head_branch: head.to_string(),
             base_branch: base.to_string(),
             created: true,
+            head_sha: "head-sha".to_string(),
+            base_sha: "base-sha".to_string(),
+            patch_digest: "patch-digest".to_string(),
+            invocation_id: "invocation-42".to_string(),
+            slice_id: "slice-42".to_string(),
+            author_agent: "agent-42".to_string(),
         };
 
         assert_eq!(response.pr_number, 42);
         assert_eq!(response.head_branch, "main.fix-auth-codex");
         assert_eq!(response.base_branch, "main");
         assert!(response.created);
+        assert_eq!(response.head_sha, "head-sha");
+        assert_eq!(response.base_sha, "base-sha");
+        assert_eq!(response.patch_digest, "patch-digest");
+        assert_eq!(response.invocation_id, "invocation-42");
+        assert_eq!(response.slice_id, "slice-42");
+        assert_eq!(response.author_agent, "agent-42");
     }
 
     #[test]

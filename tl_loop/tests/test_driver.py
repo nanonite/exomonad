@@ -15,6 +15,7 @@ from typing import Any, cast
 
 import pytest
 
+import tl_loop.loop.driver as driver_module
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
@@ -49,9 +50,11 @@ from tl_loop.loop.driver import (
     TLRunResult,
     WorkerTask,
     WorkPlan,
+    _aggregate_candidate_from_result,
     _apply_convergence,
     _apply_reconciliation_observations,
     _bind_publication_evidence,
+    _checkpoint_ordered_sub_tl_invocation,
     _child_recovery_projection,
     _confirm_dispatch_event,
     _dispatch_payload,
@@ -865,6 +868,7 @@ class RecordingTransport:
     spawned_invocation_id: str | None = None
     listed_agents: list[JsonObject] = field(default_factory=list)
     next_controller_run_seq: int = 1000
+    aggregate_reconciliation: JsonObject | None = None
 
     def call_tool(
         self,
@@ -873,7 +877,7 @@ class RecordingTransport:
         tool_name: str,
         arguments: JsonObject,
     ) -> JsonObject:
-        del role, name
+        del role
         self.calls.append((tool_name, arguments))
         if self.fail_observability and tool_name == "emit_controller_event":
             return {"success": False, "error": "ledger unavailable"}
@@ -886,6 +890,21 @@ class RecordingTransport:
             return {"success": True, "result": result}
         if tool_name == "list_agents":
             return {"success": True, "result": {"agents": self.listed_agents}}
+        if tool_name == "resolve_live_pr_for_slice":
+            if self.aggregate_reconciliation is None:
+                return {"success": True, "result": {"resolution": "never_published"}}
+            return {
+                "success": True,
+                "result": {
+                    "resolution": "live",
+                    "pr_number": self.aggregate_reconciliation["pr_number"],
+                    "publication": self.aggregate_reconciliation["publication"],
+                },
+            }
+        if tool_name == "watcher_pr_state":
+            if self.aggregate_reconciliation is None:
+                return {"success": True, "result": {"found": False}}
+            return {"success": True, "result": self.aggregate_reconciliation["watcher"]}
         if tool_name == "emit_controller_event":
             self.next_controller_run_seq += 1
             return {
@@ -894,7 +913,9 @@ class RecordingTransport:
             }
         if tool_name == "file_pr":
             title = str(arguments.get("title", ""))
-            if "aggregate-child" in title:
+            if title.startswith("Aggregate ") and " into " in title:
+                slice_id = title.removeprefix("Aggregate ").split(" into ", 1)[0]
+                base_branch = str(arguments.get("base_branch", "main"))
                 return {
                     "success": True,
                     "result": {
@@ -902,6 +923,11 @@ class RecordingTransport:
                         "head_sha": "head-a",
                         "patch_digest": "patch-a",
                         "base_sha": "base-a",
+                        "head_branch": f"{base_branch}.{slice_id}",
+                        "base_branch": base_branch,
+                        "slice_id": slice_id,
+                        "invocation_id": f"{slice_id}-invocation",
+                        "author_agent": name,
                     },
                 }
             return {
@@ -978,6 +1004,48 @@ class RecordingTransport:
         if tool_name == "chainlink_issue_list":
             return {"success": True, "result": []}
         return {"success": True, "result": None}
+
+
+
+def _install_ordered_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    invocation_id: str,
+) -> None:
+    """Record a server-confirmed subTL invocation in synthetic controller tests."""
+    original = driver_module._prepare_sub_tl_stage
+
+    def prepare(tasks, state, config, source, effects, store, effects_log, order):
+        state, prepared = original(
+            tasks, state, config, source, effects, store, effects_log, order
+        )
+        _checkpoint_ordered_sub_tl_invocation(store, tasks[0].name, invocation_id)
+        return store.load(), prepared
+
+    monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", prepare)
+
+
+def _aggregate_watcher_fixture(invocation_id: str) -> JsonObject:
+    publication = {
+        "invocation_id": invocation_id,
+        "slice_id": "aggregate-child",
+        "author_agent": "aggregate-child",
+    }
+    return {
+        "pr_number": 43,
+        "publication": publication,
+        "watcher": {
+            "found": True,
+            "pr_number": 43,
+            "head_sha": "head-a",
+            "base_sha": "base-a",
+            "patch_digest": "patch-a",
+            "head_branch": "main.aggregate-child",
+            "base_branch": "main",
+            "publication_ownership_verified": True,
+            "publication_ownership_error": "",
+            "publication": publication,
+        },
+    }
 
 
 @dataclass
@@ -1705,6 +1773,7 @@ class OrderedIntegrationTransport(IntegrationTransport):
             self.calls.append((tool_name, arguments))
             title = str(arguments.get("title", ""))
             sub_tl_id = "alpha" if "alpha" in title else "beta"
+            base_branch = str(arguments.get("base_branch", "main"))
             return {
                 "success": True,
                 "result": {
@@ -1712,6 +1781,11 @@ class OrderedIntegrationTransport(IntegrationTransport):
                     "head_sha": f"head-{sub_tl_id}",
                     "patch_digest": f"patch-{sub_tl_id}",
                     "base_sha": "base-main",
+                    "head_branch": f"{base_branch}.{sub_tl_id}",
+                    "base_branch": base_branch,
+                    "slice_id": sub_tl_id,
+                    "invocation_id": f"{sub_tl_id}-invocation",
+                    "author_agent": name,
                 },
             }
         if tool_name == "watcher_pr_state" and self.snapshots:
@@ -6440,7 +6514,7 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
         config=config,
         root_dir=tmp_path,
     )
-    assert first.final_state.fsm.phase is TLPhase.TLWaiting
+    assert isinstance(first.final_state.recursive_fsm, RecursiveTLRunning)
     parent_store = RunStore("ordered-e2e-run", tmp_path)
     parent_state = parent_store.load()
     ready_slices = {
@@ -6748,10 +6822,10 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
         (role, name) for role, name, tool_name in transport.identities if tool_name == "file_pr"
     ] == [("tl", "child-service")]
     assert file_pr_calls[0]["base_branch"] == "main"
-    assert first.final_state.fsm.phase is TLPhase.TLWaiting
-    assert second.final_state.fsm.phase is TLPhase.TLWaiting
+    assert isinstance(first.final_state.recursive_fsm, RecursiveTLRunning)
+    assert isinstance(second.final_state.recursive_fsm, RecursiveTLRunning)
     parent_slice = second.final_state.slices["aggregate-child"]
-    assert parent_slice.status is SliceStatus.IN_REVIEW
+    assert parent_slice.status is SliceStatus.IN_REVIEW, parent_slice.park_audit
     assert parent_slice.pr_number == 43
     assert parent_slice.dispatch_agent_id == "aggregate-run:aggregate-child:integration"
     assert second.final_state.slices["later-stage"].status is SliceStatus.PENDING
@@ -6852,6 +6926,365 @@ def test_aggregate_file_pr_journal_replays_after_checkpoint_crash(
     assert len(journal.confirmed_entries("file_pr", "aggregate-child")) == 1
 
 
+def test_aggregate_file_pr_result_decoder_requires_complete_correlation() -> None:
+    complete, missing = _aggregate_candidate_from_result(
+        "aggregate-child",
+        {
+            "pr_number": 43,
+            "head_sha": "head-a",
+            "base_sha": "base-a",
+            "patch_digest": "patch-a",
+            "head_branch": "main.aggregate-child",
+            "base_branch": "main",
+            "slice_id": "aggregate-child",
+            "invocation_id": "aggregate-child-invocation",
+            "author_agent": "aggregate-child",
+        },
+        "main.aggregate-child",
+        "main",
+        "aggregate-child",
+        "aggregate-child-invocation",
+    )
+
+    assert complete is not None
+    assert complete.pr_number == 43
+    assert complete.original_base_sha == "base-a"
+    assert missing == ()
+
+    partial, missing = _aggregate_candidate_from_result(
+        "aggregate-child",
+        {"pr_number": 43, "head_sha": "head-a"},
+        "main.aggregate-child",
+        "main",
+        "aggregate-child",
+        "aggregate-child-invocation",
+    )
+
+    assert partial is None
+    assert missing == (
+        "base_sha",
+        "patch_digest",
+        "head_branch",
+        "base_branch",
+        "slice_id",
+        "invocation_id",
+        "author_agent",
+    )
+
+
+@pytest.mark.parametrize("response_failed", [False, True])
+def test_partial_aggregate_file_pr_response_adopts_watcher_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    response_failed: bool,
+) -> None:
+    class PartialResponseTransport(RecordingTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            title = str(arguments.get("title", ""))
+            if tool_name == "file_pr" and title.startswith("Aggregate aggregate-child"):
+                self.calls.append((tool_name, arguments))
+                self.aggregate_reconciliation = _aggregate_watcher_fixture(
+                    "aggregate-child-invocation"
+                )
+                if response_failed:
+                    return {
+                        "success": False,
+                        "error": "publication response was lost",
+                        "error_kind": "internal",
+                    }
+                return {"success": True, "result": {"pr_number": 43}}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    run_id = "aggregate-partial-response"
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
+    transport = PartialResponseTransport()
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                _plan(),
+                source=SyntheticQueue(_lifecycle_events(run_id)),
+                order=1,
+            ),
+        )
+    )
+    config = replace(
+        _config(),
+        ledger_run_id=run_id,
+        keep_alive_on_waiting=False,
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW, (
+        result.final_state.slices["aggregate-child"].park_audit
+    )
+    assert result.final_state.slices["aggregate-child"].pr_number == 43
+    assert len(
+        [
+            arguments
+            for name, arguments in transport.calls
+            if name == "file_pr" and str(arguments.get("title", "")).startswith("Aggregate ")
+        ]
+    ) == 1
+
+
+def test_aggregate_publication_rehydrates_durable_invocation_before_file_pr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = driver_module._prepare_sub_tl_stage
+
+    def prepare(tasks, state, config, source, effects, store, effects_log, order):
+        state, prepared = original(
+            tasks, state, config, source, effects, store, effects_log, order
+        )
+        invocation_path = (
+            Path(config.project_root)
+            / ".exo"
+            / "agents"
+            / "aggregate-child"
+            / "invocation.json"
+        )
+        invocation_path.parent.mkdir(parents=True, exist_ok=True)
+        invocation_path.write_text(
+            json.dumps(
+                {
+                    "invocation_id": "aggregate-child-invocation",
+                    "slice_id": "aggregate-child",
+                    "branch": "main.aggregate-child",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return state, prepared
+
+    monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", prepare)
+    run_id = "aggregate-invocation-rehydration"
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                _plan(),
+                source=SyntheticQueue(_lifecycle_events(run_id)),
+                order=1,
+            ),
+        )
+    )
+    config = replace(
+        _config(),
+        project_root=tmp_path,
+        ledger_run_id=run_id,
+        keep_alive_on_waiting=False,
+    )
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+    assert (
+        result.final_state.slices["aggregate-child"].dispatch_invocation_id
+        == "aggregate-child-invocation"
+    )
+    assert any(name == "file_pr" for name, _ in transport.calls)
+
+
+def test_unrecoverable_aggregate_evidence_parks_with_missing_fields(
+    tmp_path: Path,
+) -> None:
+    class PartialResponseTransport(RecordingTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            title = str(arguments.get("title", ""))
+            if tool_name == "file_pr" and title.startswith("Aggregate aggregate-child"):
+                self.calls.append((tool_name, arguments))
+                return {"success": True, "result": {"pr_number": 43}}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    run_id = "aggregate-evidence-park"
+    transport = PartialResponseTransport()
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                _plan(),
+                source=SyntheticQueue(_lifecycle_events(run_id)),
+                order=1,
+            ),
+        )
+    )
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=replace(_config(), ledger_run_id=run_id, keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    parked = result.final_state.slices["aggregate-child"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.PUBLICATION_BLOCKED
+    assert parked.park_audit is not None
+    assert parked.park_audit["retryable"] is True
+    assert parked.park_audit["missing_evidence"] == [
+        "head_sha",
+        "base_sha",
+        "patch_digest",
+        "head_branch",
+        "base_branch",
+        "slice_id",
+        "invocation_id",
+        "author_agent",
+    ]
+    assert result.final_state.current_order == 1
+
+
+def test_missing_durable_invocation_parks_before_file_pr(
+    tmp_path: Path,
+) -> None:
+    run_id = "aggregate-missing-invocation"
+    transport = RecordingTransport()
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                _plan(),
+                source=SyntheticQueue(_lifecycle_events(run_id)),
+                order=1,
+            ),
+        )
+    )
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=replace(
+            _config(),
+            project_root=tmp_path,
+            ledger_run_id=run_id,
+            keep_alive_on_waiting=False,
+        ),
+        root_dir=tmp_path,
+    )
+
+    parked = result.final_state.slices["aggregate-child"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.PUBLICATION_BLOCKED
+    assert parked.park_audit is not None
+    assert parked.park_audit["error_kind"] == "missing_invocation_registration"
+    assert parked.park_audit["missing_evidence"] == [
+        "invocation_id",
+        "slice_id",
+        "head_branch",
+    ]
+    assert not any(name == "file_pr" for name, _ in transport.calls)
+
+
+def test_aggregate_file_pr_timeout_continue_adopts_existing_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CrashAfterPublishTransport(RecordingTransport):
+        crashed = False
+
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            title = str(arguments.get("title", ""))
+            if (
+                tool_name == "file_pr"
+                and title.startswith("Aggregate aggregate-child")
+                and not self.crashed
+            ):
+                self.calls.append((tool_name, arguments))
+                self.aggregate_reconciliation = _aggregate_watcher_fixture(
+                    "aggregate-child-invocation"
+                )
+                self.crashed = True
+                raise SystemExit("simulated controller crash after Forgejo publication")
+            return super().call_tool(role, name, tool_name, arguments)
+
+    run_id = "aggregate-timeout-restart"
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
+    transport = CrashAfterPublishTransport()
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                _plan(),
+                source=SyntheticQueue(_lifecycle_events(run_id)),
+                order=1,
+            ),
+        )
+    )
+    config = replace(
+        _config(),
+        ledger_run_id=run_id,
+        keep_alive_on_waiting=False,
+    )
+    with pytest.raises(SystemExit, match="simulated controller crash"):
+        run_tl_loop(
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=tmp_path,
+        )
+
+    child_store = RunStore("aggregate-child", tmp_path / run_id)
+    child_revision = child_store.load().revision
+    resumed = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert resumed.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+    assert resumed.final_state.slices["aggregate-child"].pr_number == 43
+    assert child_store.load().revision == child_revision
+    assert len(
+        [
+            arguments
+            for name, arguments in transport.calls
+            if name == "file_pr" and str(arguments.get("title", "")).startswith("Aggregate ")
+        ]
+    ) == 1
+
 def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approval(
     tmp_path: Path,
 ) -> None:
@@ -6929,7 +7362,6 @@ def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approv
 
     blocked = initial.final_state.slices["aggregate-child"]
     gate_name = f"{AGGREGATE_PUBLICATION_GATE_PREFIX}aggregate-child"
-    assert initial.final_state.fsm.phase is TLPhase.TLWaiting
     assert blocked.status is SliceStatus.PARKED
     assert blocked.park_cause is ParkCause.PUBLICATION_BLOCKED
     assert blocked.park_audit is not None

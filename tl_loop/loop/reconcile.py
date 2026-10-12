@@ -238,7 +238,7 @@ def accepted_publication_from_watcher(
         head_sha=head_sha,
         head_branch=head_branch,
         base_branch=base_branch,
-        attempt=existing.attempt if existing is not None else current.attempts,
+        attempt=existing.attempt if existing is not None else max(current.attempts, 1),
         invocation_id=record_invocation_id,
     )
 

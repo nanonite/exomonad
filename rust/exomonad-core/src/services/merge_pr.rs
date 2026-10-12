@@ -39,6 +39,11 @@ pub struct MergeObservedEvidence {
     pub merge_commit_tree_sha: Option<String>,
 }
 
+pub struct PublishedPrEvidence {
+    pub base_sha: String,
+    pub patch_digest: String,
+}
+
 pub struct MergeAuthority<'a> {
     pub resolver: &'a AgentResolver,
     pub project_dir: &'a Path,
@@ -259,6 +264,32 @@ pub async fn observe_pr_evidence_for_pr(
     observe_merge_evidence(dir, &base_sha, head_sha, merge_commit_sha).await
 }
 
+/// Observe the minimum immutable evidence needed to identify a published PR.
+/// Unlike merge evidence, this does not require the branch to merge cleanly.
+pub async fn observe_published_pr_evidence(
+    dir: &str,
+    base_ref: &str,
+    head_sha: &str,
+    pr_number: u64,
+) -> Result<PublishedPrEvidence> {
+    let base_sha = authoritative_base_sha(dir, base_ref).await?;
+    ensure_head_object(dir, head_sha, Some(pr_number)).await?;
+    let diff = run_git_bytes(
+        dir,
+        &[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            &format!("{base_sha}...{head_sha}"),
+        ],
+    )
+    .await?;
+    Ok(PublishedPrEvidence {
+        base_sha,
+        patch_digest: format!("{:x}", Sha256::digest(&diff)),
+    })
+}
+
 async fn ensure_head_object(dir: &str, head_sha: &str, pr_number: Option<u64>) -> Result<()> {
     let object = format!("{head_sha}^{{commit}}");
     if run_git(dir, &["cat-file", "-e", &object]).await.is_ok() {
@@ -419,6 +450,77 @@ mod tests {
         assert_eq!(MergeStrategy::Squash.as_str(), "squash");
         assert_eq!(MergeStrategy::Merge.as_str(), "merge");
         assert_eq!(MergeStrategy::Rebase.as_str(), "rebase");
+    }
+
+    #[tokio::test]
+    async fn published_pr_evidence_uses_authoritative_base_and_binary_patch() {
+        use std::process::Command;
+
+        fn git(dir: &std::path::Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git should start");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+
+        let repo = tempfile::tempdir().expect("repository");
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        git(repo.path(), &["branch", "-M", "main"]);
+        std::fs::write(repo.path().join("base.txt"), "base\n").expect("write base");
+        git(repo.path(), &["add", "base.txt"]);
+        git(repo.path(), &["commit", "-qm", "base"]);
+        let base = git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let remote = tempfile::tempdir().expect("remote");
+        git(remote.path(), &["init", "--bare", "-q"]);
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().expect("remote path"),
+            ],
+        );
+        git(repo.path(), &["push", "-q", "origin", "main"]);
+        git(repo.path(), &["switch", "-c", "feature"]);
+        std::fs::write(repo.path().join("image.bin"), b"\x00\x10\xffbinary\n")
+            .expect("write binary patch");
+        git(repo.path(), &["add", "image.bin"]);
+        git(repo.path(), &["commit", "-qm", "feature"]);
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        let range = format!("{base}...{head}");
+        let diff = Command::new("git")
+            .args(["diff", "--binary", "--no-ext-diff", &range])
+            .current_dir(repo.path())
+            .output()
+            .expect("git diff should start");
+        assert!(diff.status.success(), "git diff should succeed");
+
+        let evidence = observe_published_pr_evidence(
+            repo.path().to_str().expect("repository path"),
+            "main",
+            &head,
+            17,
+        )
+        .await
+        .expect("published PR evidence should be available");
+
+        assert_eq!(evidence.base_sha, base);
+        assert_eq!(
+            evidence.patch_digest,
+            format!("{:x}", Sha256::digest(&diff.stdout))
+        );
     }
 
     #[test]

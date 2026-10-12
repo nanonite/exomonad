@@ -714,6 +714,7 @@ PARK_AUDIT_KEYS = frozenset(
         "error_kind",
         "publication_attempt",
         "publication_approval_consumed",
+        "missing_evidence",
     }
 )
 RECOVERY_KEYS = frozenset(
@@ -1686,6 +1687,8 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
         _non_negative_int(audit, "attempt", f"{path}.park_audit", errors)
     if "publication_attempt" in audit:
         _non_negative_int(audit, "publication_attempt", f"{path}.park_audit", errors)
+    if "missing_evidence" in audit:
+        _string_list(audit, "missing_evidence", f"{path}.park_audit", errors, allow_empty=True)
     for key in (
         "gate_name",
         "recovery_action",
