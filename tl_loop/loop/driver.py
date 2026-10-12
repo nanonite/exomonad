@@ -286,6 +286,7 @@ from tl_loop.state.slice_transition import (
 )
 from tl_loop.state.store import (
     DEFAULT_ROOT,
+    CheckpointConflict,
     QuarantineStorageError,
     RunStore,
     create,
@@ -359,6 +360,7 @@ CHAINLINK_BINDING_RECONCILIATION_GATE_NAME = "chainlink-issue-binding-reconcilia
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
 MAX_CONVERGENCE_STEPS = 8
+MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS = 8
 # A per-call fairness cap on _drain_direct_scope_convergence, not a
 # correctness bound: that function raises the moment a step makes no
 # progress, so exhausting this many *progressing* steps in one call just
@@ -2585,24 +2587,6 @@ def _reopen_ordered_scope(
         current_order = min(pending_by_order)
     else:
         raise TLLoopError("ordered recovery found no pending child to reopen")
-    running = RecursiveTLRunning(
-        current_order=current_order,
-        pending_by_order=pending_by_order,
-        scope_path=planning.scope_path,
-        plan_digest=planning.plan_digest,
-        parallel_pending=tuple(parallel_pending),
-        completed_children=completed,
-        post_merge=post_merge,
-        dispatch_intents={
-            record.child_id: record.dispatch_intent_id
-            for record in records
-            if record.dispatch_intent_id is not None
-        },
-        lane_bindings={
-            record.child_id: record.lane_id for record in records if record.lane_id is not None
-        },
-        evidence={"ordered_recovery_child": target_name or "scope"},
-    )
     slices = dict(state.slices)
     if target_name is not None:
         target = slices[target_name]
@@ -2621,6 +2605,42 @@ def _reopen_ordered_scope(
                 _child_controller_name(task) if task is not None else target_name,
             )
         slices[target_name] = reopened
+        for order, records_at_order in pending_by_order.items():
+            pending_by_order[order] = tuple(
+                replace(
+                    record,
+                    dispatch_intent_id=reopened.dispatch_intent_id,
+                    invocation_id=reopened.dispatch_invocation_id,
+                )
+                if record.child_id == target_name
+                else record
+                for record in records_at_order
+            )
+    dispatch_intents = {
+        record.child_id: record.dispatch_intent_id
+        for record in records
+        if record.dispatch_intent_id is not None
+    }
+    if target_name is not None:
+        target_intent = slices[target_name].dispatch_intent_id
+        if target_intent is None:
+            dispatch_intents.pop(target_name, None)
+        else:
+            dispatch_intents[target_name] = target_intent
+    running = RecursiveTLRunning(
+        current_order=current_order,
+        pending_by_order=pending_by_order,
+        scope_path=planning.scope_path,
+        plan_digest=planning.plan_digest,
+        parallel_pending=tuple(parallel_pending),
+        completed_children=completed,
+        post_merge=post_merge,
+        dispatch_intents=dispatch_intents,
+        lane_bindings={
+            record.child_id: record.lane_id for record in records if record.lane_id is not None
+        },
+        evidence={"ordered_recovery_child": target_name or "scope"},
+    )
     sub_tl_states = dict(state.integration.sub_tl_states)
     if target_name is not None:
         sub_tl_states[target_name] = IntegrationLifecycle.RUNNING
@@ -11177,7 +11197,7 @@ def _run_live_sub_tl(
                 child_store,
             )
         if config.project_root is not None:
-            effects.transport.provision_ordered_sub_tl(
+            invocation_id = effects.transport.provision_ordered_sub_tl(
                 effects.name,
                 agent_name=_child_controller_name(task),
                 birth_branch=branch,
@@ -11185,6 +11205,7 @@ def _run_live_sub_tl(
                 working_dir=worktree,
                 slice_id=task.name,
             )
+            _checkpoint_ordered_sub_tl_invocation(store, task.name, invocation_id)
         child_config = _child_config(
             config,
             task,
@@ -11210,6 +11231,80 @@ def _run_live_sub_tl(
     finally:
         if owned_source is not None:
             owned_source.close(timeout=max(1.0, config.poll_interval * 4))
+
+
+def _checkpoint_ordered_sub_tl_invocation(
+    store: RunStore,
+    child_id: str,
+    invocation_id: str,
+) -> None:
+    """Persist the server-confirmed invocation across the parent FSM and slice."""
+    if not isinstance(invocation_id, str) or not invocation_id.strip():
+        raise TLLoopError("ordered sub-TL provisioning returned an empty invocation ID")
+    if not store.path.exists():
+        return
+    for _attempt in range(MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS):
+        state = store.load()
+        target = state.slices.get(child_id)
+        if target is None:
+            return
+        recursive_fsm = state.recursive_fsm
+        if not isinstance(recursive_fsm, RecursiveTLRunning):
+            raise TLLoopError("ordered sub-TL invocation has no running parent scope")
+        pending_by_order = dict(recursive_fsm.pending_by_order)
+        match_count = 0
+        for order, records in pending_by_order.items():
+            updated_records = []
+            for record in records:
+                if record.child_id == child_id:
+                    match_count += 1
+                    updated_records.append(
+                        replace(
+                            record,
+                            dispatch_intent_id=target.dispatch_intent_id,
+                            invocation_id=invocation_id,
+                        )
+                    )
+                else:
+                    updated_records.append(record)
+            pending_by_order[order] = tuple(updated_records)
+        if match_count != 1:
+            raise TLLoopError(f"ordered sub-TL {child_id!r} has {match_count} pending FSM records")
+        dispatch_intents = dict(recursive_fsm.dispatch_intents)
+        if target.dispatch_intent_id is None:
+            dispatch_intents.pop(child_id, None)
+        else:
+            dispatch_intents[child_id] = target.dispatch_intent_id
+        recovery = target.recovery
+        if recovery is not None:
+            evidence = dict(recovery.evidence)
+            evidence["invocation_id"] = invocation_id
+            recovery = replace(recovery, evidence=evidence)
+        slices = dict(state.slices)
+        slices[child_id] = replace(
+            target,
+            dispatch_invocation_id=invocation_id,
+            recovery=recovery,
+        )
+        updated_fsm = replace(
+            recursive_fsm,
+            pending_by_order=pending_by_order,
+            dispatch_intents=dispatch_intents,
+        )
+        if slices[child_id] == target and updated_fsm == recursive_fsm:
+            return
+        try:
+            store.checkpoint(
+                updated_fsm,
+                slices,
+                state.budgets,
+                state.events.last_consumed_offset,
+                expected_revision=state.revision,
+            )
+            return
+        except CheckpointConflict:
+            continue
+    raise TLLoopError("parent checkpoint kept changing while recording ordered invocation")
 
 
 def _child_source_spec(source: EventQueue) -> EventQueue | Path:

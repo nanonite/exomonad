@@ -771,9 +771,10 @@ async fn provision_ordered_sub_tl(
         slice_id: body.slice_id,
     };
     match state.agent_control.provision_ordered_sub_tl(record).await {
-        Ok(()) => Json(serde_json::json!({
+        Ok(invocation_id) => Json(serde_json::json!({
             "provisioned": true,
-            "agent_name": child_name.as_str()
+            "agent_name": child_name.as_str(),
+            "invocation_id": invocation_id
         }))
         .into_response(),
         Err(error) => {

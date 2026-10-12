@@ -131,12 +131,9 @@ class TransportClient:
         parent_branch: str,
         working_dir: str | Path,
         slice_id: str,
-    ) -> None:
-        """Provision a live ordered controller before it can emit effects."""
-        path = (
-            f"/agents/{quote('tl', safe='')}/{quote(parent_name, safe='')}"
-            "/provision-sub-tl"
-        )
+    ) -> str:
+        """Provision a live ordered controller and return its durable invocation ID."""
+        path = f"/agents/{quote('tl', safe='')}/{quote(parent_name, safe='')}/provision-sub-tl"
         response = self.post_json(
             path,
             {
@@ -147,8 +144,16 @@ class TransportClient:
                 "slice_id": slice_id,
             },
         )
-        if not isinstance(response, dict) or response.get("provisioned") is not True:
+        invocation_id = response.get("invocation_id") if isinstance(response, dict) else None
+        if (
+            not isinstance(response, dict)
+            or response.get("provisioned") is not True
+            or response.get("agent_name") != agent_name
+            or not isinstance(invocation_id, str)
+            or not invocation_id.strip()
+        ):
             raise DecodeError(f"Ordered sub-TL provisioning was not confirmed: {response!r}")
+        return invocation_id
 
     def _request(self, method: str, path: str, body: JsonValue | None = None) -> JsonValue:
         encoded_body, headers = _encode_request_body(body)

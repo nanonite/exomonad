@@ -122,6 +122,7 @@ struct OrderedSubTLProvisionRequest {
 struct OrderedSubTLProvisionResponse {
     provisioned: bool,
     agent_name: String,
+    invocation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3796,13 +3797,17 @@ async fn repair_one_ordered_sub_tl_invocation(
         )
         .await
         .with_context(|| format!("failed to repair ordered sub-TL {}", spec.agent_name))?;
-    if !response.provisioned || response.agent_name != spec.agent_name {
+    if !response.provisioned
+        || response.agent_name != spec.agent_name
+        || response.invocation_id.trim().is_empty()
+    {
         anyhow::bail!(
             "ordered sub-TL invocation repair returned an unexpected identity for {}",
             spec.agent_name
         );
     }
-    verify_repaired_ordered_sub_tl(project_dir, spec, expected_routing).await?;
+    verify_repaired_ordered_sub_tl(project_dir, spec, expected_routing, &response.invocation_id)
+        .await?;
     info!(agent = %spec.agent_name, endpoint, "Repaired missing ordered sub-TL invocation through server provisioning");
     Ok(())
 }
@@ -3811,6 +3816,7 @@ async fn verify_repaired_ordered_sub_tl(
     project_dir: &Path,
     spec: &OrderedBranchSpec,
     expected_routing: &exomonad_core::domain::RoutingInfo,
+    expected_invocation_id: &str,
 ) -> Result<()> {
     if ordered_identity_state(project_dir, spec)? != OrderedIdentityState::Matching {
         anyhow::bail!("ordered sub-TL identity changed during invocation repair");
@@ -3821,6 +3827,7 @@ async fn verify_repaired_ordered_sub_tl(
         .context("ordered sub-TL provision endpoint returned without an invocation record")?;
     let expected_worktree = spec.identity_worktree.to_string_lossy();
     let invocation_matches = invocation.is_live()
+        && invocation.invocation_id == expected_invocation_id
         && !invocation.invocation_id.trim().is_empty()
         && invocation.runtime == AgentType::Codex
         && invocation.trigger
@@ -8607,7 +8614,7 @@ mod tests {
 
             let routing =
                 exomonad_core::domain::RoutingInfo::window(WindowId::parse("@71").unwrap());
-            start_invocation_with_provenance_and_context_and_mode(
+            let invocation = start_invocation_with_provenance_and_context_and_mode(
                 &project_for_server.join(".exo/agents/stage"),
                 AgentType::Codex,
                 InvocationTrigger::ResumePr,
@@ -8627,7 +8634,12 @@ mod tests {
             )
             .await
             .unwrap();
-            let response = br#"{"provisioned":true,"agent_name":"stage"}"#;
+            let response = serde_json::to_vec(&serde_json::json!({
+                "provisioned": true,
+                "agent_name": "stage",
+                "invocation_id": invocation.invocation_id,
+            }))
+            .unwrap();
             stream
                 .write_all(
                     format!(
@@ -8638,7 +8650,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            stream.write_all(response).await.unwrap();
+            stream.write_all(&response).await.unwrap();
             stream.shutdown().await.unwrap();
         });
         let windows = [WindowInfo {

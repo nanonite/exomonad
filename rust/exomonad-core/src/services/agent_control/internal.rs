@@ -91,7 +91,7 @@ impl<
     /// Provision an ordered sub-TL's durable identity and worktree as one
     /// serialized lifecycle operation. Existing ownership is reusable only
     /// when every field matches exactly; no existing workspace is removed.
-    pub async fn provision_ordered_sub_tl(&self, record: AgentIdentityRecord) -> Result<()> {
+    pub async fn provision_ordered_sub_tl(&self, record: AgentIdentityRecord) -> Result<String> {
         let _guard = self.ordered_sub_tl_provision_lock.lock().await;
         let agent_name = record.agent_name.clone();
         if agent_name.as_str() == "root"
@@ -265,7 +265,19 @@ impl<
             true,
         )
         .await?;
-        Ok(())
+        let agent_dir = self
+            .project_dir()
+            .join(".exo/agents")
+            .join(agent_name.as_str());
+        let invocation = read_invocation(&agent_dir)
+            .await?
+            .ok_or_else(|| anyhow!("ordered sub-TL provisioning wrote no invocation record"))?;
+        if !invocation.is_live() || invocation.invocation_id.trim().is_empty() {
+            return Err(anyhow!(
+                "ordered sub-TL provisioning did not leave a live invocation"
+            ));
+        }
+        Ok(invocation.invocation_id)
     }
 
     async fn ordered_sub_tl_routing(&self) -> Result<RoutingInfo> {
@@ -1897,7 +1909,7 @@ mod tests {
             slice_id: Some("ordered-child".to_string()),
         };
 
-        service
+        let provisioned_invocation_id = service
             .provision_ordered_sub_tl(record.clone())
             .await
             .unwrap();
@@ -1923,10 +1935,12 @@ mod tests {
         assert_eq!(routing.window_id.as_ref(), Some(&expected_window));
         assert!(routing.has_delivery_target());
         let invocation_id = invocation.invocation_id.clone();
-        service
+        assert_eq!(provisioned_invocation_id, invocation_id);
+        let reused_invocation_id = service
             .provision_ordered_sub_tl(record.clone())
             .await
             .unwrap();
+        assert_eq!(reused_invocation_id, invocation_id);
         let reused = read_invocation_conservatively(&agent_dir)
             .await
             .expect("live invocation remains readable");
@@ -1971,11 +1985,12 @@ mod tests {
             project_dir.clone(),
         ));
         restarted.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
-        AgentControlService::new(Arc::new(restarted))
+        let restarted_invocation_id = AgentControlService::new(Arc::new(restarted))
             .with_ordered_sub_tl_routing_for_test(expected_routing)
             .provision_ordered_sub_tl(record.clone())
             .await
             .unwrap();
+        assert_eq!(restarted_invocation_id, invocation_id);
 
         let conflict = AgentIdentityRecord {
             birth_branch: BirthBranch::try_from_str("other.ordered-child").unwrap(),

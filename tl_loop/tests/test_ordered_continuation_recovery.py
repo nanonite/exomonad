@@ -337,6 +337,9 @@ def test_approved_recovery_reopens_the_child_with_a_fresh_invocation(tmp_path: P
     assert child.recovery.evidence["authorization_source"] == "human"
     assert reopened.recursive_fsm is not None
     assert isinstance(reopened.recursive_fsm, TLRunning)
+    fsm_child = reopened.recursive_fsm.pending_by_order[1][0]
+    assert fsm_child.dispatch_intent_id == child.dispatch_intent_id
+    assert fsm_child.invocation_id == child.dispatch_invocation_id
 
 
 def test_approved_recovery_reuses_its_invocation_when_repeated(tmp_path: Path) -> None:
@@ -361,6 +364,112 @@ def test_approved_recovery_reuses_its_invocation_when_repeated(tmp_path: Path) -
     assert (
         second.slices["child"].dispatch_generation
         == first.slices["child"].dispatch_generation
+    )
+    assert second.recursive_fsm is not None
+    assert isinstance(second.recursive_fsm, TLRunning)
+    assert (
+        second.recursive_fsm.pending_by_order[1][0].invocation_id
+        == second.slices["child"].dispatch_invocation_id
+    )
+
+
+def test_server_invocation_is_checkpointed_before_recovered_child_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_store, plan, config = _failed_ordered_run(tmp_path)
+    _unprovable_child_exit(parent_store)
+    _answer(parent_store, GateStatus.APPROVED)
+    state = parent_store.load()
+    decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
+    assert decision is not None
+    reopened = _reopen_ordered_scope(
+        state,
+        plan,
+        parent_store,
+        decision.task_name,
+        authorized=True,
+    )
+    intent_invocation_id = reopened.slices["child"].dispatch_invocation_id
+    assert intent_invocation_id is not None
+    provisioned_invocation_id = "server-confirmed-invocation"
+    child_state_at_start: list[RunState] = []
+
+    def provision(self: TransportClient, parent_name: str, **kwargs: object) -> str:
+        del self, parent_name, kwargs
+        return provisioned_invocation_id
+
+    def run_child(root_spec: object, child_config: TLLoopConfig, budgets: object) -> None:
+        del root_spec, child_config, budgets
+        child_state_at_start.append(parent_store.load())
+
+    monkeypatch.setattr(TransportClient, "provision_ordered_sub_tl", provision)
+    monkeypatch.setattr("tl_loop.loop.driver.tl_run", run_child)
+    task = replace(plan.sub_tls[0], source=EmptyQueue())
+    driver._run_live_sub_tl(
+        task,
+        replace(config, ordered_recovery_child="child"),
+        EmptyQueue(),
+        EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"), name="parent"),
+        parent_store,
+        BudgetLedger(0, 0),
+    )
+
+    assert len(child_state_at_start) == 1
+    started = child_state_at_start[0]
+    child = started.slices["child"]
+    assert child.dispatch_invocation_id == provisioned_invocation_id
+    assert child.recovery is not None
+    assert child.recovery.evidence["invocation_id"] == provisioned_invocation_id
+    assert started.recursive_fsm is not None
+    assert isinstance(started.recursive_fsm, TLRunning)
+    fsm_child = started.recursive_fsm.pending_by_order[1][0]
+    assert fsm_child.dispatch_intent_id == child.dispatch_intent_id
+    assert fsm_child.invocation_id == provisioned_invocation_id
+    assert started.recursive_fsm.dispatch_intents["child"] == child.dispatch_intent_id
+    assert child.branch == reopened.slices["child"].branch
+    assert child.worktree == reopened.slices["child"].worktree
+    revision = started.revision
+    driver._checkpoint_ordered_sub_tl_invocation(
+        parent_store,
+        "child",
+        provisioned_invocation_id,
+    )
+    assert parent_store.load().revision == revision
+
+    def publication(invocation_id: str) -> EventEnvelope:
+        return driver.project(
+            {
+                "type": "pr.filed",
+                "run_seq": 1,
+                "run_id": "parent",
+                "agent_id": child.dispatch_agent_id,
+                "invocation_id": invocation_id,
+                "generation": child.dispatch_generation,
+                "lifecycle_state": "running",
+                "observed_at": "2026-10-12T00:00:00Z",
+                "data": {
+                    "slice_id": "child",
+                    "pr_number": 45,
+                    "head_sha": "head-45",
+                },
+            }
+        )
+
+    stale_reason = driver._publication_generation_rejection(
+        child,
+        publication(intent_invocation_id),
+        "child",
+        started.controller_epoch,
+    )
+    assert stale_reason is not None
+    assert (
+        driver._publication_generation_rejection(
+            child,
+            publication(provisioned_invocation_id),
+            "child",
+            started.controller_epoch,
+        )
+        is None
     )
 
 

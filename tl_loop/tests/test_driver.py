@@ -1119,9 +1119,10 @@ def test_live_ordered_child_is_provisioned_before_controller_start(
 ) -> None:
     calls: list[str] = []
 
-    def provision(self: TransportClient, parent_name: str, **kwargs: object) -> None:
+    def provision(self: TransportClient, parent_name: str, **kwargs: object) -> str:
         del self, parent_name, kwargs
         calls.append("provision")
+        return "server-invocation"
 
     def run_child(root_spec: object, config: TLLoopConfig, budgets: object) -> None:
         del root_spec, config, budgets
@@ -1386,9 +1387,10 @@ def test_live_restart_revalidates_child_identity_before_controller_start(
     checkpoint_before = child_store.load()
     calls: list[str] = []
 
-    def provision(self: TransportClient, parent_name: str, **kwargs: object) -> None:
+    def provision(self: TransportClient, parent_name: str, **kwargs: object) -> str:
         del self, parent_name, kwargs
         calls.append("provision")
+        return "server-invocation"
 
     def run_child(root_spec: object, config: TLLoopConfig, budgets: object) -> None:
         del root_spec, config, budgets

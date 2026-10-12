@@ -17,6 +17,7 @@ from typing import cast
 from unittest.mock import patch
 
 from tl_loop.client.transport import (
+    DecodeError,
     ServerError,
     ServerTimeout,
     ServerUnreachable,
@@ -107,6 +108,43 @@ def stub_server(response_factory: ResponseFactory) -> Iterator[Path]:
 
 class TransportTest(unittest.TestCase):
     """The transport exposes server responses and failures without fallback."""
+
+    def test_ordered_sub_tl_provision_returns_the_server_invocation_id(self) -> None:
+        client = TransportClient(socket_path=Path("unused.sock"))
+        with patch.object(
+            client,
+            "post_json",
+            return_value={
+                "provisioned": True,
+                "agent_name": "child",
+                "invocation_id": "durable-id",
+            },
+        ) as post_json:
+            invocation_id = client.provision_ordered_sub_tl(
+                "root",
+                agent_name="child",
+                birth_branch="main.child",
+                parent_branch="main",
+                working_dir="/project/.exo/worktrees/child",
+                slice_id="child",
+            )
+        self.assertEqual(invocation_id, "durable-id")
+        self.assertEqual(post_json.call_args.args[0], "/agents/tl/root/provision-sub-tl")
+
+    def test_ordered_sub_tl_provision_requires_an_invocation_id(self) -> None:
+        client = TransportClient(socket_path=Path("unused.sock"))
+        with (
+            patch.object(client, "post_json", return_value={"provisioned": True}),
+            self.assertRaises(DecodeError),
+        ):
+            client.provision_ordered_sub_tl(
+                "root",
+                agent_name="child",
+                birth_branch="main.child",
+                parent_branch="main",
+                working_dir="/project/.exo/worktrees/child",
+                slice_id="child",
+            )
 
     def test_successful_list_and_call(self) -> None:
         def response(request_line: str, body: bytes) -> ResponseSpec:
