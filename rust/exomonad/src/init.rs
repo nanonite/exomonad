@@ -12265,6 +12265,7 @@ mod tests {
 
     #[test]
     fn test_validate_claude_model_full_ids() {
+        assert!(validate_claude_model("claude-haiku-5-5").is_ok());
         assert!(validate_claude_model("claude-haiku-4-5-20251001").is_ok());
         assert!(validate_claude_model("claude-sonnet-4-6").is_ok());
         assert!(validate_claude_model("claude-opus-4-7").is_ok());

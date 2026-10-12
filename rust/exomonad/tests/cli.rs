@@ -224,6 +224,26 @@ fn test_no_subcommand_shows_help() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_claude_model_list_includes_haiku_5_5_and_haiku_4_5(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = cargo_bin_cmd!("exomonad")
+        .args(["models", "claude"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let models = String::from_utf8(output)?;
+
+    assert!(models.lines().any(|line| line == "claude-haiku-5-5"));
+    assert!(models
+        .lines()
+        .any(|line| line == "claude-haiku-4-5-20251001"));
+
+    Ok(())
+}
+
+#[test]
 fn test_clean_help_exposes_safe_targeting_and_apply_flags() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut cmd = cargo_bin_cmd!("exomonad");

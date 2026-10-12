@@ -34,6 +34,7 @@ async fn run_opencode(provider: Option<String>) -> Result<()> {
 fn run_claude() -> Result<()> {
     println!("claude-opus-4-7");
     println!("claude-sonnet-4-6");
+    println!("claude-haiku-5-5");
     println!("claude-haiku-4-5-20251001");
     println!("Use shorthand (opus, sonnet, haiku) or full ID with --tl-model.");
     println!(
