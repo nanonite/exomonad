@@ -51,6 +51,7 @@ from tl_loop.loop.driver import (
     WorkerTask,
     WorkPlan,
     _aggregate_candidate_from_result,
+    _aggregate_watcher_identity_matches,
     _apply_convergence,
     _apply_reconciliation_observations,
     _bind_publication_evidence,
@@ -87,6 +88,7 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.escalate import blocked_gate_name
 from tl_loop.loop.journal import EffectJournal
+from tl_loop.loop.observation import WatcherObservation
 from tl_loop.loop.reconcile import (
     ExternalIntent,
     Quiescent,
@@ -98,6 +100,7 @@ from tl_loop.loop.reconcile import (
     publication_refused,
     reconcile_merge_observation,
     repeated_action_gate_name,
+    validate_publication_from_watcher,
     watcher_presents_publication,
 )
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
@@ -4796,8 +4799,10 @@ def test_pr_filed_refuses_historical_publication_across_recreate(tmp_path: Path)
     assert bound["leaf-a"].publication is None
     assert bound["leaf-a"].handoff is None
     assert quarantined == [
-        "publication invocation does not match the current dispatch "
-        "invocation or a recorded recovery succession"
+        (
+            "publication invocation does not match the current dispatch "
+            "invocation or a recorded recovery succession"
+        )
     ]
 
     # Current #45 at ledger seq 42329 binds only with matching invocation and
@@ -5101,6 +5106,8 @@ def _watcher_publication(
         "found": True,
         "pr_number": 45,
         "head_sha": "head-45",
+        "base_sha": "base-45",
+        "patch_digest": "patch-45",
         "head_branch": "main.leaf-a",
         "base_branch": "main",
         "publication_ownership_verified": True,
@@ -5118,21 +5125,96 @@ def _watcher_current(root: Path, invocation_id: str | None) -> SliceState:
     store = _review_store(root)
     return replace(
         store.load().slices["leaf-a"],
+        pr_number=45,
         dispatch_agent_id="leaf-a",
         dispatch_invocation_id=invocation_id,
     )
 
 
+def test_aggregate_watcher_accepts_resumed_invocation_in_durable_lineage(
+    tmp_path: Path,
+) -> None:
+    current = _watcher_current(tmp_path, "inv-root")
+    watcher = _watcher_publication("inv-root", ("inv-resumed",))
+    observation = WatcherObservation.from_response(watcher)
+
+    assert _aggregate_watcher_identity_matches(
+        SubTLTask("leaf-a", WorkPlan()),
+        current,
+        observation,
+        "main.leaf-a",
+        "leaf-a",
+        "inv-resumed",
+        "main",
+    )
+
+
 def test_publication_from_watcher_refuses_invocation_mismatch(tmp_path: Path) -> None:
     current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-host")
+    watcher["review_body"] = "review content must not enter refusal diagnostics"
+    validation = validate_publication_from_watcher(current, watcher, "head-45", "leaf-a")
+    assert validation.binding is None
+    assert validation.rejection is not None
+    assert validation.rejection.reason_code == "invocation_lineage_mismatch"
+    assert dict(validation.rejection.expected)["invocation_ids"] == ("inv-current",)
+    assert dict(validation.rejection.observed)["invocation_id"] == "inv-host"
+    assert dict(validation.rejection.observed)["succession_invocation_ids"] == ()
+    assert "review content" not in repr(validation.rejection)
+
     assert _publication_from_watcher(
-        current, _watcher_publication("inv-host"), "head-45", "leaf-a"
+        current, watcher, "head-45", "leaf-a"
     ) is None
     publication = _publication_from_watcher(
         current, _watcher_publication("inv-current"), "head-45", "leaf-a"
     )
     assert publication is not None
     assert publication.invocation_id == "inv-current"
+
+
+def test_publication_from_watcher_reports_wrong_pr_number(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-current")
+    watcher["pr_number"] = 46
+
+    validation = validate_publication_from_watcher(current, watcher, "head-45", "leaf-a")
+
+    assert validation.binding is None
+    assert validation.rejection is not None
+    assert validation.rejection.reason_code == "pr_number_mismatch"
+    assert dict(validation.rejection.expected)["pr_number"] == 45
+    assert dict(validation.rejection.observed)["pr_number"] == 46
+
+
+def test_publication_from_watcher_refuses_stale_head_evidence(tmp_path: Path) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-current")
+    watcher["head_sha"] = "head-stale"
+
+    validation = validate_publication_from_watcher(current, watcher, "head-45", "leaf-a")
+
+    assert validation.binding is None
+    assert validation.rejection is not None
+    assert validation.rejection.reason_code == "head_sha_missing_or_mismatched"
+    assert dict(validation.rejection.expected)["head_sha"] == "head-45"
+    assert dict(validation.rejection.observed)["head_sha"] == "head-stale"
+
+
+def test_publication_from_watcher_reports_evidence_failures_without_error_text(
+    tmp_path: Path,
+) -> None:
+    current = _watcher_current(tmp_path, "inv-current")
+    watcher = _watcher_publication("inv-current")
+    watcher["head_reachable"] = False
+    watcher["evidence_error"] = "forge access token must never enter diagnostics"
+
+    validation = validate_publication_from_watcher(current, watcher, "head-45", "leaf-a")
+
+    assert validation.binding is None
+    assert validation.rejection is not None
+    assert validation.rejection.reason_code == "head_unreachable"
+    assert dict(validation.rejection.observed)["evidence_error_present"] is True
+    assert "forge access token" not in repr(validation.rejection)
 
 
 def test_publication_from_watcher_refuses_missing_invocation_provenance(
@@ -5278,6 +5360,21 @@ def test_publication_from_watcher_binds_succession_in_origin_direction(
     assert publication is not None
     assert publication.invocation_id == "inv-origin"
 
+    # A root RunStore may still name the original dispatch after a resume; the
+    # durable owner record retains that origin and lists the fresh invocation.
+    resumed = _watcher_current(tmp_path / "resume", "75d73f864bd893c3c9d45ab712237499")
+    publication = _publication_from_watcher(
+        resumed,
+        _watcher_publication(
+            "75d73f864bd893c3c9d45ab712237499",
+            ("10948a5a-e48a-4df2-851c-c25872ff8cde",),
+        ),
+        "head-45",
+        "leaf-a",
+    )
+    assert publication is not None
+    assert publication.invocation_id == "75d73f864bd893c3c9d45ab712237499"
+
     # Multi hop: a later invocation is still reachable from the origin.
     multi_hop = _watcher_current(tmp_path / "multi-hop", "inv-hop2")
     publication = _publication_from_watcher(
@@ -5304,6 +5401,7 @@ def test_publication_from_watcher_binds_active_recovery_invocation(
     store = _review_store(tmp_path)
     current = replace(
         store.load().slices["leaf-a"],
+        pr_number=45,
         dispatch_agent_id="leaf-a",
         dispatch_invocation_id="inv-stale",
         recovery=RecoveryState(

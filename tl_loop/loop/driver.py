@@ -302,7 +302,7 @@ from .dispatch_classification import (
     dispatch_retry_delay,
 )
 from .journal import MUTATING_OPERATIONS, ActionJournalError, EffectJournal, stable_action_key
-from .observation import WatcherObservation
+from .observation import PublicationRecord, WatcherObservation
 from .reconcile import (
     REPEATED_ACTION_GATE_PREFIX,
     REPOSITORY_IDENTITY_GATE_NAME,
@@ -312,13 +312,13 @@ from .reconcile import (
     Quiescent,
     ReconciliationResult,
     _publication_ownership_status,
-    accepted_publication_from_watcher,
     derive_next_action,
     publication_ownership_malformed,
     publication_ownership_unresolved,
     publication_refused,
     reconcile_merge_observation,
     reconcile_slice,
+    validate_publication_from_watcher,
     watcher_presents_publication,
 )
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
@@ -9809,13 +9809,17 @@ def _publication_from_watcher(
     Delegates to the authoritative shared validator so the active driver and
     the heartbeat cannot diverge.
     """
-    binding = accepted_publication_from_watcher(current, watcher, head_sha, owner_id)
-    if binding is None and watcher_presents_publication(watcher):
+    validation = validate_publication_from_watcher(current, watcher, head_sha, owner_id)
+    if validation.rejection is not None and watcher_presents_publication(watcher):
+        rejection = validation.rejection
         LOGGER.warning(
-            "[TL loop] refusing watcher publication evidence for %s: provenance mismatch",
+            "[TL loop] refusing watcher publication evidence for %s: reason_code=%s expected=%s observed=%s",
             current.id,
+            rejection.reason_code,
+            dict(rejection.expected),
+            dict(rejection.observed),
         )
-    return binding
+    return validation.binding
 
 
 def _dispatch_waiting_phase(slices: Mapping[str, SliceState]) -> TLWaiting:
@@ -12438,10 +12442,39 @@ def _aggregate_watcher_identity_matches(
     base_branch: str,
 ) -> bool:
     """Verify immutable watcher evidence against the exact publication owner."""
-    binding = accepted_publication_from_watcher(
-        parent_slice, observation, observation.head_sha, owner_agent
-    )
+    binding = _publication_from_watcher(parent_slice, observation, observation.head_sha, owner_agent)
     publication = observation.publication
+    if binding is None or publication is None:
+        return False
+    if not _aggregate_invocation_matches(publication, invocation_id):
+        return False
+    if not _aggregate_publication_evidence_complete(observation):
+        return False
+    return _aggregate_publication_coordinates_match(
+        task, observation, publication, branch, owner_agent, base_branch
+    )
+
+
+def _aggregate_invocation_matches(
+    publication: PublicationRecord,
+    invocation_id: str | None,
+) -> bool:
+    if invocation_id is not None and (
+        publication.invocation_id == invocation_id
+        or invocation_id in publication.succession_invocation_ids
+    ):
+        return True
+    LOGGER.warning(
+        "[TL loop] refusing aggregate watcher publication: reason_code=%s expected_invocation_id=%s observed_invocation_id=%s succession_invocation_ids=%s",
+        "aggregate_invocation_lineage_mismatch",
+        invocation_id,
+        publication.invocation_id,
+        publication.succession_invocation_ids,
+    )
+    return False
+
+
+def _aggregate_publication_evidence_complete(observation: WatcherObservation) -> bool:
     evidence = (
         observation.head_sha,
         observation.base_sha,
@@ -12449,16 +12482,37 @@ def _aggregate_watcher_identity_matches(
         observation.head_branch,
         observation.base_branch,
     )
+    missing = tuple(
+        name
+        for name, value in zip(
+            ("head_sha", "base_sha", "patch_digest", "head_branch", "base_branch"), evidence
+        )
+        if not isinstance(value, str) or not value
+    )
+    if not missing:
+        return True
+    LOGGER.warning(
+        "[TL loop] refusing aggregate watcher publication: reason_code=%s missing_fields=%s",
+        "aggregate_evidence_incomplete",
+        missing,
+    )
+    return False
+
+
+def _aggregate_publication_coordinates_match(
+    task: SubTLTask,
+    observation: WatcherObservation,
+    publication: PublicationRecord,
+    branch: str,
+    owner_agent: str,
+    base_branch: str,
+) -> bool:
+    if type(observation.pr_number) is not int or observation.pr_number <= 0:
+        return False
     return bool(
-        binding is not None
-        and all(isinstance(value, str) and value for value in evidence)
-        and type(observation.pr_number) is int
-        and observation.pr_number > 0
-        and observation.head_branch == branch
+        observation.head_branch == branch
         and observation.base_branch == base_branch
-        and publication is not None
         and publication.slice_id == task.name
-        and publication.invocation_id == invocation_id
         and publication.author_agent == owner_agent
     )
 

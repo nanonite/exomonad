@@ -57,6 +57,30 @@ class ReconciliationResult:
         }
 
 
+@dataclass(frozen=True)
+class PublicationRejection:
+    """Safe identity fields explaining why watcher provenance was refused."""
+
+    reason_code: str
+    expected: tuple[tuple[str, object], ...]
+    observed: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True)
+class PublicationValidation:
+    """Structured result for accepting or refusing a watcher publication."""
+
+    binding: PublicationBinding | None
+    rejection: PublicationRejection | None
+
+
+@dataclass(frozen=True)
+class _PublicationCoordinates:
+    pr_number: int
+    head_branch: str
+    base_branch: str
+
+
 def reconcile_merge_observation(
     state: SliceState,
     watcher: WatcherObservation | Mapping[str, object],
@@ -160,86 +184,262 @@ def watcher_presents_publication(snapshot: object) -> bool:
     return observation.publication is not None or observation.publication_present
 
 
-def accepted_publication_from_watcher(
+def validate_publication_from_watcher(
     current: SliceState,
     snapshot: object,
     head_sha: str | None,
     owner_id: str | None,
-) -> PublicationBinding | None:
-    """Authoritative publication correlation for every watcher-driven path.
+) -> PublicationValidation:
+    """Validate watcher provenance and retain a stable reason for refusals.
 
     A publication binds only when the watcher ownership is verified, the exact
     PR/head/branch/base agree, and the record's durable invocation provenance
     matches the current dispatch or an explicitly recorded recovery succession.
     Missing provenance is refused and never inferred from the current dispatch.
-    Returns None for a refused or unverifiable snapshot.
     """
     observation = _watcher_observation(snapshot)
+    rejection = _publication_presence_rejection(current, observation, head_sha, owner_id)
+    if rejection is not None:
+        return PublicationValidation(None, rejection)
+    assert observation is not None
+    coordinates = _validate_publication_coordinates(current, observation, head_sha, owner_id)
+    if isinstance(coordinates, PublicationRejection):
+        return PublicationValidation(None, coordinates)
+    rejection = _validate_publication_lineage(current, observation, owner_id, head_sha)
+    if rejection is not None:
+        return PublicationValidation(None, rejection)
+    return _accepted_publication_validation(current, observation, coordinates, head_sha)
+
+
+def _publication_presence_rejection(
+    current: SliceState,
+    observation: WatcherObservation | None,
+    head_sha: str | None,
+    owner_id: str | None,
+) -> PublicationRejection | None:
     if observation is None:
-        return None
-    # A binding requires the complete ownership contract: the verdict present
-    # and exactly boolean True, the error field present, a string, and empty.
-    # A bare ``publication_ownership_verified=True`` is not sufficient proof.
-    if observation.ownership_status()[0] is not True or not head_sha:
-        return None
-    pr_number = observation.pr_number
-    head_branch = observation.head_branch
-    base_branch = observation.base_branch
-    if (
-        type(pr_number) is not int
-        or pr_number <= 0
-        or not isinstance(head_branch, str)
-        or not head_branch
-        or not isinstance(base_branch, str)
-        or not base_branch
-    ):
-        return None
+        return _publication_rejection("watcher_unavailable", current, None, head_sha, owner_id)
+    if observation.found is False:
+        return _publication_rejection("pr_not_found", current, observation, head_sha, owner_id)
+    if observation.evidence_error:
+        reason = "head_unreachable" if observation.head_reachable is False else "watcher_evidence_error"
+        return _publication_rejection(reason, current, observation, head_sha, owner_id)
+    if observation.publication is None and not observation.publication_present:
+        return _publication_rejection("publication_missing", current, observation, head_sha, owner_id)
+    if observation.publication is None:
+        return _publication_rejection("publication_record_malformed", current, observation, head_sha, owner_id)
+    if observation.ownership_status()[0] is not True:
+        return _publication_rejection("ownership_unverified", current, observation, head_sha, owner_id)
+    return None
+
+
+def _accepted_publication_validation(
+    current: SliceState,
+    observation: WatcherObservation,
+    coordinates: _PublicationCoordinates,
+    head_sha: str | None,
+) -> PublicationValidation:
+    record_invocation_id = cast(str, _publication_record_text(observation.publication, "invocation_id"))
     existing = current.publication
+    return PublicationValidation(
+        binding=PublicationBinding(
+            pr_number=coordinates.pr_number,
+            head_sha=cast(str, head_sha),
+            head_branch=coordinates.head_branch,
+            base_branch=coordinates.base_branch,
+            attempt=existing.attempt if existing is not None else max(current.attempts, 1),
+            invocation_id=record_invocation_id,
+        ),
+        rejection=None,
+    )
+
+
+def _validate_publication_coordinates(
+    current: SliceState,
+    observation: WatcherObservation,
+    head_sha: str | None,
+    owner_id: str | None,
+) -> _PublicationCoordinates | PublicationRejection:
+    rejection = _required_coordinate_rejection(current, observation, head_sha, owner_id)
+    if rejection is not None:
+        return rejection
+    pr_number = cast(int, observation.pr_number)
+    head_branch = cast(str, observation.head_branch)
+    base_branch = cast(str, observation.base_branch)
+    rejection = _coordinate_mismatch_rejection(
+        current, observation, head_sha, owner_id, pr_number, head_branch, base_branch
+    )
+    if rejection is not None:
+        return rejection
+    return _PublicationCoordinates(pr_number, head_branch, base_branch)
+
+
+def _required_coordinate_rejection(
+    current: SliceState,
+    observation: WatcherObservation,
+    head_sha: str | None,
+    owner_id: str | None,
+) -> PublicationRejection | None:
+    if not head_sha or observation.head_sha != head_sha:
+        return _publication_rejection("head_sha_missing_or_mismatched", current, observation, head_sha, owner_id)
+    if type(observation.pr_number) is not int or observation.pr_number <= 0:
+        return _publication_rejection("pr_number_missing", current, observation, head_sha, owner_id)
+    if not isinstance(observation.head_branch, str) or not observation.head_branch:
+        return _publication_rejection("head_branch_missing", current, observation, head_sha, owner_id)
+    if not isinstance(observation.base_branch, str) or not observation.base_branch:
+        return _publication_rejection("base_branch_missing", current, observation, head_sha, owner_id)
+    return None
+
+
+def _coordinate_mismatch_rejection(
+    current: SliceState,
+    observation: WatcherObservation,
+    head_sha: str | None,
+    owner_id: str | None,
+    pr_number: int,
+    head_branch: str,
+    base_branch: str,
+) -> PublicationRejection | None:
+    existing = current.publication
+    if current.pr_number is not None and current.pr_number != pr_number:
+        return _publication_rejection("pr_number_mismatch", current, observation, head_sha, owner_id)
     if existing is not None and (existing.pr_number != pr_number or existing.head_sha != head_sha):
-        return None
-    # Exact branch and base identity: a watcher that names a different branch
-    # than the slice's durable coordinates can never be the same publication.
+        return _publication_rejection("durable_publication_mismatch", current, observation, head_sha, owner_id)
     if current.branch and head_branch != current.branch:
-        return None
+        return _publication_rejection("head_branch_mismatch", current, observation, head_sha, owner_id)
     if current.base_ref and base_branch != current.base_ref:
-        return None
-    publication_record = observation.publication
-    record_slice_id = _publication_record_text(publication_record, "slice_id")
-    if record_slice_id is not None and record_slice_id != current.id:
-        return None
-    # Owner identity must be durably provable. A missing expected owner or a
-    # missing/unrelated author_agent fails closed instead of binding.
+        return _publication_rejection("base_branch_mismatch", current, observation, head_sha, owner_id)
+    return None
+
+
+def _validate_publication_lineage(
+    current: SliceState,
+    observation: WatcherObservation,
+    owner_id: str | None,
+    head_sha: str | None,
+) -> PublicationRejection | None:
+    rejection = _validate_publication_owner(current, observation, owner_id, head_sha)
+    if rejection is not None:
+        return rejection
+    return _validate_publication_invocation(current, observation, owner_id, head_sha)
+
+
+def _validate_publication_owner(
+    current: SliceState,
+    observation: WatcherObservation,
+    owner_id: str | None,
+    head_sha: str | None,
+) -> PublicationRejection | None:
+    record_slice_id = _publication_record_text(observation.publication, "slice_id")
+    if record_slice_id != current.id:
+        return _publication_rejection("slice_id_mismatch", current, observation, head_sha, owner_id)
     expected_owner = current.dispatch_agent_id or owner_id
-    record_owner = _publication_record_text(publication_record, "author_agent")
-    if expected_owner is None or record_owner is None or record_owner != expected_owner:
-        return None
-    record_invocation_id = _publication_record_text(publication_record, "invocation_id")
+    record_owner = _publication_record_text(observation.publication, "author_agent")
+    if expected_owner is None:
+        return _publication_rejection("owner_id_missing", current, observation, head_sha, owner_id)
+    if record_owner != expected_owner:
+        return _publication_rejection("owner_id_mismatch", current, observation, head_sha, owner_id)
+    return None
+
+
+def _validate_publication_invocation(
+    current: SliceState,
+    observation: WatcherObservation,
+    owner_id: str | None,
+    head_sha: str | None,
+) -> PublicationRejection | None:
+    record_invocation_id = _publication_record_text(observation.publication, "invocation_id")
     if not record_invocation_id:
-        return None
-    succession = _publication_record_succession(publication_record)
-    active_invocations = [
+        return _publication_rejection("invocation_id_missing", current, observation, head_sha, owner_id)
+    succession = _publication_record_succession(observation.publication)
+    active_invocations = tuple(
         value
         for value in (current.dispatch_invocation_id, _recorded_recovery_invocation(current))
         if value is not None
-    ]
-    if active_invocations:
-        if not any(
-            active == record_invocation_id or active in succession
-            for active in active_invocations
-        ):
-            return None
-    elif existing is None or existing.invocation_id != record_invocation_id:
-        # No active dispatch or recovery invocation to correlate against: the
-        # record may bind only when the persisted publication durably proves
-        # the same invocation. A historical record never binds on its own.
+    )
+    if active_invocations and any(
+        active == record_invocation_id or active in succession for active in active_invocations
+    ):
         return None
-    return PublicationBinding(
-        pr_number=pr_number,
-        head_sha=head_sha,
-        head_branch=head_branch,
-        base_branch=base_branch,
-        attempt=existing.attempt if existing is not None else max(current.attempts, 1),
-        invocation_id=record_invocation_id,
+    if (
+        not active_invocations
+        and current.publication is not None
+        and current.publication.invocation_id == record_invocation_id
+    ):
+        return None
+    return _publication_rejection("invocation_lineage_mismatch", current, observation, head_sha, owner_id)
+
+
+def _publication_rejection(
+    reason_code: str,
+    current: SliceState,
+    observation: WatcherObservation | None,
+    head_sha: str | None,
+    owner_id: str | None,
+) -> PublicationRejection:
+    return PublicationRejection(
+        reason_code,
+        _expected_publication_fields(current, head_sha, owner_id),
+        _observed_publication_fields(observation),
+    )
+
+
+def _expected_publication_fields(
+    current: SliceState,
+    head_sha: str | None,
+    owner_id: str | None,
+) -> tuple[tuple[str, object], ...]:
+    return (
+        ("pr_number", current.pr_number),
+        ("head_sha", head_sha),
+        ("head_branch", current.branch),
+        ("base_branch", current.base_ref),
+        ("head_reachable", True),
+        ("slice_id", current.id),
+        ("owner_id", current.dispatch_agent_id or owner_id),
+        ("invocation_ids", _active_invocation_ids(current)),
+    )
+
+
+def _observed_publication_fields(
+    observation: WatcherObservation | None,
+) -> tuple[tuple[str, object], ...]:
+    publication = observation.publication if observation is not None else None
+    return (
+        ("pr_number", observation.pr_number if observation is not None else None),
+        ("head_sha", observation.head_sha if observation is not None else None),
+        ("head_branch", observation.head_branch if observation is not None else None),
+        ("base_branch", observation.base_branch if observation is not None else None),
+        ("head_reachable", observation.head_reachable if observation is not None else None),
+        (
+            "evidence_error_present",
+            bool(observation and observation.evidence_error),
+        ),
+        ("slice_id", _publication_record_text(publication, "slice_id")),
+        ("owner_id", _publication_record_text(publication, "author_agent")),
+        ("invocation_id", _publication_record_text(publication, "invocation_id")),
+        ("succession_invocation_ids", _publication_record_succession(publication)),
+    )
+
+
+def _active_invocation_ids(current: SliceState) -> tuple[str, ...]:
+    return tuple(
+        value
+        for value in (current.dispatch_invocation_id, _recorded_recovery_invocation(current))
+        if value is not None
+    )
+
+
+def _rejected_publication(
+    reason_code: str,
+    current: SliceState,
+    observation: WatcherObservation | None,
+    head_sha: str | None,
+    owner_id: str | None,
+) -> PublicationValidation:
+    return PublicationValidation(
+        None,
+        _publication_rejection(reason_code, current, observation, head_sha, owner_id),
     )
 
 
@@ -299,7 +499,8 @@ def publication_refused(
         return False
     if observation.publication_ownership_verified is not True:
         return False
-    return accepted_publication_from_watcher(current, observation, head_sha, owner_id) is None
+    validation = validate_publication_from_watcher(current, observation, head_sha, owner_id)
+    return validation.rejection is not None
 
 
 @dataclass(frozen=True)

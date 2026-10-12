@@ -30,7 +30,9 @@ use crate::services::pr_registry::{
     AbandonedAttempt, LivePrResolution, PrEntry, PrState, PublishedHead,
 };
 #[cfg(test)]
-use crate::services::pr_registry::{PrRegistry, PublicationProvenance};
+use crate::services::pr_registry::{
+    InvocationSuccession, PrRegistry, PublicationProvenance, SuccessionReason,
+};
 use crate::services::supervisor_registry::SupervisorInfo;
 use crate::{GithubOwner, GithubRepo, IssueNumber, PRNumber};
 use async_trait::async_trait;
@@ -4799,6 +4801,34 @@ mod tests {
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
+
+    #[test]
+    fn watcher_publication_evidence_includes_resumed_invocation_lineage() {
+        let publication = PublishedHead {
+            pr_number: 46,
+            head_branch: "main.architecture".to_string(),
+            base_branch: "main".to_string(),
+            head_sha: "head-current".to_string(),
+            author_agent: Some("architecture".to_string()),
+            author_role: Some("dev".to_string()),
+            provenance: PublicationProvenance::LedgerOwned,
+            slice_id: Some("architecture".to_string()),
+            invocation_id: Some("invocation-original".to_string()),
+            invocation_trigger: Some("spawn".to_string()),
+            invocation_runtime: Some("codex".to_string()),
+            invocation_succession: vec![InvocationSuccession {
+                from_invocation_id: "invocation-original".to_string(),
+                to_invocation_id: "invocation-resumed".to_string(),
+                reason: SuccessionReason::SessionRecreate,
+                recorded_at: 1,
+            }],
+        };
+
+        let evidence = published_head_evidence(Some(&publication)).expect("evidence");
+
+        assert_eq!(evidence.invocation_id, "invocation-original");
+        assert_eq!(evidence.succession_invocation_ids, ["invocation-resumed"]);
+    }
 
     #[test]
     fn cleanup_dry_run_reports_candidates_that_would_be_cleaned() {

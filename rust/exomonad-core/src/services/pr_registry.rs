@@ -44,6 +44,18 @@ pub struct PublicationAdoption {
     pub succession: InvocationSuccession,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationAdoptionRequest<'a> {
+    pub agent_name: &'a str,
+    pub head_branch: &'a str,
+    pub base_branch: &'a str,
+    pub slice_id: &'a str,
+    pub pr_number: Option<u64>,
+    pub head_sha: Option<&'a str>,
+    pub from_invocation_id: &'a str,
+    pub to_invocation_id: &'a str,
+}
+
 /// The controller-facing result of resolving a slice's current publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LivePrResolution {
@@ -553,7 +565,7 @@ pub fn resolve_live_pr_for_slice_with_abandonments(
 /// old publication when Forgejo has already confirmed a newer head.
 pub async fn publish_verified_head(
     project_dir: &Path,
-    publication: PublishedHead,
+    mut publication: PublishedHead,
 ) -> Result<PublicationDisposition> {
     publication.validate()?;
     let _guard = published_heads_lock().lock().await;
@@ -572,6 +584,8 @@ pub async fn publish_verified_head(
             publication.pr_number
         );
     }
+
+    inherit_publication_invocation_lineage(&file.heads, &mut publication)?;
 
     if file.heads.iter().any(|existing| existing == &publication) {
         return Ok(PublicationDisposition::Duplicate);
@@ -598,6 +612,76 @@ pub async fn publish_verified_head(
     };
     write_published_heads_locked(project_dir, &file).await?;
     Ok(disposition)
+}
+
+fn inherit_publication_invocation_lineage(
+    heads: &[PublishedHead],
+    publication: &mut PublishedHead,
+) -> Result<()> {
+    if publication.provenance != PublicationProvenance::LedgerOwned {
+        return Ok(());
+    }
+    let same_pr = ledger_owned_publications_for_pr(heads, publication)?;
+    let Some(invocation_id) = publication.invocation_id.as_deref() else {
+        anyhow::bail!("ledger-owned publication is missing its invocation ID");
+    };
+    let predecessor = find_publication_predecessor(&same_pr, publication, invocation_id);
+    let Some(predecessor) = predecessor else {
+        if !same_pr.is_empty() {
+            anyhow::bail!(
+                "verified publication invocation is outside the durable owner lineage for PR #{}",
+                publication.pr_number
+            );
+        }
+        return Ok(());
+    };
+
+    publication.invocation_id = predecessor.invocation_id.clone();
+    publication.invocation_trigger = predecessor.invocation_trigger.clone();
+    publication.invocation_runtime = predecessor.invocation_runtime.clone();
+    publication.invocation_succession = predecessor.invocation_succession.clone();
+    Ok(())
+}
+
+fn ledger_owned_publications_for_pr<'a>(
+    heads: &'a [PublishedHead],
+    publication: &PublishedHead,
+) -> Result<Vec<&'a PublishedHead>> {
+    let same_pr = heads
+        .iter()
+        .filter(|head| {
+            head.pr_number == publication.pr_number
+                && head.provenance == PublicationProvenance::LedgerOwned
+        })
+        .collect::<Vec<_>>();
+    for existing in &same_pr {
+        if existing.author_agent != publication.author_agent
+            || existing.slice_id != publication.slice_id
+        {
+            anyhow::bail!(
+                "verified publication changes owner identity for PR #{}",
+                publication.pr_number
+            );
+        }
+    }
+    Ok(same_pr)
+}
+
+fn find_publication_predecessor<'a>(
+    same_pr: &[&'a PublishedHead],
+    publication: &PublishedHead,
+    invocation_id: &str,
+) -> Option<&'a PublishedHead> {
+    same_pr
+        .iter()
+        .copied()
+        .filter(|existing| {
+            existing.head_branch == publication.head_branch
+                && existing.base_branch == publication.base_branch
+                && (existing.invocation_id.as_deref() == Some(invocation_id)
+                    || invocation_succession_reaches_current(existing, invocation_id))
+        })
+        .max_by_key(|existing| existing.invocation_succession.len())
 }
 
 /// Remove publication records for PRs that were explicitly destroyed by a
@@ -645,25 +729,33 @@ async fn write_published_heads_locked(project_dir: &Path, file: &PublishedHeadsF
 
 /// Adopt a ledger-owned publication when a same-owner invocation is recreated.
 ///
-/// Every identity dimension other than invocation ID must match exactly.  The
-/// operation is append-only and idempotent: repeated startup reconciliation
+/// Every identity dimension other than invocation ID must match exactly. When
+/// supplied, PR and head coordinates further scope a direct `resume_pr`.
+/// The operation is append-only and idempotent: repeated startup reconciliation
 /// never creates duplicate succession records or changes the original
 /// publication invocation.
 pub async fn adopt_publication_for_invocation(
     project_dir: &Path,
-    agent_name: &str,
-    head_branch: &str,
-    base_branch: &str,
-    slice_id: &str,
-    from_invocation_id: &str,
-    to_invocation_id: &str,
+    request: PublicationAdoptionRequest<'_>,
 ) -> Result<Vec<PublicationAdoption>> {
+    let PublicationAdoptionRequest {
+        agent_name,
+        head_branch,
+        base_branch,
+        slice_id,
+        pr_number,
+        head_sha,
+        from_invocation_id,
+        to_invocation_id,
+    } = request;
     if agent_name.trim().is_empty()
         || head_branch.trim().is_empty()
         || base_branch.trim().is_empty()
         || slice_id.trim().is_empty()
         || from_invocation_id.trim().is_empty()
         || to_invocation_id.trim().is_empty()
+        || pr_number == Some(0)
+        || head_sha.is_some_and(|value| value.trim().is_empty())
     {
         return Ok(Vec::new());
     }
@@ -686,6 +778,8 @@ pub async fn adopt_publication_for_invocation(
             || head.head_branch != head_branch
             || head.base_branch != base_branch
             || head.slice_id.as_deref() != Some(slice_id)
+            || pr_number.is_some_and(|expected| head.pr_number != expected)
+            || head_sha.is_some_and(|expected| head.head_sha != expected)
         {
             continue;
         }
@@ -1068,20 +1162,30 @@ mod tests {
         old.author_agent = Some("leaf-codex".to_string());
         old.provenance = PublicationProvenance::LedgerOwned;
         old.slice_id = Some("slice-a".to_string());
+        old.invocation_id = Some("invocation-original".to_string());
         publish_verified_head(directory.path(), old).await.unwrap();
+        adopt_publication_for_invocation(
+            directory.path(),
+            PublicationAdoptionRequest {
+                agent_name: "leaf-codex",
+                head_branch: "main.feature-codex",
+                base_branch: "main",
+                slice_id: "slice-a",
+                pr_number: Some(43),
+                head_sha: Some("head-old"),
+                from_invocation_id: "invocation-original",
+                to_invocation_id: "invocation-current",
+            },
+        )
+        .await
+        .unwrap();
 
         let mut current = publication("head-current");
         current.pr_number = 43;
         current.author_agent = Some("leaf-codex".to_string());
         current.provenance = PublicationProvenance::LedgerOwned;
         current.slice_id = Some("slice-a".to_string());
-        current.invocation_succession.push(InvocationSuccession {
-            from_invocation_id: "invocation-original".to_string(),
-            to_invocation_id: "invocation-current".to_string(),
-            reason: SuccessionReason::SessionRecreate,
-            recorded_at: 1,
-        });
-        current.invocation_id = Some("invocation-original".to_string());
+        current.invocation_id = Some("invocation-current".to_string());
         publish_verified_head(directory.path(), current)
             .await
             .unwrap();
@@ -1290,12 +1394,16 @@ mod tests {
 
         let adoptions = adopt_publication_for_invocation(
             directory.path(),
-            "feature-codex",
-            "main.feature-codex",
-            "main",
-            "slice-a",
-            "invocation-1",
-            "invocation-2",
+            PublicationAdoptionRequest {
+                agent_name: "feature-codex",
+                head_branch: "main.feature-codex",
+                base_branch: "main",
+                slice_id: "slice-a",
+                pr_number: Some(42),
+                head_sha: Some("sha-1"),
+                from_invocation_id: "invocation-1",
+                to_invocation_id: "invocation-2",
+            },
         )
         .await
         .unwrap();
@@ -1310,24 +1418,48 @@ mod tests {
 
         assert!(adopt_publication_for_invocation(
             directory.path(),
-            "feature-codex",
-            "main.other-branch",
-            "main",
-            "slice-a",
-            "invocation-1",
-            "invocation-3",
+            PublicationAdoptionRequest {
+                agent_name: "feature-codex",
+                head_branch: "main.other-branch",
+                base_branch: "main",
+                slice_id: "slice-a",
+                pr_number: Some(42),
+                head_sha: Some("sha-1"),
+                from_invocation_id: "invocation-1",
+                to_invocation_id: "invocation-3",
+            },
         )
         .await
         .unwrap()
         .is_empty());
         assert!(adopt_publication_for_invocation(
             directory.path(),
-            "feature-codex",
-            "main.feature-codex",
-            "main",
-            "slice-a",
-            "invocation-1",
-            "invocation-2",
+            PublicationAdoptionRequest {
+                agent_name: "feature-codex",
+                head_branch: "main.feature-codex",
+                base_branch: "main",
+                slice_id: "slice-a",
+                pr_number: Some(41),
+                head_sha: Some("sha-1"),
+                from_invocation_id: "invocation-1",
+                to_invocation_id: "invocation-2",
+            },
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        assert!(adopt_publication_for_invocation(
+            directory.path(),
+            PublicationAdoptionRequest {
+                agent_name: "feature-codex",
+                head_branch: "main.feature-codex",
+                base_branch: "main",
+                slice_id: "slice-a",
+                pr_number: Some(42),
+                head_sha: Some("stale-sha"),
+                from_invocation_id: "invocation-1",
+                to_invocation_id: "invocation-3",
+            },
         )
         .await
         .unwrap()
@@ -1353,12 +1485,16 @@ mod tests {
         assert_eq!(
             adopt_publication_for_invocation(
                 directory.path(),
-                "feature-codex",
-                "main.feature-codex",
-                "main",
-                "slice-a",
-                "invocation-1",
-                "invocation-2",
+                PublicationAdoptionRequest {
+                    agent_name: "feature-codex",
+                    head_branch: "main.feature-codex",
+                    base_branch: "main",
+                    slice_id: "slice-a",
+                    pr_number: Some(42),
+                    head_sha: Some("sha-1"),
+                    from_invocation_id: "invocation-1",
+                    to_invocation_id: "invocation-2",
+                },
             )
             .await
             .unwrap()
@@ -1367,12 +1503,16 @@ mod tests {
         );
         let adoptions = adopt_publication_for_invocation(
             directory.path(),
-            "feature-codex",
-            "main.feature-codex",
-            "main",
-            "slice-a",
-            "invocation-2",
-            "invocation-3",
+            PublicationAdoptionRequest {
+                agent_name: "feature-codex",
+                head_branch: "main.feature-codex",
+                base_branch: "main",
+                slice_id: "slice-a",
+                pr_number: Some(42),
+                head_sha: Some("sha-1"),
+                from_invocation_id: "invocation-2",
+                to_invocation_id: "invocation-3",
+            },
         )
         .await
         .unwrap();
@@ -1388,12 +1528,16 @@ mod tests {
 
         assert!(adopt_publication_for_invocation(
             directory.path(),
-            "feature-codex",
-            "main.feature-codex",
-            "main",
-            "slice-a",
-            "invocation-2",
-            "invocation-3",
+            PublicationAdoptionRequest {
+                agent_name: "feature-codex",
+                head_branch: "main.feature-codex",
+                base_branch: "main",
+                slice_id: "slice-a",
+                pr_number: Some(42),
+                head_sha: Some("sha-1"),
+                from_invocation_id: "invocation-2",
+                to_invocation_id: "invocation-3",
+            },
         )
         .await
         .unwrap()
@@ -1404,6 +1548,82 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn resumed_publication_update_preserves_owner_lineage_and_rejects_unrelated_invocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut original = publication("sha-1");
+        original.provenance = PublicationProvenance::LedgerOwned;
+        original.slice_id = Some("slice-a".to_string());
+        publish_verified_head(directory.path(), original)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            adopt_publication_for_invocation(
+                directory.path(),
+                PublicationAdoptionRequest {
+                    agent_name: "feature-codex",
+                    head_branch: "main.feature-codex",
+                    base_branch: "main",
+                    slice_id: "slice-a",
+                    pr_number: Some(42),
+                    head_sha: Some("sha-1"),
+                    from_invocation_id: "invocation-1",
+                    to_invocation_id: "invocation-2",
+                },
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+
+        let mut resumed = publication("sha-2");
+        resumed.provenance = PublicationProvenance::LedgerOwned;
+        resumed.slice_id = Some("slice-a".to_string());
+        resumed.invocation_id = Some("invocation-2".to_string());
+        resumed.invocation_trigger = Some("resume_pr".to_string());
+        assert_eq!(
+            publish_verified_head(directory.path(), resumed.clone())
+                .await
+                .unwrap(),
+            PublicationDisposition::Added
+        );
+
+        let heads = read_published_heads(directory.path()).await.unwrap();
+        let current = heads
+            .iter()
+            .find(|head| head.head_sha == "sha-2")
+            .expect("new PR head is retained");
+        assert_eq!(current.invocation_id.as_deref(), Some("invocation-1"));
+        assert_eq!(current.invocation_succession.len(), 1);
+        assert!(invocation_succession_reaches_current(
+            current,
+            "invocation-2"
+        ));
+        verify_publication_ownership(
+            current,
+            Some("feature-codex"),
+            Some("main.feature-codex"),
+            Some("main"),
+            Some("slice-a"),
+            Some("invocation-2"),
+        )
+        .expect("the resumed invocation remains authorized");
+
+        let mut unrelated = resumed;
+        unrelated.head_sha = "sha-3".to_string();
+        unrelated.invocation_id = Some("invocation-unrelated".to_string());
+        assert!(publish_verified_head(directory.path(), unrelated)
+            .await
+            .is_err());
+        let heads_after_rejection = read_published_heads(directory.path()).await.unwrap();
+        assert_eq!(heads_after_rejection.len(), 2);
+        assert!(heads_after_rejection
+            .iter()
+            .any(|head| head.head_sha == "sha-2"));
     }
 
     #[tokio::test]

@@ -910,7 +910,7 @@ def test_the_restart_seed_earns_its_publication_instead_of_asserting_one() -> No
     Only the shipped ``file_pr`` handler records a verified publication, and it
     records it with the calling agent's identity, the server-resolved slice, and
     that agent's durable invocation. A PR filed over REST leaves
-    ``published-heads.json`` empty, so ``accepted_publication_from_watcher``
+    ``published-heads.json`` empty, so the publication validator
     refuses the evidence on provenance and the controller never reaches the
     boundary it is supposed to crash at.
     """

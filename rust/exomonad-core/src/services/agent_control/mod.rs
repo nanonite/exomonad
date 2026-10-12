@@ -111,6 +111,111 @@ fn live_invocation_matches(
         && record.worktree == identity.worktree
 }
 
+struct ResumePublicationContext<'a> {
+    agent_name: &'a AgentName,
+    previous: Option<&'a InvocationRecord>,
+    identity: Option<&'a (String, String, Option<String>)>,
+    pr_number: Option<u64>,
+    head_sha: Option<&'a str>,
+    next_invocation_id: &'a str,
+}
+
+struct ResumePublicationCoordinates<'a> {
+    previous_invocation_id: &'a str,
+    head_branch: &'a str,
+    base_branch: &'a str,
+    slice_id: &'a str,
+    pr_number: u64,
+    head_sha: &'a str,
+}
+
+fn required_resume_previous<'a>(
+    context: &ResumePublicationContext<'a>,
+) -> Result<&'a InvocationRecord> {
+    context.previous.ok_or_else(|| {
+        anyhow!(
+            "resume_pr for agent {} requires a durable prior invocation record; no new process was started",
+            context.agent_name
+        )
+    })
+}
+
+fn required_resume_identity<'a>(
+    context: &ResumePublicationContext<'a>,
+) -> Result<(&'a str, &'a str, &'a str)> {
+    let Some((head_branch, base_branch, Some(slice_id))) = context.identity else {
+        anyhow::bail!(
+            "resume_pr for agent {} requires durable branch and slice identity; no new process was started",
+            context.agent_name
+        );
+    };
+    Ok((head_branch, base_branch, slice_id))
+}
+
+fn resume_publication_coordinates<'a>(
+    context: &ResumePublicationContext<'a>,
+) -> Result<ResumePublicationCoordinates<'a>> {
+    let previous = required_resume_previous(context)?;
+    let (head_branch, base_branch, slice_id) = required_resume_identity(context)?;
+    let pr_number = context.pr_number.ok_or_else(|| {
+        anyhow!(
+            "resume_pr for agent {} is missing its PR number; no new process was started",
+            context.agent_name
+        )
+    })?;
+    let head_sha = context.head_sha.ok_or_else(|| {
+        anyhow!(
+            "resume_pr for agent {} PR #{} is missing its current head SHA; no new process was started",
+            context.agent_name,
+            pr_number
+        )
+    })?;
+    Ok(ResumePublicationCoordinates {
+        previous_invocation_id: &previous.invocation_id,
+        head_branch,
+        base_branch,
+        slice_id,
+        pr_number,
+        head_sha,
+    })
+}
+
+fn resume_publication_adoption_request<'a>(
+    context: ResumePublicationContext<'a>,
+) -> Result<crate::services::pr_registry::PublicationAdoptionRequest<'a>> {
+    let coordinates = resume_publication_coordinates(&context)?;
+    Ok(crate::services::pr_registry::PublicationAdoptionRequest {
+        agent_name: context.agent_name.as_str(),
+        head_branch: coordinates.head_branch,
+        base_branch: coordinates.base_branch,
+        slice_id: coordinates.slice_id,
+        pr_number: Some(coordinates.pr_number),
+        head_sha: Some(coordinates.head_sha),
+        from_invocation_id: coordinates.previous_invocation_id,
+        to_invocation_id: context.next_invocation_id,
+    })
+}
+
+async fn persist_resume_publication_lineage(
+    project_dir: &Path,
+    request: crate::services::pr_registry::PublicationAdoptionRequest<'_>,
+) -> Result<Vec<crate::services::pr_registry::PublicationAdoption>> {
+    let adoptions =
+        crate::services::pr_registry::adopt_publication_for_invocation(project_dir, request)
+            .await?;
+    if adoptions.is_empty() {
+        anyhow::bail!(
+            "resume_pr for agent {} PR #{} at head {} could not match a durable publication to prior invocation {}; invocation {} was not started",
+            request.agent_name,
+            request.pr_number.unwrap_or_default(),
+            request.head_sha.unwrap_or("<missing>"),
+            request.from_invocation_id,
+            request.to_invocation_id
+        );
+    }
+    Ok(adoptions)
+}
+
 /// Push the parent branch to the remote so child PRs can reference it as
 /// their base. Non-fatal: warns on failure (supports local/airgapped setups
 /// where no remote or non-GitHub remote is configured).
@@ -1349,41 +1454,49 @@ impl<
                 return Ok(agent_config_dir);
             }
         }
+        // Persist resume lineage before replacing the invocation record so a
+        // controller restart cannot strand the new invocation ID.
+        let invocation_id = uuid::Uuid::new_v4().to_string();
+        let adoptions = if metadata.trigger == InvocationTrigger::ResumePr {
+            let request = resume_publication_adoption_request(ResumePublicationContext {
+                agent_name,
+                previous: prior_invocation.as_ref(),
+                identity: adoption_identity.as_ref(),
+                pr_number: metadata.pr_number,
+                head_sha: metadata.head_sha.as_deref(),
+                next_invocation_id: &invocation_id,
+            })?;
+            let adoptions = persist_resume_publication_lineage(self.project_dir(), request)
+                .await
+                .with_context(|| {
+                    format!("failed to persist resume_pr lineage for agent {agent_name}")
+                })?;
+            adoptions
+        } else {
+            Vec::new()
+        };
         routing.write_to_dir(&agent_config_dir).await?;
-        let invocation = invocation::start_invocation_with_provenance_and_context_and_mode(
+        let invocation = invocation::start_invocation_with_provenance_and_context_and_mode_with_id(
             &agent_config_dir,
             metadata.runtime,
             metadata.trigger,
             routing,
             metadata.pr_number,
-            metadata.head_sha,
+            metadata.head_sha.clone(),
             metadata.model,
             metadata.effort,
             identity_context,
             metadata.recovery_lineage,
             metadata.mode,
+            invocation_id,
         )
         .await?;
-        if let (Some(previous), Some((head_branch, base_branch, Some(slice_id)))) =
-            (prior_invocation, adoption_identity)
-        {
-            let adoptions = crate::services::pr_registry::adopt_publication_for_invocation(
+        for adoption in adoptions {
+            crate::services::lifecycle::record_invocation_succession(
                 self.project_dir(),
                 agent_name.as_str(),
-                &head_branch,
-                &base_branch,
-                &slice_id,
-                &previous.invocation_id,
-                &invocation.invocation_id,
-            )
-            .await?;
-            for adoption in adoptions {
-                crate::services::lifecycle::record_invocation_succession(
-                    self.project_dir(),
-                    agent_name.as_str(),
-                    &adoption,
-                );
-            }
+                &adoption,
+            );
         }
         let effective_routing = RoutingInfo::read_from_dir(&agent_config_dir).await?;
         if effective_routing.window_id.is_some() || effective_routing.pane_id.is_some() {
@@ -1862,6 +1975,25 @@ mod tests {
         })
     }
     use super::*;
+
+    #[test]
+    fn resume_adoption_requires_a_durable_prior_invocation() {
+        let agent_name = AgentName::try_from_str("leaf-codex").expect("agent name");
+        let error = resume_publication_adoption_request(ResumePublicationContext {
+            agent_name: &agent_name,
+            previous: None,
+            identity: None,
+            pr_number: Some(46),
+            head_sha: Some("head-current"),
+            next_invocation_id: "invocation-resumed",
+        })
+        .expect_err("resume must stop before starting without prior lineage");
+
+        assert!(error
+            .to_string()
+            .contains("durable prior invocation record"));
+        assert!(error.to_string().contains("no new process was started"));
+    }
 
     /// A lifecycle-lock timeout is transient, so the refusal must carry the
     /// stable code the controller's dispatch classification treats as

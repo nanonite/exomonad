@@ -3035,7 +3035,10 @@ impl<
                 model: identity_model.clone(),
                 effort: identity_effort.clone(),
                 ledger_owned: false,
-                slice_id: Some(options.branch_name.clone()),
+                slice_id: prior_identity
+                    .as_ref()
+                    .and_then(|record| record.slice_id.clone())
+                    .or_else(|| Some(options.branch_name.clone())),
             };
             let trigger = if options.expected_agent_name.is_some() {
                 InvocationTrigger::ResumePr

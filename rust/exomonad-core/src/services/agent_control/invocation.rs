@@ -425,6 +425,42 @@ pub async fn start_invocation_with_provenance_and_context_and_mode(
     recovery_lineage: Option<RecoveryInvocationLineage>,
     mode: InvocationMode,
 ) -> Result<InvocationRecord> {
+    start_invocation_with_provenance_and_context_and_mode_with_id(
+        agent_dir,
+        runtime,
+        trigger,
+        routing,
+        pr_number,
+        head_sha,
+        model,
+        effort,
+        identity,
+        recovery_lineage,
+        mode,
+        Uuid::new_v4().to_string(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Start an invocation using an ID registered in durable publication lineage.
+pub async fn start_invocation_with_provenance_and_context_and_mode_with_id(
+    agent_dir: &Path,
+    runtime: AgentType,
+    trigger: InvocationTrigger,
+    routing: RoutingInfo,
+    pr_number: Option<u64>,
+    head_sha: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    identity: Option<InvocationIdentityContext>,
+    recovery_lineage: Option<RecoveryInvocationLineage>,
+    mode: InvocationMode,
+    invocation_id: String,
+) -> Result<InvocationRecord> {
+    if invocation_id.trim().is_empty() {
+        return Err(anyhow::anyhow!("invocation ID must not be empty"));
+    }
     let _guard = mutation_lock().lock().await;
     let generation = next_generation(agent_dir).await?;
     if let Some(lineage) = recovery_lineage.as_ref() {
@@ -438,7 +474,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode(
     }
     let identity = identity.unwrap_or_default();
     let record = InvocationRecord {
-        invocation_id: Uuid::new_v4().to_string(),
+        invocation_id,
         runtime,
         trigger,
         mode,
@@ -789,6 +825,31 @@ mod tests {
         .expect("one-shot invocation");
 
         assert_eq!(record.mode, InvocationMode::OneShot);
+        assert_eq!(read_invocation(dir.path()).await.unwrap(), Some(record));
+    }
+
+    #[tokio::test]
+    async fn preallocated_invocation_id_is_persisted_exactly() {
+        let dir = tempdir().expect("tempdir");
+        let invocation_id = "resume-invocation-id".to_string();
+        let record = start_invocation_with_provenance_and_context_and_mode_with_id(
+            dir.path(),
+            AgentType::Codex,
+            InvocationTrigger::ResumePr,
+            routing(),
+            Some(43),
+            Some("head-sha".to_string()),
+            None,
+            None,
+            None,
+            None,
+            InvocationMode::OneShot,
+            invocation_id.clone(),
+        )
+        .await
+        .expect("preallocated resume invocation");
+
+        assert_eq!(record.invocation_id, invocation_id);
         assert_eq!(read_invocation(dir.path()).await.unwrap(), Some(record));
     }
 

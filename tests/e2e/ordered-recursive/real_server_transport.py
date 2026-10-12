@@ -2374,9 +2374,8 @@ def seed_delayed_restart_run(
         # publication, and it records it with the agent's own identity, the
         # server-resolved slice, and the agent's durable invocation id. A PR
         # filed over REST leaves ``published-heads.json`` empty, so
-        # ``accepted_publication_from_watcher`` refuses the evidence on
-        # provenance -- the run would then never reach the boundary it is
-        # supposed to crash at.
+        # The publication validator refuses the evidence on provenance -- the
+        # run would then never reach the boundary it is supposed to crash at.
         #
         # The branch is the child's own ``main.<name>``, which is what an ordered
         # sub-TL publishes to its parent (see the nested aggregate PR the
