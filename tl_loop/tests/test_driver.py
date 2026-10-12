@@ -6766,6 +6766,90 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
     assert candidate.integration_owner_worktree == child.integration.integration_owner_worktree
 
 
+def test_aggregate_file_pr_journal_replays_after_checkpoint_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "aggregate-crash-run"
+    parent_dir = tmp_path / run_id
+    child_plan = _plan()
+    child_config = replace(
+        _config(),
+        branch="main.aggregate-child",
+        parent_branch="main",
+        parent_run_id=run_id,
+        depth=1,
+        keep_alive_on_waiting=False,
+    )
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(RecordingTransport()),
+        config=child_config,
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
+    child_state = child_store.load()
+    child_slices = dict(child_state.slices)
+    child_slices["leaf-a"] = replace(
+        child_slices["leaf-a"], pr_number=42, reviewed_head="head-a"
+    )
+    child_store.checkpoint(
+        child_state.fsm,
+        child_slices,
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+    )
+    config = replace(_config(), ledger_run_id=run_id, keep_alive_on_waiting=False)
+    transport = RecordingTransport()
+    original_set_ordered_state = RunStore.set_ordered_state
+
+    def crash_after_file_pr(
+        store: RunStore,
+        current_order: int,
+        ordered_stages: object,
+        integration: object,
+    ) -> RunState:
+        if store.run_id == "aggregate-child":
+            assert any(name == "file_pr" for name, _ in transport.calls)
+            raise RuntimeError("simulated crash after file_pr")
+        return original_set_ordered_state(store, current_order, ordered_stages, integration)
+
+    monkeypatch.setattr(RunStore, "set_ordered_state", crash_after_file_pr)
+    with pytest.raises(RuntimeError, match="simulated crash after file_pr"):
+        run_tl_loop(
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=tmp_path,
+        )
+
+    monkeypatch.setattr(RunStore, "set_ordered_state", original_set_ordered_state)
+    parent_store = RunStore(run_id, tmp_path)
+    journal = EffectJournal(run_id, parent_store.run_dir / "action-journal.json")
+    assert len(journal.confirmed_entries("file_pr", "aggregate-child")) == 1
+
+    resumed = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert len([name for name, _ in transport.calls if name == "file_pr"]) == 1
+    assert resumed.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+    assert resumed.final_state.slices["aggregate-child"].pr_number == 43
+    assert len(journal.confirmed_entries("file_pr", "aggregate-child")) == 1
+
+
 def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approval(
     tmp_path: Path,
 ) -> None:
