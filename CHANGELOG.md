@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Add an audited in-place plan revision command for active TL runs (#1186)
 - Preserve leaf issue provenance on subTL aggregate PRs (#1183)
 - Add Claude Haiku 5.5 (claude-haiku-5-5) to the Claude model list (#1174)
 - TL judgment: verify CHANGELOG captured unlinked slices' merged work (#1170)
