@@ -63,6 +63,8 @@ from tl_loop.select.model import load_model_catalog
 from tl_loop.select.policy import load_policy
 from tl_loop.state.lock import RunLock
 from tl_loop.state.plan_manifest import PlanManifest
+from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
+from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.plan_revision import analyze_plan_revision
 from tl_loop.state.plan_revision_apply import apply_plan_revision
 from tl_loop.state.plan_revision_files import controller_lifecycle_lock_path
@@ -98,6 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "plan-proposal",
         "plan-revision",
         "plan-revision-recover",
+        "plan-reconciliation",
         "recovery-command",
         "task-budget-reset",
         "preflight",
@@ -127,6 +130,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_plan_proposal(args)
         elif args.command == "plan-revision":
             _plan_revision(args)
+        elif args.command == "plan-reconciliation":
+            _plan_reconciliation(args)
         elif args.command == "plan-revision-recover":
             _recover_plan_revision(args)
         elif args.command == "plan-authoring":
@@ -335,6 +340,15 @@ def _parser() -> argparse.ArgumentParser:
     revision_recovery = subcommands.add_parser("plan-revision-recover", help=argparse.SUPPRESS)
     _add_project_options(revision_recovery)
     revision_recovery.set_defaults(command="plan-revision-recover")
+
+    plan_reconciliation = subcommands.add_parser("plan-reconciliation", help=argparse.SUPPRESS)
+    _add_project_options(plan_reconciliation)
+    reconciliation_mode = plan_reconciliation.add_mutually_exclusive_group(required=True)
+    reconciliation_mode.add_argument("--dry-run", action="store_true")
+    reconciliation_mode.add_argument("--apply", action="store_true")
+    plan_reconciliation.add_argument("--reason")
+    plan_reconciliation.add_argument("--expected-fingerprint")
+    plan_reconciliation.set_defaults(command="plan-reconciliation")
 
     recovery_command = subcommands.add_parser(
         "recovery-command", help="apply one authenticated, compare-and-set recovery command"
@@ -743,6 +757,25 @@ def _plan_revision(args: argparse.Namespace) -> None:
         if args.reason is not None:
             raise LauncherError("--reason is only valid with --apply")
         result = analyze_plan_revision(project_root).to_document()
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _plan_reconciliation(args: argparse.Namespace) -> None:
+    project_root = args.project_root.expanduser().absolute()
+    if args.apply:
+        if not isinstance(args.reason, str) or not args.reason.strip():
+            raise LauncherError("--apply requires a non-empty --reason")
+        if not isinstance(args.expected_fingerprint, str):
+            raise LauncherError("--apply requires --expected-fingerprint from a dry-run")
+        result = apply_plan_reconciliation(
+            project_root,
+            args.reason,
+            args.expected_fingerprint,
+        ).to_document()
+    else:
+        if args.reason is not None or args.expected_fingerprint is not None:
+            raise LauncherError("--reason and --expected-fingerprint are only valid with --apply")
+        result = analyze_plan_reconciliation(project_root).to_document()
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

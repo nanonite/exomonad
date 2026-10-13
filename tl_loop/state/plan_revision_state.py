@@ -129,21 +129,29 @@ def read_checkpoint(path: Path) -> RunState:
     """Decode a current checkpoint without triggering RunStore migrations."""
     if path.is_symlink() or path.parent.is_symlink():
         raise PlanRevisionError("runstore_symlink", f"refusing symlinked RunStore path {path}")
-    return _decode_checkpoint(path, _read_checkpoint_json(path))
+    return decode_checkpoint_bytes(path, _read_checkpoint_bytes(path))
 
 
-def _read_checkpoint_json(path: Path) -> object:
+def decode_checkpoint_bytes(path: Path, raw: bytes) -> RunState:
+    """Validate checkpoint bytes already captured for a stable evidence read."""
     try:
-        value = json.loads(path.read_bytes().decode("utf-8"))
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise PlanRevisionError("runstore_unreadable", f"cannot decode RunStore {path}") from error
+    return _decode_checkpoint(path, value)
+
+
+def _read_checkpoint_bytes(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
     except FileNotFoundError as error:
         raise PlanRevisionError(
             "runstore_missing", f"RunStore checkpoint is missing: {path}"
         ) from error
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    except OSError as error:
         raise PlanRevisionError(
             "runstore_unreadable", f"cannot read RunStore {path}: {error}"
         ) from error
-    return value
 
 
 def _decode_checkpoint(path: Path, value: object) -> RunState:

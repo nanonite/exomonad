@@ -685,6 +685,7 @@ def _allowed_target(path: PurePosixPath) -> bool:
         "plan.snapshot",
         "plan.snapshot.sha256",
         "plan-revisions.jsonl",
+        "plan-reconciliations.jsonl",
     }
     if len(path.parts) == 3 and path.parts[2] in root_participants:
         return True
