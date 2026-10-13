@@ -28,6 +28,7 @@ mod logs;
 mod mcp_stdio;
 mod models;
 mod new;
+mod plan;
 mod revert;
 mod serve;
 mod uds_client;
@@ -64,6 +65,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect or revise an active TL plan.
+    Plan(plan::PlanArgs),
+
     /// Inspect or safely clean stale managed-agent resources through the server.
     Clean(clean::CleanArgs),
 
@@ -561,6 +565,10 @@ async fn main() -> Result<()> {
 
         Commands::Clean(args) => {
             return clean::run(args).await;
+        }
+
+        Commands::Plan(args) => {
+            return plan::run(args).await;
         }
 
         Commands::CodexPruneTrust(args) => {

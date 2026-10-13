@@ -61,7 +61,12 @@ from tl_loop.rlm.tl_judgment import build_tl_model_choice
 from tl_loop.select.capability import load_capability
 from tl_loop.select.model import load_model_catalog
 from tl_loop.select.policy import load_policy
+from tl_loop.state.lock import RunLock
 from tl_loop.state.plan_manifest import PlanManifest
+from tl_loop.state.plan_revision import analyze_plan_revision
+from tl_loop.state.plan_revision_apply import apply_plan_revision
+from tl_loop.state.plan_revision_files import controller_lifecycle_lock_path
+from tl_loop.state.plan_revision_transaction import recover_plan_revision
 from tl_loop.state.read_model import project_read_model
 from tl_loop.state.schema import GateStatus, RunState
 from tl_loop.state.store import CorruptCheckpoint, RunStore
@@ -91,6 +96,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "abandon",
         "redispatch",
         "plan-proposal",
+        "plan-revision",
+        "plan-revision-recover",
         "recovery-command",
         "task-budget-reset",
         "preflight",
@@ -118,6 +125,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print_status(args)
         elif args.command == "plan-proposal":
             _print_plan_proposal(args)
+        elif args.command == "plan-revision":
+            _plan_revision(args)
+        elif args.command == "plan-revision-recover":
+            _recover_plan_revision(args)
         elif args.command == "plan-authoring":
             _plan_authoring(args)
         elif args.command == "preflight":
@@ -313,6 +324,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     proposal.set_defaults(command="plan-proposal")
 
+    plan_revision = subcommands.add_parser("plan-revision", help=argparse.SUPPRESS)
+    _add_project_options(plan_revision)
+    revision_mode = plan_revision.add_mutually_exclusive_group(required=True)
+    revision_mode.add_argument("--dry-run", action="store_true")
+    revision_mode.add_argument("--apply", action="store_true")
+    plan_revision.add_argument("--reason")
+    plan_revision.set_defaults(command="plan-revision")
+
+    revision_recovery = subcommands.add_parser("plan-revision-recover", help=argparse.SUPPRESS)
+    _add_project_options(revision_recovery)
+    revision_recovery.set_defaults(command="plan-revision-recover")
+
     recovery_command = subcommands.add_parser(
         "recovery-command", help="apply one authenticated, compare-and-set recovery command"
     )
@@ -343,6 +366,14 @@ def _add_project_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _run(args: argparse.Namespace) -> TLRunResult:
+    project_root = args.project_root.expanduser().resolve()
+    lifecycle_lock = controller_lifecycle_lock_path(project_root)
+    with RunLock(lifecycle_lock, timeout=5.0):
+        recover_plan_revision(project_root, controller_locked=True)
+        return _run_controller(args)
+
+
+def _run_controller(args: argparse.Namespace) -> TLRunResult:
     task_timeout = getattr(args, "task_timeout", DEFAULT_TASK_TIMEOUT_SECONDS)
     project_root = args.project_root.expanduser().resolve()
     controller_fingerprint = fingerprint_report(project_root)
@@ -700,6 +731,25 @@ def _plan_authoring(args: argparse.Namespace) -> None:
     summary["installed"] = True
     summary["manifest_digest"] = cast(str, cast(PlanManifest, state.plan_manifest).digest)
     print(json.dumps(summary, sort_keys=True))
+
+
+def _plan_revision(args: argparse.Namespace) -> None:
+    project_root = args.project_root.expanduser().resolve()
+    if args.apply:
+        if not isinstance(args.reason, str) or not args.reason.strip():
+            raise LauncherError("--apply requires a non-empty --reason")
+        result = apply_plan_revision(project_root, args.reason).to_document()
+    else:
+        if args.reason is not None:
+            raise LauncherError("--reason is only valid with --apply")
+        result = analyze_plan_revision(project_root).to_document()
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _recover_plan_revision(args: argparse.Namespace) -> None:
+    project_root = args.project_root.expanduser().resolve()
+    recovered = recover_plan_revision(project_root)
+    print(json.dumps({"recovered": recovered}, sort_keys=True))
 
 
 def _print_plan_proposal(args: argparse.Namespace) -> None:

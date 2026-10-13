@@ -70,7 +70,8 @@ authority and may omit the external plan, so a missing, changed, or reordered
 `plan.json` cannot silently alter active work. See the
 [recursive recovery reconciliation](docs/decisions/tl-recovery-backlog-reconciliation.md)
 and [programming guide](docs/guides/programming-the-tl.md) for the durable
-contract.
+contract, including the explicit `exomonad plan revise` path for audited
+changes to future work in an active run.
 
 ```bash
 cd your-project/

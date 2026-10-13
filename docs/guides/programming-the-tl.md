@@ -217,6 +217,34 @@ preserves a non-terminal run; `--start` is only for a missing or terminal run;
 and `--recreate --confirm-recreate` is the destructive replacement path. Use
 `--recreate --recreate-dry-run` to inspect its plan without changing state.
 
+### Revising an active plan
+
+When an operator needs to add or update future work in a nonterminal run, edit
+`.exo/tl-loop/plan.json` and inspect the candidate before applying it:
+
+```bash
+exomonad plan revise --dry-run
+exomonad plan revise --apply --reason "Bind issue IDs to the remaining planned slices"
+exomonad init --continue
+```
+
+The dry run reports changed nodes and scopes, proposed manifest revisions, and
+any protected work that blocks the change. Apply requires an operator reason,
+records an audit entry, and commits the plan snapshot, digest, and affected
+RunStore manifests as a recoverable transition. The command does not start the
+controller, dispatch work, or change Chainlink issues. After it succeeds, use
+`exomonad init --continue` to resume the existing run.
+
+Revisions can add or update future, undispatched work. They cannot rewrite the
+identity or ownership of dispatched or completed nodes, remove nodes, or alter
+their branch and dependency history. Chainlink issue IDs on future leaves are
+optional tracking metadata; they do not gate completion or issue closure. If
+the saved plan snapshot and current manifests have already drifted, revision
+fails closed and requires a separately verified reconciliation path.
+
+`--continue` remains a strict resume and never accepts an edited plan by itself.
+`--recreate` remains the path for replacing a run, not applying a revision.
+
 ### What actually gates a merge
 
 The rule has two authorities and one integrity invariant:

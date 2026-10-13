@@ -2855,7 +2855,7 @@ const PLAN_TRANSITION_PHASE_PREPARED: &str = "prepared";
 const PLAN_TRANSITION_PHASE_ARCHIVED: &str = "archived";
 const PLAN_TRANSITION_PHASE_ROLLED_BACK: &str = "rolled_back";
 
-fn acquire_init_lifecycle_lock(
+pub(crate) fn acquire_init_lifecycle_lock(
     project_dir: &Path,
 ) -> Result<claude_teams_bridge::file_lock::FileLock> {
     let lock_target = project_dir.join(".exo/tl-loop/init-reconcile");
@@ -2871,7 +2871,7 @@ fn acquire_init_lifecycle_lock(
         .context("failed to acquire project init lifecycle lock")
 }
 
-fn acquire_plan_transition_lock(
+pub(crate) fn acquire_plan_transition_lock(
     project_dir: &Path,
 ) -> Result<claude_teams_bridge::file_lock::FileLock> {
     let lock_target = project_dir.join(".exo/tl-loop/plan-transition");
@@ -4780,7 +4780,7 @@ fn validate_tl_loop_python_version(found: (u32, u32, u32), required: (u32, u32))
     Ok(())
 }
 
-fn check_tl_loop_python(cwd: &Path) -> Result<String> {
+pub(crate) fn check_tl_loop_python(cwd: &Path) -> Result<String> {
     let interpreter = tl_loop_python(cwd);
     let output = std::process::Command::new(&interpreter)
         .args([
@@ -4850,6 +4850,32 @@ fn run_tl_loop_preflight(
         anyhow::bail!("TL controller preflight failed with {status}");
     }
     Ok(())
+}
+
+fn recover_tl_loop_plan_revision(cwd: &Path, package_root: &Path) -> Result<()> {
+    if !plan_revision_recovery_needed(cwd)? {
+        return Ok(());
+    }
+    let interpreter = check_tl_loop_python(cwd)?;
+    let status = std::process::Command::new(interpreter)
+        .arg(package_root)
+        .args(["plan-revision-recover", "--project-root"])
+        .arg(cwd)
+        .status()
+        .context("failed to run plan revision recovery")?;
+    if !status.success() {
+        anyhow::bail!("plan revision recovery failed with {status}");
+    }
+    Ok(())
+}
+
+fn plan_revision_recovery_needed(cwd: &Path) -> Result<bool> {
+    let journal = cwd.join(".exo/tl-loop/plan-revision-transition.json");
+    match std::fs::symlink_metadata(journal) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("failed to inspect plan revision journal"),
+    }
 }
 
 fn plan_digest(bytes: &[u8]) -> String {
@@ -5015,7 +5041,7 @@ fn validate_runtime_compatibility(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn tl_loop_package_root() -> Result<PathBuf> {
+pub(crate) fn tl_loop_package_root() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is required to install the TL controller")?;
     tl_loop_package_root_at(&PathBuf::from(home).join(".exo"))
 }
@@ -6159,11 +6185,13 @@ pub async fn run(
     // inbox, capability, plan, or orchestration side effect.
     let mut config = Config::discover()?;
     validate_runtime_compatibility(&cwd)?;
+    let tl_loop_root = tl_loop_package_root()?;
     let init_lifecycle_lock = acquire_init_lifecycle_lock_async(&cwd).await?;
     let mut no_transition_failure = None;
     {
         let _plan_transition_lock = acquire_plan_transition_lock_async(&cwd).await?;
         recover_plan_transition_locked(&cwd, &mut no_transition_failure)?;
+        recover_tl_loop_plan_revision(&cwd, &tl_loop_root)?;
     }
     let mut mode = mode;
     let recreate = mode.is_recreate();
@@ -6210,7 +6238,6 @@ pub async fn run(
     let runtime_paths = config.tl_preflight_runtime_paths.join(",");
     std::env::set_var(TL_PREFLIGHT_RUNTIME_PATHS_ENV, &runtime_paths);
     ensure_harness_capability(&cwd)?;
-    let tl_loop_root = tl_loop_package_root()?;
     let controller_plan_digest;
     if let Some(decision) = start_plan_decision {
         let expected_plan_digest = decision.validated_plan().map(plan_digest);
@@ -13508,5 +13535,19 @@ mod tests {
         verify_first_window_codex_home("@0", None)
             .await
             .expect("nothing to verify");
+    }
+
+    #[test]
+    fn plan_revision_startup_detects_broken_journal_links() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!plan_revision_recovery_needed(dir.path()).unwrap());
+
+        let journal = dir
+            .path()
+            .join(".exo/tl-loop/plan-revision-transition.json");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing-journal"), &journal).unwrap();
+
+        assert!(plan_revision_recovery_needed(dir.path()).unwrap());
     }
 }
