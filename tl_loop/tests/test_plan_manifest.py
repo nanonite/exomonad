@@ -242,7 +242,7 @@ def test_store_round_trip_requires_exact_slice_manifest_binding(tmp_path) -> Non
     assert state.plan_manifest == manifest
 
 
-def test_store_rejects_changed_external_plan_without_revision(tmp_path) -> None:
+def test_store_refuses_unjournaled_manifest_revisions(tmp_path) -> None:
     original = build_plan_manifest(_plan(), scope_id="authority")
     changed = build_plan_manifest(
         {**_plan(), "sub_tls": list(reversed(_plan()["sub_tls"]))},
@@ -255,11 +255,20 @@ def test_store_rejects_changed_external_plan_without_revision(tmp_path) -> None:
     )
     create("authority", {"plan_manifest": original.to_document()}, root_dir=tmp_path)
     store = RunStore("authority", tmp_path)
-    with pytest.raises(ManifestError, match="revision"):
+    with pytest.raises(ManifestError, match="audited plan revision transaction"):
         store.set_plan_manifest(changed)
-    revised_state = store.set_plan_manifest(revised)
-    assert revised_state.plan_manifest == revised
-    assert set(revised_state.slices) == {node.name for node in revised.nodes}
+    with pytest.raises(ManifestError, match="audited plan revision transaction"):
+        store.set_plan_manifest(revised)
+    state = store.load()
+    with pytest.raises(ManifestError, match="audited plan revision or reconciliation"):
+        store.checkpoint(
+            state.fsm,
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+            plan_manifest=changed,
+        )
+    assert store.load().plan_manifest == original
 
 
 def test_schema_rejects_manifest_nodes_without_slice_state() -> None:
@@ -453,7 +462,7 @@ def test_continuation_rejects_reordered_external_plan(tmp_path) -> None:
         "leaves": original["leaves"],
         "sub_tls": list(reversed(original["sub_tls"])),
     }
-    with pytest.raises(driver.TLLoopError, match="increase plan_revision"):
+    with pytest.raises(driver.TLLoopError, match="exomonad plan revise --dry-run"):
         run_tl_loop(
             "reordered",
             reordered,
@@ -482,20 +491,25 @@ def test_continuation_rejects_changed_external_plan(tmp_path) -> None:
 
     changed = {
         "workers": original["workers"],
-        "leaves": [
-            {"name": "leaf", "task": "changed task", "chainlink_issue_id": None}
-        ],
+        "leaves": [{"name": "leaf", "task": "changed task", "chainlink_issue_id": None}],
         "sub_tls": original["sub_tls"],
     }
-    with pytest.raises(driver.TLLoopError, match="increase plan_revision"):
+    checkpoint = RunStore("changed", tmp_path).path.read_bytes()
+    with pytest.raises(driver.TLLoopError, match="exomonad plan revise --dry-run"):
         run_tl_loop(
             "changed",
             changed,
             EmptySource(),
             ReadOnlyEffectClient(EffectClient(NoopTransport(), role="tl", name="root")),
-            config=TLLoopConfig(active=False, max_events=1, root_dir=tmp_path),
+            config=TLLoopConfig(
+                active=False,
+                max_events=1,
+                plan_revision=2,
+                root_dir=tmp_path,
+            ),
             root_dir=tmp_path,
         )
+    assert RunStore("changed", tmp_path).path.read_bytes() == checkpoint
 
 
 def test_terminal_checkpoint_rejects_supplied_plan_drift_before_fast_path(tmp_path) -> None:

@@ -422,11 +422,13 @@ def test_unversioned_manifest_drift_is_not_adopted(tmp_path: Path) -> None:
         _manifest_plan(changed_plan),
         scope_id="root",
         owned_branch="main",
-        manifest_revision=2,
+        manifest_revision=1,
     )
-    store.set_plan_manifest(changed_manifest)
+    document = json.loads(store.path.read_text(encoding="utf-8"))
+    document["plan_manifest"] = changed_manifest.to_document()
+    store.path.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(PlanRevisionError, match="separately verified reconciliation") as error:
+    with pytest.raises(PlanRevisionError, match="exomonad plan reconcile --dry-run") as error:
         analyze_plan_revision(tmp_path)
 
     assert error.value.code == "unversioned_plan_drift"

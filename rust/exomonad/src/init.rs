@@ -3455,14 +3455,14 @@ fn validate_or_record_plan_snapshot_locked(cwd: &Path, mode: SessionMode) -> Res
             .with_context(|| format!("failed to read {}", snapshot_path.display()))?;
         if current != original {
             anyhow::bail!(
-                "cannot continue: {} differs from its persisted session snapshot; use --start or explicitly reconcile the plan",
+                "cannot continue: {} differs from its persisted session snapshot; inspect `exomonad plan revise --dry-run` and apply the audited revision. If it reports unversioned_plan_drift, inspect `exomonad plan reconcile --dry-run` and apply only with its evidence fingerprint",
                 plan_path.display()
             );
         }
         let expected_digest = plan_digest(&original);
         match read_plan_snapshot_digest(cwd)? {
             Some(actual_digest) if actual_digest != expected_digest => anyhow::bail!(
-                "cannot continue: persisted plan identity differs from its snapshot; use --recreate --confirm-recreate to reconcile it"
+                "cannot continue: plan.snapshot does not match its saved digest; automatic recovery is unsupported. Restore both files from a validated accepted-plan backup before continuing"
             ),
             Some(_) => {}
             None => write_plan_snapshot_digest(cwd, &expected_digest)?,
@@ -3501,7 +3501,7 @@ fn capture_validated_plan_digest(cwd: &Path) -> Result<Option<String>> {
             })?;
             if persisted != expected {
                 anyhow::bail!(
-                    "persisted plan identity does not match plan.json and plan.snapshot"
+                    "plan.snapshot does not match its saved digest; automatic recovery is unsupported. Restore both files from a validated accepted-plan backup before continuing"
                 );
             }
             Ok(Some(persisted))
@@ -3513,7 +3513,9 @@ fn capture_validated_plan_digest(cwd: &Path) -> Result<Option<String>> {
             "cannot use persisted plan identity: plan.snapshot is missing while plan.json exists"
         ),
         (Some(_), Some(_)) => {
-            anyhow::bail!("persisted plan identity cannot be captured because plan bytes differ")
+            anyhow::bail!(
+                "persisted plan identity cannot be captured because plan.json differs from plan.snapshot; inspect `exomonad plan revise --dry-run` before continuing"
+            )
         }
     }
 }
@@ -8762,6 +8764,10 @@ mod tests {
         assert!(error
             .to_string()
             .contains("differs from its persisted session snapshot"));
+        assert!(error.to_string().contains("exomonad plan revise --dry-run"));
+        assert!(error
+            .to_string()
+            .contains("exomonad plan reconcile --dry-run"));
         assert_eq!(
             snapshot,
             std::fs::read(plan_snapshot_path(tmp.path())).unwrap()
@@ -8792,6 +8798,7 @@ mod tests {
         assert!(error
             .to_string()
             .contains("differs from its persisted session snapshot"));
+        assert!(error.to_string().contains("exomonad plan revise --dry-run"));
         assert_eq!(
             std::fs::read(plan_snapshot_path(tmp.path())).unwrap(),
             original

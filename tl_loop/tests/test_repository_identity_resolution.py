@@ -57,12 +57,9 @@ def _seed_without_repository_identity(tmp_path: Path):
     legacy = _legacy_manifest()
     state = store.load()
     assert state.repository_identity is None
-    state = store.checkpoint(
-        state.fsm,
-        {SLICE_ID: _active_legacy_slice(merge_intent_id)},
-        state.budgets,
-        state.events.last_consumed_offset,
-        plan_manifest=legacy,
+    state = store.set_plan_manifest(
+        legacy,
+        slices={SLICE_ID: _active_legacy_slice(merge_intent_id)},
     )
 
     candidate = _candidate_manifest()
@@ -246,12 +243,8 @@ def test_previously_blocked_slice_recovers_once_identity_becomes_available(
     # recovery reused the existing owner/PR, it never re-dispatched or
     # re-merged.
     assert [name for name, _ in recovering_transport.calls if name == "merge_pr"] == []
-    assert (
-        len([n for n, _ in recovering_transport.calls if n == "chainlink_issue_close"]) == 1
-    )
-    assert (
-        len([n for n, _ in recovering_transport.calls if n == "post_merge_changelog"]) == 1
-    )
+    assert len([n for n, _ in recovering_transport.calls if n == "chainlink_issue_close"]) == 1
+    assert len([n for n, _ in recovering_transport.calls if n == "post_merge_changelog"]) == 1
     assert len([n for n, _ in recovering_transport.calls if n == "post_merge_push"]) == 1
     close_calls = [
         arguments

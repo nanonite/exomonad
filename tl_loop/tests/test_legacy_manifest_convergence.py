@@ -237,13 +237,9 @@ def _seed_and_migrate(tmp_path: Path):
     store = RunStore(RUN_ID, tmp_path)
     merge_intent_id = _seed_action_journal(store)
     legacy = _legacy_manifest()
-    state = store.load()
-    state = store.checkpoint(
-        state.fsm,
-        {SLICE_ID: _active_legacy_slice(merge_intent_id)},
-        state.budgets,
-        state.events.last_consumed_offset,
-        plan_manifest=legacy,
+    state = store.set_plan_manifest(
+        legacy,
+        slices={SLICE_ID: _active_legacy_slice(merge_intent_id)},
     )
 
     candidate = _candidate_manifest()

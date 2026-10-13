@@ -277,8 +277,15 @@ class RunStore:
         *,
         slices: Mapping[str, SliceInput] | None = None,
         protected_node_ids: set[str] | frozenset[str] = frozenset(),
+        allow_accepted_plan_install: bool = False,
     ) -> RunState:
-        """Install the immutable continuation manifest and bind direct slices."""
+        """Install an initial or accepted manifest and bind direct slices.
+
+        Active plan.json revisions must use the journaled plan revision
+        transaction so the external snapshot, digest, and recursive RunStores
+        change together. A changed non-legacy manifest is allowed here only for
+        the separately gated plan-authoring acceptance flow.
+        """
         if not isinstance(manifest, PlanManifest):
             raise TypeError("manifest must be a PlanManifest")
         encoded = manifest.to_document()
@@ -291,6 +298,10 @@ class RunStore:
                 if previous.digest != manifest.digest:
                     if _is_legacy_manifest(previous):
                         replace_node_binding = True
+                    elif not allow_accepted_plan_install:
+                        raise ManifestError(
+                            "manifest revision requires an audited plan revision transaction"
+                        )
                     else:
                         validate_manifest_revision(
                             previous,
@@ -994,6 +1005,15 @@ def checkpoint(
                 raise CheckpointConflict(
                     f"checkpoint revision changed: expected {expected_revision}, "
                     f"found {current_revision!r}"
+                )
+        existing_manifest = document.get("plan_manifest")
+        if encoded_manifest is not None and isinstance(existing_manifest, dict):
+            previous_manifest = PlanManifest.from_document(existing_manifest)
+            candidate_manifest = PlanManifest.from_document(encoded_manifest)
+            if previous_manifest.digest != candidate_manifest.digest:
+                raise ManifestError(
+                    "checkpoint cannot change plan identity; use an audited plan "
+                    "revision or reconciliation transaction"
                 )
         existing_fsm = document.get("fsm")
         legacy_terminal = isinstance(fsm, (TLDone, TLPRFiled, TLFailed))

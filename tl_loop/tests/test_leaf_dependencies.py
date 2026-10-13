@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import queue
-from pathlib import Path
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -13,7 +13,6 @@ import pytest
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope
-from tl_loop.select.policy import HarnessPolicy, validate_policy
 from tl_loop.loop import driver
 from tl_loop.loop.driver import (
     EffectIntent,
@@ -21,8 +20,8 @@ from tl_loop.loop.driver import (
     WorkPlan,
     _bind_initial_slices,
     _block_unsatisfiable_dependents,
-    _dispatch_children,
     _can_dispatch,
+    _dispatch_children,
     _initial_slices,
     _rebind_dependency_edges,
     _reopens_dispatch_pass,
@@ -37,6 +36,7 @@ from tl_loop.loop.schedule import (
 )
 from tl_loop.plan_dependencies import DependencyValidationError, validate_leaf_dependencies
 from tl_loop.plan_validation import PlanValidationError, validate_plan_document
+from tl_loop.select.policy import HarnessPolicy, validate_policy
 from tl_loop.state.plan_manifest import (
     ManifestError,
     PlanManifest,
@@ -47,7 +47,7 @@ from tl_loop.state.plan_manifest import (
 from tl_loop.state.schema import RunState, SliceState, SliceStatus
 from tl_loop.state.store import RunStore, create
 
-from .test_driver import SyntheticQueue, _event
+from .test_driver import _event
 
 
 class _EmptySource:
@@ -115,7 +115,9 @@ def test_a_nested_scope_resolves_its_edges_within_its_own_plan() -> None:
     validated = validate_plan_document(document)
     nested = cast(dict[str, object], validated["plan"]["sub_tls"][0]["plan"])  # type: ignore[index]
 
-    assert [leaf.get("depends_on", []) for leaf in cast(list[dict[str, object]], nested["leaves"])] == [  # type: ignore[index]
+    assert [
+        leaf.get("depends_on", []) for leaf in cast(list[dict[str, object]], nested["leaves"])
+    ] == [  # type: ignore[index]
         [],
         ["a"],
     ]
@@ -294,7 +296,8 @@ def test_a_node_added_by_a_manifest_revision_starts_with_its_declared_edges(
     state = store.set_plan_manifest(
         build_plan_manifest(
             _mapping(leaf_a(), leaf_b("a")), scope_id="accepted", manifest_revision=2
-        )
+        ),
+        allow_accepted_plan_install=True,
     )
 
     assert state.slices["b"].depends_on == ("a",)
@@ -480,9 +483,7 @@ def test_blocking_a_dependent_is_durable_and_idempotent(tmp_path: Path) -> None:
 
 def test_a_leaf_dag_dispatches_in_dependency_order(tmp_path: Path) -> None:
     """Only the DAG root is dispatched, and the dependent follows its merge."""
-    plan, store, transport = _started(
-        tmp_path, "leaf-dag-run", _mapping(leaf_a(), leaf_b("a"))
-    )
+    plan, store, transport = _started(tmp_path, "leaf-dag-run", _mapping(leaf_a(), leaf_b("a")))
 
     _dispatch_pass(plan, store, transport)
     assert _spawned(transport) == ["a"]
@@ -609,6 +610,7 @@ def test_a_revision_rewires_a_pending_leaf_but_never_a_dispatched_one(
             "a": _record("a", status=SliceStatus.MERGED),
         },
         protected_node_ids={"rewire/leaf/a"},
+        allow_accepted_plan_install=True,
     )
     assert dispatched.slices["a"].depends_on == ()
     rewire_dispatched = build_plan_manifest(
@@ -619,6 +621,7 @@ def test_a_revision_rewires_a_pending_leaf_but_never_a_dispatched_one(
             rewire_dispatched,
             slices={**_encoded(pending), "b": _record("b", status=SliceStatus.MERGED)},
             protected_node_ids={"rewire/leaf/b"},
+            allow_accepted_plan_install=True,
         )
 
 
@@ -831,9 +834,7 @@ def _record(
     }
 
 
-def _run_state(
-    slices: dict[str, SliceState], tmp_path: Path, *, run_id: str = "gate"
-) -> RunState:
+def _run_state(slices: dict[str, SliceState], tmp_path: Path, *, run_id: str = "gate") -> RunState:
     """Persist ``slices`` under a fresh run and return the state the gate reads."""
     store = RunStore(root_dir=tmp_path, run_id=run_id)
     create(run_id, {"slices": _encoded(slices)}, root_dir=store.root_dir)
@@ -865,7 +866,7 @@ def _encoded(slices: Mapping[str, SliceState]) -> dict[str, dict[str, object]]:
 
 def _started(
     tmp_path: Path, run_id: str, plan_mapping: dict[str, object]
-) -> tuple[WorkPlan, RunStore, "_Transport"]:
+) -> tuple[WorkPlan, RunStore, _Transport]:
     """Persist a declared run whose every slice is still pending.
 
     Starting from the durable declaration rather than a live loop keeps these
@@ -878,9 +879,7 @@ def _started(
     create(
         run_id,
         {
-            "slices": dict(
-                _bind_initial_slices(_initial_slices(plan, config), manifest)
-            ),
+            "slices": dict(_bind_initial_slices(_initial_slices(plan, config), manifest)),
             "plan_manifest": manifest.to_document(),
         },
         root_dir=tmp_path,
@@ -888,7 +887,7 @@ def _started(
     return plan, RunStore(root_dir=tmp_path, run_id=run_id), _Transport()
 
 
-def _dispatch_pass(plan: WorkPlan, store: RunStore, transport: "_Transport") -> RunState:
+def _dispatch_pass(plan: WorkPlan, store: RunStore, transport: _Transport) -> RunState:
     """Run one real dispatch pass against the persisted run."""
     config = TLLoopConfig(root_dir=store.root_dir)
     effects_log: list[EffectIntent] = []
@@ -934,7 +933,7 @@ def _policy() -> HarnessPolicy:
     )
 
 
-def _spawned(transport: "_Transport") -> list[str]:
+def _spawned(transport: _Transport) -> list[str]:
     return [
         str(arguments.get("name")) for tool, arguments in transport.calls if tool == "spawn_leaf"
     ]
@@ -945,8 +944,7 @@ def _blocked_events(effects_log: list[EffectIntent]) -> list[Mapping[str, object
     return [
         dict(entry.arguments)
         for entry in effects_log
-        if entry.operation == "emit_controller_event"
-        and "blocked_by" in entry.arguments
+        if entry.operation == "emit_controller_event" and "blocked_by" in entry.arguments
     ]
 
 
@@ -956,9 +954,7 @@ class _Transport:
     def __init__(self) -> None:
         self.calls: list[tuple[str, JsonObject]] = []
 
-    def call_tool(
-        self, role: str, name: str, tool_name: str, arguments: JsonObject
-    ) -> JsonObject:
+    def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
         del role, name
         self.calls.append((tool_name, arguments))
         if tool_name in {"spawn_leaf", "spawn_worker"}:
@@ -976,4 +972,3 @@ def _chain_events(run_id: str, *names: str) -> list[EventEnvelope]:
         seq += 1
     events.append(_event(seq, "all_children_done", run_id=run_id))
     return events
-

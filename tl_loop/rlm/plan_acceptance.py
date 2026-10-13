@@ -186,9 +186,7 @@ def plan_from_record(
         raise PlanAuthoringRecordError("plan-authoring record audit must be an object")
     _validate_audit(audit)
     try:
-        manifest = build_authoring_manifest(
-            document, run_id=run_id, owned_branch=owned_branch
-        )
+        manifest = build_authoring_manifest(document, run_id=run_id, owned_branch=owned_branch)
     except PlanAuthoringError as error:
         raise PlanAuthoringRecordError(f"recorded plan is invalid: {error}") from error
     if manifest.digest != digest:
@@ -218,6 +216,7 @@ def install_accepted_plan(
         installed = store.set_plan_manifest(
             proposal.manifest,
             protected_node_ids=_protected_node_ids(state),
+            allow_accepted_plan_install=True,
         )
     except ManifestError as error:
         raise PlanAcceptanceError(
@@ -279,8 +278,7 @@ def _validate_audit(audit: Mapping[str, object]) -> None:
             f"plan-authoring audit violations must hold at most {MAX_AUDIT_VIOLATIONS} entries"
         )
     if any(
-        not isinstance(item, str) or len(item) > MAX_AUDIT_VIOLATION_CHARS
-        for item in violations
+        not isinstance(item, str) or len(item) > MAX_AUDIT_VIOLATION_CHARS for item in violations
     ):
         raise PlanAuthoringRecordError(
             f"plan-authoring audit violations must be strings within "

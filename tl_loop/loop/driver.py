@@ -237,6 +237,7 @@ from tl_loop.state.plan_manifest import (
     PlanManifest,
     build_plan_manifest,
 )
+from tl_loop.state.plan_revision_manifest import retain_scope_revisions
 from tl_loop.state.review_validation import review_validation_disposition
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
@@ -1322,6 +1323,7 @@ def run_tl_loop(
                 )
             supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
             candidate = _candidate_manifest(supplied_plan, run_id, selected)
+            candidate = retain_scope_revisions(candidate, persisted_manifest)
             if candidate.digest != persisted_manifest.digest:
                 raise TLLoopError(
                     "terminal checkpoint plan digest "
@@ -1508,52 +1510,19 @@ def run_tl_loop(
         else:
             supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
             candidate = _candidate_manifest(supplied_plan, run_id, selected)
+            candidate = retain_scope_revisions(candidate, persisted_manifest)
             if candidate.digest == persisted_manifest.digest:
                 work_plan = _work_plan_from_manifest(persisted_manifest)
                 manifest = persisted_manifest
                 initial_slices = None
             else:
-                if candidate.manifest_revision <= persisted_manifest.manifest_revision:
-                    raise TLLoopError(
-                        "external plan differs from the persisted manifest; "
-                        "increase plan_revision with an explicit compatible revision"
-                    )
-                protected = {
-                    slice_state.manifest_node_id
-                    for slice_state in existing_state.slices.values()
-                    if slice_state.status not in _UNDISPATCHED_STATUSES
-                    and slice_state.manifest_node_id is not None
-                }
-                generated = _initial_slices(supplied_plan, selected, root_dir, run_id)
-                initial_slices = _rebind_dependency_edges(
-                    {
-                        **dict(existing_state.slices),
-                        **{
-                            name: value
-                            for name, value in generated.items()
-                            if name not in existing_state.slices
-                        },
-                    },
-                    existing_state.slices,
-                    candidate,
+                raise TLLoopError(
+                    "external plan differs from the persisted manifest; use "
+                    "`exomonad plan revise --dry-run` and apply the audited revision. "
+                    "If revision analysis reports unversioned drift, inspect "
+                    "`exomonad plan reconcile --dry-run` and apply only with its "
+                    "current evidence fingerprint."
                 )
-                try:
-                    existing_state = store.set_plan_manifest(
-                        candidate,
-                        slices=initial_slices,
-                        protected_node_ids=protected,
-                    )
-                except ManifestError as error:
-                    if "chainlink_issue_id" in str(error):
-                        store.set_gate(CHAINLINK_BINDING_RECONCILIATION_GATE_NAME)
-                        raise TLLoopError(
-                            f"plan manifest revision rejected: {error}; resolve gate "
-                            f"{CHAINLINK_BINDING_RECONCILIATION_GATE_NAME!r}"
-                        ) from error
-                    raise TLLoopError(f"plan manifest revision rejected: {error}") from error
-                work_plan = _work_plan_from_manifest(candidate)
-                manifest = candidate
-                initial_slices = None
     else:
         if plan is None:
             if existing_state is None:

@@ -27,6 +27,7 @@ from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
 from tl_loop.fsm.phase import TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
+from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
 from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
@@ -119,6 +120,9 @@ from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.plan_manifest import build_plan_manifest
+from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
+from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
+from tl_loop.state.plan_revision_apply import apply_plan_revision
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -251,7 +255,9 @@ class DuplicateConfirmationCase:
     controller_epoch: str
 
 
-def _confirmed_worker(root: Path, *, run_id: str = "dispatch-duplicate-run") -> DuplicateConfirmationCase:
+def _confirmed_worker(
+    root: Path, *, run_id: str = "dispatch-duplicate-run"
+) -> DuplicateConfirmationCase:
     """A slice the controller has already confirmed at generation 1.
 
     This is the durable shape the codex-messaging run parked in: the slice is
@@ -425,14 +431,17 @@ def test_a_duplicate_confirmation_is_refused_across_epoch_generation_and_intent(
     assert unrecorded.classification == DISPATCH_INTEGRITY_CONFLICT
 
     # A slice still awaiting its confirmation is confirmed, not deduplicated.
-    pending = replace(case.state, slices={"worker-a": replace(
-        case.state.slices["worker-a"],
-        status=SliceStatus.DISPATCH_UNCONFIRMED,
-        dispatch_authoritative_event_seq=None,
-    )})
-    assert correlate_dispatch_event(pending, duplicate).classification == (
-        DISPATCH_CORRELATED
+    pending = replace(
+        case.state,
+        slices={
+            "worker-a": replace(
+                case.state.slices["worker-a"],
+                status=SliceStatus.DISPATCH_UNCONFIRMED,
+                dispatch_authoritative_event_seq=None,
+            )
+        },
     )
+    assert correlate_dispatch_event(pending, duplicate).classification == (DISPATCH_CORRELATED)
 
 
 def test_a_nested_child_scope_classifies_its_own_duplicate_the_same_way(
@@ -449,7 +458,11 @@ def test_a_nested_child_scope_classifies_its_own_duplicate_the_same_way(
     run_id = "nested-duplicate-run"
     child_plan = WorkPlan(workers=(WorkerTask("grandchild", "do the thing"),))
     plan = WorkPlan(sub_tls=(SubTLTask("child-a", child_plan, order=1),))
-    create(run_id, {"slices": _initial_slices(plan, TLLoopConfig(), tmp_path, run_id)}, root_dir=tmp_path)
+    create(
+        run_id,
+        {"slices": _initial_slices(plan, TLLoopConfig(), tmp_path, run_id)},
+        root_dir=tmp_path,
+    )
     state = RunStore(run_id, tmp_path).load()
     intent_id = hashlib.sha256(
         f"{run_id}:child-a:{state.slices['child-a'].attempts + 1}".encode()
@@ -474,9 +487,12 @@ def test_a_nested_child_scope_classifies_its_own_duplicate_the_same_way(
         {"intent_id": intent_id, "slug": "child-a"},
         {"intent_id": intent_id, "child_agent": "child-a-tl"},
     ):
-        assert correlate_dispatch_event(
-            nested, _spawn_row(run_id, run_seq=20, data=data)
-        ).classification == DISPATCH_ALREADY_CONFIRMED
+        assert (
+            correlate_dispatch_event(
+                nested, _spawn_row(run_id, run_seq=20, data=data)
+            ).classification
+            == DISPATCH_ALREADY_CONFIRMED
+        )
 
     crossed = correlate_dispatch_event(
         nested,
@@ -523,9 +539,7 @@ def _notify_parent_row(
                 "lifecycle_state": "emitted",
                 "data": {
                     "head_sha": None,
-                    "head_sha_finding": (
-                        "not_available_without_verified_pr_context"
-                    ),
+                    "head_sha_finding": ("not_available_without_verified_pr_context"),
                     "message": "the worker finished its task",
                     "parent": "root",
                     "source": "agent",
@@ -589,16 +603,14 @@ def test_a_worker_notify_parent_reaches_tl_done_through_its_runtime_agent_id(
         {"workers": [{"name": "worker-a", "task": "task"}]},
         scope_id=run_id,
     )
+    store.set_plan_manifest(manifest, slices=case.state.slices)
     store.checkpoint(
         FSMState(TLPhase.TLWaiting, ("worker-a",)),
         case.state.slices,
         case.state.budgets,
         8,
-        plan_manifest=manifest,
     )
-    source = SyntheticQueue(
-        [_notify_parent_row(run_id, run_seq=35, agent_id="worker-a-codex")]
-    )
+    source = SyntheticQueue([_notify_parent_row(run_id, run_seq=35, agent_id="worker-a-codex")])
 
     result = run_tl_loop(
         run_id,
@@ -621,9 +633,7 @@ def test_a_worker_notify_parent_reaches_tl_done_through_its_runtime_agent_id(
     assert result.diagnostics["rejected"] == 0
     # The report is consumed as authoritative progress, not filtered away.
     assert result.diagnostics["last_authoritative_event_seq"] == 35
-    assert [(t.event_seq, t.after) for t in result.transitions] == [
-        (35, TLPhase.TLAllMerged)
-    ]
+    assert [(t.event_seq, t.after) for t in result.transitions] == [(35, TLPhase.TLAllMerged)]
     assert store.quarantined_events() == ()
 
 
@@ -635,19 +645,20 @@ def test_a_notify_parent_from_a_foreign_runtime_agent_is_still_refused(
     plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
     case = _confirmed_worker(tmp_path, run_id=run_id)
     store = RunStore(run_id, tmp_path)
+    store.set_plan_manifest(
+        build_plan_manifest(
+            {"workers": [{"name": "worker-a", "task": "task"}]},
+            scope_id=run_id,
+        ),
+        slices=case.state.slices,
+    )
     store.checkpoint(
         FSMState(TLPhase.TLWaiting, ("worker-a",)),
         case.state.slices,
         case.state.budgets,
         8,
-        plan_manifest=build_plan_manifest(
-            {"workers": [{"name": "worker-a", "task": "task"}]},
-            scope_id=run_id,
-        ),
     )
-    foreign = _notify_parent_row(
-        run_id, run_seq=35, agent_id="some-other-agent-codex"
-    )
+    foreign = _notify_parent_row(run_id, run_seq=35, agent_id="some-other-agent-codex")
     assert not _event_belongs_to_plan(foreign, set(case.state.slices), case.state)
 
     result = run_tl_loop(
@@ -685,15 +696,18 @@ def test_a_duplicate_confirmation_advances_the_cursor_without_quarantine(
     store = RunStore(run_id, tmp_path)
     # Persist the confirmed slice so the loop resumes from the parked shape:
     # one spawned worker, one waiting barrier, cursor at the first confirmation.
+    store.set_plan_manifest(
+        build_plan_manifest(
+            {"workers": [{"name": "worker-a", "task": "task"}]},
+            scope_id=run_id,
+        ),
+        slices=case.state.slices,
+    )
     store.checkpoint(
         FSMState(TLPhase.TLWaiting, ("worker-a",)),
         case.state.slices,
         case.state.budgets,
         8,
-        plan_manifest=build_plan_manifest(
-            {"workers": [{"name": "worker-a", "task": "task"}]},
-            scope_id=run_id,
-        ),
     )
     duplicate = _spawn_row(
         run_id,
@@ -772,10 +786,7 @@ def test_the_dispatch_intent_follows_the_run_generation_not_the_live_epoch(
     restarted = replace(created, controller_epoch="epoch-after-continue")
     assert restarted.generation_id == "epoch-created-under"
     assert restarted.controller_epoch != created.controller_epoch
-    assert (
-        _new_dispatch_attempt(restarted, "leaf-a", TLLoopConfig()).intent_id
-        == attempt.intent_id
-    )
+    assert _new_dispatch_attempt(restarted, "leaf-a", TLLoopConfig()).intent_id == attempt.intent_id
 
     # The attempt persists exactly as `_prepare_spawn` persists it, and the row
     # the first launch produced confirms it -- once: after the confirmation the
@@ -814,17 +825,14 @@ def test_the_dispatch_intent_follows_the_run_generation_not_the_live_epoch(
     recreated_attempt = _new_dispatch_attempt(recreated_state, "leaf-a", TLLoopConfig())
     assert recreated_attempt.intent_id != attempt.intent_id
     pending = replace(in_flight, dispatch_intent_id=recreated_attempt.intent_id)
-    assert (
-        _confirm_dispatch_event(
-            {"leaf-a": pending},
-            {"leaf-a": pending},
-            spawn_row,
-            "leaf-a",
-            11,
-            "epoch-recreated",
-        )
-        == {"leaf-a": pending}
-    )
+    assert _confirm_dispatch_event(
+        {"leaf-a": pending},
+        {"leaf-a": pending},
+        spawn_row,
+        "leaf-a",
+        11,
+        "epoch-recreated",
+    ) == {"leaf-a": pending}
 
 
 def test_continue_adopts_the_new_controller_reconciliation_epoch(tmp_path: Path) -> None:
@@ -1050,7 +1058,6 @@ class RecordingTransport:
         return {"success": True, "result": None}
 
 
-
 def _install_ordered_invocation(
     monkeypatch: pytest.MonkeyPatch,
     invocation_id: str,
@@ -1059,9 +1066,7 @@ def _install_ordered_invocation(
     original = driver_module._prepare_sub_tl_stage
 
     def prepare(tasks, state, config, source, effects, store, effects_log, order):
-        state, prepared = original(
-            tasks, state, config, source, effects, store, effects_log, order
-        )
+        state, prepared = original(tasks, state, config, source, effects, store, effects_log, order)
         _checkpoint_ordered_sub_tl_invocation(store, tasks[0].name, invocation_id)
         return store.load(), prepared
 
@@ -2373,11 +2378,7 @@ def test_dispatch_waits_for_delayed_authoritative_confirmation(tmp_path: Path) -
 def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None:
     transport = RecordingTransport(reject_spawns=True)
     plan = WorkPlan.from_mapping(
-        {
-            "leaves": [
-                {"name": "leaf-a", "task": "implement the change", "chainlink_issue_id": None}
-            ]
-        }
+        {"leaves": [{"name": "leaf-a", "task": "implement the change", "chainlink_issue_id": None}]}
     )
     result = run_tl_loop(
         "dispatch-failure-run",
@@ -2410,11 +2411,7 @@ def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None
 def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> None:
     run_id = "dispatch-restart-run"
     plan = WorkPlan.from_mapping(
-        {
-            "leaves": [
-                {"name": "leaf-a", "task": "implement the change", "chainlink_issue_id": None}
-            ]
-        }
+        {"leaves": [{"name": "leaf-a", "task": "implement the change", "chainlink_issue_id": None}]}
     )
     cancel_event = threading.Event()
     config = TLLoopConfig(
@@ -2637,7 +2634,11 @@ def test_ledger_run_id_mismatch_reaches_driver_diagnostics(tmp_path: Path) -> No
             outcome["result"] = run_tl_loop(
                 run_id,
                 WorkPlan.from_mapping(
-                    {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+                    {
+                        "leaves": [
+                            {"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}
+                        ]
+                    }
                 ),
                 source,
                 EffectClient(transport),
@@ -3281,9 +3282,7 @@ def test_an_aggregate_approval_the_candidate_already_holds_binds_nothing(
         integration=IntegrationRuntimeState(
             lifecycle=IntegrationLifecycle.READY_FOR_INTEGRATION,
             sub_tl_states={"leaf-a": IntegrationLifecycle.READY_FOR_INTEGRATION},
-            candidates={
-                "leaf-a": _aggregate_candidate(IntegrationLifecycle.READY_FOR_INTEGRATION)
-            },
+            candidates={"leaf-a": _aggregate_candidate(IntegrationLifecycle.READY_FOR_INTEGRATION)},
         ),
     )
 
@@ -3342,9 +3341,7 @@ def test_an_aggregate_owner_stays_recognisable_at_every_boundary_it_reaches(
     )
 
     assert _is_aggregate_slice(replace(owner, dispatch_last_boundary=boundary))
-    assert not _is_aggregate_slice(
-        replace(owner, dispatch_last_boundary="spawn_request_accepted")
-    )
+    assert not _is_aggregate_slice(replace(owner, dispatch_last_boundary="spawn_request_accepted"))
 
 
 def _ownership_publication_snapshot(
@@ -3462,9 +3459,7 @@ def test_pending_merge_entry_untrusted_ownership_is_not_resolved(
         snapshots=[_ownership_publication_snapshot(merged=True, ownership=ownership)]
     )
 
-    resolved = _reconcile_pending_merge_entry(
-        entry, state, store, journal, EffectClient(transport)
-    )
+    resolved = _reconcile_pending_merge_entry(entry, state, store, journal, EffectClient(transport))
 
     assert resolved is False
     # The pending merge stays pending; it was not confirmed from the snapshot.
@@ -3699,7 +3694,6 @@ def _tl_choice(backend: ReviewBackend) -> RlmModelChoice:
     )
 
 
-
 def test_requested_model_requires_catalog() -> None:
     with pytest.raises(ValueError, match="requested_model requires a model catalog"):
         TLLoopConfig(requested_model="gpt-5-mini")
@@ -3735,7 +3729,7 @@ def _review_store(
                 "owner": "org",
                 "repo": "repo",
                 "base_branch": "main",
-            }
+            },
         },
         root_dir=tmp_path,
     )
@@ -4015,9 +4009,7 @@ def _mergeable_review_store(tmp_path: Path) -> RunStore:
             "leaf-a": replace(
                 current,
                 publication=PublicationBinding(42, "head-a", "main.leaf-a", "main", 1),
-                handoff=HandoffEvidence(
-                    42, "head-a", 1, "inv-1", "leaf-a", "2026-08-12T00:00:00Z"
-                ),
+                handoff=HandoffEvidence(42, "head-a", 1, "inv-1", "leaf-a", "2026-08-12T00:00:00Z"),
                 reviewer_attempt={"head-a": 1},
                 ci_state={"head-a": "success"},
             )
@@ -4114,16 +4106,16 @@ def test_parked_repeated_action_survives_restart_idempotently(tmp_path: Path) ->
 
     assert resumed.slices["leaf-a"].status is SliceStatus.PARKED
     assert resumed.slices["leaf-a"].park_cause is ParkCause.REPEATED_ACTION_NO_PROGRESS
-    assert [call for call in transport.calls if call[0] == "chainlink_issue_create"] == issues_before
+    assert [
+        call for call in transport.calls if call[0] == "chainlink_issue_create"
+    ] == issues_before
     assert not any(name == "merge_pr" for name, _ in transport.calls)
 
 
 def test_repeated_action_without_slice_target_opens_run_gate(tmp_path: Path) -> None:
     store = _mergeable_review_store(tmp_path)
     transport = RecordingTransport()
-    error = ConvergenceInvariantError(
-        "repeated_state_version_action", "abc123", target=None
-    )
+    error = ConvergenceInvariantError("repeated_state_version_action", "abc123", target=None)
 
     result = _park_repeated_action(
         store.load(), error, None, store, TLLoopConfig(active=True), EffectClient(transport), []
@@ -4159,9 +4151,7 @@ def test_repeated_action_run_gate_is_idempotent_and_respects_answer(tmp_path: Pa
     first = _park_repeated_action(
         state, error, decision, store, config, EffectClient(first_transport), []
     )
-    assert any(
-        gate.name == gate_name and gate.status is GateStatus.PENDING for gate in first.gates
-    )
+    assert any(gate.name == gate_name and gate.status is GateStatus.PENDING for gate in first.gates)
     assert (
         len(
             [
@@ -4179,9 +4169,7 @@ def test_repeated_action_run_gate_is_idempotent_and_respects_answer(tmp_path: Pa
     later = _park_repeated_action(
         first, error, decision, store, config, EffectClient(later_transport), []
     )
-    assert any(
-        gate.name == gate_name and gate.status is GateStatus.PENDING for gate in later.gates
-    )
+    assert any(gate.name == gate_name and gate.status is GateStatus.PENDING for gate in later.gates)
     assert not [
         arguments
         for name, arguments in later_transport.calls
@@ -4196,8 +4184,7 @@ def test_repeated_action_run_gate_is_idempotent_and_respects_answer(tmp_path: Pa
         rejected, error, decision, store, config, EffectClient(rejected_transport), []
     )
     assert any(
-        gate.name == gate_name and gate.status is GateStatus.REJECTED
-        for gate in preserved.gates
+        gate.name == gate_name and gate.status is GateStatus.REJECTED for gate in preserved.gates
     )
 
     # An approved retry that repeats re-arms one fresh pending occurrence.
@@ -4512,7 +4499,9 @@ def test_direct_reviewer_verdict_rejects_unverified_shared_account(tmp_path: Pat
     )
 
     _route_review_event(
-        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}),
+        WorkPlan.from_mapping(
+            {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+        ),
         store,
         store.load(),
         TLPlanning(),
@@ -5454,9 +5443,7 @@ def test_publication_from_watcher_refuses_invocation_mismatch(tmp_path: Path) ->
     assert dict(validation.rejection.observed)["succession_invocation_ids"] == ()
     assert "review content" not in repr(validation.rejection)
 
-    assert _publication_from_watcher(
-        current, watcher, "head-45", "leaf-a"
-    ) is None
+    assert _publication_from_watcher(current, watcher, "head-45", "leaf-a") is None
     publication = _publication_from_watcher(
         current, _watcher_publication("inv-current"), "head-45", "leaf-a"
     )
@@ -5513,12 +5500,10 @@ def test_publication_from_watcher_refuses_missing_invocation_provenance(
     tmp_path: Path,
 ) -> None:
     current = _watcher_current(tmp_path, "inv-current")
-    assert _publication_from_watcher(
-        current, _watcher_publication(None), "head-45", "leaf-a"
-    ) is None
-    assert _publication_from_watcher(
-        current, _watcher_publication(""), "head-45", "leaf-a"
-    ) is None
+    assert (
+        _publication_from_watcher(current, _watcher_publication(None), "head-45", "leaf-a") is None
+    )
+    assert _publication_from_watcher(current, _watcher_publication(""), "head-45", "leaf-a") is None
 
 
 def test_publication_from_watcher_refuses_unrelated_succession(tmp_path: Path) -> None:
@@ -5533,9 +5518,12 @@ def test_publication_from_watcher_refuses_without_active_invocation(tmp_path: Pa
     assert current.publication is None
     # No active dispatch/recovery invocation and no durable publication
     # binding: a historical record may not bind by itself.
-    assert _publication_from_watcher(
-        current, _watcher_publication("inv-historical"), "head-45", "leaf-a"
-    ) is None
+    assert (
+        _publication_from_watcher(
+            current, _watcher_publication("inv-historical"), "head-45", "leaf-a"
+        )
+        is None
+    )
 
 
 def test_publication_from_watcher_binds_without_active_invocation_when_durable(
@@ -5559,9 +5547,10 @@ def test_publication_from_watcher_binds_without_active_invocation_when_durable(
     assert publication is not None
     assert publication.invocation_id == "inv-historical"
     # A durable binding proves only its own invocation.
-    assert _publication_from_watcher(
-        durable, _watcher_publication("inv-other"), "head-45", "leaf-a"
-    ) is None
+    assert (
+        _publication_from_watcher(durable, _watcher_publication("inv-other"), "head-45", "leaf-a")
+        is None
+    )
 
 
 def test_malformed_publication_is_refused_not_absent(tmp_path: Path) -> None:
@@ -5633,9 +5622,10 @@ def test_publication_from_watcher_refuses_missing_author(tmp_path: Path) -> None
 
 def test_publication_from_watcher_refuses_when_no_expected_owner(tmp_path: Path) -> None:
     current = replace(_watcher_current(tmp_path, "inv-current"), dispatch_agent_id=None)
-    assert _publication_from_watcher(
-        current, _watcher_publication("inv-current"), "head-45", None
-    ) is None
+    assert (
+        _publication_from_watcher(current, _watcher_publication("inv-current"), "head-45", None)
+        is None
+    )
 
 
 def test_publication_from_watcher_binds_succession_in_origin_direction(
@@ -6340,7 +6330,11 @@ def test_idle_silence_preserves_spawned_state_until_explicit_cancellation(
             run_tl_loop(
                 run_id,
                 WorkPlan.from_mapping(
-                    {"leaves": [{"name": "leaf-a", "task": "long work", "chainlink_issue_id": None}]}
+                    {
+                        "leaves": [
+                            {"name": "leaf-a", "task": "long work", "chainlink_issue_id": None}
+                        ]
+                    }
                 ),
                 source,
                 EffectClient(RecordingTransport()),
@@ -7328,9 +7322,7 @@ def test_aggregate_file_pr_journal_replays_after_checkpoint_crash(
     child_store = RunStore("aggregate-child", parent_dir)
     child_state = child_store.load()
     child_slices = dict(child_state.slices)
-    child_slices["leaf-a"] = replace(
-        child_slices["leaf-a"], pr_number=42, reviewed_head="head-a"
-    )
+    child_slices["leaf-a"] = replace(child_slices["leaf-a"], pr_number=42, reviewed_head="head-a")
     child_store.checkpoint(
         child_state.fsm,
         child_slices,
@@ -7469,7 +7461,10 @@ def test_aggregate_watcher_observation_replays_after_checkpoint_crash(
         assert resumed.final_state.slices["later-stage"].status is SliceStatus.PENDING
 
     assert sum(name == "file_pr" for name, _ in transport.calls) == 1
-    assert sum(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls) == initial_leaf_effects
+    assert (
+        sum(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls)
+        == initial_leaf_effects
+    )
 
 
 def test_aggregate_file_pr_result_decoder_requires_complete_correlation() -> None:
@@ -7579,13 +7574,16 @@ def test_partial_aggregate_file_pr_response_adopts_watcher_evidence(
         result.final_state.slices["aggregate-child"].park_audit
     )
     assert result.final_state.slices["aggregate-child"].pr_number == 43
-    assert len(
-        [
-            arguments
-            for name, arguments in transport.calls
-            if name == "file_pr" and str(arguments.get("title", "")).startswith("Aggregate ")
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                arguments
+                for name, arguments in transport.calls
+                if name == "file_pr" and str(arguments.get("title", "")).startswith("Aggregate ")
+            ]
+        )
+        == 1
+    )
 
 
 def test_aggregate_publication_rehydrates_durable_invocation_before_file_pr(
@@ -7595,15 +7593,9 @@ def test_aggregate_publication_rehydrates_durable_invocation_before_file_pr(
     original = driver_module._prepare_sub_tl_stage
 
     def prepare(tasks, state, config, source, effects, store, effects_log, order):
-        state, prepared = original(
-            tasks, state, config, source, effects, store, effects_log, order
-        )
+        state, prepared = original(tasks, state, config, source, effects, store, effects_log, order)
         invocation_path = (
-            Path(config.project_root)
-            / ".exo"
-            / "agents"
-            / "aggregate-child"
-            / "invocation.json"
+            Path(config.project_root) / ".exo" / "agents" / "aggregate-child" / "invocation.json"
         )
         invocation_path.parent.mkdir(parents=True, exist_ok=True)
         worktree = str(
@@ -7839,13 +7831,429 @@ def test_aggregate_file_pr_timeout_continue_reconciles_without_duplicate(
         assert parked.park_audit is not None
         assert parked.park_audit["error_kind"] == "prior_file_pr_outcome_unresolved"
     assert child_store.load().revision == child_revision
-    assert len(
-        [
-            arguments
-            for name, arguments in transport.calls
-            if name == "file_pr" and str(arguments.get("title", "")).startswith("Aggregate ")
+    assert (
+        len(
+            [
+                arguments
+                for name, arguments in transport.calls
+                if name == "file_pr" and str(arguments.get("title", "")).startswith("Aggregate ")
+            ]
+        )
+        == 1
+    )
+
+
+def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "root"
+    architecture = _plan()
+    architecture = replace(
+        architecture,
+        leaves=(replace(architecture.leaves[0], chainlink_issue_id=811),),
+    )
+    future_issue_ids = (814, 812, 813, 815)
+    future_names = tuple(f"future-stage-{index}" for index in range(1, 5))
+    accepted_future_plans = tuple(
+        WorkPlan.from_mapping(
+            {
+                "leaves": [
+                    {
+                        "name": "future-leaf",
+                        "task": f"unchanged future task {index}",
+                        "chainlink_issue_id": None,
+                    }
+                ]
+            }
+        )
+        for index in range(1, 5)
+    )
+    stages = (
+        SubTLTask(
+            "architecture",
+            architecture,
+            source=SyntheticQueue(_lifecycle_events(run_id)),
+            order=1,
+        ),
+        *tuple(
+            SubTLTask(name, child_plan, source=SyntheticQueue([]), order=index + 2)
+            for index, (name, child_plan) in enumerate(
+                zip(future_names, accepted_future_plans, strict=True)
+            )
+        ),
+    )
+    accepted_plan = WorkPlan(sub_tls=stages)
+    candidate_stages = (
+        stages[0],
+        *tuple(
+            replace(
+                stage,
+                plan=replace(
+                    stage.plan,
+                    leaves=(
+                        replace(
+                            stage.plan.leaves[0],
+                            chainlink_issue_id=issue_id,
+                        ),
+                    ),
+                ),
+            )
+            for stage, issue_id in zip(stages[1:], future_issue_ids, strict=True)
+        ),
+    )
+    candidate_plan = WorkPlan(sub_tls=candidate_stages)
+
+    def public_plan_document(plan: WorkPlan) -> dict[str, object]:
+        canonical = dict(driver_module._manifest_plan(plan))
+        canonical["sub_tls"] = [
+            {
+                "name": stage.name,
+                "order": stage.order,
+                "plan": public_plan_document(
+                    stage.plan
+                    if isinstance(stage.plan, WorkPlan)
+                    else WorkPlan.from_mapping(stage.plan)
+                ),
+            }
+            for stage in plan.sub_tls
         ]
-    ) == 1
+        return canonical
+
+    def plan_bytes(plan: WorkPlan) -> bytes:
+        return json.dumps(
+            {"run_id": run_id, "plan": public_plan_document(plan)},
+            sort_keys=True,
+        ).encode()
+
+    state_root = tmp_path / ".exo" / "tl-loop"
+    state_root.mkdir(parents=True)
+    accepted_bytes = plan_bytes(accepted_plan)
+    (state_root / "plan.json").write_bytes(accepted_bytes)
+    (state_root / "plan.snapshot").write_bytes(accepted_bytes)
+    (state_root / "plan.snapshot.sha256").write_text(
+        hashlib.sha256(accepted_bytes).hexdigest() + "\n",
+        encoding="ascii",
+    )
+
+    invocation_id = "architecture-invocation"
+    original_prepare = driver_module._prepare_sub_tl_stage
+
+    def prepare(tasks, state, config, source, effects, store, effects_log, order):
+        state, prepared = original_prepare(
+            tasks, state, config, source, effects, store, effects_log, order
+        )
+        invocation_path = (
+            Path(config.project_root) / ".exo" / "agents" / tasks[0].name / "invocation.json"
+        )
+        if not invocation_path.exists():
+            _checkpoint_ordered_sub_tl_invocation(store, tasks[0].name, invocation_id)
+            worktree = str(
+                driver_module._sub_tl_worktree(config, store.root_dir, store.run_id, tasks[0])
+            )
+            invocation_path.parent.mkdir(parents=True, exist_ok=True)
+            invocation_path.write_text(
+                json.dumps(
+                    {
+                        "invocation_id": invocation_id,
+                        "trigger": "spawn",
+                        "slice_id": tasks[0].name,
+                        "branch": "main.architecture",
+                        "worktree": worktree,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return store.load(), prepared
+
+    monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", prepare)
+
+    class CrashAfterAggregatePublication(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            title = str(arguments.get("title", ""))
+            if tool_name == "file_pr" and title.startswith("Aggregate architecture into "):
+                self.calls.append((tool_name, arguments))
+                self.aggregate_reconciliation = _aggregate_watcher_fixture(
+                    invocation_id,
+                    slice_id="architecture",
+                    author_agent="architecture",
+                    head_branch="main.architecture",
+                )
+                raise SystemExit("simulated controller crash after aggregate publication")
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = CrashAfterAggregatePublication()
+    config = replace(
+        _config(),
+        root_dir=state_root,
+        project_root=tmp_path,
+        ledger_run_id=run_id,
+        keep_alive_on_waiting=False,
+    )
+    with pytest.raises(SystemExit, match="after aggregate publication"):
+        run_tl_loop(
+            run_id,
+            accepted_plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=state_root,
+        )
+
+    root_store = RunStore(run_id, state_root)
+    child_store = RunStore("architecture", root_store.run_dir)
+    child_state = child_store.load()
+    completed_leaf = child_state.slices["leaf-a"]
+    assert completed_leaf.chainlink_issue_id == 811
+    assert isinstance(child_state.recursive_fsm, RecursiveTLAllMerged)
+    receipt = PostMergeState(
+        PostMergePhase.COMPLETE,
+        {
+            "child_id": "leaf-a",
+            "repository": "org/repo",
+            "parent_branch": "main.architecture",
+            "pr_number": "45",
+            "head_sha": "a" * 40,
+            "merge_journal_id": "merge-45",
+            "lane_epoch": "epoch-1",
+            "parent_commit_sha": "b" * 40,
+            "issue_id": "811",
+            "issue_close_intent_id": "close-811",
+            "issue_close_journal_id": "chainlink-close:811",
+            "changelog_intent_id": "changelog-811",
+            "changelog_generation": "1",
+            "changelog_commit_sha": "c" * 40,
+            "parent_push_intent_id": "push-811",
+            "push_journal_id": "push-journal-811",
+            "expected_base_sha": "d" * 40,
+            "push_receipt_id": "receipt-811",
+            "pushed_commit": "e" * 40,
+            "bookkeeping_commit": "f" * 40,
+            "observed_remote_head": "f" * 40,
+            "ancestry_proof": "push-ancestry-811",
+        },
+    )
+    completed_leaf = replace(
+        completed_leaf,
+        status=SliceStatus.MERGED,
+        pr_number=45,
+        reviewed_head="a" * 40,
+        post_merge=receipt,
+        park_cause=None,
+        park_issue_id=None,
+        park_audit=None,
+    )
+    merged_fsm = replace(
+        child_state.recursive_fsm,
+        completed_children={
+            **child_state.recursive_fsm.completed_children,
+            "leaf-a": receipt,
+        },
+    )
+    child_store.checkpoint(
+        merged_fsm,
+        {**child_state.slices, "leaf-a": completed_leaf},
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    assert child_store.load().slices["leaf-a"].post_merge == receipt
+    close_count = sum(
+        name == "chainlink_issue_close" and str(args.get("issue_id")) == "811"
+        for name, args in transport.calls
+    )
+    assert close_count == 0
+    completed_leaf_effect_count = sum(
+        name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls
+    )
+
+    candidate_bytes = plan_bytes(candidate_plan)
+    (state_root / "plan.json").write_bytes(candidate_bytes)
+    drifted_manifest = driver_module._manifest_for_plan(
+        candidate_plan,
+        run_id,
+        replace(config, plan_revision=1),
+    )
+    root_document = json.loads(root_store.path.read_text(encoding="utf-8"))
+    root_document["plan_manifest"] = drifted_manifest.to_document()
+    root_store.path.write_text(json.dumps(root_document), encoding="utf-8")
+
+    reconciliation = analyze_plan_reconciliation(tmp_path)
+    assert reconciliation.can_apply, reconciliation.blockers
+    applied_reconciliation = apply_plan_reconciliation(
+        tmp_path,
+        "Restore accepted plan bindings before updating future issue metadata",
+        reconciliation.evidence_fingerprint,
+        actor="operator",
+    )
+    assert applied_reconciliation.applied
+    assert root_store.load().plan_manifest is not None
+    assert (
+        root_store.load().plan_manifest.digest
+        == driver_module._manifest_for_plan(accepted_plan, run_id, config).digest
+    )
+
+    revision = apply_plan_revision(
+        tmp_path,
+        "Bind Chainlink issues to future planned leaves",
+        actor="operator",
+    )
+    assert revision.applied
+    revised_root = root_store.load()
+    assert revised_root.plan_manifest is not None
+    for stage, issue_id in zip(candidate_stages[1:], future_issue_ids, strict=True):
+        stage_node = revised_root.plan_manifest.node(f"root/sub_tl/{stage.name}")
+        child_manifest = revised_root.plan_manifest.child_manifests[stage_node.node_id]
+        leaf = child_manifest.nodes[0]
+        assert leaf.chainlink_issue_id == issue_id
+        assert leaf.task == f"unchanged future task {future_names.index(stage.name) + 1}"
+
+    resumed_config = replace(
+        config,
+        session_mode="continue",
+        plan_revision=revised_root.plan_manifest.manifest_revision,
+    )
+    adopted = run_tl_loop(
+        run_id,
+        candidate_plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=resumed_config,
+        root_dir=state_root,
+    )
+    architecture_slice = adopted.final_state.slices["architecture"]
+    assert architecture_slice.status is SliceStatus.IN_REVIEW
+    assert architecture_slice.pr_number == 43
+    assert adopted.final_state.current_order == 1
+    assert all(
+        adopted.final_state.slices[name].status is SliceStatus.PENDING for name in future_names
+    )
+    assert sum(name == "file_pr" for name, _ in transport.calls) == 1
+    assert (
+        sum(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls)
+        == completed_leaf_effect_count
+    )
+    assert (
+        sum(
+            name == "chainlink_issue_close" and str(args.get("issue_id")) == "811"
+            for name, args in transport.calls
+        )
+        == close_count
+    )
+    assert child_store.load().slices["leaf-a"].post_merge == completed_leaf.post_merge
+
+    root_state = root_store.load()
+    waiting_for_review = root_state.slices["architecture"]
+    assert waiting_for_review.verdict is None
+    assert waiting_for_review.ci_state.get("head-a") != "success"
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+
+    approved = replace(
+        waiting_for_review,
+        verdict=Verdict.GO,
+        reviewed_head="head-a",
+        review_patch_digests={"head-a": "patch-a"},
+        ci_state={"head-a": "success"},
+    )
+    root_store.checkpoint(
+        root_state.fsm,
+        {**root_state.slices, "architecture": approved},
+        root_state.budgets,
+        root_state.events.last_consumed_offset,
+        current_order=root_state.current_order,
+        ordered_stages=root_state.ordered_stages,
+        integration=root_state.integration,
+    )
+    successful_snapshot = {
+        "head_sha": "head-a",
+        "base_sha": "base-a",
+        "patch_digest": "patch-a",
+        "merge_tree_sha": "tree-a",
+        "ci_status": "success",
+    }
+
+    class ReconciledIntegrationTransport(IntegrationTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "watcher_pr_state":
+                self.calls.append((tool_name, arguments))
+                snapshot = self.snapshots[0]
+                fixture = cast(JsonObject, self.aggregate_reconciliation)
+                watcher = cast(JsonObject, fixture["watcher"])
+                return {"success": True, "result": {**watcher, **snapshot}}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    integration_transport = ReconciledIntegrationTransport(
+        snapshots=[dict(successful_snapshot), dict(successful_snapshot)],
+        aggregate_reconciliation=transport.aggregate_reconciliation,
+    )
+    integrated = run_tl_loop(
+        run_id,
+        candidate_plan,
+        SyntheticQueue([]),
+        EffectClient(integration_transport),
+        config=resumed_config,
+        root_dir=state_root,
+    )
+
+    assert integrated.final_state.slices["architecture"].status is SliceStatus.MERGED
+    assert integrated.final_state.current_order == 1
+    root_state = root_store.load()
+    assert not driver_module._ordered_stage_complete(
+        (candidate_plan.sub_tls[0],), root_state.slices
+    )
+    aggregate_receipt = PostMergeState(
+        PostMergePhase.COMPLETE,
+        {
+            "child_id": "architecture",
+            "repository": "org/repo",
+            "parent_branch": "main",
+            "pr_number": "43",
+            "head_sha": "head-a",
+            "merge_journal_id": "aggregate-merge-43",
+            "lane_epoch": "1",
+            "parent_commit_sha": "base-a",
+            "issue_close_outcome": "not_applicable",
+            "changelog_outcome": "not_applicable",
+        },
+    )
+    merged_slice = replace(
+        root_state.slices["architecture"],
+        post_merge=aggregate_receipt,
+    )
+    recursive_fsm = root_state.recursive_fsm
+    assert isinstance(recursive_fsm, RecursiveTLRunning)
+    post_merge = dict(recursive_fsm.post_merge)
+    post_merge["architecture"] = aggregate_receipt
+    root_store.checkpoint(
+        replace(recursive_fsm, post_merge=post_merge),
+        {**root_state.slices, "architecture": merged_slice},
+        root_state.budgets,
+        root_state.events.last_consumed_offset,
+        current_order=root_state.current_order,
+        ordered_stages=root_state.ordered_stages,
+        integration=root_state.integration,
+    )
+    advanced = run_tl_loop(
+        run_id,
+        candidate_plan,
+        SyntheticQueue([]),
+        EffectClient(integration_transport),
+        config=resumed_config,
+        root_dir=state_root,
+    )
+    assert advanced.final_state.current_order == 2
+    assert advanced.final_state.slices[future_names[0]].status is not SliceStatus.PENDING
+    assert all(
+        advanced.final_state.slices[name].status is SliceStatus.PENDING for name in future_names[1:]
+    )
+    assert [name for name, _ in integration_transport.calls if name == "merge_pr"] == ["merge_pr"]
+    assert child_store.load().slices["leaf-a"].post_merge == completed_leaf.post_merge
+    assert (
+        sum(
+            name == "chainlink_issue_close" and str(args.get("issue_id")) == "811"
+            for name, args in transport.calls + integration_transport.calls
+        )
+        == close_count
+    )
 
 
 @pytest.mark.parametrize(
@@ -7886,9 +8294,15 @@ def test_aggregate_recovery_refuses_unresolved_or_mismatched_publications(
                 "watcher_unavailable",
             }:
                 self.aggregate_reconciliation = _aggregate_watcher_fixture(
-                    "unrelated-invocation" if failure_mode == "wrong_invocation" else "aggregate-child-invocation",
-                    author_agent="another-owner" if failure_mode == "wrong_owner" else "aggregate-child",
-                    head_branch="other-branch" if failure_mode == "wrong_branch" else "main.aggregate-child",
+                    "unrelated-invocation"
+                    if failure_mode == "wrong_invocation"
+                    else "aggregate-child-invocation",
+                    author_agent="another-owner"
+                    if failure_mode == "wrong_owner"
+                    else "aggregate-child",
+                    head_branch="other-branch"
+                    if failure_mode == "wrong_branch"
+                    else "main.aggregate-child",
                     base_branch="other-base" if failure_mode == "wrong_base" else "main",
                 )
                 if failure_mode == "stale_head":
@@ -7931,9 +8345,9 @@ def test_aggregate_recovery_refuses_unresolved_or_mismatched_publications(
                             "resolution": "live",
                             "slice_id": "aggregate-child",
                             "pr_number": "43",
-                            "publication": _aggregate_watcher_fixture(
-                                "aggregate-child-invocation"
-                            )["publication"],
+                            "publication": _aggregate_watcher_fixture("aggregate-child-invocation")[
+                                "publication"
+                            ],
                         },
                     }
                 if failure_mode == "wrong_pr":
@@ -7943,9 +8357,9 @@ def test_aggregate_recovery_refuses_unresolved_or_mismatched_publications(
                             "resolution": "live",
                             "slice_id": "aggregate-child",
                             "pr_number": 44,
-                            "publication": _aggregate_watcher_fixture(
-                                "aggregate-child-invocation"
-                            )["publication"],
+                            "publication": _aggregate_watcher_fixture("aggregate-child-invocation")[
+                                "publication"
+                            ],
                         },
                     }
                 if failure_mode == "wrong_slice":
@@ -7955,9 +8369,9 @@ def test_aggregate_recovery_refuses_unresolved_or_mismatched_publications(
                             "resolution": "live",
                             "slice_id": "another-slice",
                             "pr_number": 43,
-                            "publication": _aggregate_watcher_fixture(
-                                "aggregate-child-invocation"
-                            )["publication"],
+                            "publication": _aggregate_watcher_fixture("aggregate-child-invocation")[
+                                "publication"
+                            ],
                         },
                     }
             if tool_name == "watcher_pr_state" and failure_mode == "watcher_unavailable":
@@ -8017,11 +8431,7 @@ def test_aggregate_recovery_adopts_authorized_resume_without_replaying_leaf(
             tasks, state, config, source, effects, store, effects_log, order
         )
         invocation_path = (
-            Path(config.project_root)
-            / ".exo"
-            / "agents"
-            / "aggregate-child"
-            / "invocation.json"
+            Path(config.project_root) / ".exo" / "agents" / "aggregate-child" / "invocation.json"
         )
         if not invocation_path.exists():
             _checkpoint_ordered_sub_tl_invocation(store, tasks[0].name, prior_invocation)
@@ -8094,12 +8504,8 @@ def test_aggregate_recovery_adopts_authorized_resume_without_replaying_leaf(
 
     store = RunStore(run_id, tmp_path)
     assert store.load().slices["aggregate-child"].dispatch_invocation_id == prior_invocation
-    leaf_effects = sum(
-        name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls
-    )
-    invocation_path = (
-        tmp_path / ".exo" / "agents" / "aggregate-child" / "invocation.json"
-    )
+    leaf_effects = sum(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls)
+    invocation_path = tmp_path / ".exo" / "agents" / "aggregate-child" / "invocation.json"
     record = json.loads(invocation_path.read_text(encoding="utf-8"))
     record.update(
         {
@@ -8129,8 +8535,11 @@ def test_aggregate_recovery_adopts_authorized_resume_without_replaying_leaf(
     assert stage.pr_number == 43
     assert stage.dispatch_invocation_id == resumed_invocation
     assert resumed.final_state.slices["later-stage"].status is SliceStatus.PENDING
-    assert sum(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls) == leaf_effects
+    assert (
+        sum(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls) == leaf_effects
+    )
     assert sum(name == "file_pr" for name, _ in transport.calls) == 1
+
 
 def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approval(
     tmp_path: Path,
@@ -8973,8 +9382,7 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
     assert result.final_state.integration.head_sha is None
     assert [request.name for request in backend.requests] == ["integration_failure"]
     assert (
-        result.final_state.integration.candidates["aggregate-child"].tl_intervention_attempts
-        == 1
+        result.final_state.integration.candidates["aggregate-child"].tl_intervention_attempts == 1
     )
     assert result.final_state.budgets.role_spent["tl"] == 15
     assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]

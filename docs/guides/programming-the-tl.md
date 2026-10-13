@@ -30,9 +30,10 @@ checkpoint, the controller canonicalizes it into the immutable
 declarations. That persisted manifest—not a later external file—is the
 continuation authority. A continuation may omit `plan.json`; if an external
 file is supplied, missing, changed, or reordered content must not silently
-change the run. Only a strictly higher explicit manifest revision can change
-the declaration, and revisions are additive-only: dispatched ownership,
-parent scope, branch targets, and completed history are immutable.
+change the run. An active declaration changes only through the audited
+`exomonad plan revise` transition. It advances changed scope revisions and
+preserves dispatched ownership, parent scope, branch targets, and completed
+history.
 
 An externally blocked leaf may receive one bounded continuation clarification.
 The clarification carries the prior and proposed plan revision plus a
@@ -50,8 +51,9 @@ ceiling to make a run continue.
 For a new run, `plan.json` is the only accepted form of a root specification. A
 natural-language TL prompt is rejected — there is no interactive TL fallback.
 After the first checkpoint, the persisted manifest is the root specification
-for continuation; editing or replacing the external plan is not a recovery
-mechanism.
+for continuation. Editing the external plan alone changes no run authority;
+use `exomonad plan revise` for a supported declaration change or
+`exomonad plan reconcile` to repair evidence-backed drift.
 
 ---
 
@@ -244,6 +246,63 @@ fails closed and requires a separately verified reconciliation path.
 
 `--continue` remains a strict resume and never accepts an edited plan by itself.
 `--recreate` remains the path for replacing a run, not applying a revision.
+
+### Recovering plan drift
+
+`exomonad plan reconcile` and `exomonad plan revise` are implemented CLI
+commands. Reconciliation repairs drift in the persisted RunStore bindings from
+the accepted `plan.snapshot`; revision then applies an operator-edited
+`plan.json` candidate. Neither command starts the controller or dispatches
+work.
+
+Use this order when a revision dry run reports `unversioned_plan_drift`:
+
+```bash
+exomonad plan reconcile --dry-run
+exomonad plan reconcile --apply \
+  --reason "Restore RunStore identity from the accepted snapshot" \
+  --expected-fingerprint "<fingerprint from the dry run>"
+exomonad plan revise --dry-run
+exomonad plan revise --apply --reason "Bind issue IDs to future slices"
+exomonad init --continue
+```
+
+Reconciliation is allowed only when its evidence report proves the proposed
+restoration. It preserves completed work and receipts, and it does not change
+`plan.json`, `plan.snapshot`, or its digest. If the report has blockers, keep
+the run parked and resolve the missing evidence; do not copy a manifest or
+rewrite a RunStore by hand. Revision then updates the candidate, snapshot,
+digest, changed recursive manifests and runtime bindings, and audit in one
+recoverable transaction. A changed manifest passed directly to a continuing TL
+controller is refused with these command paths in the error.
+
+After `init --continue`, the controller may adopt a uniquely correlated
+existing aggregate PR using current repository, owner, invocation, branch, PR,
+head, base, and patch evidence. Adoption resumes review and CI tracking for that
+head. It does not supply a reviewer verdict, CI result, merge receipt, or
+ancestry proof. The ordered plan remains on that stage until its aggregate
+integration contract is complete. Missing, stale, or ambiguous publication
+evidence leaves the stage parked; do not create another PR or rerun completed
+leaves to repair the binding.
+
+### Plan identity writer inventory
+
+This inventory separates initial authority capture and checkpoint migration
+from active declaration changes:
+
+| Writer | What it writes | Supported boundary |
+| --- | --- | --- |
+| `tl_loop/__main__.py` launcher and `rust/exomonad/src/init.rs` snapshot capture | The launcher sends the exact preflight-accepted bytes to Rust `record-plan-snapshot`; Rust records the initial `plan.snapshot` and SHA-256 under the plan-transition lock. Continuation verifies existing bytes. | Establishes a new or legacy baseline. A missing digest can be derived only from the exact saved snapshot. It does not approve an edited active plan. |
+| `tl_loop/loop/driver.py` new-run creation | `run.json` manifest, slices, and recursive FSM in the initial checkpoint. | Initial declaration is installed together in one RunStore write. On continuation, a different external plan is refused. Proven legacy-manifest migration remains a compatibility path. |
+| `RunStore.checkpoint` | FSM, slices, budgets, event offset, and optional declaration binding in one `run.json` checkpoint. | Routine checkpointing may retain or initially install a manifest, but it rejects a changed manifest identity. It cannot update the accepted snapshot and therefore is not a plan-edit path. |
+| `RunStore.set_plan_manifest` | A single `run.json` manifest and its direct slice bindings. | Used for initial installation, verified legacy migration, and explicitly gated plan-authoring acceptance. Ordinary active revisions are rejected here because this method does not update the plan snapshot. |
+| `apply_plan_reconciliation` | Eligible recursive `run.json` bindings and a reconciliation audit record. | Journaled restoration from the digest-verified accepted snapshot. It leaves the candidate plan and snapshot bytes unchanged. |
+| `apply_plan_revision` | Candidate plan, snapshot, digest, affected recursive `run.json` manifests/slices/FSMs, and revision audit. | The supported path for active declaration changes; it locks participants, rechecks inputs, and commits or replays the transaction. |
+| Startup transaction recovery | Replays an existing plan-revision or plan-reconciliation journal. | Completes an already-approved transition. It does not create a new revision or choose a new plan authority. |
+
+The repository contains no separate operational script for changing these
+identities. Tests and fixtures may write checkpoint files directly to construct
+failure cases; those writes are not supported recovery operations.
 
 ### What actually gates a merge
 

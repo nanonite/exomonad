@@ -148,7 +148,8 @@ def _ensure_snapshot_matches_manifest(
         raise PlanRevisionError(
             "unversioned_plan_drift",
             "saved plan snapshot does not match the current root manifest; "
-            "use a separately verified reconciliation path",
+            "inspect `exomonad plan reconcile --dry-run`; apply only with the "
+            "current evidence fingerprint returned by that report",
         )
 
 

@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Prevent partial plan identity updates and document supported recovery boundaries (#1193)
 - Recover existing aggregate PR ownership without repeating completed leaf work (#1192)
 - Route nested recovery and require explicit plan issue bindings (#1185)
 - Track resumed TL invocations when reconciling existing publications (#1184)
