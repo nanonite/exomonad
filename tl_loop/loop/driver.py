@@ -233,6 +233,7 @@ from tl_loop.state.legacy_manifest import (
 )
 from tl_loop.state.plan_manifest import (
     ManifestError,
+    ManifestNode,
     PlanManifest,
     build_plan_manifest,
 )
@@ -629,6 +630,12 @@ class AggregatePublicationRejected(TLLoopError):
         self.needs_human = needs_human
         self.retryable = retryable
         self.missing_evidence = tuple(missing_evidence)
+
+
+@dataclass(frozen=True)
+class _LeafIssueProvenance:
+    issue_id: int | None
+    pr_number: int | None
 
 
 class IssueCloseRecoveryError(RuntimeError):
@@ -12222,8 +12229,8 @@ def _request_aggregate_candidate(
     effects_log: list[EffectIntent],
 ) -> AggregateCandidate:
     """Build and publish one sub-TL aggregate candidate."""
-    title = f"Aggregate {task.name} into {config.branch}"
-    body = _aggregate_publication_body(task, child_state, identity, config)
+    title = _aggregate_pr_title(task.name, config.branch)
+    body = _aggregate_publication_body(task, child_state, identity, config, store)
     arguments = {
         "title": title,
         "base_branch": config.branch,
@@ -12255,14 +12262,180 @@ def _aggregate_publication_body(
     child_state: RunState,
     identity: _AggregatePublicationIdentity,
     config: TLLoopConfig,
+    store: RunStore,
 ) -> str:
     """Format the credential-free aggregate PR description."""
-    return (
-        f"Aggregate sub-TL `{task.name}` into `{config.branch}`.\n"
-        f"Owner: `{identity.owner_id}`\n"
-        f"Head: `{_child_head_sha(child_state, identity.branch)}`\n"
-        f"Patch: `{_child_patch_digest(child_state)}`"
+    child_store = RunStore(task.name, store.run_dir)
+    return _aggregate_pr_body(
+        task.name,
+        config.branch,
+        identity.owner_id,
+        _child_head_sha(child_state, identity.branch),
+        _child_patch_digest(child_state),
+        _aggregate_leaf_provenance(child_state, child_store),
     )
+
+
+def _aggregate_leaf_provenance(
+    state: RunState,
+    store: RunStore,
+) -> tuple[_LeafIssueProvenance, ...]:
+    """Collect issue and PR references from leaf changes represented in this branch."""
+    references: list[_LeafIssueProvenance] = []
+    _collect_aggregate_leaf_provenance(state, store, references)
+    return tuple(
+        sorted(
+            set(references),
+            key=lambda ref: (
+                ref.issue_id is None,
+                ref.issue_id or 0,
+                ref.pr_number is None,
+                ref.pr_number or 0,
+            ),
+        )
+    )
+
+
+def _collect_aggregate_leaf_provenance(
+    state: RunState,
+    store: RunStore,
+    references: list[_LeafIssueProvenance],
+) -> None:
+    """Walk nested sub-TLs and collect leaves that published or merged their changes."""
+    if state.plan_manifest is None:
+        return
+    for node in state.plan_manifest.nodes:
+        if node.kind == "leaf":
+            _collect_leaf_slice_provenance(state, node, references)
+        elif node.kind == "sub_tl":
+            _collect_nested_leaf_provenance(state, store, node, references)
+
+
+def _collect_leaf_slice_provenance(
+    state: RunState,
+    node: ManifestNode,
+    references: list[_LeafIssueProvenance],
+) -> None:
+    """Add references from one leaf that published or merged its change."""
+    current = state.slices.get(node.name)
+    if current is None or current.status not in {SliceStatus.IN_REVIEW, SliceStatus.MERGED}:
+        return
+    issue_id = node.chainlink_issue_id or current.chainlink_issue_id
+    pr_number = current.pr_number
+    if issue_id is not None or pr_number is not None:
+        references.append(_LeafIssueProvenance(issue_id, pr_number))
+
+
+def _collect_nested_leaf_provenance(
+    state: RunState,
+    store: RunStore,
+    node: ManifestNode,
+    references: list[_LeafIssueProvenance],
+) -> None:
+    """Recurse into a completed nested sub-TL branch."""
+    current = state.slices.get(node.name)
+    if current is None or current.status is not SliceStatus.MERGED:
+        return
+    child_manifest = state.plan_manifest.child_manifests.get(node.node_id)
+    if child_manifest is None:
+        return
+    child_store = RunStore(node.name, store.run_dir)
+    if not child_store.path.exists():
+        _collect_manifest_leaf_issue_ids(child_manifest, references)
+        return
+    _collect_aggregate_leaf_provenance(child_store.load(), child_store, references)
+
+
+def _collect_manifest_leaf_issue_ids(
+    manifest: PlanManifest,
+    references: list[_LeafIssueProvenance],
+) -> None:
+    """Retain declared leaf issue IDs when a completed nested state is absent."""
+    for node in manifest.nodes:
+        if node.kind == "leaf" and node.chainlink_issue_id is not None:
+            references.append(_LeafIssueProvenance(node.chainlink_issue_id, None))
+        if node.kind == "sub_tl":
+            child = manifest.child_manifests.get(node.node_id)
+            if child is not None:
+                _collect_manifest_leaf_issue_ids(child, references)
+
+
+def _aggregate_pr_title(task_name: str, base_branch: str) -> str:
+    """Create a single-line title from the supplied aggregate identifiers."""
+    return _single_line_public_text(f"Aggregate {task_name} into {base_branch}")
+
+
+def _aggregate_pr_body(
+    task_name: str,
+    base_branch: str,
+    owner_id: str,
+    head_sha: str,
+    patch_digest: str,
+    references: Sequence[_LeafIssueProvenance],
+) -> str:
+    """Render escaped aggregate metadata and non-closing leaf references."""
+    lines = [
+        f"Aggregate sub-TL {_markdown_code_span(task_name)} into "
+        f"{_markdown_code_span(base_branch)}.",
+        f"Owner: {_markdown_code_span(owner_id)}",
+        f"Head: {_markdown_code_span(head_sha)}",
+        f"Patch: {_markdown_code_span(patch_digest)}",
+    ]
+    reference_lines = _aggregate_reference_lines(references)
+    if reference_lines:
+        lines.extend(("", "Leaf issue references:", *reference_lines))
+    return "\n".join(lines)
+
+
+def _aggregate_reference_lines(
+    references: Sequence[_LeafIssueProvenance],
+) -> tuple[str, ...]:
+    """Render stable, non-closing issue and PR references for included leaves."""
+    lines: list[str] = []
+    ordered = sorted(
+        set(references),
+        key=lambda ref: (
+            ref.issue_id is None,
+            ref.issue_id or 0,
+            ref.pr_number is None,
+            ref.pr_number or 0,
+        ),
+    )
+    for reference in ordered:
+        parts: list[str] = []
+        if reference.issue_id is not None:
+            parts.append(f"Refs #{reference.issue_id}")
+        if reference.pr_number is not None:
+            parts.append(f"Related PR: #{reference.pr_number}")
+        if parts:
+            lines.append(f"- {' · '.join(parts)}")
+    return tuple(lines)
+
+
+def _markdown_code_span(value: str) -> str:
+    """Wrap supplied text in a code span that cannot be closed by embedded ticks."""
+    normalized = _single_line_public_text(value)
+    fence = "`" * (_longest_backtick_run(normalized) + 1)
+    padding = " " if normalized.startswith("`") or normalized.endswith("`") else ""
+    return f"{fence}{padding}{normalized}{padding}{fence}"
+
+
+def _longest_backtick_run(value: str) -> int:
+    """Return the longest consecutive backtick run in one supplied value."""
+    longest = current = 0
+    for character in value:
+        if character == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
+
+
+def _single_line_public_text(value: str) -> str:
+    """Remove control characters and collapse whitespace before PR rendering."""
+    printable = "".join(character if character.isprintable() else " " for character in value)
+    return " ".join(printable.split())
 
 
 def _validate_aggregate_candidate(
