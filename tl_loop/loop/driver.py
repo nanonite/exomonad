@@ -606,6 +606,15 @@ class _AggregatePublicationIdentity:
     owner_agent: str
     parent_slice: SliceState | None
     invocation_id: str | None
+    resume_invocation: Mapping[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class _AggregatePublicationLookup:
+    """Unique live PR identity resolved by the host for one aggregate slice."""
+
+    pr_number: int
+    publication: Mapping[str, object]
 
 
 class AggregatePublicationRejected(TLLoopError):
@@ -8889,6 +8898,12 @@ def _reconcile_nonterminal_slices(
                 changed = True
                 current = reconfirmed
             continue
+        if _aggregate_resume_requires_owner_reconciliation(plan, current, watcher, config):
+            LOGGER.info(
+                "[TL loop] deferring resumed aggregate publication to its owner reconciler: slice=%s",
+                current.id,
+            )
+            continue
         owner_id = _agent_for_dispatch_intent(
             agent_listing,
             current.dispatch_intent_id or "",
@@ -9160,6 +9175,70 @@ def _reconcile_nonterminal_slices(
     if conflicts_found:
         state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
     return state
+
+
+def _aggregate_resume_requires_owner_reconciliation(
+    plan: WorkPlan,
+    current: SliceState,
+    watcher: WatcherObservation | Mapping[str, object] | None,
+    config: TLLoopConfig,
+) -> bool:
+    """Keep resumed aggregate adoption on the path that durably checkpoints lineage."""
+    task = _aggregate_resume_task(plan, current.id)
+    observation = _as_watcher_observation(watcher)
+    if (
+        task is None
+        or observation is None
+        or observation.publication is None
+        or config.project_root is None
+        or current.dispatch_invocation_id is None
+    ):
+        return False
+    record = _read_durable_sub_tl_invocation(config.project_root, task.agent_id or task.name)
+    return _aggregate_resume_observation_matches(task, current, observation, record)
+
+
+def _aggregate_resume_task(plan: WorkPlan, slice_id: str) -> SubTLTask | None:
+    """Find the planned aggregate owner for one persisted slice."""
+    return next(
+        (
+            task
+            for task in plan.sub_tls
+            if task.name == slice_id and task.integration.aggregate_pr_required
+        ),
+        None,
+    )
+
+
+def _aggregate_resume_observation_matches(
+    task: SubTLTask,
+    current: SliceState,
+    observation: WatcherObservation,
+    record: Mapping[str, object] | None,
+) -> bool:
+    """Check whether this watcher record needs lineage checkpointing first."""
+    if record is None or observation.publication is None:
+        return False
+    if not _authorized_aggregate_resume(
+        record,
+        task.name,
+        current.branch or "",
+        current.worktree or "",
+        current.dispatch_invocation_id,
+    ):
+        return False
+    resumed_id = record.get("invocation_id")
+    succession_matches = (
+        record.get("prior_invocation_id") == current.dispatch_invocation_id
+        or current.dispatch_invocation_id in observation.publication.succession_invocation_ids
+    )
+    return bool(
+        observation.publication.invocation_id == resumed_id
+        and succession_matches
+        and observation.pr_number == record.get("pr_number")
+        and observation.head_branch == current.branch
+        and observation.base_branch == current.base_ref
+    )
 
 
 def _watcher_presents_publication(watcher: WatcherObservation | None) -> bool:
@@ -11880,8 +11959,8 @@ def _recover_parked_aggregate_candidate(
         candidate = _ensure_aggregate_candidate(
             task, child_state, config, effects, store, effects_log, publish=False
         )
-    except AggregatePublicationRejected:
-        return None
+    except AggregatePublicationRejected as error:
+        return _record_parked_aggregate_rejection(task, error, config, effects, store, effects_log)
     if candidate is None:
         return None
     child_state = RunStore(task.name, store.run_dir).load()
@@ -11895,6 +11974,28 @@ def _recover_parked_aggregate_candidate(
         effects_log,
         prepublished_candidates={task.name: candidate},
     )
+
+
+def _record_parked_aggregate_rejection(
+    task: SubTLTask,
+    error: AggregatePublicationRejected,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Refresh the parked reason and re-arm its approval gate after reconciliation."""
+    state = store.load()
+    current = state.slices.get(task.name)
+    if current is None:
+        return state
+    parked = _park_aggregate_publication(current, error)
+    state = _checkpoint_slice_action(store, state, task.name, None, slice_state=parked)
+    state = _open_aggregate_publication_gate(
+        state, task.name, error.detail, config, effects, store, effects_log, rearm=True
+    )
+    _emit_aggregate_publication_failure(state, error, config, effects, effects_log)
+    return state
 
 
 def _restore_aggregate_publication_gate(
@@ -12151,19 +12252,29 @@ def _aggregate_publication_identity(
         config.branch, _child_controller_name(task)
     )
     owner_agent = task.agent_id or task.name
+    owner_worktree = child_state.owner_worktree or str(
+        _sub_tl_worktree(config, store.root_dir, store.run_id, task)
+    )
     parent_slice = store.load().slices.get(task.name)
-    parent_slice, invocation_id = _registered_aggregate_invocation(
-        task, parent_slice, branch, owner_agent, config, store, publication_attempt
+    parent_slice, invocation_id, resume_invocation = _registered_aggregate_invocation(
+        task,
+        parent_slice,
+        branch,
+        owner_agent,
+        owner_worktree,
+        config,
+        store,
+        publication_attempt,
     )
     return _AggregatePublicationIdentity(
         owner_id=(own_candidate.integration_owner_id if own_candidate else None)
         or f"{store.run_id}:{task.name}:integration",
         branch=branch,
-        owner_worktree=child_state.owner_worktree
-        or str(_sub_tl_worktree(config, store.root_dir, store.run_id, task)),
+        owner_worktree=owner_worktree,
         owner_agent=owner_agent,
         parent_slice=parent_slice,
         invocation_id=invocation_id,
+        resume_invocation=resume_invocation,
     )
 
 
@@ -12172,26 +12283,28 @@ def _registered_aggregate_invocation(
     parent_slice: SliceState | None,
     branch: str,
     owner_agent: str,
+    owner_worktree: str,
     config: TLLoopConfig,
     store: RunStore,
     publication_attempt: int,
-) -> tuple[SliceState | None, str | None]:
+) -> tuple[SliceState | None, str | None, Mapping[str, object] | None]:
     """Rehydrate an invocation when possible and reject unsafe publication."""
     invocation_id = parent_slice.dispatch_invocation_id if parent_slice is not None else None
     if config.project_root is not None and not invocation_id:
         invocation_id = _rehydrate_aggregate_invocation(
-            task, owner_agent, branch, config.project_root, store
+            task, owner_agent, branch, owner_worktree, config.project_root, store
         )
         parent_slice = store.load().slices.get(task.name)
         invocation_id = parent_slice.dispatch_invocation_id if parent_slice else None
-    durable = config.project_root is None or _durable_sub_tl_invocation_matches(
-        config.project_root,
-        owner_agent,
-        task.name,
-        branch,
-        invocation_id,
+    if config.project_root is None:
+        return parent_slice, invocation_id, None
+    durable = _durable_sub_tl_invocation_matches(
+        config.project_root, owner_agent, task.name, branch, invocation_id, owner_worktree
     )
     if not durable:
+        record = _read_durable_sub_tl_invocation(config.project_root, owner_agent)
+        if _authorized_aggregate_resume(record, task.name, branch, owner_worktree, invocation_id):
+            return parent_slice, invocation_id, record
         raise AggregatePublicationRejected(
             task.name,
             "aggregate publication stopped before file_pr: the sub-TL invocation record is "
@@ -12202,13 +12315,14 @@ def _registered_aggregate_invocation(
             retryable=False,
             missing_evidence=("invocation_id", "slice_id", "head_branch"),
         )
-    return parent_slice, invocation_id
+    return parent_slice, invocation_id, None
 
 
 def _rehydrate_aggregate_invocation(
     task: SubTLTask,
     owner_agent: str,
     branch: str,
+    owner_worktree: str,
     project_root: str | Path,
     store: RunStore,
 ) -> str | None:
@@ -12219,6 +12333,9 @@ def _rehydrate_aggregate_invocation(
         isinstance(invocation_id, str)
         and record.get("slice_id") == task.name
         and record.get("branch") == branch
+        and record.get("worktree") == owner_worktree
+        and record.get("prior_invocation_id") is None
+        and record.get("trigger") != "resume_pr"
     ):
         return None
     try:
@@ -12241,8 +12358,6 @@ def _find_aggregate_candidate(
     effects_log: list[EffectIntent],
 ) -> AggregateCandidate | None:
     """Reuse durable evidence, observe the watcher, then publish if needed."""
-    if own_candidate is not None and own_candidate.aggregate_pr_number is not None:
-        return _persisted_aggregate_candidate(task.name, own_candidate)
     candidate = _aggregate_candidate_from_watcher(
         task,
         identity.parent_slice,
@@ -12252,12 +12367,100 @@ def _find_aggregate_candidate(
         config,
         effects,
         effects_log,
+        store,
+        publication_attempt,
+        identity.owner_worktree,
+        identity.resume_invocation,
     )
-    if candidate is None and publish:
-        return _request_aggregate_candidate(
-            task, child_state, identity, publication_attempt, config, effects, store, effects_log
+    if own_candidate is not None and own_candidate.aggregate_pr_number is not None:
+        return _reuse_verified_aggregate_candidate(
+            task, own_candidate, candidate, publication_attempt
         )
-    return candidate
+    if candidate is not None or not publish:
+        return candidate
+    _require_safe_aggregate_creation(task, identity, config, effects_log, publication_attempt)
+    return _request_aggregate_candidate(
+        task, child_state, identity, publication_attempt, config, effects, store, effects_log
+    )
+
+
+def _reuse_verified_aggregate_candidate(
+    task: SubTLTask,
+    persisted: IntegrationCandidateState,
+    observed: AggregateCandidate | None,
+    publication_attempt: int,
+) -> AggregateCandidate:
+    """Require fresh watcher ownership to agree with a saved aggregate PR number."""
+    if observed is None:
+        reason = "persisted_candidate_not_found"
+        missing = ("authoritative_publication",)
+    elif observed.pr_number != persisted.aggregate_pr_number:
+        reason = "persisted_candidate_mismatch"
+        missing = ("persisted_pr_number", "observed_pr_number")
+    else:
+        return observed
+    raise _aggregate_publication_failure(
+        task.name,
+        f"aggregate publication recovery refused: reason_code={reason}",
+        reason,
+        publication_attempt,
+        missing,
+    )
+
+
+def _require_safe_aggregate_creation(
+    task: SubTLTask,
+    identity: _AggregatePublicationIdentity,
+    config: TLLoopConfig,
+    effects_log: list[EffectIntent],
+    publication_attempt: int,
+) -> None:
+    """Allow file_pr only when authority proves no PR and no prior attempt is ambiguous."""
+    if identity.resume_invocation is not None or (
+        identity.parent_slice is not None and identity.parent_slice.pr_number is not None
+    ):
+        raise _aggregate_reconciliation_rejected(
+            task.name,
+            "existing_publication_not_found",
+            publication_attempt,
+            ("authoritative_publication",),
+            retryable=False,
+        )
+    if _aggregate_file_pr_effect_is_unresolved(task, config, effects_log):
+        raise _aggregate_reconciliation_rejected(
+            task.name,
+            "prior_file_pr_outcome_unresolved",
+            publication_attempt,
+            ("prior_file_pr_outcome", "authoritative_publication"),
+            retryable=False,
+        )
+
+
+def _aggregate_file_pr_effect_is_unresolved(
+    task: SubTLTask,
+    config: TLLoopConfig,
+    effects_log: list[EffectIntent],
+) -> bool:
+    """Prevent a second external PR creation after an ambiguous prior attempt."""
+    title = _aggregate_pr_title(task.name, config.branch)
+    if isinstance(effects_log, EffectJournal):
+        records = effects_log.snapshot()
+        return any(
+            record.get("operation") == "file_pr"
+            and record.get("target") == task.name
+            and isinstance(record.get("arguments"), Mapping)
+            and record["arguments"].get("title") == title
+            and record["arguments"].get("base_branch") == config.branch
+            and record.get("status") in {"intended", "unknown", "confirmed", "reconciled"}
+            for record in records
+        )
+    return any(
+        intent.operation == "file_pr"
+        and intent.target == task.name
+        and intent.arguments.get("title") == title
+        and intent.arguments.get("base_branch") == config.branch
+        for intent in effects_log
+    )
 
 
 def _request_aggregate_candidate(
@@ -12417,8 +12620,10 @@ def _aggregate_pr_body(
 ) -> str:
     """Render escaped aggregate metadata and non-closing leaf references."""
     lines = [
-        f"Aggregate sub-TL {_markdown_code_span(task_name)} into "
-        f"{_markdown_code_span(base_branch)}.",
+        (
+            f"Aggregate sub-TL {_markdown_code_span(task_name)} into "
+            f"{_markdown_code_span(base_branch)}."
+        ),
         f"Owner: {_markdown_code_span(owner_id)}",
         f"Head: {_markdown_code_span(head_sha)}",
         f"Patch: {_markdown_code_span(patch_digest)}",
@@ -12573,26 +12778,13 @@ def _record_aggregate_open_event(
     )
 
 
-def _persisted_aggregate_candidate(
-    task_name: str,
-    candidate: IntegrationCandidateState,
-) -> AggregateCandidate:
-    """Decode a previously checkpointed candidate without filling evidence from guesses."""
-    return AggregateCandidate(
-        task_name,
-        candidate.aggregate_pr_number or 0,
-        candidate.aggregate_head_sha or "",
-        candidate.aggregate_patch_digest or "",
-        candidate.aggregate_original_base_sha or "",
-    )
-
-
 def _durable_sub_tl_invocation_matches(
     project_root: str | Path,
     owner_agent: str,
     slice_id: str,
     branch: str,
     invocation_id: str | None,
+    worktree: str,
 ) -> bool:
     """Require the exact server-owned invocation record before publication."""
     record = _read_durable_sub_tl_invocation(project_root, owner_agent)
@@ -12602,6 +12794,54 @@ def _durable_sub_tl_invocation_matches(
         and record.get("invocation_id") == invocation_id
         and record.get("slice_id") == slice_id
         and record.get("branch") == branch
+        and record.get("worktree") == worktree
+    )
+
+
+def _authorized_aggregate_resume(
+    record: Mapping[str, object] | None,
+    slice_id: str,
+    branch: str,
+    worktree: str,
+    prior_invocation_id: str | None,
+) -> bool:
+    """Recognize a durable same-owner resume without checkpointing it yet."""
+    if record is None or not prior_invocation_id:
+        return False
+    return _aggregate_resume_record_matches(record, slice_id, branch, worktree, prior_invocation_id)
+
+
+def _aggregate_resume_record_matches(
+    record: Mapping[str, object],
+    slice_id: str,
+    branch: str,
+    worktree: str,
+    prior_invocation_id: str,
+) -> bool:
+    """Validate durable resume coordinates before watcher correlation."""
+    invocation_id = record.get("invocation_id")
+    prior = record.get("prior_invocation_id")
+    return bool(
+        isinstance(invocation_id, str)
+        and invocation_id
+        and invocation_id != prior_invocation_id
+        and record.get("trigger") == "resume_pr"
+        and isinstance(prior, str)
+        and prior
+        and record.get("slice_id") == slice_id
+        and record.get("branch") == branch
+        and record.get("worktree") == worktree
+        and _aggregate_resume_pr_coordinates_present(record)
+    )
+
+
+def _aggregate_resume_pr_coordinates_present(record: Mapping[str, object]) -> bool:
+    """Require a resume record anchored to a concrete existing PR head."""
+    return bool(
+        type(record.get("pr_number")) is int
+        and record.get("pr_number", 0) > 0
+        and isinstance(record.get("head_sha"), str)
+        and record.get("head_sha")
     )
 
 
@@ -12627,23 +12867,575 @@ def _aggregate_candidate_from_watcher(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    store: RunStore,
+    publication_attempt: int,
+    owner_worktree: str,
+    resume_invocation: Mapping[str, object] | None,
 ) -> AggregateCandidate | None:
     """Adopt an aggregate PR only when watcher identity and evidence are complete."""
     if parent_slice is None:
+        raise _aggregate_reconciliation_rejected(
+            task.name,
+            "parent_slice_missing",
+            publication_attempt,
+            ("parent_slice",),
+            retryable=False,
+        )
+    _validate_aggregate_repository_identity(
+        task.name, config, effects, effects_log, store, publication_attempt
+    )
+    observation = _resolve_aggregate_watcher_observation(
+        task.name, config, effects, effects_log, publication_attempt
+    )
+    if observation is None:
         return None
-    observation = _watcher_snapshot_for_slice(task.name, config, effects, effects_log)
-    if observation is None or observation.ownership_status()[0] is not True:
-        return None
-    if not _aggregate_watcher_identity_matches(
-        task, parent_slice, observation, branch, owner_agent, invocation_id, config.branch
-    ):
-        return None
-    return AggregateCandidate(
+    binding = _validate_aggregate_watcher_identity(
+        task,
+        parent_slice,
+        observation,
+        branch,
+        owner_agent,
+        invocation_id,
+        config.branch,
+        publication_attempt,
+        owner_worktree,
+        resume_invocation,
+    )
+    _checkpoint_aggregate_resume(
+        task, resume_invocation, invocation_id, observation, store, publication_attempt
+    )
+    return _aggregate_candidate_from_observation(
+        task.name, observation, binding, publication_attempt
+    )
+
+
+def _checkpoint_aggregate_resume(
+    task: SubTLTask,
+    resume_invocation: Mapping[str, object] | None,
+    prior_invocation_id: str | None,
+    observation: WatcherObservation,
+    store: RunStore,
+    publication_attempt: int,
+) -> None:
+    """Persist a verified resume before storing its PR binding."""
+    if resume_invocation is None:
+        return
+    resumed_id = cast(str, resume_invocation.get("invocation_id"))
+    LOGGER.info(
+        "[TL loop] adopting authorized aggregate resume: slice=%s prior_invocation_id=%s resumed_invocation_id=%s pr_number=%s",
         task.name,
+        prior_invocation_id,
+        resumed_id,
         observation.pr_number,
-        cast(str, observation.head_sha),
+    )
+    try:
+        _checkpoint_ordered_sub_tl_invocation(store, task.name, resumed_id)
+        _assert_aggregate_resume_checkpoint(store, task.name, resumed_id)
+    except (TLLoopError, DurableWriteError, CheckpointConflict) as error:
+        _raise_resume_checkpoint_rejection(task.name, publication_attempt, error)
+
+
+def _assert_aggregate_resume_checkpoint(
+    store: RunStore,
+    slice_id: str,
+    invocation_id: str,
+) -> None:
+    """Fail closed if the lineage checkpoint did not take effect."""
+    current = store.load().slices.get(slice_id)
+    if current is None or current.dispatch_invocation_id != invocation_id:
+        raise TLLoopError("aggregate resume invocation checkpoint did not persist")
+
+
+def _raise_resume_checkpoint_rejection(
+    slice_id: str,
+    publication_attempt: int,
+    error: Exception,
+) -> None:
+    """Convert durable resume checkpoint errors into a safe retryable park."""
+    LOGGER.warning(
+        "[TL loop] aggregate resume lineage checkpoint deferred: slice=%s error_type=%s",
+        slice_id,
+        type(error).__name__,
+    )
+    raise _aggregate_reconciliation_rejected(
+        slice_id,
+        "resume_lineage_checkpoint_failed",
+        publication_attempt,
+        ("durable_invocation_lineage",),
+        retryable=True,
+    ) from error
+
+
+def _aggregate_candidate_from_observation(
+    slice_id: str,
+    observation: WatcherObservation,
+    binding: PublicationBinding,
+    publication_attempt: int,
+) -> AggregateCandidate:
+    """Project the verified current PR evidence into a candidate."""
+    if binding.pr_number != observation.pr_number or binding.head_sha != observation.head_sha:
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "publication_binding_observation_mismatch",
+            publication_attempt,
+            ("pr_number", "head_sha"),
+            retryable=False,
+        )
+    return AggregateCandidate(
+        slice_id,
+        binding.pr_number,
+        binding.head_sha,
         cast(str, observation.patch_digest),
         cast(str, observation.base_sha),
+    )
+
+
+def _resolve_aggregate_watcher_observation(
+    slice_id: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    publication_attempt: int,
+) -> WatcherObservation | None:
+    """Return an observation, only using ``None`` for authoritative absence."""
+    result = _call_aggregate_publication_lookup(
+        slice_id, config, effects, effects_log, publication_attempt
+    )
+    lookup = _decode_aggregate_publication_lookup(slice_id, result, publication_attempt)
+    if lookup is None:
+        return None
+    return _read_aggregate_pr_observation(
+        slice_id, lookup, config, effects, effects_log, publication_attempt
+    )
+
+
+def _call_aggregate_publication_lookup(
+    slice_id: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    publication_attempt: int,
+) -> ToolResult | None:
+    """Query host publication identity and convert transport failures safely."""
+    try:
+        return _invoke(
+            "resolve_live_pr_for_slice",
+            f"slice:{slice_id}",
+            {"slice_id": slice_id},
+            config.active,
+            cast(EffectClient, effects),
+            lambda client: client.resolve_live_pr_for_slice(slice_id=slice_id),
+            effects_log,
+            raise_on_failure=False,
+        )
+    except TLLoopError:
+        raise
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, ToolUnavailableError) as error:
+        LOGGER.warning(
+            "[TL loop] aggregate publication lookup unavailable: slice=%s error_type=%s",
+            slice_id,
+            type(error).__name__,
+        )
+        _raise_aggregate_lookup_unavailable(slice_id, publication_attempt, error)
+
+
+def _raise_aggregate_lookup_unavailable(
+    slice_id: str,
+    publication_attempt: int,
+    error: Exception | None = None,
+) -> None:
+    """Record an actionable unavailable lookup without copying tool error text."""
+    failure = _aggregate_reconciliation_rejected(
+        slice_id,
+        "publication_lookup_unavailable",
+        publication_attempt,
+        ("authoritative_publication_lookup",),
+        retryable=True,
+    )
+    if error is not None:
+        raise failure from error
+    raise failure
+
+
+def _decode_aggregate_publication_lookup(
+    slice_id: str,
+    result: ToolResult | None,
+    publication_attempt: int,
+) -> _AggregatePublicationLookup | None:
+    """Distinguish a never-published slice from unresolved host responses."""
+    if result is None or result.success is not True or not isinstance(result.result, Mapping):
+        _raise_aggregate_lookup_unavailable(slice_id, publication_attempt)
+    resolution = result.result.get("resolution")
+    if result.result.get("slice_id") != slice_id:
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "publication_lookup_slice_mismatch",
+            publication_attempt,
+            ("slice_id",),
+            retryable=False,
+        )
+    if resolution == "never_published":
+        return None
+    if resolution != "live":
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "publication_lookup_unresolved",
+            publication_attempt,
+            ("unique_live_publication",),
+            retryable=False,
+        )
+    return _aggregate_lookup_coordinates(slice_id, result.result, publication_attempt)
+
+
+def _aggregate_lookup_coordinates(
+    slice_id: str,
+    result: Mapping[str, object],
+    publication_attempt: int,
+) -> _AggregatePublicationLookup:
+    """Require a unique PR number and its durable publication record."""
+    pr_number = result.get("pr_number")
+    publication = result.get("publication")
+    if type(pr_number) is not int or pr_number <= 0 or not isinstance(publication, Mapping):
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "publication_lookup_malformed",
+            publication_attempt,
+            ("pr_number", "publication_record"),
+            retryable=False,
+        )
+    return _AggregatePublicationLookup(pr_number, publication)
+
+
+def _read_aggregate_pr_observation(
+    slice_id: str,
+    lookup: _AggregatePublicationLookup,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    publication_attempt: int,
+) -> WatcherObservation:
+    """Read fresh Forgejo facts for the one host-resolved PR."""
+    snapshot = _call_aggregate_watcher(
+        slice_id, lookup.pr_number, config, effects, effects_log, publication_attempt
+    )
+    observation = WatcherObservation.from_response(snapshot).with_publication(lookup.publication)
+    if observation.pr_number != lookup.pr_number or observation.found is not True:
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "watcher_pr_mismatch",
+            publication_attempt,
+            ("pr_number", "found"),
+            retryable=False,
+        )
+    return observation
+
+
+def _call_aggregate_watcher(
+    slice_id: str,
+    pr_number: int,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    publication_attempt: int,
+) -> Mapping[str, object]:
+    """Fetch fresh PR state, parking on unavailable or malformed responses."""
+    try:
+        snapshot = _invoke(
+            "watcher_pr_state",
+            str(pr_number),
+            {"pr_number": pr_number},
+            config.active,
+            cast(EffectClient, effects),
+            lambda client: client.watcher_pr_state(pr_number=pr_number),
+            effects_log,
+            raise_on_failure=False,
+        )
+    except TLLoopError:
+        raise
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, ToolUnavailableError) as error:
+        LOGGER.warning(
+            "[TL loop] aggregate watcher unavailable: slice=%s pr_number=%s error_type=%s",
+            slice_id,
+            pr_number,
+            type(error).__name__,
+        )
+        _raise_aggregate_watcher_unavailable(slice_id, pr_number, publication_attempt, error)
+    if snapshot is None or snapshot.success is not True or not isinstance(snapshot.result, Mapping):
+        _raise_aggregate_watcher_unavailable(slice_id, pr_number, publication_attempt)
+    return snapshot.result
+
+
+def _raise_aggregate_watcher_unavailable(
+    slice_id: str,
+    pr_number: int,
+    publication_attempt: int,
+    error: Exception | None = None,
+) -> None:
+    """Record an actionable watcher failure without copying raw error text."""
+    failure = _aggregate_reconciliation_rejected(
+        slice_id,
+        "watcher_observation_unavailable",
+        publication_attempt,
+        ("current_pr_head", "base_sha", "patch_digest"),
+        retryable=True,
+    )
+    if error is not None:
+        raise failure from error
+    raise failure
+
+
+def _validate_aggregate_repository_identity(
+    slice_id: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+    publication_attempt: int,
+) -> None:
+    """Refuse watcher adoption when the host repository differs from the run."""
+    persisted = store.load().repository_identity
+    try:
+        observed = _resolve_repository_identity(config, effects, effects_log)
+    except TLLoopError:
+        raise
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, ToolUnavailableError) as error:
+        LOGGER.warning(
+            "[TL loop] aggregate repository identity unavailable: error_type=%s",
+            type(error).__name__,
+        )
+        observed = None
+    if observed is None:
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "repository_identity_unavailable",
+            publication_attempt,
+            ("authoritative_repository_identity",),
+            retryable=True,
+        )
+    if not _aggregate_repository_matches(persisted, config, observed):
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "repository_identity_mismatch",
+            publication_attempt,
+            ("repository_identity",),
+            retryable=False,
+        )
+
+
+def _aggregate_repository_matches(
+    persisted: RepositoryIdentity | None,
+    config: TLLoopConfig,
+    observed: RepositoryIdentity,
+) -> bool:
+    """Compare current, configured, and saved repository coordinates."""
+    return bool(
+        persisted is not None
+        and observed == persisted
+        and (config.repository_identity is None or config.repository_identity == persisted)
+        and persisted.base_branch == config.branch
+    )
+
+
+def _validate_aggregate_watcher_identity(
+    task: SubTLTask,
+    parent_slice: SliceState,
+    observation: WatcherObservation,
+    branch: str,
+    owner_agent: str,
+    invocation_id: str | None,
+    base_branch: str,
+    publication_attempt: int,
+    owner_worktree: str,
+    resume_invocation: Mapping[str, object] | None,
+) -> PublicationBinding:
+    """Validate exact coordinates and lineage before allowing invocation adoption."""
+    _require_aggregate_watcher_evidence(task.name, observation, publication_attempt)
+    publication = observation.publication
+    _require_aggregate_publication_coordinates(
+        task, observation, publication, branch, owner_agent, base_branch, publication_attempt
+    )
+    if resume_invocation is None:
+        return _validate_existing_aggregate_lineage(
+            task, parent_slice, observation, owner_agent, invocation_id, publication_attempt
+        )
+    return _validate_resumed_aggregate_lineage(
+        task,
+        parent_slice,
+        observation,
+        publication,
+        branch,
+        owner_agent,
+        invocation_id,
+        owner_worktree,
+        resume_invocation,
+        publication_attempt,
+    )
+
+
+def _require_aggregate_watcher_evidence(
+    slice_id: str,
+    observation: WatcherObservation,
+    publication_attempt: int,
+) -> None:
+    """Require verified ownership and complete current-head evidence."""
+    if observation.ownership_status()[0] is not True:
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "publication_ownership_unverified",
+            publication_attempt,
+            ("publication_ownership",),
+            retryable=False,
+        )
+    missing = _aggregate_missing_publication_evidence(observation)
+    if missing:
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "publication_evidence_incomplete",
+            publication_attempt,
+            missing,
+            retryable=True,
+        )
+
+
+def _require_aggregate_publication_coordinates(
+    task: SubTLTask,
+    observation: WatcherObservation,
+    publication: PublicationRecord | None,
+    branch: str,
+    owner_agent: str,
+    base_branch: str,
+    publication_attempt: int,
+) -> None:
+    """Refuse a live PR whose immutable coordinates differ from its plan."""
+    if publication is not None and _aggregate_publication_coordinates_match(
+        task, observation, publication, branch, owner_agent, base_branch
+    ):
+        return
+    raise _aggregate_reconciliation_rejected(
+        task.name,
+        "publication_coordinates_mismatch",
+        publication_attempt,
+        ("pr_number", "head_branch", "base_branch", "slice_id", "author_agent"),
+        retryable=False,
+    )
+
+
+def _validate_resumed_aggregate_lineage(
+    task: SubTLTask,
+    parent_slice: SliceState,
+    observation: WatcherObservation,
+    publication: PublicationRecord | None,
+    branch: str,
+    owner_agent: str,
+    prior_invocation_id: str | None,
+    owner_worktree: str,
+    resume_invocation: Mapping[str, object],
+    publication_attempt: int,
+) -> PublicationBinding:
+    """Accept a fresh resume only when host lineage ties it to this existing PR."""
+    if not _aggregate_resume_publication_matches(
+        task.name,
+        observation,
+        publication,
+        branch,
+        owner_worktree,
+        prior_invocation_id,
+        resume_invocation,
+    ):
+        raise _aggregate_reconciliation_rejected(
+            task.name,
+            "publication_resume_identity_mismatch",
+            publication_attempt,
+            ("invocation_id", "pr_number"),
+            retryable=False,
+        )
+    resumed_id = cast(str, resume_invocation.get("invocation_id"))
+    resumed_slice = replace(parent_slice, dispatch_invocation_id=resumed_id)
+    return _validated_aggregate_binding(
+        task.name,
+        resumed_slice,
+        observation,
+        owner_agent,
+        publication_attempt,
+        "publication_resume_rejected",
+    )
+
+
+def _aggregate_resume_publication_matches(
+    slice_id: str,
+    observation: WatcherObservation,
+    publication: PublicationRecord | None,
+    branch: str,
+    owner_worktree: str,
+    prior_invocation_id: str | None,
+    resume_invocation: Mapping[str, object],
+) -> bool:
+    """Match the resumed invocation to the same PR and prior owner lineage."""
+    return bool(
+        publication is not None
+        and _authorized_aggregate_resume(
+            resume_invocation, slice_id, branch, owner_worktree, prior_invocation_id
+        )
+        and publication.invocation_id == resume_invocation.get("invocation_id")
+        and resume_invocation.get("pr_number") == observation.pr_number
+        and (
+            resume_invocation.get("prior_invocation_id") == prior_invocation_id
+            or prior_invocation_id in publication.succession_invocation_ids
+        )
+    )
+
+
+def _validate_existing_aggregate_lineage(
+    task: SubTLTask,
+    parent_slice: SliceState,
+    observation: WatcherObservation,
+    owner_agent: str,
+    invocation_id: str | None,
+    publication_attempt: int,
+) -> PublicationBinding:
+    """Validate an existing invocation or its host-recorded succession."""
+    binding = _validated_aggregate_binding(
+        task.name,
+        parent_slice,
+        observation,
+        owner_agent,
+        publication_attempt,
+        "publication_lineage_rejected",
+    )
+    if not _aggregate_invocation_matches(
+        cast(PublicationRecord, observation.publication), invocation_id
+    ):
+        raise _aggregate_reconciliation_rejected(
+            task.name,
+            "publication_lineage_rejected:invocation_lineage_mismatch",
+            publication_attempt,
+            ("invocation_lineage",),
+            retryable=False,
+        )
+    return binding
+
+
+def _validated_aggregate_binding(
+    slice_id: str,
+    current: SliceState,
+    observation: WatcherObservation,
+    owner_agent: str,
+    publication_attempt: int,
+    rejection_prefix: str,
+) -> PublicationBinding:
+    """Use the shared validator and turn refusals into stable aggregate park reasons."""
+    validation = validate_publication_from_watcher(
+        current, observation, observation.head_sha, owner_agent
+    )
+    if validation.binding is not None:
+        return validation.binding
+    rejection_code = validation.rejection.reason_code if validation.rejection else "unknown"
+    raise _aggregate_reconciliation_rejected(
+        slice_id,
+        f"{rejection_prefix}:{rejection_code}",
+        publication_attempt,
+        ("invocation_lineage",),
+        retryable=False,
     )
 
 
@@ -12656,17 +13448,62 @@ def _aggregate_watcher_identity_matches(
     invocation_id: str | None,
     base_branch: str,
 ) -> bool:
-    """Verify immutable watcher evidence against the exact publication owner."""
-    binding = _publication_from_watcher(parent_slice, observation, observation.head_sha, owner_agent)
+    """Compatibility predicate for tests of the non-resume identity contract."""
     publication = observation.publication
-    if binding is None or publication is None:
+    if publication is None or observation.ownership_status()[0] is not True:
         return False
     if not _aggregate_invocation_matches(publication, invocation_id):
         return False
-    if not _aggregate_publication_evidence_complete(observation):
+    if _aggregate_missing_publication_evidence(observation):
         return False
-    return _aggregate_publication_coordinates_match(
-        task, observation, publication, branch, owner_agent, base_branch
+    validation = validate_publication_from_watcher(
+        parent_slice, observation, observation.head_sha, owner_agent
+    )
+    return bool(
+        validation.binding is not None
+        and _aggregate_publication_coordinates_match(
+            task, observation, publication, branch, owner_agent, base_branch
+        )
+    )
+
+
+def _aggregate_missing_publication_evidence(
+    observation: WatcherObservation,
+) -> tuple[str, ...]:
+    """Name absent current-head publication evidence without exposing tool errors."""
+    fields = {
+        "pr_number": observation.pr_number,
+        "head_sha": observation.head_sha,
+        "base_sha": observation.base_sha,
+        "patch_digest": observation.patch_digest,
+        "head_branch": observation.head_branch,
+        "base_branch": observation.base_branch,
+        "publication": observation.publication,
+    }
+    missing = [name for name, value in fields.items() if value is None or value == ""]
+    if observation.head_reachable is not True:
+        missing.append("head_reachable")
+    return tuple(missing)
+
+
+def _aggregate_reconciliation_rejected(
+    slice_id: str,
+    reason_code: str,
+    publication_attempt: int,
+    missing_evidence: Sequence[str],
+    *,
+    retryable: bool,
+) -> AggregatePublicationRejected:
+    """Build a safe, stable parked reason for unresolved aggregate ownership."""
+    return AggregatePublicationRejected(
+        slice_id,
+        f"aggregate publication recovery parked: reason_code={reason_code}; "
+        f"missing evidence: {', '.join(missing_evidence) if missing_evidence else 'none'}",
+        reason_code,
+        publication_attempt,
+        needs_human=not retryable,
+        retryable=retryable,
+        missing_evidence=missing_evidence,
     )
 
 
@@ -12685,31 +13522,6 @@ def _aggregate_invocation_matches(
         invocation_id,
         publication.invocation_id,
         publication.succession_invocation_ids,
-    )
-    return False
-
-
-def _aggregate_publication_evidence_complete(observation: WatcherObservation) -> bool:
-    evidence = (
-        observation.head_sha,
-        observation.base_sha,
-        observation.patch_digest,
-        observation.head_branch,
-        observation.base_branch,
-    )
-    missing = tuple(
-        name
-        for name, value in zip(
-            ("head_sha", "base_sha", "patch_digest", "head_branch", "base_branch"), evidence
-        )
-        if not isinstance(value, str) or not value
-    )
-    if not missing:
-        return True
-    LOGGER.warning(
-        "[TL loop] refusing aggregate watcher publication: reason_code=%s missing_fields=%s",
-        "aggregate_evidence_incomplete",
-        missing,
     )
     return False
 
@@ -12767,6 +13579,7 @@ def _publish_aggregate_candidate(
         config,
         cast(EffectClient | None, owner_effects),
         effects,
+        store,
         effects_log,
         journal,
     )
@@ -12793,7 +13606,15 @@ def _publish_aggregate_candidate(
         _resolve_aggregate_file_pr_entries(journal, task.name, title, config.branch, result)
         return candidate
     recovered = _adopt_aggregate_watcher_candidate(
-        task, title, identity, config, effects, effects_log, journal
+        task,
+        title,
+        identity,
+        publication_attempt,
+        config,
+        effects,
+        store,
+        effects_log,
+        journal,
     )
     if recovered is not None:
         return recovered
@@ -12840,10 +13661,12 @@ def _invoke_aggregate_file_pr(
     config: TLLoopConfig,
     owner_effects: EffectClient | None,
     effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
     effects_log: list[EffectIntent],
     journal: EffectJournal | None,
 ) -> ToolResult | AggregateCandidate | None:
     """Invoke file_pr and recover publication results at ambiguous boundaries."""
+
     def call_file_pr(client: EffectClient) -> ToolResult:
         return client.file_pr(title=title, body=body, base_branch=config.branch)
 
@@ -12860,21 +13683,42 @@ def _invoke_aggregate_file_pr(
         )
     except Exception as error:
         recovered = _adopt_aggregate_watcher_candidate(
-            task, title, identity, config, effects, effects_log, journal
+            task,
+            title,
+            identity,
+            publication_attempt,
+            config,
+            effects,
+            store,
+            effects_log,
+            journal,
         )
         if recovered is not None:
             return recovered
-        raise _aggregate_publication_failure(
+        LOGGER.warning(
+            "[TL loop] aggregate file_pr outcome unresolved: slice=%s error_type=%s",
             task.name,
-            f"aggregate file_pr outcome is unknown and no matching publication evidence was "
-            f"recoverable: {error}",
+            type(error).__name__,
+        )
+        raise _aggregate_reconciliation_rejected(
+            task.name,
             "publication_outcome_unknown",
             publication_attempt,
             ("pr_number", "head_sha", "base_sha", "patch_digest", "invocation_id"),
+            retryable=True,
         ) from error
     if result is not None and result.success is False:
         return _recover_rejected_aggregate_file_pr(
-            task, title, identity, result, publication_attempt, config, effects, effects_log, journal
+            task,
+            title,
+            identity,
+            result,
+            publication_attempt,
+            config,
+            effects,
+            store,
+            effects_log,
+            journal,
         )
     return result
 
@@ -12887,12 +13731,21 @@ def _recover_rejected_aggregate_file_pr(
     publication_attempt: int,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
     effects_log: list[EffectIntent],
     journal: EffectJournal | None,
 ) -> AggregateCandidate:
     """Adopt a completed PR or park the explicit file_pr rejection."""
     recovered = _adopt_aggregate_watcher_candidate(
-        task, title, identity, config, effects, effects_log, journal
+        task,
+        title,
+        identity,
+        publication_attempt,
+        config,
+        effects,
+        store,
+        effects_log,
+        journal,
     )
     if recovered is not None:
         return recovered
@@ -12903,10 +13756,16 @@ def _recover_rejected_aggregate_file_pr(
         and "durable invocation record" in (result.error or "").lower()
     )
     needs_human = normalized_kind in {"invalid_input", "invalidinput"}
+    reason = "missing_invocation_registration" if missing_invocation else "file_pr_rejected"
+    safe_error_kind = (
+        error_kind
+        if normalized_kind in {"invalid_input", "invalidinput", "internal", "tool_unavailable"}
+        else reason
+    )
     raise AggregatePublicationRejected(
         task.name,
-        result.error or "aggregate file_pr was rejected",
-        "missing_invocation_registration" if missing_invocation else error_kind,
+        f"aggregate publication recovery parked: reason_code={reason}",
+        safe_error_kind,
         publication_attempt,
         needs_human=needs_human,
         retryable=not needs_human,
@@ -12922,8 +13781,10 @@ def _adopt_aggregate_watcher_candidate(
     task: SubTLTask,
     title: str,
     identity: _AggregatePublicationIdentity,
+    publication_attempt: int,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
     effects_log: list[EffectIntent],
     journal: EffectJournal | None,
 ) -> AggregateCandidate | None:
@@ -12937,6 +13798,10 @@ def _adopt_aggregate_watcher_candidate(
         config,
         effects,
         effects_log,
+        store,
+        publication_attempt,
+        identity.owner_worktree,
+        identity.resume_invocation,
     )
     if candidate is not None:
         result = _candidate_result(
@@ -12945,7 +13810,11 @@ def _adopt_aggregate_watcher_candidate(
             identity.branch,
             config.branch,
             identity.owner_agent,
-            identity.invocation_id,
+            (
+                cast(str, identity.resume_invocation["invocation_id"])
+                if identity.resume_invocation is not None
+                else identity.invocation_id
+            ),
         )
         _resolve_aggregate_file_pr_entries(journal, task.name, title, config.branch, result)
     return candidate

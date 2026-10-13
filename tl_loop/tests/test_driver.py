@@ -879,6 +879,7 @@ class RecordingTransport:
     listed_agents: list[JsonObject] = field(default_factory=list)
     next_controller_run_seq: int = 1000
     aggregate_reconciliation: JsonObject | None = None
+    aggregate_reconciliations: dict[str, JsonObject] = field(default_factory=dict)
 
     def call_tool(
         self,
@@ -900,21 +901,47 @@ class RecordingTransport:
             return {"success": True, "result": result}
         if tool_name == "list_agents":
             return {"success": True, "result": {"agents": self.listed_agents}}
+        if tool_name == "repository_identity":
+            return {
+                "success": True,
+                "result": {"owner": "org", "repo": "repo", "base_branch": "main"},
+            }
         if tool_name == "resolve_live_pr_for_slice":
-            if self.aggregate_reconciliation is None:
-                return {"success": True, "result": {"resolution": "never_published"}}
+            slice_id = str(arguments["slice_id"])
+            reconciliation = self.aggregate_reconciliations.get(slice_id)
+            if reconciliation is None and self.aggregate_reconciliation is not None:
+                publication = self.aggregate_reconciliation.get("publication")
+                if isinstance(publication, dict) and publication.get("slice_id") == slice_id:
+                    reconciliation = self.aggregate_reconciliation
+            if reconciliation is None:
+                return {
+                    "success": True,
+                    "result": {
+                        "resolution": "never_published",
+                        "slice_id": slice_id,
+                    },
+                }
             return {
                 "success": True,
                 "result": {
                     "resolution": "live",
-                    "pr_number": self.aggregate_reconciliation["pr_number"],
-                    "publication": self.aggregate_reconciliation["publication"],
+                    "pr_number": reconciliation["pr_number"],
+                    "publication": reconciliation["publication"],
+                    "slice_id": slice_id,
                 },
             }
         if tool_name == "watcher_pr_state":
-            if self.aggregate_reconciliation is None:
+            reconciliation = next(
+                (
+                    record
+                    for record in self.aggregate_reconciliations.values()
+                    if record.get("pr_number") == arguments["pr_number"]
+                ),
+                self.aggregate_reconciliation,
+            )
+            if reconciliation is None or reconciliation.get("pr_number") != arguments["pr_number"]:
                 return {"success": True, "result": {"found": False}}
-            return {"success": True, "result": self.aggregate_reconciliation["watcher"]}
+            return {"success": True, "result": reconciliation["watcher"]}
         if tool_name == "emit_controller_event":
             self.next_controller_run_seq += 1
             return {
@@ -926,6 +953,13 @@ class RecordingTransport:
             if title.startswith("Aggregate ") and " into " in title:
                 slice_id = title.removeprefix("Aggregate ").split(" into ", 1)[0]
                 base_branch = str(arguments.get("base_branch", "main"))
+                self.aggregate_reconciliations[slice_id] = _aggregate_watcher_fixture(
+                    f"{slice_id}-invocation",
+                    slice_id=slice_id,
+                    author_agent=name,
+                    head_branch=f"{base_branch}.{slice_id}",
+                    base_branch=base_branch,
+                )
                 return {
                     "success": True,
                     "result": {
@@ -1034,11 +1068,20 @@ def _install_ordered_invocation(
     monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", prepare)
 
 
-def _aggregate_watcher_fixture(invocation_id: str) -> JsonObject:
+def _aggregate_watcher_fixture(
+    invocation_id: str,
+    *,
+    slice_id: str = "aggregate-child",
+    author_agent: str = "aggregate-child",
+    head_branch: str = "main.aggregate-child",
+    base_branch: str = "main",
+    succession_invocation_ids: tuple[str, ...] = (),
+) -> JsonObject:
     publication = {
         "invocation_id": invocation_id,
-        "slice_id": "aggregate-child",
-        "author_agent": "aggregate-child",
+        "slice_id": slice_id,
+        "author_agent": author_agent,
+        "succession_invocation_ids": list(succession_invocation_ids),
     }
     return {
         "pr_number": 43,
@@ -1049,10 +1092,11 @@ def _aggregate_watcher_fixture(invocation_id: str) -> JsonObject:
             "head_sha": "head-a",
             "base_sha": "base-a",
             "patch_digest": "patch-a",
-            "head_branch": "main.aggregate-child",
-            "base_branch": "main",
+            "head_branch": head_branch,
+            "base_branch": base_branch,
             "publication_ownership_verified": True,
             "publication_ownership_error": "",
+            "head_reachable": True,
             "publication": publication,
         },
     }
@@ -4736,6 +4780,7 @@ def test_reconciliation_backfills_handoff_from_host_publication_provenance(
         "ci_status": "success",
         "publication_ownership_verified": True,
         "publication_ownership_error": "",
+        "head_reachable": True,
         "publication": {
             "invocation_id": "inv-host",
             "slice_id": "leaf-a",
@@ -5356,6 +5401,7 @@ def _watcher_publication(
         "patch_digest": "patch-45",
         "head_branch": "main.leaf-a",
         "base_branch": "main",
+        "head_reachable": True,
         "publication_ownership_verified": True,
         "publication_ownership_error": "",
         "publication": {
@@ -7260,6 +7306,7 @@ def test_aggregate_file_pr_journal_replays_after_checkpoint_crash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_id = "aggregate-crash-run"
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     parent_dir = tmp_path / run_id
     child_plan = _plan()
     child_config = replace(
@@ -7337,6 +7384,92 @@ def test_aggregate_file_pr_journal_replays_after_checkpoint_crash(
     assert resumed.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
     assert resumed.final_state.slices["aggregate-child"].pr_number == 43
     assert len(journal.confirmed_entries("file_pr", "aggregate-child")) == 1
+
+
+def test_aggregate_watcher_observation_replays_after_checkpoint_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PartialResponseTransport(RecordingTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            title = str(arguments.get("title", ""))
+            if tool_name == "file_pr" and title.startswith("Aggregate aggregate-child"):
+                self.calls.append((tool_name, arguments))
+                self.aggregate_reconciliation = _aggregate_watcher_fixture(
+                    "aggregate-child-invocation"
+                )
+                return {"success": True, "result": {"pr_number": 43}}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    run_id = "aggregate-observation-crash"
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
+    transport = PartialResponseTransport()
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                _plan(),
+                source=SyntheticQueue(_lifecycle_events(run_id)),
+                order=1,
+            ),
+            SubTLTask("later-stage", WorkPlan(), order=2),
+        )
+    )
+    config = replace(
+        _config(),
+        ledger_run_id=run_id,
+        keep_alive_on_waiting=False,
+    )
+    original_set_ordered_state = RunStore.set_ordered_state
+
+    def crash_after_watcher_observation(
+        store: RunStore,
+        current_order: int,
+        ordered_stages: object,
+        integration: object,
+    ) -> RunState:
+        observed_watcher = any(name == "watcher_pr_state" for name, _ in transport.calls)
+        if store.run_id == "aggregate-child" and observed_watcher:
+            raise RuntimeError("simulated crash after watcher observation")
+        return original_set_ordered_state(store, current_order, ordered_stages, integration)
+
+    monkeypatch.setattr(RunStore, "set_ordered_state", crash_after_watcher_observation)
+    with pytest.raises(RuntimeError, match="simulated crash after watcher observation"):
+        run_tl_loop(
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=tmp_path,
+        )
+
+    initial_leaf_effects = sum(
+        name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls
+    )
+    monkeypatch.setattr(RunStore, "set_ordered_state", original_set_ordered_state)
+    for _ in range(2):
+        resumed = run_tl_loop(
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=tmp_path,
+        )
+        aggregate = resumed.final_state.slices["aggregate-child"]
+        assert aggregate.status is SliceStatus.IN_REVIEW
+        assert aggregate.pr_number == 43
+        assert resumed.final_state.slices["later-stage"].status is SliceStatus.PENDING
+
+    assert sum(name == "file_pr" for name, _ in transport.calls) == 1
+    assert sum(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls) == initial_leaf_effects
 
 
 def test_aggregate_file_pr_result_decoder_requires_complete_correlation() -> None:
@@ -7473,12 +7606,17 @@ def test_aggregate_publication_rehydrates_durable_invocation_before_file_pr(
             / "invocation.json"
         )
         invocation_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree = str(
+            driver_module._sub_tl_worktree(config, store.root_dir, store.run_id, tasks[0])
+        )
         invocation_path.write_text(
             json.dumps(
                 {
                     "invocation_id": "aggregate-child-invocation",
+                    "trigger": "spawn",
                     "slice_id": "aggregate-child",
                     "branch": "main.aggregate-child",
+                    "worktree": worktree,
                 }
             ),
             encoding="utf-8",
@@ -7620,9 +7758,11 @@ def test_missing_durable_invocation_parks_before_file_pr(
     assert not any(name == "file_pr" for name, _ in transport.calls)
 
 
-def test_aggregate_file_pr_timeout_continue_adopts_existing_publication(
+@pytest.mark.parametrize("publication_available", [True, False])
+def test_aggregate_file_pr_timeout_continue_reconciles_without_duplicate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    publication_available: bool,
 ) -> None:
     class CrashAfterPublishTransport(RecordingTransport):
         crashed = False
@@ -7676,6 +7816,8 @@ def test_aggregate_file_pr_timeout_continue_adopts_existing_publication(
             root_dir=tmp_path,
         )
 
+    if not publication_available:
+        transport.aggregate_reconciliation = None
     child_store = RunStore("aggregate-child", tmp_path / run_id)
     child_revision = child_store.load().revision
     resumed = run_tl_loop(
@@ -7687,8 +7829,15 @@ def test_aggregate_file_pr_timeout_continue_adopts_existing_publication(
         root_dir=tmp_path,
     )
 
-    assert resumed.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
-    assert resumed.final_state.slices["aggregate-child"].pr_number == 43
+    if publication_available:
+        assert resumed.final_state.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+        assert resumed.final_state.slices["aggregate-child"].pr_number == 43
+    else:
+        parked = resumed.final_state.slices["aggregate-child"]
+        assert parked.status is SliceStatus.PARKED
+        assert parked.park_cause is ParkCause.PUBLICATION_BLOCKED
+        assert parked.park_audit is not None
+        assert parked.park_audit["error_kind"] == "prior_file_pr_outcome_unresolved"
     assert child_store.load().revision == child_revision
     assert len(
         [
@@ -7697,6 +7846,291 @@ def test_aggregate_file_pr_timeout_continue_adopts_existing_publication(
             if name == "file_pr" and str(arguments.get("title", "")).startswith("Aggregate ")
         ]
     ) == 1
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_reason"),
+    [
+        ("lookup_unavailable", "publication_lookup_unavailable"),
+        ("ambiguous", "publication_lookup_unresolved"),
+        ("malformed_lookup", "publication_lookup_malformed"),
+        ("wrong_repo", "repository_identity_mismatch"),
+        ("repository_timeout", "repository_identity_unavailable"),
+        ("wrong_slice", "publication_lookup_slice_mismatch"),
+        ("wrong_pr", "watcher_pr_mismatch"),
+        ("wrong_owner", "publication_coordinates_mismatch"),
+        ("wrong_invocation", "publication_lineage_rejected:invocation_lineage_mismatch"),
+        ("wrong_branch", "publication_coordinates_mismatch"),
+        ("wrong_base", "publication_coordinates_mismatch"),
+        ("stale_head", "publication_evidence_incomplete"),
+        ("stale_patch", "publication_lineage_rejected:watcher_evidence_error"),
+        ("watcher_unavailable", "watcher_observation_unavailable"),
+    ],
+)
+def test_aggregate_recovery_refuses_unresolved_or_mismatched_publications(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+    expected_reason: str,
+) -> None:
+    class RefusalTransport(RecordingTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            if failure_mode in {
+                "wrong_owner",
+                "wrong_invocation",
+                "wrong_branch",
+                "wrong_base",
+                "stale_head",
+                "stale_patch",
+                "watcher_unavailable",
+            }:
+                self.aggregate_reconciliation = _aggregate_watcher_fixture(
+                    "unrelated-invocation" if failure_mode == "wrong_invocation" else "aggregate-child-invocation",
+                    author_agent="another-owner" if failure_mode == "wrong_owner" else "aggregate-child",
+                    head_branch="other-branch" if failure_mode == "wrong_branch" else "main.aggregate-child",
+                    base_branch="other-base" if failure_mode == "wrong_base" else "main",
+                )
+                if failure_mode == "stale_head":
+                    self.aggregate_reconciliation["watcher"]["head_reachable"] = False
+                if failure_mode == "stale_patch":
+                    self.aggregate_reconciliation["watcher"]["evidence_error"] = (
+                        "stale patch digest"
+                    )
+
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            if tool_name == "repository_identity" and failure_mode == "repository_timeout":
+                raise TimeoutError("secret-token must be redacted")
+            if tool_name == "repository_identity" and failure_mode == "wrong_repo":
+                return {
+                    "success": True,
+                    "result": {"owner": "other", "repo": "repository", "base_branch": "main"},
+                }
+            if tool_name == "resolve_live_pr_for_slice":
+                if failure_mode == "lookup_unavailable":
+                    return {"success": False, "error": "secret-token must be redacted"}
+                if failure_mode == "ambiguous":
+                    return {
+                        "success": True,
+                        "result": {
+                            "resolution": "ambiguous",
+                            "slice_id": "aggregate-child",
+                            "candidate_pr_numbers": [43, 44],
+                        },
+                    }
+                if failure_mode == "malformed_lookup":
+                    return {
+                        "success": True,
+                        "result": {
+                            "resolution": "live",
+                            "slice_id": "aggregate-child",
+                            "pr_number": "43",
+                            "publication": _aggregate_watcher_fixture(
+                                "aggregate-child-invocation"
+                            )["publication"],
+                        },
+                    }
+                if failure_mode == "wrong_pr":
+                    return {
+                        "success": True,
+                        "result": {
+                            "resolution": "live",
+                            "slice_id": "aggregate-child",
+                            "pr_number": 44,
+                            "publication": _aggregate_watcher_fixture(
+                                "aggregate-child-invocation"
+                            )["publication"],
+                        },
+                    }
+                if failure_mode == "wrong_slice":
+                    return {
+                        "success": True,
+                        "result": {
+                            "resolution": "live",
+                            "slice_id": "another-slice",
+                            "pr_number": 43,
+                            "publication": _aggregate_watcher_fixture(
+                                "aggregate-child-invocation"
+                            )["publication"],
+                        },
+                    }
+            if tool_name == "watcher_pr_state" and failure_mode == "watcher_unavailable":
+                return {"success": False, "error": "secret-token must be redacted"}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    run_id = f"aggregate-refusal-{failure_mode}"
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
+    transport = RefusalTransport()
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                _plan(),
+                source=SyntheticQueue(_lifecycle_events(run_id)),
+                order=1,
+            ),
+        )
+    )
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=replace(_config(), ledger_run_id=run_id, keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    parked = result.final_state.slices["aggregate-child"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.PUBLICATION_BLOCKED
+    assert parked.park_audit is not None
+    assert expected_reason in str(parked.park_audit["error_kind"])
+    assert "secret-token" not in repr(parked.park_audit)
+    assert not any(name == "file_pr" for name, _ in transport.calls)
+
+
+@pytest.mark.parametrize(
+    ("resume_prior", "publication_succession"),
+    [
+        ("aggregate-child-invocation", ()),
+        ("intermediate-resume", ("aggregate-child-invocation", "intermediate-resume")),
+    ],
+)
+def test_aggregate_recovery_adopts_authorized_resume_without_replaying_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_prior: str,
+    publication_succession: tuple[str, ...],
+) -> None:
+    original_prepare = driver_module._prepare_sub_tl_stage
+    prior_invocation = "aggregate-child-invocation"
+    resumed_invocation = "aggregate-child-resume"
+
+    def prepare(tasks, state, config, source, effects, store, effects_log, order):
+        state, prepared = original_prepare(
+            tasks, state, config, source, effects, store, effects_log, order
+        )
+        invocation_path = (
+            Path(config.project_root)
+            / ".exo"
+            / "agents"
+            / "aggregate-child"
+            / "invocation.json"
+        )
+        if not invocation_path.exists():
+            _checkpoint_ordered_sub_tl_invocation(store, tasks[0].name, prior_invocation)
+            worktree = str(
+                driver_module._sub_tl_worktree(config, store.root_dir, store.run_id, tasks[0])
+            )
+            invocation_path.parent.mkdir(parents=True, exist_ok=True)
+            invocation_path.write_text(
+                json.dumps(
+                    {
+                        "invocation_id": prior_invocation,
+                        "trigger": "spawn",
+                        "slice_id": "aggregate-child",
+                        "branch": "main.aggregate-child",
+                        "worktree": worktree,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return store.load(), prepared
+
+    monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", prepare)
+
+    class CrashAfterPublishTransport(RecordingTransport):
+        crashed = False
+
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            title = str(arguments.get("title", ""))
+            if tool_name == "file_pr" and title.startswith("Aggregate aggregate-child"):
+                self.calls.append((tool_name, arguments))
+                self.aggregate_reconciliation = _aggregate_watcher_fixture(prior_invocation)
+                self.crashed = True
+                raise SystemExit("simulated controller crash after aggregate PR creation")
+            return super().call_tool(role, name, tool_name, arguments)
+
+    run_id = "aggregate-resume-lineage"
+    transport = CrashAfterPublishTransport()
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                _plan(),
+                source=SyntheticQueue(_lifecycle_events(run_id)),
+                order=1,
+            ),
+            SubTLTask("later-stage", WorkPlan(), order=2),
+        )
+    )
+    config = replace(
+        _config(),
+        project_root=tmp_path,
+        ledger_run_id=run_id,
+        keep_alive_on_waiting=False,
+    )
+    with pytest.raises(SystemExit, match="simulated controller crash"):
+        run_tl_loop(
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=tmp_path,
+        )
+
+    store = RunStore(run_id, tmp_path)
+    assert store.load().slices["aggregate-child"].dispatch_invocation_id == prior_invocation
+    leaf_effects = sum(
+        name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls
+    )
+    invocation_path = (
+        tmp_path / ".exo" / "agents" / "aggregate-child" / "invocation.json"
+    )
+    record = json.loads(invocation_path.read_text(encoding="utf-8"))
+    record.update(
+        {
+            "invocation_id": resumed_invocation,
+            "trigger": "resume_pr",
+            "prior_invocation_id": resume_prior,
+            "pr_number": 43,
+            "head_sha": "head-a",
+        }
+    )
+    invocation_path.write_text(json.dumps(record), encoding="utf-8")
+    transport.aggregate_reconciliation = _aggregate_watcher_fixture(
+        resumed_invocation, succession_invocation_ids=publication_succession
+    )
+
+    resumed = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    stage = resumed.final_state.slices["aggregate-child"]
+    assert stage.status is SliceStatus.IN_REVIEW
+    assert stage.pr_number == 43
+    assert stage.dispatch_invocation_id == resumed_invocation
+    assert resumed.final_state.slices["later-stage"].status is SliceStatus.PENDING
+    assert sum(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls) == leaf_effects
+    assert sum(name == "file_pr" for name, _ in transport.calls) == 1
 
 def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approval(
     tmp_path: Path,
@@ -8351,6 +8785,7 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("org", "repo", "main"),
     )
     run_tl_loop(
         "mismatch-run",
