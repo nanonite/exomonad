@@ -8,6 +8,7 @@
       {
         "name": "root-leaf",
         "task": "retain direct root work while ordered children run",
+        "chainlink_issue_id": null,
         "boundary": ["src/root.py"]
       }
     ],
@@ -22,6 +23,7 @@
             {
               "name": "child-leaf",
               "task": "retain direct child work for the replay checkpoint",
+              "chainlink_issue_id": null,
               "boundary": ["src/child.py"]
             }
           ],

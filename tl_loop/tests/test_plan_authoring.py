@@ -613,6 +613,7 @@ def test_allowed_harness_request_reaches_every_leaf() -> None:
 
     leaves = cast(list[JsonObject], cast(JsonObject, plan.plan_mapping())["leaves"])
     assert [leaf["agent_type"] for leaf in leaves] == ["codex", "codex"]
+    assert [leaf["chainlink_issue_id"] for leaf in leaves] == [None, None]
 
 
 # --------------------------------------------------------------------------

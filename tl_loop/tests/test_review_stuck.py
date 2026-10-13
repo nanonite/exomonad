@@ -162,6 +162,7 @@ def _plan() -> WorkPlan:
                 {
                     "name": "leaf-a",
                     "task": "implement",
+                    "chainlink_issue_id": None,
                     "boundary": ["src/leaf.py"],
                     "verify": ["just tl-loop-test"],
                 }
@@ -495,7 +496,10 @@ def test_review_stuck_keeps_slice_issue_binding_without_tracker_or_plan_effects(
     project_root = tmp_path / "project"
     plan_path = project_root / ".exo" / "tl-loop" / "plan.json"
     plan_path.parent.mkdir(parents=True)
-    plan_bytes = b'{"plan":{"leaves":[{"name":"leaf-a","chainlink_issue_id":1169}]}}\n'
+    plan_bytes = (
+        b'{"plan":{"leaves":[{"name":"leaf-a","task":"implement",'
+        b'"chainlink_issue_id":1169}]}}\n'
+    )
     plan_path.write_bytes(plan_bytes)
 
     result = _converge(

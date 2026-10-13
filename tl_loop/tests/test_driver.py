@@ -195,7 +195,9 @@ def test_dispatch_correlation_rejects_historical_epoch_and_stale_generation(
     tmp_path: Path,
 ) -> None:
     run_id = "dispatch-correlation-run"
-    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "task"}]})
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "task", "chainlink_issue_id": None}]}
+    )
     create(
         run_id,
         {
@@ -743,7 +745,9 @@ def test_the_dispatch_intent_follows_the_run_generation_not_the_live_epoch(
     keeps a predecessor's owner off the new dispatch.
     """
     run_id = "generation-scoped-intent"
-    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "task"}]})
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "task", "chainlink_issue_id": None}]}
+    )
 
     def generation(epoch: str) -> RunState:
         """One run state created under ``epoch``, as ``--start``/``--recreate`` do."""
@@ -1982,6 +1986,212 @@ def _blocked_event(run_seq: int, slug: str, run_id: str) -> EventEnvelope:
     )
 
 
+def _nested_blocked_owner_stores(
+    root_dir: Path,
+    run_id: str,
+    *,
+    direct_leaf: bool = False,
+    create_child: bool = True,
+) -> tuple[WorkPlan, RunStore, RunStore | None]:
+    """Persist a root stage and its declared child scope for routing tests."""
+    child_plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "blocked leaf", "chainlink_issue_id": None}]}
+    )
+    root_plan = WorkPlan(
+        leaves=(
+            WorkPlan.from_mapping(
+                {"leaves": [{"name": "leaf-a", "task": "direct leaf", "chainlink_issue_id": None}]}
+            ).leaves
+            if direct_leaf
+            else ()
+        ),
+        sub_tls=(
+            SubTLTask("architecture", child_plan, order=1),
+            SubTLTask("kani", WorkPlan(), order=2),
+        ),
+    )
+    config = TLLoopConfig(root_dir=root_dir, run_id=run_id)
+    root_manifest = driver_module._manifest_for_plan(root_plan, run_id, config)
+    root_slices = _initial_slices(root_plan, config, root_dir, run_id)
+    create(run_id, {"slices": root_slices}, root_dir=root_dir)
+    root_store = RunStore(run_id, root_dir)
+    root_store.set_plan_manifest(root_manifest, slices=root_slices)
+    root_state = root_store.set_ordered_state(
+        1,
+        (
+            driver_module.OrderedStageState(1, ("architecture",)),
+            driver_module.OrderedStageState(2, ("kani",)),
+        ),
+        root_store.load().integration,
+    )
+    root_slices = dict(root_state.slices)
+    root_slices["architecture"] = replace(
+        root_slices["architecture"],
+        status=SliceStatus.SPAWNED,
+        dispatch_intent_id="architecture-intent",
+        dispatch_agent_id="architecture",
+        dispatch_authoritative_event_seq=0,
+        dispatch_last_boundary="sub_tl_started",
+    )
+    root_store.checkpoint(
+        root_state.fsm.phase,
+        root_slices,
+        root_state.budgets,
+        root_state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=root_state.ordered_stages,
+        integration=root_state.integration,
+    )
+    if not create_child:
+        return root_plan, root_store, None
+    child_node = next(node for node in root_manifest.nodes if node.name == "architecture")
+    child_manifest = root_manifest.child_manifests[child_node.node_id]
+    child_store = RunStore("architecture", root_store.run_dir)
+    child_config = replace(
+        config,
+        root_dir=root_store.run_dir,
+        run_id="architecture",
+        parent_run_id=run_id,
+        parent_branch="main",
+        depth=1,
+        declared_manifest=child_manifest,
+    )
+    child_slices = _initial_slices(child_plan, child_config, root_store.run_dir, "architecture")
+    create(
+        "architecture",
+        {"slices": child_slices, "parent_run_id": run_id, "depth": 1},
+        root_dir=root_store.run_dir,
+    )
+    child_store.set_plan_manifest(child_manifest, slices=child_slices)
+    return root_plan, root_store, child_store
+
+
+def test_nested_task_blocked_recovers_child_before_ack_and_keeps_ordered_stage_gated(
+    tmp_path: Path,
+) -> None:
+    run_id = "nested-task-blocked"
+    cancel_event = threading.Event()
+    plan, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
+    assert child_store is not None
+
+    class ObservingQueue(SyntheticQueue):
+        def acknowledge(self, event: EventEnvelope) -> int:
+            assert child_store.load().slices["leaf-a"].recovery is not None
+            assert root_store.load().events.last_consumed_offset == event.run_seq
+            result = super().acknowledge(event)
+            cancel_event.set()
+            return result
+
+    source = ObservingQueue([_blocked_event(1, "leaf-a", run_id)])
+    config = TLLoopConfig(
+        root_dir=tmp_path,
+        run_id=run_id,
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        cancel_event=cancel_event,
+    )
+    with pytest.raises(LoopCancelled):
+        driver_module._run_loop(
+            run_id,
+            plan,
+            source,
+            EffectClient(RecordingTransport()),
+            config,
+            root_store,
+            root_store.load(),
+            [],
+            TLEventDecoder(),
+        )
+
+    root_state = root_store.load()
+    child_state = child_store.load()
+    assert source.acknowledged == [1]
+    assert child_state.slices["leaf-a"].recovery is not None
+    assert not driver_module._child_handoff_ready(child_state, run_id)
+    assert root_state.current_order == 1
+    assert root_state.slices["kani"].status is SliceStatus.PENDING
+    assert root_state.integration.sub_tl_recovery["architecture"].slice_id == "leaf-a"
+
+
+def test_nested_task_blocked_owner_lookup_parks_missing_or_ambiguous_scope(
+    tmp_path: Path,
+) -> None:
+    missing_run, ambiguous_run = "missing-child-owner", "ambiguous-child-owner"
+    missing_plan, missing_store, _ = _nested_blocked_owner_stores(
+        tmp_path, missing_run, create_child=False
+    )
+    del missing_plan
+    missing_event = _blocked_event(1, "leaf-a", missing_run)
+    missing_lookup = driver_module._resolve_task_blocked_owner(
+        missing_event, missing_store.load(), missing_store
+    )
+    assert missing_lookup.reason_code == "child_state_missing"
+    parked = driver_module._park_task_blocked_owner_issue(
+        missing_event,
+        missing_store.load(),
+        missing_store,
+        missing_lookup,
+        EventDiagnostics(),
+    )
+    assert parked.events.last_consumed_offset == 0
+    assert any(gate.name == "task-blocked-owner:1" for gate in parked.gates)
+    assert missing_store.audited_events()[0]["reason_code"] == "child_state_missing"
+
+    _, ambiguous_store, _ = _nested_blocked_owner_stores(tmp_path, ambiguous_run, direct_leaf=True)
+    ambiguous_lookup = driver_module._resolve_task_blocked_owner(
+        _blocked_event(1, "leaf-a", ambiguous_run),
+        ambiguous_store.load(),
+        ambiguous_store,
+    )
+    assert ambiguous_lookup.owner is None
+    assert ambiguous_lookup.reason_code == "ambiguous_owner"
+
+
+@pytest.mark.parametrize(
+    ("failed_owner", "expected_reason"),
+    (
+        ("architecture", "recovery_record_failed"),
+        ("nested-task-blocked-write", "parent_checkpoint_failed"),
+    ),
+)
+def test_nested_task_blocked_persistence_failure_does_not_ack_unrecorded_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_owner: str,
+    expected_reason: str,
+) -> None:
+    run_id = "nested-task-blocked-write"
+    plan, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
+    assert child_store is not None
+    failing_store = child_store if failed_owner == "architecture" else root_store
+    original_checkpoint = RunStore.checkpoint
+
+    def fail_checkpoint(self: RunStore, *args: Any, **kwargs: Any) -> RunState:
+        if self.path == failing_store.path:
+            raise OSError("injected checkpoint failure")
+        return original_checkpoint(self, *args, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", fail_checkpoint)
+    source = SyntheticQueue([_blocked_event(1, "leaf-a", run_id)])
+    config = TLLoopConfig(root_dir=tmp_path, run_id=run_id, max_parallel_slices=1)
+    result = driver_module._run_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(RecordingTransport()),
+        config,
+        root_store,
+        root_store.load(),
+        [],
+        TLEventDecoder(),
+    )
+
+    assert source.acknowledged == []
+    assert root_store.load().events.last_consumed_offset == 0
+    assert any(gate.name == "task-blocked-owner:1" for gate in result.final_state.gates)
+    assert expected_reason in " ".join(result.diagnostics["unresolved_events"])
+
+
 def test_durable_journal_failure_parks_the_affected_slice(tmp_path: Path, monkeypatch) -> None:
     class ParkingTransport(RecordingTransport):
         def call_tool(
@@ -2069,7 +2279,9 @@ def test_dispatch_waits_for_delayed_authoritative_confirmation(tmp_path: Path) -
         try:
             run_tl_loop(
                 run_id,
-                WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "delayed"}]}),
+                WorkPlan.from_mapping(
+                    {"leaves": [{"name": "leaf-a", "task": "delayed", "chainlink_issue_id": None}]}
+                ),
                 source,
                 EffectClient(transport),
                 config=TLLoopConfig(
@@ -2116,7 +2328,13 @@ def test_dispatch_waits_for_delayed_authoritative_confirmation(tmp_path: Path) -
 
 def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None:
     transport = RecordingTransport(reject_spawns=True)
-    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement the change"}]})
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {"name": "leaf-a", "task": "implement the change", "chainlink_issue_id": None}
+            ]
+        }
+    )
     result = run_tl_loop(
         "dispatch-failure-run",
         plan,
@@ -2147,7 +2365,13 @@ def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None
 
 def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> None:
     run_id = "dispatch-restart-run"
-    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement the change"}]})
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {"name": "leaf-a", "task": "implement the change", "chainlink_issue_id": None}
+            ]
+        }
+    )
     cancel_event = threading.Event()
     config = TLLoopConfig(
         poll_interval=0.001,
@@ -2212,7 +2436,9 @@ def test_restart_reconciles_dispatch_without_duplicate_spawn(tmp_path: Path) -> 
 
 def test_restart_adopts_owner_by_intent_without_duplicate_spawn(tmp_path: Path) -> None:
     run_id = "dispatch-adopt-run"
-    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]})
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+    )
     config = TLLoopConfig(poll_interval=0.001)
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["leaf-a"].update(
@@ -2254,7 +2480,9 @@ def test_restart_adopts_owner_by_intent_without_duplicate_spawn(tmp_path: Path) 
 
 def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
     run_id = "dispatch-stale-intent-run"
-    plan = WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]})
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+    )
     cancel_event = threading.Event()
     config = TLLoopConfig(
         poll_interval=0.001,
@@ -2364,7 +2592,9 @@ def test_ledger_run_id_mismatch_reaches_driver_diagnostics(tmp_path: Path) -> No
         try:
             outcome["result"] = run_tl_loop(
                 run_id,
-                WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+                WorkPlan.from_mapping(
+                    {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+                ),
                 source,
                 EffectClient(transport),
                 config=TLLoopConfig(
@@ -2562,6 +2792,7 @@ def test_pr_published_is_acknowledged_without_a_publication_transition(
                 {
                     "name": "leaf-a",
                     "task": "implement the change",
+                    "chainlink_issue_id": None,
                     "boundary": ["src/leaf.py"],
                     "verify": ["just tl-loop-test"],
                 }
@@ -2632,6 +2863,7 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
                 {
                     "name": "tunable-operator-body",
                     "task": "implement the change",
+                    "chainlink_issue_id": None,
                     "boundary": ["src/leaf.py"],
                     "verify": ["just tl-loop-test"],
                     "done_criteria": ["the changed behavior is covered"],
@@ -2764,6 +2996,7 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(
                     {
                         "name": "leaf-a",
                         "task": "implement the requested change",
+                        "chainlink_issue_id": None,
                         "boundary": ["src/leaf.py"],
                         "verify": ["just tl-loop-test"],
                         "done_criteria": ["the failure path is covered"],
@@ -3222,6 +3455,7 @@ def test_go_with_nits_persists_follow_up_in_per_head_state(tmp_path: Path) -> No
                     {
                         "name": "leaf-a",
                         "task": "implement the requested change",
+                        "chainlink_issue_id": None,
                         "boundary": ["src/leaf.py"],
                         "verify": ["just tl-loop-test"],
                     }
@@ -3548,7 +3782,9 @@ def test_direct_reviewer_approval_is_reduced_for_exact_head_without_model(tmp_pa
     )
 
     _route_review_event(
-        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+        WorkPlan.from_mapping(
+            {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+        ),
         store,
         store.load(),
         TLPlanning(),
@@ -3601,6 +3837,7 @@ def test_direct_reviewer_requested_changes_routes_one_same_owner_repair(tmp_path
                 {
                     "name": "leaf-a",
                     "task": "implement",
+                    "chainlink_issue_id": None,
                     "boundary": ["src/leaf.py"],
                     "verify": ["just tl-loop-test"],
                 }
@@ -4157,7 +4394,9 @@ def test_direct_reviewer_verdict_rejects_unregistered_actor(tmp_path: Path) -> N
     )
 
     _route_review_event(
-        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+        WorkPlan.from_mapping(
+            {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+        ),
         store,
         store.load(),
         TLPlanning(),
@@ -4196,7 +4435,9 @@ def test_direct_reviewer_verdict_uses_shared_account_not_event_agent_slug(tmp_pa
         agent_id="exomonad-reviewer",
     )
     _route_review_event(
-        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+        WorkPlan.from_mapping(
+            {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+        ),
         store,
         store.load(),
         TLPlanning(),
@@ -4227,7 +4468,7 @@ def test_direct_reviewer_verdict_rejects_unverified_shared_account(tmp_path: Pat
     )
 
     _route_review_event(
-        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]}),
+        WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}),
         store,
         store.load(),
         TLPlanning(),
@@ -4935,6 +5176,7 @@ def test_historical_publication_rejected_before_reduction_across_recreate(
                 {
                     "name": leaf,
                     "task": "implement the change",
+                    "chainlink_issue_id": None,
                     "boundary": ["src/leaf.py"],
                     "verify": ["just tl-loop-test"],
                     "done_criteria": ["covered"],
@@ -5026,6 +5268,7 @@ def test_conflicting_publication_refused_before_reduction_preserves_owner(
                 {
                     "name": leaf,
                     "task": "implement the change",
+                    "chainlink_issue_id": None,
                     "boundary": ["src/leaf.py"],
                     "verify": ["just tl-loop-test"],
                     "done_criteria": ["covered"],
@@ -6050,7 +6293,9 @@ def test_idle_silence_preserves_spawned_state_until_explicit_cancellation(
         try:
             run_tl_loop(
                 run_id,
-                WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "long work"}]}),
+                WorkPlan.from_mapping(
+                    {"leaves": [{"name": "leaf-a", "task": "long work", "chainlink_issue_id": None}]}
+                ),
                 source,
                 EffectClient(RecordingTransport()),
                 config=TLLoopConfig(
@@ -6099,6 +6344,7 @@ def _plan() -> WorkPlan:
                 {
                     "name": "leaf-a",
                     "task": "implement the requested change",
+                    "chainlink_issue_id": None,
                     "agent_type": "codex",
                     "verify": ["just tl-loop-test"],
                 }
@@ -6672,7 +6918,15 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
 
 def test_failed_ordered_sub_tl_blocks_higher_order_work(tmp_path: Path) -> None:
     failing_child = WorkPlan.from_mapping(
-        {"leaves": [{"name": "leaf-fails", "task": "fail without a completion event"}]}
+        {
+            "leaves": [
+                {
+                    "name": "leaf-fails",
+                    "task": "fail without a completion event",
+                    "chainlink_issue_id": None,
+                }
+            ]
+        }
     )
     plan = WorkPlan(
         sub_tls=(

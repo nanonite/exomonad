@@ -211,7 +211,16 @@ def test_plan_persists_the_request_and_the_resolved_route_separately() -> None:
     from tl_loop.loop.driver import _initial_slices
 
     plan = WorkPlan.from_mapping(
-        {"leaves": [{"name": "leaf-a", "task": "build", "agent_type": "codex"}]}
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "build",
+                    "chainlink_issue_id": None,
+                    "agent_type": "codex",
+                }
+            ]
+        }
     )
     records = _initial_slices(plan)
     record = records["leaf-a"]

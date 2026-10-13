@@ -302,7 +302,10 @@ def test_a_node_added_by_a_manifest_revision_starts_with_its_declared_edges(
 
 
 def test_a_worker_records_no_edge_because_it_never_merges() -> None:
-    records = _initial_slices(_parse({"name": "w", "task": "prepare"}), TLLoopConfig())
+    records = _initial_slices(
+        WorkPlan.from_mapping({"workers": [{"name": "w", "task": "prepare"}]}),
+        TLLoopConfig(),
+    )
 
     assert records["w"]["depends_on"] == []
 
@@ -691,7 +694,16 @@ def test_malformed_depends_on_values_are_rejected_as_a_closed_shape() -> None:
         validate_plan_document(
             {
                 "run_id": "root",
-                "plan": {"leaves": [{"name": "a", "task": "x", "depends_on": "b"}]},
+                "plan": {
+                    "leaves": [
+                        {
+                            "name": "a",
+                            "task": "x",
+                            "chainlink_issue_id": None,
+                            "depends_on": "b",
+                        }
+                    ]
+                },
             }
         )
 
@@ -709,7 +721,12 @@ def _leaf(
     name: str, path: str, depends_on: tuple[str, ...], **overrides: object
 ) -> dict[str, object]:
     """Build one JSON-shaped leaf entry, declaring edges only when there are any."""
-    leaf: dict[str, object] = {"name": name, "task": f"implement {name}", "boundary": [path]}
+    leaf: dict[str, object] = {
+        "name": name,
+        "task": f"implement {name}",
+        "boundary": [path],
+        "chainlink_issue_id": None,
+    }
     if depends_on:
         leaf["depends_on"] = list(depends_on)
     return {**leaf, **overrides}

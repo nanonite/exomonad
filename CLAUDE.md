@@ -957,12 +957,14 @@ parallelism/retries; it cannot choose a harness, model, budget, or hidden
 fallback. The selector applies `.exo/harness_policy.toml` and capability
 ratings without widening an allowlist or ceiling.
 
-Each worker, leaf, or sub-TL may declare its own optional positive integer
-`chainlink_issue_id`. The binding belongs to that slice and is persisted in the
-recursive plan manifest and checkpoint; omitted IDs remain unlinked. The
-controller never infers an ID from a parent, sibling, run-level configuration,
-or slice name; malformed or duplicate bindings stop plan admission with a
-reconciliation gate.
+Every leaf in an executable plan must declare `chainlink_issue_id`: a positive
+integer for an issue-linked leaf or explicit `null` for an unlinked leaf.
+Omission is invalid, including in nested plans. Workers and sub-TL nodes do not
+need synthetic issue IDs. A binding belongs to its slice and is persisted in the
+recursive plan manifest and checkpoint. The controller never infers an ID from
+a parent, sibling, run-level configuration, or slice name; malformed or
+duplicate bindings stop plan admission with a reconciliation gate. Persisted
+legacy manifests and checkpoints without the field still decode as unlinked.
 After confirmed parent-branch sync, an unlinked merged slice makes no Chainlink
 call and gets one `roles.tl` `changelog_coverage` judgment: it reads the
 CHANGELOG `[Unreleased]` section, the merged paths, and the PR title and body,

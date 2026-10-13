@@ -276,11 +276,15 @@ class RecursivePlanShape:
         if self.depth == 0:
             return {
                 "workers": [{"name": worker_name, "task": "parallel"}],
-                "leaves": [{"name": leaf_name, "task": "parallel"}],
+                "leaves": [
+                    {"name": leaf_name, "task": "parallel", "chainlink_issue_id": None}
+                ],
             }
         return {
             "workers": [{"name": worker_name, "task": "parallel"}],
-            "leaves": [{"name": leaf_name, "task": "parallel"}],
+            "leaves": [
+                {"name": leaf_name, "task": "parallel", "chainlink_issue_id": None}
+            ],
             "sub_tls": [
                 {
                     "name": f"{self.prefix}-scope-{self.depth}-{index}",

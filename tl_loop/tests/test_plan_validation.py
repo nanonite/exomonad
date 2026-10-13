@@ -13,7 +13,12 @@ from tl_loop.plan_validation import (
 
 
 def _leaf(name: str, boundary: list[str]) -> dict[str, object]:
-    return {"name": name, "task": f"implement {name}", "boundary": boundary}
+    return {
+        "name": name,
+        "task": f"implement {name}",
+        "boundary": boundary,
+        "chainlink_issue_id": None,
+    }
 
 
 def test_plan_document_and_proposal_share_workplan_validation() -> None:
@@ -24,6 +29,19 @@ def test_plan_document_and_proposal_share_workplan_validation() -> None:
 
     assert validated["plan"] == proposal["plan"]
     assert validated is not document
+
+
+def test_plan_document_rejects_leaf_without_explicit_issue_binding() -> None:
+    with pytest.raises(
+        PlanValidationError,
+        match=r"plan: plan\.leaves\[0\]\.chainlink_issue_id is required",
+    ):
+        validate_plan_document(
+            {
+                "run_id": "root",
+                "plan": {"leaves": [{"name": "api", "task": "implement api"}]},
+            }
+        )
 
 
 def test_unknown_keys_are_rejected_at_document_and_task_boundaries() -> None:

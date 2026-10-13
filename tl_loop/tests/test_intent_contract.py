@@ -47,12 +47,25 @@ def test_plan_proposal_is_validated_by_the_plan_contract() -> None:
         {
             "kind": "plan_proposal",
             "run_id": "root",
-            "plan": {"leaves": [{"name": "api", "task": "implement api"}]},
+            "plan": {
+                "leaves": [
+                    {
+                        "name": "api",
+                        "task": "implement api",
+                        "chainlink_issue_id": None,
+                    }
+                ]
+            },
         }
     )
 
     assert intent == PlanProposalIntent(
-        "root", {"leaves": [{"name": "api", "task": "implement api"}]}
+        "root",
+        {
+            "leaves": [
+                {"name": "api", "task": "implement api", "chainlink_issue_id": None}
+            ]
+        },
     )
 
     with pytest.raises(IntentValidationError, match="overlaps"):
@@ -62,8 +75,18 @@ def test_plan_proposal_is_validated_by_the_plan_contract() -> None:
                 "run_id": "root",
                 "plan": {
                     "leaves": [
-                        {"name": "a", "task": "a", "boundary": ["src/**"]},
-                        {"name": "b", "task": "b", "boundary": ["src/a.py"]},
+                        {
+                            "name": "a",
+                            "task": "a",
+                            "boundary": ["src/**"],
+                            "chainlink_issue_id": None,
+                        },
+                        {
+                            "name": "b",
+                            "task": "b",
+                            "boundary": ["src/a.py"],
+                            "chainlink_issue_id": None,
+                        },
                     ]
                 },
             }

@@ -245,7 +245,11 @@ def _dispatch(
 
 
 def _plan(requested_harness: str | None = None) -> WorkPlan:
-    leaf: dict[str, object] = {"name": SLICE, "task": "implement"}
+    leaf: dict[str, object] = {
+        "name": SLICE,
+        "task": "implement",
+        "chainlink_issue_id": None,
+    }
     if requested_harness is not None:
         leaf["agent_type"] = requested_harness
     return WorkPlan.from_mapping({"leaves": [leaf]})

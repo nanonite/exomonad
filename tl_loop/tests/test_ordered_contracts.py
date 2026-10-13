@@ -95,7 +95,7 @@ def test_ordered_plan_rejects_mixed_invalid_or_non_contiguous_orders(
 def test_ordered_plan_keeps_top_level_leaves_and_rejects_recursive_overlap() -> None:
     plan = WorkPlan.from_mapping(
         {
-            "leaves": [{"name": "top", "task": "parallel"}],
+            "leaves": [{"name": "top", "task": "parallel", "chainlink_issue_id": None}],
             "sub_tls": [{"name": "stage", "order": 1, "plan": {}}],
         }
     )
@@ -108,7 +108,16 @@ def test_ordered_plan_keeps_top_level_leaves_and_rejects_recursive_overlap() -> 
                     {
                         "name": "one",
                         "order": 1,
-                        "plan": {"leaves": [{"name": "a", "task": "a", "boundary": ["src/**"]}]},
+                        "plan": {
+                            "leaves": [
+                                {
+                                    "name": "a",
+                                    "task": "a",
+                                    "chainlink_issue_id": None,
+                                    "boundary": ["src/**"],
+                                }
+                            ]
+                        },
                     },
                     {
                         "name": "two",
@@ -122,6 +131,7 @@ def test_ordered_plan_keeps_top_level_leaves_and_rejects_recursive_overlap() -> 
                                             {
                                                 "name": "b",
                                                 "task": "b",
+                                                "chainlink_issue_id": None,
                                                 "boundary": ["src/api.py"],
                                             }
                                         ]

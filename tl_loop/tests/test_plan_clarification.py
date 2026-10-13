@@ -20,6 +20,7 @@ def _plan(boundary: str = "src/api.py", task: str = "implement api") -> dict[str
             {
                 "name": "api",
                 "task": task,
+                "chainlink_issue_id": None,
                 "boundary": [boundary],
                 "verify": ["git diff --check"],
                 "done_criteria": ["tests pass"],

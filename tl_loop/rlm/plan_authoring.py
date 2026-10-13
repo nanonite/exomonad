@@ -322,11 +322,10 @@ def _leaf(spec: SliceSpec, *, agent_type: str | None) -> JsonObject:
         "steps": [item for item in spec.steps],
         "verify": [item for item in verification],
         "done_criteria": [item for item in spec.done_criteria],
+        "chainlink_issue_id": spec.chainlink_issue_id,
     }
     if spec.depends_on:
         leaf["depends_on"] = [item for item in spec.depends_on]
-    if spec.chainlink_issue_id is not None:
-        leaf["chainlink_issue_id"] = spec.chainlink_issue_id
     if agent_type is not None:
         leaf["agent_type"] = agent_type
     return leaf

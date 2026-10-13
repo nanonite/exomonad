@@ -230,7 +230,9 @@ def _intent_id(run_id: str, attempt: int, epoch: str | None = None) -> str:
 
 
 def _plan() -> WorkPlan:
-    return WorkPlan.from_mapping({"leaves": [{"name": "leaf-a", "task": "implement"}]})
+    return WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "implement", "chainlink_issue_id": None}]}
+    )
 
 
 def _config(

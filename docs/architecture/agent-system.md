@@ -77,17 +77,20 @@ routes through same-owner `resume_pr`, preserving branch, worktree, and PR.
 
 ### Slice-scoped Chainlink ownership
 
-`chainlink_issue_id` is optional metadata on one worker, leaf, or sub-TL slice
-in the immutable recursive manifest. A sub-TL owns issue integration for the
-slices in its scope and closes only an explicitly bound issue after merge
-adoption and parent-branch sync. The root orchestrator never supplies its own
-ID or closes a child slice's issue. An unlinked slice is a normal outcome: it
-records issue closure as not applicable, makes no Chainlink call, and gets one
-`roles.tl` `changelog_coverage` judgment that either confirms CHANGELOG
-`[Unreleased]` already captures the work or writes and pushes one entry; any
-failure there is a typed changelog outcome, and the slice can release its parent
-after post-merge recovery completes. The parent
-advances only through its persisted plan order after that child handoff.
+Persisted manifests may carry optional `chainlink_issue_id` metadata on a
+slice. New `plan.json` inputs require every leaf to declare a positive issue ID
+or explicit `null`, including nested leaves; workers and sub-TL nodes do not
+need synthetic issue IDs. Older persisted manifests without the field continue
+to decode as unlinked. A sub-TL owns issue integration for the slices in its
+scope and closes only an explicitly bound issue after merge adoption and
+parent-branch sync. The root orchestrator never supplies its own ID or closes a
+child slice's issue. An unlinked slice is a normal outcome: it records issue
+closure as not applicable, makes no Chainlink call, and gets one `roles.tl`
+`changelog_coverage` judgment that either confirms CHANGELOG `[Unreleased]`
+already captures the work or writes and pushes one entry; any failure there is
+a typed changelog outcome, and the slice can release its parent after post-merge
+recovery completes. The parent advances only through its persisted plan order
+after that child handoff.
 
 | Lifecycle | Authority | Recovery |
 |---|---|---|

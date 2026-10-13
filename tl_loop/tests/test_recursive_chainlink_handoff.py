@@ -75,7 +75,13 @@ def _recursive_plan() -> tuple[dict[str, object], WorkPlan]:
                 "order": 1,
                 "integration": {"aggregate_pr_required": False},
                 "plan": {
-                    "leaves": [{"name": LEAF_ID, "task": "complete merged work"}]
+                    "leaves": [
+                        {
+                            "name": LEAF_ID,
+                            "task": "complete merged work",
+                            "chainlink_issue_id": None,
+                        }
+                    ]
                 },
             },
             {

@@ -31,7 +31,9 @@ from tl_loop.state.schema import GateStatus, RepositoryIdentity, RunState, Slice
 from tl_loop.state.store import RunStore, create
 
 
-def test_binding_round_trips_through_work_plan_and_recursive_manifest() -> None:
+def test_binding_round_trips_through_work_plan_manifest_and_child_state(
+    tmp_path: Path,
+) -> None:
     document = {
         "sub_tls": [
             {
@@ -59,7 +61,11 @@ def test_binding_round_trips_through_work_plan_and_recursive_manifest() -> None:
                 {
                     "name": "stage",
                     "order": 1,
-                    "plan": {"leaves": [{"name": "leaf", "task": "implement work"}]},
+                    "plan": {
+                        "leaves": [
+                            {"name": "leaf", "task": "implement work", "chainlink_issue_id": None}
+                        ]
+                    },
                 }
             ]
         }
@@ -70,6 +76,37 @@ def test_binding_round_trips_through_work_plan_and_recursive_manifest() -> None:
         "root/sub_tl/stage/leaf/leaf"
     ).chainlink_issue_id == 1167
     assert reconstructed.sub_tls[0].plan.leaves[0].chainlink_issue_id is None
+
+    child_manifest = restored.child_manifests["root/sub_tl/stage"]
+    create("stage", {"plan_manifest": child_manifest.to_document()}, root_dir=tmp_path)
+    child_state = RunStore("stage", tmp_path).load()
+    assert child_state.slices["leaf"].chainlink_issue_id == 1167
+
+
+def test_leaf_binding_is_required_in_nested_plan_mapping() -> None:
+    with pytest.raises(
+        ChainlinkIssueBindingError,
+        match=r"plan\.sub_tls\[0\]\.plan\.leaves\[0\]\.chainlink_issue_id is required",
+    ):
+        WorkPlan.from_mapping(
+            {
+                "sub_tls": [
+                    {
+                        "name": "stage",
+                        "order": 1,
+                        "plan": {"leaves": [{"name": "leaf", "task": "implement work"}]},
+                    }
+                ]
+            }
+        )
+
+
+def test_unlinked_leaf_uses_explicit_null_binding() -> None:
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf", "task": "work", "chainlink_issue_id": None}]}
+    )
+
+    assert plan.leaves[0].chainlink_issue_id is None
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 1167.0, "1167"])
@@ -510,7 +547,11 @@ def test_child_controller_config_has_no_parent_slice_issue_binding(tmp_path: Pat
                     "name": "child",
                     "order": 1,
                     "chainlink_issue_id": 318,
-                    "plan": {"leaves": [{"name": "leaf", "task": "child work"}]},
+                    "plan": {
+                        "leaves": [
+                            {"name": "leaf", "task": "child work", "chainlink_issue_id": None}
+                        ]
+                    },
                 }
             ]
         }

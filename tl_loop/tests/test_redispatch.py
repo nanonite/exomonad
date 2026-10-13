@@ -159,7 +159,15 @@ def test_nested_plan_resolves_the_same_dispatch_path(tmp_path: Path) -> None:
             "sub_tls": [
                 {
                     "name": "child",
-                    "plan": {"leaves": [{"name": "nested-leaf", "task": "nested spec"}]},
+                    "plan": {
+                        "leaves": [
+                            {
+                                "name": "nested-leaf",
+                                "task": "nested spec",
+                                "chainlink_issue_id": None,
+                            }
+                        ]
+                    },
                 }
             ]
         }

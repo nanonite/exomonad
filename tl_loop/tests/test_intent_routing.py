@@ -51,15 +51,32 @@ def test_query_routing_uses_cli_run_and_slice_validation(tmp_path: Path) -> None
 
 def test_plan_routing_revalidates_model_payload(tmp_path: Path) -> None:
     project = _root(tmp_path)
-    valid = PlanProposalIntent("root", {"leaves": [{"name": "api", "task": "implement api"}]})
+    valid = PlanProposalIntent(
+        "root",
+        {
+            "leaves": [
+                {"name": "api", "task": "implement api", "chainlink_issue_id": None}
+            ]
+        },
+    )
     assert route_operator_intent(valid, project) == valid
 
     invalid = PlanProposalIntent(
         "root",
         {
             "leaves": [
-                {"name": "api", "task": "api", "boundary": ["src/**"]},
-                {"name": "tests", "task": "tests", "boundary": ["src/api.py"]},
+                {
+                    "name": "api",
+                    "task": "api",
+                    "boundary": ["src/**"],
+                    "chainlink_issue_id": None,
+                },
+                {
+                    "name": "tests",
+                    "task": "tests",
+                    "boundary": ["src/api.py"],
+                    "chainlink_issue_id": None,
+                },
             ]
         },
     )

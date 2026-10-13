@@ -393,7 +393,8 @@ def test_reconciliation_preserves_plan_json_bytes_across_restart(tmp_path) -> No
     store, state = _load_state(tmp_path)
     plan_path = tmp_path / ".exo" / "tl-loop" / "plan.json"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
-    original = b'{"leaves":[{"name":"slice-a"}]}\n'
+    original = b'{"leaves":[{"name":"slice-a","task":"implement slice a",' \
+        b'"chainlink_issue_id":null}]}\n'
     plan_path.write_bytes(original)
     client = FakeClient()
     config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)

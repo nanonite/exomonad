@@ -394,7 +394,7 @@ The workhorse. One leaf owns one branch, one worktree, one PR.
 | `verify` | no | **Becomes the slice's `test_plan`** (falls back to `steps`) |
 | `done_criteria` | no | Becomes TL-owned reviewer acceptance criteria |
 | `context`, `read_first`, `steps` | no | Passed through to `spawn_leaf` as structured spec fields |
-| `chainlink_issue_id` | no | Binds this slice to one positive Chainlink issue ID |
+| `chainlink_issue_id` | yes on leaves; no on workers/sub-TLs | Binds a leaf to one positive Chainlink issue ID; use `null` for an unlinked leaf |
 
 `boundary` and `verify` are doing double duty: they are both instructions to the
 leaf and the controller's own ownership and test-plan records. Two leaves whose
@@ -449,8 +449,10 @@ acceptable.
 
 ### `chainlink_issue_id` — bind one issue to one slice
 
-Add the positive integer `chainlink_issue_id` to the worker, leaf, or sub-TL
-entry that owns that issue:
+Every leaf must include `chainlink_issue_id`: use a positive integer when the
+leaf owns a Chainlink issue, or explicit `null` when it has no issue. Omitting
+the field is a plan validation error, including for leaves nested under a
+sub-TL. Workers and sub-TL nodes do not need synthetic issue IDs. For example:
 
 ```json
 {
@@ -464,10 +466,11 @@ entry that owns that issue:
 }
 ```
 
-The binding is optional and unique across the recursive plan. A sub-TL's ID
-binds to that sub-TL slice; it does not flow into leaves in its nested plan.
-Put an ID on a nested leaf when that leaf owns a separate issue. Omit the field
-for dynamic work that has no Chainlink task.
+Leaf issue bindings are unique across the recursive plan. An issue ID does not
+flow from a sub-TL into leaves in its nested plan; each leaf declares its own
+binding or explicit `null`.
+Put an ID on a nested leaf when that leaf owns a separate issue. Use explicit
+`null` for dynamic work that has no Chainlink task.
 
 The sub-TL that owns the slice closes its explicitly bound issue mechanically
 after merge adoption and parent-branch sync. The root only orchestrates child
@@ -500,8 +503,8 @@ serializes integration.
   "name": "auth",
   "plan": {
     "leaves": [
-      { "name": "token-refresh", "task": "..." },
-      { "name": "session-store", "task": "..." }
+      { "name": "token-refresh", "task": "...", "chainlink_issue_id": null },
+      { "name": "session-store", "task": "...", "chainlink_issue_id": null }
     ]
   }
 }
@@ -593,6 +596,7 @@ One parallel group:
             {
               "name": "tokens",
               "task": "Implement access-token rotation.",
+              "chainlink_issue_id": null,
               "boundary": ["src/auth/tokens/**"],
               "verify": ["cargo test -p auth tokens"]
             }
@@ -607,6 +611,7 @@ One parallel group:
             {
               "name": "invoices",
               "task": "Implement invoice persistence.",
+              "chainlink_issue_id": null,
               "boundary": ["src/billing/invoices/**"],
               "verify": ["cargo test -p billing invoices"]
             }
@@ -634,6 +639,7 @@ Multiple same-order sub-TLs followed by an integration stage:
             {
               "name": "grammar",
               "task": "Add the parser grammar.",
+              "chainlink_issue_id": null,
               "boundary": ["src/parser/grammar/**"],
               "verify": ["cargo test -p parser grammar"]
             }
@@ -648,6 +654,7 @@ Multiple same-order sub-TLs followed by an integration stage:
             {
               "name": "types",
               "task": "Add parsed AST types.",
+              "chainlink_issue_id": null,
               "boundary": ["src/parser/types/**"],
               "verify": ["cargo test -p parser types"]
             }
@@ -662,6 +669,7 @@ Multiple same-order sub-TLs followed by an integration stage:
             {
               "name": "adapter",
               "task": "Integrate the parser and schema changes.",
+              "chainlink_issue_id": null,
               "boundary": ["src/integration/parser/**"],
               "verify": ["cargo test -p integration parser"]
             }
@@ -694,6 +702,7 @@ Nested orders reset at each recursive boundary:
                   {
                     "name": "endpoint",
                     "task": "Add the release endpoint.",
+                    "chainlink_issue_id": null,
                     "boundary": ["src/release/api/**"],
                     "verify": ["cargo test -p release endpoint"]
                   }
@@ -708,6 +717,7 @@ Nested orders reset at each recursive boundary:
                   {
                     "name": "command",
                     "task": "Expose the release endpoint in the CLI.",
+                    "chainlink_issue_id": null,
                     "boundary": ["src/release/cli/**"],
                     "verify": ["cargo test -p release command"]
                   }
@@ -738,6 +748,7 @@ Sequential dependent stages:
             {
               "name": "implementation",
               "task": "Implement the feature.",
+              "chainlink_issue_id": null,
               "boundary": ["src/feature/**"],
               "verify": ["cargo test -p feature"]
             }
@@ -752,6 +763,7 @@ Sequential dependent stages:
             {
               "name": "acceptance",
               "task": "Verify the merged feature behavior.",
+              "chainlink_issue_id": null,
               "boundary": ["tests/feature/**"],
               "verify": ["cargo test -p feature --test acceptance"]
             }
@@ -766,6 +778,7 @@ Sequential dependent stages:
             {
               "name": "documentation",
               "task": "Document the verified feature.",
+              "chainlink_issue_id": null,
               "boundary": ["docs/feature/**"],
               "verify": ["just docs-lint"]
             }
@@ -788,12 +801,14 @@ A direct-leaf dependency chain, with no stage boundary:
       {
         "name": "rotation",
         "task": "Implement access-token rotation.",
+        "chainlink_issue_id": null,
         "boundary": ["src/auth/rotation.rs"],
         "verify": ["cargo test -p auth rotation"]
       },
       {
         "name": "rotation-docs",
         "task": "Document the merged rotation behavior.",
+        "chainlink_issue_id": null,
         "boundary": ["docs/auth/**"],
         "depends_on": ["rotation"],
         "verify": ["just docs-lint"]
@@ -1016,12 +1031,14 @@ implementation work, which is what a stage expresses.
             {
               "name": "token-refresh",
               "task": "Implement refresh-token rotation.",
+              "chainlink_issue_id": null,
               "boundary": ["src/auth/**"],
               "verify": ["cargo test -p auth refresh"]
             },
             {
               "name": "session-store",
               "task": "Move session state into the shared store.",
+              "chainlink_issue_id": null,
               "boundary": ["src/session/**"],
               "verify": ["cargo test -p session"]
             }
@@ -1036,6 +1053,7 @@ implementation work, which is what a stage expresses.
             {
               "name": "auth-docs",
               "task": "Document the auth changes that just merged into this branch.",
+              "chainlink_issue_id": null,
               "context": "The refresh-rotation and session-store work is already merged into your base branch. Read the merged diff, not a spec.",
               "read_first": ["src/auth/provider.rs", "src/session/store.rs"],
               "steps": [

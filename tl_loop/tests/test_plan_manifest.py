@@ -26,12 +26,28 @@ from tl_loop.state.store import RunStore, _decode_recursive_fsm, _encode_fsm, cr
 def _plan() -> dict[str, object]:
     return {
         "workers": [{"name": "prepare", "task": "prepare the workspace"}],
-        "leaves": [{"name": "leaf-a", "task": "implement the change", "boundary": ["src"]}],
+        "leaves": [
+            {
+                "name": "leaf-a",
+                "task": "implement the change",
+                "chainlink_issue_id": None,
+                "boundary": ["src"],
+            }
+        ],
         "sub_tls": [
             {
                 "name": "stage-a",
                 "order": 1,
-                "plan": {"workers": [], "leaves": [{"name": "nested", "task": "nested work"}]},
+                "plan": {
+                    "workers": [],
+                    "leaves": [
+                        {
+                            "name": "nested",
+                            "task": "nested work",
+                            "chainlink_issue_id": None,
+                        }
+                    ],
+                },
             },
             {
                 "name": "stage-b",
@@ -73,7 +89,11 @@ def test_nested_nodes_target_their_scope_owned_branch() -> None:
                 {
                     "name": "stage",
                     "order": 1,
-                    "plan": {"leaves": [{"name": "leaf", "task": "leaf task"}]},
+                    "plan": {
+                        "leaves": [
+                            {"name": "leaf", "task": "leaf task", "chainlink_issue_id": None}
+                        ]
+                    },
                 }
             ]
         },
@@ -462,7 +482,9 @@ def test_continuation_rejects_changed_external_plan(tmp_path) -> None:
 
     changed = {
         "workers": original["workers"],
-        "leaves": [{"name": "leaf", "task": "changed task"}],
+        "leaves": [
+            {"name": "leaf", "task": "changed task", "chainlink_issue_id": None}
+        ],
         "sub_tls": original["sub_tls"],
     }
     with pytest.raises(driver.TLLoopError, match="increase plan_revision"):
@@ -501,7 +523,14 @@ def test_terminal_checkpoint_rejects_supplied_plan_drift_before_fast_path(tmp_pa
 
     changed = {
         "workers": original["workers"],
-        "leaves": [{"name": "leaf-a", "task": "changed task", "boundary": ["src"]}],
+        "leaves": [
+            {
+                "name": "leaf-a",
+                "task": "changed task",
+                "chainlink_issue_id": None,
+                "boundary": ["src"],
+            }
+        ],
         "sub_tls": original["sub_tls"],
     }
     with pytest.raises(

@@ -83,6 +83,7 @@ def test_leaf_plan_retains_done_criteria() -> None:
                 {
                     "name": "leaf-a",
                     "task": "implement the change",
+                    "chainlink_issue_id": None,
                     "done_criteria": ["The change is complete"],
                 }
             ]

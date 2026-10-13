@@ -300,6 +300,11 @@ explicitly bound to that slice after merge adoption and parent-branch sync. The
 root controller orchestrates child handoff and persisted plan order; it never
 supplies its own issue ID or closes a child slice's issue.
 
+At the `plan.json` input boundary, every leaf now declares a positive
+`chainlink_issue_id` or explicit `null`; omitted bindings are invalid, including
+in nested plans. This strict input rule does not change decoding of older
+persisted manifests, which continue to treat an absent binding as unlinked.
+
 A slice without an issue binding is a first-class unlinked task for dynamic
 work. After parent-branch sync it records issue closure as not applicable and
 makes no Chainlink call. Because no `chainlink close` writes its CHANGELOG entry,

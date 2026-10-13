@@ -860,6 +860,23 @@ class EventDiagnostics:
         self.unresolved_events.append(details)
         self.rejected += 1
 
+    def record_task_blocked_owner_issue(
+        self,
+        event: EventEnvelope,
+        reason_code: str,
+        candidates: Sequence[str],
+    ) -> None:
+        """Retain the stable reason for an unresolved blocked-event owner."""
+        key = (event.run_seq or 0, event.event_type)
+        if key in self.unresolved_event_keys:
+            return
+        self.unresolved_event_keys.add(key)
+        self.unresolved_events.append(
+            f"{event.event_type} seq={event.run_seq} reason={reason_code} "
+            f"candidates={list(candidates)}"
+        )
+        self.rejected += 1
+
     def snapshot(self) -> Mapping[str, object]:
         return {
             "controller_started_at": self.controller_started_at,
@@ -980,7 +997,7 @@ class WorkPlan:
             raise ValueError(f"work plan contains unknown keys: {', '.join(unknown)}")
         parsed = cls(
             workers=_workers(value.get("workers", ())),
-            leaves=_leaves(value.get("leaves", ())),
+            leaves=_leaves(value.get("leaves", ()), path=f"{path}.leaves"),
             sub_tls=_sub_tls(value.get("sub_tls", ()), path=f"{path}.sub_tls"),
         )
         return normalize_work_plan(parsed, path=path)
@@ -3137,6 +3154,33 @@ def _run_loop(
             if _is_terminal_phase(phase):
                 break
             continue
+        if event.kind is EventKind.AGENT_TASK_BLOCKED:
+            state, routed = _route_task_blocked_event(
+                event,
+                plan,
+                state,
+                event_seq,
+                replaying,
+                diagnostics,
+                convergence,
+                config,
+                effects,
+                store,
+                source,
+                effects_log,
+            )
+            if not routed:
+                return TLRunResult(
+                    state,
+                    tuple(effects_log),
+                    tuple(transitions),
+                    tuple(consumed),
+                    tuple(heartbeat_events),
+                    diagnostics.snapshot(),
+                    _journal_entries(effects_log),
+                )
+            phase = _phase_from_state(state)
+            continue
         resolution = resolve_event_slice(event, state, allowed_ids=expected)
         if not _event_belongs_to_plan(event, expected, state):
             if _is_reconcilable_identity_event(event):
@@ -3338,21 +3382,6 @@ def _run_loop(
         # row belongs to, so the child is renamed before the transition rather
         # than raising an illegal transition against an unknown child.
         fsm_event = _retarget_child_event(fsm_event, event_slice_id)
-        if event.kind is EventKind.AGENT_TASK_BLOCKED:
-            state = _record_task_blocked_recovery(
-                event,
-                state,
-                store,
-                phase,
-                checkpoint_seq,
-                effects,
-            )
-            phase = _phase_from_state(state)
-            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
-            _ack_event(source, event, replaying, diagnostics)
-            _release_replayed_event(store, event, replaying)
-            diagnostics.correlated += 1
-            continue
         if _duplicate_event(phase, fsm_event, state):
             diagnostics.filtered += 1
             _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
@@ -10779,10 +10808,15 @@ def _run_sub_tls(
             stage.order, state, current_order, plan, store
         )
     if plan.sub_tls and not plan.workers and not plan.leaves:
+        current_stage_ids = next(
+            (stage.sub_tls for stage in plan.ordered_stages if stage.order == state.current_order),
+            (),
+        )
         awaiting_integration = tuple(
             task.name
             for task in plan.sub_tls
-            if not _ordered_child_complete(task, state.slices[task.name])
+            if task.name in current_stage_ids
+            and not _ordered_child_complete(task, state.slices[task.name])
         )
         if awaiting_integration:
             before_phase = _phase_from_state(state)
@@ -11404,6 +11438,14 @@ def _child_handoff_ready(state: RunState | None, parent_run_id: str) -> bool:
     if state is None:
         return False
     del parent_run_id
+    slices = getattr(state, "slices", {})
+    if isinstance(slices, Mapping) and any(
+        getattr(slice_state, "recovery", None) is not None for slice_state in slices.values()
+    ):
+        return False
+    integration = getattr(state, "integration", None)
+    if getattr(integration, "sub_tl_recovery", {}):
+        return False
     recursive_fsm = getattr(state, "recursive_fsm", None)
     if isinstance(recursive_fsm, (RecursiveTLFailed, RecursiveTLParked)):
         return True
@@ -16715,6 +16757,343 @@ def _next_event(
         return None
 
 
+@dataclass(frozen=True)
+class _TaskBlockedOwner:
+    """One persisted scope that owns the blocked slice."""
+
+    store: RunStore
+    slice_id: str
+    path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _TaskBlockedOwnerLookup:
+    """An unambiguous owner or a stable reason that recovery cannot be routed."""
+
+    owner: _TaskBlockedOwner | None = None
+    reason_code: str = "owner_not_found"
+    candidate_paths: tuple[tuple[str, ...], ...] = ()
+    unavailable_paths: tuple[tuple[str, ...], ...] = ()
+    candidate_slice_ids: tuple[str, ...] = ()
+
+
+def _route_task_blocked_event(
+    event: EventEnvelope,
+    plan: WorkPlan,
+    state: RunState,
+    event_seq: int,
+    replaying: bool,
+    diagnostics: EventDiagnostics,
+    convergence: ConvergenceTracker,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    source: EventQueue,
+    effects_log: list[EffectIntent],
+) -> tuple[RunState, bool]:
+    """Record blocked recovery at its owner before acknowledging the root event."""
+    lookup = _resolve_task_blocked_owner(event, state, store)
+    owner = lookup.owner
+    if owner is None:
+        return _park_task_blocked_owner_issue(event, state, store, lookup, diagnostics), False
+    try:
+        owner_state = owner.store.load()
+        identity = resolve_event_slice(event, owner_state)
+        if not identity.resolved or identity.slice_id != owner.slice_id:
+            raise TLLoopError("task-blocked owner changed during recovery routing")
+        owner_state = _record_task_blocked_recovery(
+            event,
+            owner_state,
+            owner.store,
+            _phase_from_state(owner_state),
+            max(event_seq, owner_state.events.last_consumed_offset),
+            _owner_effect_client(effects, owner.store.run_id),
+        )
+    except (OSError, ValueError, RuntimeError):
+        failed = replace(lookup, reason_code="recovery_record_failed")
+        return _park_task_blocked_owner_issue(event, state, store, failed, diagnostics), False
+    if owner.store.path == store.path:
+        return _finish_local_task_blocked_event(
+            event,
+            owner_state,
+            convergence,
+            config,
+            effects,
+            store,
+            source,
+            replaying,
+            diagnostics,
+            effects_log,
+            lookup,
+        )
+    return _finish_nested_task_blocked_event(
+        event,
+        plan,
+        event_seq,
+        state,
+        convergence,
+        config,
+        effects,
+        store,
+        source,
+        replaying,
+        diagnostics,
+        effects_log,
+        lookup,
+    )
+
+
+def _finish_local_task_blocked_event(
+    event: EventEnvelope,
+    state: RunState,
+    convergence: ConvergenceTracker,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    source: EventQueue,
+    replaying: bool,
+    diagnostics: EventDiagnostics,
+    effects_log: list[EffectIntent],
+    lookup: _TaskBlockedOwnerLookup,
+) -> tuple[RunState, bool]:
+    """Finish a block owned by this scope, parking convergence write failures."""
+    try:
+        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+        state = _clear_task_blocked_owner_gate(event, state, store)
+    except (OSError, ValueError, RuntimeError):
+        failed = replace(lookup, reason_code="owner_convergence_failed")
+        return _park_task_blocked_owner_issue(event, state, store, failed, diagnostics), False
+    _ack_task_blocked_event(event, source, replaying, diagnostics, store)
+    return state, True
+
+
+def _finish_nested_task_blocked_event(
+    event: EventEnvelope,
+    plan: WorkPlan,
+    event_seq: int,
+    state: RunState,
+    convergence: ConvergenceTracker,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    source: EventQueue,
+    replaying: bool,
+    diagnostics: EventDiagnostics,
+    effects_log: list[EffectIntent],
+    lookup: _TaskBlockedOwnerLookup,
+) -> tuple[RunState, bool]:
+    """Checkpoint parent progress, project recovery, then acknowledge the event."""
+    try:
+        state = store.checkpoint(
+            _phase_from_state(state),
+            state.slices,
+            state.budgets,
+            max(event_seq, state.events.last_consumed_offset),
+        )
+    except (OSError, ValueError, RuntimeError):
+        failed = replace(lookup, reason_code="parent_checkpoint_failed")
+        return _park_task_blocked_owner_issue(event, state, store, failed, diagnostics), False
+    try:
+        if plan.sub_tls:
+            state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
+        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+        state = _clear_task_blocked_owner_gate(event, state, store)
+    except (OSError, ValueError, RuntimeError):
+        failed = replace(lookup, reason_code="parent_projection_failed")
+        return _park_task_blocked_owner_issue(event, state, store, failed, diagnostics), False
+    _ack_task_blocked_event(event, source, replaying, diagnostics, store)
+    return state, True
+
+
+def _clear_task_blocked_owner_gate(
+    event: EventEnvelope,
+    state: RunState,
+    store: RunStore,
+) -> RunState:
+    """Clear a prior owner-resolution park after recovery is durable."""
+    gate_name = _task_blocked_owner_gate_name(event)
+    if any(gate.name == gate_name for gate in state.gates):
+        return store.clear_gate(gate_name)
+    return state
+
+
+def _ack_task_blocked_event(
+    event: EventEnvelope,
+    source: EventQueue,
+    replaying: bool,
+    diagnostics: EventDiagnostics,
+    store: RunStore,
+) -> None:
+    """Acknowledge only after owner and parent checkpoints are durable."""
+    _ack_event(source, event, replaying, diagnostics)
+    _release_replayed_event(store, event, replaying)
+    diagnostics.correlated += 1
+
+
+def _resolve_task_blocked_owner(
+    event: EventEnvelope,
+    state: RunState,
+    store: RunStore,
+) -> _TaskBlockedOwnerLookup:
+    """Find the unique manifest-owned scope for a blocked event."""
+    matches: list[_TaskBlockedOwner] = []
+    issues: list[tuple[str, tuple[str, ...], str | None]] = []
+    _collect_task_blocked_owners(event, state, store, (state.run_id,), matches, issues)
+    paths = tuple(sorted({owner.path for owner in matches}))
+    slice_ids = tuple(sorted({owner.slice_id for owner in matches}))
+    if len(matches) == 1 and not issues:
+        return _TaskBlockedOwnerLookup(owner=matches[0], candidate_paths=paths)
+    if len(matches) > 1:
+        return _TaskBlockedOwnerLookup(
+            reason_code="ambiguous_owner",
+            candidate_paths=paths,
+            candidate_slice_ids=slice_ids,
+        )
+    if issues:
+        reason, _, candidate = min(issues, key=lambda item: (item[0], item[1]))
+        return _TaskBlockedOwnerLookup(
+            reason_code=reason,
+            candidate_paths=tuple(sorted({path for _, path, _ in issues})),
+            unavailable_paths=tuple(
+                sorted({path for kind, path, _ in issues if kind != "owner_identity_mismatch"})
+            ),
+            candidate_slice_ids=(candidate,) if candidate is not None else (),
+        )
+    return _TaskBlockedOwnerLookup()
+
+
+def _collect_task_blocked_owners(
+    event: EventEnvelope,
+    state: RunState,
+    store: RunStore,
+    path: tuple[str, ...],
+    matches: list[_TaskBlockedOwner],
+    issues: list[tuple[str, tuple[str, ...], str | None]],
+) -> None:
+    """Walk declared child scopes and collect matching durable owners."""
+    resolution = resolve_event_slice(event, state)
+    if resolution.resolved and resolution.slice_id is not None:
+        matches.append(_TaskBlockedOwner(store, resolution.slice_id, path))
+    elif resolution.candidates:
+        issues.append(("owner_identity_conflict", path, event.task_blocked.slice_id))
+    manifest = state.plan_manifest
+    if manifest is None:
+        return
+    for node in manifest.nodes:
+        if node.kind != "sub_tl":
+            continue
+        child_manifest = manifest.child_manifests.get(node.node_id)
+        if child_manifest is None:
+            continue
+        child_store = RunStore(node.name, store.run_dir)
+        child_path = (*path, node.name)
+        if not child_store.path.exists():
+            if _manifest_contains_blocked_slice(event, child_manifest):
+                issues.append(("child_state_missing", child_path, event.task_blocked.slice_id))
+            continue
+        try:
+            child_state = child_store.load()
+        except (OSError, ValueError):
+            if _manifest_contains_blocked_slice(event, child_manifest):
+                issues.append(("child_state_unavailable", child_path, event.task_blocked.slice_id))
+            continue
+        if not _child_owner_checkpoint_matches(state, node.name, child_state, child_manifest):
+            if (
+                _manifest_contains_blocked_slice(event, child_manifest)
+                or resolve_event_slice(event, child_state).candidates
+            ):
+                issues.append(("owner_identity_mismatch", child_path, event.task_blocked.slice_id))
+            continue
+        _collect_task_blocked_owners(event, child_state, child_store, child_path, matches, issues)
+
+
+def _child_owner_checkpoint_matches(
+    parent: RunState,
+    child_name: str,
+    child: RunState,
+    manifest: PlanManifest,
+) -> bool:
+    """Require a nested checkpoint to match its declared parent and manifest."""
+    return (
+        child.run_id == child_name
+        and child.parent_run_id == parent.run_id
+        and child.plan_manifest is not None
+        and child.plan_manifest.digest == manifest.digest
+    )
+
+
+def _manifest_contains_blocked_slice(event: EventEnvelope, manifest: PlanManifest) -> bool:
+    """Check only canonical slice aliases against declared leaf names."""
+    blocked = event.task_blocked
+    if blocked is None:
+        return False
+    observed = {blocked.slice_id, event.slice_id, event.data.get("slice_id")}
+    names = {node.name for node in manifest.nodes if node.kind in {"leaf", "worker"}}
+    for child in manifest.child_manifests.values():
+        names.update(_manifest_leaf_names(child))
+    return any(isinstance(value, str) and value in names for value in observed)
+
+
+def _manifest_leaf_names(manifest: PlanManifest) -> set[str]:
+    """Return declared leaf and worker names from a recursive child manifest."""
+    names = {node.name for node in manifest.nodes if node.kind in {"leaf", "worker"}}
+    for child in manifest.child_manifests.values():
+        names.update(_manifest_leaf_names(child))
+    return names
+
+
+def _task_blocked_owner_gate_name(event: EventEnvelope) -> str:
+    """Name one unresolved blocked-event owner decision by immutable sequence."""
+    return f"task-blocked-owner:{event.run_seq}"
+
+
+def _park_task_blocked_owner_issue(
+    event: EventEnvelope,
+    state: RunState,
+    store: RunStore,
+    lookup: _TaskBlockedOwnerLookup,
+    diagnostics: EventDiagnostics,
+) -> RunState:
+    """Persist a retryable owner-routing park without advancing the event cursor."""
+    blocked = event.task_blocked
+    reason = lookup.reason_code
+    diagnostics.record_task_blocked_owner_issue(event, reason, lookup.candidate_slice_ids)
+    audit = {
+        "run_seq": event.run_seq,
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "correlation": "task_blocked_owner_unresolved",
+        "reason_code": reason,
+        "observed_slice_id": blocked.slice_id if blocked is not None else None,
+        "observed_agent_id": event.agent_id,
+        "observed_invocation_id": event.invocation_id,
+        "candidate_owner_paths": [list(path) for path in lookup.candidate_paths],
+        "unavailable_owner_paths": [list(path) for path in lookup.unavailable_paths],
+    }
+    try:
+        if event.run_seq is not None:
+            store.append_audit_event(audit)
+    except (OSError, ValueError, RuntimeError) as error:
+        LOGGER.error(
+            "Unable to persist task-blocked owner audit run_id=%s seq=%s reason=%s error=%s",
+            state.run_id,
+            event.run_seq,
+            reason,
+            type(error).__name__,
+        )
+    try:
+        return store.set_gate(_task_blocked_owner_gate_name(event), GateStatus.PENDING)
+    except (OSError, ValueError, RuntimeError) as error:
+        LOGGER.error(
+            "Unable to persist task-blocked owner gate run_id=%s seq=%s reason=%s error=%s",
+            state.run_id,
+            event.run_seq,
+            reason,
+            type(error).__name__,
+        )
+        return state
+
+
 def _record_task_blocked_recovery(
     event: EventEnvelope,
     state: RunState,
@@ -17947,10 +18326,10 @@ def _workers(value: object) -> tuple[WorkerTask, ...]:
     return tuple(_worker(item) for item in value)
 
 
-def _leaves(value: object) -> tuple[LeafTask, ...]:
+def _leaves(value: object, *, path: str = "plan.leaves") -> tuple[LeafTask, ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise TypeError("work plan leaves must be an array")
-    return tuple(_leaf(item) for item in value)
+    return tuple(_leaf(item, path=f"{path}[{index}]") for index, item in enumerate(value))
 
 
 def _sub_tls(value: object, *, path: str = "plan.sub_tls") -> tuple[SubTLTask, ...]:
@@ -18025,7 +18404,7 @@ def _optional_chainlink_issue_id(value: object, path: str) -> int | None:
     if value is None:
         return None
     if type(value) is not int or value <= 0:
-        raise ChainlinkIssueBindingError(f"{path} must be a positive integer or omitted")
+        raise ChainlinkIssueBindingError(f"{path} must be a positive integer or null")
     return value
 
 
@@ -18183,11 +18562,15 @@ def _worker(value: object) -> WorkerTask:
     )
 
 
-def _leaf(value: object) -> LeafTask:
+def _leaf(value: object, *, path: str = "plan.leaves[0]") -> LeafTask:
     if isinstance(value, LeafTask):
         return value
     if not isinstance(value, Mapping):
         raise TypeError("leaf task must be an object")
+    if "chainlink_issue_id" not in value:
+        raise ChainlinkIssueBindingError(
+            f"{path}.chainlink_issue_id is required; use null for an unlinked leaf"
+        )
     _reject_unknown_task_keys(
         value,
         {

@@ -216,7 +216,7 @@ def test_ordered_scope_keeps_direct_workers_and_leaves_in_parallel_block() -> No
     plan = WorkPlan.from_mapping(
         {
             "workers": [{"name": "worker", "task": "inspect"}],
-            "leaves": [{"name": "leaf", "task": "publish"}],
+            "leaves": [{"name": "leaf", "task": "publish", "chainlink_issue_id": None}],
             "sub_tls": [{"name": "stage", "order": 1, "plan": {}}],
         }
     )

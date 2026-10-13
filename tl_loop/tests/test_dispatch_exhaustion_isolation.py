@@ -178,7 +178,14 @@ def _invoke(
     plan = WorkPlan.from_mapping(
         {
             "workers": [{"name": name, "task": f"implement {name}"} for name in workers],
-            "leaves": [{"name": name, "task": f"implement {name}"} for name in leaves],
+            "leaves": [
+                {
+                    "name": name,
+                    "task": f"implement {name}",
+                    "chainlink_issue_id": None,
+                }
+                for name in leaves
+            ],
         }
     )
     result = run_tl_loop(
