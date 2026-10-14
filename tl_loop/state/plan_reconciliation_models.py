@@ -57,6 +57,12 @@ class ReconciliationScope:
     )
     action_journal_status: str = "missing"
     action_journal_sha256: str | None = None
+    dispatch_event_records: Mapping[int, tuple[Mapping[str, object], ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    dispatch_event_status: Mapping[int, str] = field(
+        default_factory=dict, repr=False, compare=False
+    )
     protected_node_ids: tuple[str, ...] = ()
 
     def to_document(self, blocked_node_ids: tuple[str, ...] = ()) -> dict[str, object]:
@@ -125,6 +131,7 @@ class ReconciliationScope:
                     "disposition": "proven" if proof.proven else "blocked",
                     "reason_code": proof.reason_code,
                     "evidence": list(proof.evidence),
+                    "correlation": dict(proof.correlation),
                 }
                 for proof in declaration_proofs
             ],

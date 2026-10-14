@@ -12,7 +12,7 @@ import pytest
 from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
-from tl_loop.fsm.scope import TLRunning
+from tl_loop.fsm.scope import TLAllMerged, TLRunning
 from tl_loop.loop.driver import EffectIntent, WorkPlan, _manifest_plan
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.ordered import IntegrationLifecycle
@@ -149,6 +149,7 @@ def _project(
     candidate_completed_issue_id: int | None = 811,
     include_completed_spawn_journal: bool = False,
     spawn_task_override: str | None = None,
+    legacy_completed_dispatch: bool = False,
 ) -> tuple[Path, RunStore, RunStore, bytes, bytes]:
     accepted_document = _plan_document(
         future_issue_id=None,
@@ -187,7 +188,10 @@ def _project(
         runtime_digest,
         include_spawn_journal=include_completed_spawn_journal,
         spawn_task_override=spawn_task_override,
+        legacy_completed_dispatch=legacy_completed_dispatch,
     )
+    if legacy_completed_dispatch:
+        _record_authoritative_spawn_event(tmp_path, child_store)
     return state_root, root_store, child_store, accepted_bytes, candidate_bytes
 
 
@@ -252,15 +256,28 @@ def _create_child(
     *,
     include_spawn_journal: bool = False,
     spawn_task_override: str | None = None,
+    legacy_completed_dispatch: bool = False,
 ) -> RunStore:
-    create(
-        "architecture",
-        {"parent_run_id": "root", "plan_manifest": current.to_document()},
-        root_dir=state_root / "root",
-    )
+    child_spec = {"parent_run_id": "root", "plan_manifest": current.to_document()}
+    if legacy_completed_dispatch:
+        child_spec.update(
+            ledger_run_id="root-ledger",
+            parent_agent_id="agent-architecture",
+        )
+    create("architecture", child_spec, root_dir=state_root / "root")
     store = RunStore("architecture", state_root / "root")
     state = store.load()
     receipt = _post_merge_receipt()
+    if legacy_completed_dispatch:
+        receipt = PostMergeState(
+            PostMergePhase.COMPLETE,
+            {
+                **receipt.evidence,
+                "forgejo_head_sha": "a" * 40,
+                "forgejo_merged": "true",
+                "forgejo_pr_number": "45",
+            },
+        )
     slices = dict(state.slices)
     completed_node = current.node("root/sub_tl/architecture/leaf/completed")
     slices["completed"] = replace(
@@ -271,8 +288,11 @@ def _create_child(
         dispatch_intent_id="dispatch-completed",
         dispatch_started_at=1.0,
         dispatch_agent_id="agent-completed",
-        dispatch_invocation_id="invocation-completed",
+        dispatch_invocation_id=None if legacy_completed_dispatch else "invocation-completed",
         dispatch_authoritative_event_seq=1,
+        branch="main.agent-completed" if legacy_completed_dispatch else None,
+        worktree="/tmp/architecture/completed" if legacy_completed_dispatch else None,
+        base_ref="main" if legacy_completed_dispatch else slices["completed"].base_ref,
         manifest_node_id=completed_node.node_id,
         manifest_revision=current.manifest_revision,
         chainlink_issue_id=completed_node.chainlink_issue_id,
@@ -287,14 +307,22 @@ def _create_child(
         current.node("root/sub_tl/architecture/leaf/future"),
         ChildKind.LEAF,
     )
-    phase = TLRunning(
-        current_order=0,
-        pending_by_order={},
-        scope_path=(current.scope_id,),
-        plan_digest=runtime_digest or accepted.digest or "",
-        parallel_pending=(future,),
-        completed_children={"completed": completed},
-        post_merge={"completed": receipt},
+    phase = (
+        TLAllMerged(
+            scope_path=(current.scope_id,),
+            plan_digest=runtime_digest or accepted.digest or "",
+            completed_children={"completed": receipt},
+        )
+        if legacy_completed_dispatch
+        else TLRunning(
+            current_order=0,
+            pending_by_order={},
+            scope_path=(current.scope_id,),
+            plan_digest=runtime_digest or accepted.digest or "",
+            parallel_pending=(future,),
+            completed_children={"completed": completed},
+            post_merge={"completed": receipt},
+        )
     )
     store.checkpoint(
         phase,
@@ -308,11 +336,18 @@ def _create_child(
             store,
             accepted.node("root/sub_tl/architecture/leaf/completed").task,
             spawn_task_override,
+            legacy_completed_dispatch=legacy_completed_dispatch,
         )
     return store
 
 
-def _record_completed_spawn(store: RunStore, accepted_task: str, task_override: str | None) -> None:
+def _record_completed_spawn(
+    store: RunStore,
+    accepted_task: str,
+    task_override: str | None,
+    *,
+    legacy_completed_dispatch: bool = False,
+) -> None:
     intent = EffectIntent(
         "spawn_leaf",
         "completed",
@@ -326,15 +361,66 @@ def _record_completed_spawn(store: RunStore, accepted_task: str, task_override: 
     )
     journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
     journal.append(intent)
+    result = (
+        {
+            "success": True,
+            "result": {
+                "invocation_id": None,
+                "branch_name": "main.agent-completed",
+                "worktree_path": "/tmp/architecture/agent-completed",
+            },
+        }
+        if legacy_completed_dispatch
+        else {
+            "success": True,
+            "result": {"agent_id": "agent-completed", "invocation_id": "invocation-completed"},
+        }
+    )
     journal.mark_result(
         intent,
-        ToolResult.from_raw(
-            {
-                "success": True,
-                "result": {"agent_id": "agent-completed", "invocation_id": "invocation-completed"},
-            }
-        ),
+        ToolResult.from_raw(result),
     )
+
+
+def _record_authoritative_spawn_event(project: Path, store: RunStore) -> None:
+    state = store.load()
+    slice_state = state.slices["completed"]
+    ledger = project / ".exo" / "ledger" / "segments"
+    ledger.mkdir(parents=True)
+    event = {
+        "agent_id": state.parent_agent_id,
+        "data": {
+            "branch": slice_state.branch,
+            "child_agent": slice_state.dispatch_agent_id,
+            "intent_id": slice_state.dispatch_intent_id,
+        },
+        "invocation_id": None,
+        "lifecycle_state": "observed",
+        "observed_at": "2026-10-13T00:00:00Z",
+        "run_id": state.ledger_run_id,
+        "run_seq": slice_state.dispatch_authoritative_event_seq,
+        "type": "agent.spawned",
+    }
+    (ledger / "segment-000000000001.jsonl").write_text(
+        json.dumps(event, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _mutate_completed_spawn_result(
+    store: RunStore,
+    field: str,
+    value: object,
+) -> None:
+    journal_path = store.run_dir / "action-journal.json"
+    entries = json.loads(journal_path.read_text(encoding="utf-8"))
+    entry = next(
+        item
+        for item in entries
+        if item.get("operation") == "spawn_leaf" and item.get("target") == "completed"
+    )
+    entry["result"]["result"][field] = value
+    journal_path.write_text(json.dumps(entries, sort_keys=True), encoding="utf-8")
 
 
 def _tree_bytes(root: Path) -> dict[Path, bytes]:
@@ -633,6 +719,172 @@ def test_apply_restores_completed_task_and_issue_binding_from_dispatch_evidence(
     assert restored.dispatch_invocation_id == before_slice.dispatch_invocation_id
     assert restored.post_merge == before_receipt
     assert action_journal.read_bytes() == action_journal_bytes
+
+
+def test_apply_restores_historical_dispatch_without_inventing_invocation_identity(
+    tmp_path: Path,
+) -> None:
+    state_root, _root_store, child_store, _accepted, _candidate = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    before = child_store.load().slices["completed"]
+    before_tree = _tree_bytes(tmp_path)
+
+    report = analyze_plan_reconciliation(tmp_path)
+    assert _tree_bytes(tmp_path) == before_tree
+    child_report = next(
+        item
+        for item in report.to_document()["scopes"]
+        if item["scope_id"] == "root/sub_tl/architecture"
+    )
+    proof = child_report["protected_declaration_proofs"][0]
+
+    assert report.can_apply, report.blockers
+    assert proof["disposition"] == "proven"
+    assert "missing_dispatch_invocation_preserved_as_unknown" in proof["evidence"]
+    dispatch_event = json.loads(
+        (tmp_path / ".exo" / "ledger" / "segments" / "segment-000000000001.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert proof["correlation"] == {
+        "accepted_boundary_sha256": proof["correlation"]["accepted_boundary_sha256"],
+        "accepted_task_sha256": proof["correlation"]["accepted_task_sha256"],
+        "base_branch": "main",
+        "branch": "main.agent-completed",
+        "dispatch_event_seq": 1,
+        "dispatch_event_sha256": hashlib.sha256(
+            json.dumps(dispatch_event, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "dispatch_event_emitter_agent_id": "agent-architecture",
+        "dispatch_intent_id": "dispatch-completed",
+        "dispatch_invocation_id": None,
+        "dispatch_invocation_status": "unavailable_in_legacy_records",
+        "dispatch_owner_agent_id": "agent-completed",
+        "pr_base_branch": "main",
+        "pr_head_sha": "a" * 40,
+        "pr_number": 45,
+        "completion_receipt_sha256": hashlib.sha256(
+            json.dumps(
+                dict(before.post_merge.evidence), sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+        "ledger_run_id": "root-ledger",
+        "scope_id": "root/sub_tl/architecture",
+        "scope_run_id": "architecture",
+        "slice_id": "completed",
+        "spawn_action_key": proof["correlation"]["spawn_action_key"],
+        "spawn_result_agent_id": None,
+        "spawn_result_invocation_id": None,
+        "slice_worktree_sha256": hashlib.sha256(b"/tmp/architecture/completed").hexdigest(),
+        "spawn_result_worktree_sha256": hashlib.sha256(
+            b"/tmp/architecture/agent-completed"
+        ).hexdigest(),
+        "worktree_paths_match": False,
+    }
+
+    result = apply_plan_reconciliation(
+        tmp_path,
+        "Restore the completed declaration from legacy dispatch evidence",
+        report.evidence_fingerprint,
+        actor="operator",
+    )
+
+    restored = child_store.load().slices["completed"]
+    audit = json.loads((state_root / "plan-reconciliations.jsonl").read_text().splitlines()[0])
+    assert result.applied
+    assert restored.status is SliceStatus.MERGED
+    assert restored.dispatch_invocation_id is None
+    assert restored.dispatch_agent_id == before.dispatch_agent_id
+    assert restored.dispatch_intent_id == before.dispatch_intent_id
+    assert restored.dispatch_authoritative_event_seq == before.dispatch_authoritative_event_seq
+    assert restored.pr_number == before.pr_number == 45
+    assert restored.post_merge == before.post_merge
+    assert audit["protected_declaration_proofs"][0]["correlation"] == proof["correlation"]
+
+
+def test_legacy_dispatch_event_change_invalidates_reconciliation_fingerprint(
+    tmp_path: Path,
+) -> None:
+    _state_root, _root_store, _child_store, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    report = analyze_plan_reconciliation(tmp_path)
+    ledger = tmp_path / ".exo" / "ledger" / "segments" / "segment-000000000001.jsonl"
+    event = json.loads(ledger.read_text(encoding="utf-8"))
+    event["data"]["branch"] = "main.changed-after-dry-run"
+    ledger.write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(PlanRevisionError) as error:
+        apply_plan_reconciliation(
+            tmp_path,
+            "Reject stale legacy dispatch evidence",
+            report.evidence_fingerprint,
+            actor="operator",
+        )
+
+    assert error.value.code == "reconciliation_evidence_stale"
+
+
+@pytest.mark.parametrize(
+    ("corruption", "reason_code"),
+    [
+        ("missing_event", "legacy_dispatch_event_missing"),
+        ("malformed_event", "legacy_dispatch_event_ledger_invalid"),
+        ("duplicate_event", "legacy_dispatch_event_ambiguous"),
+        ("conflicting_invocation", "legacy_dispatch_result_identity_conflict"),
+        ("wrong_branch", "legacy_dispatch_coordinates_mismatch"),
+        ("missing_worktree", "legacy_spawn_result_worktree_missing"),
+        ("wrong_owner", "legacy_dispatch_coordinates_mismatch"),
+    ],
+)
+def test_legacy_dispatch_recovery_fails_closed_on_conflicting_or_missing_evidence(
+    tmp_path: Path,
+    corruption: str,
+    reason_code: str,
+) -> None:
+    state_root, _root, child_store, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    ledger = tmp_path / ".exo" / "ledger" / "segments" / "segment-000000000001.jsonl"
+    if corruption == "missing_event":
+        ledger.unlink()
+    elif corruption == "malformed_event":
+        ledger.write_text("not-json\n", encoding="utf-8")
+    elif corruption == "duplicate_event":
+        ledger.write_text(ledger.read_text(encoding="utf-8") * 2, encoding="utf-8")
+    elif corruption == "conflicting_invocation":
+        _mutate_completed_spawn_result(child_store, "invocation_id", "unrelated-invocation")
+    elif corruption == "wrong_branch":
+        _mutate_completed_spawn_result(child_store, "branch_name", "main.other")
+    elif corruption == "missing_worktree":
+        _mutate_completed_spawn_result(child_store, "worktree_path", None)
+    elif corruption == "wrong_owner":
+        event = json.loads(ledger.read_text(encoding="utf-8"))
+        event["data"]["child_agent"] = "unrelated-agent"
+        ledger.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    before = _tree_bytes(state_root)
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child_report = next(
+        item for item in report["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+
+    assert report["can_apply"] is False
+    assert child_report["protected_declaration_proofs"][0]["reason_code"] == reason_code
+    assert _tree_bytes(state_root) == before
 
 
 def test_completed_declaration_restore_blocks_without_spawn_journal(tmp_path: Path) -> None:

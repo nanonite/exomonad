@@ -9,7 +9,11 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 from .plan_reconciliation_checkpoint import _reconciled_checkpoint, _scope_needs_update
-from .plan_reconciliation_models import PlanReconciliationAnalysis, ReconciliationScope
+from .plan_reconciliation_models import (
+    PlanReconciliationAnalysis,
+    ReconciliationScope,
+    _protected_declaration_proofs,
+)
 from .plan_reconciliation_report import _safe_text
 from .plan_revision_types import PlanRevisionError
 
@@ -35,7 +39,25 @@ def _audit_record(
         "candidate_sha256_after": analysis.candidate_sha256,
         "scopes": [_audit_scope(scope) for scope in analysis.scopes if _scope_needs_update(scope)],
         "changed_node_ids": list(analysis.changes),
+        "protected_declaration_proofs": _audit_declaration_proofs(analysis.scopes),
     }
+
+
+def _audit_declaration_proofs(
+    scopes: tuple[ReconciliationScope, ...],
+) -> list[dict[str, object]]:
+    return [
+        {
+            "scope_id": _safe_text(scope.current.scope_id),
+            "node_id": _safe_text(proof.node_id),
+            "fields": list(proof.fields),
+            "reason_code": proof.reason_code,
+            "evidence": list(proof.evidence),
+            "correlation": dict(proof.correlation),
+        }
+        for scope in scopes
+        for proof in _protected_declaration_proofs(scope)
+    ]
 
 
 def _audit_scope(scope: ReconciliationScope) -> dict[str, object]:

@@ -8048,6 +8048,9 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
             "issue_id": "811",
             "issue_close_intent_id": "close-811",
             "issue_close_journal_id": "chainlink-close:811",
+            "forgejo_head_sha": "a" * 40,
+            "forgejo_merged": "true",
+            "forgejo_pr_number": "45",
             "changelog_intent_id": "changelog-811",
             "changelog_generation": "1",
             "changelog_commit_sha": "c" * 40,
@@ -8067,6 +8070,8 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         pr_number=45,
         reviewed_head="a" * 40,
         chainlink_issue_id=811,
+        dispatch_invocation_id=None,
+        dispatch_authoritative_event_seq=2,
         post_merge=receipt,
         park_cause=None,
         park_issue_id=None,
@@ -8089,6 +8094,44 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         child_state.events.last_consumed_offset,
     )
     assert child_store.load().slices["leaf-a"].post_merge == receipt
+    legacy_leaf = child_store.load().slices["leaf-a"]
+    legacy_journal_path = child_store.run_dir / "action-journal.json"
+    legacy_journal = json.loads(legacy_journal_path.read_text(encoding="utf-8"))
+    spawn_record = next(
+        row
+        for row in legacy_journal
+        if row.get("operation") == "spawn_leaf" and row.get("target") == "leaf-a"
+    )
+    spawn_result = spawn_record["result"]["result"]
+    spawn_result.pop("agent_id", None)
+    spawn_result["invocation_id"] = None
+    spawn_result["branch_name"] = legacy_leaf.branch
+    spawn_result["worktree_path"] = str(tmp_path / ".exo" / "worktrees" / "leaf-a-opencode")
+    legacy_journal_path.write_text(
+        json.dumps(legacy_journal, sort_keys=True),
+        encoding="utf-8",
+    )
+    assert child_store.load().ledger_run_id is not None
+    ledger_segments = tmp_path / ".exo" / "ledger" / "segments"
+    ledger_segments.mkdir(parents=True)
+    dispatch_event = {
+        "agent_id": child_store.load().parent_agent_id,
+        "data": {
+            "branch": legacy_leaf.branch,
+            "child_agent": legacy_leaf.dispatch_agent_id,
+            "intent_id": legacy_leaf.dispatch_intent_id,
+        },
+        "invocation_id": None,
+        "lifecycle_state": "observed",
+        "observed_at": "2026-10-13T00:00:00Z",
+        "run_id": child_store.load().ledger_run_id,
+        "run_seq": legacy_leaf.dispatch_authoritative_event_seq,
+        "type": "agent.spawned",
+    }
+    (ledger_segments / "segment-000000000001.jsonl").write_text(
+        json.dumps(dispatch_event, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     close_count = sum(
         name == "chainlink_issue_close" and str(args.get("issue_id")) == "811"
         for name, args in transport.calls
@@ -8176,7 +8219,16 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     action_journal_before_reconciliation = action_journal.read_bytes()
 
     reconciliation = analyze_plan_reconciliation(tmp_path)
-    assert reconciliation.can_apply, reconciliation.blockers
+    assert reconciliation.can_apply, [
+        (
+            scope["scope_id"],
+            [
+                (proof["reason_code"], proof["evidence"])
+                for proof in scope["protected_declaration_proofs"]
+            ],
+        )
+        for scope in reconciliation.to_document()["scopes"]
+    ]
     reconciliation_document = reconciliation.to_document()
     root_scope_report = next(
         scope for scope in reconciliation_document["scopes"] if scope["scope_id"] == "root"
@@ -8197,6 +8249,8 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     assert declaration_proof["fields"] == ["chainlink_issue_id", "task"]
     assert declaration_proof["disposition"] == "proven"
     assert "completed_issue_closure_receipt" in declaration_proof["evidence"]
+    assert declaration_proof["correlation"]["dispatch_invocation_id"] is None
+    assert declaration_proof["correlation"]["worktree_paths_match"] is False
     applied_reconciliation = apply_plan_reconciliation(
         tmp_path,
         "Restore accepted plan bindings before updating future issue metadata",
@@ -8211,6 +8265,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     )
     restored_leaf = child_store.load().slices["leaf-a"]
     assert restored_leaf.status is SliceStatus.MERGED
+    assert restored_leaf.dispatch_invocation_id is None
     assert restored_leaf.chainlink_issue_id is None
     assert restored_leaf.pr_number == 45
     assert restored_leaf.post_merge == receipt

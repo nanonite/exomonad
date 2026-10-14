@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from tl_loop.fsm.post_merge import PostMergePhase
+from tl_loop.fsm.child import ChildRecord
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.scope import TLAllMerged
 from tl_loop.loop.journal import stable_action_key
 from tl_loop.state.plan_revision_diff import changed_node_fields
 
 from .plan_manifest import ManifestNode
 from .plan_reconciliation_ownership import _records_for
+from .plan_reconciliation_report import _safe_text
 from .schema import SliceState, SliceStatus
 
 if TYPE_CHECKING:
@@ -30,6 +35,7 @@ class ProtectedDeclarationProof:
     proven: bool
     reason_code: str
     evidence: tuple[str, ...] = ()
+    correlation: tuple[tuple[str, object], ...] = ()
 
 
 def evaluate_protected_declaration_restore(
@@ -39,25 +45,14 @@ def evaluate_protected_declaration_restore(
 ) -> ProtectedDeclarationProof | None:
     """Prove only task and issue-ID restoration from the original dispatch."""
     fields = changed_node_fields(current, accepted)
-    if (
-        current.kind != "leaf"
-        or accepted.kind != "leaf"
-        or not fields
-        or not set(fields) <= _RESTORABLE_FIELDS
-    ):
+    if not _restorable_declaration_fields(current, accepted, fields):
         return None
     slice_state = scope.state.slices.get(current.name)
     if slice_state is None or slice_state.status is not SliceStatus.MERGED:
         return None
-    if not _fsm_matches_accepted(scope):
-        return _blocked(current, fields, "accepted_fsm_digest_mismatch")
-    if not _slice_binds_declaration(scope, slice_state, current):
-        return _blocked(current, fields, "slice_dispatch_identity_mismatch")
-    has_dispatch_record = _dispatch_identity_is_durable(
-        scope, current, slice_state, slice_state.dispatch_intent_id
-    )
-    if not has_dispatch_record:
-        return _blocked(current, fields, "runtime_dispatch_identity_mismatch")
+    reason = _declaration_restore_blocker(scope, current, slice_state)
+    if reason is not None:
+        return _blocked(current, fields, reason)
     entry, reason = _confirmed_spawn_entry(
         scope, current, accepted, slice_state, slice_state.dispatch_intent_id
     )
@@ -65,29 +60,90 @@ def evaluate_protected_declaration_restore(
         return _blocked(current, fields, reason)
     if not _issue_binding_matches(current, accepted, slice_state, entry):
         return _blocked(current, fields, "issue_binding_evidence_mismatch")
+    return _proven_declaration(scope, current, accepted, fields, slice_state, entry)
+
+
+def _restorable_declaration_fields(
+    current: ManifestNode,
+    accepted: ManifestNode,
+    fields: tuple[str, ...],
+) -> bool:
+    return (
+        current.kind == "leaf"
+        and accepted.kind == "leaf"
+        and bool(fields)
+        and set(fields) <= _RESTORABLE_FIELDS
+    )
+
+
+def _declaration_restore_blocker(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    slice_state: SliceState,
+) -> str | None:
+    if not _fsm_matches_accepted(scope):
+        return "accepted_fsm_digest_mismatch"
+    if not _slice_binds_declaration(scope, slice_state, node):
+        return _slice_identity_failure(slice_state)
+    if not _dispatch_identity_is_durable(scope, node, slice_state, slice_state.dispatch_intent_id):
+        return "runtime_dispatch_identity_mismatch"
+    return None
+
+
+def _slice_identity_failure(slice_state: SliceState) -> str:
+    if slice_state.dispatch_invocation_id is None:
+        return "legacy_dispatch_completion_unproven"
+    return "slice_dispatch_identity_mismatch"
+
+
+def _proven_declaration(
+    scope: ReconciliationScope,
+    current: ManifestNode,
+    accepted: ManifestNode,
+    fields: tuple[str, ...],
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> ProtectedDeclarationProof:
+    evidence = _declaration_evidence(scope, current, accepted, slice_state)
+    correlation = (
+        _legacy_correlation(scope, current, accepted, slice_state, entry)
+        if slice_state.dispatch_invocation_id is None
+        else ()
+    )
+    return ProtectedDeclarationProof(current.node_id, fields, True, "proven", evidence, correlation)
+
+
+def _declaration_evidence(
+    scope: ReconciliationScope,
+    current: ManifestNode,
+    accepted: ManifestNode,
+    slice_state: SliceState,
+) -> tuple[str, ...]:
     evidence = [
         "accepted_snapshot_manifest_digest",
         "matching_fsm_plan_digest",
         "slice_dispatch_identity",
-        (
-            "recursive_child_dispatch_record"
-            if any(
-                record.child_id == current.name
-                for record in _records_for(scope.state.recursive_fsm)
-            )
-            else "all_merged_completion_receipt"
-        ),
+        _completion_evidence_source(scope, current.name),
         "confirmed_spawn_action_with_accepted_task",
     ]
+    if slice_state.dispatch_invocation_id is None:
+        evidence.extend(
+            (
+                "authoritative_dispatch_event_matches_owner_and_branch",
+                "confirmed_spawn_result_records_actual_worktree",
+                "completed_pr_receipt_matches_leaf_and_base",
+                "missing_dispatch_invocation_preserved_as_unknown",
+            )
+        )
     if current.chainlink_issue_id != accepted.chainlink_issue_id:
         evidence.append("completed_issue_closure_receipt")
-    return ProtectedDeclarationProof(
-        current.node_id,
-        fields,
-        True,
-        "proven",
-        tuple(evidence),
-    )
+    return tuple(evidence)
+
+
+def _completion_evidence_source(scope: ReconciliationScope, slice_id: str) -> str:
+    if any(record.child_id == slice_id for record in _records_for(scope.state.recursive_fsm)):
+        return "recursive_child_dispatch_record"
+    return "all_merged_completion_receipt"
 
 
 def _fsm_matches_accepted(scope: ReconciliationScope) -> bool:
@@ -110,8 +166,11 @@ def _slice_binds_declaration(
         and record.manifest_revision == scope.current.manifest_revision
         and bool(record.dispatch_intent_id)
         and bool(record.dispatch_agent_id)
-        and bool(record.dispatch_invocation_id)
         and record.dispatch_authoritative_event_seq is not None
+        and (
+            bool(record.dispatch_invocation_id)
+            or _legacy_completion_receipt_matches(scope, node, record)
+        )
     )
 
 
@@ -125,21 +184,25 @@ def _dispatch_identity_is_durable(
         record for record in _records_for(scope.state.recursive_fsm) if record.child_id == node.name
     ]
     if len(matches) == 1:
-        record = matches[0]
-        return (
-            record.kind.value == node.kind
-            and record.manifest_node_id == node.node_id
-            and record.manifest_revision == scope.current.manifest_revision
-            and record.dispatch_intent_id == intent_id
-            and record.invocation_id == slice_state.dispatch_invocation_id
-        )
+        return _dispatch_record_matches(scope, node, slice_state, matches[0], intent_id)
     if matches or not isinstance(scope.state.recursive_fsm, TLAllMerged):
         return False
-    completed = scope.state.recursive_fsm.completed_children.get(node.name)
+    return _legacy_completion_receipt_matches(scope, node, slice_state)
+
+
+def _dispatch_record_matches(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    slice_state: SliceState,
+    record: ChildRecord,
+    intent_id: str,
+) -> bool:
     return (
-        completed is not None
-        and completed.phase is PostMergePhase.COMPLETE
-        and slice_state.post_merge == completed
+        record.kind.value == node.kind
+        and record.manifest_node_id == node.node_id
+        and record.manifest_revision == scope.current.manifest_revision
+        and record.dispatch_intent_id == intent_id
+        and record.invocation_id == slice_state.dispatch_invocation_id
     )
 
 
@@ -164,17 +227,29 @@ def _confirmed_spawn_entry(
     if len(correlated) != 1:
         return None, "spawn_action_ambiguous"
     entry = correlated[0]
+    reason = _spawn_entry_failure(scope, current, accepted, slice_state, entry)
+    return (None, reason) if reason else (entry, "proven")
+
+
+def _spawn_entry_failure(
+    scope: ReconciliationScope,
+    current: ManifestNode,
+    accepted: ManifestNode,
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> str | None:
     arguments = _arguments(entry)
     if entry.get("status") != "confirmed" or not _confirmed_result(entry):
-        return None, "spawn_action_unconfirmed"
-    if not _spawn_result_matches_slice(entry, slice_state):
-        return None, "spawn_result_identity_mismatch"
+        return "spawn_action_unconfirmed"
+    matches, reason = _spawn_result_matches_slice(scope, current, slice_state, entry)
+    if not matches:
+        return reason
     if arguments.get("name") != accepted.name or arguments.get("task") != accepted.task:
-        return None, "spawn_declaration_mismatch"
+        return "spawn_declaration_mismatch"
     boundary = arguments.get("boundary", [])
     if boundary != list(accepted.boundary):
-        return None, "spawn_declaration_mismatch"
-    return entry, "proven"
+        return "spawn_declaration_mismatch"
+    return None
 
 
 def _entry_targets_dispatch(
@@ -200,16 +275,301 @@ def _confirmed_result(entry: Mapping[str, object]) -> bool:
     return isinstance(result, Mapping) and result.get("success") is True
 
 
-def _spawn_result_matches_slice(entry: Mapping[str, object], slice_state: SliceState) -> bool:
+def _spawn_result_matches_slice(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> tuple[bool, str]:
     outcome = entry.get("result")
     if not isinstance(outcome, Mapping):
-        return False
+        return False, "spawn_result_identity_mismatch"
     result = outcome.get("result")
-    return (
-        isinstance(result, Mapping)
+    if not isinstance(result, Mapping):
+        return False, "spawn_result_identity_mismatch"
+    if (
+        slice_state.dispatch_invocation_id is not None
         and result.get("agent_id") == slice_state.dispatch_agent_id
         and result.get("invocation_id") == slice_state.dispatch_invocation_id
+    ):
+        return True, "proven"
+    legacy, reason = _legacy_spawn_result_matches(scope, node, slice_state, entry)
+    return (True, "proven") if legacy else (False, reason)
+
+
+def _legacy_spawn_result_matches(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> tuple[bool, str]:
+    result = _spawn_result(entry)
+    if not isinstance(result, Mapping):
+        return False, "spawn_result_identity_mismatch"
+    reason = _legacy_spawn_result_metadata_failure(slice_state, result)
+    if reason is not None:
+        return False, reason
+    event, reason = _legacy_dispatch_event(scope, slice_state)
+    if event is None:
+        return False, reason
+    if not _legacy_event_matches_slice(scope, slice_state, event):
+        return False, "legacy_dispatch_coordinates_mismatch"
+    if not _legacy_result_coordinates_match(result, slice_state):
+        return False, "legacy_dispatch_coordinates_mismatch"
+    if not _legacy_completion_receipt_matches(scope, node, slice_state):
+        return False, "legacy_dispatch_completion_mismatch"
+    return True, "proven"
+
+
+def _legacy_spawn_result_metadata_failure(
+    slice_state: SliceState,
+    result: Mapping[str, object],
+) -> str | None:
+    if slice_state.dispatch_invocation_id is not None:
+        return "spawn_result_identity_mismatch"
+    if result.get("agent_id") is not None or result.get("invocation_id") is not None:
+        return "legacy_dispatch_result_identity_conflict"
+    worktree = result.get("worktree_path")
+    if not isinstance(worktree, str) or not worktree or not Path(worktree).is_absolute():
+        return "legacy_spawn_result_worktree_missing"
+    return None
+
+
+def _spawn_result(entry: Mapping[str, object]) -> Mapping[str, object] | None:
+    outcome = entry.get("result")
+    result = outcome.get("result") if isinstance(outcome, Mapping) else None
+    return result if isinstance(result, Mapping) else None
+
+
+def _legacy_dispatch_event(
+    scope: ReconciliationScope,
+    slice_state: SliceState,
+) -> tuple[Mapping[str, object] | None, str]:
+    sequence = slice_state.dispatch_authoritative_event_seq
+    if type(sequence) is not int:
+        return None, "legacy_dispatch_event_sequence_missing"
+    status = scope.dispatch_event_status.get(sequence, "ledger_missing")
+    if status != "found":
+        return None, f"legacy_dispatch_event_{status}"
+    events = scope.dispatch_event_records.get(sequence, ())
+    return (events[0], "proven") if len(events) == 1 else (None, "legacy_dispatch_event_ambiguous")
+
+
+def _legacy_event_matches_slice(
+    scope: ReconciliationScope,
+    slice_state: SliceState,
+    event: Mapping[str, object],
+) -> bool:
+    data = event.get("data")
+    if not isinstance(data, Mapping):
+        return False
+    sequence = slice_state.dispatch_authoritative_event_seq
+    branch = data.get("branch", data.get("branch_name"))
+    return (
+        event.get("type", event.get("event_type")) == "agent.spawned"
+        and event.get("run_id") == scope.state.ledger_run_id
+        and event.get("run_seq") == sequence
+        and (
+            scope.state.parent_agent_id is None
+            or event.get("agent_id") == scope.state.parent_agent_id
+        )
+        and event.get("invocation_id") is None
+        and data.get("intent_id") == slice_state.dispatch_intent_id
+        and data.get("child_agent") == slice_state.dispatch_agent_id
+        and isinstance(slice_state.branch, str)
+        and bool(slice_state.branch)
+        and branch == slice_state.branch
     )
+
+
+def _legacy_result_coordinates_match(
+    result: Mapping[str, object],
+    slice_state: SliceState,
+) -> bool:
+    worktree = result.get("worktree_path")
+    return (
+        isinstance(slice_state.branch, str)
+        and bool(slice_state.branch)
+        and result.get("branch_name") == slice_state.branch
+        and isinstance(worktree, str)
+        and bool(worktree)
+        and Path(worktree).is_absolute()
+    )
+
+
+def _legacy_completion_receipt_matches(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    slice_state: SliceState,
+) -> bool:
+    completed = _completed_leaf_receipt(scope, node)
+    return (
+        completed is not None
+        and slice_state.post_merge == completed
+        and _completion_receipt_coordinates_match(node, slice_state, completed)
+    )
+
+
+def _completed_leaf_receipt(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+) -> PostMergeState | None:
+    phase = scope.state.recursive_fsm
+    if not isinstance(phase, TLAllMerged):
+        return None
+    completed = phase.completed_children.get(node.name)
+    return (
+        completed if completed is not None and completed.phase is PostMergePhase.COMPLETE else None
+    )
+
+
+def _completion_receipt_coordinates_match(
+    node: ManifestNode,
+    slice_state: SliceState,
+    completed: PostMergeState,
+) -> bool:
+    if slice_state.pr_number is None:
+        return False
+    evidence = completed.evidence
+    pr_number = str(slice_state.pr_number)
+    head_sha = evidence.get("head_sha")
+    return (
+        evidence.get("child_id") == node.name
+        and evidence.get("pr_number") == pr_number
+        and evidence.get("forgejo_pr_number") == pr_number
+        and evidence.get("forgejo_merged") == "true"
+        and evidence.get("parent_branch") == slice_state.base_ref
+        and _is_commit_sha(head_sha)
+        and evidence.get("forgejo_head_sha") == head_sha
+        and bool(evidence.get("merge_journal_id"))
+    )
+
+
+def _is_commit_sha(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) in {40, 64}
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _legacy_correlation(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    accepted: ManifestNode,
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> tuple[tuple[str, object], ...]:
+    values = _legacy_dispatch_correlation(scope, node, accepted, slice_state, entry)
+    values.update(_legacy_publication_correlation(slice_state))
+    return tuple(sorted(values.items()))
+
+
+def _legacy_dispatch_correlation(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    accepted: ManifestNode,
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> dict[str, object]:
+    values = _legacy_dispatch_identity_fields(scope, node, accepted, slice_state, entry)
+    values.update(_legacy_worktree_fields(slice_state, entry))
+    return values
+
+
+def _legacy_dispatch_identity_fields(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    accepted: ManifestNode,
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        **_legacy_run_scope_fields(scope, node, slice_state),
+        **_legacy_invocation_fields(scope, slice_state, entry),
+        **_legacy_declaration_fields(accepted),
+    }
+
+
+def _legacy_run_scope_fields(
+    scope: ReconciliationScope,
+    node: ManifestNode,
+    slice_state: SliceState,
+) -> dict[str, object]:
+    return {
+        "ledger_run_id": _safe_text(scope.state.ledger_run_id),
+        "scope_run_id": _safe_text(scope.state.run_id),
+        "scope_id": _safe_text(scope.current.scope_id),
+        "slice_id": _safe_text(node.name),
+        "dispatch_owner_agent_id": _safe_text(slice_state.dispatch_agent_id),
+        "branch": _safe_text(slice_state.branch),
+        "base_branch": _safe_text(slice_state.base_ref),
+    }
+
+
+def _legacy_invocation_fields(
+    scope: ReconciliationScope,
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> dict[str, object]:
+    sequence = slice_state.dispatch_authoritative_event_seq
+    events = scope.dispatch_event_records.get(sequence, ()) if type(sequence) is int else ()
+    event = events[0] if len(events) == 1 else {}
+    return {
+        "dispatch_intent_id": _safe_text(slice_state.dispatch_intent_id),
+        "dispatch_invocation_id": None,
+        "dispatch_invocation_status": "unavailable_in_legacy_records",
+        "dispatch_event_seq": slice_state.dispatch_authoritative_event_seq,
+        "dispatch_event_sha256": _json_digest(event),
+        "dispatch_event_emitter_agent_id": _safe_text(event.get("agent_id")),
+        "spawn_action_key": _safe_text(entry.get("key")),
+        "spawn_result_agent_id": None,
+        "spawn_result_invocation_id": None,
+    }
+
+
+def _legacy_declaration_fields(accepted: ManifestNode) -> dict[str, str]:
+    return {
+        "accepted_task_sha256": _text_digest(accepted.task),
+        "accepted_boundary_sha256": _json_digest(list(accepted.boundary)),
+    }
+
+
+def _legacy_worktree_fields(
+    slice_state: SliceState,
+    entry: Mapping[str, object],
+) -> dict[str, object]:
+    result = _spawn_result(entry)
+    spawn_worktree = result.get("worktree_path") if result is not None else None
+    spawn_path = spawn_worktree if isinstance(spawn_worktree, str) else ""
+    slice_path = slice_state.worktree or ""
+    # The plan-derived slice path and server-returned worker path are distinct
+    # records; preserve both instead of pretending they name the same path.
+    return {
+        "slice_worktree_sha256": _text_digest(slice_path),
+        "spawn_result_worktree_sha256": _text_digest(spawn_path),
+        "worktree_paths_match": spawn_path == slice_path,
+    }
+
+
+def _legacy_publication_correlation(slice_state: SliceState) -> dict[str, object]:
+    receipt = slice_state.post_merge
+    evidence = receipt.evidence if receipt is not None else {}
+    return {
+        "pr_number": slice_state.pr_number,
+        "pr_head_sha": _safe_text(evidence.get("head_sha")),
+        "pr_base_branch": _safe_text(evidence.get("parent_branch")),
+        "completion_receipt_sha256": _json_digest(dict(evidence)),
+    }
+
+
+def _text_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _json_digest(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _issue_binding_matches(
