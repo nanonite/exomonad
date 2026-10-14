@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .plan_manifest import PlanManifest
 from .plan_reconciliation_declarations import _declaration_changes, _manifest_node_summary
+from .plan_reconciliation_execution import (
+    ProtectedDeclarationProof,
+    evaluate_protected_declaration_restore,
+)
 from .plan_reconciliation_legacy import proven_legacy_default_fields
 from .plan_reconciliation_ownership import _runtime_record_summary, _slice_ownership_summary
 from .plan_reconciliation_report import (
@@ -22,6 +27,19 @@ from .plan_revision_types import PlanRevisionBlocker
 from .schema import RunState
 
 
+def _protected_declaration_proofs(scope: ReconciliationScope) -> list[ProtectedDeclarationProof]:
+    if scope.accepted is None:
+        return []
+    accepted = {node.node_id: node for node in scope.accepted.nodes}
+    return [
+        proof
+        for node in scope.current.nodes
+        if node.node_id in accepted
+        for proof in (evaluate_protected_declaration_restore(scope, node, accepted[node.node_id]),)
+        if proof is not None
+    ]
+
+
 @dataclass(frozen=True)
 class ReconciliationScope:
     """One captured RunStore and its accepted-plan reconstruction target."""
@@ -34,6 +52,11 @@ class ReconciliationScope:
     accepted: PlanManifest | None = field(repr=False)
     parent_manifest_matches: bool
     run_identity_matches: bool
+    action_journal_entries: tuple[Mapping[str, object], ...] | None = field(
+        default=None, repr=False, compare=False
+    )
+    action_journal_status: str = "missing"
+    action_journal_sha256: str | None = None
     protected_node_ids: tuple[str, ...] = ()
 
     def to_document(self, blocked_node_ids: tuple[str, ...] = ()) -> dict[str, object]:
@@ -45,6 +68,7 @@ class ReconciliationScope:
             if self.accepted is not None
             else {}
         )
+        declaration_proofs = _protected_declaration_proofs(self)
         current_order = getattr(phase, "current_order", None)
         expected_stages = _stage_projection(self.accepted) if self.accepted else ()
         persisted_stages = _persisted_stages(self.state)
@@ -69,6 +93,11 @@ class ReconciliationScope:
             "retained_state": _retained_state_summary(self.state),
             "slice_ownership": _slice_ownership_summary(self.state),
             "runtime_records": _runtime_record_summary(self.state),
+            "action_journal": {
+                "status": self.action_journal_status,
+                "sha256": self.action_journal_sha256,
+                "entry_count": len(self.action_journal_entries or ()),
+            },
             "current_manifest_nodes": _manifest_node_summary(self.current),
             "accepted_manifest_nodes": (
                 _manifest_node_summary(self.accepted) if self.accepted is not None else []
@@ -88,6 +117,16 @@ class ReconciliationScope:
                     "evidence_source": "verified_snapshot_and_matching_fsm_dispatch_identity",
                 }
                 for node_id, fields in sorted(legacy_equivalences.items())
+            ],
+            "protected_declaration_proofs": [
+                {
+                    "node_id": _safe_text(proof.node_id),
+                    "fields": list(proof.fields),
+                    "disposition": "proven" if proof.proven else "blocked",
+                    "reason_code": proof.reason_code,
+                    "evidence": list(proof.evidence),
+                }
+                for proof in declaration_proofs
             ],
         }
 

@@ -276,6 +276,20 @@ digest, changed recursive manifests and runtime bindings, and audit in one
 recoverable transaction. A changed manifest passed directly to a continuing TL
 controller is refused with these command paths in the error.
 
+For a protected completed declaration, reconciliation requires the exact
+accepted snapshot baseline, dispatch identity, and confirmed dispatch record.
+If any of those records are missing, conflicting, malformed, or stale, there
+is no supported in-place override. Keep the original run and its candidate,
+snapshot, checkpoints, and journals intact and parked. The safe recovery path
+is to recover the original authoritative dispatch evidence from a trusted run
+archive or backup without changing its run, scope, action key, status, or
+result; then rerun `plan reconcile --dry-run` and apply only if the report
+proves the restoration. If that evidence cannot be recovered, preserve the
+parked run for a separately reviewed recovery decision. Do not use
+`--continue`, `plan revise`, hand-edited RunStores, or `--recreate` as a
+substitute: they cannot prove the old declaration while preserving completed
+work.
+
 After `init --continue`, the controller may adopt a uniquely correlated
 existing aggregate PR using current repository, owner, invocation, branch, PR,
 head, base, and patch evidence. Adoption resumes review and CI tracking for that

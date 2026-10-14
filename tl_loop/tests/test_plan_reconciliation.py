@@ -9,10 +9,12 @@ from pathlib import Path
 
 import pytest
 
+from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.scope import TLRunning
-from tl_loop.loop.driver import WorkPlan, _manifest_plan
+from tl_loop.loop.driver import EffectIntent, WorkPlan, _manifest_plan
+from tl_loop.loop.journal import EffectJournal
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.lock import LockTimeout, RunLock
 from tl_loop.state.plan_manifest import ManifestNode, PlanManifest, build_plan_manifest
@@ -29,7 +31,12 @@ from tl_loop.state.schema import (
 from tl_loop.state.store import RunStore, create
 
 
-def _plan_document(*, future_issue_id: int | None, completed_task: str = "accepted completed task"):
+def _plan_document(
+    *,
+    future_issue_id: int | None,
+    completed_task: str = "accepted completed task",
+    completed_issue_id: int | None = 811,
+):
     return {
         "run_id": "root",
         "plan": {
@@ -42,7 +49,7 @@ def _plan_document(*, future_issue_id: int | None, completed_task: str = "accept
                             {
                                 "name": "completed",
                                 "task": completed_task,
-                                "chainlink_issue_id": 811,
+                                "chainlink_issue_id": completed_issue_id,
                             },
                             {
                                 "name": "future",
@@ -138,11 +145,19 @@ def _project(
     stale_runtime_digest: bool = False,
     legacy_root_defaults: bool = False,
     legacy_leaf_review_owner: str | None = None,
+    accepted_completed_issue_id: int | None = 811,
+    candidate_completed_issue_id: int | None = 811,
+    include_completed_spawn_journal: bool = False,
+    spawn_task_override: str | None = None,
 ) -> tuple[Path, RunStore, RunStore, bytes, bytes]:
-    accepted_document = _plan_document(future_issue_id=None)
+    accepted_document = _plan_document(
+        future_issue_id=None,
+        completed_issue_id=accepted_completed_issue_id,
+    )
     candidate_document = _plan_document(
         future_issue_id=candidate_issue_id,
         completed_task=candidate_completed_task,
+        completed_issue_id=candidate_completed_issue_id,
     )
     accepted_bytes = json.dumps(accepted_document, sort_keys=True).encode()
     candidate_bytes = json.dumps(candidate_document, sort_keys=True).encode()
@@ -165,7 +180,14 @@ def _project(
     current_child = current_root.child_manifests["root/sub_tl/architecture"]
     runtime_digest = "0" * 64 if stale_runtime_digest else None
     root_store = _create_root(state_root, current_root, accepted_root, runtime_digest)
-    child_store = _create_child(state_root, current_child, accepted_child, runtime_digest)
+    child_store = _create_child(
+        state_root,
+        current_child,
+        accepted_child,
+        runtime_digest,
+        include_spawn_journal=include_completed_spawn_journal,
+        spawn_task_override=spawn_task_override,
+    )
     return state_root, root_store, child_store, accepted_bytes, candidate_bytes
 
 
@@ -227,6 +249,9 @@ def _create_child(
     current: PlanManifest,
     accepted: PlanManifest,
     runtime_digest: str | None = None,
+    *,
+    include_spawn_journal: bool = False,
+    spawn_task_override: str | None = None,
 ) -> RunStore:
     create(
         "architecture",
@@ -237,16 +262,26 @@ def _create_child(
     state = store.load()
     receipt = _post_merge_receipt()
     slices = dict(state.slices)
+    completed_node = current.node("root/sub_tl/architecture/leaf/completed")
     slices["completed"] = replace(
         slices["completed"],
         status=SliceStatus.MERGED,
         attempts=1,
         pr_number=45,
+        dispatch_intent_id="dispatch-completed",
+        dispatch_started_at=1.0,
+        dispatch_agent_id="agent-completed",
+        dispatch_invocation_id="invocation-completed",
+        dispatch_authoritative_event_seq=1,
+        manifest_node_id=completed_node.node_id,
+        manifest_revision=current.manifest_revision,
+        chainlink_issue_id=completed_node.chainlink_issue_id,
         post_merge=receipt,
     )
-    completed = _child_record(
-        current.node("root/sub_tl/architecture/leaf/completed"),
-        ChildKind.LEAF,
+    completed = replace(
+        _child_record(completed_node, ChildKind.LEAF),
+        dispatch_intent_id="dispatch-completed",
+        invocation_id="invocation-completed",
     )
     future = _child_record(
         current.node("root/sub_tl/architecture/leaf/future"),
@@ -268,7 +303,30 @@ def _create_child(
         state.events.last_consumed_offset,
         plan_manifest=current,
     )
+    if include_spawn_journal:
+        _record_completed_spawn(
+            store,
+            accepted.node("root/sub_tl/architecture/leaf/completed").task,
+            spawn_task_override,
+        )
     return store
+
+
+def _record_completed_spawn(store: RunStore, accepted_task: str, task_override: str | None) -> None:
+    intent = EffectIntent(
+        "spawn_leaf",
+        "completed",
+        {
+            "name": "completed",
+            "task": task_override if task_override is not None else accepted_task,
+            "intent_id": "dispatch-completed",
+            "boundary": [],
+        },
+        True,
+    )
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    journal.append(intent)
+    journal.mark_result(intent, ToolResult.from_raw({"success": True, "result": {}}))
 
 
 def _tree_bytes(root: Path) -> dict[Path, bytes]:
@@ -301,7 +359,7 @@ def test_dry_run_reports_snapshot_manifest_fsm_and_protected_leaf_drift(
     }
     assert all(scope["fsm_matches_accepted"] for scope in report["scopes"])
     assert any(
-        blocker["code"] == "protected_identity_unproven"
+        blocker["code"] == "protected_declaration_evidence_unproven"
         and blocker["node_id"] == "root/sub_tl/architecture/leaf/completed"
         for blocker in report["blockers"]
     )
@@ -368,7 +426,7 @@ def test_stale_fsm_digests_do_not_hide_manifest_and_ownership_drift(tmp_path: Pa
     assert completed["post_merge_evidence_sha256"]
     assert {blocker["code"] for blocker in report["blockers"]} >= {
         "runtime_digest_unproven",
-        "protected_identity_unproven",
+        "protected_declaration_evidence_unproven",
     }
     assert _tree_bytes(state_root) == before
 
@@ -513,6 +571,150 @@ def test_legacy_default_equivalence_requires_accepted_fsm_digest(tmp_path: Path)
         and blocker["node_id"] == "root/sub_tl/architecture"
         for blocker in report["blockers"]
     )
+
+
+def test_apply_restores_completed_task_and_issue_binding_from_dispatch_evidence(
+    tmp_path: Path,
+) -> None:
+    _state_root, root_store, child_store, _accepted, _candidate = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+    )
+    before_child = child_store.load()
+    before_slice = before_child.slices["completed"]
+    before_receipt = before_slice.post_merge
+    action_journal = child_store.run_dir / "action-journal.json"
+    action_journal_bytes = action_journal.read_bytes()
+
+    report = analyze_plan_reconciliation(tmp_path)
+    document = report.to_document()
+    child_report = next(
+        item for item in document["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+    proof = child_report["protected_declaration_proofs"][0]
+
+    assert report.can_apply, report.blockers
+    assert proof["fields"] == ["chainlink_issue_id", "task"]
+    assert proof["disposition"] == "proven"
+    assert "confirmed_spawn_action_with_accepted_task" in proof["evidence"]
+    assert "completed_issue_closure_receipt" in proof["evidence"]
+
+    result = apply_plan_reconciliation(
+        tmp_path,
+        "Restore the completed declaration from its dispatch and closure evidence",
+        report.evidence_fingerprint,
+        actor="operator",
+    )
+
+    after_root = root_store.load()
+    after_child = child_store.load()
+    restored = after_child.slices["completed"]
+    accepted_manifest = _manifest(_plan_document(future_issue_id=None, completed_issue_id=None))
+    assert result.applied
+    assert after_root.plan_manifest == accepted_manifest
+    assert (
+        after_child.plan_manifest == accepted_manifest.child_manifests["root/sub_tl/architecture"]
+    )
+    assert restored.status is SliceStatus.MERGED
+    assert restored.pr_number == before_slice.pr_number == 45
+    assert restored.chainlink_issue_id is None
+    assert restored.dispatch_intent_id == before_slice.dispatch_intent_id
+    assert restored.dispatch_agent_id == before_slice.dispatch_agent_id
+    assert restored.dispatch_invocation_id == before_slice.dispatch_invocation_id
+    assert restored.post_merge == before_receipt
+    assert action_journal.read_bytes() == action_journal_bytes
+
+
+def test_completed_declaration_restore_blocks_without_spawn_journal(tmp_path: Path) -> None:
+    state_root, _root, _child, _accepted, _candidate = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+    )
+    before = _tree_bytes(state_root)
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child_report = next(
+        item for item in report["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+    proof = child_report["protected_declaration_proofs"][0]
+
+    assert report["can_apply"] is False
+    assert proof["disposition"] == "blocked"
+    assert proof["reason_code"] == "action_journal_missing"
+    assert any(
+        item["code"] == "protected_declaration_evidence_unproven" for item in report["blockers"]
+    )
+    assert _tree_bytes(state_root) == before
+
+
+def test_completed_declaration_restore_blocks_when_spawn_task_conflicts(tmp_path: Path) -> None:
+    state_root, _root, _child, _accepted, _candidate = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        spawn_task_override="different dispatch task",
+    )
+    before = _tree_bytes(state_root)
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child_report = next(
+        item for item in report["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+    proof = child_report["protected_declaration_proofs"][0]
+
+    assert report["can_apply"] is False
+    assert proof["reason_code"] == "spawn_declaration_mismatch"
+    assert _tree_bytes(state_root) == before
+
+
+def test_malformed_spawn_journal_is_reported_as_unproven_evidence(tmp_path: Path) -> None:
+    state_root, _root, child_store, _accepted, _candidate = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+    )
+    journal = child_store.run_dir / "action-journal.json"
+    journal.write_bytes(b"not-json")
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child_report = next(
+        item for item in report["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+
+    assert report["can_apply"] is False
+    assert child_report["action_journal"]["status"] == "invalid"
+    assert child_report["protected_declaration_proofs"][0]["reason_code"] == (
+        "action_journal_invalid"
+    )
+    assert not (state_root / "plan-reconciliations.jsonl").exists()
+
+
+def test_action_journal_change_invalidates_completed_declaration_proof(tmp_path: Path) -> None:
+    state_root, _root, child_store, _accepted, _candidate = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+    )
+    report = analyze_plan_reconciliation(tmp_path)
+    journal = child_store.run_dir / "action-journal.json"
+    journal.write_bytes(journal.read_bytes() + b" ")
+    before = _tree_bytes(state_root)
+
+    with pytest.raises(PlanRevisionError) as error:
+        apply_plan_reconciliation(
+            tmp_path,
+            "reject stale declaration evidence",
+            report.evidence_fingerprint,
+            actor="operator",
+        )
+
+    assert error.value.code == "reconciliation_evidence_stale"
+    assert _tree_bytes(state_root) == before
 
 
 def test_apply_requires_the_exact_dry_run_fingerprint(tmp_path: Path) -> None:

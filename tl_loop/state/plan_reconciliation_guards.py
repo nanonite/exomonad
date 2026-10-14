@@ -7,6 +7,7 @@ from tl_loop.fsm.post_merge import PostMergePhase
 from tl_loop.fsm.scope import TLRunning
 
 from .plan_manifest import ManifestNode, PlanManifest
+from .plan_reconciliation_execution import evaluate_protected_declaration_restore
 from .plan_reconciliation_legacy import proven_legacy_default_fields
 from .plan_reconciliation_models import ReconciliationScope
 from .plan_reconciliation_ownership import _records_for
@@ -60,13 +61,20 @@ def _node_blockers(
         current, accepted = current_nodes.get(node_id), target_nodes.get(node_id)
         if current is None or accepted is None:
             blockers.append(_blocker("node_topology_drift", node_id, view.current.scope_id))
-        elif changed_node_fields(current, accepted) and _protected_change_unproven(
-            view,
-            current,
-            accepted,
-            legacy_equivalences.get(node_id, ()),
-        ):
-            blockers.append(_blocker("protected_identity_unproven", node_id, view.current.scope_id))
+            continue
+        if not changed_node_fields(current, accepted):
+            continue
+        proof = evaluate_protected_declaration_restore(view, current, accepted)
+        equivalent = legacy_equivalences.get(node_id, ()) + (
+            proof.fields if proof is not None and proof.proven else ()
+        )
+        if _protected_change_unproven(view, current, accepted, equivalent):
+            code = (
+                "protected_declaration_evidence_unproven"
+                if proof is not None and not proof.proven
+                else "protected_identity_unproven"
+            )
+            blockers.append(_blocker(code, node_id, view.current.scope_id))
     return blockers
 
 
@@ -184,6 +192,7 @@ def _blocker_reason(code: str) -> str:
         "node_topology_drift": "node addition or removal cannot be reconstructed safely",
         "scope_topology_drift": "child scope topology differs from accepted plan",
         "protected_identity_unproven": "changed node has execution history; accepted identity cannot be proven from dispatch evidence",
+        "protected_declaration_evidence_unproven": "completed declaration differs from its accepted task or issue binding and exact dispatch evidence is incomplete or conflicts",
         "runtime_digest_unproven": "runtime digest matches neither the current nor accepted manifest",
         "runtime_record_identity_unproven": "runtime child record does not identify the accepted node",
         "runtime_record_revision_unproven": "runtime child record revision does not match the accepted scope revision",

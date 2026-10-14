@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
@@ -40,6 +43,9 @@ def _read_scope(
         raise PlanRevisionError(
             "manifest_missing", f"RunStore {_safe_text(relative_dir)} has no plan manifest"
         )
+    action_journal_entries, action_journal_status, action_journal_sha256 = _read_action_journal(
+        project, relative_dir, inputs
+    )
     parent_matches = parent_manifest is None or manifest == parent_manifest
     is_root = relative_dir == run_id
     identity_matches = (
@@ -63,10 +69,33 @@ def _read_scope(
         accepted=None,
         parent_manifest_matches=parent_matches,
         run_identity_matches=identity_matches,
+        action_journal_entries=action_journal_entries,
+        action_journal_status=action_journal_status,
+        action_journal_sha256=action_journal_sha256,
         protected_node_ids=tuple(
             node.node_id for node in manifest.nodes if _node_is_protected(state, node.name)
         ),
     )
+
+
+def _read_action_journal(
+    project: Path,
+    relative_dir: str,
+    inputs: dict[str, bytes | None],
+) -> tuple[tuple[Mapping[str, object], ...] | None, str, str | None]:
+    relative = f".exo/tl-loop/{relative_dir}/action-journal.json"
+    raw, _mode = read_regular_file(safe_target(project, relative))
+    inputs[relative] = raw
+    if raw is None:
+        return None, "missing", None
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None, "invalid", digest
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        return None, "invalid", digest
+    return tuple(cast(Mapping[str, object], item) for item in value), "valid", digest
 
 
 def _validate_plan_run_id(
@@ -98,6 +127,9 @@ def _collect_scope_tree(
         accepted=accepted,
         parent_manifest_matches=parent_manifest_matches,
         run_identity_matches=view.run_identity_matches,
+        action_journal_entries=view.action_journal_entries,
+        action_journal_status=view.action_journal_status,
+        action_journal_sha256=view.action_journal_sha256,
         protected_node_ids=view.protected_node_ids,
     )
     scopes.append(accepted_view)
