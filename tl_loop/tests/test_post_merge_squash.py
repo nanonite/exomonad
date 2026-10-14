@@ -36,7 +36,7 @@ def _arguments() -> dict[str, object]:
     return {
         "child_id": "slice-a",
         "pr_number": 43,
-        "repository": "org/repo",
+        "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "merged_head_sha": "pr-head",
         "expected_base_sha": "base-head",
@@ -55,7 +55,7 @@ def _receipt() -> dict[str, str]:
     return {
         "child_id": "slice-a",
         "pr_number": "43",
-        "repository": "org/repo",
+        "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "merged_head_sha": "pr-head",
         "expected_base_sha": "base-head",
@@ -89,7 +89,7 @@ def test_issue_close_uses_explicit_slice_issue_id(tmp_path) -> None:
     slice_id = "slice-a"
     evidence = {
         "child_id": slice_id,
-        "repository": "org/repo",
+        "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "pr_number": "45",
         "head_sha": "merged-head",
@@ -169,7 +169,7 @@ def test_parent_push_recovery_binds_new_lane_epoch(tmp_path) -> None:
     store, state = _load_state(tmp_path)
     evidence = {
         "child_id": "slice-a",
-        "repository": "org/repo",
+        "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "pr_number": "43",
         "head_sha": "head-a",
@@ -203,11 +203,11 @@ def test_parent_push_recovery_binds_new_lane_epoch(tmp_path) -> None:
         state.budgets,
         state.events.last_consumed_offset,
     )
-    state = store.transition_lane("org/repo", "main", LaneReserved("slice-a", 1, "base-head"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("slice-a", 1, "base-head"))
     state = store.transition_lane(
-        "org/repo", "main", LaneAbandoned("post_merge_gate", "previous retry")
+        "https://forge.example.com/org/repo.git", "main", LaneAbandoned("post_merge_gate", "previous retry")
     )
-    state = store.transition_lane("org/repo", "main", LaneReserved("slice-a", 2, "base-head"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("slice-a", 2, "base-head"))
 
     advanced = _advance_post_merge_boundary(
         state,
@@ -221,7 +221,7 @@ def test_parent_push_recovery_binds_new_lane_epoch(tmp_path) -> None:
 
     assert advanced.slices["slice-a"].post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING
     assert advanced.slices["slice-a"].post_merge.evidence["lane_epoch"] == "2"
-    assert advanced.integration.lanes["org/repo:main"].phase is LanePhase.BOOKKEEPING
+    assert advanced.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.BOOKKEEPING
 
 
 def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) -> None:
@@ -251,7 +251,7 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
     assert watcher_evidence["merge_tree_sha"] == "merged-tree"
     evidence = {
         **watcher_evidence,
-        "repository": "org/repo",
+        "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "lane_epoch": 7,
     }
@@ -556,7 +556,7 @@ def test_advanced_parent_refresh_preserves_historical_squash_tree(tmp_path: Path
     assert isinstance(observation, WatcherObservation)
     evidence = {
         **_watcher_merge_evidence(observation),
-        "repository": "org/repo",
+        "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "lane_epoch": 7,
     }
@@ -670,7 +670,7 @@ def test_conflicting_refreshed_identity_blocks_recovery(
         "merge_tree_sha": "merged-tree",
         "merge_commit_sha": "merge-commit",
         "merge_commit_tree_sha": "merged-tree",
-        "repository": "org/repo",
+        "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "lane_epoch": 7,
     }

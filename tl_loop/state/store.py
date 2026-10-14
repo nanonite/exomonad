@@ -330,13 +330,7 @@ class RunStore:
         """Persist the immutable repository identity supplied by the controller."""
         if not isinstance(identity, RepositoryIdentity):
             raise TypeError("repository identity must be a RepositoryIdentity")
-        encoded = {
-            "owner": identity.owner,
-            "repo": identity.repo,
-            "base_branch": identity.base_branch,
-            "forge_host": identity.forge_host,
-            "remote_url": identity.remote_url,
-        }
+        encoded = identity.to_document()
 
         def mutate(document: dict[str, object]) -> dict[str, object]:
             existing = document.get("repository_identity")
@@ -2683,13 +2677,12 @@ def _decode_post_merge_state(value: object) -> PostMergeState | None:
 def _decode_repository_identity(value: object) -> RepositoryIdentity | None:
     if not isinstance(value, Mapping):
         return None
-    return RepositoryIdentity(
-        owner=cast(str, value["owner"]),
-        repo=cast(str, value["repo"]),
-        base_branch=cast(str, value["base_branch"]),
-        forge_host=cast(str | None, value.get("forge_host")),
-        remote_url=cast(str | None, value.get("remote_url")),
-    )
+    remote_url = value.get("remote_url")
+    if not isinstance(remote_url, str) or not remote_url:
+        return None
+    from .repository_identity import canonical_repository_url
+
+    return RepositoryIdentity(canonical_repository_url(remote_url))
 
 
 def _decode_publication(value: object) -> PublicationBinding | None:

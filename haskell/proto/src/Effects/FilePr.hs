@@ -178,7 +178,13 @@ data FilePrResponse
     filePrResponsePrNumber :: Hs.Int64,
     filePrResponseHeadBranch :: Hs.Text,
     filePrResponseBaseBranch :: Hs.Text,
-    filePrResponseCreated :: Hs.Bool
+    filePrResponseCreated :: Hs.Bool,
+    filePrResponseHeadSha :: Hs.Text,
+    filePrResponseBaseSha :: Hs.Text,
+    filePrResponsePatchDigest :: Hs.Text,
+    filePrResponseInvocationId :: Hs.Text,
+    filePrResponseSliceId :: Hs.Text,
+    filePrResponseAuthorAgent :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -197,40 +203,94 @@ instance (HsProtobuf.Message FilePrResponse) where
         filePrResponsePrNumber,
         filePrResponseHeadBranch,
         filePrResponseBaseBranch,
-        filePrResponseCreated
+        filePrResponseCreated,
+        filePrResponseHeadSha,
+        filePrResponseBaseSha,
+        filePrResponsePatchDigest,
+        filePrResponseInvocationId,
+        filePrResponseSliceId,
+        filePrResponseAuthorAgent
       } =
       Hs.mappend
         ( Hs.mappend
             ( Hs.mappend
                 ( Hs.mappend
-                    ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 1)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            filePrResponsePrUrl
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( Hs.mappend
+                                    ( Hs.mappend
+                                        ( Hs.mappend
+                                            ( HsProtobuf.encodeMessageField
+                                                (HsProtobuf.FieldNumber 1)
+                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                    filePrResponsePrUrl
+                                                )
+                                            )
+                                            ( HsProtobuf.encodeMessageField
+                                                (HsProtobuf.FieldNumber 2)
+                                                filePrResponsePrNumber
+                                            )
+                                        )
+                                        ( HsProtobuf.encodeMessageField
+                                            (HsProtobuf.FieldNumber 3)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                filePrResponseHeadBranch
+                                            )
+                                        )
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 4)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            filePrResponseBaseBranch
+                                        )
+                                    )
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 5)
+                                    filePrResponseCreated
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 6)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    filePrResponseHeadSha
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 7)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                filePrResponseBaseSha
+                            )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 2)
-                        filePrResponsePrNumber
+                        (HsProtobuf.FieldNumber 8)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            filePrResponsePatchDigest
+                        )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 3)
+                    (HsProtobuf.FieldNumber 9)
                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        filePrResponseHeadBranch
+                        filePrResponseInvocationId
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 4)
+                (HsProtobuf.FieldNumber 10)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    filePrResponseBaseBranch
+                    filePrResponseSliceId
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 5)
-            filePrResponseCreated
+            (HsProtobuf.FieldNumber 11)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                filePrResponseAuthorAgent
+            )
         )
   decodeMessage _ =
     Hs.pure FilePrResponse
@@ -258,6 +318,42 @@ instance (HsProtobuf.Message FilePrResponse) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 5)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 6)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 9)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 10)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 11)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -288,11 +384,47 @@ instance (HsProtobuf.Message FilePrResponse) where
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "created")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "head_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "base_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "patch_digest")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "invocation_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 10)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "slice_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 11)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "author_agent")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB FilePrResponse) where
-  toJSONPB (FilePrResponse f1 f2 f3 f4 f5) =
+  toJSONPB (FilePrResponse f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11) =
     HsJSONPB.object
       [ "pr_url"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -301,9 +433,21 @@ instance (HsJSONPB.ToJSONPB FilePrResponse) where
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
         "base_branch"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
-        "created" .= f5
+        "created" .= f5,
+        "head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "base_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "patch_digest"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "invocation_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+        "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f10),
+        "author_agent"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11)
       ]
-  toEncodingPB (FilePrResponse f1 f2 f3 f4 f5) =
+  toEncodingPB (FilePrResponse f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11) =
     HsJSONPB.pairs
       [ "pr_url"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -312,7 +456,19 @@ instance (HsJSONPB.ToJSONPB FilePrResponse) where
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
         "base_branch"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
-        "created" .= f5
+        "created" .= f5,
+        "head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "base_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "patch_digest"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "invocation_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+        "slice_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f10),
+        "author_agent"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11)
       ]
 
 instance (HsJSONPB.FromJSONPB FilePrResponse) where
@@ -332,6 +488,24 @@ instance (HsJSONPB.FromJSONPB FilePrResponse) where
                     (obj .: "base_branch")
                 )
             <*> obj .: "created"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "head_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "base_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "patch_digest")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "invocation_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "slice_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "author_agent")
+                )
       )
 
 instance (HsJSONPB.ToJSON FilePrResponse) where

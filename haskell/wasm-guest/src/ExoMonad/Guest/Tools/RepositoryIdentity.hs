@@ -37,7 +37,7 @@ instance FromJSON RepositoryIdentityArgs where
 
 repositoryIdentityDescription :: Text
 repositoryIdentityDescription =
-  "Resolve the run's repository identity (owner, repo, base branch, forge host) from the pinned git remote. Read-only, no arguments, one call per continuation. Fails closed when the remote is missing, ambiguous, or unparseable. This is static run configuration, not a per-PR observation -- it is never sourced from watcher_pr_state."
+  "Resolve the run's canonical, credential-free repository URL from the pinned git remote. Read-only, no arguments. Fails closed when the remote is missing, ambiguous, malformed, or unsupported. Branch identity is separate; API owner/repository coordinates are derived only by consumers that need them. This is static run configuration, not a per-PR observation -- it is never sourced from watcher_pr_state."
 
 repositoryIdentitySchema :: Aeson.Object
 repositoryIdentitySchema = genericToolSchemaWith @RepositoryIdentityArgs []
@@ -46,12 +46,7 @@ repositoryIdentityResponseValue :: PA.RepositoryIdentityResponse -> Aeson.Value
 repositoryIdentityResponseValue resp =
   object
     [ "success" .= True,
-      "owner" .= lazyText (PA.repositoryIdentityResponseOwner resp),
-      "repo" .= lazyText (PA.repositoryIdentityResponseRepo resp),
-      "base_branch" .= lazyText (PA.repositoryIdentityResponseBaseBranch resp),
-      "forge_host" .= lazyText (PA.repositoryIdentityResponseForgeHost resp),
-      "remote_url" .= lazyText (PA.repositoryIdentityResponseRemoteUrl resp),
-      "remote_name" .= lazyText (PA.repositoryIdentityResponseRemoteName resp)
+      "remote_url" .= lazyText (PA.repositoryIdentityResponseRemoteUrl resp)
     ]
 
 repositoryIdentityCore :: RepositoryIdentityArgs -> Eff Effects (Either Text Aeson.Value)

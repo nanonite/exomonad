@@ -6722,12 +6722,7 @@ data RepositoryIdentityResponse
   = RepositoryIdentityResponse
   { repositoryIdentityResponseSuccess :: Hs.Bool,
     repositoryIdentityResponseError :: Hs.Text,
-    repositoryIdentityResponseOwner :: Hs.Text,
-    repositoryIdentityResponseRepo :: Hs.Text,
-    repositoryIdentityResponseBaseBranch :: Hs.Text,
-    repositoryIdentityResponseForgeHost :: Hs.Text,
-    repositoryIdentityResponseRemoteUrl :: Hs.Text,
-    repositoryIdentityResponseRemoteName :: Hs.Text
+    repositoryIdentityResponseRemoteUrl :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -6744,70 +6739,25 @@ instance (HsProtobuf.Message RepositoryIdentityResponse) where
     RepositoryIdentityResponse
       { repositoryIdentityResponseSuccess,
         repositoryIdentityResponseError,
-        repositoryIdentityResponseOwner,
-        repositoryIdentityResponseRepo,
-        repositoryIdentityResponseBaseBranch,
-        repositoryIdentityResponseForgeHost,
-        repositoryIdentityResponseRemoteUrl,
-        repositoryIdentityResponseRemoteName
+        repositoryIdentityResponseRemoteUrl
       } =
       Hs.mappend
         ( Hs.mappend
-            ( Hs.mappend
-                ( Hs.mappend
-                    ( Hs.mappend
-                        ( Hs.mappend
-                            ( Hs.mappend
-                                ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 1)
-                                    repositoryIdentityResponseSuccess
-                                )
-                                ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 2)
-                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        repositoryIdentityResponseError
-                                    )
-                                )
-                            )
-                            ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 3)
-                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    repositoryIdentityResponseOwner
-                                )
-                            )
-                        )
-                        ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 4)
-                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                repositoryIdentityResponseRepo
-                            )
-                        )
-                    )
-                    ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 5)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            repositoryIdentityResponseBaseBranch
-                        )
-                    )
-                )
-                ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 6)
-                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        repositoryIdentityResponseForgeHost
-                    )
-                )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 1)
+                repositoryIdentityResponseSuccess
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 7)
+                (HsProtobuf.FieldNumber 2)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    repositoryIdentityResponseRemoteUrl
+                    repositoryIdentityResponseError
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 8)
+            (HsProtobuf.FieldNumber 7)
             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                repositoryIdentityResponseRemoteName
+                repositoryIdentityResponseRemoteUrl
             )
         )
   decodeMessage _ =
@@ -6824,37 +6774,7 @@ instance (HsProtobuf.Message RepositoryIdentityResponse) where
       <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 3)
-              )
-          )
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 4)
-              )
-          )
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 5)
-              )
-          )
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 6)
-              )
-          )
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
                   (HsProtobuf.FieldNumber 7)
-              )
-          )
-      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-              ( HsProtobuf.at
-                  HsProtobuf.decodeMessageField
-                  (HsProtobuf.FieldNumber 8)
               )
           )
   dotProto _ =
@@ -6871,73 +6791,27 @@ instance (HsProtobuf.Message RepositoryIdentityResponse) where
         []
         "",
       HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 3)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "owner")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 4)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "repo")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 5)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "base_branch")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 6)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "forge_host")
-        []
-        "",
-      HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 7)
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "remote_url")
-        []
-        "",
-      HsProtobufAST.DotProtoField
-        (HsProtobuf.FieldNumber 8)
-        (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "remote_name")
         []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB RepositoryIdentityResponse) where
-  toJSONPB (RepositoryIdentityResponse f1 f2 f3 f4 f5 f6 f7 f8) =
+  toJSONPB (RepositoryIdentityResponse f1 f2 f7) =
     HsJSONPB.object
       [ "success" .= f1,
         "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
-        "owner" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
-        "repo" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
-        "base_branch"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
-        "forge_host"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
         "remote_url"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
-        "remote_name"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
       ]
-  toEncodingPB (RepositoryIdentityResponse f1 f2 f3 f4 f5 f6 f7 f8) =
+  toEncodingPB (RepositoryIdentityResponse f1 f2 f7) =
     HsJSONPB.pairs
       [ "success" .= f1,
         "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
-        "owner" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
-        "repo" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
-        "base_branch"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
-        "forge_host"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
         "remote_url"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
-        "remote_name"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
       ]
 
 instance (HsJSONPB.FromJSONPB RepositoryIdentityResponse) where
@@ -6951,22 +6825,7 @@ instance (HsJSONPB.FromJSONPB RepositoryIdentityResponse) where
                     (obj .: "error")
                 )
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "owner")
-                )
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "repo")
-                )
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "base_branch")
-                )
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "forge_host")
-                )
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "remote_url")
-                )
-            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "remote_name")
                 )
       )
 

@@ -111,7 +111,7 @@ def test_unique_pr_without_persisted_alias_is_rejected() -> None:
     assert result.rejected_aliases == ("pr_number_only",)
 
 
-def test_repository_identity_mismatch_is_rejected_even_with_slice_alias() -> None:
+def test_repository_namespace_metadata_is_not_an_independent_identity_gate() -> None:
     event = project(
         {
             "type": "ci.status_changed",
@@ -129,12 +129,32 @@ def test_repository_identity_mismatch_is_rejected_even_with_slice_alias() -> Non
         }
     )
     state = _state()
-    state.repository_identity = RepositoryIdentity(
-        owner="acme",
-        repo="exomonad",
-        base_branch="main",
-        forge_host="forgejo.local",
+    state.repository_identity = RepositoryIdentity("https://forgejo.local/acme/exomonad.git")
+
+    result = resolve_event_slice(event, state)
+
+    assert result.resolved
+    assert result.slice_id == "tunable-operator-body"
+
+
+def test_repository_url_mismatch_is_rejected_even_with_slice_alias() -> None:
+    event = project(
+        {
+            "type": "ci.status_changed",
+            "run_seq": 7,
+            "run_id": "swarm-uuid",
+            "agent_id": "tunable-operator-body-opencode",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-08-18T00:00:00Z",
+            "data": {
+                "slice_id": "tunable-operator-body",
+                "pr_number": 42,
+                "remote_url": "https://forgejo.local/other/exomonad.git",
+            },
+        }
     )
+    state = _state()
+    state.repository_identity = RepositoryIdentity("https://forgejo.local/acme/exomonad.git")
 
     result = resolve_event_slice(event, state)
 

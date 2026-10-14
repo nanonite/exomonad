@@ -19,6 +19,7 @@ from tl_loop.ordered import (
 )
 
 from .plan_manifest import ManifestError, PlanManifest
+from .repository_identity import canonical_repository_url
 
 BLOCK_CAUSE_VALUES = frozenset(
     {
@@ -308,22 +309,19 @@ class ActionPhase(str, Enum):
 
 @dataclass(frozen=True)
 class RepositoryIdentity:
-    """Stable Forgejo repository identity for persisted observations."""
+    """Canonical repository address stored in a run checkpoint."""
 
-    owner: str
-    repo: str
-    base_branch: str
-    forge_host: str | None = None
-    remote_url: str | None = None
+    remote_url: str
 
     def __post_init__(self) -> None:
-        for name in ("owner", "repo", "base_branch"):
-            if not isinstance(getattr(self, name), str) or not getattr(self, name):
-                raise ValueError(f"repository identity {name} must be non-empty")
-        for name in ("forge_host", "remote_url"):
-            value = getattr(self, name)
-            if value is not None and not value:
-                raise ValueError(f"repository identity {name} must be non-empty or null")
+        if not isinstance(self.remote_url, str) or not self.remote_url:
+            raise ValueError("canonical repository remote_url is required")
+        if canonical_repository_url(self.remote_url) != self.remote_url:
+            raise ValueError("repository remote_url must already be canonical")
+
+    def to_document(self) -> dict[str, str]:
+        """Return the exact current checkpoint representation."""
+        return {"remote_url": self.remote_url}
 
 
 @dataclass(frozen=True)
@@ -746,7 +744,10 @@ DEADLINE_LEDGER_KEYS = frozenset(
         "recovery_wait_seconds",
     }
 )
-REPOSITORY_IDENTITY_KEYS = frozenset({"owner", "repo", "base_branch", "forge_host", "remote_url"})
+REPOSITORY_IDENTITY_KEYS = frozenset({"remote_url"})
+LEGACY_REPOSITORY_IDENTITY_KEYS = frozenset(
+    {"owner", "repo", "base_branch", "forge_host", "remote_url"}
+)
 PUBLICATION_KEYS = frozenset(
     {"pr_number", "head_sha", "head_branch", "base_branch", "attempt", "invocation_id"}
 )
@@ -1856,13 +1857,38 @@ def _validate_suspended_dependency(value: object, path: str, errors: list[tuple[
 def _validate_repository_identity(value: object, path: str, errors: list[tuple[str, str]]) -> None:
     if value is None:
         return
-    identity = _object(value, f"{path}.repository_identity", REPOSITORY_IDENTITY_KEYS, errors)
-    if identity is None:
+    identity_path = f"{path}.repository_identity"
+    if not isinstance(value, Mapping):
+        errors.append((identity_path, "must be an object or null"))
+        return
+    keys = frozenset(value)
+    if keys == REPOSITORY_IDENTITY_KEYS:
+        remote_url = value.get("remote_url")
+        _non_empty_string(value, "remote_url", identity_path, errors)
+        if isinstance(remote_url, str):
+            try:
+                if canonical_repository_url(remote_url) != remote_url:
+                    errors.append((identity_path, "remote_url must already be canonical"))
+            except ValueError as error:
+                errors.append((identity_path, str(error)))
+        return
+    if not keys <= LEGACY_REPOSITORY_IDENTITY_KEYS or not {
+        "owner",
+        "repo",
+        "base_branch",
+    } <= keys:
+        errors.append((identity_path, "does not match current or supported legacy shape"))
         return
     for key in ("owner", "repo", "base_branch"):
-        _non_empty_string(identity, key, f"{path}.repository_identity", errors)
-    _nullable_string(identity, "forge_host", f"{path}.repository_identity", errors)
-    _nullable_string(identity, "remote_url", f"{path}.repository_identity", errors)
+        _non_empty_string(value, key, identity_path, errors)
+    _nullable_string(value, "forge_host", identity_path, errors)
+    _nullable_string(value, "remote_url", identity_path, errors)
+    remote_url = value.get("remote_url")
+    if isinstance(remote_url, str) and remote_url:
+        try:
+            canonical_repository_url(remote_url)
+        except ValueError as error:
+            errors.append((identity_path, str(error)))
 
 
 def _validate_publication(value: object, path: str, errors: list[tuple[str, str]]) -> None:

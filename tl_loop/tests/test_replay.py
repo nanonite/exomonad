@@ -373,7 +373,7 @@ class _RecoveryTransport(RecordingTransport):
                     "resolution": "live",
                     "pr_number": 42,
                     "publication": {
-                        "repository": "org/repo",
+                        "repository": "https://forge.example.com/org/repo.git",
                         "parent_branch": "main",
                         "head_sha": "head-a",
                     },
@@ -467,7 +467,7 @@ def _seed_recovery_checkpoint(root: Path, operation: str) -> tuple[Path, str, st
     current = state.slices["nested-a"]
     evidence = {
         "child_id": "nested-a",
-        "repository": "org/repo",
+        "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "pr_number": "42",
         "head_sha": "head-a",
@@ -576,7 +576,7 @@ def _run_recovery_tl(
         policy=load_policy(POLICY_ROOT / "selector_policy_cheap_only.toml"),
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
         ledger_run_id=ledger_run_id,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
         session_mode="continue",
         max_events=32,
         poll_interval=0.001,

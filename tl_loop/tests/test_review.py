@@ -394,7 +394,7 @@ def test_matching_head_within_window_allows_merge(tmp_path: Path) -> None:
     )
 
     assert result.slices["leaf"].status is SliceStatus.MERGED
-    lane = store.load().integration.lanes["org/repo:main"]
+    lane = store.load().integration.lanes["https://forge.example.com/org/repo.git:main"]
     assert lane.child_id is None
     assert lane.phase is LanePhase.IDLE
     assert [name for name, _ in transport.calls if name != "emit_controller_event"] == [
@@ -656,7 +656,7 @@ def test_unknown_merge_merged_with_unresolved_ownership_is_not_adopted(
     assert slice_state.action is not None
     assert slice_state.action.phase.value == "unknown"
     assert slice_state.post_merge is None
-    assert result.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+    assert result.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.RECOVERY
 
 
 def test_unknown_merge_nonmerged_with_unresolved_ownership_retains_action(
@@ -683,7 +683,7 @@ def test_unknown_merge_nonmerged_with_unresolved_ownership_retains_action(
     slice_state = result.slices["leaf"]
     assert slice_state.action is not None
     assert slice_state.action.phase.value == "unknown"
-    assert result.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+    assert result.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.RECOVERY
 
 
 @pytest.mark.parametrize("merged", [True, False])
@@ -712,7 +712,7 @@ def test_unknown_merge_malformed_ownership_retains_action(
     assert slice_state.action is not None
     assert slice_state.action.phase.value == "unknown"
     assert slice_state.post_merge is None
-    assert result.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+    assert result.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.RECOVERY
 
 
 def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_path: Path) -> None:
@@ -727,8 +727,8 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
             scope_id="review-test",
         )
     )
-    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
-    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneIntegrationStarted("leaf", "abc123"))
     journal = EffectJournal("review-test", store.run_dir / "action-journal.json")
 
     class LostMergeTransport(DirectMergeTransport):
@@ -765,7 +765,7 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
 
     assert first.slices["leaf"].action is not None
     assert first.slices["leaf"].action.phase.value == "unknown"
-    assert first.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+    assert first.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.RECOVERY
     assert lost.merge_count == 1
 
     class RecoveryTransport(DirectMergeTransport):
@@ -839,7 +839,7 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
         EffectJournal("review-test", store.run_dir / "action-journal.json"),
         effects=EffectClient(recovery),
     )
-    assert restarted.integration.lanes["org/repo:main"].phase is LanePhase.INTEGRATING
+    assert restarted.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.INTEGRATING
 
     config = TLLoopConfig(active=True)
     for _ in range(8):
@@ -858,15 +858,15 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
 
     assert restarted.slices["leaf"].post_merge is not None
     assert restarted.slices["leaf"].post_merge.phase.value == "complete"
-    assert restarted.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert restarted.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
     assert lost.merge_count == 1
     assert [name for name, _ in recovery.calls].count("merge_pr") == 0
 
 
 def test_authoritative_nonmerge_clears_pending_action_and_releases_lane(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
-    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
-    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneIntegrationStarted("leaf", "abc123"))
     current = replace(
         state.slices["leaf"],
         action=ActionState(
@@ -898,14 +898,14 @@ def test_authoritative_nonmerge_clears_pending_action_and_releases_lane(tmp_path
     )
 
     assert reconciled.slices["leaf"].action is None
-    assert reconciled.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert reconciled.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
     assert journal.pending_entries() == []
     assert journal.snapshot()[0]["status"] == "compensated"
 
 
 def test_direct_merge_waits_for_an_existing_parent_lane(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
-    state = store.transition_lane("org/repo", "main", LaneReserved("other", 1, "base-a"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("other", 1, "base-a"))
     transport = DirectMergeTransport(snapshots=[_snapshot(head_sha="abc123")])
     effects_log: list[EffectIntent] = []
 
@@ -918,14 +918,14 @@ def test_direct_merge_waits_for_an_existing_parent_lane(tmp_path: Path) -> None:
     )
 
     assert [name for name, _ in transport.calls if name == "merge_pr"] == []
-    lane = result.integration.lanes["org/repo:main"]
+    lane = result.integration.lanes["https://forge.example.com/org/repo.git:main"]
     assert lane.child_id == "other"
     assert lane.phase is LanePhase.RESERVED
 
 
 def test_integration_gate_releases_the_owned_parent_lane(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
-    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("leaf", 1, "base-a"))
     transport = DirectMergeTransport()
 
     result = _open_integration_gate(
@@ -940,34 +940,34 @@ def test_integration_gate_releases_the_owned_parent_lane(tmp_path: Path) -> None
         reason="conflicting parent update",
     )
 
-    lane = result.integration.lanes["org/repo:main"]
+    lane = result.integration.lanes["https://forge.example.com/org/repo.git:main"]
     assert lane.child_id is None
     assert lane.phase is LanePhase.IDLE
-    assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert store.load().integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
 
 
 def test_continuation_releases_legacy_parked_deterministic_lane(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
-    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
-    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneIntegrationStarted("leaf", "abc123"))
     state = store.transition_lane(
-        "org/repo",
+        "https://forge.example.com/org/repo.git",
         "main",
         LaneParkRequested("legacy_gate", "persisted before lane recovery migration"),
     )
 
     migrated = _reconcile_legacy_parked_lanes(state, store)
 
-    assert migrated.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
-    assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert migrated.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
+    assert store.load().integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
 
 
 def test_continuation_keeps_legacy_parked_unknown_merge_in_recovery(tmp_path: Path) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
-    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
-    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneIntegrationStarted("leaf", "abc123"))
     state = store.transition_lane(
-        "org/repo",
+        "https://forge.example.com/org/repo.git",
         "main",
         LaneParkRequested("legacy_unknown", "merge response was lost before migration"),
     )
@@ -991,18 +991,18 @@ def test_continuation_keeps_legacy_parked_unknown_merge_in_recovery(tmp_path: Pa
 
     migrated = _reconcile_legacy_parked_lanes(state, store)
 
-    assert migrated.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
-    assert store.load().integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+    assert migrated.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.RECOVERY
+    assert store.load().integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.RECOVERY
 
 
 def test_journal_less_legacy_unknown_merge_reaches_operator_terminal_gate(
     tmp_path: Path,
 ) -> None:
     state, store = _state(tmp_path, "abc123", _fresh_verdict_at())
-    state = store.transition_lane("org/repo", "main", LaneReserved("leaf", 1, "base-a"))
-    state = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "abc123"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("leaf", 1, "base-a"))
+    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneIntegrationStarted("leaf", "abc123"))
     state = store.transition_lane(
-        "org/repo",
+        "https://forge.example.com/org/repo.git",
         "main",
         LaneParkRequested("legacy_unknown", "merge response was lost before migration"),
     )
@@ -1039,7 +1039,7 @@ def test_journal_less_legacy_unknown_merge_reaches_operator_terminal_gate(
         next(gate for gate in waiting.gates if gate.name == gate_name).status is GateStatus.PENDING
     )
     assert waiting.slices["leaf"].action is not None
-    assert waiting.integration.lanes["org/repo:main"].phase is LanePhase.RECOVERY
+    assert waiting.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.RECOVERY
 
     store.answer_gate(gate_name, GateStatus.APPROVED)
     approved = _reconcile_nonterminal_slices(
@@ -1051,14 +1051,14 @@ def test_journal_less_legacy_unknown_merge_reaches_operator_terminal_gate(
         [],
     )
     assert approved.slices["leaf"].action is None
-    assert approved.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert approved.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
 
     approved = store.transition_lane(
-        "org/repo",
+        "https://forge.example.com/org/repo.git",
         "main",
         LaneReserved("leaf", 2, "base-b"),
     )
-    approved = store.transition_lane("org/repo", "main", LaneIntegrationStarted("leaf", "def456"))
+    approved = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneIntegrationStarted("leaf", "def456"))
     second_current = replace(
         approved.slices["leaf"],
         action=ActionState(
@@ -1107,7 +1107,7 @@ def test_journal_less_legacy_unknown_merge_reaches_operator_terminal_gate(
 
     assert terminal.slices["leaf"].action is None
     assert terminal.slices["leaf"].status is SliceStatus.PARKED
-    assert terminal.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert terminal.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
 
 
 def test_merge_recovery_gate_hash_separates_hyphenated_slice_and_intent_ids(
@@ -1263,9 +1263,7 @@ def _state(tmp_path: Path, head: str, verdict_at: str) -> tuple[RunState, RunSto
     record["verdict_at"] = verdict_at
     root_spec = {key: document[key] for key in ("fsm", "slices", "budgets", "gates", "events")}
     root_spec["repository_identity"] = {
-        "owner": "org",
-        "repo": "repo",
-        "base_branch": "main",
+        "remote_url": "https://forge.example.com/org/repo.git",
     }
     create("review-test", root_spec, root_dir=tmp_path)
     store = RunStore("review-test", root_dir=tmp_path)

@@ -912,7 +912,7 @@ class RecordingTransport:
         if tool_name == "repository_identity":
             return {
                 "success": True,
-                "result": {"owner": "org", "repo": "repo", "base_branch": "main"},
+                "result": {"remote_url": "https://forge.example.com/org/repo.git"},
             }
         if tool_name == "resolve_live_pr_for_slice":
             slice_id = str(arguments["slice_id"])
@@ -3430,7 +3430,7 @@ def test_aggregate_candidate_untrusted_ownership_is_not_merged(
     task = SubTLTask("leaf-a", WorkPlan(), source=SyntheticQueue([]))
     config = TLLoopConfig(
         active=True,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
 
     result = _integrate_one_candidate(task, state, config, EffectClient(transport), store, [])
@@ -3726,9 +3726,7 @@ def _review_store(
         {
             "plan_manifest": manifest.to_document(),
             "repository_identity": {
-                "owner": "org",
-                "repo": "repo",
-                "base_branch": "main",
+                "remote_url": "https://forge.example.com/org/repo.git",
             },
         },
         root_dir=tmp_path,
@@ -6400,7 +6398,7 @@ def _config(*, active: bool = True) -> TLLoopConfig:
         max_leaves=1,
         max_events=5,
         poll_interval=0.001,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
 
 
@@ -6864,7 +6862,7 @@ def test_recursive_ordered_lifecycle_handles_parallel_leaves_and_ready_order(
         max_events=5,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     parent_root = tmp_path / "ordered-e2e-run"
     for sub_tl_id, pr_number in (("alpha", 101), ("beta", 102)):
@@ -7195,7 +7193,7 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) 
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
 
     first = run_tl_loop(
@@ -8040,7 +8038,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         PostMergePhase.COMPLETE,
         {
             "child_id": "leaf-a",
-            "repository": "org/repo",
+            "repository": "https://forge.example.com/org/repo.git",
             "parent_branch": "main.architecture",
             "pr_number": "45",
             "head_sha": "a" * 40,
@@ -8414,7 +8412,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         PostMergePhase.COMPLETE,
         {
             "child_id": "architecture",
-            "repository": "org/repo",
+            "repository": "https://forge.example.com/org/repo.git",
             "parent_branch": "main",
             "pr_number": "43",
             "head_sha": "head-a",
@@ -8534,7 +8532,7 @@ def test_aggregate_recovery_refuses_unresolved_or_mismatched_publications(
             if tool_name == "repository_identity" and failure_mode == "wrong_repo":
                 return {
                     "success": True,
-                    "result": {"owner": "other", "repo": "repository", "base_branch": "main"},
+                    "result": {"remote_url": "https://forge.example.com/other/repository.git"},
                 }
             if tool_name == "resolve_live_pr_for_slice":
                 if failure_mode == "lookup_unavailable":
@@ -8977,7 +8975,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     verified: list[tuple[str, str, str, str]] = []
     from tl_loop.loop import driver
@@ -9074,7 +9072,7 @@ def test_restart_during_merging_reconciles_without_duplicate_merge(tmp_path: Pat
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     initial = _initial_slices(plan, config, tmp_path, run_id)
     initial["aggregate-child"].update(
@@ -9163,7 +9161,7 @@ def test_external_merge_is_adopted_before_dispatch_with_integrity_telemetry(
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     initial = _initial_slices(plan, config, tmp_path, "external-merge-run")
     initial["aggregate-child"].update(
@@ -9288,7 +9286,7 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
         poll_interval=0.001,
         max_base_revalidations=1,
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     run_tl_loop(
         "serialized-run",
@@ -9404,7 +9402,7 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     run_tl_loop(
         "mismatch-run",
@@ -9545,7 +9543,7 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
         policy=validate_policy(_selector_policy()),
         tl_model_choice=_tl_choice(backend),
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     run_tl_loop(
         "conflict-run",
@@ -9656,7 +9654,7 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
         max_parallel_slices=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
         policy=validate_policy(_selector_policy()),
         tl_model_choice=_tl_choice(backend),
     )

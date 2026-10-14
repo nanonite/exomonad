@@ -264,7 +264,7 @@ def _linked_parent_sync_state(
     run_id: str = "linked",
     issue_id: int = 702,
 ) -> tuple[RunStore, RunState, RepositoryIdentity]:
-    identity = RepositoryIdentity("org", "repo", "main")
+    identity = RepositoryIdentity("https://forge.example.com/org/repo.git")
     plan = {
         "leaves": [
             {"name": "leaf", "task": "work", "chainlink_issue_id": issue_id}
@@ -275,11 +275,7 @@ def _linked_parent_sync_state(
         run_id,
         {
             "plan_manifest": manifest.to_document(),
-            "repository_identity": {
-                "owner": identity.owner,
-                "repo": identity.repo,
-                "base_branch": identity.base_branch,
-            },
+            "repository_identity": identity.to_document(),
         },
         root_dir=root_dir,
     )
@@ -294,7 +290,7 @@ def _linked_parent_sync_state(
             PostMergePhase.PARENT_BRANCH_SYNCED,
             {
                 "child_id": "leaf",
-                "repository": "org/repo",
+                "repository": "https://forge.example.com/org/repo.git",
                 "parent_branch": "main",
                 "pr_number": "42",
                 "head_sha": "head-a",
@@ -307,8 +303,8 @@ def _linked_parent_sync_state(
     integration = replace(
         state.integration,
         lanes={
-            "org/repo:main": LaneState(
-                "org/repo",
+            "https://forge.example.com/org/repo.git:main": LaneState(
+                "https://forge.example.com/org/repo.git",
                 "main",
                 phase=LanePhase.INTEGRATING,
                 child_id="leaf",
@@ -509,7 +505,7 @@ def test_approved_issue_close_retry_requires_open_status_and_new_intent(
     )
     journal = EffectJournal(run_id, store.run_dir / "action-journal.json")
 
-    failed = _advance_post_merge_boundary(
+    _advance_post_merge_boundary(
         pending,
         "leaf",
         42,

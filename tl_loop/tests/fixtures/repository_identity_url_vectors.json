@@ -1,0 +1,97 @@
+[
+  {
+    "name": "http userinfo scheme host casing and explicit port",
+    "input": "HTTPS://alice:secret@Forge.Example.com:8443/Org/Repo.git",
+    "canonical": "https://forge.example.com:8443/Org/Repo.git"
+  },
+  {
+    "name": "http transport username removed",
+    "input": "http://build-user@forge.example.com/org/repo.git",
+    "canonical": "http://forge.example.com/org/repo.git"
+  },
+  {
+    "name": "known credential query removed",
+    "input": "https://forge.example.com/org/repo.git?access_token=sample-secret",
+    "canonical": "https://forge.example.com/org/repo.git"
+  },
+  {
+    "name": "known credential fragment removed",
+    "input": "ssh://git@Forge.Example.com/Org/Repo.git#token=sample-secret",
+    "canonical": "ssh://forge.example.com/Org/Repo.git"
+  },
+  {
+    "name": "ssh user port and path case",
+    "input": "ssh://git@Forge.Example.com:2222/Org/Repo.git",
+    "canonical": "ssh://forge.example.com:2222/Org/Repo.git"
+  },
+  {
+    "name": "scp user normalized to ssh URL",
+    "input": "worker@Forge.Example.com:Org/Repo.git",
+    "canonical": "ssh://forge.example.com/Org/Repo.git"
+  },
+  {
+    "name": "scp IPv6 host normalized",
+    "input": "git@[2001:0DB8::1]:org/repo.git",
+    "canonical": "ssh://[2001:db8::1]/org/repo.git"
+  },
+  {
+    "name": "scp path may contain at sign",
+    "input": "git@forge.example.com:org/repo@review.git",
+    "canonical": "ssh://forge.example.com/org/repo@review.git"
+  },
+  {
+    "name": "scp remote rejects multiple user separators",
+    "input": "git@worker@forge.example.com:org/repo.git",
+    "error": "malformed or unsupported"
+  },
+  {
+    "name": "scp remote rejects empty user",
+    "input": "@forge.example.com:org/repo.git",
+    "error": "malformed or unsupported"
+  },
+  {
+    "name": "path percent escapes use uppercase hex",
+    "input": "https://forge.example.com/org/repo%2egit",
+    "canonical": "https://forge.example.com/org/repo%2Egit"
+  },
+  {
+    "name": "path rejects non-UTF8 percent escapes",
+    "input": "https://forge.example.com/org/repo%FF.git",
+    "error": "invalid encoding"
+  },
+  {
+    "name": "unknown query routing is rejected",
+    "input": "https://forge.example.com/org/repo.git?repo=other",
+    "error": "ambiguous query"
+  },
+  {
+    "name": "credential and routing query mixture is rejected",
+    "input": "https://forge.example.com/org/repo.git?token=sample-secret&repo=other",
+    "error": "ambiguous query"
+  },
+  {
+    "name": "unknown fragment routing is rejected",
+    "input": "https://forge.example.com/org/repo.git#other/repository",
+    "error": "malformed fragment"
+  },
+  {
+    "name": "credential marker in path is rejected",
+    "input": "https://forge.example.com/access_token/sample-secret/org/repo.git",
+    "error": "credential marker"
+  },
+  {
+    "name": "unsupported git transport is rejected",
+    "input": "git://forge.example.com/org/repo.git",
+    "error": "unsupported transport"
+  },
+  {
+    "name": "relative filesystem remote is rejected",
+    "input": "../bare/repo.git",
+    "error": "malformed or unsupported"
+  },
+  {
+    "name": "repository path case remains distinct",
+    "input": "https://forge.example.com/Org/Repo.git",
+    "canonical": "https://forge.example.com/Org/Repo.git"
+  }
+]

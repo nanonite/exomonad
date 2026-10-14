@@ -25,9 +25,11 @@ from tl_loop.fsm.post_merge import PostMergePhase
 from tl_loop.fsm.scope import TLDone as RecursiveTLDone
 from tl_loop.loop.driver import (
     REPOSITORY_IDENTITY_GATE_NAME,
+    AggregatePublicationRejected,
     LoopCancelled,
     TLLoopConfig,
     TLLoopError,
+    _validate_aggregate_repository_identity,
     run_tl_loop,
 )
 from tl_loop.loop.journal import EffectJournal
@@ -104,14 +106,7 @@ class RepositoryIdentityTransport(IntegrationTransport):
 
 
 def _resolved_identity_payload() -> JsonObject:
-    return {
-        "owner": "org",
-        "repo": "repo",
-        "base_branch": "main",
-        "forge_host": "forge.example.com",
-        "remote_url": "https://forge.example.com/org/repo.git",
-        "remote_name": "origin",
-    }
+    return {"remote_url": "https://forge.example.com/org/repo.git"}
 
 
 def _transport_with_identity(resolved: bool) -> RepositoryIdentityTransport:
@@ -160,13 +155,7 @@ def test_continuation_resolves_null_identity_and_adopts_merged_pr(tmp_path: Path
         ) from None
 
     final = result.final_state
-    assert final.repository_identity == RepositoryIdentity(
-        owner="org",
-        repo="repo",
-        base_branch="main",
-        forge_host="forge.example.com",
-        remote_url="https://forge.example.com/org/repo.git",
-    )
+    assert final.repository_identity == RepositoryIdentity("https://forge.example.com/org/repo.git")
     assert isinstance(final.recursive_fsm, RecursiveTLDone)
     assert final.slices[SLICE_ID].status is SliceStatus.MERGED
     assert final.slices[SLICE_ID].post_merge is not None
@@ -193,12 +182,60 @@ def test_failed_resolution_opens_named_gate_without_raising_or_guessing(tmp_path
     assert final.slices[SLICE_ID].status is not SliceStatus.MERGED
 
 
+def test_beast_root_missing_identity_with_legacy_child_falsely_rejects_matching_repository(
+    tmp_path: Path,
+) -> None:
+    """Reproduce #1201 from temporary root/child checkpoint shapes only.
+
+    The root has no identity while its completed architecture child has the
+    historical five-field identity. Current authority resolves to the same
+    remote URL, but aggregate validation rejects the missing root identity as
+    a repository mismatch before it can adopt the existing publication.
+    """
+    root_store, root_state = _seed_without_repository_identity(tmp_path)
+    child_run_id = "substitution-model-architecture-stage"
+    legacy_child_identity = {
+        "owner": "exomonad",
+        "repo": "beast-rs",
+        "base_branch": "main",
+        "forge_host": "localhost",
+        "remote_url": "http://localhost:3000/exomonad/beast-rs.git",
+    }
+    child_state = create(
+        child_run_id,
+        {
+            "owner_branch": "main.substitution-model-architecture-stage",
+            "repository_identity": legacy_child_identity,
+        },
+        root_dir=root_store.run_dir,
+    )
+    assert root_state.repository_identity is None
+    assert child_state.repository_identity == RepositoryIdentity(
+        "http://localhost:3000/exomonad/beast-rs.git"
+    )
+
+    transport = _transport_with_identity(resolved=True)
+    effects = EffectClient(transport)
+    with pytest.raises(AggregatePublicationRejected) as rejected:
+        _validate_aggregate_repository_identity(
+            "substitution-model-architecture-stage",
+            replace(_config(), repository_identity=None, branch="main"),
+            effects,
+            [],
+            root_store,
+            publication_attempt=1,
+        )
+
+    assert rejected.value.error_kind == "repository_identity_mismatch"
+    assert transport.identity_calls == [{}]
+
+
 def test_conflicting_supplied_identity_still_raises(tmp_path: Path) -> None:
     store, _migrated = _seed_without_repository_identity(tmp_path)
-    store.set_repository_identity(RepositoryIdentity("org", "repo", "main"))
+    store.set_repository_identity(RepositoryIdentity("https://forge.example.com/org/repo.git"))
     config = replace(
         _config(),
-        repository_identity=RepositoryIdentity("a-different-org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/a-different-org/repo.git"),
     )
     transport = _transport_with_identity(resolved=True)
     effects = EffectClient(transport)

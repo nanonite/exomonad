@@ -31,7 +31,7 @@ UNRELEASED = "### Fixed\n- Fix an older thing (#1)"
 
 SYNCED_EVIDENCE = {
     "child_id": "leaf",
-    "repository": "org/repo",
+    "repository": "https://forge.example.com/org/repo.git",
     "parent_branch": "main",
     "pr_number": "42",
     "head_sha": "head-a",
@@ -110,7 +110,7 @@ def _config(backend: object, *, token_budget: int = 120_000) -> TLLoopConfig:
     policy["roles"]["tl"]["token_budget"] = token_budget  # type: ignore[index]
     return TLLoopConfig(
         active=True,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
         policy=validate_policy(policy),
         tl_model_choice=RlmModelChoice(
             model_id="tl-model",
@@ -129,7 +129,7 @@ def _synced_store(root_dir: Path, evidence: dict[str, str] | None = None) -> tup
         "unlinked",
         {
             "plan_manifest": manifest.to_document(),
-            "repository_identity": {"owner": "org", "repo": "repo", "base_branch": "main"},
+            "repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"},
         },
         root_dir=root_dir,
     )
@@ -147,8 +147,8 @@ def _synced_store(root_dir: Path, evidence: dict[str, str] | None = None) -> tup
     integration = replace(
         state.integration,
         lanes={
-            "org/repo:main": LaneState(
-                "org/repo",
+            "https://forge.example.com/org/repo.git:main": LaneState(
+                "https://forge.example.com/org/repo.git",
                 "main",
                 phase=LanePhase.INTEGRATING,
                 child_id="leaf",
@@ -197,7 +197,7 @@ def test_captured_work_completes_without_writing(tmp_path: Path) -> None:
     assert final.evidence["changelog_decision"] == "captured"
     assert final.evidence["changelog_outcome"] == "captured"
     assert transport.names() == ["post_merge_changelog_context"]
-    assert done.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert done.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
     assert store.load().budgets.role_spent["tl"] == 37
     (event,) = transport.events()
     assert event["event_type"] == "tl.unlinked_changelog_resolved"
@@ -276,7 +276,7 @@ def test_a_failed_write_is_a_typed_outcome_and_the_slice_completes(
     assert final.evidence["changelog_outcome"] == outcome
     assert final.evidence["changelog_outcome_detail"] == "stale info"
     assert "changelog_commit_sha" not in final.evidence
-    assert done.integration.lanes["org/repo:main"].phase is LanePhase.IDLE
+    assert done.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
 
 
 def test_a_parent_without_changelog_makes_no_model_call(tmp_path: Path) -> None:

@@ -128,7 +128,7 @@ Agent management:
 - Spawn messages: `SpawnRequest`, `SpawnBatchRequest`, `SpawnSubtreeRequest`, `SpawnLeafSubtreeRequest`, `SpawnWorkerRequest`
 - Cleanup messages: `CleanupRequest`, `DisposeOrphanRequest`, `CleanupBatchRequest`
 - `ListRequest/Response`: Active agent listing
-- `RepositoryIdentityRequest/Response`: Resolve owner/repo/base branch/forge host from the pinned git remote (`agent.repository_identity`). Static run configuration, not a per-PR observation; `remote_url` is sanitized (credentials stripped) before it leaves the Rust handler.
+- `RepositoryIdentityRequest/Response`: Resolve the canonical, credential-free URL from the pinned git remote (`agent.repository_identity`). Branch identity stays separate; owner/repo are derived transiently only for APIs that need them. Static run configuration, not a per-PR observation.
 
 ## Effects Proto Reference
 

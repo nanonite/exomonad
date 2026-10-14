@@ -274,7 +274,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     client.post_merge_parent_sync(
         child_id="child",
         pr_number=1,
-        repository="org/repo",
+        repository="https://forge.example.com/org/repo.git",
         parent_branch="main",
         merged_head_sha="merged-head",
         expected_base_sha="base",
@@ -283,7 +283,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     client.post_merge_remote_reconcile(
         child_id="child",
         pr_number=1,
-        repository="org/repo",
+        repository="https://forge.example.com/org/repo.git",
         parent_branch="main",
         merged_head_sha="merged-head",
         expected_base_sha="base",
@@ -292,7 +292,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     client.post_merge_changelog(
         child_id="child",
         issue_id=1,
-        repository="org/repo",
+        repository="https://forge.example.com/org/repo.git",
         parent_branch="main",
         expected_base_sha="base",
         generation=0,
@@ -307,7 +307,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     )
     client.post_merge_changelog_entry(
         child_id="child",
-        repository="org/repo",
+        repository="https://forge.example.com/org/repo.git",
         parent_branch="main",
         expected_base_sha="base",
         intent_id="entry-intent",
@@ -316,7 +316,7 @@ def _invoke_sample_effects(client: EffectClient) -> None:
     )
     client.post_merge_push(
         child_id="child",
-        repository="org/repo",
+        repository="https://forge.example.com/org/repo.git",
         parent_branch="main",
         lane_epoch=1,
         push_intent_id="push-intent",

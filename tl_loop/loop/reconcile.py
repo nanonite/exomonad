@@ -12,6 +12,7 @@ from typing import cast
 from tl_loop.fsm.post_merge import PostMergePhase
 from tl_loop.loop.observation import WatcherObservation
 from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.state.repository_identity import repository_api_coordinates
 from tl_loop.state.review_validation import review_validation_is_fresh
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
@@ -758,17 +759,13 @@ def _derive_run_action(
             {"patch_digest": integration.aggregate_patch_digest},
         )
     if active:
-        repository_identity = (
-            {
-                "owner": state.repository_identity.owner,
-                "repo": state.repository_identity.repo,
-                "base_branch": state.repository_identity.base_branch,
-            }
-            if state.repository_identity is not None
-            else None
-        )
         first_wait: Quiescent | None = None
         for current in active:
+            repository_identity = (
+                _review_api_coordinates(state.repository_identity.remote_url, current)
+                if state.repository_identity is not None
+                else None
+            )
             decision = _derive_slice_action(
                 current,
                 repository_identity=repository_identity,
@@ -1054,6 +1051,23 @@ def _derive_slice_action(
             {"pr_number": state.pr_number, "head_sha": current_head},
         )
     return Quiescent("await_merge_gate")
+
+
+def _review_api_coordinates(
+    remote_url: str,
+    state: SliceState,
+) -> dict[str, object]:
+    """Build transient reviewer API coordinates from the canonical URL."""
+    owner, repo = repository_api_coordinates(remote_url)
+    coordinates: dict[str, object] = {"owner": owner, "repo": repo}
+    base_branch = (
+        state.publication.base_branch
+        if state.publication is not None
+        else state.base_ref
+    )
+    if base_branch:
+        coordinates["base_branch"] = base_branch
+    return coordinates
 
 
 def _persisted_head(state: SliceState) -> str | None:

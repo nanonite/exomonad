@@ -3,9 +3,7 @@
   "run_id": "replay-recovery",
   "policy": "selector_policy_cheap_only.toml",
   "repository_identity": {
-    "owner": "org",
-    "repo": "repo",
-    "base_branch": "main"
+    "remote_url": "https://forge.example.com/org/repo.git"
   },
   "plan": {
     "sub_tls": [

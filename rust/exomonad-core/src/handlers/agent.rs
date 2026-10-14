@@ -961,12 +961,7 @@ fn repository_identity_error(error: impl Into<String>) -> RepositoryIdentityResp
     RepositoryIdentityResponse {
         success: false,
         error: error.into(),
-        owner: String::new(),
-        repo: String::new(),
-        base_branch: String::new(),
-        forge_host: String::new(),
         remote_url: String::new(),
-        remote_name: String::new(),
     }
 }
 
@@ -2301,28 +2296,18 @@ impl<
     ) -> EffectResult<RepositoryIdentityResponse> {
         let dir = self.ctx.project_dir();
         tracing::info!(dir = ?dir, "Resolving repository identity");
-        let identity = match crate::services::repo::get_repository_identity(dir).await {
-            Ok(identity) => identity,
+        let remote_url = match crate::services::repo::get_repository_remote_url(dir).await {
+            Ok(remote_url) => remote_url,
             Err(error) => {
                 tracing::error!(%error, "Repository identity resolution failed");
                 return Ok(repository_identity_error(error.to_string()));
             }
         };
-        tracing::info!(
-            owner = %identity.owner,
-            repo = %identity.repo,
-            base_branch = %identity.base_branch,
-            "Resolved repository identity"
-        );
+        tracing::info!("Resolved canonical repository identity");
         Ok(RepositoryIdentityResponse {
             success: true,
             error: String::new(),
-            owner: identity.owner.to_string(),
-            repo: identity.repo.to_string(),
-            base_branch: identity.base_branch,
-            forge_host: identity.forge_host,
-            remote_url: identity.remote_url,
-            remote_name: identity.remote_name,
+            remote_url,
         })
     }
 

@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from urllib.parse import urlsplit
 
+from tl_loop.state.repository_identity import canonical_repository_url
 from tl_loop.state.schema import RunState, SliceState
 
 from .envelope import EventEnvelope
@@ -143,7 +143,7 @@ def _published_head_matches(current: SliceState, pr_number: int, head_sha: str) 
 
 
 def _repository_identity_conflict(event: EventEnvelope, state: RunState) -> str | None:
-    """Reject watcher facts that contradict the persisted Forgejo identity."""
+    """Reject an event only when its canonical repository URL conflicts."""
     identity = getattr(state, "repository_identity", None)
     if identity is None:
         return None
@@ -151,25 +151,18 @@ def _repository_identity_conflict(event: EventEnvelope, state: RunState) -> str 
     nested = payload.get("repository")
     if isinstance(nested, Mapping):
         payload = {**nested, **payload}
-    owner = _first_text(payload, "owner", "repository_owner", "repo_owner")
-    repo = _first_text(payload, "repo", "repository", "repo_name")
-    host = _first_text(payload, "forge_host", "host", "forgejo_host")
     remote_url = _first_text(payload, "remote_url", "repository_url", "forge_url")
-    if owner is not None and owner != getattr(identity, "owner", None):
+    if remote_url is None:
+        return None
+    try:
+        observed = canonical_repository_url(remote_url)
+    except ValueError:
         return "repository_identity_conflict"
-    if repo is not None and repo != getattr(identity, "repo", None):
-        return "repository_identity_conflict"
-    expected_host = getattr(identity, "forge_host", None) or _url_host(
-        getattr(identity, "remote_url", None)
+    return (
+        "repository_identity_conflict"
+        if observed != identity.remote_url
+        else None
     )
-    actual_host = host or _url_host(remote_url)
-    if (
-        expected_host is not None
-        and actual_host is not None
-        and actual_host.lower() != expected_host.lower()
-    ):
-        return "repository_identity_conflict"
-    return None
 
 
 def _first_text(payload: Mapping[str, object], *keys: str) -> str | None:
@@ -178,12 +171,6 @@ def _first_text(payload: Mapping[str, object], *keys: str) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
-
-
-def _url_host(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return urlsplit(value).hostname
 
 
 def envelope_document(event: EventEnvelope) -> dict[str, object]:

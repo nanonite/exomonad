@@ -238,6 +238,10 @@ from tl_loop.state.plan_manifest import (
     build_plan_manifest,
 )
 from tl_loop.state.plan_revision_manifest import retain_scope_revisions
+from tl_loop.state.repository_identity import (
+    canonical_repository_url,
+    repository_api_coordinates,
+)
 from tl_loop.state.review_validation import review_validation_disposition
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
@@ -1569,13 +1573,7 @@ def run_tl_loop(
         if selected.ledger_run_id is not None:
             root_state["ledger_run_id"] = selected.ledger_run_id
         if selected.repository_identity is not None:
-            root_state["repository_identity"] = {
-                "owner": selected.repository_identity.owner,
-                "repo": selected.repository_identity.repo,
-                "base_branch": selected.repository_identity.base_branch,
-                "forge_host": selected.repository_identity.forge_host,
-                "remote_url": selected.repository_identity.remote_url,
-            }
+            root_state["repository_identity"] = selected.repository_identity.to_document()
         if selected.session_mode is not None:
             root_state["session_mode"] = selected.session_mode
         if epoch_enabled:
@@ -4398,10 +4396,15 @@ def _review_repository_identity(
     store: RunStore,
 ) -> dict[str, object]:
     if state.repository_identity is not None:
+        owner, repo = repository_api_coordinates(state.repository_identity.remote_url)
         return {
-            "owner": state.repository_identity.owner,
-            "repo": state.repository_identity.repo,
-            "base_branch": state.repository_identity.base_branch,
+            "owner": owner,
+            "repo": repo,
+            "base_branch": (
+                current.publication.base_branch
+                if current.publication is not None
+                else current.base_ref or config.branch
+            ),
         }
     root = Path(config.project_root or store.root_dir.parent).resolve()
     base_branch = (
@@ -4995,9 +4998,9 @@ def _merge_adoption_lane_epoch(
 
 def _repository_identity(state: RunState) -> str:
     identity = state.repository_identity
-    if identity is None or not identity.owner or not identity.repo:
+    if identity is None:
         raise ValueError("repository identity is unavailable")
-    return f"{identity.owner}/{identity.repo}"
+    return identity.remote_url
 
 
 def _publication_parent_branch_from_slice(current: SliceState) -> str:
@@ -13204,12 +13207,11 @@ def _aggregate_repository_matches(
     config: TLLoopConfig,
     observed: RepositoryIdentity,
 ) -> bool:
-    """Compare current, configured, and saved repository coordinates."""
+    """Compare only the canonical repository URL across runtime and state."""
     return bool(
         persisted is not None
         and observed == persisted
         and (config.repository_identity is None or config.repository_identity == persisted)
-        and persisted.base_branch == config.branch
     )
 
 
@@ -15460,7 +15462,7 @@ def _resolve_repository_identity(
 
     A single read-only effect call through the same EffectJournal executor as
     every other effect -- never the watcher, since identity is static run
-    configuration (owner, repo, base branch), not a per-PR observation.
+    configuration, not a per-PR observation.
     Returns None on any failure so the caller opens a durable gate instead of
     raising or guessing an identity (#1062).
     """
@@ -15476,34 +15478,14 @@ def _resolve_repository_identity(
     )
     if result is None or result.success is not True or not isinstance(result.result, Mapping):
         return None
-    payload = result.result
-    owner = payload.get("owner")
-    repo = payload.get("repo")
-    base_branch = payload.get("base_branch")
-    if not isinstance(owner, str) or not owner:
+    remote_url = result.result.get("remote_url")
+    if not isinstance(remote_url, str) or not remote_url:
         return None
-    if not isinstance(repo, str) or not repo:
-        return None
-    if not isinstance(base_branch, str) or not base_branch:
-        return None
-    forge_host = payload.get("forge_host")
-    remote_url = payload.get("remote_url")
     try:
-        identity = RepositoryIdentity(
-            owner=owner,
-            repo=repo,
-            base_branch=base_branch,
-            forge_host=forge_host if isinstance(forge_host, str) and forge_host else None,
-            remote_url=remote_url if isinstance(remote_url, str) and remote_url else None,
-        )
+        identity = RepositoryIdentity(canonical_repository_url(remote_url))
     except ValueError:
         return None
-    LOGGER.info(
-        "[TL loop] Resolved repository identity owner=%s repo=%s base_branch=%s",
-        owner,
-        repo,
-        base_branch,
-    )
+    LOGGER.info("[TL loop] Resolved canonical repository identity")
     return identity
 
 

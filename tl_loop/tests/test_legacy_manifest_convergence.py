@@ -198,7 +198,7 @@ def _seed_action_journal(store: RunStore) -> str:
 def _config() -> TLLoopConfig:
     return TLLoopConfig(
         active=True,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
         enable_reviewer_spawn=True,
         ledger_run_id=RUN_ID,
     )
@@ -231,7 +231,7 @@ def _seed_and_migrate(tmp_path: Path):
     """
     create(
         RUN_ID,
-        {"repository_identity": {"owner": "org", "repo": "repo", "base_branch": "main"}},
+        {"repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"}},
         root_dir=tmp_path,
     )
     store = RunStore(RUN_ID, tmp_path)

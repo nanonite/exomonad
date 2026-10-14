@@ -39,7 +39,7 @@ LEAF_ID = "feature"
 MERGED_PR = 45
 HEAD_SHA = "a" * 40
 PARENT_COMMIT_SHA = "b" * 40
-REPOSITORY_IDENTITY = RepositoryIdentity("org", "repo", "main")
+REPOSITORY_IDENTITY = RepositoryIdentity("https://forge.example.com/org/repo.git")
 
 
 @dataclass
@@ -96,7 +96,7 @@ def _recursive_plan() -> tuple[dict[str, object], WorkPlan]:
 
 
 def _seed_parent_and_captured_child(tmp_path: Path) -> tuple[WorkPlan, TLLoopConfig, RunStore]:
-    document, plan = _recursive_plan()
+    _document, plan = _recursive_plan()
     config = TLLoopConfig(
         run_id=ROOT_RUN_ID,
         root_dir=tmp_path,
@@ -126,11 +126,7 @@ def _seed_parent_and_captured_child(tmp_path: Path) -> tuple[WorkPlan, TLLoopCon
         {
             "plan_manifest": parent_manifest.to_document(),
             "slices": parent_slices,
-            "repository_identity": {
-                "owner": REPOSITORY_IDENTITY.owner,
-                "repo": REPOSITORY_IDENTITY.repo,
-                "base_branch": REPOSITORY_IDENTITY.base_branch,
-            },
+            "repository_identity": REPOSITORY_IDENTITY.to_document(),
         },
         root_dir=tmp_path,
     )
@@ -170,11 +166,7 @@ def _seed_parent_and_captured_child(tmp_path: Path) -> tuple[WorkPlan, TLLoopCon
             "parent_run_id": ROOT_RUN_ID,
             "parent_agent_id": ROOT_RUN_ID,
             "depth": 1,
-            "repository_identity": {
-                "owner": REPOSITORY_IDENTITY.owner,
-                "repo": REPOSITORY_IDENTITY.repo,
-                "base_branch": REPOSITORY_IDENTITY.base_branch,
-            },
+            "repository_identity": REPOSITORY_IDENTITY.to_document(),
         },
         root_dir=parent_store.run_dir,
     )
@@ -190,7 +182,7 @@ def _seed_parent_and_captured_child(tmp_path: Path) -> tuple[WorkPlan, TLLoopCon
             PostMergePhase.PARENT_BRANCH_SYNCED,
             {
                 "child_id": LEAF_ID,
-                "repository": "org/repo",
+                "repository": "https://forge.example.com/org/repo.git",
                 "parent_branch": child_branch,
                 "pr_number": str(MERGED_PR),
                 "head_sha": HEAD_SHA,

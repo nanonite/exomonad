@@ -86,7 +86,7 @@ class RecordingTransport:
                 "success": True,
                 "result": {
                     **arguments,
-                    "repository": "org/repo",
+                    "repository": "https://forge.example.com/org/repo.git",
                     "parent_commit_sha": parent_commit,
                     "remote_head_sha": parent_commit,
                     "ancestry_proof": f"ancestor:{merged_head}->{parent_commit}",
@@ -562,14 +562,10 @@ def _repository_identity(value: object) -> RepositoryIdentity | None:
         return None
     if not isinstance(value, Mapping):
         raise TypeError("fixture.repository_identity must be an object or null")
-    fields = {name: value.get(name) for name in ("owner", "repo", "base_branch")}
-    if any(not isinstance(item, str) or not item for item in fields.values()):
-        raise TypeError("fixture.repository_identity requires owner, repo, and base_branch")
-    return RepositoryIdentity(
-        fields["owner"],
-        fields["repo"],
-        fields["base_branch"],
-    )
+    remote_url = value.get("remote_url")
+    if not isinstance(remote_url, str) or not remote_url:
+        raise TypeError("fixture.repository_identity requires remote_url")
+    return RepositoryIdentity(remote_url)
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:

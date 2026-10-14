@@ -3,9 +3,7 @@
   "run_id": "replay-recreate",
   "policy": "selector_policy_cheap_only.toml",
   "repository_identity": {
-    "owner": "synthetic-org",
-    "repo": "synthetic-repo",
-    "base_branch": "main"
+    "remote_url": "https://forge.example.com/synthetic-org/synthetic-repo.git"
   },
   "controller_epoch": "fd510ebdd318dec7c78d56df90ea9627",
   "predecessor_controller_epoch": "1111aaaa2222bbbb3333cccc4444dddd",

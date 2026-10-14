@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -24,6 +25,7 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.reconcile import Quiescent, _derive_slice_action
+from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -44,7 +46,6 @@ from tl_loop.state.slice_transition import (
     ReviewValidationFailed,
     slice_transition,
 )
-from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.store import RunStore, _encode_slice, create
 
 _PLAN = WorkPlan(
@@ -313,9 +314,7 @@ def _load_state(tmp_path, *, chainlink_issue_id: int | None = None):
         {
             "slices": {"slice-a": _encode_slice("slice-a", _spawned_slice_without_pr())},
             "repository_identity": {
-                "owner": "org",
-                "repo": "repo",
-                "base_branch": "main",
+                "remote_url": "https://forge.example.com/org/repo.git",
             },
         },
         root_dir=tmp_path,
@@ -1421,7 +1420,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
                     "result": {
                         "child_id": arguments["child_id"],
                         "pr_number": arguments["pr_number"],
-                        "repository": "org/repo",
+                        "repository": "https://forge.example.com/org/repo.git",
                         "parent_branch": "main",
                         "merged_head_sha": arguments["merged_head_sha"],
                         "expected_base_sha": arguments["expected_base_sha"],
@@ -1482,7 +1481,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
 
@@ -1708,7 +1707,7 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
                     "result": {
                         "child_id": arguments["child_id"],
                         "pr_number": arguments["pr_number"],
-                        "repository": "org/repo",
+                        "repository": "https://forge.example.com/org/repo.git",
                         "parent_branch": "main",
                         "merged_head_sha": arguments["merged_head_sha"],
                         "expected_base_sha": arguments["expected_base_sha"],
@@ -1770,11 +1769,11 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
         active=True,
         ledger_run_id="run-1",
         enable_reviewer_spawn=True,
-        repository_identity=RepositoryIdentity("org", "repo", "main"),
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     client.post_merge_calls = []
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
-    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+    _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
 
     checkpoint = RunStore.checkpoint
 
@@ -1789,9 +1788,7 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
         if crash["raised"]:
             break
         try:
-            recovered = _apply_convergence(
-                store.load(), ConvergenceTracker(), store, config, client, journal
-            )
+            _apply_convergence(store.load(), ConvergenceTracker(), store, config, client, journal)
         except RuntimeError as error:
             assert str(error) == "simulated process death after post-merge boundary"
     else:

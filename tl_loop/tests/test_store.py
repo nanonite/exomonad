@@ -175,7 +175,7 @@ def test_deadline_ledger_round_trips(tmp_path: Path) -> None:
 
 def test_merge_evidence_and_action_state_round_trip_across_resume(tmp_path: Path) -> None:
     store = RunStore("merge-run", tmp_path)
-    identity = RepositoryIdentity("acme", "exomonad", "main", "https://forgejo.local/acme/exomonad")
+    identity = RepositoryIdentity("https://forgejo.local/acme/exomonad")
     value = replace(
         _slice("leaf", SliceStatus.IN_REVIEW, "src/leaf.py"),
         pr_number=42,
@@ -196,7 +196,7 @@ def test_merge_evidence_and_action_state_round_trip_across_resume(tmp_path: Path
     state = create(
         "merge-run",
         {
-            "repository_identity": identity.__dict__,
+            "repository_identity": identity.to_document(),
             "state_version": 3,
         },
         root_dir=tmp_path,

@@ -13,6 +13,19 @@ const DEFAULT_REMOTE: &str = "origin";
 /// remote) — without it, the wrong remote's owner/repo can leak into calls
 /// meant for a different backend.
 const REMOTE_OVERRIDE_KEY: &str = "exomonad.remote";
+const REPOSITORY_CREDENTIAL_PARAMETERS: &[&str] = &[
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "oauth_token",
+    "password",
+    "passwd",
+    "private_token",
+    "sig",
+    "signature",
+    "token",
+];
 
 /// Shared repository information.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
@@ -42,12 +55,11 @@ pub async fn get_repo_info<P: AsRef<Path>>(working_dir: P) -> Result<RepoInfo> {
     Ok(RepoInfo { owner, repo })
 }
 
-/// Full repository identity for a continued controller run: owner, repo,
-/// the pinned remote's default branch, and sanitized remote metadata.
+/// Repository routing metadata used by cleanup safety checks.
 ///
-/// Distinct from [`RepoInfo`] (used pervasively for owner/repo-only
-/// resolution) so that adding these fields cannot ripple into every one of
-/// `get_repo_info`'s existing call sites.
+/// This is not the durable TL run identity. Runnable runs store only the
+/// canonical remote URL returned by [`get_repository_remote_url`]; branch and
+/// cleanup routing details remain separate from that identity.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct RepositoryIdentity {
     pub owner: GithubOwner,
@@ -61,6 +73,259 @@ pub struct RepositoryIdentity {
     pub remote_url: String,
     /// The resolved remote name (e.g. "origin", "forgejo").
     pub remote_name: String,
+}
+
+/// Resolve the selected remote as the sole durable run repository identity.
+///
+/// Unlike [`get_repository_identity`], this does not parse API coordinates or
+/// require a locally recorded remote default branch. Those facts are not part
+/// of repository identity and the configured integration branch is separate.
+pub async fn get_repository_remote_url<P: AsRef<Path>>(working_dir: P) -> Result<String> {
+    let working_dir = working_dir.as_ref();
+    let remote = match configured_remote(working_dir).await? {
+        Some(remote) => remote,
+        None => detect_first_remote(working_dir).await?,
+    };
+    let url = get_remote_url(working_dir, &remote).await?;
+    canonical_repository_url(&url)
+}
+
+/// Canonicalize one supported repository address without retaining credentials.
+///
+/// Supported inputs are HTTP(S), `ssh://`, and relative scp-like SSH remotes.
+/// Host/scheme casing is normalized, transport users and recognized
+/// credential-only query/fragment parameters are removed, and explicit ports
+/// and repository path spelling are preserved. Unknown query/fragment
+/// parameters are rejected because they may route to a different repository.
+/// Error messages never include the supplied URL.
+pub fn canonical_repository_url(input: &str) -> Result<String> {
+    let value = input.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        anyhow::bail!("repository remote URL is missing or malformed");
+    }
+    if let Some((scheme, rest)) = value.split_once("://") {
+        return canonical_url_with_scheme(scheme, rest);
+    }
+    canonical_scp_remote(value)
+}
+
+fn canonical_url_with_scheme(scheme: &str, rest: &str) -> Result<String> {
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "ssh") {
+        anyhow::bail!("repository remote URL uses an unsupported transport");
+    }
+    let authority_end = rest
+        .find('/')
+        .context("repository remote URL is malformed")?;
+    let raw_authority = &rest[..authority_end];
+    let suffix = &rest[authority_end..];
+    let (path, query, fragment) = split_url_suffix(suffix)?;
+    validate_removable_parameters(query, "query")?;
+    validate_removable_parameters(fragment, "fragment")?;
+    let authority = canonical_authority(raw_authority)?;
+    let path = canonical_repository_path(path)?;
+    Ok(format!("{scheme}://{authority}{path}"))
+}
+
+fn split_url_suffix(suffix: &str) -> Result<(&str, Option<&str>, Option<&str>)> {
+    let fragment_start = suffix.find('#');
+    let before_fragment = fragment_start.map_or(suffix, |index| &suffix[..index]);
+    let fragment = fragment_start.map(|index| &suffix[index + 1..]);
+    let query_start = before_fragment.find('?');
+    let path = query_start.map_or(before_fragment, |index| &before_fragment[..index]);
+    let query = query_start.map(|index| &before_fragment[index + 1..]);
+    if query == Some("") || fragment == Some("") {
+        anyhow::bail!("repository remote URL has an ambiguous empty query or fragment");
+    }
+    Ok((path, query, fragment))
+}
+
+fn canonical_scp_remote(value: &str) -> Result<String> {
+    let user_separator = value.find('@');
+    if user_separator == Some(0) {
+        anyhow::bail!("repository remote URL is malformed or unsupported");
+    }
+    let host_start = user_separator.map_or(0, |index| index + 1);
+    let (authority, path) = if value[host_start..].starts_with('[') {
+        let close = value[host_start..]
+            .find(']')
+            .context("repository remote URL is malformed or unsupported")?;
+        let separator = host_start + close + 1;
+        if value.as_bytes().get(separator) != Some(&b':') {
+            anyhow::bail!("repository remote URL is malformed or unsupported");
+        }
+        (&value[..separator], &value[separator + 1..])
+    } else {
+        value
+            .split_once(':')
+            .context("repository remote URL is malformed or unsupported")?
+    };
+    if path.is_empty() || path.starts_with('/') || path.contains('?') || path.contains('#') {
+        anyhow::bail!("absolute or ambiguous scp-like repository paths are unsupported");
+    }
+    if authority.matches('@').count() > 1 || authority.starts_with('@') {
+        anyhow::bail!("repository remote URL is malformed or unsupported");
+    }
+    let authority = canonical_authority(authority)?;
+    let path = canonical_repository_path(&format!("/{path}"))?;
+    Ok(format!("ssh://{authority}{path}"))
+}
+
+fn canonical_authority(value: &str) -> Result<String> {
+    let authority = value.rsplit('@').next().unwrap_or_default();
+    if authority.is_empty() {
+        anyhow::bail!("repository remote URL is malformed");
+    }
+    let (host, port) = if authority.starts_with('[') {
+        let close = authority
+            .find(']')
+            .context("repository remote URL has an invalid host")?;
+        let host = &authority[..=close];
+        let suffix = &authority[close + 1..];
+        if !suffix.is_empty() && !suffix.starts_with(':') {
+            anyhow::bail!("repository remote URL is malformed");
+        }
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(&suffix[1..])
+        };
+        (canonical_host(host)?, port)
+    } else {
+        if authority.matches(':').count() > 1 {
+            anyhow::bail!("IPv6 repository hosts must use brackets");
+        }
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        (canonical_host(host)?, port)
+    };
+    match port {
+        None => Ok(host),
+        Some(port)
+            if !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && port.parse::<u16>().is_ok_and(|value| value > 0) =>
+        {
+            Ok(format!("{host}:{port}"))
+        }
+        Some(_) => anyhow::bail!("repository remote URL has an invalid port"),
+    }
+}
+
+fn canonical_host(host: &str) -> Result<String> {
+    if host.starts_with('[') && host.ends_with(']') {
+        let address = host[1..host.len() - 1]
+            .parse::<std::net::Ipv6Addr>()
+            .context("repository remote URL has an invalid host")?;
+        return Ok(format!("[{address}]"));
+    }
+    if host.is_empty() || !host.is_ascii() || host.ends_with('.') {
+        anyhow::bail!("repository remote URL has an invalid host");
+    }
+    for label in host.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            anyhow::bail!("repository remote URL has an invalid host");
+        }
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+fn canonical_repository_path(path: &str) -> Result<String> {
+    if !path.starts_with('/') || path.len() < 2 {
+        anyhow::bail!("repository remote URL has no repository path");
+    }
+    if !path.is_ascii()
+        || path.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || character == '\\'
+        })
+    {
+        anyhow::bail!("repository remote URL has a malformed path");
+    }
+    let bytes = path.as_bytes();
+    let mut normalized = String::with_capacity(path.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                anyhow::bail!("repository remote URL has a malformed path");
+            }
+            normalized.push('%');
+            normalized.push((bytes[index + 1] as char).to_ascii_uppercase());
+            normalized.push((bytes[index + 2] as char).to_ascii_uppercase());
+            index += 3;
+        } else {
+            normalized.push(bytes[index] as char);
+            index += 1;
+        }
+    }
+    for raw_segment in normalized.split('/') {
+        let decoded = decode_percent_component(raw_segment)?;
+        let segment = decoded.as_str();
+        if matches!(segment, "." | "..") {
+            anyhow::bail!("repository remote URL has an ambiguous path");
+        }
+        if REPOSITORY_CREDENTIAL_PARAMETERS.contains(&segment.to_ascii_lowercase().as_str()) {
+            anyhow::bail!("repository remote URL path contains a credential marker");
+        }
+    }
+    Ok(normalized)
+}
+
+fn validate_removable_parameters(value: Option<&str>, component: &str) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let mut found = false;
+    for parameter in value.split('&') {
+        let (key, _) = parameter
+            .split_once('=')
+            .with_context(|| format!("repository remote URL has a malformed {component}"))?;
+        let decoded = decode_percent_component(key)?.replace('+', " ");
+        if decoded.is_empty()
+            || !REPOSITORY_CREDENTIAL_PARAMETERS.contains(&decoded.to_ascii_lowercase().as_str())
+        {
+            anyhow::bail!("repository remote URL has an ambiguous {component}");
+        }
+        found = true;
+    }
+    if !found {
+        anyhow::bail!("repository remote URL has an ambiguous {component}");
+    }
+    Ok(())
+}
+
+fn decode_percent_component(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                anyhow::bail!("repository remote URL has a malformed escape");
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .context("repository remote URL has a malformed escape")?;
+            let byte = u8::from_str_radix(hex, 16)
+                .context("repository remote URL has a malformed escape")?;
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).context("repository remote URL has an invalid encoding")
 }
 
 /// Resolve the complete repository identity from the pinned or auto-detected
@@ -285,6 +550,42 @@ mod tests {
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, ScrubGitRepositoryEnv,
     };
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct RepositoryUrlVector {
+        name: String,
+        input: String,
+        canonical: Option<String>,
+        error: Option<String>,
+    }
+
+    #[test]
+    fn canonical_repository_url_matches_shared_python_vectors() {
+        let vectors: Vec<RepositoryUrlVector> = serde_json::from_str(include_str!(
+            "../../../../tl_loop/tests/fixtures/repository_identity_url_vectors.json"
+        ))
+        .expect("shared repository URL vectors are valid JSON");
+
+        for vector in vectors {
+            match (canonical_repository_url(&vector.input), vector.canonical, vector.error) {
+                (Ok(actual), Some(expected), None) => {
+                    assert_eq!(actual, expected, "{}", vector.name);
+                    assert_eq!(canonical_repository_url(&actual).unwrap(), actual, "{}", vector.name);
+                    assert!(!actual.contains("sample-secret"), "{}", vector.name);
+                    assert!(!actual.contains("alice"), "{}", vector.name);
+                }
+                (Err(error), None, Some(expected)) => {
+                    assert!(error.to_string().contains(&expected), "{}", vector.name);
+                    assert!(!error.to_string().contains("sample-secret"), "{}", vector.name);
+                }
+                (result, canonical, error) => panic!(
+                    "{}: vector outcome mismatch (result={result:?}, canonical={canonical:?}, error={error:?})",
+                    vector.name
+                ),
+            }
+        }
+    }
 
     #[test]
     fn test_select_remote_prefers_origin() {
@@ -488,6 +789,21 @@ mod tests {
 
         assert!(error.contains("not recorded locally"));
         assert!(error.contains("origin"));
+    }
+
+    #[tokio::test]
+    async fn get_repository_remote_url_does_not_require_remote_default_branch() {
+        let tmp = init_repo_with_remotes(&[(
+            "origin",
+            "https://user:secret@Forge.Example.com:8443/Org/Repo.git",
+        )])
+        .await;
+
+        let remote_url = get_repository_remote_url(tmp.path()).await.unwrap();
+
+        assert_eq!(remote_url, "https://forge.example.com:8443/Org/Repo.git");
+        assert!(!remote_url.contains("secret"));
+        assert!(!remote_url.contains("user"));
     }
 
     #[test]

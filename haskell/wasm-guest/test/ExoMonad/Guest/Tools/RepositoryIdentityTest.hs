@@ -20,25 +20,15 @@ successResponse =
   PA.RepositoryIdentityResponse
     { PA.repositoryIdentityResponseSuccess = True,
       PA.repositoryIdentityResponseError = "",
-      PA.repositoryIdentityResponseOwner = TL.pack "goya",
-      PA.repositoryIdentityResponseRepo = TL.pack "beast",
-      PA.repositoryIdentityResponseBaseBranch = TL.pack "main",
-      PA.repositoryIdentityResponseForgeHost = TL.pack "forge.example.com",
-      PA.repositoryIdentityResponseRemoteUrl = TL.pack "https://forge.example.com/goya/beast.git",
-      PA.repositoryIdentityResponseRemoteName = TL.pack "forgejo"
+      PA.repositoryIdentityResponseRemoteUrl = TL.pack "https://forge.example.com/goya/beast.git"
     }
 
 errorResponse :: PA.RepositoryIdentityResponse
 errorResponse =
   PA.RepositoryIdentityResponse
     { PA.repositoryIdentityResponseSuccess = False,
-      PA.repositoryIdentityResponseError = TL.pack "Remote \"origin\"'s default branch is not recorded locally",
-      PA.repositoryIdentityResponseOwner = "",
-      PA.repositoryIdentityResponseRepo = "",
-      PA.repositoryIdentityResponseBaseBranch = "",
-      PA.repositoryIdentityResponseForgeHost = "",
-      PA.repositoryIdentityResponseRemoteUrl = "",
-      PA.repositoryIdentityResponseRemoteName = ""
+      PA.repositoryIdentityResponseError = TL.pack "Repository remote URL is unavailable",
+      PA.repositoryIdentityResponseRemoteUrl = ""
     }
 
 field :: String -> Aeson.Object -> Maybe Value
@@ -56,26 +46,22 @@ repositoryIdentityTests =
               Just (Object props) -> assertEqual "properties" mempty props
               _ -> assertFailure "repository_identity schema must declare an (empty) properties object"
           _ -> assertFailure "repository_identity schema must serialize as a JSON object",
-      testCase "success decode projects owner/repo/base_branch/forge_host/remote metadata" $
+      testCase "success decode projects only the canonical repository URL" $
         case repositoryIdentityResponseValue successResponse of
           Object fields -> do
             assertEqual "success" (Just (Aeson.toJSON True)) (field "success" fields)
-            assertEqual "owner" (Just (Aeson.toJSON ("goya" :: String))) (field "owner" fields)
-            assertEqual "repo" (Just (Aeson.toJSON ("beast" :: String))) (field "repo" fields)
-            assertEqual "base_branch" (Just (Aeson.toJSON ("main" :: String))) (field "base_branch" fields)
-            assertEqual "forge_host" (Just (Aeson.toJSON ("forge.example.com" :: String))) (field "forge_host" fields)
             assertEqual
               "remote_url"
               (Just (Aeson.toJSON ("https://forge.example.com/goya/beast.git" :: String)))
               (field "remote_url" fields)
-            assertEqual "remote_name" (Just (Aeson.toJSON ("forgejo" :: String))) (field "remote_name" fields)
+            assertEqual "identity has no owner field" Nothing (field "owner" fields)
+            assertEqual "identity has no branch field" Nothing (field "base_branch" fields)
           _ -> assertFailure "repository_identity projection must serialize as a JSON object",
       testCase "error decode carries the durable fail-closed reason, never a guessed identity" $ do
         assertEqual "success" False (PA.repositoryIdentityResponseSuccess errorResponse)
         assertEqual
           "error"
-          (TL.pack "Remote \"origin\"'s default branch is not recorded locally")
+          (TL.pack "Repository remote URL is unavailable")
           (PA.repositoryIdentityResponseError errorResponse)
-        assertEqual "owner is not guessed" "" (PA.repositoryIdentityResponseOwner errorResponse)
-        assertEqual "base_branch is not guessed" "" (PA.repositoryIdentityResponseBaseBranch errorResponse)
+        assertEqual "URL is not guessed" "" (PA.repositoryIdentityResponseRemoteUrl errorResponse)
     ]
