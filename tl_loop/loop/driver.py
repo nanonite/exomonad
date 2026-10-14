@@ -8873,9 +8873,17 @@ def _reconcile_nonterminal_slices(
                 current.id,
             )
             continue
-        owner_id = _agent_for_dispatch_intent(
-            agent_listing,
-            current.dispatch_intent_id or "",
+        aggregate_task = next(
+            (task for task in plan.sub_tls if task.name == current.id),
+            None,
+        )
+        owner_id = (
+            aggregate_task.agent_id or aggregate_task.name
+            if aggregate_task is not None
+            else _agent_for_dispatch_intent(
+                agent_listing,
+                current.dispatch_intent_id or "",
+            )
         )
         # A watcher-only merge may be adopted when publication provenance
         # validates against the dispatch or active recovery succession. A
@@ -14922,12 +14930,13 @@ def _integrate_one_candidate(
     """Validate one aggregate candidate, recheck its base, then merge it."""
     current = state.slices[task.name]
     candidate_runtime = _candidate_runtime(state.integration, task.name)
+    publication_owner = task.agent_id or task.name
     first: Mapping[str, object] | None = None
     if candidate_runtime.lifecycle is IntegrationLifecycle.MERGING:
         first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
         if first is None:
             return state
-        if _watcher_publication_refused(current, first) or (
+        if _watcher_publication_refused(current, first, publication_owner) or (
             _watcher_publication_ownership_unresolved(first)
         ):
             LOGGER.warning(
@@ -14959,7 +14968,7 @@ def _integrate_one_candidate(
     first = first or _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if first is None:
         return state
-    if _watcher_publication_refused(current, first) or (
+    if _watcher_publication_refused(current, first, publication_owner) or (
         _watcher_publication_ownership_unresolved(first)
     ):
         LOGGER.warning(
@@ -15054,7 +15063,7 @@ def _integrate_one_candidate(
     second = _watcher_snapshot(current.pr_number, config, effects, effects_log)
     if second is None:
         return state
-    if _watcher_publication_refused(current, second) or (
+    if _watcher_publication_refused(current, second, publication_owner) or (
         _watcher_publication_ownership_unresolved(second)
     ):
         LOGGER.warning(

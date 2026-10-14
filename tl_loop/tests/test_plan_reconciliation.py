@@ -326,7 +326,15 @@ def _record_completed_spawn(store: RunStore, accepted_task: str, task_override: 
     )
     journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
     journal.append(intent)
-    journal.mark_result(intent, ToolResult.from_raw({"success": True, "result": {}}))
+    journal.mark_result(
+        intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {"agent_id": "agent-completed", "invocation_id": "invocation-completed"},
+            }
+        ),
+    )
 
 
 def _tree_bytes(root: Path) -> dict[Path, bytes]:

@@ -333,7 +333,9 @@ def _validate_publication_owner(
     record_slice_id = _publication_record_text(observation.publication, "slice_id")
     if record_slice_id != current.id:
         return _publication_rejection("slice_id_mismatch", current, observation, head_sha, owner_id)
-    expected_owner = current.dispatch_agent_id or owner_id
+    # For aggregate slices, dispatch_agent_id can identify the root's
+    # integration action while owner_id identifies the subTL publication author.
+    expected_owner = owner_id or current.dispatch_agent_id
     record_owner = _publication_record_text(observation.publication, "author_agent")
     if expected_owner is None:
         return _publication_rejection("owner_id_missing", current, observation, head_sha, owner_id)
@@ -396,7 +398,7 @@ def _expected_publication_fields(
         ("base_branch", current.base_ref),
         ("head_reachable", True),
         ("slice_id", current.id),
-        ("owner_id", current.dispatch_agent_id or owner_id),
+        ("owner_id", owner_id or current.dispatch_agent_id),
         ("invocation_ids", _active_invocation_ids(current)),
     )
 

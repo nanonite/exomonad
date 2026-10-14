@@ -119,7 +119,7 @@ from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
-from tl_loop.state.plan_manifest import build_plan_manifest
+from tl_loop.state.plan_manifest import PlanManifest, build_plan_manifest
 from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
 from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.plan_revision_apply import apply_plan_revision
@@ -7851,7 +7851,13 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     architecture = _plan()
     architecture = replace(
         architecture,
-        leaves=(replace(architecture.leaves[0], chainlink_issue_id=811),),
+        leaves=(
+            replace(
+                architecture.leaves[0],
+                task="accepted architecture task",
+                chainlink_issue_id=None,
+            ),
+        ),
     )
     future_issue_ids = (814, 812, 813, 815)
     future_names = tuple(f"future-stage-{index}" for index in range(1, 5))
@@ -7906,6 +7912,8 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
 
     def public_plan_document(plan: WorkPlan) -> dict[str, object]:
         canonical = dict(driver_module._manifest_plan(plan))
+        for leaf in cast(list[dict[str, object]], canonical["leaves"]):
+            leaf.setdefault("chainlink_issue_id", None)
         canonical["sub_tls"] = [
             {
                 "name": stage.name,
@@ -7970,6 +7978,19 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
 
     class CrashAfterAggregatePublication(RecordingTransport):
         def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "post_merge_changelog_context":
+                self.calls.append((tool_name, arguments))
+                return {"success": True, "result": {"changelog_present": False}}
+            if tool_name in {"spawn_leaf", "spawn_worker"}:
+                self.calls.append((tool_name, arguments))
+                agent_id = str(arguments["name"])
+                return {
+                    "success": True,
+                    "result": {
+                        "agent_id": agent_id,
+                        "invocation_id": f"{agent_id}-invocation",
+                    },
+                }
             title = str(arguments.get("title", ""))
             if tool_name == "file_pr" and title.startswith("Aggregate architecture into "):
                 self.calls.append((tool_name, arguments))
@@ -7989,6 +8010,13 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         project_root=tmp_path,
         ledger_run_id=run_id,
         keep_alive_on_waiting=False,
+        policy=validate_policy(_selector_policy()),
+        capabilities=CapabilityMap(
+            {"codex/gpt-luna": Difficulty.STANDARD, "claude/sonnet": Difficulty.HARD}
+        ),
+        catalog=ModelCatalog.from_fixture(
+            Path(__file__).parent / "fixtures" / "model_catalog.json"
+        ),
     )
     with pytest.raises(SystemExit, match="after aggregate publication"):
         run_tl_loop(
@@ -8004,7 +8032,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     child_store = RunStore("architecture", root_store.run_dir)
     child_state = child_store.load()
     completed_leaf = child_state.slices["leaf-a"]
-    assert completed_leaf.chainlink_issue_id == 811
+    assert completed_leaf.chainlink_issue_id is None
     assert isinstance(child_state.recursive_fsm, RecursiveTLAllMerged)
     receipt = PostMergeState(
         PostMergePhase.COMPLETE,
@@ -8038,6 +8066,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         status=SliceStatus.MERGED,
         pr_number=45,
         reviewed_head="a" * 40,
+        chainlink_issue_id=811,
         post_merge=receipt,
         park_cause=None,
         park_issue_id=None,
@@ -8052,7 +8081,10 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     )
     child_store.checkpoint(
         merged_fsm,
-        {**child_state.slices, "leaf-a": completed_leaf},
+        {
+            **child_state.slices,
+            "leaf-a": replace(completed_leaf, chainlink_issue_id=None),
+        },
         child_state.budgets,
         child_state.events.last_consumed_offset,
     )
@@ -8066,19 +8098,105 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls
     )
 
-    candidate_bytes = plan_bytes(candidate_plan)
-    (state_root / "plan.json").write_bytes(candidate_bytes)
+    drifted_architecture = replace(
+        architecture,
+        leaves=(
+            replace(
+                architecture.leaves[0],
+                task="rewritten completed task",
+                chainlink_issue_id=811,
+            ),
+        ),
+    )
+    drifted_plan = WorkPlan(
+        sub_tls=(replace(stages[0], plan=drifted_architecture), *candidate_stages[1:])
+    )
+    (state_root / "plan.json").write_bytes(plan_bytes(drifted_plan))
     drifted_manifest = driver_module._manifest_for_plan(
-        candidate_plan,
+        drifted_plan,
         run_id,
         replace(config, plan_revision=1),
     )
+
+    # Reproduce the live parked aggregate and legacy root declaration while
+    # retaining accepted FSM digests and dispatch records.
+    root_state = root_store.load()
+    blocked_stage = replace(
+        root_state.slices["architecture"],
+        status=SliceStatus.PARKED,
+        park_cause=ParkCause.PUBLICATION_BLOCKED,
+        park_issue_id=None,
+        park_audit={
+            "error_kind": "publication_evidence_incomplete",
+            "reason": "existing aggregate publication awaits reconciliation",
+            "missing_evidence": ["durable_invocation_correlation"],
+            "retryable": True,
+        },
+    )
+    root_store.checkpoint(
+        root_state.recursive_fsm,
+        {**root_state.slices, "architecture": blocked_stage},
+        root_state.budgets,
+        root_state.events.last_consumed_offset,
+        current_order=root_state.current_order,
+        ordered_stages=root_state.ordered_stages,
+        integration=root_state.integration,
+    )
     root_document = json.loads(root_store.path.read_text(encoding="utf-8"))
-    root_document["plan_manifest"] = drifted_manifest.to_document()
+    root_manifest_document = cast(JsonObject, drifted_manifest.to_document())
+    architecture_node = next(
+        node
+        for node in cast(list[JsonObject], root_manifest_document["nodes"])
+        if node["name"] == "architecture"
+    )
+    cast(JsonObject, architecture_node["declaration"]).pop("order_explicit", None)
+    integration_contract = cast(JsonObject, architecture_node["integration_contract"])
+    for field_name in (
+        "leaf_review_owner",
+        "aggregate_review_owner",
+        "aggregate_repair_owner",
+    ):
+        integration_contract.pop(field_name, None)
+    root_manifest_document.pop("digest", None)
+    root_document["plan_manifest"] = PlanManifest.from_document(
+        root_manifest_document
+    ).to_document()
     root_store.path.write_text(json.dumps(root_document), encoding="utf-8")
+    child_document = json.loads(child_store.path.read_text(encoding="utf-8"))
+    child_manifest = drifted_manifest.child_manifests["root/sub_tl/architecture"]
+    child_document["plan_manifest"] = child_manifest.to_document()
+    child_document["slices"]["leaf-a"]["chainlink_issue_id"] = 811
+    child_document["slices"]["leaf-a"]["dispatch_authoritative_event_seq"] = 2
+    child_store.path.write_text(json.dumps(child_document), encoding="utf-8")
+    root_store.set_gate(
+        driver_module._aggregate_publication_gate_name("architecture"),
+        GateStatus.PENDING,
+    )
+    action_journal = child_store.run_dir / "action-journal.json"
+    action_journal_before_reconciliation = action_journal.read_bytes()
 
     reconciliation = analyze_plan_reconciliation(tmp_path)
     assert reconciliation.can_apply, reconciliation.blockers
+    reconciliation_document = reconciliation.to_document()
+    root_scope_report = next(
+        scope for scope in reconciliation_document["scopes"] if scope["scope_id"] == "root"
+    )
+    legacy_proof = root_scope_report["legacy_default_equivalences"][0]
+    assert set(legacy_proof["fields"]) == {
+        "declaration.order_explicit",
+        "integration_contract.aggregate_repair_owner",
+        "integration_contract.aggregate_review_owner",
+        "integration_contract.leaf_review_owner",
+    }
+    child_scope_report = next(
+        scope
+        for scope in reconciliation_document["scopes"]
+        if scope["scope_id"] == "root/sub_tl/architecture"
+    )
+    declaration_proof = child_scope_report["protected_declaration_proofs"][0]
+    assert declaration_proof["fields"] == ["chainlink_issue_id", "task"]
+    assert declaration_proof["disposition"] == "proven"
+    assert "completed_issue_closure_receipt" in declaration_proof["evidence"]
     applied_reconciliation = apply_plan_reconciliation(
         tmp_path,
         "Restore accepted plan bindings before updating future issue metadata",
@@ -8091,6 +8209,15 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         root_store.load().plan_manifest.digest
         == driver_module._manifest_for_plan(accepted_plan, run_id, config).digest
     )
+    restored_leaf = child_store.load().slices["leaf-a"]
+    assert restored_leaf.status is SliceStatus.MERGED
+    assert restored_leaf.chainlink_issue_id is None
+    assert restored_leaf.pr_number == 45
+    assert restored_leaf.post_merge == receipt
+    assert action_journal.read_bytes() == action_journal_before_reconciliation
+
+    # Only the future leaf metadata is proposed after history is restored.
+    (state_root / "plan.json").write_bytes(plan_bytes(candidate_plan))
 
     revision = apply_plan_revision(
         tmp_path,
@@ -8123,6 +8250,23 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     architecture_slice = adopted.final_state.slices["architecture"]
     assert architecture_slice.status is SliceStatus.IN_REVIEW
     assert architecture_slice.pr_number == 43
+    assert architecture_slice.dispatch_invocation_id == invocation_id
+    aggregate_candidate = adopted.final_state.integration.candidates["architecture"]
+    assert aggregate_candidate.aggregate_pr_number == 43
+    assert aggregate_candidate.aggregate_head_sha == "head-a"
+    assert aggregate_candidate.aggregate_original_base_sha == "base-a"
+    assert aggregate_candidate.aggregate_patch_digest == "patch-a"
+    assert aggregate_candidate.integration_owner_id == "root:architecture:integration"
+    assert aggregate_candidate.integration_owner_run_id == "architecture"
+    assert aggregate_candidate.integration_owner_branch == "main.architecture"
+    assert transport.aggregate_reconciliation is not None
+    publication = cast(JsonObject, transport.aggregate_reconciliation["publication"])
+    assert publication["invocation_id"] == invocation_id
+    assert publication["author_agent"] == "architecture"
+    assert not any(
+        gate.name == driver_module._aggregate_publication_gate_name("architecture")
+        for gate in adopted.final_state.gates
+    )
     assert adopted.final_state.current_order == 1
     assert all(
         adopted.final_state.slices[name].status is SliceStatus.PENDING for name in future_names

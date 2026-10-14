@@ -6,8 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from tl_loop.fsm.child import ChildRecord
 from tl_loop.fsm.post_merge import PostMergePhase
+from tl_loop.fsm.scope import TLAllMerged
 from tl_loop.loop.journal import stable_action_key
 from tl_loop.state.plan_revision_diff import changed_node_fields
 
@@ -53,10 +53,14 @@ def evaluate_protected_declaration_restore(
         return _blocked(current, fields, "accepted_fsm_digest_mismatch")
     if not _slice_binds_declaration(scope, slice_state, current):
         return _blocked(current, fields, "slice_dispatch_identity_mismatch")
-    child_record = _dispatch_record(scope, current, slice_state.dispatch_intent_id)
-    if child_record is None:
+    has_dispatch_record = _dispatch_identity_is_durable(
+        scope, current, slice_state, slice_state.dispatch_intent_id
+    )
+    if not has_dispatch_record:
         return _blocked(current, fields, "runtime_dispatch_identity_mismatch")
-    entry, reason = _confirmed_spawn_entry(scope, current, accepted, slice_state.dispatch_intent_id)
+    entry, reason = _confirmed_spawn_entry(
+        scope, current, accepted, slice_state, slice_state.dispatch_intent_id
+    )
     if entry is None:
         return _blocked(current, fields, reason)
     if not _issue_binding_matches(current, accepted, slice_state, entry):
@@ -64,7 +68,15 @@ def evaluate_protected_declaration_restore(
     evidence = [
         "accepted_snapshot_manifest_digest",
         "matching_fsm_plan_digest",
-        "slice_and_recursive_dispatch_identity",
+        "slice_dispatch_identity",
+        (
+            "recursive_child_dispatch_record"
+            if any(
+                record.child_id == current.name
+                for record in _records_for(scope.state.recursive_fsm)
+            )
+            else "all_merged_completion_receipt"
+        ),
         "confirmed_spawn_action_with_accepted_task",
     ]
     if current.chainlink_issue_id != accepted.chainlink_issue_id:
@@ -103,33 +115,39 @@ def _slice_binds_declaration(
     )
 
 
-def _dispatch_record(
+def _dispatch_identity_is_durable(
     scope: ReconciliationScope,
     node: ManifestNode,
+    slice_state: SliceState,
     intent_id: str,
-) -> ChildRecord | None:
+) -> bool:
     matches = [
         record for record in _records_for(scope.state.recursive_fsm) if record.child_id == node.name
     ]
-    if len(matches) != 1:
-        return None
-    record = matches[0]
-    slice_state = scope.state.slices[node.name]
-    if (
-        record.kind.value != node.kind
-        or record.manifest_node_id != node.node_id
-        or record.manifest_revision != scope.current.manifest_revision
-        or record.dispatch_intent_id != intent_id
-        or record.invocation_id != slice_state.dispatch_invocation_id
-    ):
-        return None
-    return record
+    if len(matches) == 1:
+        record = matches[0]
+        return (
+            record.kind.value == node.kind
+            and record.manifest_node_id == node.node_id
+            and record.manifest_revision == scope.current.manifest_revision
+            and record.dispatch_intent_id == intent_id
+            and record.invocation_id == slice_state.dispatch_invocation_id
+        )
+    if matches or not isinstance(scope.state.recursive_fsm, TLAllMerged):
+        return False
+    completed = scope.state.recursive_fsm.completed_children.get(node.name)
+    return (
+        completed is not None
+        and completed.phase is PostMergePhase.COMPLETE
+        and slice_state.post_merge == completed
+    )
 
 
 def _confirmed_spawn_entry(
     scope: ReconciliationScope,
     current: ManifestNode,
     accepted: ManifestNode,
+    slice_state: SliceState,
     intent_id: str,
 ) -> tuple[Mapping[str, object] | None, str]:
     if scope.action_journal_status == "invalid":
@@ -149,6 +167,8 @@ def _confirmed_spawn_entry(
     arguments = _arguments(entry)
     if entry.get("status") != "confirmed" or not _confirmed_result(entry):
         return None, "spawn_action_unconfirmed"
+    if not _spawn_result_matches_slice(entry, slice_state):
+        return None, "spawn_result_identity_mismatch"
     if arguments.get("name") != accepted.name or arguments.get("task") != accepted.task:
         return None, "spawn_declaration_mismatch"
     boundary = arguments.get("boundary", [])
@@ -178,6 +198,18 @@ def _arguments(entry: Mapping[str, object]) -> Mapping[str, object]:
 def _confirmed_result(entry: Mapping[str, object]) -> bool:
     result = entry.get("result")
     return isinstance(result, Mapping) and result.get("success") is True
+
+
+def _spawn_result_matches_slice(entry: Mapping[str, object], slice_state: SliceState) -> bool:
+    outcome = entry.get("result")
+    if not isinstance(outcome, Mapping):
+        return False
+    result = outcome.get("result")
+    return (
+        isinstance(result, Mapping)
+        and result.get("agent_id") == slice_state.dispatch_agent_id
+        and result.get("invocation_id") == slice_state.dispatch_invocation_id
+    )
 
 
 def _issue_binding_matches(
