@@ -23,6 +23,7 @@ from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.plan_reconciliation_report import _safe_text
 from tl_loop.state.plan_revision_transaction import recover_plan_revision
 from tl_loop.state.schema import (
+    IntegrationCandidateState,
     IntegrationRuntimeState,
     OrderedStageState,
     ParkCause,
@@ -36,6 +37,7 @@ def _plan_document(
     future_issue_id: int | None,
     completed_task: str = "accepted completed task",
     completed_issue_id: int | None = 811,
+    controller_alias: str = "agent-architecture",
 ):
     return {
         "run_id": "root",
@@ -43,6 +45,7 @@ def _plan_document(
             "sub_tls": [
                 {
                     "name": "architecture",
+                    "agent_id": controller_alias,
                     "order": 1,
                     "plan": {
                         "leaves": [
@@ -123,10 +126,19 @@ def _post_merge_receipt() -> PostMergeState:
     return PostMergeState(PostMergePhase.COMPLETE, evidence)
 
 
-def _child_record(node: ManifestNode, kind: ChildKind, **evidence: str) -> ChildRecord:
+def _child_record(
+    node: ManifestNode,
+    kind: ChildKind,
+    *,
+    dispatch_intent_id: str | None = None,
+    invocation_id: str | None = None,
+    **evidence: str,
+) -> ChildRecord:
     return ChildRecord(
         child_id=node.name,
         kind=kind,
+        dispatch_intent_id=dispatch_intent_id,
+        invocation_id=invocation_id,
         evidence={
             "manifest_node_id": node.node_id,
             "manifest_revision": "1",
@@ -150,15 +162,18 @@ def _project(
     include_completed_spawn_journal: bool = False,
     spawn_task_override: str | None = None,
     legacy_completed_dispatch: bool = False,
+    controller_alias: str = "agent-architecture",
 ) -> tuple[Path, RunStore, RunStore, bytes, bytes]:
     accepted_document = _plan_document(
         future_issue_id=None,
         completed_issue_id=accepted_completed_issue_id,
+        controller_alias=controller_alias,
     )
     candidate_document = _plan_document(
         future_issue_id=candidate_issue_id,
         completed_task=candidate_completed_task,
         completed_issue_id=candidate_completed_issue_id,
+        controller_alias=controller_alias,
     )
     accepted_bytes = json.dumps(accepted_document, sort_keys=True).encode()
     candidate_bytes = json.dumps(candidate_document, sort_keys=True).encode()
@@ -180,7 +195,13 @@ def _project(
     accepted_child = accepted_root.child_manifests["root/sub_tl/architecture"]
     current_child = current_root.child_manifests["root/sub_tl/architecture"]
     runtime_digest = "0" * 64 if stale_runtime_digest else None
-    root_store = _create_root(state_root, current_root, accepted_root, runtime_digest)
+    root_store = _create_root(
+        state_root,
+        current_root,
+        accepted_root,
+        runtime_digest,
+        controller_alias=controller_alias,
+    )
     child_store = _create_child(
         state_root,
         current_child,
@@ -189,9 +210,30 @@ def _project(
         include_spawn_journal=include_completed_spawn_journal,
         spawn_task_override=spawn_task_override,
         legacy_completed_dispatch=legacy_completed_dispatch,
+        controller_alias=controller_alias,
     )
     if legacy_completed_dispatch:
-        _record_authoritative_spawn_event(tmp_path, child_store)
+        _record_authoritative_spawn_event(
+            tmp_path,
+            child_store,
+            emitting_controller_id=controller_alias,
+        )
+        invocation_dir = tmp_path / ".exo" / "agents" / controller_alias
+        invocation_dir.mkdir(parents=True)
+        (invocation_dir / "invocation.json").write_text(
+            json.dumps(
+                {
+                    "invocation_id": "invocation-architecture",
+                    "runtime_agent_id": controller_alias,
+                    "trigger": "spawn",
+                    "slice_id": "architecture",
+                    "branch": f"main.{controller_alias}",
+                    "worktree": f"/tmp/architecture/{controller_alias}",
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
     return state_root, root_store, child_store, accepted_bytes, candidate_bytes
 
 
@@ -200,8 +242,18 @@ def _create_root(
     current: PlanManifest,
     accepted: PlanManifest,
     runtime_digest: str | None = None,
+    *,
+    controller_alias: str = "agent-architecture",
 ) -> RunStore:
-    create("root", {"plan_manifest": current.to_document()}, root_dir=state_root)
+    create(
+        "root",
+        {
+            "plan_manifest": current.to_document(),
+            "owner_branch": "main",
+            "owner_worktree": "/tmp/root",
+        },
+        root_dir=state_root,
+    )
     store = RunStore("root", state_root)
     state = store.load()
     stage = current.node("root/sub_tl/architecture")
@@ -210,8 +262,11 @@ def _create_root(
         slices["architecture"],
         status=SliceStatus.PARKED,
         attempts=1,
+        branch=f"main.{controller_alias}",
+        worktree=f"/tmp/architecture/{controller_alias}",
+        base_ref="main",
         dispatch_intent_id="dispatch-architecture",
-        dispatch_agent_id="agent-architecture",
+        dispatch_agent_id=controller_alias,
         dispatch_invocation_id="invocation-architecture",
         dispatch_authoritative_event_seq=1,
         park_cause=ParkCause.PUBLICATION_BLOCKED,
@@ -257,12 +312,20 @@ def _create_child(
     include_spawn_journal: bool = False,
     spawn_task_override: str | None = None,
     legacy_completed_dispatch: bool = False,
+    controller_alias: str = "agent-architecture",
 ) -> RunStore:
-    child_spec = {"parent_run_id": "root", "plan_manifest": current.to_document()}
+    child_spec = {
+        "parent_run_id": "root",
+        "parent_agent_id": "root",
+        "parent_branch": "main",
+        "owner_branch": f"main.{controller_alias}",
+        "owner_worktree": f"/tmp/architecture/{controller_alias}",
+        "depth": 1,
+        "plan_manifest": current.to_document(),
+    }
     if legacy_completed_dispatch:
         child_spec.update(
             ledger_run_id="root-ledger",
-            parent_agent_id="agent-architecture",
         )
     create("architecture", child_spec, root_dir=state_root / "root")
     store = RunStore("architecture", state_root / "root")
@@ -273,6 +336,7 @@ def _create_child(
             PostMergePhase.COMPLETE,
             {
                 **receipt.evidence,
+                "parent_branch": f"main.{controller_alias}",
                 "forgejo_head_sha": "a" * 40,
                 "forgejo_merged": "true",
                 "forgejo_pr_number": "45",
@@ -290,9 +354,11 @@ def _create_child(
         dispatch_agent_id="agent-completed",
         dispatch_invocation_id=None if legacy_completed_dispatch else "invocation-completed",
         dispatch_authoritative_event_seq=1,
-        branch="main.agent-completed" if legacy_completed_dispatch else None,
+        branch=f"main.{controller_alias}.agent-completed" if legacy_completed_dispatch else None,
         worktree="/tmp/architecture/completed" if legacy_completed_dispatch else None,
-        base_ref="main" if legacy_completed_dispatch else slices["completed"].base_ref,
+        base_ref=f"main.{controller_alias}"
+        if legacy_completed_dispatch
+        else slices["completed"].base_ref,
         manifest_node_id=completed_node.node_id,
         manifest_revision=current.manifest_revision,
         chainlink_issue_id=completed_node.chainlink_issue_id,
@@ -337,6 +403,7 @@ def _create_child(
             accepted.node("root/sub_tl/architecture/leaf/completed").task,
             spawn_task_override,
             legacy_completed_dispatch=legacy_completed_dispatch,
+            branch_name=f"main.{controller_alias}.agent-completed",
         )
     return store
 
@@ -347,6 +414,8 @@ def _record_completed_spawn(
     task_override: str | None,
     *,
     legacy_completed_dispatch: bool = False,
+    branch_name: str = "main.agent-completed",
+    intent_id: str = "dispatch-completed",
 ) -> None:
     intent = EffectIntent(
         "spawn_leaf",
@@ -354,7 +423,7 @@ def _record_completed_spawn(
         {
             "name": "completed",
             "task": task_override if task_override is not None else accepted_task,
-            "intent_id": "dispatch-completed",
+            "intent_id": intent_id,
             "boundary": [],
         },
         True,
@@ -366,7 +435,7 @@ def _record_completed_spawn(
             "success": True,
             "result": {
                 "invocation_id": None,
-                "branch_name": "main.agent-completed",
+                "branch_name": branch_name,
                 "worktree_path": "/tmp/architecture/agent-completed",
             },
         }
@@ -382,13 +451,18 @@ def _record_completed_spawn(
     )
 
 
-def _record_authoritative_spawn_event(project: Path, store: RunStore) -> None:
+def _record_authoritative_spawn_event(
+    project: Path,
+    store: RunStore,
+    *,
+    emitting_controller_id: str,
+) -> None:
     state = store.load()
     slice_state = state.slices["completed"]
     ledger = project / ".exo" / "ledger" / "segments"
     ledger.mkdir(parents=True)
     event = {
-        "agent_id": state.parent_agent_id,
+        "agent_id": emitting_controller_id,
         "data": {
             "branch": slice_state.branch,
             "child_agent": slice_state.dispatch_agent_id,
@@ -405,6 +479,113 @@ def _record_authoritative_spawn_event(project: Path, store: RunStore) -> None:
         json.dumps(event, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _direct_root_legacy_project(
+    project: Path,
+    *,
+    emitting_controller_id: str,
+) -> tuple[Path, RunStore]:
+    state_root = project / ".exo" / "tl-loop"
+    state_root.mkdir(parents=True)
+    accepted_document = {
+        "run_id": "root",
+        "plan": {
+            "leaves": [
+                {
+                    "name": "completed",
+                    "task": "accepted root task",
+                    "chainlink_issue_id": 811,
+                }
+            ]
+        },
+    }
+    candidate_document = {
+        "run_id": "root",
+        "plan": {
+            "leaves": [
+                {
+                    "name": "completed",
+                    "task": "rewritten root task",
+                    "chainlink_issue_id": 811,
+                }
+            ]
+        },
+    }
+    accepted_bytes = json.dumps(accepted_document, sort_keys=True).encode()
+    candidate_bytes = json.dumps(candidate_document, sort_keys=True).encode()
+    (state_root / "plan.snapshot").write_bytes(accepted_bytes)
+    (state_root / "plan.snapshot.sha256").write_text(
+        hashlib.sha256(accepted_bytes).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    (state_root / "plan.json").write_bytes(candidate_bytes)
+    accepted = _manifest(accepted_document)
+    current = _manifest(candidate_document)
+    create(
+        "root",
+        {
+            "ledger_run_id": "root-ledger",
+            "owner_branch": "main",
+            "owner_worktree": "/tmp/root",
+            "plan_manifest": current.to_document(),
+        },
+        root_dir=state_root,
+    )
+    store = RunStore("root", state_root)
+    state = store.load()
+    receipt = PostMergeState(
+        PostMergePhase.COMPLETE,
+        {
+            **_post_merge_receipt().evidence,
+            "forgejo_head_sha": "a" * 40,
+            "forgejo_merged": "true",
+            "forgejo_pr_number": "45",
+        },
+    )
+    completed_node = current.node("root/leaf/completed")
+    completed_slice = replace(
+        state.slices["completed"],
+        status=SliceStatus.MERGED,
+        attempts=1,
+        pr_number=45,
+        dispatch_intent_id="dispatch-root-leaf",
+        dispatch_agent_id="agent-completed",
+        dispatch_invocation_id=None,
+        dispatch_authoritative_event_seq=1,
+        branch="main.agent-completed",
+        worktree="/tmp/root/completed",
+        base_ref="main",
+        manifest_node_id=completed_node.node_id,
+        manifest_revision=current.manifest_revision,
+        chainlink_issue_id=811,
+        post_merge=receipt,
+    )
+    store.checkpoint(
+        TLAllMerged(
+            scope_path=("root",),
+            plan_digest=accepted.digest or "",
+            completed_children={"completed": receipt},
+        ),
+        {**state.slices, "completed": completed_slice},
+        state.budgets,
+        state.events.last_consumed_offset,
+        plan_manifest=current,
+    )
+    _record_completed_spawn(
+        store,
+        "accepted root task",
+        None,
+        legacy_completed_dispatch=True,
+        branch_name="main.agent-completed",
+        intent_id="dispatch-root-leaf",
+    )
+    _record_authoritative_spawn_event(
+        project,
+        store,
+        emitting_controller_id=emitting_controller_id,
+    )
+    return state_root, store
 
 
 def _mutate_completed_spawn_result(
@@ -751,21 +932,26 @@ def test_apply_restores_historical_dispatch_without_inventing_invocation_identit
             encoding="utf-8"
         )
     )
+    controller_invocation = (
+        tmp_path / ".exo" / "agents" / "agent-architecture" / "invocation.json"
+    ).read_bytes()
     assert proof["correlation"] == {
         "accepted_boundary_sha256": proof["correlation"]["accepted_boundary_sha256"],
         "accepted_task_sha256": proof["correlation"]["accepted_task_sha256"],
-        "base_branch": "main",
-        "branch": "main.agent-completed",
+        "base_branch": "main.agent-architecture",
+        "branch": "main.agent-architecture.agent-completed",
         "dispatch_event_seq": 1,
         "dispatch_event_sha256": hashlib.sha256(
             json.dumps(dispatch_event, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
         "dispatch_event_emitter_agent_id": "agent-architecture",
+        "dispatch_event_expected_emitter_agent_id": "agent-architecture",
+        "dispatch_event_observed_emitter_agent_id": "agent-architecture",
         "dispatch_intent_id": "dispatch-completed",
         "dispatch_invocation_id": None,
         "dispatch_invocation_status": "unavailable_in_legacy_records",
         "dispatch_owner_agent_id": "agent-completed",
-        "pr_base_branch": "main",
+        "pr_base_branch": "main.agent-architecture",
         "pr_head_sha": "a" * 40,
         "pr_number": 45,
         "completion_receipt_sha256": hashlib.sha256(
@@ -776,6 +962,21 @@ def test_apply_restores_historical_dispatch_without_inventing_invocation_identit
         "ledger_run_id": "root-ledger",
         "scope_id": "root/sub_tl/architecture",
         "scope_run_id": "architecture",
+        "scope_controller_agent_id": "agent-architecture",
+        "scope_controller_invocation_id": "invocation-architecture",
+        "scope_controller_invocation_sha256": hashlib.sha256(controller_invocation).hexdigest(),
+        "scope_controller_invocation_trigger": "spawn",
+        "scope_controller_branch_sha256": hashlib.sha256(b"main.agent-architecture").hexdigest(),
+        "scope_controller_worktree_sha256": hashlib.sha256(
+            b"/tmp/architecture/agent-architecture"
+        ).hexdigest(),
+        "parent_scope_run_id": "root",
+        "parent_scope_controller_agent_id": "root",
+        "parent_dispatch_intent_id": "dispatch-architecture",
+        "parent_dispatch_invocation_id": "invocation-architecture",
+        "parent_dispatch_event_seq": 1,
+        "parent_dispatch_agent_id": "agent-architecture",
+        "parent_dispatch_owner_record": "dispatch_owner",
         "slice_id": "completed",
         "spawn_action_key": proof["correlation"]["spawn_action_key"],
         "spawn_result_agent_id": None,
@@ -834,6 +1035,149 @@ def test_legacy_dispatch_event_change_invalidates_reconciliation_fingerprint(
     assert error.value.code == "reconciliation_evidence_stale"
 
 
+def test_scope_controller_registration_change_invalidates_fingerprint(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    report = analyze_plan_reconciliation(tmp_path)
+    registration = tmp_path / ".exo" / "agents" / "agent-architecture" / "invocation.json"
+    recorded = dict(report.input_hashes)
+    assert recorded[".exo/agents/agent-architecture/invocation.json"] is not None
+    registration.write_text(
+        registration.read_text(encoding="utf-8").replace(
+            "main.agent-architecture", "main.changed-after-dry-run"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PlanRevisionError) as error:
+        apply_plan_reconciliation(
+            tmp_path,
+            "Reject stale scope controller ownership evidence",
+            report.evidence_fingerprint,
+            actor="operator",
+        )
+
+    assert error.value.code == "reconciliation_evidence_stale"
+
+
+@pytest.mark.parametrize(
+    ("registration_state", "reason_code"),
+    [
+        ("missing", "scope_controller_registration_missing"),
+        ("malformed", "scope_controller_registration_malformed"),
+    ],
+)
+def test_legacy_dispatch_requires_a_valid_scope_controller_registration(
+    tmp_path: Path,
+    registration_state: str,
+    reason_code: str,
+) -> None:
+    state_root, _root, _child, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    registration = tmp_path / ".exo" / "agents" / "agent-architecture" / "invocation.json"
+    if registration_state == "missing":
+        registration.unlink()
+    else:
+        registration.write_text('{"invocation_id":', encoding="utf-8")
+    before = _tree_bytes(state_root)
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child = next(
+        scope for scope in report["scopes"] if scope["scope_id"] == "root/sub_tl/architecture"
+    )
+    proof = child["protected_declaration_proofs"][0]
+
+    assert not report["can_apply"]
+    assert proof["reason_code"] == reason_code
+    assert proof["correlation"]["dispatch_event_observed_emitter_agent_id"] == (
+        "agent-architecture"
+    )
+    assert _tree_bytes(state_root) == before
+
+
+@pytest.mark.parametrize(
+    ("corruption", "reason_code"),
+    [
+        ("wrong_owner", "scope_controller_invocation_owner_mismatch"),
+        ("wrong_lineage", "scope_controller_invocation_lineage_mismatch"),
+        ("wrong_branch", "scope_controller_invocation_branch_mismatch"),
+    ],
+)
+def test_legacy_dispatch_rejects_conflicting_scope_controller_registration(
+    tmp_path: Path,
+    corruption: str,
+    reason_code: str,
+) -> None:
+    state_root, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    registration = tmp_path / ".exo" / "agents" / "agent-architecture" / "invocation.json"
+    record = json.loads(registration.read_text(encoding="utf-8"))
+    if corruption == "wrong_owner":
+        record["runtime_agent_id"] = "unrelated-controller"
+    elif corruption == "wrong_lineage":
+        record["invocation_id"] = "unrelated-invocation"
+    elif corruption == "wrong_branch":
+        record["branch"] = "main.unrelated"
+    registration.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    before = _tree_bytes(state_root)
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child = next(
+        scope for scope in report["scopes"] if scope["scope_id"] == "root/sub_tl/architecture"
+    )
+    proof = child["protected_declaration_proofs"][0]
+
+    assert not report["can_apply"]
+    assert proof["reason_code"] == reason_code
+    assert proof["correlation"]["expected"] == "agent-architecture"
+    assert proof["correlation"]["dispatch_event_observed_emitter_agent_id"] == (
+        "agent-architecture"
+    )
+    assert _tree_bytes(state_root) == before
+
+
+def test_legacy_dispatch_requires_proven_parent_scope_identity(tmp_path: Path) -> None:
+    state_root, root_store, _child_store, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    root_document = json.loads(root_store.path.read_text(encoding="utf-8"))
+    root_document["parent_agent_id"] = "unexpected-parent"
+    root_store.path.write_text(json.dumps(root_document), encoding="utf-8")
+    before = _tree_bytes(state_root)
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    root = next(scope for scope in report["scopes"] if scope["scope_id"] == "root")
+    child = next(
+        scope for scope in report["scopes"] if scope["scope_id"] == "root/sub_tl/architecture"
+    )
+
+    assert not report["can_apply"]
+    assert root["scope_emitter_proof"]["reason_code"] == ("scope_controller_root_identity_unproven")
+    assert child["protected_declaration_proofs"][0]["reason_code"] == (
+        "scope_controller_parent_identity_unproven"
+    )
+    assert _tree_bytes(state_root) == before
+
+
 @pytest.mark.parametrize(
     ("corruption", "reason_code"),
     [
@@ -844,6 +1188,9 @@ def test_legacy_dispatch_event_change_invalidates_reconciliation_fingerprint(
         ("wrong_branch", "legacy_dispatch_coordinates_mismatch"),
         ("missing_worktree", "legacy_spawn_result_worktree_missing"),
         ("wrong_owner", "legacy_dispatch_coordinates_mismatch"),
+        ("wrong_emitter_parent", "legacy_scope_emitter_mismatch"),
+        ("wrong_emitter_child", "legacy_scope_emitter_mismatch"),
+        ("wrong_emitter_unrelated", "legacy_scope_emitter_mismatch"),
     ],
 )
 def test_legacy_dispatch_recovery_fails_closed_on_conflicting_or_missing_evidence(
@@ -875,6 +1222,15 @@ def test_legacy_dispatch_recovery_fails_closed_on_conflicting_or_missing_evidenc
         event = json.loads(ledger.read_text(encoding="utf-8"))
         event["data"]["child_agent"] = "unrelated-agent"
         ledger.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    elif corruption.startswith("wrong_emitter_"):
+        emitter = {
+            "wrong_emitter_parent": "root",
+            "wrong_emitter_child": "agent-completed",
+            "wrong_emitter_unrelated": "unrelated-controller",
+        }[corruption]
+        event = json.loads(ledger.read_text(encoding="utf-8"))
+        event["agent_id"] = emitter
+        ledger.write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
     before = _tree_bytes(state_root)
 
     report = analyze_plan_reconciliation(tmp_path).to_document()
@@ -884,7 +1240,152 @@ def test_legacy_dispatch_recovery_fails_closed_on_conflicting_or_missing_evidenc
 
     assert report["can_apply"] is False
     assert child_report["protected_declaration_proofs"][0]["reason_code"] == reason_code
+    if corruption.startswith("wrong_emitter_"):
+        proof = child_report["protected_declaration_proofs"][0]
+        assert proof["correlation"]["dispatch_event_expected_emitter_agent_id"] == (
+            "agent-architecture"
+        )
+        assert proof["correlation"]["dispatch_event_observed_emitter_agent_id"] == emitter
     assert _tree_bytes(state_root) == before
+
+
+def test_legacy_dispatch_resolves_sub_tl_controller_alias(tmp_path: Path) -> None:
+    alias = "architecture-controller-alias"
+    _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        controller_alias=alias,
+    )
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child = next(
+        scope for scope in report["scopes"] if scope["scope_id"] == "root/sub_tl/architecture"
+    )
+    proof = child["protected_declaration_proofs"][0]
+
+    assert report["can_apply"]
+    assert child["scope_emitter_proof"]["agent_id"] == alias
+    assert proof["disposition"] == "proven"
+    assert proof["correlation"]["dispatch_event_expected_emitter_agent_id"] == alias
+    assert proof["correlation"]["dispatch_event_observed_emitter_agent_id"] == alias
+
+
+def test_scope_controller_registration_recovers_original_owner_after_aggregate_handoff(
+    tmp_path: Path,
+) -> None:
+    state_root, root_store, _child_store, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    root = root_store.load()
+    controller_branch = "main.agent-architecture"
+    controller_worktree = "/tmp/architecture/agent-architecture"
+    owner_id = "root:architecture:integration"
+    candidate = IntegrationCandidateState(
+        lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        integration_owner_id=owner_id,
+        integration_owner_run_id="architecture",
+        integration_owner_branch=controller_branch,
+        integration_owner_worktree=controller_worktree,
+    )
+    slices = {
+        **root.slices,
+        "architecture": replace(
+            root.slices["architecture"],
+            dispatch_agent_id=owner_id,
+        ),
+    }
+    root_store.checkpoint(
+        root.recursive_fsm,
+        slices,
+        root.budgets,
+        root.events.last_consumed_offset,
+        current_order=root.current_order,
+        ordered_stages=root.ordered_stages,
+        integration=replace(root.integration, candidates={"architecture": candidate}),
+    )
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child = next(
+        scope for scope in report["scopes"] if scope["scope_id"] == "root/sub_tl/architecture"
+    )
+    proof = child["protected_declaration_proofs"][0]
+
+    assert report["can_apply"]
+    assert proof["disposition"] == "proven"
+    assert proof["correlation"]["scope_controller_agent_id"] == "agent-architecture"
+    assert proof["correlation"]["parent_dispatch_agent_id"] == owner_id
+    assert proof["correlation"]["parent_dispatch_owner_record"] == (
+        "integration_owner_with_verified_registration"
+    )
+    assert state_root.is_dir()
+
+
+def test_integration_owner_id_alone_does_not_prove_scope_controller(tmp_path: Path) -> None:
+    _state_root, root_store, _child_store, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
+    root = root_store.load()
+    owner_id = "root:architecture:integration"
+    slices = {
+        **root.slices,
+        "architecture": replace(root.slices["architecture"], dispatch_agent_id=owner_id),
+    }
+    root_store.checkpoint(
+        root.recursive_fsm,
+        slices,
+        root.budgets,
+        root.events.last_consumed_offset,
+        current_order=root.current_order,
+        ordered_stages=root.ordered_stages,
+        integration=root.integration,
+    )
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child = next(
+        scope for scope in report["scopes"] if scope["scope_id"] == "root/sub_tl/architecture"
+    )
+
+    assert not report["can_apply"]
+    assert child["scope_emitter_proof"]["reason_code"] == ("scope_controller_parent_owner_conflict")
+
+
+@pytest.mark.parametrize(
+    ("emitter", "expected_can_apply", "expected_disposition", "expected_reason"),
+    [
+        ("root", True, "proven", "proven"),
+        ("unrelated-controller", False, "blocked", "legacy_scope_emitter_mismatch"),
+    ],
+)
+def test_root_scope_requires_its_proven_controller_emitter(
+    tmp_path: Path,
+    emitter: str,
+    expected_can_apply: bool,
+    expected_disposition: str,
+    expected_reason: str,
+) -> None:
+    _direct_root_legacy_project(tmp_path, emitting_controller_id=emitter)
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    root = report["scopes"][0]
+    proof = root["protected_declaration_proofs"][0]
+
+    assert root["scope_emitter_proof"]["agent_id"] == "root"
+    assert proof["disposition"] == expected_disposition
+    assert proof["reason_code"] == expected_reason
+    assert proof["correlation"]["dispatch_event_expected_emitter_agent_id"] == "root"
+    assert proof["correlation"]["dispatch_event_observed_emitter_agent_id"] == emitter
+    assert report["can_apply"] is expected_can_apply
 
 
 def test_completed_declaration_restore_blocks_without_spawn_journal(tmp_path: Path) -> None:

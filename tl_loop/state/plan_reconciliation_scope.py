@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 from .plan_manifest import ManifestNode, PlanManifest
+from .plan_reconciliation_emitter import child_scope_emitter
 from .plan_reconciliation_guards import _blocker, _node_is_protected, _scope_blockers
 from .plan_reconciliation_models import ReconciliationScope
 from .plan_reconciliation_report import _safe_text
@@ -76,6 +78,7 @@ def _read_scope(
         action_journal_sha256=action_journal_sha256,
         dispatch_event_records=dispatch_event_records,
         dispatch_event_status=dispatch_event_status,
+        scope_emitter_proof=None,
         protected_node_ids=tuple(
             node.node_id for node in manifest.nodes if _node_is_protected(state, node.name)
         ),
@@ -242,6 +245,7 @@ def _collect_scope_tree(
     inputs: dict[str, bytes | None],
     scopes: list[ReconciliationScope],
     blockers: list[PlanRevisionBlocker],
+    accepted_plan: Mapping[str, object],
 ) -> None:
     accepted_view = ReconciliationScope(
         run_dir=view.run_dir,
@@ -258,6 +262,7 @@ def _collect_scope_tree(
         dispatch_event_records=view.dispatch_event_records,
         dispatch_event_status=view.dispatch_event_status,
         protected_node_ids=view.protected_node_ids,
+        scope_emitter_proof=view.scope_emitter_proof,
     )
     scopes.append(accepted_view)
     blockers.extend(_scope_blockers(accepted_view))
@@ -286,6 +291,18 @@ def _collect_scope_tree(
             current_child,
             inputs,
         )
+        declaration = _accepted_sub_tl_declaration(accepted_plan, node.name)
+        child_view = replace(
+            child_view,
+            scope_emitter_proof=child_scope_emitter(
+                project,
+                accepted_view,
+                child_view,
+                declaration,
+                inputs,
+            ),
+        )
+        child_plan = _nested_plan_document(declaration)
         _collect_scope_tree(
             project,
             child_view,
@@ -294,7 +311,38 @@ def _collect_scope_tree(
             inputs=inputs,
             scopes=scopes,
             blockers=blockers,
+            accepted_plan=child_plan,
         )
+
+
+def _accepted_sub_tl_declaration(
+    plan: Mapping[str, object],
+    name: str,
+) -> Mapping[str, object] | None:
+    scope = _plan_scope_document(plan)
+    sub_tls = scope.get("sub_tls", ())
+    if not isinstance(sub_tls, list | tuple):
+        return None
+    matches = [item for item in sub_tls if isinstance(item, Mapping) and item.get("name") == name]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _nested_plan_document(
+    declaration: Mapping[str, object] | None,
+) -> Mapping[str, object]:
+    if declaration is None:
+        return {}
+    nested = declaration.get("plan")
+    if isinstance(nested, Mapping):
+        return nested
+    return {key: declaration[key] for key in ("workers", "leaves", "sub_tls") if key in declaration}
+
+
+def _plan_scope_document(document: Mapping[str, object]) -> Mapping[str, object]:
+    plan = document.get("plan")
+    if isinstance(plan, Mapping):
+        return plan
+    return {key: document[key] for key in ("workers", "leaves", "sub_tls") if key in document}
 
 
 def _child_relative_dir(checkpoint: str, node: ManifestNode) -> str:

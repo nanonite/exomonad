@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .plan_manifest import PlanManifest
 from .plan_reconciliation_declarations import _declaration_changes, _manifest_node_summary
+from .plan_reconciliation_emitter import ScopeEmitterProof
 from .plan_reconciliation_execution import (
     ProtectedDeclarationProof,
     evaluate_protected_declaration_restore,
@@ -64,6 +65,7 @@ class ReconciliationScope:
         default_factory=dict, repr=False, compare=False
     )
     protected_node_ids: tuple[str, ...] = ()
+    scope_emitter_proof: ScopeEmitterProof | None = field(default=None, repr=False)
 
     def to_document(self, blocked_node_ids: tuple[str, ...] = ()) -> dict[str, object]:
         phase = self.state.recursive_fsm
@@ -104,6 +106,17 @@ class ReconciliationScope:
                 "sha256": self.action_journal_sha256,
                 "entry_count": len(self.action_journal_entries or ()),
             },
+            "scope_emitter_proof": (
+                self.scope_emitter_proof.to_document()
+                if self.scope_emitter_proof is not None
+                else {
+                    "status": "unproven",
+                    "reason_code": "scope_controller_identity_unavailable",
+                    "agent_id": "",
+                    "evidence": [],
+                    "correlation": {},
+                }
+            ),
             "current_manifest_nodes": _manifest_node_summary(self.current),
             "accepted_manifest_nodes": (
                 _manifest_node_summary(self.accepted) if self.accepted is not None else []

@@ -52,12 +52,22 @@ def evaluate_protected_declaration_restore(
         return None
     reason = _declaration_restore_blocker(scope, current, slice_state)
     if reason is not None:
-        return _blocked(current, fields, reason)
+        return _blocked(
+            current,
+            fields,
+            reason,
+            _scope_emitter_failure_correlation(scope, slice_state, reason),
+        )
     entry, reason = _confirmed_spawn_entry(
         scope, current, accepted, slice_state, slice_state.dispatch_intent_id
     )
     if entry is None:
-        return _blocked(current, fields, reason)
+        return _blocked(
+            current,
+            fields,
+            reason,
+            _scope_emitter_failure_correlation(scope, slice_state, reason),
+        )
     if not _issue_binding_matches(current, accepted, slice_state, entry):
         return _blocked(current, fields, "issue_binding_evidence_mismatch")
     return _proven_declaration(scope, current, accepted, fields, slice_state, entry)
@@ -81,6 +91,12 @@ def _declaration_restore_blocker(
     node: ManifestNode,
     slice_state: SliceState,
 ) -> str | None:
+    if slice_state.dispatch_invocation_id is None:
+        proof = scope.scope_emitter_proof
+        if proof is None or proof.agent_id is None:
+            return (
+                proof.reason_code if proof is not None else "scope_controller_identity_unavailable"
+            )
     if not _fsm_matches_accepted(scope):
         return "accepted_fsm_digest_mismatch"
     if not _slice_binds_declaration(scope, slice_state, node):
@@ -129,6 +145,7 @@ def _declaration_evidence(
     if slice_state.dispatch_invocation_id is None:
         evidence.extend(
             (
+                "proven_scope_controller_identity",
                 "authoritative_dispatch_event_matches_owner_and_branch",
                 "confirmed_spawn_result_records_actual_worktree",
                 "completed_pr_receipt_matches_leaf_and_base",
@@ -312,7 +329,19 @@ def _legacy_spawn_result_matches(
     event, reason = _legacy_dispatch_event(scope, slice_state)
     if event is None:
         return False, reason
-    if not _legacy_event_matches_slice(scope, slice_state, event):
+    proof = scope.scope_emitter_proof
+    if proof is None or proof.agent_id is None:
+        return False, (
+            proof.reason_code if proof is not None else "scope_controller_identity_unavailable"
+        )
+    if event.get("agent_id") != proof.agent_id:
+        return False, "legacy_scope_emitter_mismatch"
+    if not _legacy_event_matches_slice(
+        scope,
+        slice_state,
+        event,
+        proven_scope_emitter=proof.agent_id,
+    ):
         return False, "legacy_dispatch_coordinates_mismatch"
     if not _legacy_result_coordinates_match(result, slice_state):
         return False, "legacy_dispatch_coordinates_mismatch"
@@ -359,6 +388,8 @@ def _legacy_event_matches_slice(
     scope: ReconciliationScope,
     slice_state: SliceState,
     event: Mapping[str, object],
+    *,
+    proven_scope_emitter: str,
 ) -> bool:
     data = event.get("data")
     if not isinstance(data, Mapping):
@@ -369,10 +400,7 @@ def _legacy_event_matches_slice(
         event.get("type", event.get("event_type")) == "agent.spawned"
         and event.get("run_id") == scope.state.ledger_run_id
         and event.get("run_seq") == sequence
-        and (
-            scope.state.parent_agent_id is None
-            or event.get("agent_id") == scope.state.parent_agent_id
-        )
+        and event.get("agent_id") == proven_scope_emitter
         and event.get("invocation_id") is None
         and data.get("intent_id") == slice_state.dispatch_intent_id
         and data.get("child_agent") == slice_state.dispatch_agent_id
@@ -462,6 +490,15 @@ def _legacy_correlation(
 ) -> tuple[tuple[str, object], ...]:
     values = _legacy_dispatch_correlation(scope, node, accepted, slice_state, entry)
     values.update(_legacy_publication_correlation(slice_state))
+    proof = scope.scope_emitter_proof
+    if proof is not None:
+        values.update(dict(proof.correlation))
+        events = scope.dispatch_event_records.get(slice_state.dispatch_authoritative_event_seq, ())
+        observed = events[0].get("agent_id") if len(events) == 1 else None
+        values["dispatch_event_expected_emitter_agent_id"] = _safe_text(proof.agent_id)
+        values["dispatch_event_observed_emitter_agent_id"] = (
+            _safe_text(observed) if isinstance(observed, str) else ""
+        )
     return tuple(sorted(values.items()))
 
 
@@ -609,5 +646,45 @@ def _blocked(
     node: ManifestNode,
     fields: tuple[str, ...],
     reason_code: str,
+    correlation: tuple[tuple[str, object], ...] = (),
 ) -> ProtectedDeclarationProof:
-    return ProtectedDeclarationProof(node.node_id, fields, False, reason_code)
+    return ProtectedDeclarationProof(
+        node.node_id,
+        fields,
+        False,
+        reason_code,
+        correlation=correlation,
+    )
+
+
+def _scope_emitter_failure_correlation(
+    scope: ReconciliationScope,
+    slice_state: SliceState,
+    reason_code: str,
+) -> tuple[tuple[str, object], ...]:
+    if not (
+        reason_code.startswith("scope_controller_")
+        or reason_code == "legacy_scope_emitter_mismatch"
+    ):
+        return ()
+    proof = scope.scope_emitter_proof
+    values = dict(proof.correlation) if proof is not None else {}
+    expected = (
+        proof.agent_id
+        if proof is not None and proof.agent_id is not None
+        else values.get("expected")
+    )
+    events = scope.dispatch_event_records.get(slice_state.dispatch_authoritative_event_seq, ())
+    observed = events[0].get("agent_id") if len(events) == 1 else None
+    values.update(
+        {
+            "dispatch_event_expected_emitter_agent_id": (
+                _safe_text(expected) if isinstance(expected, str) else ""
+            ),
+            "dispatch_event_observed_emitter_agent_id": _safe_text(observed)
+            if isinstance(observed, str)
+            else "",
+            "scope_emitter_reason_code": proof.reason_code if proof is not None else reason_code,
+        }
+    )
+    return tuple(sorted(values.items()))

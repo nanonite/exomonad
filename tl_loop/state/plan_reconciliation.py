@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
 from .plan_reconciliation_declarations import _recursive_declaration_changes
+from .plan_reconciliation_emitter import root_scope_emitter
 from .plan_reconciliation_models import PlanReconciliationAnalysis, ReconciliationScope
 from .plan_reconciliation_report import (
     _fingerprint,
@@ -47,6 +49,7 @@ def analyze_plan_reconciliation(
     preserve_run_settings(baseline.document, revised.document)
     _validate_plan_run_id(baseline.document, revised.document, run_id)
     root_view = _read_scope(project, run_id, run_id, None, inputs)
+    root_view = replace(root_view, scope_emitter_proof=root_scope_emitter(root_view))
     root_current = root_view.current
     root_accepted = retain_scope_revisions(
         build_root_manifest(baseline.plan, root_current), root_current
@@ -64,6 +67,7 @@ def analyze_plan_reconciliation(
         inputs=inputs,
         scopes=scopes,
         blockers=blockers,
+        accepted_plan=baseline.document,
     )
     changes = _safe_changes(collect_node_changes(root_current, root_accepted))
     candidate_changes = _safe_changes(collect_node_changes(root_accepted, candidate_manifest))

@@ -7918,6 +7918,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
             {
                 "name": stage.name,
                 "order": stage.order,
+                **({"agent_id": stage.agent_id} if stage.agent_id is not None else {}),
                 "plan": public_plan_document(
                     stage.plan
                     if isinstance(stage.plan, WorkPlan)
@@ -7964,6 +7965,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
                 json.dumps(
                     {
                         "invocation_id": invocation_id,
+                        "runtime_agent_id": tasks[0].agent_id or tasks[0].name,
                         "trigger": "spawn",
                         "slice_id": tasks[0].name,
                         "branch": "main.architecture",
@@ -8115,7 +8117,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     ledger_segments = tmp_path / ".exo" / "ledger" / "segments"
     ledger_segments.mkdir(parents=True)
     dispatch_event = {
-        "agent_id": child_store.load().parent_agent_id,
+        "agent_id": "architecture",
         "data": {
             "branch": legacy_leaf.branch,
             "child_agent": legacy_leaf.dispatch_agent_id,

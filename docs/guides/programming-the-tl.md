@@ -290,6 +290,19 @@ parked run for a separately reviewed recovery decision. Do not use
 substitute: they cannot prove the old declaration while preserving completed
 work.
 
+For legacy spawn records with no leaf invocation ID, the ledger emitter must
+match a separately proven scope controller. A root scope uses its canonical run
+identity only when the manifest and checkpoint establish a root. A nested scope
+uses the controller declared by the accepted plan, correlated with the parent's
+durable sub-TL dispatch record and the server invocation registration for that
+scope, branch, worktree, and invocation lineage. The nested checkpoint's
+`parent_agent_id` identifies its parent controller; it is not the emitter of
+the nested controller's leaf events. If a parent slice has moved to an aggregate
+integration owner, that value alone does not establish the original controller.
+The reconciliation report records the expected and observed emitter identities
+and fingerprints the registration used by the proof. A blocked proof leaves the
+run parked and requires fresh evidence before apply.
+
 After `init --continue`, the controller may adopt a uniquely correlated
 existing aggregate PR using current repository, owner, invocation, branch, PR,
 head, base, and patch evidence. Adoption resumes review and CI tracking for that
