@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Canonicalize repository URLs across runtime and effect protocol (#1202)
 - Exercise live-shaped reconciliation through aggregate PR adoption (#1197)
 - Restore completed declarations only from authoritative execution evidence (#1196)
 - Resolve provenance-backed legacy defaults during plan reconciliation (#1195)
