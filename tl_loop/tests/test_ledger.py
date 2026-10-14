@@ -21,7 +21,8 @@ from tl_loop.select.ledger import (
     resolve_actual_tokens,
 )
 from tl_loop.state.schema import SliceState, SliceStatus, validate
-from tl_loop.state.store import create, load
+from tl_loop.state.store import load
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def test_ceiling_failure_happens_before_any_state_write(tmp_path: Path) -> None:

@@ -247,7 +247,9 @@ from tl_loop.state.repository_identity_migration import RepositoryIdentityMigrat
 from tl_loop.state.review_validation import review_validation_disposition
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
+    LEGACY_IDENTITY_CHECKPOINT_VERSION,
     REDUCER_VERSION,
+    SCHEMA_VERSION,
     ActionKind,
     ActionPhase,
     ActionState,
@@ -1269,7 +1271,12 @@ def tl_run(
         plan, run_id, source, effects = _root_inputs(root_spec, cfg)
     except ChainlinkIssueBindingError as error:
         if cfg.active:
-            _record_chainlink_binding_gate(root_spec, cfg, error)
+            gate_recorded = _record_chainlink_binding_gate(root_spec, cfg, error)
+            if not gate_recorded:
+                raise TLLoopError(
+                    f"{error}; no durable gate was created because repository identity "
+                    "is unavailable"
+                ) from error
         raise TLLoopError(
             f"{error}; resolve gate {CHAINLINK_BINDING_RECONCILIATION_GATE_NAME!r} "
             "by correcting the explicit slice binding"
@@ -1309,7 +1316,14 @@ def run_tl_loop(
             plan = WorkPlan.from_mapping(plan)
         except ChainlinkIssueBindingError as error:
             if selected.active:
-                _record_chainlink_binding_gate({"run_id": run_id, "plan": plan}, selected, error)
+                gate_recorded = _record_chainlink_binding_gate(
+                    {"run_id": run_id, "plan": plan}, selected, error
+                )
+                if not gate_recorded:
+                    raise TLLoopError(
+                        f"{error}; no durable gate was created because repository identity "
+                        "is unavailable"
+                    ) from error
             raise TLLoopError(
                 f"{error}; resolve gate {CHAINLINK_BINDING_RECONCILIATION_GATE_NAME!r} "
                 "by correcting the explicit slice binding"
@@ -1357,7 +1371,10 @@ def run_tl_loop(
                     f"repository_identity_{failure_code}: no runnable run was created"
                 )
             return _park_repository_identity_failure(
-                store, failure_code or "unavailable", identity_effects
+                store,
+                failure_code or "unavailable",
+                identity_effects,
+                existing_state,
             )
         if selected.repository_identity is not None and selected.repository_identity != resolution:
             raise TLLoopError(
@@ -1388,7 +1405,12 @@ def run_tl_loop(
                     raise TLLoopError(
                         "repository_identity_conflict: checkpoint and selected remote differ"
                     ) from error
-                return _park_repository_identity_failure(store, error.code, identity_effects)
+                return _park_repository_identity_failure(
+                    store,
+                    error.code,
+                    identity_effects,
+                    existing_state,
+                )
             if any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in existing_state.gates):
                 existing_state = store.clear_gate(REPOSITORY_IDENTITY_GATE_NAME)
     if existing_state is not None:
@@ -12265,6 +12287,9 @@ def _ensure_aggregate_candidate(
         return None
     if not _child_has_aggregate_output(child_state):
         return None
+    child_state = _migrate_aggregate_child_identity(
+        task, child_state, config, store, publication_attempt
+    )
     child_integration = child_state.integration
     own_candidate = child_integration.candidates.get(task.name)
     identity = _aggregate_publication_identity(
@@ -12302,6 +12327,51 @@ def _ensure_aggregate_candidate(
         effects_log,
     )
     return candidate
+
+
+def _migrate_aggregate_child_identity(
+    task: SubTLTask,
+    child_state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+    publication_attempt: int,
+) -> RunState:
+    """Upgrade a legacy child checkpoint before parent-owned writes touch it."""
+    if child_state.version != LEGACY_IDENTITY_CHECKPOINT_VERSION:
+        return child_state
+    identity = config.repository_identity
+    if identity is None:
+        raise _aggregate_reconciliation_rejected(
+            task.name,
+            "repository_identity_missing",
+            publication_attempt,
+            ("selected_repository_url",),
+            retryable=True,
+        )
+    child_store = RunStore(task.name, store.run_dir)
+    evidence_children = (
+        _repository_identity_sub_tl_names(child_state, child_store)
+        if child_state.repository_identity is None
+        else ()
+    )
+    try:
+        return child_store.migrate_repository_identity(
+            identity,
+            corroborating_sub_tls=evidence_children,
+        )
+    except RepositoryIdentityMigrationError as error:
+        reason = (
+            "repository_identity_mismatch"
+            if error.code == "conflicting"
+            else f"repository_identity_{error.code}"
+        )
+        raise _aggregate_reconciliation_rejected(
+            task.name,
+            reason,
+            publication_attempt,
+            ("child_repository_identity",),
+            retryable=error.code in {"missing", "unavailable", "stale"},
+        ) from error
 
 
 def _aggregate_publication_identity(
@@ -15630,9 +15700,13 @@ def _park_repository_identity_failure(
     store: RunStore,
     failure_code: str,
     effects: Sequence[EffectIntent],
+    legacy_state: RunState | None = None,
 ) -> TLRunResult:
-    """Keep an existing run parked until its identity blocker is resolved."""
-    parked = store.set_gate(REPOSITORY_IDENTITY_GATE_NAME)
+    """Keep identity failures visible without mutating unbound legacy state."""
+    if legacy_state is not None and legacy_state.version == LEGACY_IDENTITY_CHECKPOINT_VERSION:
+        parked = legacy_state
+    else:
+        parked = store.set_gate(REPOSITORY_IDENTITY_GATE_NAME)
     return TLRunResult(
         parked,
         tuple(effects),
@@ -18722,7 +18796,7 @@ def _record_chainlink_binding_gate(
     root_spec: WorkPlan | Mapping[str, object],
     config: TLLoopConfig,
     error: ChainlinkIssueBindingError,
-) -> None:
+) -> bool:
     raw_run_id = (
         root_spec.get("run_id", config.run_id) if isinstance(root_spec, Mapping) else config.run_id
     )
@@ -18730,10 +18804,16 @@ def _record_chainlink_binding_gate(
         raise TLLoopError(f"invalid Chainlink binding cannot be gated: {error}") from error
     store = RunStore(raw_run_id, Path(config.root_dir))
     if store.path.exists():
+        state = store.load()
+        if state.version != SCHEMA_VERSION or state.repository_identity is None:
+            return False
         store.set_gate(CHAINLINK_BINDING_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
-        return
+        return True
+    if config.repository_identity is None:
+        return False
     manifest = _manifest_for_plan(WorkPlan(), raw_run_id, config)
     initial: dict[str, object] = {
+        "repository_identity": config.repository_identity.to_document(),
         "plan_manifest": manifest.to_document(),
         "gates": [{"name": CHAINLINK_BINDING_RECONCILIATION_GATE_NAME, "status": "pending"}],
     }
@@ -18756,6 +18836,7 @@ def _record_chainlink_binding_gate(
             }
         )
     create(raw_run_id, initial, root_dir=store.root_dir)
+    return True
 
 
 def _root_inputs(

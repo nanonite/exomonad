@@ -18,7 +18,8 @@ from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult
 from tl_loop.state.schema import GateStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 @dataclass
@@ -170,9 +171,7 @@ def test_gate_answer_reaches_a_gate_whose_slice_id_contains_a_slash(
     )
 
     reloaded = store.load()
-    assert [(entry.name, entry.status.value) for entry in reloaded.gates] == [
-        (gate, status)
-    ]
+    assert [(entry.name, entry.status.value) for entry in reloaded.gates] == [(gate, status)]
     # The recorded decision carries the raw name, so an operator reading the
     # gate back out of run state sees exactly what they answered.
     assert transport.calls == [

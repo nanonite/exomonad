@@ -39,7 +39,8 @@ from tl_loop.loop.driver import (
     _new_dispatch_attempt,
 )
 from tl_loop.state.schema import RunState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 CHILD_RUN_ID = "stage"
 LEAF_SLICE = "out"
@@ -192,9 +193,7 @@ def test_a_predecessors_spawn_row_cannot_confirm_the_recreated_childs_dispatch(
     slices = {LEAF_SLICE: dispatching}
 
     stale = replace(
-        _canonical_event(
-            20, "agent.spawned", LEAF_SLICE, CHILD_RUN_ID, intent_id="stale-intent"
-        ),
+        _canonical_event(20, "agent.spawned", LEAF_SLICE, CHILD_RUN_ID, intent_id="stale-intent"),
         invocation_id=DEAD_INVOCATION,
     )
     assert _confirm_dispatch_event(slices, slices, stale, LEAF_SLICE, 20) == slices
@@ -268,14 +267,21 @@ def test_a_recreated_child_binds_the_current_publication_not_the_predecessors(
         )
 
     after_stale = _bind_publication_evidence(
-        slices, PRFiled(PR_A, HEAD_SHA, LEAF_SLICE), publication(PR_A, DEAD_INVOCATION),
-        LEAF_SLICE, controller_epoch=None, validation_slices=slices,
+        slices,
+        PRFiled(PR_A, HEAD_SHA, LEAF_SLICE),
+        publication(PR_A, DEAD_INVOCATION),
+        LEAF_SLICE,
+        controller_epoch=None,
+        validation_slices=slices,
     )
     assert after_stale[LEAF_SLICE].publication is None
 
     bound = _bind_publication_evidence(
-        after_stale, PRFiled(PR_B, HEAD_SHA, LEAF_SLICE),
-        publication(PR_B, CURRENT_INVOCATION), LEAF_SLICE, controller_epoch=None,
+        after_stale,
+        PRFiled(PR_B, HEAD_SHA, LEAF_SLICE),
+        publication(PR_B, CURRENT_INVOCATION),
+        LEAF_SLICE,
+        controller_epoch=None,
         validation_slices=after_stale,
     )
     leaf = bound[LEAF_SLICE]

@@ -5,12 +5,18 @@ from __future__ import annotations
 import copy
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .plan_manifest import ManifestError, PlanManifest, build_legacy_manifest
-from .schema import REDUCER_VERSION, SCHEMA_VERSION
+from .repository_identity import canonical_repository_url
+from .schema import (
+    LEGACY_IDENTITY_CHECKPOINT_VERSION,
+    REDUCER_VERSION,
+    SCHEMA_VERSION,
+)
 from .serialization import dumps as dumps_json
 
 MIGRATION_VERSION = 1
@@ -54,12 +60,26 @@ def migrate_checkpoint_document(
         value.get("plan_manifest"), dict
     ):
         return MigrationResult(copy.deepcopy(value), source_version, False, ())
+    if source_version == LEGACY_IDENTITY_CHECKPOINT_VERSION and isinstance(
+        value.get("plan_manifest"), dict
+    ):
+        if not _has_canonical_repository_identity(value):
+            return MigrationResult(copy.deepcopy(value), source_version, False, ())
+        document = copy.deepcopy(value)
+        document["version"] = CURRENT_CHECKPOINT_VERSION
+        return MigrationResult(document, source_version, True, ("version",))
 
     document = copy.deepcopy(value)
     changes: list[str] = []
+    target_version = (
+        CURRENT_CHECKPOINT_VERSION
+        if source_version == CURRENT_CHECKPOINT_VERSION
+        or _has_canonical_repository_identity(document)
+        else LEGACY_IDENTITY_CHECKPOINT_VERSION
+    )
     document.pop("schema_version", None)
-    if document.get("version") != CURRENT_CHECKPOINT_VERSION:
-        document["version"] = CURRENT_CHECKPOINT_VERSION
+    if document.get("version") != target_version:
+        document["version"] = target_version
         changes.append("version")
     if not isinstance(document.get("run_id"), str) or not document["run_id"]:
         document["run_id"] = run_id
@@ -95,6 +115,19 @@ def migrate_checkpoint_document(
             )
             changes.append("plan_manifest_recovery_gate")
     return MigrationResult(document, source_version, True, tuple(changes))
+
+
+def _has_canonical_repository_identity(document: Mapping[str, object]) -> bool:
+    identity = document.get("repository_identity")
+    if not isinstance(identity, Mapping) or frozenset(identity) != {"remote_url"}:
+        return False
+    remote_url = identity.get("remote_url")
+    if not isinstance(remote_url, str) or not remote_url:
+        return False
+    try:
+        return canonical_repository_url(remote_url) == remote_url
+    except ValueError:
+        return False
 
 
 def _bind_migrated_slices(value: object, manifest: PlanManifest) -> None:
@@ -137,9 +170,10 @@ def install_migration(path: Path, result: MigrationResult) -> Path:
     """
     if not result.migrated:
         raise MigrationError("cannot install a non-migrated checkpoint")
-    backup = path.with_name(
-        f"{path.name}.legacy-v{result.source_version}-to-v{CURRENT_CHECKPOINT_VERSION}"
-    )
+    target_version = result.document.get("version")
+    if type(target_version) is not int:
+        raise MigrationError("migrated checkpoint version must be an integer")
+    backup = path.with_name(f"{path.name}.legacy-v{result.source_version}-to-v{target_version}")
     if not backup.exists():
         _atomic_write_bytes(backup, path.read_bytes())
     report = path.with_name("migration-report.json")
@@ -148,7 +182,7 @@ def install_migration(path: Path, result: MigrationResult) -> Path:
         {
             "migration_version": MIGRATION_VERSION,
             "source_version": result.source_version,
-            "target_version": CURRENT_CHECKPOINT_VERSION,
+            "target_version": target_version,
             "checkpoint": str(path),
             "original": str(backup),
             "changes": list(result.changes),

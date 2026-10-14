@@ -16,7 +16,8 @@ from tl_loop.fsm.recovery import (
     transition_recovery,
 )
 from tl_loop.state.schema import FSMState, SliceState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def test_recovery_transitions_are_bounded_and_explicit() -> None:

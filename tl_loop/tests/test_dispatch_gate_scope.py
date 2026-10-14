@@ -42,7 +42,8 @@ from tl_loop.state.schema import (
     SliceState,
     SliceStatus,
 )
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 from tl_loop.tests.test_dispatch_retry import (
     ScriptedClock,
     ScriptedTransport,
@@ -325,9 +326,7 @@ def test_the_gate_name_is_derived_from_the_parked_slices_own_code() -> None:
     )
     # An absent code is terminal too, so it names the refusal gate, not a
     # conflict gate, and the slice id is the whole scope either way.
-    assert _dispatch_failure_gate_name("leaf-a", None) == (
-        f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-a"
-    )
+    assert _dispatch_failure_gate_name("leaf-a", None) == (f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-a")
     assert _dispatch_failure_gate_name("leaf-a", BRANCH_EXISTS) != (
         _dispatch_failure_gate_name("leaf-b", BRANCH_EXISTS)
     )

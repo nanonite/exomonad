@@ -294,7 +294,8 @@ def test_migration_proof_projection_is_body_free():
 def test_migration_cleanup_removes_only_the_exact_resolved_gate(tmp_path):
     from tl_loop.loop.driver import _clear_resolved_migration_gate
     from tl_loop.state.legacy_manifest import LegacyManifestReconciliation
-    from tl_loop.state.store import RunStore, create
+    from tl_loop.state.store import RunStore
+    from tl_loop.tests.checkpoint_fixtures import create
 
     create(
         "gates",
@@ -382,7 +383,8 @@ def test_active_legacy_binding_rejects_in_flight_merge_without_action_journal_en
 
 def test_migration_proof_round_trips_through_the_slice_schema(tmp_path):
     from tl_loop.state.plan_manifest import build_plan_manifest
-    from tl_loop.state.store import RunStore, create
+    from tl_loop.state.store import RunStore
+    from tl_loop.tests.checkpoint_fixtures import create
 
     manifest = build_plan_manifest(
         {"workers": [{"name": "worker", "task": "work"}]}, scope_id="schema"

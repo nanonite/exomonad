@@ -50,7 +50,8 @@ from tl_loop.state.schema import (
     RunState,
     SliceStatus,
 )
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 class EmptyQueue:

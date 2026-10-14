@@ -70,7 +70,7 @@ from tl_loop.fsm.transition import IllegalTransition
 from tl_loop.fsm.transition import transition as phase_transition
 from tl_loop.loop.escalate import blocked_gate_name
 from tl_loop.loop.schedule import propagate_abandonment, restore_dependents, suspend_dependents
-from tl_loop.state.schema import GateStatus, RunState, SliceState, SliceStatus
+from tl_loop.state.schema import GateStatus, RepositoryIdentity, RunState, SliceState, SliceStatus
 from tl_loop.state.slice_transition import (
     HeadChanged,
     MergeCompleted,
@@ -214,9 +214,7 @@ class TLEventDecoder:
             pr_number = event.data.get("pr_number")
             verified = event.data.get("verified")
             return PublicationObserved(
-                pr_number=(
-                    pr_number if type(pr_number) is int and pr_number > 0 else None
-                ),
+                pr_number=(pr_number if type(pr_number) is int and pr_number > 0 else None),
                 head_sha=event.head_sha or "",
                 slice_id=event.slice_id,
                 verified=verified if type(verified) is bool else None,
@@ -320,6 +318,7 @@ class ShadowLoop:
         run_id: str,
         *,
         readonly_client: ReadOnlyEffectClient,
+        repository_identity: RepositoryIdentity,
         root_dir: str | Path = DEFAULT_SHADOW_ROOT,
         judgments: ShadowJudgments | None = None,
         decoder: TLEventDecoder | None = None,
@@ -328,7 +327,11 @@ class ShadowLoop:
         """Open a shadow checkpoint below ``.exo/tl-loop/shadow``."""
         store = RunStore(run_id, Path(root_dir))
         if not store.path.exists():
-            create(run_id, {}, root_dir=store.root_dir)
+            create(
+                run_id,
+                {"repository_identity": repository_identity.to_document()},
+                root_dir=store.root_dir,
+            )
         if recorder is None:
             from tl_loop.shadow.recorder import IntendedActionRecorder
 

@@ -38,8 +38,8 @@ from tl_loop.loop.driver import (
     LeafTask,
     SubTLTask,
     TLLoopConfig,
-    WorkPlan,
     WorkerTask,
+    WorkPlan,
     _bind_publication_evidence,
     _child_config,
     _initial_slices,
@@ -47,6 +47,7 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.state.schema import SliceState, SliceStatus
 from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 PARENT_BRANCH = "main"
 CHILD_BRANCH = "main.stage"
@@ -68,13 +69,18 @@ def _child_config_for(tmp_path: Path) -> TLLoopConfig:
     own, so the parent checkpoint has to exist first. It is created once and
     reused, because a run state is written exactly once.
     """
-    from tl_loop.loop.driver import SubTLTask, create
+    from tl_loop.loop.driver import SubTLTask
 
     root_state = tmp_path / "root-state"
     if not RunStore("root", root_state).path.exists():
         create(
             "root",
-            {"controller_epoch": "root-controller-epoch"},
+            {
+                "controller_epoch": "root-controller-epoch",
+                "repository_identity": {
+                    "remote_url": "https://forge.example.test/test/repository.git"
+                },
+            },
             root_dir=root_state,
         )
     root_config = TLLoopConfig(

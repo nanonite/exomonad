@@ -45,7 +45,8 @@ from tl_loop.state.schema import (
     SliceStatus,
     Verdict,
 )
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 CAUSES = tuple(ParkCause)
 
@@ -291,17 +292,13 @@ def test_create_issue_reuses_run_scoped_issue_with_provenance(tmp_path: Path) ->
             return _tool_result({"issues": issues})
 
     creator = Creator()
-    first = _create_issue(
-        creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
-    )
+    first = _create_issue(creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store)
     assert first == 900
 
     # Simulate a crash after remote creation but before the intent recorded the
     # issue id: only the pre-failure request (with PR/head) survives.
     token = _run_token(store)
-    title = (
-        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
-    )
+    title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
     intent_path = _escalation_intent_path(
         store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
     )
@@ -319,9 +316,7 @@ def test_create_issue_reuses_run_scoped_issue_with_provenance(tmp_path: Path) ->
         },
     )
 
-    second = _create_issue(
-        creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
-    )
+    second = _create_issue(creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store)
 
     assert second == 900
     assert len(created) == 1, "a proven run-scoped issue must be reused"
@@ -329,9 +324,7 @@ def test_create_issue_reuses_run_scoped_issue_with_provenance(tmp_path: Path) ->
 
 def test_create_issue_reuses_bound_legacy_issue() -> None:
     class NoopCreator:
-        def chainlink_issue_create(
-            self, **kwargs: object
-        ) -> ToolResult:
+        def chainlink_issue_create(self, **kwargs: object) -> ToolResult:
             raise AssertionError("a verified legacy binding must be reused")
 
         def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
@@ -375,9 +368,7 @@ def test_create_issue_fails_closed_when_lookup_is_unavailable(tmp_path: Path) ->
         [{"id": 901, "title": "other"}, {}],
     ],
 )
-def test_malformed_successful_issue_list_blocks_create(
-    tmp_path: Path, payload: object
-) -> None:
+def test_malformed_successful_issue_list_blocks_create(tmp_path: Path, payload: object) -> None:
     store = _store(tmp_path)
     created: list[str] = []
 
@@ -432,12 +423,11 @@ def test_create_only_creator_cannot_start_durable_escalation(tmp_path: Path) -> 
 def test_create_only_creator_cannot_retry_requested_intent(tmp_path: Path) -> None:
     store = _store(tmp_path)
     creator = RecordingCreator()
-    assert _create_issue(
-        creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
-    ) == 701
+    assert (
+        _create_issue(creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store) == 701
+    )
     title = (
-        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} "
-        f"(attempt 1) [run {_run_token(store)}]"
+        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {_run_token(store)}]"
     )
     intent_path = _escalation_intent_path(
         store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
@@ -463,14 +453,12 @@ def test_create_only_creator_cannot_retry_requested_intent(tmp_path: Path) -> No
         return 901
 
     with pytest.raises(IssueLookupUnavailable, match="chainlink_issue_list"):
-        _create_issue(
-            create_only, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
-        )
+        _create_issue(create_only, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store)
 
     assert created == []
-    assert _create_issue(
-        creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
-    ) == 701
+    assert (
+        _create_issue(creator, _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store) == 701
+    )
 
 
 def test_park_reconciles_bound_legacy_816_on_stored_first_attempt(tmp_path: Path) -> None:
@@ -808,9 +796,7 @@ def test_create_issue_fails_closed_when_intent_lacks_provenance_keys(
 ) -> None:
     store = _store(tmp_path)
     token = _run_token(store)
-    title = (
-        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
-    )
+    title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
     intent_path = _escalation_intent_path(
         store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
     )
@@ -838,9 +824,7 @@ def test_create_issue_fails_closed_when_intent_lacks_provenance_keys(
             return _tool_result({"issues": []})
 
     with pytest.raises(EscalationError, match="does not match the current publication"):
-        _create_issue(
-            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
-        )
+        _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store)
 
 
 def test_park_refuses_stale_caller_slice(tmp_path: Path) -> None:
@@ -882,9 +866,7 @@ def test_park_refuses_stale_caller_slice(tmp_path: Path) -> None:
 def test_pre_389_intent_is_detected_and_blocks_creation(tmp_path: Path) -> None:
     store = _store(tmp_path)
     token = _run_token(store)
-    title = (
-        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2) [run {token}]"
-    )
+    title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2) [run {token}]"
     # The actual pre-389 filename and (identity-less) intent format. The title
     # matches so the identity/provenance proof is what fails closed.
     legacy_path = _legacy_escalation_intent_path(
@@ -912,9 +894,7 @@ def test_pre_389_intent_is_detected_and_blocks_creation(tmp_path: Path) -> None:
             return _tool_result({"issues": []})
 
     with pytest.raises(EscalationError, match="cannot be proven"):
-        _create_issue(
-            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store
-        )
+        _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store)
 
 
 def test_stale_audit_attempt_cannot_select_older_issue(tmp_path: Path) -> None:
@@ -926,9 +906,7 @@ def test_stale_audit_attempt_cannot_select_older_issue(tmp_path: Path) -> None:
     )
     store = RunStore("escalate-test", root_dir=tmp_path)
     token = _run_token(store)
-    title = (
-        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
-    )
+    title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
     _write_intent(
         _escalation_intent_path(
             store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
@@ -978,9 +956,7 @@ def test_intent_paths_do_not_collide_for_lookalike_slice_ids(tmp_path: Path) -> 
 def test_mixed_version_intents_cannot_create_a_duplicate(tmp_path: Path) -> None:
     store = _store(tmp_path)
     token = _run_token(store)
-    title = (
-        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2) [run {token}]"
-    )
+    title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 2) [run {token}]"
     # Pre-389 intent records issue 900 but carries no identity/provenance.
     legacy_path = _legacy_escalation_intent_path(
         store, store.run_id, "root", 2, ParkCause.REVIEW_STUCK
@@ -1024,9 +1000,7 @@ def test_mixed_version_intents_cannot_create_a_duplicate(tmp_path: Path) -> None
             return _tool_result({"issues": []})
 
     with pytest.raises(EscalationError, match="cannot be proven"):
-        _create_issue(
-            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store
-        )
+        _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store)
 
 
 @pytest.mark.parametrize("bad_attempt", [True, 1.0, 1, 0, -1, "2", None])
@@ -1114,25 +1088,19 @@ def test_intent_with_mismatched_title_fails_closed(tmp_path: Path) -> None:
 
         def chainlink_issue_list(self, **kwargs: object) -> ToolResult:
             del kwargs
-            return _tool_result(
-                {"issues": [{"issue_id": 900, "title": stale_title}]}
-            )
+            return _tool_result({"issues": [{"issue_id": 900, "title": stale_title}]})
 
     # The crash window where an old issue exists remotely but the ID was not
     # written under the current title: the title mismatch fails closed.
     with pytest.raises(EscalationError, match="title"):
-        _create_issue(
-            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store
-        )
+        _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store)
 
 
 def test_concurrent_pre_389_writer_serializes_new_writer(tmp_path: Path) -> None:
     store = _store(tmp_path)
     cause = ParkCause.REVIEW_STUCK
     attempt = 2
-    legacy_path = _legacy_escalation_intent_path(
-        store, store.run_id, "root", attempt, cause
-    )
+    legacy_path = _legacy_escalation_intent_path(store, store.run_id, "root", attempt, cause)
     legacy_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = legacy_path.with_suffix(".lock")
     holdings = threading.Event()
@@ -1223,9 +1191,7 @@ def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
             issues = [{"issue_id": 701, "title": created[0]}] if created else []
             return _tool_result({"issues": issues})
 
-    first = _create_issue(
-        Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store_a
-    )
+    first = _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store_a)
     second = _create_issue(
         Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store_b
     )
@@ -1238,9 +1204,7 @@ def test_reconciliation_does_not_cross_runs(tmp_path: Path) -> None:
 def test_create_issue_fails_closed_on_intent_provenance_mismatch(tmp_path: Path) -> None:
     store = _store(tmp_path)
     token = _run_token(store)
-    title = (
-        f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
-    )
+    title = f"Escalate slice root: {ParkCause.REVIEW_STUCK.value} (attempt 1) [run {token}]"
     intent_path = _escalation_intent_path(
         store, _escalation_key(store.run_id, "root", 1, ParkCause.REVIEW_STUCK)
     )
@@ -1310,12 +1274,8 @@ def test_escalation_intent_is_scoped_per_attempt(tmp_path: Path) -> None:
             issues = [{"issue_id": 900, "title": created[0]}] if created else []
             return _tool_result({"issues": issues})
 
-    first = _create_issue(
-        Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
-    )
-    second = _create_issue(
-        Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store
-    )
+    first = _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store)
+    second = _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=2, store=store)
 
     assert first == 901
     assert second == 902
@@ -1339,9 +1299,7 @@ def test_escalation_fails_closed_on_malformed_intent(tmp_path: Path) -> None:
             return _tool_result({"issues": []})
 
     with pytest.raises(EscalationError):
-        _create_issue(
-            Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store
-        )
+        _create_issue(Creator(), _slice(), ParkCause.REVIEW_STUCK, {}, attempt=1, store=store)
 
 
 def test_park_reuses_durable_intent_for_non_gated_cause(tmp_path: Path) -> None:

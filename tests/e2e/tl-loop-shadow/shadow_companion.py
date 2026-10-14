@@ -20,7 +20,8 @@ from tl_loop.events.reader import LedgerReader
 from tl_loop.loop.shadow import ShadowLoop, ShadowLoopError
 from tl_loop.shadow.actual import ActualActionReader
 from tl_loop.shadow.diff import generate_report
-from tl_loop.state.store import create
+from tl_loop.state.repository_identity import canonical_repository_url
+from tl_loop.state.schema import RepositoryIdentity
 
 RELEVANT_EVENT_TYPES = frozenset(
     {
@@ -72,9 +73,6 @@ def main() -> int:
     run_id = _wait_for_run_id(repo / ".exo" / "run_id", arguments.timeout)
     shadow_root = repo / ".exo" / "tl-loop" / "shadow"
     segments = repo / ".exo" / "ledger" / "segments"
-    checkpoint = shadow_root / run_id / "run.json"
-    if not checkpoint.exists():
-        create(run_id, {}, root_dir=shadow_root)
     source_queue = LedgerQueue(
         LedgerReader(segments, run_id=run_id, state_root=shadow_root),
         maxsize=64,
@@ -82,12 +80,33 @@ def main() -> int:
     ).start()
     source = LifecycleSource(source_queue)
     readonly = ReadOnlyEffectClient(
-        EffectClient(TransportClient(project_root=repo, timeout=2), role="tl", name="root")
+        EffectClient(
+            TransportClient(project_root=repo, timeout=2), role="tl", name="root"
+        )
     )
+    identity_result = readonly.repository_identity()
+    identity_payload = identity_result.result
+    if (
+        identity_result.success is not True
+        or not isinstance(identity_payload, dict)
+        or not isinstance(identity_payload.get("remote_url"), str)
+    ):
+        raise ShadowLoopError(
+            "repository identity is unavailable for a new shadow checkpoint"
+        )
+    try:
+        identity = RepositoryIdentity(
+            canonical_repository_url(identity_payload["remote_url"])
+        )
+    except ValueError as error:
+        raise ShadowLoopError(
+            "repository identity is malformed for a new shadow checkpoint"
+        ) from error
     shadow = ShadowLoop.for_run(
         source,
         run_id,
         readonly_client=readonly,
+        repository_identity=identity,
         root_dir=shadow_root,
     )
     shadow_error: str | None = None
@@ -111,7 +130,10 @@ def main() -> int:
             if current_sequence != last_sequence:
                 last_sequence = current_sequence
                 last_activity = time.monotonic()
-            if merged >= 2 and time.monotonic() - last_activity >= arguments.quiet_seconds:
+            if (
+                merged >= 2
+                and time.monotonic() - last_activity >= arguments.quiet_seconds
+            ):
                 break
             time.sleep(0.2)
         else:

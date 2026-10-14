@@ -13,7 +13,7 @@ from tl_loop.rlm.intent_contract import (
     UnclearIntent,
 )
 from tl_loop.rlm.intent_routing import IntentRoutingError, route_operator_intent
-from tl_loop.state.store import create
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def _root(tmp_path: Path) -> Path:
@@ -53,11 +53,7 @@ def test_plan_routing_revalidates_model_payload(tmp_path: Path) -> None:
     project = _root(tmp_path)
     valid = PlanProposalIntent(
         "root",
-        {
-            "leaves": [
-                {"name": "api", "task": "implement api", "chainlink_issue_id": None}
-            ]
-        },
+        {"leaves": [{"name": "api", "task": "implement api", "chainlink_issue_id": None}]},
     )
     assert route_operator_intent(valid, project) == valid
 

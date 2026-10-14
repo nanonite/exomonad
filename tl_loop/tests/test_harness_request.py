@@ -14,11 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from tl_loop.loop.driver import SubTLTask, TLLoopConfig, WorkPlan
+from tl_loop.fsm.phase import TLPhase
+from tl_loop.loop.driver import SubTLTask, WorkPlan
 from tl_loop.plan_validation import PlanValidationError, validate_plan_document
 from tl_loop.preflight import PreflightError, _validate_plan_spawn_routes
 from tl_loop.select.agent_type import (
     POLICY_REQUEST_REASON,
+    HarnessChoice,
     SelectionFailure,
     SelectionLedger,
     policy_approved_candidates,
@@ -27,9 +29,7 @@ from tl_loop.select.agent_type import (
 )
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
-from tl_loop.select.agent_type import HarnessChoice
 from tl_loop.select.policy import HarnessPolicy, validate_policy
-from tl_loop.fsm.phase import TLPhase
 from tl_loop.state.schema import (
     BudgetLedger,
     FSMState,
@@ -117,14 +117,17 @@ def test_unavailable_capability_parks_the_request_rather_than_substituting() -> 
     )
 
     assert choice is None
-    assert selection_failure(
-        hard,
-        "worker",
-        SelectionLedger(),
-        policy,
-        capabilities,
-        requested_harness="claude/sonnet",
-    ) is SelectionFailure.REQUEST_NOT_CAPABLE
+    assert (
+        selection_failure(
+            hard,
+            "worker",
+            SelectionLedger(),
+            policy,
+            capabilities,
+            requested_harness="claude/sonnet",
+        )
+        is SelectionFailure.REQUEST_NOT_CAPABLE
+    )
 
 
 def test_exhausted_budget_parks_the_request_with_the_budget_cause() -> None:
@@ -179,14 +182,17 @@ def test_request_the_escalation_retired_is_refused_not_re_run() -> None:
     )
 
     assert choice is None
-    assert selection_failure(
-        retried,
-        "worker",
-        SelectionLedger(),
-        policy,
-        CAPABILITIES,
-        requested_harness="codex/gpt-luna",
-    ) is SelectionFailure.REQUEST_SUPERSEDED_BY_ESCALATION
+    assert (
+        selection_failure(
+            retried,
+            "worker",
+            SelectionLedger(),
+            policy,
+            CAPABILITIES,
+            requested_harness="codex/gpt-luna",
+        )
+        is SelectionFailure.REQUEST_SUPERSEDED_BY_ESCALATION
+    )
 
 
 def test_escalation_reads_the_resolved_harness_so_it_actually_escalates() -> None:
@@ -273,9 +279,7 @@ def test_status_explains_requested_versus_resolved_execution() -> None:
     """An operator reading status can tell what was asked for from what ran."""
     from tl_loop.state.read_model import _slice_model
 
-    model = _slice_model(
-        _slice(requested_harness="codex", resolved_harness="codex/gpt-luna"), {}
-    )
+    model = _slice_model(_slice(requested_harness="codex", resolved_harness="codex/gpt-luna"), {})
     document = model.to_document()
 
     assert document["requested_harness"] == "codex"
@@ -286,8 +290,9 @@ def test_status_explains_requested_versus_resolved_execution() -> None:
 def test_restart_replays_the_request_rather_than_the_executed_route(tmp_path: Path) -> None:
     """A reloaded checkpoint still answers "what did the plan ask for?"""
     from tl_loop.loop.driver import DispatchAttempt
-    from tl_loop.state.plan_manifest import build_plan_manifest  # noqa: PLC0415
-    from tl_loop.state.store import RunStore, _decode_slice, create  # noqa: PLC0415
+    from tl_loop.state.plan_manifest import build_plan_manifest
+    from tl_loop.state.store import RunStore, _decode_slice
+    from tl_loop.tests.checkpoint_fixtures import create
 
     run_dir = tmp_path
     store = RunStore("restart", run_dir)
@@ -301,10 +306,10 @@ def test_restart_replays_the_request_rather_than_the_executed_route(tmp_path: Pa
         },
         root_dir=run_dir,
     )
-    dispatched = _dispatched(
-        _slice(requested_harness="codex", resolved_harness="codex/gpt-luna")
+    dispatched = _dispatched(_slice(requested_harness="codex", resolved_harness="codex/gpt-luna"))
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("task",)), {"task": dispatched}, BudgetLedger(0, 0), 0
     )
-    store.checkpoint(FSMState(TLPhase.TLWaiting, ("task",)), {"task": dispatched}, BudgetLedger(0, 0), 0)
 
     reloaded = RunStore("restart", run_dir).load().slices["task"]
 
@@ -372,13 +377,13 @@ def test_legacy_checkpoint_refuses_an_unusable_harness_value(tmp_path: Path) -> 
 
 def _migrated_slices(document: dict[str, object]) -> dict[str, dict[str, object]]:
     """Type-narrow the migrated document's slice map for direct assertions."""
-    from typing import cast  # noqa: PLC0415
+    from typing import cast
 
     return cast(dict[str, dict[str, object]], document["slices"])
 
 
 def _encoded_slice(slice_state: SliceState) -> dict[str, object]:
-    from tl_loop.state.store import _encode_slice  # noqa: PLC0415 - encoder under test
+    from tl_loop.state.store import _encode_slice
 
     return _encode_slice(slice_state.id, slice_state)
 

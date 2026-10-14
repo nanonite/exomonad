@@ -124,6 +124,7 @@ from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
 from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.plan_revision_apply import apply_plan_revision
 from tl_loop.state.schema import (
+    SCHEMA_VERSION,
     ActionKind,
     ActionPhase,
     ActionState,
@@ -145,8 +146,9 @@ from tl_loop.state.schema import (
     Verdict,
 )
 from tl_loop.state.serialization import DurableWriteError
-from tl_loop.state.store import QuarantineStorageError, RunStore, create
+from tl_loop.state.store import QuarantineStorageError, RunStore
 from tl_loop.state.store import load as load_state
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 @dataclass
@@ -8331,9 +8333,11 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     # the root has no identity key and its completed child has the old
     # five-field identity while the authoritative URL remains unchanged.
     root_document = json.loads(root_store.path.read_text(encoding="utf-8"))
+    root_document["version"] = 4
     root_document.pop("repository_identity", None)
     root_store.path.write_text(json.dumps(root_document), encoding="utf-8")
     child_document = json.loads(child_store.path.read_text(encoding="utf-8"))
+    child_document["version"] = 4
     child_document["repository_identity"] = {
         "owner": "forge-example",
         "repo": "repository",
@@ -8361,6 +8365,10 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         "https://forge.example.com/org/repo.git"
     )
     assert adopted.final_state.repository_identity_migration is not None
+    adopted_child = child_store.load()
+    assert adopted_child.version == SCHEMA_VERSION
+    assert adopted_child.repository_identity == adopted.final_state.repository_identity
+    assert adopted_child.repository_identity_migration is not None
     assert architecture_slice.status is SliceStatus.IN_REVIEW
     assert architecture_slice.pr_number == 43
     assert architecture_slice.dispatch_invocation_id == invocation_id

@@ -16,11 +16,12 @@ from tl_loop.loop.recovery_control import (
     execute_recovery_command,
 )
 from tl_loop.state.schema import GateStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def test_policy_retry_is_durable_and_idempotent(tmp_path: Path) -> None:
-    store, state = _store(tmp_path)
+    store, _state = _store(tmp_path)
     request = _request("retry-1", "retry", generation=2)
 
     first = execute_recovery_command(tmp_path, request)

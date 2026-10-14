@@ -45,7 +45,8 @@ from tl_loop.state.plan_manifest import (
     validate_manifest_revision,
 )
 from tl_loop.state.schema import RunState, SliceState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 from .test_driver import _event
 

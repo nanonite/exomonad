@@ -20,7 +20,7 @@ from tl_loop.events.reader import (
     LedgerReadError,
     SequenceStatus,
 )
-from tl_loop.state.store import create
+from tl_loop.tests.checkpoint_fixtures import create
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ledger_projection_events.json"
 
@@ -548,8 +548,7 @@ def test_reader_scopes_direct_children_across_polls_and_excludes_grandchildren(
     assert second.events[2].agent_id == "dev-leaf"
     assert second.events[2].parent_agent_id is None
     assert not any(
-        item.agent_id == "nested-leaf"
-        and item.event_type in {"pr.filed", "agent.completed"}
+        item.agent_id == "nested-leaf" and item.event_type in {"pr.filed", "agent.completed"}
         for item in second.events
     )
 

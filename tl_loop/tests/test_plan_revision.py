@@ -22,7 +22,8 @@ from tl_loop.state.plan_revision_transaction import (
     recover_plan_revision,
 )
 from tl_loop.state.schema import OrderedStageState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def _document(*, issue_id: int | None = None, include_issue_id: bool = True) -> dict[str, object]:

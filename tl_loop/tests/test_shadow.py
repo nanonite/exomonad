@@ -22,8 +22,10 @@ from tl_loop.fsm.event import (
 )
 from tl_loop.fsm.phase import ChildHandle
 from tl_loop.loop.shadow import ShadowLoop, TLEventDecoder, _update_slices
-from tl_loop.state.schema import SliceState, SliceStatus
-from tl_loop.state.store import create
+from tl_loop.state.schema import RepositoryIdentity, SliceState, SliceStatus
+from tl_loop.tests.checkpoint_fixtures import create
+
+SHADOW_REPOSITORY_IDENTITY = RepositoryIdentity("https://forge.example.test/test/repository.git")
 
 
 @dataclass
@@ -202,6 +204,7 @@ def test_shadow_loop_acknowledges_pr_published_without_a_transition(
         source,
         run_id,
         readonly_client=ReadOnlyEffectClient(EffectClient(_RecordingTransport())),
+        repository_identity=SHADOW_REPOSITORY_IDENTITY,
         root_dir=tmp_path / run_id,
     ).run()
 
@@ -288,6 +291,7 @@ def test_shadow_loop_reaches_terminal_phase_and_records_intended_sequence(tmp_pa
         source,
         "synthetic-shadow",
         readonly_client=readonly,
+        repository_identity=SHADOW_REPOSITORY_IDENTITY,
         root_dir=tmp_path / "shadow",
     ).run()
 
@@ -347,6 +351,7 @@ def test_shadow_loop_accepts_two_distinct_live_spawns(tmp_path: Path) -> None:
         source,
         "two-spawns",
         readonly_client=ReadOnlyEffectClient(EffectClient(_RecordingTransport())),
+        repository_identity=SHADOW_REPOSITORY_IDENTITY,
         root_dir=tmp_path / "shadow",
     ).run()
 

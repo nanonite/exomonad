@@ -25,7 +25,8 @@ from tl_loop.loop.driver import (
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import RepositoryIdentity, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 from tl_loop.tests.test_driver import (
     RecordingTransport,
     ReviewBackend,

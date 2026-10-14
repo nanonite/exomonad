@@ -132,6 +132,7 @@ def _make_run(tmp_path: Path) -> Path:
         "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "run-1",
+        "repository_identity": {"remote_url": "https://forge.example.test/test/repository.git"},
         "fsm": {"phase": "tl_planning", "waiting": []},
         "slices": {
             "slice-a": {

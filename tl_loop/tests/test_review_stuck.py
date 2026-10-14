@@ -40,7 +40,8 @@ from tl_loop.state.schema import (
     SliceStatus,
     Verdict,
 )
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 from tl_loop.tests.test_driver import (
     RecordingTransport,
     ReviewBackend,
@@ -497,8 +498,7 @@ def test_review_stuck_keeps_slice_issue_binding_without_tracker_or_plan_effects(
     plan_path = project_root / ".exo" / "tl-loop" / "plan.json"
     plan_path.parent.mkdir(parents=True)
     plan_bytes = (
-        b'{"plan":{"leaves":[{"name":"leaf-a","task":"implement",'
-        b'"chainlink_issue_id":1169}]}}\n'
+        b'{"plan":{"leaves":[{"name":"leaf-a","task":"implement","chainlink_issue_id":1169}]}}\n'
     )
     plan_path.write_bytes(plan_bytes)
 

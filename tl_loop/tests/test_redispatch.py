@@ -10,7 +10,8 @@ from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.driver import LeafTask, WorkPlan
 from tl_loop.loop.redispatch import RedispatchError, redispatch_slice
 from tl_loop.state.schema import BudgetLedger, ParkCause, SliceState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 @dataclass

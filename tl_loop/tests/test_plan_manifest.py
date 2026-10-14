@@ -20,7 +20,9 @@ from tl_loop.state.plan_manifest import (
     build_plan_manifest,
     validate_manifest_revision,
 )
-from tl_loop.state.store import RunStore, _decode_recursive_fsm, _encode_fsm, create
+from tl_loop.state.schema import SCHEMA_VERSION
+from tl_loop.state.store import RunStore, _decode_recursive_fsm, _encode_fsm
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def _plan() -> dict[str, object]:
@@ -343,7 +345,7 @@ def test_schema_rejects_current_checkpoint_without_manifest() -> None:
     from tl_loop.state.schema import SchemaError, validate
 
     document = {
-        "version": 4,
+        "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "missing-manifest",
         "fsm": {"phase": "tl_planning", "waiting": []},
@@ -351,6 +353,7 @@ def test_schema_rejects_current_checkpoint_without_manifest() -> None:
         "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
         "gates": [],
         "events": {"last_consumed_offset": 0},
+        "repository_identity": {"remote_url": "https://forge.example.test/test/repository.git"},
     }
 
     with pytest.raises(SchemaError, match="plan_manifest.*required"):

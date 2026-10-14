@@ -69,7 +69,8 @@ from tl_loop.ordered import (
     transition_integration,
 )
 from tl_loop.state.schema import BudgetLedger, FSMState, IntegrationRuntimeState
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def _child(

@@ -51,7 +51,8 @@ from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmRespo
 from tl_loop.select.model import ModelCatalog, select_model
 from tl_loop.select.policy import HarnessPolicy, validate_policy
 from tl_loop.state.schema import GateStatus, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 ROOT = Path(__file__).resolve().parents[2]
 

@@ -27,7 +27,8 @@ from tl_loop.state.schema import (
     RunState,
     SliceStatus,
 )
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 @dataclass
@@ -1164,17 +1165,17 @@ def test_the_heartbeat_logs_the_classification_it_did_not_act_on(
         heartbeat_once(
             state,
             store,
-            EffectClient(
-                HeartbeatTransport(
-                    pr_state="open", publication_ownership_verified=True
-                )
-            ),
+            EffectClient(HeartbeatTransport(pr_state="open", publication_ownership_verified=True)),
             HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
             now=10.0,
             project_root=tmp_path,
         )
 
-    lines = [record.getMessage() for record in caplog.records if "heartbeat target=" in record.getMessage()]
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "heartbeat target=" in record.getMessage()
+    ]
     assert lines, "the heartbeat classified nothing"
     assert "pr_state='open'" in lines[0]
     assert "ownership=verified" in lines[0]

@@ -24,7 +24,8 @@ from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmRespo
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import RepositoryIdentity, RunState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 from tl_loop.tests.test_driver import ReviewBackend, _selector_policy
 
 UNRELEASED = "### Fixed\n- Fix an older thing (#1)"

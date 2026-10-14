@@ -87,6 +87,7 @@ from .repository_identity_migration import (
     validate_audit_record,
 )
 from .schema import (
+    LEGACY_IDENTITY_CHECKPOINT_VERSION,
     REDUCER_VERSION,
     SCHEMA_VERSION,
     ActionKind,
@@ -121,6 +122,7 @@ from .schema import (
     SuspendedDependencyState,
     Verdict,
     validate,
+    validate_legacy_identity_checkpoint,
 )
 from .serialization import dumps as dumps_json
 from .serialization import to_jsonable
@@ -1227,9 +1229,9 @@ class RunStore:
 def create(run_id: str, root_spec: RootSpec, *, root_dir: str | Path = DEFAULT_ROOT) -> RunState:
     """Create a run at ``.exo/tl-loop/<run_id>/run.json``.
 
-    ``root_spec`` supplies any of the persisted ``fsm``, ``slices``,
-    ``budgets``, ``gates``, and ``events`` sections. Omitted sections use the
-    empty, planning-state defaults.
+    ``root_spec`` must include a canonical URL-only ``repository_identity``.
+    It may also supply ``fsm``, ``slices``, ``budgets``, ``gates``, and
+    ``events``; omitted sections use the empty, planning-state defaults.
     """
     _validate_run_id(run_id)
     directory = Path(root_dir) / run_id
@@ -1282,7 +1284,7 @@ def load(path: str | Path) -> RunState:
                     run_id=target.parent.name,
                 )
                 if migration.migrated:
-                    validate(migration.document)
+                    _validate_loaded_checkpoint(migration.document)
                     migrated_state = _decode(migration.document)
                     _assert_consistent(target, migrated_state)
                     install_migration(target, migration)
@@ -1295,12 +1297,23 @@ def load(path: str | Path) -> RunState:
                 f"{target}: migration validation failed: {error}; see {report}"
             ) from error
     try:
-        validate(value)
+        _validate_loaded_checkpoint(value)
     except SchemaError as error:
         raise CorruptCheckpoint(f"{target}: schema inconsistency: {error}") from error
     state = _decode(value)
     _assert_consistent(target, state)
     return state
+
+
+def _validate_loaded_checkpoint(document: object) -> None:
+    """Use the narrow legacy decoder only for the explicitly old version."""
+    if (
+        isinstance(document, Mapping)
+        and document.get("version") == LEGACY_IDENTITY_CHECKPOINT_VERSION
+    ):
+        validate_legacy_identity_checkpoint(document)
+        return
+    validate(document)
 
 
 def checkpoint(
@@ -2384,17 +2397,14 @@ def _identity_for_migration(document: Mapping[str, object]) -> tuple[str | None,
 
 
 def _validate_repository_identity_migration_source(document: object) -> None:
-    """Validate all checkpoint state while temporarily permitting legacy identity shape."""
+    """Validate version-4 sources only through the explicit legacy schema."""
     if not isinstance(document, Mapping):
         validate(document)
         return
-    _identity_url, source_shape = _identity_for_migration(document)
-    if source_shape == "canonical":
-        validate(document)
+    if document.get("version") == LEGACY_IDENTITY_CHECKPOINT_VERSION:
+        validate_legacy_identity_checkpoint(document)
         return
-    legacy_safe = copy.deepcopy(dict(document))
-    legacy_safe["repository_identity"] = None
-    validate(legacy_safe)
+    validate(document)
 
 
 def _semantic_document_digest(document: Mapping[str, object]) -> str:
@@ -2425,6 +2435,7 @@ def _apply_repository_identity_migration(
             "malformed", "repository identity migration source revision is invalid"
         )
     target = copy.deepcopy(dict(source_document))
+    target["version"] = SCHEMA_VERSION
     target["repository_identity"] = identity.to_document()
     target["repository_identity_migration"] = copy.deepcopy(dict(audit))
     target["revision"] = revision + 1
@@ -2464,6 +2475,7 @@ def _apply_repository_identity_migration(
             raise RepositoryIdentityMigrationError(
                 "stale", "run checkpoint changed before repository identity migration apply"
             )
+        document["version"] = SCHEMA_VERSION
         document["repository_identity"] = identity.to_document()
         document["repository_identity_migration"] = copy.deepcopy(dict(audit))
         return document

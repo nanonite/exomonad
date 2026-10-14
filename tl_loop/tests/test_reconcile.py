@@ -11,8 +11,8 @@ from tl_loop.loop.reconcile import (
     Quiescent,
     derive_next_action,
     reconcile_merge_observation,
-    reduce_observation,
     reconcile_slice,
+    reduce_observation,
 )
 from tl_loop.state.schema import (
     BudgetLedger,
@@ -26,7 +26,8 @@ from tl_loop.state.schema import (
     TLPhase,
     Verdict,
 )
-from tl_loop.state.store import RunStore, _encode_slice, create
+from tl_loop.state.store import RunStore, _encode_slice
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def _slice(status: SliceStatus) -> SliceState:
@@ -436,8 +437,10 @@ def test_missing_publication_ownership_fields_fail_closed_with_reason() -> None:
 
     assert result.next_action == "park_publication_ownership_unresolved"
     assert result.conflicts == (
-        "publication ownership is unresolved: "
-        "watcher_pr_state omitted publication_ownership_verified",
+        (
+            "publication ownership is unresolved: watcher_pr_state omitted "
+            "publication_ownership_verified"
+        ),
     )
 
 

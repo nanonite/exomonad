@@ -49,7 +49,8 @@ from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.policy import load_policy
 from tl_loop.state.schema import BudgetLedger, RunState, SliceState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 PACKAGE_ROOT = Path(tl_loop.__file__).parent
 POLICY = Path(__file__).parent / "fixtures" / "selector_policy_cheap_only.toml"
@@ -140,9 +141,7 @@ class RecordingTransport:
 
     def payloads(self, event_type: str) -> list[dict[str, Any]]:
         return [
-            dict(event["payload"])
-            for event in self.events
-            if event.get("event_type") == event_type
+            dict(event["payload"]) for event in self.events if event.get("event_type") == event_type
         ]
 
     def _record_refusal(self, intent_id: object) -> None:
@@ -184,9 +183,7 @@ class DispatchPass:
     spawn: dict[str, Any]
 
 
-def _config(
-    root: Path, clock: ScriptedClock, *, policy: bool
-) -> TLLoopConfig:
+def _config(root: Path, clock: ScriptedClock, *, policy: bool) -> TLLoopConfig:
     return TLLoopConfig(
         policy=load_policy(POLICY) if policy else None,
         capabilities=CapabilityMap({HARNESS: Difficulty.STANDARD}),
@@ -219,9 +216,7 @@ def _dispatch_pass(
     )
 
 
-def _dispatch(
-    root: Path, *, policy: bool, requested_harness: str | None = None
-) -> DispatchPass:
+def _dispatch(root: Path, *, policy: bool, requested_harness: str | None = None) -> DispatchPass:
     store = _store(root, requested_harness)
     transport = RecordingTransport(project_root=root)
     state = _dispatch_pass(
@@ -290,22 +285,18 @@ def _pending_slice(requested_harness: str | None = None) -> SliceState:
 
 
 def _both_paths(tmp_path: Path) -> tuple[DispatchPass, DispatchPass]:
-    return _dispatch(tmp_path / "direct", policy=False), _dispatch(
-        tmp_path / "policy", policy=True
-    )
+    return _dispatch(tmp_path / "direct", policy=False), _dispatch(tmp_path / "policy", policy=True)
 
 
 def _identity(pass_result: DispatchPass, event_type: str) -> dict[str, object]:
     return {
-        field_name: pass_result.payloads[event_type][field_name]
-        for field_name in IDENTITY_FIELDS
+        field_name: pass_result.payloads[event_type][field_name] for field_name in IDENTITY_FIELDS
     }
 
 
 def _persisted(pass_result: DispatchPass) -> dict[str, object]:
     return {
-        field_name: getattr(pass_result.slice_state, field_name)
-        for field_name in PERSISTED_FIELDS
+        field_name: getattr(pass_result.slice_state, field_name) for field_name in PERSISTED_FIELDS
     }
 
 
@@ -586,9 +577,7 @@ def test_a_rebuilt_attempt_reads_every_field_from_its_slice() -> None:
         ledger_floor=41,
     )
 
-    rebuilt = DispatchAttempt.recorded_for(
-        _recorded_slice(recorded), recorded.controller_epoch
-    )
+    rebuilt = DispatchAttempt.recorded_for(_recorded_slice(recorded), recorded.controller_epoch)
 
     assert {f.name: getattr(rebuilt, f.name) for f in fields(DispatchAttempt)} == {
         f.name: getattr(recorded, f.name) for f in fields(DispatchAttempt)
@@ -609,9 +598,7 @@ def test_the_rebuild_constructor_propagates_every_dispatch_field() -> None:
     """
     source = textwrap.dedent(inspect.getsource(DispatchAttempt.recorded_for))
     assigned = _keyword_arguments(ast.parse(source))
-    supplied = set(inspect.signature(DispatchAttempt.recorded_for).parameters) - {
-        "slice_state"
-    }
+    supplied = set(inspect.signature(DispatchAttempt.recorded_for).parameters) - {"slice_state"}
 
     assert assigned | supplied == {f.name for f in fields(DispatchAttempt)}
 
@@ -717,9 +704,7 @@ def _constructing_functions(tree: ast.AST) -> set[str]:
             and node.func.id == "DispatchAttempt"
         ):
             found.add(owner)
-        name = (
-            node.name if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
-        )
+        name = node.name if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
         for child in ast.iter_child_nodes(node):
             visit(child, name or owner)
 

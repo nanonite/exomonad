@@ -8,9 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import tl_loop.state.migration as migration_module
+from tl_loop.fsm.phase import TLDone
 from tl_loop.state.migration import install_migration, migrate_checkpoint_document
-from tl_loop.state.schema import SCHEMA_VERSION
+from tl_loop.state.schema import LEGACY_IDENTITY_CHECKPOINT_VERSION, SCHEMA_VERSION
 from tl_loop.state.store import CorruptCheckpoint, RunStore
+from tl_loop.state.store import load as load_checkpoint
+from tl_loop.tests.checkpoint_fixtures import create, mark_legacy_identity_checkpoint
 
 
 def _legacy_spawned() -> dict[str, object]:
@@ -35,7 +38,7 @@ def test_legacy_checkpoint_is_migrated_without_losing_original(tmp_path) -> None
 
     state = RunStore("legacy", tmp_path).load()
 
-    assert state.version == SCHEMA_VERSION
+    assert state.version == LEGACY_IDENTITY_CHECKPOINT_VERSION
     assert state.slices["slice-a"].status.value == "dispatch_unconfirmed"
     assert path.read_text(encoding="utf-8") != original
     backups = tuple(path.parent.glob("run.json.legacy-*"))
@@ -46,6 +49,31 @@ def test_legacy_checkpoint_is_migrated_without_losing_original(tmp_path) -> None
 
     RunStore("legacy", tmp_path).load()
     assert len(tuple(path.parent.glob("run.json.legacy-*"))) == 1
+
+
+def test_archived_terminal_legacy_checkpoint_replays_without_becoming_runnable_scope(
+    tmp_path,
+) -> None:
+    create("historical", {}, root_dir=tmp_path)
+    source = RunStore("historical", tmp_path)
+    current = source.load()
+    source.checkpoint(TLDone(), {}, current.budgets, 0)
+    mark_legacy_identity_checkpoint(source)
+    legacy_bytes = source.path.read_bytes()
+
+    archive = tmp_path / "root.invalid-archive" / "historical"
+    archive.mkdir(parents=True)
+    archived_checkpoint = archive / "run.json"
+    archived_checkpoint.write_bytes(legacy_bytes)
+
+    replayed = load_checkpoint(archived_checkpoint)
+    resumed = RunStore("historical", archive.parent).resume()
+
+    assert replayed.version == LEGACY_IDENTITY_CHECKPOINT_VERSION
+    assert replayed.fsm.phase.value == "tl_done"
+    assert resumed.fsm.phase.value == "tl_done"
+    assert replayed.repository_identity is None
+    assert archived_checkpoint.read_bytes() == legacy_bytes
 
 
 def test_malformed_checkpoint_is_blocked_without_overwriting_evidence(tmp_path) -> None:
@@ -90,14 +118,14 @@ def test_deployed_pre_898_version_1_checkpoint_is_migrated(tmp_path) -> None:
 
     state = RunStore("pre898", tmp_path).load()
 
-    assert state.version == SCHEMA_VERSION
+    assert state.version == LEGACY_IDENTITY_CHECKPOINT_VERSION
     assert SCHEMA_VERSION > 1, "regression only proves anything once the target moved past 1"
     assert state.slices["slice-a"].status.value == "dispatch_unconfirmed"
     assert state.slices["slice-a"].dispatch_error is not None
     report = json.loads((path.parent / "migration-report.json").read_text())
     assert report["status"] == "complete"
     assert report["source_version"] == 1
-    assert report["target_version"] == SCHEMA_VERSION
+    assert report["target_version"] == LEGACY_IDENTITY_CHECKPOINT_VERSION
 
 
 def test_legacy_reviewed_head_never_becomes_handoff_evidence() -> None:
@@ -216,7 +244,12 @@ def test_concurrent_loads_serialize_migration_and_leave_one_checkpoint(tmp_path)
     with ThreadPoolExecutor(max_workers=2) as executor:
         states = list(executor.map(lambda _index: load_checkpoint(), range(2)))
 
-    assert [state.version for state in states] == [SCHEMA_VERSION, SCHEMA_VERSION]
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == SCHEMA_VERSION
+    assert [state.version for state in states] == [
+        LEGACY_IDENTITY_CHECKPOINT_VERSION,
+        LEGACY_IDENTITY_CHECKPOINT_VERSION,
+    ]
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == (
+        LEGACY_IDENTITY_CHECKPOINT_VERSION
+    )
     assert len(tuple(path.parent.glob("run.json.legacy-*"))) == 1
     assert not tuple(path.parent.glob("*.tmp"))

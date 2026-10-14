@@ -68,7 +68,8 @@ from tl_loop.state.schema import (
     Verdict,
     validate,
 )
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 NOW = datetime(2026, 8, 11, 17, 0, tzinfo=UTC)
 

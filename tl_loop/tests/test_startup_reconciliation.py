@@ -46,7 +46,8 @@ from tl_loop.state.slice_transition import (
     ReviewValidationFailed,
     slice_transition,
 )
-from tl_loop.state.store import RunStore, _encode_slice, create
+from tl_loop.state.store import RunStore, _encode_slice
+from tl_loop.tests.checkpoint_fixtures import create
 
 _PLAN = WorkPlan(
     leaves=(

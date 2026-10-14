@@ -34,8 +34,13 @@ from tl_loop.loop.driver import (
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.state.legacy_manifest import LegacyManifestDisposition, reconcile_legacy_manifest
 from tl_loop.state.plan_manifest import build_plan_manifest
-from tl_loop.state.schema import GateStatus, RepositoryIdentity, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.schema import RepositoryIdentity, SliceStatus
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import (
+    create,
+    create_legacy_identity_checkpoint,
+    mark_legacy_identity_checkpoint,
+)
 from tl_loop.tests.test_driver import IntegrationTransport, SyntheticQueue
 from tl_loop.tests.test_legacy_manifest_convergence import (
     RUN_ID,
@@ -49,15 +54,19 @@ from tl_loop.tests.test_legacy_manifest_convergence import (
 )
 
 
-def _seed_without_repository_identity(tmp_path: Path):
+def _seed_without_repository_identity(tmp_path: Path, *, legacy: bool = True):
     """Same sanitized fixture as _seed_and_migrate, but the checkpoint's
     repository_identity is left null -- the exact #1062 shape."""
-    create(RUN_ID, {}, root_dir=tmp_path)
+    create(
+        RUN_ID,
+        {"repository_identity": _resolved_identity_payload()},
+        root_dir=tmp_path,
+    )
     store = RunStore(RUN_ID, tmp_path)
     merge_intent_id = _seed_action_journal(store)
     legacy = _legacy_manifest()
     state = store.load()
-    assert state.repository_identity is None
+    assert state.repository_identity is not None
     state = store.set_plan_manifest(
         legacy,
         slices={SLICE_ID: _active_legacy_slice(merge_intent_id)},
@@ -78,6 +87,8 @@ def _seed_without_repository_identity(tmp_path: Path):
         legacy_manifest_migration=proof.to_document(),
     )
     migrated = store.set_plan_manifest(candidate, slices={SLICE_ID: rebound})
+    if legacy:
+        mark_legacy_identity_checkpoint(store)
     return store, migrated
 
 
@@ -146,6 +157,7 @@ def _run_bounded(config: TLLoopConfig, effects: EffectClient, tmp_path: Path):
 
 def test_continuation_without_child_identity_proof_stays_parked(tmp_path: Path) -> None:
     _seed_without_repository_identity(tmp_path)
+    checkpoint_before = RunStore(RUN_ID, tmp_path).path.read_bytes()
     config = replace(_config(), repository_identity=None)
     transport = _transport_with_identity(resolved=True)
     effects = EffectClient(transport)
@@ -157,13 +169,15 @@ def test_continuation_without_child_identity_proof_stays_parked(tmp_path: Path) 
     assert final.repository_identity_migration is None
     assert final.slices[SLICE_ID].status is SliceStatus.IN_REVIEW
     assert final.slices[SLICE_ID].post_merge is None
-    assert any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in final.gates)
+    assert not any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in final.gates)
+    assert RunStore(RUN_ID, tmp_path).path.read_bytes() == checkpoint_before
     assert result.diagnostics["repository_identity_blocker"] == "missing"
     assert len(transport.identity_calls) == 1
 
 
 def test_failed_resolution_opens_named_gate_without_raising_or_guessing(tmp_path: Path) -> None:
     _seed_without_repository_identity(tmp_path)
+    checkpoint_before = RunStore(RUN_ID, tmp_path).path.read_bytes()
     config = replace(_config(), repository_identity=None)
     transport = _transport_with_identity(resolved=False)
     effects = EffectClient(transport)
@@ -172,8 +186,8 @@ def test_failed_resolution_opens_named_gate_without_raising_or_guessing(tmp_path
 
     final = result.final_state
     assert final.repository_identity is None
-    gate_names = {gate.name: gate.status for gate in final.gates}
-    assert gate_names.get(REPOSITORY_IDENTITY_GATE_NAME) is GateStatus.PENDING
+    assert not any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in final.gates)
+    assert RunStore(RUN_ID, tmp_path).path.read_bytes() == checkpoint_before
     # The slice must not have been silently adopted against a guessed identity.
     assert final.slices[SLICE_ID].status is not SliceStatus.MERGED
 
@@ -202,10 +216,14 @@ def test_beast_root_missing_identity_adopts_matching_legacy_child_repository(
         ]
     }
     root_manifest = build_plan_manifest(plan, scope_id=RUN_ID, owned_branch="main")
-    create(RUN_ID, {"plan_manifest": root_manifest.to_document()}, root_dir=tmp_path)
+    create_legacy_identity_checkpoint(
+        RUN_ID,
+        {"plan_manifest": root_manifest.to_document()},
+        root_dir=tmp_path,
+    )
     root_store = RunStore(RUN_ID, tmp_path)
     child_manifest = root_manifest.child_manifests[f"{RUN_ID}/sub_tl/{child_run_id}"]
-    child_state = create(
+    create_legacy_identity_checkpoint(
         child_run_id,
         {
             "parent_run_id": RUN_ID,
@@ -214,7 +232,9 @@ def test_beast_root_missing_identity_adopts_matching_legacy_child_repository(
             "repository_identity": legacy_child_identity,
         },
         root_dir=root_store.run_dir,
+        repository_identity=legacy_child_identity,
     )
+    child_state = RunStore(child_run_id, root_store.run_dir).load()
     assert root_store.load().repository_identity is None
     assert child_state.repository_identity == RepositoryIdentity(remote_url)
 
@@ -235,8 +255,7 @@ def test_beast_root_missing_identity_adopts_matching_legacy_child_repository(
 
 
 def test_conflicting_supplied_identity_still_raises(tmp_path: Path) -> None:
-    store, _migrated = _seed_without_repository_identity(tmp_path)
-    store.set_repository_identity(RepositoryIdentity("https://forge.example.com/org/repo.git"))
+    _seed_without_repository_identity(tmp_path, legacy=False)
     config = replace(
         _config(),
         repository_identity=RepositoryIdentity(
@@ -332,13 +351,14 @@ def test_missing_identity_without_child_proof_stays_blocked_after_lookup_recover
 ) -> None:
     """A current remote cannot establish historical ownership without child proof."""
     _seed_without_repository_identity(tmp_path)
+    checkpoint_before = RunStore(RUN_ID, tmp_path).path.read_bytes()
     config = replace(_config(), repository_identity=None)
 
     blocked_transport = _transport_with_identity(resolved=False)
     parked = _run_bounded(config, EffectClient(blocked_transport), tmp_path)
     assert parked.final_state.repository_identity is None
-    gate_names = {gate.name: gate.status for gate in parked.final_state.gates}
-    assert gate_names.get(REPOSITORY_IDENTITY_GATE_NAME) is GateStatus.PENDING
+    assert not any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in parked.final_state.gates)
+    assert RunStore(RUN_ID, tmp_path).path.read_bytes() == checkpoint_before
     assert parked.final_state.slices[SLICE_ID].status is not SliceStatus.MERGED
 
     recovering_transport = _transport_with_identity(resolved=True)
@@ -348,7 +368,8 @@ def test_missing_identity_without_child_proof_stays_blocked_after_lookup_recover
     assert final.slices[SLICE_ID].status is SliceStatus.IN_REVIEW
     assert final.slices[SLICE_ID].post_merge is None
     assert recovered.diagnostics["repository_identity_blocker"] == "missing"
-    assert any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in final.gates)
+    assert not any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in final.gates)
+    assert RunStore(RUN_ID, tmp_path).path.read_bytes() == checkpoint_before
     assert [name for name, _ in recovering_transport.calls if name == "merge_pr"] == []
     assert not any(
         name in {"chainlink_issue_close", "post_merge_changelog", "post_merge_push"}

@@ -12,7 +12,8 @@ from tl_loop.state.lock import RunLock
 from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.repository_identity_migration import RepositoryIdentityMigrationError
 from tl_loop.state.schema import RepositoryIdentity
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create_legacy_identity_checkpoint
 
 CANONICAL_URL = "https://forge.example.com/Org/Repo.git"
 LEGACY_CHILD_IDENTITY = {
@@ -45,7 +46,12 @@ def _seed_root_and_child(
     root_spec: dict[str, object] = {"plan_manifest": manifest.to_document()}
     if include_root_identity:
         root_spec["repository_identity"] = root_identity
-    create("root", root_spec, root_dir=root_dir)
+    create_legacy_identity_checkpoint(
+        "root",
+        root_spec,
+        root_dir=root_dir,
+        repository_identity=root_identity if include_root_identity else None,
+    )
     root = RunStore("root", root_dir)
 
     child_manifest = manifest.child_manifests["root/sub_tl/stage"]
@@ -54,9 +60,12 @@ def _seed_root_and_child(
         "owner_branch": "main.stage",
         "plan_manifest": child_manifest.to_document(),
     }
-    if child_identity is not None:
-        child_spec["repository_identity"] = child_identity
-    create("stage", child_spec, root_dir=root.run_dir)
+    create_legacy_identity_checkpoint(
+        "stage",
+        child_spec,
+        root_dir=root.run_dir,
+        repository_identity=child_identity,
+    )
     return root, RunStore("stage", root.run_dir)
 
 
@@ -119,7 +128,7 @@ def test_missing_root_identity_migrates_only_with_matching_declared_child(tmp_pa
 
 
 def test_missing_root_identity_without_child_proof_fails_closed(tmp_path: Path) -> None:
-    create("root", {}, root_dir=tmp_path)
+    create_legacy_identity_checkpoint("root", {}, root_dir=tmp_path)
     root = RunStore("root", tmp_path)
     before = root.path.read_bytes()
 
@@ -225,7 +234,9 @@ def test_stale_checkpoint_fingerprint_refuses_apply(tmp_path: Path, monkeypatch)
 
     def race_before_apply(run_dir, mutator, **kwargs):
         if Path(run_dir) == root.run_dir:
-            real_apply(run_dir, lambda document: document)
+            current = _read(root.path)
+            current["revision"] = current["revision"] + 1
+            root.path.write_text(json.dumps(current), encoding="utf-8")
         return real_apply(run_dir, mutator, **kwargs)
 
     monkeypatch.setattr(store_module, "apply", race_before_apply)
@@ -304,7 +315,9 @@ def test_interrupted_migration_rejects_changed_child_fingerprint(
             RepositoryIdentity(CANONICAL_URL), corroborating_sub_tls=("stage",)
         )
     monkeypatch.setattr(store_module, "apply", real_apply)
-    real_apply(child.run_dir, lambda document: document)
+    child_document = _read(child.path)
+    child_document["revision"] = child_document["revision"] + 1
+    child.path.write_text(json.dumps(child_document), encoding="utf-8")
     before = root.path.read_bytes()
 
     with pytest.raises(RepositoryIdentityMigrationError) as rejected:

@@ -5,13 +5,80 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import cast
 
+import pytest
+
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.plan_manifest import build_plan_manifest
-from tl_loop.state.schema import SCHEMA_VERSION, SchemaError, validate
+from tl_loop.state.schema import (
+    LEGACY_IDENTITY_CHECKPOINT_VERSION,
+    SCHEMA_VERSION,
+    SchemaError,
+    validate,
+    validate_legacy_identity_checkpoint,
+)
 
 
 def test_valid_run_state_document_is_accepted() -> None:
     validate(_valid_document())
+
+
+def test_current_runnable_checkpoint_requires_repository_identity() -> None:
+    document = _valid_document()
+    slice_state = _slice(document, "slice-a")
+    slice_state.update(
+        {
+            "status": "spawned",
+            "dispatch_intent_id": "intent-current",
+            "dispatch_agent_id": "agent-current",
+            "dispatch_authoritative_event_seq": 7,
+        }
+    )
+    document["fsm"] = {"phase": "tl_running", "waiting": ["slice-a"]}
+    document.pop("repository_identity")
+
+    _assert_rejected(document, "run.repository_identity")
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        None,
+        {"remote_url": ""},
+        {"remote_url": "HTTPS://FORGE.example.com/org/repo.git"},
+        {"remote_url": "https://token:secret@forge.example.com/org/repo.git"},
+        {
+            "owner": "org",
+            "repo": "repo",
+            "base_branch": "main",
+            "remote_url": "https://forge.example.com/org/repo.git",
+        },
+    ],
+)
+def test_current_checkpoint_rejects_invalid_repository_identity(identity: object) -> None:
+    document = _valid_document()
+    document["repository_identity"] = identity
+
+    _assert_rejected(document, "run.repository_identity")
+
+
+def test_legacy_identity_shapes_are_allowed_only_by_the_versioned_legacy_validator() -> None:
+    missing = _valid_document()
+    missing["version"] = LEGACY_IDENTITY_CHECKPOINT_VERSION
+    missing.pop("repository_identity")
+    validate_legacy_identity_checkpoint(missing)
+    _assert_rejected(missing, "run.version")
+
+    old_shaped = _valid_document()
+    old_shaped["version"] = LEGACY_IDENTITY_CHECKPOINT_VERSION
+    old_shaped["repository_identity"] = {
+        "owner": "historical-org",
+        "repo": "historical-repo",
+        "base_branch": "historical-main",
+        "forge_host": "old-forge.example.com",
+        "remote_url": "https://forge.example.com/org/repo.git",
+    }
+    validate_legacy_identity_checkpoint(old_shaped)
+    _assert_rejected(old_shaped, "run.version")
 
 
 def test_per_head_review_state_is_valid_and_closed() -> None:
@@ -170,9 +237,6 @@ def test_merge_evidence_is_typed_and_exact_head_bound() -> None:
     document = _valid_document()
     document["state_version"] = 3
     document["repository_identity"] = {
-        "owner": "acme",
-        "repo": "exomonad",
-        "base_branch": "main",
         "remote_url": "https://forgejo.local/acme/exomonad",
     }
     _slice(document, "slice-a").update(
@@ -418,6 +482,9 @@ def _valid_document() -> dict[str, object]:
         "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},
         "gates": [{"name": "plan", "status": "pending"}],
         "events": {"last_consumed_offset": 0},
+        "repository_identity": {
+            "remote_url": "https://forge.example.com/org/repo.git",
+        },
     }
     manifest = build_plan_manifest(
         {"workers": [{"name": "slice-a", "task": "legacy"}]},

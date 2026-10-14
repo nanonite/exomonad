@@ -28,7 +28,8 @@ from tl_loop.rlm.plan_authoring import slices_to_plan_document
 from tl_loop.rlm.slice_spec import SliceSpec
 from tl_loop.state.plan_manifest import PlanManifest, build_plan_manifest
 from tl_loop.state.schema import GateStatus, RepositoryIdentity, RunState, SliceStatus
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def test_binding_round_trips_through_work_plan_manifest_and_child_state(
@@ -139,7 +140,11 @@ def test_binding_rejects_duplicate_ids_across_recursive_slices() -> None:
 
 
 def test_malformed_binding_opens_reconciliation_gate(tmp_path: Path) -> None:
-    config = TLLoopConfig(root_dir=tmp_path, run_id="invalid-binding")
+    config = TLLoopConfig(
+        root_dir=tmp_path,
+        run_id="invalid-binding",
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
 
     with pytest.raises(TLLoopError, match=CHAINLINK_BINDING_RECONCILIATION_GATE_NAME):
         tl_run(
@@ -161,7 +166,11 @@ def test_direct_loop_entrypoint_gates_malformed_binding(tmp_path: Path) -> None:
             del arguments
             raise AssertionError("invalid plans must be rejected before effects")
 
-    config = TLLoopConfig(root_dir=tmp_path, run_id="direct-invalid-binding")
+    config = TLLoopConfig(
+        root_dir=tmp_path,
+        run_id="direct-invalid-binding",
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
     with pytest.raises(TLLoopError, match=CHAINLINK_BINDING_RECONCILIATION_GATE_NAME):
         run_tl_loop(
             "direct-invalid-binding",

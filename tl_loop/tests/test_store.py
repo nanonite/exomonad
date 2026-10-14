@@ -35,10 +35,13 @@ from tl_loop.state.store import (
     CorruptCheckpoint,
     RunStore,
     WorktreeClaimError,
-    create,
     load,
     resume,
 )
+from tl_loop.state.store import (
+    create as create_checkpoint,
+)
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 def test_mid_wave_resume_reconstructs_exact_local_state(tmp_path: Path) -> None:
@@ -74,6 +77,31 @@ def test_mid_wave_resume_reconstructs_exact_local_state(tmp_path: Path) -> None:
     assert loaded.revision == 1
 
 
+def test_create_without_repository_identity_leaves_no_runnable_checkpoint(tmp_path: Path) -> None:
+    run_id = "missing-repository-identity"
+    store = RunStore(run_id, tmp_path)
+
+    with pytest.raises(CorruptCheckpoint, match="repository_identity"):
+        create_checkpoint(run_id, {}, root_dir=tmp_path)
+
+    assert not store.path.exists()
+    assert not store.run_dir.exists()
+
+
+def test_create_persists_exact_canonical_repository_identity(tmp_path: Path) -> None:
+    identity = RepositoryIdentity("https://forge.example.com/org/repo.git")
+
+    state = create_checkpoint(
+        "identified-run",
+        {"repository_identity": identity.to_document()},
+        root_dir=tmp_path,
+    )
+    document = json.loads((tmp_path / "identified-run" / "run.json").read_text())
+
+    assert state.repository_identity == identity
+    assert document["repository_identity"] == {"remote_url": identity.remote_url}
+
+
 def test_role_token_charges_survive_checkpoint_reload(tmp_path: Path) -> None:
     create("run-1", {}, root_dir=tmp_path)
     store = RunStore("run-1", tmp_path)
@@ -100,6 +128,7 @@ def test_legacy_checkpoint_defaults_new_review_state(tmp_path: Path) -> None:
     record = document["slices"]["in-review"]
     for key in ("review_findings", "ci_state", "reviewer_attempt", "repair_attempts"):
         record.pop(key)
+    document["version"] = 4
     store.path.write_text(json.dumps(document), encoding="utf-8")
 
     restored = load(store.path).slices["in-review"]

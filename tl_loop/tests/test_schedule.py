@@ -169,6 +169,7 @@ def _valid_document() -> dict[str, object]:
         "version": SCHEMA_VERSION,
         "revision": 0,
         "run_id": "schedule-test",
+        "repository_identity": {"remote_url": "https://forge.example.test/test/repository.git"},
         "fsm": {"phase": TLPhase.TLPlanning.value, "waiting": []},
         "slices": {"a": _record("a"), "b": _record("b")},
         "budgets": {"ledger": {"tokens": 0, "wall_seconds": 0}},

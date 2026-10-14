@@ -32,7 +32,8 @@ BLOCK_CAUSE_VALUES = frozenset(
     }
 )
 
-SCHEMA_VERSION = 4
+LEGACY_IDENTITY_CHECKPOINT_VERSION = 4
+SCHEMA_VERSION = 5
 REDUCER_VERSION = 1
 
 
@@ -1093,13 +1094,22 @@ class SchemaError(ValueError):
 
 
 def validate(doc: object) -> None:
-    """Validate a complete run-state document, rejecting every unknown key."""
+    """Validate a current run-state document, rejecting every unknown key."""
+    _validate_document(doc, allow_legacy_identity=False)
+
+
+def validate_legacy_identity_checkpoint(doc: object) -> None:
+    """Validate the version-4 migration input without treating it as current."""
+    _validate_document(doc, allow_legacy_identity=True)
+
+
+def _validate_document(doc: object, *, allow_legacy_identity: bool) -> None:
     errors: list[tuple[str, str]] = []
     root = _object(doc, "run", RUN_KEYS, errors)
     if root is None:
         raise SchemaError(errors)
 
-    _version(root, errors)
+    _version(root, errors, allow_legacy_identity=allow_legacy_identity)
     _non_negative_int(root, "revision", "run", errors)
     _non_empty_string(root, "run_id", "run", errors)
     for key in (
@@ -1120,7 +1130,12 @@ def validate(doc: object) -> None:
     if root.get("session_mode") is not None:
         _enum_value(root, "session_mode", "run", SessionMode, errors)
     _validate_review_policy_snapshot(root, "run", errors)
-    _validate_repository_identity(root.get("repository_identity"), "run", errors)
+    _validate_repository_identity(
+        root.get("repository_identity"),
+        "run",
+        errors,
+        allow_legacy=allow_legacy_identity,
+    )
     _validate_repository_identity_migration(
         root.get("repository_identity_migration"),
         "run",
@@ -1163,11 +1178,16 @@ def validate(doc: object) -> None:
         raise SchemaError(errors)
 
 
-def _version(root: dict[str, object], errors: list[tuple[str, str]]) -> None:
+def _version(
+    root: dict[str, object],
+    errors: list[tuple[str, str]],
+    *,
+    allow_legacy_identity: bool,
+) -> None:
     value = root.get("version")
     if type(value) is not int:
         errors.append(("run.version", "must be an integer"))
-    elif value not in {SCHEMA_VERSION}:
+    elif value != (LEGACY_IDENTITY_CHECKPOINT_VERSION if allow_legacy_identity else SCHEMA_VERSION):
         errors.append(("run.version", f"unrecognised version {value}"))
 
 
@@ -1177,7 +1197,9 @@ def _validate_plan_manifest(
     errors: list[tuple[str, str]],
 ) -> None:
     if value is None:
-        errors.append(("run.plan_manifest", "is required for schema v4 checkpoints"))
+        errors.append(
+            ("run.plan_manifest", f"is required for schema v{SCHEMA_VERSION} checkpoints")
+        )
         return
     if not isinstance(value, Mapping):
         errors.append(("run.plan_manifest", "must be an object"))
@@ -1862,8 +1884,16 @@ def _validate_suspended_dependency(value: object, path: str, errors: list[tuple[
     )
 
 
-def _validate_repository_identity(value: object, path: str, errors: list[tuple[str, str]]) -> None:
+def _validate_repository_identity(
+    value: object,
+    path: str,
+    errors: list[tuple[str, str]],
+    *,
+    allow_legacy: bool,
+) -> None:
     if value is None:
+        if not allow_legacy:
+            errors.append((f"{path}.repository_identity", "is required for current checkpoints"))
         return
     identity_path = f"{path}.repository_identity"
     if not isinstance(value, Mapping):
@@ -1875,10 +1905,16 @@ def _validate_repository_identity(value: object, path: str, errors: list[tuple[s
         _non_empty_string(value, "remote_url", identity_path, errors)
         if isinstance(remote_url, str):
             try:
-                if canonical_repository_url(remote_url) != remote_url:
+                canonical_url = canonical_repository_url(remote_url)
+                if not allow_legacy and canonical_url != remote_url:
                     errors.append((identity_path, "remote_url must already be canonical"))
             except ValueError as error:
                 errors.append((identity_path, str(error)))
+        return
+    if not allow_legacy:
+        errors.append(
+            (identity_path, "current checkpoints require exactly one canonical remote_url")
+        )
         return
     if (
         not keys <= LEGACY_REPOSITORY_IDENTITY_KEYS

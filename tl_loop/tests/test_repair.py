@@ -17,7 +17,8 @@ from tl_loop.rlm.repair import (
 )
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.state.schema import BudgetLedger, FSMState, SliceState, SliceStatus, Verdict
-from tl_loop.state.store import RunStore, create
+from tl_loop.state.store import RunStore
+from tl_loop.tests.checkpoint_fixtures import create
 
 
 @dataclass
@@ -132,7 +133,15 @@ def test_valid_repair_round_trips_through_resume_pr() -> None:
     task = str(resume_arguments["task"])
     assert all(
         section in task
-        for section in ("ROOT CAUSE", "PROPOSED SOLUTION", "READ FIRST", "STEPS", "VERIFY", "BOUNDARY", "DONE CRITERIA")
+        for section in (
+            "ROOT CAUSE",
+            "PROPOSED SOLUTION",
+            "READ FIRST",
+            "STEPS",
+            "VERIFY",
+            "BOUNDARY",
+            "DONE CRITERIA",
+        )
     )
     assert "src/owned.py" in task and "just tl-loop-test" in task
     assert pr["attempts"] == 1
