@@ -62,6 +62,32 @@ def _manifest(document: dict[str, object]) -> PlanManifest:
     return build_plan_manifest(_manifest_plan(plan), scope_id="root", owned_branch="main")
 
 
+def _legacy_root_defaults(
+    manifest: PlanManifest,
+    *,
+    leaf_review_owner: str | None = None,
+) -> PlanManifest:
+    owner_fields = (
+        "leaf_review_owner",
+        "aggregate_review_owner",
+        "aggregate_repair_owner",
+    )
+    nodes = []
+    for node in manifest.nodes:
+        if node.name != "architecture":
+            nodes.append(node)
+            continue
+        declaration = dict(node.declaration)
+        declaration.pop("order_explicit", None)
+        contract = dict(node.integration_contract)
+        for name in owner_fields:
+            contract.pop(name, None)
+        if leaf_review_owner is not None:
+            contract["leaf_review_owner"] = leaf_review_owner
+        nodes.append(replace(node, declaration=declaration, integration_contract=contract))
+    return replace(manifest, nodes=tuple(nodes), digest=None)
+
+
 def _post_merge_receipt() -> PostMergeState:
     evidence = {
         "child_id": "completed",
@@ -110,6 +136,8 @@ def _project(
     candidate_issue_id: int | None = 812,
     candidate_completed_task: str = "accepted completed task",
     stale_runtime_digest: bool = False,
+    legacy_root_defaults: bool = False,
+    legacy_leaf_review_owner: str | None = None,
 ) -> tuple[Path, RunStore, RunStore, bytes, bytes]:
     accepted_document = _plan_document(future_issue_id=None)
     candidate_document = _plan_document(
@@ -128,6 +156,11 @@ def _project(
 
     accepted_root = _manifest(accepted_document)
     current_root = _manifest(candidate_document)
+    if legacy_root_defaults:
+        current_root = _legacy_root_defaults(
+            current_root,
+            leaf_review_owner=legacy_leaf_review_owner,
+        )
     accepted_child = accepted_root.child_manifests["root/sub_tl/architecture"]
     current_child = current_root.child_manifests["root/sub_tl/architecture"]
     runtime_digest = "0" * 64 if stale_runtime_digest else None
@@ -392,6 +425,94 @@ def test_apply_restores_only_proven_future_drift_and_keeps_completion_receipt(
     )
     assert not second.applied
     assert len((state_root / "plan-reconciliations.jsonl").read_text().splitlines()) == 1
+
+
+def test_apply_accepts_exact_legacy_parent_defaults_with_fsm_and_dispatch_proof(
+    tmp_path: Path,
+) -> None:
+    state_root, root_store, _child_store, _accepted, _candidate = _project(
+        tmp_path,
+        legacy_root_defaults=True,
+    )
+
+    report = analyze_plan_reconciliation(tmp_path)
+    root_report = report.to_document()["scopes"][0]
+
+    assert report.can_apply, report.blockers
+    equivalence = root_report["legacy_default_equivalences"][0]
+    assert equivalence["node_id"] == "root/sub_tl/architecture"
+    assert equivalence["fields"] == [
+        "declaration.order_explicit",
+        "integration_contract.aggregate_repair_owner",
+        "integration_contract.aggregate_review_owner",
+        "integration_contract.leaf_review_owner",
+    ]
+    assert equivalence["evidence_source"] == (
+        "verified_snapshot_and_matching_fsm_dispatch_identity"
+    )
+
+    result = apply_plan_reconciliation(
+        tmp_path,
+        "Restore the accepted manifest after proving legacy defaults",
+        report.evidence_fingerprint,
+        actor="operator",
+    )
+
+    assert result.applied
+    assert root_store.load().plan_manifest == _manifest(_plan_document(future_issue_id=None))
+    assert (state_root / "plan-reconciliations.jsonl").is_file()
+
+
+def test_legacy_default_equivalence_does_not_hide_explicit_owner_changes(
+    tmp_path: Path,
+) -> None:
+    _state_root, _root_store, _child_store, _accepted, _candidate = _project(
+        tmp_path,
+        legacy_root_defaults=True,
+        legacy_leaf_review_owner="aggregate",
+    )
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    root = report["scopes"][0]
+
+    assert not report["can_apply"]
+    equivalent_fields = root["legacy_default_equivalences"][0]["fields"]
+    assert "integration_contract.leaf_review_owner" not in equivalent_fields
+    assert any(
+        blocker["code"] == "protected_identity_unproven"
+        and blocker["node_id"] == "root/sub_tl/architecture"
+        for blocker in report["blockers"]
+    )
+
+
+def test_legacy_default_equivalence_requires_accepted_fsm_digest(tmp_path: Path) -> None:
+    _state_root, root_store, _child_store, _accepted, _candidate = _project(
+        tmp_path,
+        legacy_root_defaults=True,
+    )
+    state = root_store.load()
+    phase = replace(state.recursive_fsm, plan_digest=state.plan_manifest.digest)
+    root_store.checkpoint(
+        phase,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    root = report["scopes"][0]
+
+    assert not report["can_apply"]
+    assert root["legacy_default_equivalences"] == []
+    assert any(
+        blocker["code"] == "protected_identity_unproven"
+        and blocker["node_id"] == "root/sub_tl/architecture"
+        for blocker in report["blockers"]
+    )
 
 
 def test_apply_requires_the_exact_dry_run_fingerprint(tmp_path: Path) -> None:

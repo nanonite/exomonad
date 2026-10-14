@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .plan_manifest import PlanManifest
 from .plan_reconciliation_declarations import _declaration_changes, _manifest_node_summary
+from .plan_reconciliation_legacy import proven_legacy_default_fields
 from .plan_reconciliation_ownership import _runtime_record_summary, _slice_ownership_summary
 from .plan_reconciliation_report import (
     _persisted_stages,
@@ -39,6 +40,11 @@ class ReconciliationScope:
         phase = self.state.recursive_fsm
         phase_digest = getattr(phase, "plan_digest", None)
         accepted_digest = self.accepted.digest if self.accepted else None
+        legacy_equivalences = (
+            proven_legacy_default_fields(self.current, self.accepted, self.state)
+            if self.accepted is not None
+            else {}
+        )
         current_order = getattr(phase, "current_order", None)
         expected_stages = _stage_projection(self.accepted) if self.accepted else ()
         persisted_stages = _persisted_stages(self.state)
@@ -73,6 +79,16 @@ class ReconciliationScope:
                 self.protected_node_ids,
                 blocked_node_ids,
             ),
+            "legacy_default_equivalences": [
+                {
+                    "node_id": _safe_text(node_id),
+                    "fields": list(fields),
+                    "manifest_schema_version": self.current.schema_version,
+                    "accepted_manifest_sha256": accepted_digest,
+                    "evidence_source": "verified_snapshot_and_matching_fsm_dispatch_identity",
+                }
+                for node_id, fields in sorted(legacy_equivalences.items())
+            ],
         }
 
 

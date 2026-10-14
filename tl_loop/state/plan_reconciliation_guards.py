@@ -7,6 +7,7 @@ from tl_loop.fsm.post_merge import PostMergePhase
 from tl_loop.fsm.scope import TLRunning
 
 from .plan_manifest import ManifestNode, PlanManifest
+from .plan_reconciliation_legacy import proven_legacy_default_fields
 from .plan_reconciliation_models import ReconciliationScope
 from .plan_reconciliation_ownership import _records_for
 from .plan_reconciliation_report import (
@@ -53,13 +54,17 @@ def _node_blockers(
 ) -> list[PlanRevisionBlocker]:
     current_nodes = {node.node_id: node for node in view.current.nodes}
     target_nodes = {node.node_id: node for node in target.nodes}
+    legacy_equivalences = proven_legacy_default_fields(view.current, target, view.state)
     blockers = []
     for node_id in sorted(set(current_nodes) | set(target_nodes)):
         current, accepted = current_nodes.get(node_id), target_nodes.get(node_id)
         if current is None or accepted is None:
             blockers.append(_blocker("node_topology_drift", node_id, view.current.scope_id))
         elif changed_node_fields(current, accepted) and _protected_change_unproven(
-            view, current, accepted
+            view,
+            current,
+            accepted,
+            legacy_equivalences.get(node_id, ()),
         ):
             blockers.append(_blocker("protected_identity_unproven", node_id, view.current.scope_id))
     return blockers
@@ -69,8 +74,13 @@ def _protected_change_unproven(
     view: ReconciliationScope,
     current: ManifestNode,
     accepted: ManifestNode,
+    equivalent_fields: tuple[str, ...] = (),
 ) -> bool:
-    fields = changed_node_fields(current, accepted)
+    fields = tuple(
+        field for field in changed_node_fields(current, accepted) if field not in equivalent_fields
+    )
+    if not fields:
+        return False
     if fields == ("child_manifest_digest",) and _has_materialized_child(view, current.name):
         return False
     return _node_is_protected(view.state, current.name)
