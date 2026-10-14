@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Require canonical repository identity before TL run creation and continuation (#1204)
 - Migrate legacy repository identity checkpoints with durable audit (#1203)
 - Canonicalize repository URLs across runtime and effect protocol (#1202)
 - Exercise live-shaped reconciliation through aggregate PR adoption (#1197)

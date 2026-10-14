@@ -19,26 +19,25 @@ from pathlib import Path
 
 import pytest
 
+import tl_loop.loop.driver as driver_module
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import JsonObject
-from tl_loop.fsm.post_merge import PostMergePhase
-from tl_loop.fsm.scope import TLDone as RecursiveTLDone
 from tl_loop.loop.driver import (
     REPOSITORY_IDENTITY_GATE_NAME,
-    AggregatePublicationRejected,
-    LoopCancelled,
     TLLoopConfig,
     TLLoopError,
+    WorkPlan,
+    _resolve_repository_identity_detail,
     _validate_aggregate_repository_identity,
     run_tl_loop,
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.state.legacy_manifest import LegacyManifestDisposition, reconcile_legacy_manifest
+from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import GateStatus, RepositoryIdentity, SliceStatus
 from tl_loop.state.store import RunStore, create
 from tl_loop.tests.test_driver import IntegrationTransport, SyntheticQueue
 from tl_loop.tests.test_legacy_manifest_convergence import (
-    CHAINLINK_ISSUE_ID,
     RUN_ID,
     SLICE_ID,
     _active_legacy_slice,
@@ -105,15 +104,20 @@ class RepositoryIdentityTransport(IntegrationTransport):
         return super().call_tool(role, name, tool_name, arguments)
 
 
-def _resolved_identity_payload() -> JsonObject:
-    return {"remote_url": "https://forge.example.com/org/repo.git"}
+def _resolved_identity_payload(
+    remote_url: str = "https://forge.example.com/org/repo.git",
+) -> JsonObject:
+    return {"remote_url": remote_url}
 
 
-def _transport_with_identity(resolved: bool) -> RepositoryIdentityTransport:
+def _transport_with_identity(
+    resolved: bool,
+    remote_url: str = "https://forge.example.com/org/repo.git",
+) -> RepositoryIdentityTransport:
     base = _merged_watcher_transport()
     return RepositoryIdentityTransport(
         snapshots=base.snapshots,
-        identity_response=_resolved_identity_payload() if resolved else None,
+        identity_response=_resolved_identity_payload(remote_url) if resolved else None,
     )
 
 
@@ -140,29 +144,21 @@ def _run_bounded(config: TLLoopConfig, effects: EffectClient, tmp_path: Path):
         timer.cancel()
 
 
-def test_continuation_resolves_null_identity_and_adopts_merged_pr(tmp_path: Path) -> None:
+def test_continuation_without_child_identity_proof_stays_parked(tmp_path: Path) -> None:
     _seed_without_repository_identity(tmp_path)
     config = replace(_config(), repository_identity=None)
     transport = _transport_with_identity(resolved=True)
     effects = EffectClient(transport)
 
-    try:
-        result = _run_bounded(config, effects, tmp_path)
-    except LoopCancelled:
-        raise AssertionError(
-            "run_tl_loop did not resolve repository identity and converge to "
-            "TLDone -- #1062 regressed"
-        ) from None
+    result = _run_bounded(config, effects, tmp_path)
 
     final = result.final_state
-    assert final.repository_identity == RepositoryIdentity("https://forge.example.com/org/repo.git")
-    assert isinstance(final.recursive_fsm, RecursiveTLDone)
-    assert final.slices[SLICE_ID].status is SliceStatus.MERGED
-    assert final.slices[SLICE_ID].post_merge is not None
-    assert final.slices[SLICE_ID].post_merge.phase is PostMergePhase.COMPLETE
-    assert not final.gates
-    # Exactly one identity resolution call, never routed through the watcher
-    # for identity purposes.
+    assert final.repository_identity is None
+    assert final.repository_identity_migration is None
+    assert final.slices[SLICE_ID].status is SliceStatus.IN_REVIEW
+    assert final.slices[SLICE_ID].post_merge is None
+    assert any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in final.gates)
+    assert result.diagnostics["repository_identity_blocker"] == "missing"
     assert len(transport.identity_calls) == 1
 
 
@@ -182,51 +178,59 @@ def test_failed_resolution_opens_named_gate_without_raising_or_guessing(tmp_path
     assert final.slices[SLICE_ID].status is not SliceStatus.MERGED
 
 
-def test_beast_root_missing_identity_with_legacy_child_falsely_rejects_matching_repository(
+def test_beast_root_missing_identity_adopts_matching_legacy_child_repository(
     tmp_path: Path,
 ) -> None:
-    """Reproduce #1201 from temporary root/child checkpoint shapes only.
-
-    The root has no identity while its completed architecture child has the
-    historical five-field identity. Current authority resolves to the same
-    remote URL, but aggregate validation rejects the missing root identity as
-    a repository mismatch before it can adopt the existing publication.
-    """
-    root_store, root_state = _seed_without_repository_identity(tmp_path)
+    """Reproduce the historical root/child identity shape in temporary state."""
     child_run_id = "substitution-model-architecture-stage"
+    remote_url = "http://localhost:3000/exomonad/beast-rs.git"
     legacy_child_identity = {
         "owner": "exomonad",
         "repo": "beast-rs",
         "base_branch": "main",
         "forge_host": "localhost",
-        "remote_url": "http://localhost:3000/exomonad/beast-rs.git",
+        "remote_url": remote_url,
     }
+    plan = {
+        "sub_tls": [
+            {
+                "name": child_run_id,
+                "task": "integrate architecture changes",
+                "order": 1,
+                "plan": {"leaves": []},
+            }
+        ]
+    }
+    root_manifest = build_plan_manifest(plan, scope_id=RUN_ID, owned_branch="main")
+    create(RUN_ID, {"plan_manifest": root_manifest.to_document()}, root_dir=tmp_path)
+    root_store = RunStore(RUN_ID, tmp_path)
+    child_manifest = root_manifest.child_manifests[f"{RUN_ID}/sub_tl/{child_run_id}"]
     child_state = create(
         child_run_id,
         {
+            "parent_run_id": RUN_ID,
             "owner_branch": "main.substitution-model-architecture-stage",
+            "plan_manifest": child_manifest.to_document(),
             "repository_identity": legacy_child_identity,
         },
         root_dir=root_store.run_dir,
     )
-    assert root_state.repository_identity is None
-    assert child_state.repository_identity == RepositoryIdentity(
-        "http://localhost:3000/exomonad/beast-rs.git"
+    assert root_store.load().repository_identity is None
+    assert child_state.repository_identity == RepositoryIdentity(remote_url)
+
+    transport = _transport_with_identity(resolved=True, remote_url=remote_url)
+    effects = EffectClient(transport)
+    _validate_aggregate_repository_identity(
+        child_run_id,
+        replace(_config(), repository_identity=None, branch="main"),
+        effects,
+        [],
+        root_store,
+        publication_attempt=1,
     )
 
-    transport = _transport_with_identity(resolved=True)
-    effects = EffectClient(transport)
-    with pytest.raises(AggregatePublicationRejected) as rejected:
-        _validate_aggregate_repository_identity(
-            "substitution-model-architecture-stage",
-            replace(_config(), repository_identity=None, branch="main"),
-            effects,
-            [],
-            root_store,
-            publication_attempt=1,
-        )
-
-    assert rejected.value.error_kind == "repository_identity_mismatch"
+    assert root_store.load().repository_identity == RepositoryIdentity(remote_url)
+    assert root_store.load().repository_identity_migration is not None
     assert transport.identity_calls == [{}]
 
 
@@ -235,21 +239,98 @@ def test_conflicting_supplied_identity_still_raises(tmp_path: Path) -> None:
     store.set_repository_identity(RepositoryIdentity("https://forge.example.com/org/repo.git"))
     config = replace(
         _config(),
-        repository_identity=RepositoryIdentity("https://forge.example.com/a-different-org/repo.git"),
+        repository_identity=RepositoryIdentity(
+            "https://forge.example.com/a-different-org/repo.git"
+        ),
     )
     transport = _transport_with_identity(resolved=True)
     effects = EffectClient(transport)
 
-    with pytest.raises(TLLoopError, match="continuation repository identity differs"):
+    with pytest.raises(TLLoopError, match="repository_identity_conflict"):
         _run_bounded(config, effects, tmp_path)
 
 
-def test_previously_blocked_slice_recovers_once_identity_becomes_available(
+@pytest.mark.parametrize(
+    ("payload", "expected_code"),
+    [
+        (None, "unavailable"),
+        ({}, "missing"),
+        ({"remote_url": 17}, "malformed"),
+        ({"remote_url": "https://forge.example.com/org/repo.git?route=other"}, "ambiguous"),
+    ],
+)
+def test_identity_authority_failures_have_distinct_codes(
+    payload: JsonObject | None,
+    expected_code: str,
+) -> None:
+    transport = _transport_with_identity(resolved=True)
+    transport.identity_response = payload
+
+    identity, failure_code = _resolve_repository_identity_detail(
+        _config(), EffectClient(transport), []
+    )
+
+    assert identity is None
+    assert failure_code == expected_code
+
+
+def test_unavailable_identity_does_not_create_a_new_run(tmp_path: Path) -> None:
+    run_id = "missing-identity-new-run"
+    store = RunStore(run_id, tmp_path)
+    transport = _transport_with_identity(resolved=False)
+
+    with pytest.raises(TLLoopError, match="repository_identity_unavailable"):
+        run_tl_loop(
+            run_id,
+            WorkPlan(),
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=replace(_config(), run_id=run_id, repository_identity=None),
+            root_dir=tmp_path,
+        )
+
+    assert not store.path.exists()
+
+
+def test_new_run_create_includes_resolved_identity_atomically(tmp_path: Path, monkeypatch) -> None:
+    run_id = "identity-before-create"
+    actual_create = driver_module.create
+    observed: dict[str, object] = {}
+
+    def create_with_identity(run_id, root_spec, *, root_dir):
+        observed.update(root_spec)
+        assert root_spec["repository_identity"] == {
+            "remote_url": "https://forge.example.com/org/repo.git"
+        }
+        return actual_create(run_id, root_spec, root_dir=root_dir)
+
+    monkeypatch.setattr(driver_module, "create", create_with_identity)
+    transport = _transport_with_identity(resolved=True)
+
+    run_tl_loop(
+        run_id,
+        WorkPlan(),
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=replace(
+            _config(),
+            run_id=run_id,
+            repository_identity=None,
+            ledger_run_id=None,
+            keep_alive_on_waiting=False,
+        ),
+        root_dir=tmp_path,
+    )
+
+    state = RunStore(run_id, tmp_path).load()
+    assert state.repository_identity == RepositoryIdentity("https://forge.example.com/org/repo.git")
+    assert observed["repository_identity"] == state.repository_identity.to_document()
+
+
+def test_missing_identity_without_child_proof_stays_blocked_after_lookup_recovers(
     tmp_path: Path,
 ) -> None:
-    """A slice parked by a failed resolution must resume through the same
-    post-merge entry point once identity becomes available -- no new spawn,
-    branch, or duplicate merge."""
+    """A current remote cannot establish historical ownership without child proof."""
     _seed_without_repository_identity(tmp_path)
     config = replace(_config(), repository_identity=None)
 
@@ -261,31 +342,16 @@ def test_previously_blocked_slice_recovers_once_identity_becomes_available(
     assert parked.final_state.slices[SLICE_ID].status is not SliceStatus.MERGED
 
     recovering_transport = _transport_with_identity(resolved=True)
-    try:
-        recovered = _run_bounded(config, EffectClient(recovering_transport), tmp_path)
-    except LoopCancelled:
-        raise AssertionError(
-            "a previously-blocked slice did not recover once repository "
-            "identity became available -- #1062 regressed"
-        ) from None
-
+    recovered = _run_bounded(config, EffectClient(recovering_transport), tmp_path)
     final = recovered.final_state
-    assert final.repository_identity is not None
-    assert final.slices[SLICE_ID].status is SliceStatus.MERGED
-    assert final.slices[SLICE_ID].post_merge is not None
-    assert final.slices[SLICE_ID].post_merge.phase is PostMergePhase.COMPLETE
-    assert isinstance(final.recursive_fsm, RecursiveTLDone)
-    assert not final.gates
-    # Exactly one merge, one Chainlink close, one changelog, one push --
-    # recovery reused the existing owner/PR, it never re-dispatched or
-    # re-merged.
+    assert final.repository_identity is None
+    assert final.slices[SLICE_ID].status is SliceStatus.IN_REVIEW
+    assert final.slices[SLICE_ID].post_merge is None
+    assert recovered.diagnostics["repository_identity_blocker"] == "missing"
+    assert any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in final.gates)
     assert [name for name, _ in recovering_transport.calls if name == "merge_pr"] == []
-    assert len([n for n, _ in recovering_transport.calls if n == "chainlink_issue_close"]) == 1
-    assert len([n for n, _ in recovering_transport.calls if n == "post_merge_changelog"]) == 1
-    assert len([n for n, _ in recovering_transport.calls if n == "post_merge_push"]) == 1
-    close_calls = [
-        arguments
-        for name, arguments in recovering_transport.calls
-        if name == "chainlink_issue_close"
-    ]
-    assert close_calls[0]["issue_id"] == CHAINLINK_ISSUE_ID
+    assert not any(
+        name in {"chainlink_issue_close", "post_merge_changelog", "post_merge_push"}
+        for name, _ in recovering_transport.calls
+    )
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in recovering_transport.calls)

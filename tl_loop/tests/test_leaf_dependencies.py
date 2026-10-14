@@ -550,7 +550,14 @@ def test_a_dependency_edge_survives_a_restart_from_the_persisted_manifest(
     """
     run_id = "restart-run"
     manifest = build_plan_manifest({"leaves": [leaf_a(), leaf_b("a")]}, scope_id=run_id)
-    create(run_id, {"plan_manifest": manifest.to_document()}, root_dir=tmp_path)
+    create(
+        run_id,
+        {
+            "plan_manifest": manifest.to_document(),
+            "repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"},
+        },
+        root_dir=tmp_path,
+    )
     monkeypatch.setattr(driver, "_run_loop", lambda _run_id, plan, *a, **k: plan)
 
     result = run_tl_loop(
@@ -957,6 +964,11 @@ class _Transport:
     def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
         del role, name
         self.calls.append((tool_name, arguments))
+        if tool_name == "repository_identity":
+            return {
+                "success": True,
+                "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+            }
         if tool_name in {"spawn_leaf", "spawn_worker"}:
             return {"success": True, "result": {"agent_id": f"{tool_name}-agent"}}
         return {"success": True, "result": None}

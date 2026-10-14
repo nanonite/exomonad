@@ -118,6 +118,19 @@ def test_missing_root_identity_migrates_only_with_matching_declared_child(tmp_pa
     assert _read(root.run_dir / "repository-identity-migration.json")["audit"] == audit
 
 
+def test_missing_root_identity_without_child_proof_fails_closed(tmp_path: Path) -> None:
+    create("root", {}, root_dir=tmp_path)
+    root = RunStore("root", tmp_path)
+    before = root.path.read_bytes()
+
+    with pytest.raises(RepositoryIdentityMigrationError) as rejected:
+        root.migrate_repository_identity(RepositoryIdentity(CANONICAL_URL))
+
+    assert rejected.value.code == "missing"
+    assert root.path.read_bytes() == before
+    assert not (root.run_dir / "repository-identity-migration.json").exists()
+
+
 def test_legacy_identity_is_canonicalized_after_authoritative_comparison(tmp_path: Path) -> None:
     legacy = {
         **LEGACY_CHILD_IDENTITY,

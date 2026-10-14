@@ -46,6 +46,7 @@ from tl_loop.state.schema import (
     IntegrationRuntimeState,
     OrderedStageState,
     PublicationBinding,
+    RepositoryIdentity,
     RunState,
     SliceStatus,
 )
@@ -89,6 +90,7 @@ def _failed_ordered_run(
         project_root=tmp_path,
         branch="main",
         session_mode="continue",
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     manifest = _manifest_for_plan(plan, "parent", config)
     parent_slices = _bind_initial_slices(
@@ -97,7 +99,11 @@ def _failed_ordered_run(
     )
     create(
         "parent",
-        {"plan_manifest": manifest.to_document(), "slices": parent_slices},
+        {
+            "plan_manifest": manifest.to_document(),
+            "slices": parent_slices,
+            "repository_identity": config.repository_identity.to_document(),
+        },
         root_dir=state_root,
     )
     parent_store = RunStore("parent", state_root)
@@ -122,9 +128,7 @@ def _failed_ordered_run(
         0,
         current_order=1,
         ordered_stages=(OrderedStageState(1, ("child",)),),
-        integration=IntegrationRuntimeState(
-            sub_tl_states={"child": IntegrationLifecycle.FAILED}
-        ),
+        integration=IntegrationRuntimeState(sub_tl_states={"child": IntegrationLifecycle.FAILED}),
     )
 
     child_manifest = manifest.child_manifests[
@@ -154,6 +158,7 @@ def _failed_ordered_run(
             "parent_branch": "main",
             "parent_run_id": "parent",
             "session_mode": "continue",
+            "repository_identity": config.repository_identity.to_document(),
         },
         root_dir=parent_store.run_dir,
     )
@@ -238,9 +243,7 @@ def test_approved_gate_authorizes_recovery_the_evidence_cannot_prove(tmp_path: P
     _unprovable_child_exit(parent_store)
     _answer(parent_store, GateStatus.APPROVED)
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.recoverable is True
@@ -252,17 +255,13 @@ def test_approved_gate_authorizes_recovery_the_evidence_cannot_prove(tmp_path: P
 
 
 @pytest.mark.parametrize("status", [GateStatus.PENDING, GateStatus.REJECTED])
-def test_unresolved_or_rejected_recovery_stays_gated(
-    tmp_path: Path, status: GateStatus
-) -> None:
+def test_unresolved_or_rejected_recovery_stays_gated(tmp_path: Path, status: GateStatus) -> None:
     """Only approval releases the recovery; the other answers never do."""
     parent_store, plan, config = _failed_ordered_run(tmp_path)
     _unprovable_child_exit(parent_store)
     _answer(parent_store, status)
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.recoverable is False
@@ -281,9 +280,7 @@ def test_rejected_gate_is_never_re_armed_to_pending(tmp_path: Path) -> None:
         "parent",
         plan,
         EmptyQueue(),
-        ReadOnlyEffectClient(
-            EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
-        ),
+        ReadOnlyEffectClient(EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))),
         config=replace(config, active=False),
         root_dir=parent_store.root_dir,
         budgets=BudgetLedger(0, 0),
@@ -350,21 +347,14 @@ def test_approved_recovery_reuses_its_invocation_when_repeated(tmp_path: Path) -
     state = parent_store.load()
     decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
     assert decision is not None
-    first = _reopen_ordered_scope(
-        state, plan, parent_store, decision.task_name, authorized=True
-    )
-    second = _reopen_ordered_scope(
-        first, plan, parent_store, decision.task_name, authorized=True
-    )
+    first = _reopen_ordered_scope(state, plan, parent_store, decision.task_name, authorized=True)
+    second = _reopen_ordered_scope(first, plan, parent_store, decision.task_name, authorized=True)
 
     assert (
         second.slices["child"].dispatch_invocation_id
         == first.slices["child"].dispatch_invocation_id
     )
-    assert (
-        second.slices["child"].dispatch_generation
-        == first.slices["child"].dispatch_generation
-    )
+    assert second.slices["child"].dispatch_generation == first.slices["child"].dispatch_generation
     assert second.recursive_fsm is not None
     assert isinstance(second.recursive_fsm, TLRunning)
     assert (
@@ -504,9 +494,7 @@ def _refail_recovered_child(parent_store: RunStore, reason: str) -> None:
         parent_state.events.last_consumed_offset,
         current_order=1,
         ordered_stages=(OrderedStageState(1, ("child",)),),
-        integration=IntegrationRuntimeState(
-            sub_tl_states={"child": IntegrationLifecycle.FAILED}
-        ),
+        integration=IntegrationRuntimeState(sub_tl_states={"child": IntegrationLifecycle.FAILED}),
     )
 
 
@@ -538,9 +526,7 @@ def test_recovered_child_that_fails_again_is_still_provable(tmp_path: Path) -> N
 
     # A transient second failure needs no operator answer: the checkpoint proves it.
     _refail_recovered_child(parent_store, RETRYABLE_EXIT)
-    transient = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    transient = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert transient is not None
     assert transient.recoverable is True
@@ -587,9 +573,7 @@ def test_second_recovery_mints_a_new_invocation_for_the_second_exit(
     state = parent_store.load()
     decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
     assert decision is not None and decision.authorized is True
-    reopened = _reopen_ordered_scope(
-        state, plan, parent_store, decision.task_name, authorized=True
-    )
+    reopened = _reopen_ordered_scope(state, plan, parent_store, decision.task_name, authorized=True)
     second = reopened.slices["child"]
 
     assert second.dispatch_invocation_id != first.dispatch_invocation_id
@@ -614,9 +598,7 @@ def test_approved_recovery_keeps_publication_ownership(tmp_path: Path) -> None:
     decision = _ordered_terminal_recovery_decision(state, plan, config, parent_store)
 
     assert decision is not None and decision.authorized is True
-    reopened = _reopen_ordered_scope(
-        state, plan, parent_store, decision.task_name, authorized=True
-    )
+    reopened = _reopen_ordered_scope(state, plan, parent_store, decision.task_name, authorized=True)
     child = reopened.slices["child"]
 
     assert child.pr_number == state.slices["child"].pr_number
@@ -646,9 +628,7 @@ def test_approved_gate_does_not_release_an_ownership_failure(tmp_path: Path) -> 
     _unprovable_child_exit(parent_store)
     _answer(parent_store, GateStatus.APPROVED)
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.recoverable is False
@@ -672,9 +652,7 @@ def test_approved_gate_does_not_release_an_unreconciled_effect(tmp_path: Path) -
     )
     _answer(parent_store, GateStatus.APPROVED)
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.recoverable is False
@@ -700,9 +678,7 @@ def test_approved_ownership_failure_dispatches_nothing(tmp_path: Path) -> None:
         "parent",
         plan,
         EmptyQueue(),
-        ReadOnlyEffectClient(
-            EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
-        ),
+        ReadOnlyEffectClient(EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))),
         config=replace(config, active=False),
         root_dir=parent_store.root_dir,
         budgets=BudgetLedger(0, 0),
@@ -731,9 +707,7 @@ def test_unanswered_recovery_opens_exactly_one_pending_gate(tmp_path: Path) -> N
     parent_store, plan, config = _failed_ordered_run(tmp_path)
     _unprovable_child_exit(parent_store)
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.gate_status is None
@@ -746,16 +720,12 @@ def test_unanswered_recovery_opens_exactly_one_pending_gate(tmp_path: Path) -> N
 def test_continue_reopens_only_proven_failed_ordered_child(tmp_path: Path) -> None:
     parent_store, plan, config = _failed_ordered_run(tmp_path)
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
     assert decision is not None
     assert decision.recoverable is True
     assert decision.task_name == "child"
 
-    reopened = _reopen_ordered_scope(
-        parent_store.load(), plan, parent_store, decision.task_name
-    )
+    reopened = _reopen_ordered_scope(parent_store.load(), plan, parent_store, decision.task_name)
 
     assert isinstance(reopened.recursive_fsm, TLRunning)
     assert reopened.slices["child"].status is SliceStatus.SPAWNED
@@ -807,9 +777,7 @@ def test_recovery_keeps_merged_leaf_pending_until_post_merge_completes(
     )
 
     assert isinstance(reopened.recursive_fsm, TLRunning)
-    assert tuple(record.child_id for record in reopened.recursive_fsm.parallel_pending) == (
-        "leaf",
-    )
+    assert tuple(record.child_id for record in reopened.recursive_fsm.parallel_pending) == ("leaf",)
     assert reopened.slices["leaf"].status is SliceStatus.MERGED
     assert reopened.slices["leaf"].pr_number == 41
     assert reopened.slices["leaf"].post_merge == leaf.post_merge
@@ -824,9 +792,7 @@ def test_continue_preserves_accepted_leaf_and_later_pr_evidence(tmp_path: Path) 
     )
     child_state = RunStore("child", parent_store.run_dir).load()
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None and decision.recoverable is True
     publication = child_state.slices["leaf"].publication
@@ -842,9 +808,7 @@ def test_conflicting_child_identity_opens_named_gate_and_keeps_failure(
         child_owner_branch="main.other-child",
     )
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.recoverable is False
@@ -887,9 +851,7 @@ def test_continue_terminal_gate_is_idempotent_and_does_not_consume_events(
 
     assert first.final_state.fsm.phase.value == "tl_failed"
     assert second.final_state.fsm.phase.value == "tl_failed"
-    assert [gate.name for gate in second.final_state.gates] == [
-        "tl-ordered-child-recovery-child"
-    ]
+    assert [gate.name for gate in second.final_state.gates] == ["tl-ordered-child-recovery-child"]
 
 
 def test_continue_recovers_from_manifest_without_reloading_plan(
@@ -956,9 +918,7 @@ def test_new_failure_replaces_stale_exit_marker(tmp_path: Path) -> None:
         integration=child_state.integration,
     )
 
-    driver._record_child_exit_reason(
-        child_store, "sub-TL controller completed an unsafe merge"
-    )
+    driver._record_child_exit_reason(child_store, "sub-TL controller completed an unsafe merge")
 
     refreshed = child_store.exit_diagnostics()
     assert refreshed is not None
@@ -969,19 +929,13 @@ def test_new_failure_replaces_stale_exit_marker(tmp_path: Path) -> None:
 
 def test_repeated_continuation_does_not_reopen_twice(tmp_path: Path) -> None:
     parent_store, plan, config = _failed_ordered_run(tmp_path)
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
     assert decision is not None and decision.recoverable is True
 
-    reopened = _reopen_ordered_scope(
-        parent_store.load(), plan, parent_store, decision.task_name
-    )
+    reopened = _reopen_ordered_scope(parent_store.load(), plan, parent_store, decision.task_name)
     # The second continuation observes a running scope, so it can neither
     # reopen again nor mint a second dispatch intent.
-    assert (
-        _ordered_terminal_recovery_decision(reopened, plan, config, parent_store) is None
-    )
+    assert _ordered_terminal_recovery_decision(reopened, plan, config, parent_store) is None
     assert reopened.slices["child"].dispatch_intent_id == "sub-tl-dispatch"
 
 
@@ -1023,9 +977,7 @@ def test_unbound_stale_exit_marker_cannot_reopen_newer_failure(
         encoding="utf-8",
     )
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.recoverable is False
@@ -1046,9 +998,7 @@ def test_stale_exit_reason_cannot_reopen_newer_failure(tmp_path: Path) -> None:
         integration=child_state.integration,
     )
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.recoverable is False
@@ -1065,9 +1015,7 @@ def test_child_config_declares_parent_manifest_for_recovery(tmp_path: Path) -> N
     """
     parent_store, plan, config = _failed_ordered_run(tmp_path)
     task = plan.sub_tls[0]
-    child_worktree = str(
-        _sub_tl_worktree(config, parent_store.root_dir, parent_store.run_id, task)
-    )
+    child_worktree = str(_sub_tl_worktree(config, parent_store.root_dir, parent_store.run_id, task))
     child_config = _child_config(
         config,
         task,
@@ -1108,9 +1056,7 @@ def test_wrong_controller_identity_is_not_recoverable(tmp_path: Path) -> None:
         integration=state.integration,
     )
 
-    decision = _ordered_terminal_recovery_decision(
-        parent_store.load(), plan, config, parent_store
-    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None
     assert decision.recoverable is False
@@ -1143,6 +1089,7 @@ def test_recreate_starts_replacement_child_after_archiving_nonterminal_checkpoin
         active=False,
         keep_alive_on_waiting=False,
         max_events=8,
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     child_worktree = str(_sub_tl_worktree(config, state_root, "root", plan.sub_tls[0]))
 

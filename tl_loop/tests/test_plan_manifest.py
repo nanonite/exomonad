@@ -405,7 +405,14 @@ def test_continuation_reconstructs_work_plan_without_external_plan(
         },
         scope_id="resume",
     )
-    create("resume", {"plan_manifest": manifest.to_document()}, root_dir=tmp_path)
+    create(
+        "resume",
+        {
+            "plan_manifest": manifest.to_document(),
+            "repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"},
+        },
+        root_dir=tmp_path,
+    )
 
     class EmptySource:
         def get(self, timeout=None):
@@ -416,6 +423,11 @@ def test_continuation_reconstructs_work_plan_without_external_plan(
 
     class NoopTransport:
         def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+                }
             return {"success": True, "result": {}}
 
     monkeypatch.setattr(
@@ -455,6 +467,11 @@ def test_continuation_rejects_reordered_external_plan(tmp_path) -> None:
 
     class NoopTransport:
         def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+                }
             return {"success": True, "result": {}}
 
     reordered = {
@@ -487,6 +504,11 @@ def test_continuation_rejects_changed_external_plan(tmp_path) -> None:
 
     class NoopTransport:
         def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+                }
             return {"success": True, "result": {}}
 
     changed = {
@@ -533,6 +555,11 @@ def test_terminal_checkpoint_rejects_supplied_plan_drift_before_fast_path(tmp_pa
 
     class NoopTransport:
         def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+                }
             return {"success": True, "result": {}}
 
     changed = {

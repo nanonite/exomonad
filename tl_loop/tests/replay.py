@@ -53,6 +53,11 @@ class RecordingTransport:
     ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, copy.deepcopy(arguments)))
+        if tool_name == "repository_identity":
+            return {
+                "success": True,
+                "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+            }
         if tool_name == "watcher_pr_state":
             return {
                 "success": True,
@@ -185,9 +190,7 @@ def replay_fixture(
     # durable run identity) stay stable across replays.
     token_directory = Path(root_dir) / run_id / "escalations"
     token_directory.mkdir(parents=True, exist_ok=True)
-    (token_directory / "run.token").write_text(
-        _replay_token(Path(fixture).stem), encoding="utf-8"
-    )
+    (token_directory / "run.token").write_text(_replay_token(Path(fixture).stem), encoding="utf-8")
     plan = _plan_with_replay_sources(
         _mapping(spec["plan"], "plan"),
         spec.get("child_events"),
@@ -244,7 +247,8 @@ def replay_fixture(
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
         review_clock=None if production_clock else lambda: REPLAY_REVIEW_NOW,
         ledger_run_id=run_id if journal else None,
-        repository_identity=_repository_identity(spec.get("repository_identity")),
+        repository_identity=_repository_identity(spec.get("repository_identity"))
+        or RepositoryIdentity("https://forge.example.com/org/repo.git"),
         session_mode=session_mode,
     )
     run_result = None
@@ -318,6 +322,7 @@ def replay_fixture(
             },
         )
         for tool_name, arguments in transport.calls
+        if tool_name != "repository_identity"
     )
     normalized = normalize_state(cast(dict[str, object], document))
     durable = normalize_durable_state(cast(dict[str, object], document))
@@ -453,9 +458,7 @@ def _seed_controller_epochs(root_dir: Path, spec: Mapping[str, object]) -> None:
     markers = [Path(root_dir) / f"{run_id}.controller-epoch"]
     child_events = spec.get("child_events")
     if isinstance(child_events, Mapping):
-        markers.extend(
-            run_dir / f"{scope}.controller-epoch" for scope in child_events
-        )
+        markers.extend(run_dir / f"{scope}.controller-epoch" for scope in child_events)
     for marker in markers:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(epoch + "\n", encoding="utf-8")

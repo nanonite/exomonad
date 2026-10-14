@@ -24,6 +24,7 @@ from typing import NamedTuple, Protocol, cast
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import (
+    DecodeError,
     JsonObject,
     ServerTimeout,
     ServerUnreachable,
@@ -242,6 +243,7 @@ from tl_loop.state.repository_identity import (
     canonical_repository_url,
     repository_api_coordinates,
 )
+from tl_loop.state.repository_identity_migration import RepositoryIdentityMigrationError
 from tl_loop.state.review_validation import review_validation_disposition
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
@@ -293,6 +295,7 @@ from tl_loop.state.slice_transition import (
 from tl_loop.state.store import (
     DEFAULT_ROOT,
     CheckpointConflict,
+    CorruptCheckpoint,
     QuarantineStorageError,
     RunStore,
     create,
@@ -1312,7 +1315,82 @@ def run_tl_loop(
                 "by correcting the explicit slice binding"
             ) from error
     store = RunStore(run_id, Path(root_dir))
-    existing_state = store.load() if store.path.exists() else None
+    identity_effects: list[EffectIntent] = []
+    checkpoint_error: CorruptCheckpoint | None = None
+    existing_state: RunState | None = None
+    if store.path.exists():
+        try:
+            existing_state = store.load()
+        except CorruptCheckpoint as error:
+            checkpoint_error = error
+    if existing_state is not None:
+        _verify_supplied_plan_before_identity_recovery(
+            run_id,
+            plan,
+            existing_state,
+            selected,
+        )
+    identity_required = _repository_identity_required(existing_state, selected)
+    if checkpoint_error is not None and not identity_required:
+        raise TLLoopError(f"run checkpoint is corrupt: {checkpoint_error}") from checkpoint_error
+    if identity_required:
+        inherited_identity = (
+            selected.repository_identity
+            if selected.parent_run_id is not None
+            or (existing_state is None and selected.repository_identity is not None)
+            or (not selected.active and selected.repository_identity is not None)
+            else None
+        )
+        if inherited_identity is not None:
+            resolution, failure_code = inherited_identity, None
+        else:
+            resolution, failure_code = _resolve_repository_identity_detail(
+                selected, effects, identity_effects
+            )
+        if resolution is None:
+            if checkpoint_error is not None:
+                raise TLLoopError(
+                    f"repository_identity_{failure_code}: existing run checkpoint is unavailable"
+                ) from checkpoint_error
+            if existing_state is None:
+                raise TLLoopError(
+                    f"repository_identity_{failure_code}: no runnable run was created"
+                )
+            return _park_repository_identity_failure(
+                store, failure_code or "unavailable", identity_effects
+            )
+        if selected.repository_identity is not None and selected.repository_identity != resolution:
+            raise TLLoopError(
+                "repository_identity_conflict: configured identity differs from the selected remote"
+            )
+        selected = replace(selected, repository_identity=resolution)
+        if checkpoint_error is not None:
+            try:
+                store.migrate_repository_identity(resolution)
+            except RepositoryIdentityMigrationError as error:
+                raise TLLoopError(
+                    f"repository_identity_{error.code}: existing checkpoint cannot be resumed"
+                ) from error
+            raise TLLoopError("repository_identity_malformed: checkpoint validation failed")
+        if existing_state is not None:
+            evidence_children = (
+                _repository_identity_sub_tl_names(existing_state, store)
+                if existing_state.repository_identity is None
+                else ()
+            )
+            try:
+                existing_state = store.migrate_repository_identity(
+                    resolution,
+                    corroborating_sub_tls=evidence_children,
+                )
+            except RepositoryIdentityMigrationError as error:
+                if error.code == "conflicting":
+                    raise TLLoopError(
+                        "repository_identity_conflict: checkpoint and selected remote differ"
+                    ) from error
+                return _park_repository_identity_failure(store, error.code, identity_effects)
+            if any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in existing_state.gates):
+                existing_state = store.clear_gate(REPOSITORY_IDENTITY_GATE_NAME)
     if existing_state is not None:
         # Before anything reads the gates, so a parked run resumed from a
         # pre-#1119 checkpoint resolves the same per-slice name this code opens.
@@ -1647,6 +1725,7 @@ def run_tl_loop(
         if selected.ledger_run_id is not None or (store.run_dir / "action-journal.json").exists()
         else []
     )
+    effects_log.extend(identity_effects)
     state = _reconcile_legacy_parked_lanes(state, store, effects_log)
     state = _initialize_ordered_runtime(work_plan, state, store)
     try:
@@ -4787,10 +4866,16 @@ def _heal_missing_repository_identity(
     decide whether to retry the adoption that triggered this healing. A
     successful resolution also removes the now-resolved recovery gate.
     """
-    resolved = _resolve_repository_identity(config, effects, effects_log)
+    resolved, _failure_code = _resolve_repository_identity_detail(config, effects, effects_log)
     if resolved is None:
         return store.set_gate(REPOSITORY_IDENTITY_GATE_NAME)
-    state = store.set_repository_identity(resolved)
+    try:
+        state = store.migrate_repository_identity(
+            resolved,
+            corroborating_sub_tls=_repository_identity_sub_tl_names(state, store),
+        )
+    except RepositoryIdentityMigrationError:
+        return store.set_gate(REPOSITORY_IDENTITY_GATE_NAME)
     if any(gate.name == REPOSITORY_IDENTITY_GATE_NAME for gate in state.gates):
         state = store.clear_gate(REPOSITORY_IDENTITY_GATE_NAME)
     return state
@@ -13173,26 +13258,46 @@ def _validate_aggregate_repository_identity(
     publication_attempt: int,
 ) -> None:
     """Refuse watcher adoption when the host repository differs from the run."""
-    persisted = store.load().repository_identity
-    try:
-        observed = _resolve_repository_identity(config, effects, effects_log)
-    except TLLoopError:
-        raise
-    except (ConnectionError, OSError, RuntimeError, TimeoutError, ToolUnavailableError) as error:
-        LOGGER.warning(
-            "[TL loop] aggregate repository identity unavailable: error_type=%s",
-            type(error).__name__,
-        )
-        observed = None
+    state = store.load()
+    observed, failure_code = _resolve_repository_identity_detail(config, effects, effects_log)
     if observed is None:
         raise _aggregate_reconciliation_rejected(
             slice_id,
-            "repository_identity_unavailable",
+            f"repository_identity_{failure_code or 'unavailable'}",
             publication_attempt,
             ("authoritative_repository_identity",),
-            retryable=True,
+            retryable=failure_code in {"missing", "unavailable", "timeout"},
         )
-    if not _aggregate_repository_matches(persisted, config, observed):
+    if config.repository_identity is not None and config.repository_identity != observed:
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            "repository_identity_mismatch",
+            publication_attempt,
+            ("repository_identity",),
+            retryable=False,
+        )
+    evidence_children = (
+        _repository_identity_sub_tl_names(state, store) if state.repository_identity is None else ()
+    )
+    try:
+        state = store.migrate_repository_identity(
+            observed,
+            corroborating_sub_tls=evidence_children,
+        )
+    except RepositoryIdentityMigrationError as error:
+        reason = (
+            "repository_identity_mismatch"
+            if error.code == "conflicting"
+            else f"repository_identity_{error.code}"
+        )
+        raise _aggregate_reconciliation_rejected(
+            slice_id,
+            reason,
+            publication_attempt,
+            ("repository_identity_migration",),
+            retryable=error.code in {"missing", "unavailable", "stale"},
+        ) from error
+    if not _aggregate_repository_matches(state.repository_identity, config, observed):
         raise _aggregate_reconciliation_rejected(
             slice_id,
             "repository_identity_mismatch",
@@ -15458,35 +15563,137 @@ def _resolve_repository_identity(
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
 ) -> RepositoryIdentity | None:
-    """Resolve repository identity once from the pinned git remote.
+    """Resolve a canonical repository URL without exposing transport details."""
+    identity, _failure_code = _resolve_repository_identity_detail(config, effects, effects_log)
+    return identity
 
-    A single read-only effect call through the same EffectJournal executor as
-    every other effect -- never the watcher, since identity is static run
-    configuration, not a per-PR observation.
-    Returns None on any failure so the caller opens a durable gate instead of
-    raising or guessing an identity (#1062).
-    """
-    result = _invoke(
-        "repository_identity",
-        "repository_identity",
-        {},
-        config.active,
-        cast(EffectClient, effects),
-        lambda client: client.repository_identity(),
-        effects_log,
-        raise_on_failure=False,
+
+def _repository_identity_required(
+    state: RunState | None,
+    config: TLLoopConfig,
+) -> bool:
+    """Require identity before any new or resumable controller can act."""
+    if state is None or not _is_terminal_phase(_phase_from_state(state)):
+        return True
+    return isinstance(state.recursive_fsm, RecursiveTLFailed) and (
+        config.session_mode == "continue" or config.ordered_recovery
     )
-    if result is None or result.success is not True or not isinstance(result.result, Mapping):
-        return None
+
+
+def _verify_supplied_plan_before_identity_recovery(
+    run_id: str,
+    plan: WorkPlan | Mapping[str, object] | None,
+    state: RunState,
+    config: TLLoopConfig,
+) -> None:
+    """Reject stale declarations before identity migration can write a checkpoint."""
+    manifest = state.plan_manifest
+    if plan is None or manifest is None or _manifest_is_legacy(manifest):
+        return
+    supplied_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
+    candidate = retain_scope_revisions(_candidate_manifest(supplied_plan, run_id, config), manifest)
+    if candidate.digest == manifest.digest:
+        return
+    if _is_terminal_phase(_phase_from_state(state)):
+        raise TLLoopError(
+            "terminal checkpoint plan digest "
+            f"{manifest.digest} differs from supplied plan digest {candidate.digest}; "
+            "archive the completed run before starting a new plan"
+        )
+    raise TLLoopError(
+        "external plan differs from the persisted manifest; use "
+        "`exomonad plan revise --dry-run` and apply the audited revision. "
+        "If revision analysis reports unversioned drift, inspect "
+        "`exomonad plan reconcile --dry-run` and apply only with its "
+        "current evidence fingerprint."
+    )
+
+
+def _repository_identity_sub_tl_names(
+    state: RunState,
+    store: RunStore,
+) -> tuple[str, ...]:
+    """Return existing direct child scopes declared by this run's manifest."""
+    manifest = state.plan_manifest
+    if manifest is None:
+        return ()
+    return tuple(
+        node.name
+        for node in manifest.nodes
+        if node.kind == "sub_tl"
+        and node.parent_id == manifest.scope_id
+        and RunStore(node.name, store.run_dir).path.is_file()
+    )
+
+
+def _park_repository_identity_failure(
+    store: RunStore,
+    failure_code: str,
+    effects: Sequence[EffectIntent],
+) -> TLRunResult:
+    """Keep an existing run parked until its identity blocker is resolved."""
+    parked = store.set_gate(REPOSITORY_IDENTITY_GATE_NAME)
+    return TLRunResult(
+        parked,
+        tuple(effects),
+        (),
+        (),
+        diagnostics={"repository_identity_blocker": failure_code},
+    )
+
+
+def _resolve_repository_identity_detail(
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> tuple[RepositoryIdentity | None, str | None]:
+    """Classify authority failures without logging the supplied remote URL."""
+    del config
+    try:
+        result = _invoke(
+            "repository_identity",
+            "repository_identity",
+            {},
+            True,
+            cast(EffectClient, effects),
+            lambda client: client.repository_identity(),
+            effects_log,
+            raise_on_failure=False,
+        )
+    except ToolUnavailableError:
+        return None, "unavailable"
+    except (ServerTimeout, TimeoutError):
+        return None, "timeout"
+    except DecodeError:
+        return None, "malformed"
+    except (ServerUnreachable, TransportError, OSError, ConnectionError):
+        return None, "unavailable"
+    if result is None:
+        return None, "unavailable"
+    if result.success is not True:
+        failure_code = "malformed" if result.success is None else "unavailable"
+        if result.error_kind == "timeout":
+            failure_code = "timeout"
+        return None, failure_code
+    if not isinstance(result.result, Mapping):
+        return None, "malformed"
+    if "remote_url" not in result.result:
+        return None, "missing"
     remote_url = result.result.get("remote_url")
-    if not isinstance(remote_url, str) or not remote_url:
-        return None
+    if remote_url is None or remote_url == "":
+        return None, "missing"
+    if not isinstance(remote_url, str):
+        return None, "malformed"
     try:
         identity = RepositoryIdentity(canonical_repository_url(remote_url))
-    except ValueError:
-        return None
+    except ValueError as error:
+        detail = str(error)
+        failure_code = (
+            "ambiguous" if "ambiguous" in detail or "credential marker" in detail else "malformed"
+        )
+        return None, failure_code
     LOGGER.info("[TL loop] Resolved canonical repository identity")
-    return identity
+    return identity, None
 
 
 def _watcher_snapshot(

@@ -115,6 +115,11 @@ class ScriptedTransport:
     ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, arguments))
+        if tool_name == "repository_identity":
+            return {
+                "success": True,
+                "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+            }
         if tool_name in {"spawn_worker", "spawn_leaf"}:
             self.spawn_calls.append(arguments)
             attempt = len(self.spawn_calls)
@@ -267,9 +272,7 @@ def _invoke(
         _plan(),
         SyntheticQueue([]),
         EffectClient(transport),
-        config=_config(
-            tmp_path, run_id, clock, dispatch_retry_limit=dispatch_retry_limit
-        ),
+        config=_config(tmp_path, run_id, clock, dispatch_retry_limit=dispatch_retry_limit),
         root_dir=tmp_path,
     )
 
@@ -313,9 +316,7 @@ def test_an_unknown_code_is_terminal_and_never_retryable(
 ) -> None:
     clock = ScriptedClock()
     run_id = f"unknown-{code or 'absent'}"
-    transport = ScriptedTransport(
-        code=code, rejections=1, project_root=tmp_path, run_id=run_id
-    )
+    transport = ScriptedTransport(code=code, rejections=1, project_root=tmp_path, run_id=run_id)
 
     result = _invoke(tmp_path, run_id, clock, transport)
 
@@ -406,9 +407,7 @@ def test_repeated_reconciliation_issues_exactly_one_authoritative_spawn(
     assert spawns_after_first == 2
     assert len(transport.spawn_calls) == 2
     for result in (first, second, third):
-        assert result.final_state.slices["leaf-a"].status is (
-            SliceStatus.DISPATCH_UNCONFIRMED
-        )
+        assert result.final_state.slices["leaf-a"].status is (SliceStatus.DISPATCH_UNCONFIRMED)
         assert result.final_state.slices["leaf-a"].attempts == 2
     assert len(set(transport.spawned_intent_ids())) == 2
 
@@ -583,9 +582,7 @@ def test_a_refusal_at_or_after_the_intents_ledger_position_is_correlated(
     store = _floored_store(tmp_path, ledger_floor=4)
     config = _config(tmp_path, "root", clock)
 
-    assert _resolve_code(tmp_path, "root", config, store, ledger_floor=4) == (
-        BRANCH_EXISTS
-    )
+    assert _resolve_code(tmp_path, "root", config, store, ledger_floor=4) == (BRANCH_EXISTS)
     # The floor is the boundary: the same row is invisible one position later.
     assert _resolve_code(tmp_path, "root", config, store, ledger_floor=5) is None
     del store

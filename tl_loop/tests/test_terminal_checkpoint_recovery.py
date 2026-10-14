@@ -54,6 +54,7 @@ from tl_loop.state.schema import (
     OrderedStageState,
     ParkCause,
     PublicationBinding,
+    RepositoryIdentity,
     SliceStatus,
 )
 from tl_loop.state.store import RunStore, create
@@ -116,6 +117,7 @@ def _config(state_root: Path, root: Path) -> TLLoopConfig:
         branch="main",
         session_mode="continue",
         active=False,
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
 
 
@@ -139,6 +141,7 @@ def _terminal_failed_checkpoints(
             "slices": _bind_initial_slices(
                 _initial_slices(plan, config, state_root, ROOT_RUN), manifest
             ),
+            "repository_identity": config.repository_identity.to_document(),
         },
         root_dir=state_root,
     )
@@ -192,6 +195,7 @@ def _terminal_failed_checkpoints(
             "parent_branch": "main",
             "parent_run_id": ROOT_RUN,
             "session_mode": "continue",
+            "repository_identity": config.repository_identity.to_document(),
         },
         root_dir=parent_store.run_dir,
     )

@@ -87,6 +87,11 @@ class ScriptedRefusals:
     ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, arguments))
+        if tool_name == "repository_identity":
+            return {
+                "success": True,
+                "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+            }
         if tool_name in {"spawn_worker", "spawn_leaf"}:
             self.spawn_calls.append(arguments)
             if str(arguments.get("name")) in self.refused:
@@ -286,18 +291,14 @@ def test_an_exhausted_slice_does_not_starve_its_siblings(tmp_path: Path) -> None
     )
 
     assert state.slices["worker-a"].status is SliceStatus.DISPATCH_FAILED
-    assert [gate.name for gate in state.gates] == [
-        f"{DISPATCH_FAILURE_GATE_PREFIX}worker-a"
-    ]
+    assert [gate.name for gate in state.gates] == [f"{DISPATCH_FAILURE_GATE_PREFIX}worker-a"]
     # The sibling was reached in this very pass, and the accepted request left
     # it waiting for its own authoritative confirmation rather than parked.
     assert transport.dispatched_names() == ["worker-a", "leaf-b"]
     assert state.slices["leaf-b"].status is SliceStatus.DISPATCH_UNCONFIRMED
     assert state.slices["leaf-b"].dispatch_error is None
     # Exactly one slice is parked: the refusal did not spread to the sibling.
-    assert [gate.name for gate in state.gates].count(
-        f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-b"
-    ) == 0
+    assert [gate.name for gate in state.gates].count(f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-b") == 0
 
 
 def test_a_held_run_reports_failed_while_its_gates_stay_pending(tmp_path: Path) -> None:
@@ -350,9 +351,7 @@ def test_a_held_run_reopens_neither_gate_on_a_later_pass(tmp_path: Path) -> None
 
     resumed = _invoke(tmp_path, clock, transport, ["leaf-a", "leaf-b"])
 
-    assert sorted(gate.name for gate in resumed.gates) == sorted(
-        gate.name for gate in held.gates
-    )
+    assert sorted(gate.name for gate in resumed.gates) == sorted(gate.name for gate in held.gates)
     assert all(gate.status is GateStatus.PENDING for gate in resumed.gates)
     assert "tl.gate_opened" not in transport.event_types()[events_before:]
     # Neither is the exhausted slice re-driven: both are parked, not candidates.

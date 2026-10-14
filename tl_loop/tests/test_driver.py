@@ -269,6 +269,7 @@ def _confirmed_worker(
         run_id,
         {
             "slices": _initial_slices(plan, TLLoopConfig(), root, run_id),
+            "repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"},
         },
         root_dir=root,
     )
@@ -839,7 +840,14 @@ def test_continue_adopts_the_new_controller_reconciliation_epoch(tmp_path: Path)
     run_id = "continued-epoch"
     epoch_path = tmp_path / f"{run_id}.controller-epoch"
     epoch_path.write_text("epoch-new\n", encoding="utf-8")
-    create(run_id, {"controller_epoch": "epoch-old"}, root_dir=tmp_path)
+    create(
+        run_id,
+        {
+            "controller_epoch": "epoch-old",
+            "repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"},
+        },
+        root_dir=tmp_path,
+    )
 
     result = tl_run(
         {"run_id": run_id, "plan": WorkPlan()},
@@ -1169,6 +1177,7 @@ def test_live_ordered_batch_uses_independent_durable_controllers(tmp_path: Path)
         root_dir=root,
         run_id="parent",
         ledger_run_id="swarm-uuid",
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     effects = EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
     outcomes = _run_sub_tl_batch(
@@ -1196,7 +1205,11 @@ def test_live_ordered_child_starts_beneath_archived_root_claim(
     child_worktree = str(tmp_path / ".worktrees" / "root" / "stage-a")
     create(
         "root",
-        {"owner_branch": "main", "owner_worktree": root_worktree},
+        {
+            "owner_branch": "main",
+            "owner_worktree": root_worktree,
+            "repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"},
+        },
         root_dir=state_root,
     )
 
@@ -1222,6 +1235,7 @@ def test_live_ordered_child_starts_beneath_archived_root_claim(
         run_id="root",
         branch="main",
         worktree=root_worktree,
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
     effects = EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
     task = SubTLTask("stage-a", WorkPlan(), source=SyntheticQueue([]), order=1)
@@ -1853,12 +1867,18 @@ class OrderedIntegrationTransport(IntegrationTransport):
 
 
 def _effect_names(transport: RecordingTransport) -> list[str]:
-    return [name for name, _ in transport.calls if name != "emit_controller_event"]
+    return [
+        name
+        for name, _ in transport.calls
+        if name not in {"emit_controller_event", "repository_identity"}
+    ]
 
 
 def _effect_operations(result: TLRunResult) -> list[str]:
     return [
-        effect.operation for effect in result.effects if effect.operation != "emit_controller_event"
+        effect.operation
+        for effect in result.effects
+        if effect.operation not in {"emit_controller_event", "repository_identity"}
     ]
 
 
@@ -6611,7 +6631,16 @@ def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) 
     assert child.parent_branch == "main"
     assert child.slices["grandchild"].branch == "main.child.grandchild"
     assert child.slices["grandchild"].base_ref == "main.child"
-    assert all(name == "emit_controller_event" for name, _ in transport.calls)
+    assert result.final_state.repository_identity == RepositoryIdentity(
+        "https://forge.example.com/org/repo.git"
+    )
+    assert child.repository_identity == result.final_state.repository_identity
+    grandchild = load_state(tmp_path / "recursive-run" / "child" / "grandchild" / "run.json")
+    assert grandchild.repository_identity == result.final_state.repository_identity
+    assert not any(name == "repository_identity" for name, _ in transport.calls)
+    assert all(
+        name in {"emit_controller_event", "repository_identity"} for name, _ in transport.calls
+    )
 
 
 def test_root_finalization_checkpoint_precedes_terminal_checkpoint(
@@ -8298,6 +8327,22 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         assert leaf.chainlink_issue_id == issue_id
         assert leaf.task == f"unchanged future task {future_names.index(stage.name) + 1}"
 
+    # Match the historical Beast identity shape immediately before resume:
+    # the root has no identity key and its completed child has the old
+    # five-field identity while the authoritative URL remains unchanged.
+    root_document = json.loads(root_store.path.read_text(encoding="utf-8"))
+    root_document.pop("repository_identity", None)
+    root_store.path.write_text(json.dumps(root_document), encoding="utf-8")
+    child_document = json.loads(child_store.path.read_text(encoding="utf-8"))
+    child_document["repository_identity"] = {
+        "owner": "forge-example",
+        "repo": "repository",
+        "base_branch": "main",
+        "forge_host": "forge.example.com",
+        "remote_url": "https://forge.example.com/org/repo.git",
+    }
+    child_store.path.write_text(json.dumps(child_document), encoding="utf-8")
+
     resumed_config = replace(
         config,
         session_mode="continue",
@@ -8312,6 +8357,10 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         root_dir=state_root,
     )
     architecture_slice = adopted.final_state.slices["architecture"]
+    assert adopted.final_state.repository_identity == RepositoryIdentity(
+        "https://forge.example.com/org/repo.git"
+    )
+    assert adopted.final_state.repository_identity_migration is not None
     assert architecture_slice.status is SliceStatus.IN_REVIEW
     assert architecture_slice.pr_number == 43
     assert architecture_slice.dispatch_invocation_id == invocation_id
@@ -8470,8 +8519,8 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         ("lookup_unavailable", "publication_lookup_unavailable"),
         ("ambiguous", "publication_lookup_unresolved"),
         ("malformed_lookup", "publication_lookup_malformed"),
-        ("wrong_repo", "repository_identity_mismatch"),
-        ("repository_timeout", "repository_identity_unavailable"),
+        ("wrong_repo", "repository_identity_conflict"),
+        ("repository_timeout", "repository_identity_timeout"),
         ("wrong_slice", "publication_lookup_slice_mismatch"),
         ("wrong_pr", "watcher_pr_mismatch"),
         ("wrong_owner", "publication_coordinates_mismatch"),
@@ -8599,14 +8648,50 @@ def test_aggregate_recovery_refuses_unresolved_or_mismatched_publications(
             ),
         )
     )
-    result = run_tl_loop(
-        run_id,
-        plan,
-        SyntheticQueue([]),
-        EffectClient(transport),
-        config=replace(_config(), ledger_run_id=run_id, keep_alive_on_waiting=False),
-        root_dir=tmp_path,
-    )
+
+    def invoke_loop() -> TLRunResult:
+        return run_tl_loop(
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=replace(
+                _config(),
+                ledger_run_id=run_id,
+                keep_alive_on_waiting=False,
+                repository_identity=(
+                    None
+                    if failure_mode in {"wrong_repo", "repository_timeout"}
+                    else _config().repository_identity
+                ),
+            ),
+            root_dir=tmp_path,
+        )
+
+    if failure_mode == "wrong_repo":
+        create(
+            run_id,
+            {"repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"}},
+            root_dir=tmp_path,
+        )
+        with pytest.raises(TLLoopError, match=expected_reason):
+            invoke_loop()
+        assert RunStore(run_id, tmp_path).load().repository_identity == RepositoryIdentity(
+            "https://forge.example.com/org/repo.git"
+        )
+        assert not any(
+            name in {"spawn_leaf", "spawn_worker", "file_pr"} for name, _ in transport.calls
+        )
+        return
+    if failure_mode == "repository_timeout":
+        with pytest.raises(TLLoopError, match=expected_reason):
+            invoke_loop()
+        assert not RunStore(run_id, tmp_path).path.exists()
+        assert not any(
+            name in {"spawn_leaf", "spawn_worker", "file_pr"} for name, _ in transport.calls
+        )
+        return
+    result = invoke_loop()
 
     parked = result.final_state.slices["aggregate-child"]
     assert parked.status is SliceStatus.PARKED

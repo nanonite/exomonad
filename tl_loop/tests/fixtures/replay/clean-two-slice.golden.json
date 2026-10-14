@@ -1,4 +1,7 @@
 {
+  "repository_identity": {
+    "remote_url": "https://forge.example.com/org/repo.git"
+  },
   "budgets": {
     "ledger": {
       "charges": [

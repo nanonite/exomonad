@@ -207,7 +207,12 @@ class _RecordingLedgerQueue:
 
 class _NoopTransport:
     def call_tool(self, role, name, tool_name, arguments):
-        del role, name, tool_name, arguments
+        del role, name, arguments
+        if tool_name == "repository_identity":
+            return {
+                "success": True,
+                "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+            }
         return {"success": True, "result": {}}
 
 
@@ -278,7 +283,8 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
                     "dispatch_agent_id": "tunable-operator-body",
                     "dispatch_invocation_id": "inv-42",
                 }
-            }
+            },
+            "repository_identity": {"remote_url": "https://forgejo.local/acme/exomonad.git"},
         },
         root_dir=tmp_path,
     )
@@ -371,6 +377,7 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
                 max_events=8,
                 poll_interval=0.001,
                 root_dir=tmp_path,
+                repository_identity=RepositoryIdentity("https://forgejo.local/acme/exomonad.git"),
             ),
             root_dir=tmp_path,
         )

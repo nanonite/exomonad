@@ -48,7 +48,7 @@ escalate_after_attempts = 1
     )
     if capability is not None:
         (exo / "harness_capability.toml").write_text(
-            f"[capabilities]\n\"codex/custom\" = \"{capability}\"\n", encoding="utf-8"
+            f'[capabilities]\n"codex/custom" = "{capability}"\n', encoding="utf-8"
         )
     return tmp_path
 
@@ -101,7 +101,7 @@ def test_missing_and_invalid_plan_fail_preflight(tmp_path: Path) -> None:
     plan.unlink()
     with pytest.raises(PreflightError, match="plan.json"):
         run_preflight(project)
-    plan.write_text("{\"plan\": {\"unknown\": true}}", encoding="utf-8")
+    plan.write_text('{"plan": {"unknown": true}}', encoding="utf-8")
     with pytest.raises(PreflightError, match="invalid plan"):
         run_preflight(project)
 
@@ -138,7 +138,9 @@ def test_recreate_plan_digest_comes_from_rust_identity(tmp_path: Path) -> None:
     project = _project(tmp_path)
     plan = project / ".exo" / "tl-loop" / "plan.json"
     old = plan.read_bytes()
-    accepted = b'{"plan":{"workers":[{"name":"recreated","task":"rebuild"}],"leaves":[],"sub_tls":[]}}\n'
+    accepted = (
+        b'{"plan":{"workers":[{"name":"recreated","task":"rebuild"}],"leaves":[],"sub_tls":[]}}\n'
+    )
     plan.write_bytes(accepted)
     snapshot = project / ".exo" / "tl-loop" / "plan.snapshot"
     digest = project / ".exo" / "tl-loop" / "plan.snapshot.sha256"
@@ -150,9 +152,7 @@ def test_recreate_plan_digest_comes_from_rust_identity(tmp_path: Path) -> None:
     plan.write_bytes(old)
     assert snapshot.read_bytes() == accepted
     assert digest.read_text(encoding="ascii").strip() == hashlib.sha256(accepted).hexdigest()
-    document, captured = tl_main._load_recreate_plan(
-        project, hashlib.sha256(accepted).hexdigest()
-    )
+    document, captured = tl_main._load_recreate_plan(project, hashlib.sha256(accepted).hexdigest())
     assert document["plan"]["workers"][0]["name"] == "recreated"
     assert captured == accepted
     plan.unlink()
@@ -167,8 +167,7 @@ def test_recreate_controller_startup_uses_rust_plan_identity(
     plan = project / ".exo" / "tl-loop" / "plan.json"
     accepted = (
         b'{"plan":{"workers":[{"name":"recreated","task":"rebuild"}],'
-        b'"leaves":[],"sub_tls":[]}}'
-        + bytes((10,))
+        b'"leaves":[],"sub_tls":[]}}' + bytes((10,))
     )
     plan.write_bytes(accepted)
     (project / ".exo" / "tl-loop" / "plan.snapshot").write_bytes(accepted)
@@ -220,12 +219,9 @@ def test_recreate_controller_startup_uses_rust_plan_identity(
     )
 
     assert (project / ".exo" / "tl-loop" / "plan.snapshot").read_bytes() == accepted
-    assert (
-        (project / ".exo" / "tl-loop" / "plan.snapshot.sha256")
-        .read_text(encoding="ascii")
-        .strip()
-        == hashlib.sha256(accepted).hexdigest()
-    )
+    assert (project / ".exo" / "tl-loop" / "plan.snapshot.sha256").read_text(
+        encoding="ascii"
+    ).strip() == hashlib.sha256(accepted).hexdigest()
 
 
 def test_recreate_waits_for_plan_when_rust_accepted_no_plan(
@@ -359,9 +355,7 @@ def test_snapshot_loader_binds_startup_to_immutable_snapshot(tmp_path: Path) -> 
     snapshot.write_bytes(accepted)
     plan.write_bytes(b'{"plan":{"workers":[{"name":"changed"}]}}')
 
-    document, captured = tl_main._load_snapshot_plan(
-        project, hashlib.sha256(accepted).hexdigest()
-    )
+    document, captured = tl_main._load_snapshot_plan(project, hashlib.sha256(accepted).hexdigest())
 
     assert document["plan"]["workers"] == []
     assert captured == accepted
@@ -467,7 +461,7 @@ def test_cli_persists_actual_ledger_queue_failure_diagnostics(
         encoding="utf-8",
     )
     (project / ".exo" / "tl-loop" / "plan.json").write_text(
-        '{\"plan\":{\"workers\":[{\"name\":\"worker-a\",\"task\":\"work\"}],\"leaves\":[],\"sub_tls\":[]},\"budgets\":{\"tokens\":100,\"wall_seconds\":100}}',
+        '{"plan":{"workers":[{"name":"worker-a","task":"work"}],"leaves":[],"sub_tls":[]},"budgets":{"tokens":100,"wall_seconds":100}}',
         encoding="utf-8",
     )
     segments = project / ".exo" / "ledger" / "segments"
@@ -487,6 +481,11 @@ def test_cli_persists_actual_ledger_queue_failure_diagnostics(
             arguments: dict[str, object],
         ) -> dict[str, object]:
             del role, name
+            if tool_name == "repository_identity":
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+                }
             if tool_name == "spawn_worker":
                 return {
                     "success": True,
@@ -512,9 +511,7 @@ def test_cli_persists_actual_ledger_queue_failure_diagnostics(
     )
 
     payload = json.loads(
-        (project / ".exo" / "tl-loop" / "root" / "controller-exit.json").read_text(
-            encoding="utf-8"
-        )
+        (project / ".exo" / "tl-loop" / "root" / "controller-exit.json").read_text(encoding="utf-8")
     )
     assert payload["context"]["line_number"] == 1
     assert payload["context"]["segment"] == str(segment)
