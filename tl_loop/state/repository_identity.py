@@ -156,9 +156,7 @@ def _canonical_path(path: str) -> str:
     ):
         raise ValueError("repository remote URL has a malformed path")
     try:
-        decoded_segments = [
-            unquote(segment, errors="strict") for segment in path.split("/")
-        ]
+        decoded_segments = [unquote(segment, errors="strict") for segment in path.split("/")]
     except UnicodeDecodeError as error:
         raise ValueError("repository remote URL has an invalid encoding") from error
     if any(segment in {".", ".."} for segment in decoded_segments):
@@ -175,9 +173,7 @@ def _validate_removable_parameters(value: str, component: str) -> None:
         parameters = parse_qsl(value, keep_blank_values=True, strict_parsing=True)
     except ValueError as error:
         raise ValueError(f"repository remote URL has a malformed {component}") from error
-    if not parameters or any(
-        key.casefold() not in _CREDENTIAL_PARAMETERS for key, _ in parameters
-    ):
+    if not parameters or any(key.casefold() not in _CREDENTIAL_PARAMETERS for key, _ in parameters):
         raise ValueError(f"repository remote URL has an ambiguous {component}")
 
 

@@ -254,9 +254,7 @@ class FakeClient:
             error=None,
         )
 
-    def chainlink_issue_list(
-        self, *, labels: tuple[str, ...], status: str
-    ) -> ToolResult:
+    def chainlink_issue_list(self, *, labels: tuple[str, ...], status: str) -> ToolResult:
         assert labels == ("needs-human",)
         assert status == "all"
         return ToolResult(raw={"success": True}, success=True, result={"issues": []}, error=None)
@@ -392,8 +390,9 @@ def test_reconciliation_preserves_plan_json_bytes_across_restart(tmp_path) -> No
     store, state = _load_state(tmp_path)
     plan_path = tmp_path / ".exo" / "tl-loop" / "plan.json"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
-    original = b'{"leaves":[{"name":"slice-a","task":"implement slice a",' \
-        b'"chainlink_issue_id":null}]}\n'
+    original = (
+        b'{"leaves":[{"name":"slice-a","task":"implement slice a","chainlink_issue_id":null}]}\n'
+    )
     plan_path.write_bytes(original)
     client = FakeClient()
     config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
@@ -528,9 +527,7 @@ def test_reconciliation_reconfirms_a_park_it_already_recorded(
 
     first_client = FakeClient(**closed)
     first: list[object] = []
-    parked_state = _reconcile_nonterminal_slices(
-        _PLAN, state, config, first_client, store, first
-    )
+    parked_state = _reconcile_nonterminal_slices(_PLAN, state, config, first_client, store, first)
     assert len(first_client.issue_create_calls) == 1
     parked = parked_state.slices["slice-a"]
     assert parked.status is SliceStatus.PARKED
@@ -547,9 +544,7 @@ def test_reconciliation_reconfirms_a_park_it_already_recorded(
     monkeypatch.setattr(driver_module, "park", record_park)
     client = FakeClient(**closed)
     second: list[object] = []
-    _reconcile_nonterminal_slices(
-        _PLAN, store.load(), config, client, store, second
-    )
+    _reconcile_nonterminal_slices(_PLAN, store.load(), config, client, store, second)
 
     # The boundary is re-emitted for the same cause, the slice stays parked,
     # and the issue the first park created is reused rather than replaced.
@@ -741,9 +736,7 @@ def test_stale_reviewer_action_self_heals_and_queues_merge_once(tmp_path) -> Non
     assert client.merge_calls[0]["expected_head_sha"] == "head-a"
     assert merged.slices["slice-a"].status is SliceStatus.MERGED
 
-    repeated = _reconcile_nonterminal_slices(
-        _PLAN, store.load(), config, client, store, journal
-    )
+    repeated = _reconcile_nonterminal_slices(_PLAN, store.load(), config, client, store, journal)
     _apply_convergence(repeated, ConvergenceTracker(), store, config, client, journal)
     assert len(client.merge_calls) == 1
     assert client.spawn_reviewer_calls == []
@@ -780,8 +773,16 @@ def test_stale_reviewer_action_heal_does_not_fire_with_pending_journal(tmp_path)
     "changes",
     [
         {"action": ActionState(ActionKind.REPAIR, ActionPhase.CONFIRMED, head_sha="head-a")},
-        {"action": ActionState(ActionKind.REVIEWER_SPAWN, ActionPhase.CONFIRMED, head_sha="other-head")},
-        {"action": ActionState(ActionKind.REVIEWER_SPAWN, ActionPhase.IN_FLIGHT, head_sha="head-a")},
+        {
+            "action": ActionState(
+                ActionKind.REVIEWER_SPAWN, ActionPhase.CONFIRMED, head_sha="other-head"
+            )
+        },
+        {
+            "action": ActionState(
+                ActionKind.REVIEWER_SPAWN, ActionPhase.IN_FLIGHT, head_sha="head-a"
+            )
+        },
         {"reviewer_attempt": {}},
     ],
 )

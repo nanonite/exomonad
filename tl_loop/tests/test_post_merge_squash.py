@@ -203,11 +203,17 @@ def test_parent_push_recovery_binds_new_lane_epoch(tmp_path) -> None:
         state.budgets,
         state.events.last_consumed_offset,
     )
-    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("slice-a", 1, "base-head"))
     state = store.transition_lane(
-        "https://forge.example.com/org/repo.git", "main", LaneAbandoned("post_merge_gate", "previous retry")
+        "https://forge.example.com/org/repo.git", "main", LaneReserved("slice-a", 1, "base-head")
     )
-    state = store.transition_lane("https://forge.example.com/org/repo.git", "main", LaneReserved("slice-a", 2, "base-head"))
+    state = store.transition_lane(
+        "https://forge.example.com/org/repo.git",
+        "main",
+        LaneAbandoned("post_merge_gate", "previous retry"),
+    )
+    state = store.transition_lane(
+        "https://forge.example.com/org/repo.git", "main", LaneReserved("slice-a", 2, "base-head")
+    )
 
     advanced = _advance_post_merge_boundary(
         state,
@@ -221,7 +227,10 @@ def test_parent_push_recovery_binds_new_lane_epoch(tmp_path) -> None:
 
     assert advanced.slices["slice-a"].post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING
     assert advanced.slices["slice-a"].post_merge.evidence["lane_epoch"] == "2"
-    assert advanced.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.BOOKKEEPING
+    assert (
+        advanced.integration.lanes["https://forge.example.com/org/repo.git:main"].phase
+        is LanePhase.BOOKKEEPING
+    )
 
 
 def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) -> None:

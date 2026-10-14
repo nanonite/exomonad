@@ -72,9 +72,12 @@ def test_binding_round_trips_through_work_plan_manifest_and_child_state(
     )
 
     assert plan.sub_tls[0].plan.leaves[0].chainlink_issue_id == 1167
-    assert restored.child_manifests["root/sub_tl/stage"].node(
-        "root/sub_tl/stage/leaf/leaf"
-    ).chainlink_issue_id == 1167
+    assert (
+        restored.child_manifests["root/sub_tl/stage"]
+        .node("root/sub_tl/stage/leaf/leaf")
+        .chainlink_issue_id
+        == 1167
+    )
     assert reconstructed.sub_tls[0].plan.leaves[0].chainlink_issue_id is None
 
     child_manifest = restored.child_manifests["root/sub_tl/stage"]
@@ -121,17 +124,13 @@ def test_binding_rejects_duplicate_ids_across_recursive_slices() -> None:
     with pytest.raises(ChainlinkIssueBindingError, match="bind each issue to one slice"):
         WorkPlan.from_mapping(
             {
-                "leaves": [
-                    {"name": "one", "task": "one", "chainlink_issue_id": 91}
-                ],
+                "leaves": [{"name": "one", "task": "one", "chainlink_issue_id": 91}],
                 "sub_tls": [
                     {
                         "name": "stage",
                         "order": 1,
                         "plan": {
-                            "leaves": [
-                                {"name": "two", "task": "two", "chainlink_issue_id": 91}
-                            ]
+                            "leaves": [{"name": "two", "task": "two", "chainlink_issue_id": 91}]
                         },
                     }
                 ],
@@ -146,21 +145,14 @@ def test_malformed_binding_opens_reconciliation_gate(tmp_path: Path) -> None:
         tl_run(
             {
                 "run_id": "invalid-binding",
-                "plan": {
-                    "leaves": [
-                        {"name": "leaf", "task": "work", "chainlink_issue_id": 0}
-                    ]
-                },
+                "plan": {"leaves": [{"name": "leaf", "task": "work", "chainlink_issue_id": 0}]},
             },
             config,
             {"tokens": 0, "wall_seconds": 0},
         )
 
     state = RunStore("invalid-binding", tmp_path).load()
-    assert any(
-        gate.name == CHAINLINK_BINDING_RECONCILIATION_GATE_NAME
-        for gate in state.gates
-    )
+    assert any(gate.name == CHAINLINK_BINDING_RECONCILIATION_GATE_NAME for gate in state.gates)
 
 
 def test_direct_loop_entrypoint_gates_malformed_binding(tmp_path: Path) -> None:
@@ -181,10 +173,7 @@ def test_direct_loop_entrypoint_gates_malformed_binding(tmp_path: Path) -> None:
         )
 
     state = RunStore("direct-invalid-binding", tmp_path).load()
-    assert any(
-        gate.name == CHAINLINK_BINDING_RECONCILIATION_GATE_NAME
-        for gate in state.gates
-    )
+    assert any(gate.name == CHAINLINK_BINDING_RECONCILIATION_GATE_NAME for gate in state.gates)
 
 
 def test_old_manifest_and_checkpoint_decode_as_unlinked(tmp_path: Path) -> None:
@@ -265,11 +254,7 @@ def _linked_parent_sync_state(
     issue_id: int = 702,
 ) -> tuple[RunStore, RunState, RepositoryIdentity]:
     identity = RepositoryIdentity("https://forge.example.com/org/repo.git")
-    plan = {
-        "leaves": [
-            {"name": "leaf", "task": "work", "chainlink_issue_id": issue_id}
-        ]
-    }
+    plan = {"leaves": [{"name": "leaf", "task": "work", "chainlink_issue_id": issue_id}]}
     manifest = build_plan_manifest(plan, scope_id=run_id)
     create(
         run_id,
@@ -331,9 +316,7 @@ def _pending_issue_close(
     run_id: str = "linked",
     issue_id: int = 702,
 ) -> tuple[RunStore, RunState, RepositoryIdentity]:
-    store, state, identity = _linked_parent_sync_state(
-        root_dir, run_id=run_id, issue_id=issue_id
-    )
+    store, state, identity = _linked_parent_sync_state(root_dir, run_id=run_id, issue_id=issue_id)
     pending = _advance_post_merge_boundary(
         state,
         "leaf",
@@ -370,8 +353,17 @@ def test_linked_issue_close_uses_exact_binding_and_receipt(tmp_path: Path) -> No
     assert close_state.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED
     assert close_state.evidence["issue_close_outcome"] == "closed"
     assert close_state.evidence["issue_close_journal_id"] == f"chainlink-close:{issue_id}"
-    close_calls = [arguments for name, arguments in transport.calls if name == "chainlink_issue_close"]
-    assert close_calls == [{"issue_id": issue_id, "force": True, "commit_changelog": False, "summary": "Closed after successful merge of PR #42"}]
+    close_calls = [
+        arguments for name, arguments in transport.calls if name == "chainlink_issue_close"
+    ]
+    assert close_calls == [
+        {
+            "issue_id": issue_id,
+            "force": True,
+            "commit_changelog": False,
+            "summary": "Closed after successful merge of PR #42",
+        }
+    ]
 
 
 def test_linked_already_closed_issue_is_adopted_without_receipt(tmp_path: Path) -> None:
@@ -438,8 +430,7 @@ def test_linked_issue_close_failures_are_typed_and_recoverable(
     assert close_state.evidence["issue_close_failure_1_observed_status"] == "open"
     assert "issue_close_journal_id" not in close_state.evidence
     assert any(
-        gate.name == "tl-post-merge-issue-close-leaf-1"
-        and gate.status is GateStatus.PENDING
+        gate.name == "tl-post-merge-issue-close-leaf-1" and gate.status is GateStatus.PENDING
         for gate in failed.gates
     )
 
@@ -491,7 +482,9 @@ def test_confirmed_close_receipt_replays_without_second_close(tmp_path: Path) ->
     final = confirmed.slices["leaf"].post_merge
     assert final is not None and final.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED
     assert final.evidence["issue_close_journal_id"] == f"chainlink-close:{issue_id}"
-    assert not any(name in {"chainlink_issue_close", "chainlink_issue_show"} for name, _ in transport.calls)
+    assert not any(
+        name in {"chainlink_issue_close", "chainlink_issue_show"} for name, _ in transport.calls
+    )
 
 
 def test_approved_issue_close_retry_requires_open_status_and_new_intent(

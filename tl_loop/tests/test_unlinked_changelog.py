@@ -122,7 +122,9 @@ def _config(backend: object, *, token_budget: int = 120_000) -> TLLoopConfig:
     )
 
 
-def _synced_store(root_dir: Path, evidence: dict[str, str] | None = None) -> tuple[RunStore, RunState]:
+def _synced_store(
+    root_dir: Path, evidence: dict[str, str] | None = None
+) -> tuple[RunStore, RunState]:
     plan = {"leaves": [{"name": "leaf", "task": "work"}]}
     manifest = build_plan_manifest(plan, scope_id="unlinked")
     create(
@@ -171,9 +173,7 @@ def _synced_store(root_dir: Path, evidence: dict[str, str] | None = None) -> tup
 def _drain(
     store: RunStore, state: RunState, config: TLLoopConfig, transport: ChangelogTransport
 ) -> RunState:
-    return _drain_post_merge_recovery(
-        state, "leaf", 42, config, EffectClient(transport), [], store
-    )
+    return _drain_post_merge_recovery(state, "leaf", 42, config, EffectClient(transport), [], store)
 
 
 def _final(state: RunState) -> PostMergeState:
@@ -197,7 +197,10 @@ def test_captured_work_completes_without_writing(tmp_path: Path) -> None:
     assert final.evidence["changelog_decision"] == "captured"
     assert final.evidence["changelog_outcome"] == "captured"
     assert transport.names() == ["post_merge_changelog_context"]
-    assert done.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
+    assert (
+        done.integration.lanes["https://forge.example.com/org/repo.git:main"].phase
+        is LanePhase.IDLE
+    )
     assert store.load().budgets.role_spent["tl"] == 37
     (event,) = transport.events()
     assert event["event_type"] == "tl.unlinked_changelog_resolved"
@@ -219,7 +222,9 @@ def test_judgment_sees_the_merged_slice_evidence(tmp_path: Path) -> None:
     prompt = json.dumps(request.inputs)
     for text in ("Add the feature", "src/feature.py", "Fix an older thing (#1)"):
         assert text in prompt
-    (context_call,) = [args for name, args in transport.calls if name == "post_merge_changelog_context"]
+    (context_call,) = [
+        args for name, args in transport.calls if name == "post_merge_changelog_context"
+    ]
     assert context_call["merge_commit_sha"] == "merge-commit"
     assert context_call["expected_base_sha"] == "parent-commit"
 
@@ -276,12 +281,17 @@ def test_a_failed_write_is_a_typed_outcome_and_the_slice_completes(
     assert final.evidence["changelog_outcome"] == outcome
     assert final.evidence["changelog_outcome_detail"] == "stale info"
     assert "changelog_commit_sha" not in final.evidence
-    assert done.integration.lanes["https://forge.example.com/org/repo.git:main"].phase is LanePhase.IDLE
+    assert (
+        done.integration.lanes["https://forge.example.com/org/repo.git:main"].phase
+        is LanePhase.IDLE
+    )
 
 
 def test_a_parent_without_changelog_makes_no_model_call(tmp_path: Path) -> None:
     backend = ReviewBackend([])
-    transport = ChangelogTransport(context=_context(changelog_present=False, unreleased_present=False, unreleased_section=None))
+    transport = ChangelogTransport(
+        context=_context(changelog_present=False, unreleased_present=False, unreleased_section=None)
+    )
     store, state = _synced_store(tmp_path)
 
     done = _drain(store, state, _config(backend), transport)
@@ -294,7 +304,9 @@ def test_a_parent_without_changelog_makes_no_model_call(tmp_path: Path) -> None:
 
 def test_a_changelog_without_unreleased_makes_no_model_call(tmp_path: Path) -> None:
     backend = ReviewBackend([])
-    transport = ChangelogTransport(context=_context(unreleased_present=False, unreleased_section=None))
+    transport = ChangelogTransport(
+        context=_context(unreleased_present=False, unreleased_section=None)
+    )
     store, state = _synced_store(tmp_path)
 
     done = _drain(store, state, _config(backend), transport)
@@ -321,9 +333,7 @@ def test_a_backend_failure_completes_as_judgment_failed(tmp_path: Path) -> None:
 
 
 def test_an_exhausted_tl_budget_completes_as_judgment_failed(tmp_path: Path) -> None:
-    backend = ReviewBackend(
-        [RlmResponse({"action": "captured", "reason": "covered"}, 50, 50)] * 3
-    )
+    backend = ReviewBackend([RlmResponse({"action": "captured", "reason": "covered"}, 50, 50)] * 3)
     transport = ChangelogTransport()
     store, state = _synced_store(tmp_path)
 
@@ -346,7 +356,9 @@ def test_an_unreadable_context_completes_as_judgment_failed(tmp_path: Path) -> N
 
 
 def test_a_malformed_judgment_completes_as_judgment_failed(tmp_path: Path) -> None:
-    bad = RlmResponse({"action": "add_entry", "reason": "missing", "section": "Added", "entry": "- marked"})
+    bad = RlmResponse(
+        {"action": "add_entry", "reason": "missing", "section": "Added", "entry": "- marked"}
+    )
     backend = ReviewBackend([bad, bad, bad])
     transport = ChangelogTransport()
     store, state = _synced_store(tmp_path)
@@ -431,9 +443,12 @@ def test_entry_added_requires_its_commit_evidence() -> None:
         judged, PostMergeNotApplicable("leaf", "entry_added", "", "commit", "commit")
     )
     assert done.phase is PostMergePhase.COMPLETE
-    assert advance_post_merge(
-        done, PostMergeNotApplicable("leaf", "entry_added", "", "commit", "commit")
-    ) == done
+    assert (
+        advance_post_merge(
+            done, PostMergeNotApplicable("leaf", "entry_added", "", "commit", "commit")
+        )
+        == done
+    )
 
 
 def test_a_judgment_replays_only_with_the_same_decision() -> None:

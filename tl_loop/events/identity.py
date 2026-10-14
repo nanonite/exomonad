@@ -158,11 +158,7 @@ def _repository_identity_conflict(event: EventEnvelope, state: RunState) -> str 
         observed = canonical_repository_url(remote_url)
     except ValueError:
         return "repository_identity_conflict"
-    return (
-        "repository_identity_conflict"
-        if observed != identity.remote_url
-        else None
-    )
+    return "repository_identity_conflict" if observed != identity.remote_url else None
 
 
 def _first_text(payload: Mapping[str, object], *keys: str) -> str | None:

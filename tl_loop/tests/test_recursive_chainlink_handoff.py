@@ -46,9 +46,7 @@ REPOSITORY_IDENTITY = RepositoryIdentity("https://forge.example.com/org/repo.git
 class ChangelogRecordingTransport(RecordingTransport):
     """Answers the unlinked CHANGELOG context read for the merged child slice."""
 
-    def call_tool(
-        self, role: str, name: str, tool_name: str, arguments: JsonObject
-    ) -> JsonObject:
+    def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
         if tool_name == "post_merge_changelog_context":
             self.calls.append((tool_name, arguments))
             return {
@@ -132,9 +130,7 @@ def _seed_parent_and_captured_child(tmp_path: Path) -> tuple[WorkPlan, TLLoopCon
     )
     parent_store = RunStore(ROOT_RUN_ID, tmp_path)
     child_task = plan.sub_tls[0]
-    child_manifest = parent_manifest.child_manifests[
-        f"{ROOT_RUN_ID}/sub_tl/{CHILD_RUN_ID}"
-    ]
+    child_manifest = parent_manifest.child_manifests[f"{ROOT_RUN_ID}/sub_tl/{CHILD_RUN_ID}"]
     child_branch = derive_child_branch(config.branch, CHILD_RUN_ID)
     child_worktree = _sub_tl_worktree(config, parent_store.run_dir, ROOT_RUN_ID, child_task)
     child_config = replace(

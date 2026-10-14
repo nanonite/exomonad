@@ -223,14 +223,22 @@ def _publication_presence_rejection(
     if observation.found is False:
         return _publication_rejection("pr_not_found", current, observation, head_sha, owner_id)
     if observation.evidence_error:
-        reason = "head_unreachable" if observation.head_reachable is False else "watcher_evidence_error"
+        reason = (
+            "head_unreachable" if observation.head_reachable is False else "watcher_evidence_error"
+        )
         return _publication_rejection(reason, current, observation, head_sha, owner_id)
     if observation.publication is None and not observation.publication_present:
-        return _publication_rejection("publication_missing", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "publication_missing", current, observation, head_sha, owner_id
+        )
     if observation.publication is None:
-        return _publication_rejection("publication_record_malformed", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "publication_record_malformed", current, observation, head_sha, owner_id
+        )
     if observation.ownership_status()[0] is not True:
-        return _publication_rejection("ownership_unverified", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "ownership_unverified", current, observation, head_sha, owner_id
+        )
     return None
 
 
@@ -240,7 +248,9 @@ def _accepted_publication_validation(
     coordinates: _PublicationCoordinates,
     head_sha: str | None,
 ) -> PublicationValidation:
-    record_invocation_id = cast(str, _publication_record_text(observation.publication, "invocation_id"))
+    record_invocation_id = cast(
+        str, _publication_record_text(observation.publication, "invocation_id")
+    )
     existing = current.publication
     return PublicationValidation(
         binding=PublicationBinding(
@@ -282,13 +292,19 @@ def _required_coordinate_rejection(
     owner_id: str | None,
 ) -> PublicationRejection | None:
     if not head_sha or observation.head_sha != head_sha:
-        return _publication_rejection("head_sha_missing_or_mismatched", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "head_sha_missing_or_mismatched", current, observation, head_sha, owner_id
+        )
     if type(observation.pr_number) is not int or observation.pr_number <= 0:
         return _publication_rejection("pr_number_missing", current, observation, head_sha, owner_id)
     if not isinstance(observation.head_branch, str) or not observation.head_branch:
-        return _publication_rejection("head_branch_missing", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "head_branch_missing", current, observation, head_sha, owner_id
+        )
     if not isinstance(observation.base_branch, str) or not observation.base_branch:
-        return _publication_rejection("base_branch_missing", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "base_branch_missing", current, observation, head_sha, owner_id
+        )
     return None
 
 
@@ -303,13 +319,21 @@ def _coordinate_mismatch_rejection(
 ) -> PublicationRejection | None:
     existing = current.publication
     if current.pr_number is not None and current.pr_number != pr_number:
-        return _publication_rejection("pr_number_mismatch", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "pr_number_mismatch", current, observation, head_sha, owner_id
+        )
     if existing is not None and (existing.pr_number != pr_number or existing.head_sha != head_sha):
-        return _publication_rejection("durable_publication_mismatch", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "durable_publication_mismatch", current, observation, head_sha, owner_id
+        )
     if current.branch and head_branch != current.branch:
-        return _publication_rejection("head_branch_mismatch", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "head_branch_mismatch", current, observation, head_sha, owner_id
+        )
     if current.base_ref and base_branch != current.base_ref:
-        return _publication_rejection("base_branch_mismatch", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "base_branch_mismatch", current, observation, head_sha, owner_id
+        )
     return None
 
 
@@ -353,7 +377,9 @@ def _validate_publication_invocation(
 ) -> PublicationRejection | None:
     record_invocation_id = _publication_record_text(observation.publication, "invocation_id")
     if not record_invocation_id:
-        return _publication_rejection("invocation_id_missing", current, observation, head_sha, owner_id)
+        return _publication_rejection(
+            "invocation_id_missing", current, observation, head_sha, owner_id
+        )
     succession = _publication_record_succession(observation.publication)
     active_invocations = tuple(
         value
@@ -370,7 +396,9 @@ def _validate_publication_invocation(
         and current.publication.invocation_id == record_invocation_id
     ):
         return None
-    return _publication_rejection("invocation_lineage_mismatch", current, observation, head_sha, owner_id)
+    return _publication_rejection(
+        "invocation_lineage_mismatch", current, observation, head_sha, owner_id
+    )
 
 
 def _publication_rejection(
@@ -605,11 +633,7 @@ def derive_next_action(
     """
     if isinstance(persisted_state, RunState):
         identity_gate = next(
-            (
-                gate
-                for gate in persisted_state.gates
-                if gate.name == REPOSITORY_IDENTITY_GATE_NAME
-            ),
+            (gate for gate in persisted_state.gates if gate.name == REPOSITORY_IDENTITY_GATE_NAME),
             None,
         )
         if identity_gate is not None and identity_gate.status is not GateStatus.APPROVED:
@@ -1060,11 +1084,7 @@ def _review_api_coordinates(
     """Build transient reviewer API coordinates from the canonical URL."""
     owner, repo = repository_api_coordinates(remote_url)
     coordinates: dict[str, object] = {"owner": owner, "repo": repo}
-    base_branch = (
-        state.publication.base_branch
-        if state.publication is not None
-        else state.base_ref
-    )
+    base_branch = state.publication.base_branch if state.publication is not None else state.base_ref
     if base_branch:
         coordinates["base_branch"] = base_branch
     return coordinates
