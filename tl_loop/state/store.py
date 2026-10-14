@@ -6,8 +6,10 @@ import copy
 import json
 import os
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeAlias, cast
@@ -75,6 +77,15 @@ from .plan_manifest import (
     build_legacy_manifest,
     validate_manifest_revision,
 )
+from .repository_identity_migration import (
+    ChildIdentityEvidence,
+    RepositoryIdentityMigrationError,
+    digest_bytes,
+    digest_url,
+    identity_url_from_document,
+    make_audit_record,
+    validate_audit_record,
+)
 from .schema import (
     REDUCER_VERSION,
     SCHEMA_VERSION,
@@ -113,7 +124,7 @@ from .schema import (
 )
 from .serialization import dumps as dumps_json
 from .serialization import to_jsonable
-from .write import apply, publish
+from .write import ConcurrentWrite, StateReadError, apply, publish
 
 DEFAULT_ROOT = Path(".exo/tl-loop")
 RootSpec: TypeAlias = Mapping[str, object]
@@ -341,6 +352,342 @@ class RunStore:
 
         apply(self.run_dir, mutate)
         return self.load()
+
+    def migrate_repository_identity(
+        self,
+        identity: RepositoryIdentity,
+        *,
+        corroborating_sub_tls: Sequence[str] = (),
+        lock_timeout: float = 5.0,
+    ) -> RunState:
+        """Audit and install a legacy repository identity without touching receipts.
+
+        A missing binding requires a canonical URL from at least one declared,
+        direct subTL checkpoint. Existing legacy URLs are compared with the
+        selected authoritative URL before their shape is migrated. The journal
+        and in-checkpoint marker make a crash between the checkpoint write and
+        journal completion replayable without applying a second revision.
+        """
+        if not isinstance(identity, RepositoryIdentity):
+            raise TypeError("repository identity must be a RepositoryIdentity")
+        names = tuple(corroborating_sub_tls)
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("corroborating subTL names must be non-empty strings")
+        if len(names) != len(set(names)):
+            raise ValueError("corroborating subTL names must be unique")
+        journal_path = self.run_dir / "repository-identity-migration.json"
+        try:
+            with RunLock(self.run_dir / "repository-identity.lock", timeout=lock_timeout):
+                raw_bytes = _read_bytes(self.path)
+                document = _read_json_object(raw_bytes, "run checkpoint")
+                persisted_url, source_shape = _identity_for_migration(document)
+                journal = _read_identity_migration_journal(journal_path)
+                if journal is not None:
+                    if journal.get("target_identity_sha256") != digest_url(identity.remote_url):
+                        raise RepositoryIdentityMigrationError(
+                            "conflicting",
+                            "selected repository URL conflicts with the pending migration target",
+                        )
+                    marker = document.get("repository_identity_migration")
+                    if isinstance(marker, Mapping):
+                        recovered = self._recover_repository_identity_migration(
+                            document,
+                            raw_bytes,
+                            identity,
+                            (),
+                            journal,
+                            journal_path,
+                        )
+                        if recovered is not None:
+                            return _decode(recovered)
+                    if journal.get("status") == "complete":
+                        raise RepositoryIdentityMigrationError(
+                            "stale",
+                            "completed repository identity migration lost its checkpoint marker",
+                        )
+
+                if persisted_url is not None and persisted_url != identity.remote_url:
+                    raise RepositoryIdentityMigrationError(
+                        "conflicting",
+                        "selected repository URL conflicts with the checkpoint identity",
+                    )
+                if source_shape == "canonical" and persisted_url == identity.remote_url:
+                    validate(document)
+                    return _decode(document)
+
+                with ExitStack() as child_locks:
+                    self._acquire_repository_identity_child_locks(
+                        document, names, child_locks, lock_timeout
+                    )
+                    child_evidence = self._repository_identity_child_evidence(
+                        document,
+                        identity.remote_url,
+                        names,
+                    )
+                    _validate_repository_identity_migration_source(document)
+                    if journal is not None:
+                        recovered = self._recover_repository_identity_migration(
+                            document,
+                            raw_bytes,
+                            identity,
+                            child_evidence,
+                            journal,
+                            journal_path,
+                        )
+                        if recovered is not None:
+                            return _decode(recovered)
+
+                    if persisted_url is None and not child_evidence:
+                        raise RepositoryIdentityMigrationError(
+                            "missing",
+                            "repository identity has no recoverable URL or declared subTL corroboration",
+                        )
+
+                    source_sha = digest_bytes(raw_bytes)
+                    target_identity_sha = digest_url(identity.remote_url)
+                    audit = make_audit_record(
+                        run_id=self.run_id,
+                        source_checkpoint_sha256=source_sha,
+                        source_shape=source_shape,
+                        target_identity_sha256=target_identity_sha,
+                        evidence=child_evidence,
+                        created_at=_identity_migration_timestamp(),
+                        actor=f"exomonad-controller:uid={os.getuid()}",
+                    )
+                    return _decode(
+                        _apply_repository_identity_migration(
+                            self,
+                            document,
+                            raw_bytes,
+                            identity,
+                            audit,
+                            journal_path,
+                        )
+                    )
+        except RepositoryIdentityMigrationError:
+            raise
+        except TimeoutError as error:
+            raise RepositoryIdentityMigrationError(
+                "unavailable", "timed out acquiring a repository identity migration lock"
+            ) from error
+        except ConcurrentWrite as error:
+            raise RepositoryIdentityMigrationError(
+                "stale", "run checkpoint changed during repository identity migration"
+            ) from error
+        except SchemaError as error:
+            raise RepositoryIdentityMigrationError(
+                "malformed", "run checkpoint failed repository identity migration validation"
+            ) from error
+        except StateReadError as error:
+            raise RepositoryIdentityMigrationError(
+                "unavailable",
+                "run checkpoint became unavailable during repository identity migration",
+            ) from error
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise RepositoryIdentityMigrationError(
+                "unavailable", "repository identity migration evidence is unavailable"
+            ) from error
+
+    def _acquire_repository_identity_child_locks(
+        self,
+        document: Mapping[str, object],
+        names: Sequence[str],
+        stack: ExitStack,
+        lock_timeout: float,
+    ) -> None:
+        for _child_run_id, _child_manifest, child_checkpoint in self._declared_sub_tl_checkpoints(
+            document, names
+        ):
+            stack.enter_context(
+                RunLock(child_checkpoint.parent.parent / "run.lock", timeout=lock_timeout)
+            )
+
+    def _declared_sub_tl_checkpoints(
+        self,
+        document: Mapping[str, object],
+        sub_tl_names: Sequence[str],
+    ) -> tuple[tuple[str, PlanManifest, Path], ...]:
+        if not sub_tl_names:
+            return ()
+        raw_manifest = document.get("plan_manifest")
+        if not isinstance(raw_manifest, Mapping):
+            raise RepositoryIdentityMigrationError(
+                "ambiguous", "subTL corroboration cannot be bound without a plan manifest"
+            )
+        try:
+            manifest = PlanManifest.from_document(raw_manifest)
+        except (ManifestError, TypeError, ValueError) as error:
+            raise RepositoryIdentityMigrationError(
+                "ambiguous", "subTL corroboration has a malformed plan manifest"
+            ) from error
+        declared = {
+            node.name: (node, manifest.child_manifests.get(node.node_id))
+            for node in manifest.nodes
+            if node.kind == "sub_tl" and node.parent_id == manifest.scope_id
+        }
+        if set(sub_tl_names) - set(declared):
+            raise RepositoryIdentityMigrationError(
+                "ambiguous", "subTL corroboration is not declared by this run's manifest"
+            )
+        result: list[tuple[str, PlanManifest, Path]] = []
+        for child_run_id in sorted(sub_tl_names):
+            _validate_run_id(child_run_id)
+            node, child_manifest = declared[child_run_id]
+            if child_manifest is None:
+                raise RepositoryIdentityMigrationError(
+                    "ambiguous", "declared subTL has no child plan manifest for correlation"
+                )
+            result.append((node.name, child_manifest, self.run_dir / child_run_id / "run.json"))
+        return tuple(result)
+
+    def _repository_identity_child_evidence(
+        self,
+        document: Mapping[str, object],
+        observed_url: str,
+        sub_tl_names: Sequence[str],
+    ) -> tuple[ChildIdentityEvidence, ...]:
+        if not sub_tl_names:
+            return ()
+        evidence: list[ChildIdentityEvidence] = []
+        for child_run_id, expected_manifest, child_checkpoint in self._declared_sub_tl_checkpoints(
+            document, sub_tl_names
+        ):
+            try:
+                child_bytes = _read_bytes(child_checkpoint)
+                child_document = _read_json_object(child_bytes, "subTL checkpoint")
+                recorded_run_id = child_document.get("run_id")
+                if recorded_run_id != child_run_id:
+                    raise RepositoryIdentityMigrationError(
+                        "conflicting", "subTL checkpoint run id conflicts with its declared scope"
+                    )
+                if child_document.get("parent_run_id") != document.get("run_id"):
+                    raise RepositoryIdentityMigrationError(
+                        "conflicting", "subTL checkpoint parent conflicts with its declared owner"
+                    )
+                raw_child_manifest = child_document.get("plan_manifest")
+                if not isinstance(raw_child_manifest, Mapping):
+                    raise RepositoryIdentityMigrationError(
+                        "missing", "subTL checkpoint has no declared plan manifest"
+                    )
+                child_manifest = PlanManifest.from_document(raw_child_manifest)
+                if child_manifest.digest != expected_manifest.digest:
+                    raise RepositoryIdentityMigrationError(
+                        "conflicting", "subTL checkpoint plan conflicts with its parent declaration"
+                    )
+                _validate_repository_identity_migration_source(child_document)
+                child_url, _shape = _identity_for_migration(child_document)
+            except RepositoryIdentityMigrationError:
+                raise
+            except (ManifestError, TypeError, ValueError) as error:
+                raise RepositoryIdentityMigrationError(
+                    "malformed", "declared subTL checkpoint is malformed"
+                ) from error
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise RepositoryIdentityMigrationError(
+                    "unavailable", "declared subTL identity evidence is unavailable"
+                ) from error
+            if child_url is None:
+                raise RepositoryIdentityMigrationError(
+                    "missing", "declared subTL checkpoint has no recoverable repository URL"
+                )
+            if child_url != observed_url:
+                raise RepositoryIdentityMigrationError(
+                    "conflicting",
+                    "declared subTL repository URL conflicts with the selected remote",
+                )
+            evidence.append(
+                ChildIdentityEvidence(
+                    child_run_id,
+                    digest_bytes(child_bytes),
+                    digest_url(child_url),
+                )
+            )
+        return tuple(evidence)
+
+    def _recover_repository_identity_migration(
+        self,
+        document: dict[str, object],
+        raw_bytes: bytes,
+        identity: RepositoryIdentity,
+        evidence: Sequence[ChildIdentityEvidence],
+        journal: dict[str, object],
+        journal_path: Path,
+    ) -> dict[str, object] | None:
+        status = journal.get("status")
+        audit = validate_audit_record(journal.get("audit"))
+        if journal.get("run_id") != self.run_id or audit.get("run_id") != self.run_id:
+            raise RepositoryIdentityMigrationError(
+                "conflicting", "repository identity migration journal belongs to another run"
+            )
+        if journal.get("target_identity_sha256") != digest_url(identity.remote_url):
+            raise RepositoryIdentityMigrationError(
+                "conflicting", "selected URL conflicts with the migration target"
+            )
+        if audit.get("target_identity_sha256") != journal.get("target_identity_sha256"):
+            raise RepositoryIdentityMigrationError(
+                "malformed", "migration journal target does not match its audit record"
+            )
+        if audit.get("source_checkpoint_sha256") != journal.get("source_checkpoint_sha256"):
+            raise RepositoryIdentityMigrationError(
+                "malformed", "migration journal source does not match its audit record"
+            )
+        marker = document.get("repository_identity_migration")
+        current_url, current_shape = _identity_for_migration(document)
+        if isinstance(marker, Mapping):
+            if (
+                dict(marker) != audit
+                or current_url != identity.remote_url
+                or current_shape != "canonical"
+            ):
+                raise RepositoryIdentityMigrationError(
+                    "stale", "checkpoint no longer matches the migration completion evidence"
+                )
+            _validate_repository_identity_migration_source(document)
+            if status == "prepared":
+                if digest_bytes(raw_bytes) != journal.get("target_checkpoint_sha256"):
+                    raise RepositoryIdentityMigrationError(
+                        "stale", "interrupted migration checkpoint differs from its prepared target"
+                    )
+                publish(journal_path, {**journal, "status": "complete"})
+            elif status != "complete":
+                raise RepositoryIdentityMigrationError(
+                    "malformed", "repository identity migration journal has an invalid status"
+                )
+            return document
+        if status == "complete":
+            raise RepositoryIdentityMigrationError(
+                "stale", "completed repository identity migration lost its checkpoint marker"
+            )
+        if status != "prepared":
+            raise RepositoryIdentityMigrationError(
+                "malformed", "repository identity migration journal has an invalid status"
+            )
+        source_sha = journal.get("source_checkpoint_sha256")
+        if source_sha != digest_bytes(raw_bytes):
+            raise RepositoryIdentityMigrationError(
+                "stale", "repository identity migration source checkpoint changed before apply"
+            )
+        source_document_sha = journal.get("source_document_sha256")
+        if source_document_sha != _semantic_document_digest(document):
+            raise RepositoryIdentityMigrationError(
+                "stale", "repository identity migration source state changed before apply"
+            )
+        journal_evidence = audit.get("corroborating_children")
+        if journal_evidence != [
+            item.to_document() for item in sorted(evidence, key=lambda item: item.run_id)
+        ]:
+            raise RepositoryIdentityMigrationError(
+                "stale", "repository identity migration child evidence changed before apply"
+            )
+        return _apply_repository_identity_migration(
+            self,
+            document,
+            raw_bytes,
+            identity,
+            dict(audit),
+            journal_path,
+            journal=journal,
+        )
 
     def set_ordered_state(
         self,
@@ -1955,6 +2302,186 @@ def _read_bytes(target: Path) -> bytes:
         return stream.read()
 
 
+def _read_json_object(data: bytes, description: str) -> dict[str, object]:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise RepositoryIdentityMigrationError(
+            "malformed", f"{description} is not valid UTF-8 JSON"
+        ) from error
+    if not isinstance(value, dict):
+        raise RepositoryIdentityMigrationError(
+            "malformed", f"{description} must contain a JSON object"
+        )
+    return cast(dict[str, object], value)
+
+
+def _read_identity_migration_journal(path: Path) -> dict[str, object] | None:
+    try:
+        payload = _read_bytes(path)
+    except FileNotFoundError:
+        return None
+    journal = _read_json_object(payload, "repository identity migration journal")
+    required = {
+        "format_version",
+        "status",
+        "run_id",
+        "source_checkpoint_sha256",
+        "source_document_sha256",
+        "target_checkpoint_sha256",
+        "target_identity_sha256",
+        "audit",
+    }
+    if frozenset(journal) != required or journal.get("format_version") != 1:
+        raise RepositoryIdentityMigrationError(
+            "malformed", "repository identity migration journal has an unsupported shape"
+        )
+    if journal.get("status") not in {"prepared", "complete"}:
+        raise RepositoryIdentityMigrationError(
+            "malformed", "repository identity migration journal has an invalid status"
+        )
+    if not isinstance(journal.get("run_id"), str) or not journal.get("run_id"):
+        raise RepositoryIdentityMigrationError(
+            "malformed", "repository identity migration journal run id is invalid"
+        )
+    for key in (
+        "source_checkpoint_sha256",
+        "source_document_sha256",
+        "target_checkpoint_sha256",
+        "target_identity_sha256",
+    ):
+        digest = journal.get(key)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise RepositoryIdentityMigrationError(
+                "malformed", f"repository identity migration journal {key} is invalid"
+            )
+    audit = validate_audit_record(journal.get("audit"))
+    if (
+        audit.get("run_id") != journal.get("run_id")
+        or audit.get("source_checkpoint_sha256") != journal.get("source_checkpoint_sha256")
+        or audit.get("target_identity_sha256") != journal.get("target_identity_sha256")
+    ):
+        raise RepositoryIdentityMigrationError(
+            "malformed", "repository identity migration journal conflicts with its audit"
+        )
+    journal["audit"] = audit
+    return journal
+
+
+def _identity_for_migration(document: Mapping[str, object]) -> tuple[str | None, str]:
+    try:
+        return identity_url_from_document(document.get("repository_identity"))
+    except RepositoryIdentityMigrationError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise RepositoryIdentityMigrationError(
+            "malformed", "repository identity cannot be decoded safely"
+        ) from error
+
+
+def _validate_repository_identity_migration_source(document: object) -> None:
+    """Validate all checkpoint state while temporarily permitting legacy identity shape."""
+    if not isinstance(document, Mapping):
+        validate(document)
+        return
+    _identity_url, source_shape = _identity_for_migration(document)
+    if source_shape == "canonical":
+        validate(document)
+        return
+    legacy_safe = copy.deepcopy(dict(document))
+    legacy_safe["repository_identity"] = None
+    validate(legacy_safe)
+
+
+def _semantic_document_digest(document: Mapping[str, object]) -> str:
+    payload = dumps_json(document, sort_keys=True, separators=(",", ":"))
+    return digest_bytes(payload.encode("utf-8"))
+
+
+def _identity_migration_timestamp() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _apply_repository_identity_migration(
+    store: RunStore,
+    source_document: Mapping[str, object],
+    source_bytes: bytes,
+    identity: RepositoryIdentity,
+    audit: Mapping[str, object],
+    journal_path: Path,
+    *,
+    journal: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    source_sha = digest_bytes(source_bytes)
+    semantic_sha = _semantic_document_digest(source_document)
+    target_identity_sha = digest_url(identity.remote_url)
+    revision = source_document.get("revision")
+    if type(revision) is not int or revision < 0:
+        raise RepositoryIdentityMigrationError(
+            "malformed", "repository identity migration source revision is invalid"
+        )
+    target = copy.deepcopy(dict(source_document))
+    target["repository_identity"] = identity.to_document()
+    target["repository_identity_migration"] = copy.deepcopy(dict(audit))
+    target["revision"] = revision + 1
+    validate(target)
+    target_bytes = (dumps_json(target, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    target_sha = digest_bytes(target_bytes)
+
+    if journal is None:
+        prepared: dict[str, object] = {
+            "format_version": 1,
+            "status": "prepared",
+            "run_id": store.run_id,
+            "source_checkpoint_sha256": source_sha,
+            "source_document_sha256": semantic_sha,
+            "target_checkpoint_sha256": target_sha,
+            "target_identity_sha256": target_identity_sha,
+            "audit": copy.deepcopy(dict(audit)),
+        }
+        publish(journal_path, prepared)
+    else:
+        prepared = copy.deepcopy(dict(journal))
+        if (
+            prepared.get("status") != "prepared"
+            or prepared.get("run_id") != store.run_id
+            or prepared.get("source_checkpoint_sha256") != source_sha
+            or prepared.get("source_document_sha256") != semantic_sha
+            or prepared.get("target_checkpoint_sha256") != target_sha
+            or prepared.get("target_identity_sha256") != target_identity_sha
+            or prepared.get("audit") != dict(audit)
+        ):
+            raise RepositoryIdentityMigrationError(
+                "stale", "pending repository identity migration no longer matches its inputs"
+            )
+
+    def mutate(document: dict[str, object]) -> dict[str, object]:
+        if _semantic_document_digest(document) != semantic_sha:
+            raise RepositoryIdentityMigrationError(
+                "stale", "run checkpoint changed before repository identity migration apply"
+            )
+        document["repository_identity"] = identity.to_document()
+        document["repository_identity_migration"] = copy.deepcopy(dict(audit))
+        return document
+
+    updated = apply(
+        store.run_dir,
+        mutate,
+        validator=_validate_repository_identity_migration_source,
+    )
+    persisted_bytes = (dumps_json(updated, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if digest_bytes(persisted_bytes) != target_sha:
+        raise RepositoryIdentityMigrationError(
+            "stale", "repository identity migration checkpoint differs from its prepared target"
+        )
+    publish(journal_path, {**prepared, "status": "complete"})
+    return updated
+
+
 def _decode(document: dict[str, object]) -> RunState:
     fsm = cast(dict[str, object], document["fsm"])
     raw_slices = cast(dict[str, object], document["slices"])
@@ -2039,6 +2566,13 @@ def _decode(document: dict[str, object]) -> RunState:
         ordered_stages=_decode_ordered_stages(document.get("ordered_stages")),
         integration=integration,
         repository_identity=_decode_repository_identity(document.get("repository_identity")),
+        repository_identity_migration=(
+            MappingProxyType(
+                copy.deepcopy(cast(dict[str, object], document["repository_identity_migration"]))
+            )
+            if isinstance(document.get("repository_identity_migration"), dict)
+            else None
+        ),
         state_version=cast(int, document.get("state_version", 0)),
         reducer_version=cast(int, document.get("reducer_version", REDUCER_VERSION)),
         controller_epoch=cast(str | None, document.get("controller_epoch")),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -476,6 +477,7 @@ RUN_KEYS = frozenset(
         "ordered_stages",
         "integration",
         "repository_identity",
+        "repository_identity_migration",
         "state_version",
         "reducer_version",
         "controller_epoch",
@@ -1061,6 +1063,7 @@ class RunState:
     ordered_stages: tuple[OrderedStageState, ...] = ()
     integration: IntegrationRuntimeState = field(default_factory=IntegrationRuntimeState)
     repository_identity: RepositoryIdentity | None = None
+    repository_identity_migration: Mapping[str, object] | None = None
     state_version: int = 0
     reducer_version: int = 1
     controller_epoch: str | None = None
@@ -1118,6 +1121,13 @@ def validate(doc: object) -> None:
         _enum_value(root, "session_mode", "run", SessionMode, errors)
     _validate_review_policy_snapshot(root, "run", errors)
     _validate_repository_identity(root.get("repository_identity"), "run", errors)
+    _validate_repository_identity_migration(
+        root.get("repository_identity_migration"),
+        "run",
+        errors,
+        expected_run_id=root.get("run_id"),
+        repository_identity=root.get("repository_identity"),
+    )
 
     fsm = _object(root.get("fsm"), "run.fsm", FSM_KEYS, errors)
     if fsm is not None:
@@ -1531,9 +1541,7 @@ def _validate_slice(
     _nullable_string(value, "task_budget_reset_key", path, errors)
     reset_key = value.get("task_budget_reset_key")
     if isinstance(reset_key, str) and len(reset_key) > 128:
-        errors.append(
-            (f"{path}.task_budget_reset_key", "must contain at most 128 characters")
-        )
+        errors.append((f"{path}.task_budget_reset_key", "must contain at most 128 characters"))
     _validate_recovery(value.get("recovery"), path, errors)
     _validate_suspended_dependency(value.get("suspended_dependency"), path, errors)
     _validate_deadline_ledger(value.get("deadline_ledger"), path, errors)
@@ -1872,11 +1880,15 @@ def _validate_repository_identity(value: object, path: str, errors: list[tuple[s
             except ValueError as error:
                 errors.append((identity_path, str(error)))
         return
-    if not keys <= LEGACY_REPOSITORY_IDENTITY_KEYS or not {
-        "owner",
-        "repo",
-        "base_branch",
-    } <= keys:
+    if (
+        not keys <= LEGACY_REPOSITORY_IDENTITY_KEYS
+        or not {
+            "owner",
+            "repo",
+            "base_branch",
+        }
+        <= keys
+    ):
         errors.append((identity_path, "does not match current or supported legacy shape"))
         return
     for key in ("owner", "repo", "base_branch"):
@@ -1889,6 +1901,137 @@ def _validate_repository_identity(value: object, path: str, errors: list[tuple[s
             canonical_repository_url(remote_url)
         except ValueError as error:
             errors.append((identity_path, str(error)))
+
+
+def _validate_repository_identity_migration(
+    value: object,
+    path: str,
+    errors: list[tuple[str, str]],
+    *,
+    expected_run_id: object,
+    repository_identity: object,
+) -> None:
+    if value is None:
+        return
+    allowed = frozenset(
+        {
+            "schema_version",
+            "run_id",
+            "transition_id",
+            "source_checkpoint_sha256",
+            "source_shape",
+            "target_identity_sha256",
+            "corroborating_children",
+            "created_at",
+            "actor",
+            "reason_code",
+        }
+    )
+    record = _object(value, f"{path}.repository_identity_migration", allowed, errors)
+    if record is None:
+        return
+    if type(record.get("schema_version")) is not int or record.get("schema_version") != 1:
+        errors.append((f"{path}.repository_identity_migration.schema_version", "must be 1"))
+    for key in (
+        "run_id",
+        "transition_id",
+        "source_checkpoint_sha256",
+        "target_identity_sha256",
+        "created_at",
+        "actor",
+        "reason_code",
+    ):
+        _non_empty_string(record, key, f"{path}.repository_identity_migration", errors)
+    if isinstance(expected_run_id, str) and record.get("run_id") != expected_run_id:
+        errors.append((f"{path}.repository_identity_migration.run_id", "must match the owning run"))
+    for key in (
+        "transition_id",
+        "source_checkpoint_sha256",
+        "target_identity_sha256",
+    ):
+        digest = record.get(key)
+        if isinstance(digest, str) and (
+            len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            errors.append(
+                (
+                    f"{path}.repository_identity_migration.{key}",
+                    "must be a lowercase SHA-256 digest",
+                )
+            )
+    source_shape = record.get("source_shape")
+    if not isinstance(source_shape, str) or source_shape not in {"missing", "legacy"}:
+        errors.append(
+            (f"{path}.repository_identity_migration.source_shape", "must be missing or legacy")
+        )
+    expected_reason = (
+        "bootstrap_missing_identity"
+        if source_shape == "missing"
+        else "canonicalize_legacy_identity"
+        if source_shape == "legacy"
+        else None
+    )
+    if expected_reason is not None and record.get("reason_code") != expected_reason:
+        errors.append(
+            (f"{path}.repository_identity_migration.reason_code", "does not match source_shape")
+        )
+    children = record.get("corroborating_children")
+    if not isinstance(children, list):
+        errors.append(
+            (f"{path}.repository_identity_migration.corroborating_children", "must be an array")
+        )
+        return
+    child_ids: list[str] = []
+    child_keys = frozenset({"run_id", "checkpoint_sha256", "identity_sha256"})
+    for index, child_value in enumerate(children):
+        child_path = f"{path}.repository_identity_migration.corroborating_children[{index}]"
+        child = _object(child_value, child_path, child_keys, errors)
+        if child is None:
+            continue
+        _non_empty_string(child, "run_id", child_path, errors)
+        child_run_id = child.get("run_id")
+        if isinstance(child_run_id, str):
+            child_ids.append(child_run_id)
+        for key in ("checkpoint_sha256", "identity_sha256"):
+            _non_empty_string(child, key, child_path, errors)
+            digest = child.get(key)
+            if isinstance(digest, str) and (
+                len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                errors.append((f"{child_path}.{key}", "must be a lowercase SHA-256 digest"))
+    if child_ids != sorted(set(child_ids)):
+        errors.append(
+            (
+                f"{path}.repository_identity_migration.corroborating_children",
+                "must be unique and sorted",
+            )
+        )
+    if source_shape == "missing" and not children:
+        errors.append(
+            (
+                f"{path}.repository_identity_migration.corroborating_children",
+                "is required for missing identity",
+            )
+        )
+    if not isinstance(repository_identity, Mapping) or frozenset(repository_identity) != {
+        "remote_url"
+    }:
+        errors.append(
+            (f"{path}.repository_identity_migration", "requires a canonical repository identity")
+        )
+    else:
+        remote_url = repository_identity.get("remote_url")
+        target_digest = record.get("target_identity_sha256")
+        if isinstance(remote_url, str) and isinstance(target_digest, str):
+            observed_digest = hashlib.sha256(remote_url.encode("utf-8")).hexdigest()
+            if observed_digest != target_digest:
+                errors.append(
+                    (
+                        f"{path}.repository_identity_migration.target_identity_sha256",
+                        "does not match the owning repository identity",
+                    )
+                )
 
 
 def _validate_publication(value: object, path: str, errors: list[tuple[str, str]]) -> None:
