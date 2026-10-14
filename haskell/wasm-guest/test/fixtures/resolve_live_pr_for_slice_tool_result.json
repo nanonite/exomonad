@@ -1,0 +1,20 @@
+{
+  "success": true,
+  "result": {
+    "success": true,
+    "slice_id": "slice-contract-雪/\"stage",
+    "resolution": "live",
+    "pr_number": 46,
+    "publication": {
+      "invocation_id": "invocation-1205-雪/\"head",
+      "slice_id": "slice-contract-雪/\"stage",
+      "author_agent": "stage-agent-雪/\"owner",
+      "succession_invocation_ids": [
+        "invocation-original-1205",
+        "invocation-resumed-1205"
+      ]
+    }
+  },
+  "error": null,
+  "error_kind": null
+}

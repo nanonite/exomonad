@@ -8,11 +8,12 @@ module ExoMonad.Guest.Tools.ResolveLivePrForSlice
     ResolveLivePrForSliceArgs (..),
     resolveLivePrForSliceDescription,
     resolveLivePrForSliceSchema,
+    resolveLivePrForSliceResponseValue,
     resolveLivePrForSliceCore,
   )
 where
 
-import Control.Monad.Freer (Eff)
+import Control.Monad.Freer (Eff, Member)
 import Data.Aeson (FromJSON (..), object, withObject, (.:), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
@@ -22,9 +23,9 @@ import Effects.Agent qualified as PA
 import ExoMonad.Effects.Agent qualified as Agent
 import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
+import ExoMonad.Guest.Tool.Suspend.Types (SuspendYield)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
 import ExoMonad.Guest.Tools.Spawn (spawnErrorMessage)
-import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
 import Proto3.Suite.Types qualified as Protobuf
 
@@ -48,7 +49,17 @@ resolveLivePrForSliceSchema =
   genericToolSchemaWith @ResolveLivePrForSliceArgs
     [("slice_id", "Stable TL slice identifier whose live PR should be resolved.")]
 
-resolveLivePrForSliceCore :: ResolveLivePrForSliceArgs -> Eff Effects (Either Text Aeson.Value)
+resolveLivePrForSliceResponseValue :: PA.ResolveLivePrForSliceResponse -> Aeson.Value
+resolveLivePrForSliceResponseValue response =
+  object
+    [ "success" .= PA.resolveLivePrForSliceResponseSuccess response,
+      "slice_id" .= TL.toStrict (PA.resolveLivePrForSliceResponseSliceId response),
+      "resolution" .= resolutionText (PA.resolveLivePrForSliceResponseResolution response),
+      "pr_number" .= PA.resolveLivePrForSliceResponsePrNumber response,
+      "publication" .= PA.resolveLivePrForSliceResponsePublication response
+    ]
+
+resolveLivePrForSliceCore :: (Member SuspendYield effs) => ResolveLivePrForSliceArgs -> Eff effs (Either Text Aeson.Value)
 resolveLivePrForSliceCore args
   | T.null (T.strip (rlpfssSliceId args)) = pure $ Left "slice_id is required"
   | otherwise = do
@@ -62,14 +73,7 @@ resolveLivePrForSliceCore args
         Right response
           | not (PA.resolveLivePrForSliceResponseSuccess response) ->
               Left (TL.toStrict (PA.resolveLivePrForSliceResponseError response))
-          | otherwise ->
-              Right $
-                object
-                  [ "success" .= True,
-                    "slice_id" .= TL.toStrict (PA.resolveLivePrForSliceResponseSliceId response),
-                    "resolution" .= resolutionText (PA.resolveLivePrForSliceResponseResolution response),
-                    "pr_number" .= PA.resolveLivePrForSliceResponsePrNumber response
-                  ]
+          | otherwise -> Right (resolveLivePrForSliceResponseValue response)
 
 resolutionText :: Protobuf.Enumerated PA.LivePrResolutionKind -> Text
 resolutionText value =

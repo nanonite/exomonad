@@ -74,6 +74,20 @@ class (FromJSON (Args t), ToJSON (Result t)) => MCPTool t where
 
 Tool schemas are typically derived using `genericToolSchema` from `ExoMonad.Guest.Tool.Schema`.
 
+### Typed host response projections
+
+When a tool turns a typed host effect response into MCP JSON, keep the
+projection pure, export it from the tool module, and use it for the successful
+tool response. Preserve optional host evidence as supplied; do not invent an
+empty record when the typed field is absent. Assert emitted JSON keys against
+the downstream consumer because protobuf field names and consumer names need
+not share a casing convention.
+
+For cross-language contracts, keep one shared JSON fixture under
+`test/fixtures/`. The Haskell test verifies the fixture against the production
+projection from typed responses, and the Python consumer test loads that same
+file. `just wasm-guest-test` exposes only the fixture directory to Wasmtime.
+
 ### Permissions (`ExoMonad.Guest.Types.Permissions`)
 
 Claude-only permissions system using the `ClaudePermissions` DSL.

@@ -276,10 +276,11 @@ role-hook-tests:
     @nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build role-hook-tests'
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name role-hook-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
 
-# Build and run the wasm-guest test suite under wasmtime
+# Build and run the wasm-guest test suite under wasmtime. Preopen only its shared
+# cross-language contract fixture directory.
 wasm-guest-test:
     @nix develop .#wasm --command bash -c 'export PATH=$PWD/.codex/tmp/bin:$PATH; wasm32-wasi-cabal --project-file=cabal.project.wasm build wasm-guest:wasm-guest-tests'
-    @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime "$WASM"'
+    @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime --dir=haskell/wasm-guest/test/fixtures::contract-fixtures "$WASM"'
 
 # Run tests: Python checks, formatting, Rust check, WASM build/tests, Rust tests, proto freshness
 test: tl-loop-replay tl-loop-test tl-loop-lint watcher-projection-check tl-loop-archive-test tool-surface-check controller-event-contract-check

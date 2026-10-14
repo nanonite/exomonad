@@ -605,6 +605,33 @@ impl EffectHandler for MockAgentHandler {
                 }
                 .encode_to_vec())
             }
+            "agent.resolve_live_pr_for_slice" => {
+                let req = ResolveLivePrForSliceRequest::decode(payload)
+                    .expect("mock agent handler should decode resolve_live_pr_for_slice request");
+                if req.slice_id != "slice-live" {
+                    return Err(EffectError::invalid_input(format!(
+                        "unexpected slice: {}",
+                        req.slice_id
+                    )));
+                }
+                Ok(ResolveLivePrForSliceResponse {
+                    success: true,
+                    error: String::new(),
+                    slice_id: req.slice_id,
+                    resolution: LivePrResolutionKind::Live as i32,
+                    pr_number: 46,
+                    publication: Some(PublishedHeadEvidence {
+                        invocation_id: "invocation-live".into(),
+                        slice_id: "slice-live".into(),
+                        author_agent: "stage-agent".into(),
+                        succession_invocation_ids: vec![
+                            "invocation-original".into(),
+                            "invocation-resumed".into(),
+                        ],
+                    }),
+                }
+                .encode_to_vec())
+            }
             _ => Err(EffectError::not_found(format!("mock_agent/{effect_type}"))),
         }
     }
@@ -1020,6 +1047,34 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
             "TL role missing tool '{expected}'. Got: {names:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn resolve_live_pr_tool_preserves_registry_publication_evidence() {
+    let runtime = build_test_runtime().await;
+
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "resolve_live_pr_for_slice",
+        json!({"slice_id": "slice-live"}),
+    )
+    .await;
+
+    assert_tool_success(&output, "resolve_live_pr_for_slice");
+    let result = &output["result"];
+    assert_eq!(result["success"], true);
+    assert_eq!(result["slice_id"], "slice-live");
+    assert_eq!(result["resolution"], "live");
+    assert_eq!(result["pr_number"], 46);
+    assert_eq!(result["publication"]["invocation_id"], "invocation-live");
+    assert_eq!(result["publication"]["slice_id"], "slice-live");
+    assert_eq!(result["publication"]["author_agent"], "stage-agent");
+    assert_eq!(
+        result["publication"]["succession_invocation_ids"],
+        json!(["invocation-original", "invocation-resumed"])
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
