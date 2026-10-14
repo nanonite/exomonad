@@ -8169,6 +8169,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     blocked_stage = replace(
         root_state.slices["architecture"],
         status=SliceStatus.PARKED,
+        attempts=0,
         park_cause=ParkCause.PUBLICATION_BLOCKED,
         park_issue_id=None,
         park_audit={
@@ -8253,6 +8254,13 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     assert "completed_issue_closure_receipt" in declaration_proof["evidence"]
     assert declaration_proof["correlation"]["dispatch_invocation_id"] is None
     assert declaration_proof["correlation"]["worktree_paths_match"] is False
+    assert child_scope_report["scope_emitter_proof"]["correlation"]["parent_dispatch_attempts"] == 0
+    assert (
+        child_scope_report["scope_emitter_proof"]["correlation"][
+            "parent_dispatch_attempt_condition"
+        ]
+        == "zero_with_complete_dispatch_proof"
+    )
     applied_reconciliation = apply_plan_reconciliation(
         tmp_path,
         "Restore accepted plan bindings before updating future issue metadata",
@@ -8260,6 +8268,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         actor="operator",
     )
     assert applied_reconciliation.applied
+    assert root_store.load().slices["architecture"].attempts == 0
     assert root_store.load().plan_manifest is not None
     assert (
         root_store.load().plan_manifest.digest

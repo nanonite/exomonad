@@ -93,6 +93,12 @@ def child_scope_emitter(
             reason or "scope_controller_dispatch_unproven",
             expected=expected,
             observed=parent_slice.dispatch_agent_id if parent_slice is not None else None,
+            parent_dispatch_attempts=(parent_slice.attempts if parent_slice is not None else None),
+            parent_dispatch_attempt_condition=(
+                _attempt_counter_condition(parent_slice.attempts, proof_complete=False)
+                if parent_slice is not None
+                else "unavailable"
+            ),
         )
     relative = f".exo/agents/{expected}/invocation.json"
     path = project / relative
@@ -110,6 +116,10 @@ def child_scope_emitter(
             "scope_controller_registration_unreadable",
             expected=expected,
             parent_agent_id=parent_slice.dispatch_agent_id,
+            parent_dispatch_attempts=parent_slice.attempts,
+            parent_dispatch_attempt_condition=_attempt_counter_condition(
+                parent_slice.attempts, proof_complete=False
+            ),
         )
     try:
         raw, _mode = read_regular_file(path)
@@ -121,6 +131,10 @@ def child_scope_emitter(
             "scope_controller_registration_missing",
             expected=expected,
             parent_agent_id=parent_slice.dispatch_agent_id,
+            parent_dispatch_attempts=parent_slice.attempts,
+            parent_dispatch_attempt_condition=_attempt_counter_condition(
+                parent_slice.attempts, proof_complete=False
+            ),
         )
     record = _decode_invocation(raw)
     if record is None:
@@ -128,6 +142,10 @@ def child_scope_emitter(
             "scope_controller_registration_malformed",
             expected=expected,
             registration_sha256=hashlib.sha256(raw).hexdigest(),
+            parent_dispatch_attempts=parent_slice.attempts,
+            parent_dispatch_attempt_condition=_attempt_counter_condition(
+                parent_slice.attempts, proof_complete=False
+            ),
         )
     reason = _invocation_registration_failure(
         record,
@@ -143,6 +161,10 @@ def child_scope_emitter(
             invocation_id=record.get("invocation_id"),
             parent_invocation_id=parent_slice.dispatch_invocation_id,
             registration_sha256=hashlib.sha256(raw).hexdigest(),
+            parent_dispatch_attempts=parent_slice.attempts,
+            parent_dispatch_attempt_condition=_attempt_counter_condition(
+                parent_slice.attempts, proof_complete=False
+            ),
         )
     invocation_id = record["invocation_id"]
     evidence = (
@@ -166,13 +188,22 @@ def child_scope_emitter(
         "parent_dispatch_invocation_id": _safe_text(parent_slice.dispatch_invocation_id),
         "parent_dispatch_event_seq": parent_slice.dispatch_authoritative_event_seq,
         "parent_dispatch_agent_id": _safe_text(parent_slice.dispatch_agent_id),
+        "parent_dispatch_attempts": parent_slice.attempts,
+        "parent_dispatch_attempt_condition": _attempt_counter_condition(
+            parent_slice.attempts, proof_complete=True
+        ),
         "parent_dispatch_owner_record": owner_record,
     }
+    counter_evidence = (
+        "zero_attempt_counter_with_complete_dispatch_proof"
+        if parent_slice.attempts == 0
+        else "positive_attempt_counter_with_complete_dispatch_proof"
+    )
     return ScopeEmitterProof(
         expected,
         "proven",
         "proven",
-        evidence,
+        (*evidence, counter_evidence),
         tuple(sorted(correlation.items())),
     )
 
@@ -217,18 +248,9 @@ def _parent_dispatch_proof(
     parent_slice = parent.state.slices.get(child.state.run_id)
     if parent_slice is None:
         return "scope_controller_parent_dispatch_missing", None, "missing"
-    if not (
-        parent_slice.attempts > 0
-        and isinstance(parent_slice.dispatch_intent_id, str)
-        and bool(parent_slice.dispatch_intent_id)
-        and isinstance(parent_slice.dispatch_invocation_id, str)
-        and bool(parent_slice.dispatch_invocation_id)
-        and type(parent_slice.dispatch_authoritative_event_seq) is int
-        and parent_slice.dispatch_authoritative_event_seq > 0
-        and parent_slice.branch == child.state.owner_branch
-        and parent_slice.worktree == child.state.owner_worktree
-        and parent_slice.base_ref == child.state.parent_branch
-    ):
+    if not _valid_attempt_counter(parent_slice.attempts):
+        return "scope_controller_attempt_counter_invalid", parent_slice, "invalid"
+    if not _parent_dispatch_coordinates_match(parent_slice, child):
         return "scope_controller_parent_dispatch_unproven", parent_slice, "incomplete"
     matching = [
         record
@@ -255,6 +277,35 @@ def _parent_dispatch_proof(
     ):
         return "scope_controller_parent_owner_conflict", parent_slice, "conflict"
     return None, parent_slice, "integration_owner_with_verified_registration"
+
+
+def _valid_attempt_counter(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _attempt_counter_condition(value: object, *, proof_complete: bool) -> str:
+    if not _valid_attempt_counter(value):
+        return "invalid"
+    counter_value = "zero" if value == 0 else "positive"
+    proof_status = "with_complete_dispatch_proof" if proof_complete else "dispatch_proof_unproven"
+    return f"{counter_value}_{proof_status}"
+
+
+def _parent_dispatch_coordinates_match(
+    parent_slice: SliceState,
+    child: ReconciliationScope,
+) -> bool:
+    return (
+        isinstance(parent_slice.dispatch_intent_id, str)
+        and bool(parent_slice.dispatch_intent_id)
+        and isinstance(parent_slice.dispatch_invocation_id, str)
+        and bool(parent_slice.dispatch_invocation_id)
+        and type(parent_slice.dispatch_authoritative_event_seq) is int
+        and parent_slice.dispatch_authoritative_event_seq > 0
+        and parent_slice.branch == child.state.owner_branch
+        and parent_slice.worktree == child.state.owner_worktree
+        and parent_slice.base_ref == child.state.parent_branch
+    )
 
 
 def _accepted_sub_tl_node(manifest: object | None, name: str) -> ManifestNode | None:

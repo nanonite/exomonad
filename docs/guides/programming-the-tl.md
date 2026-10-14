@@ -303,6 +303,15 @@ The reconciliation report records the expected and observed emitter identities
 and fingerprints the registration used by the proof. A blocked proof leaves the
 run parked and requires fresh evidence before apply.
 
+The parent sub-TL dispatch attempt counter is recorded as observed evidence, not
+used as dispatch identity. A zero counter is compatible with reconciliation only
+when the accepted declaration, parent identity, dispatch intent and invocation,
+authoritative sequence, exact branch/worktree/base coordinates, unique recursive
+child record, ownership, and host invocation registration all prove the same
+dispatch. The audit retains the zero value and its proof condition; reconciliation
+never increments or normalizes it. Positive counters do not replace missing proof,
+and negative, boolean, or non-integer counters fail RunStore validation.
+
 After `init --continue`, the controller may adopt a uniquely correlated
 existing aggregate PR using current repository, owner, invocation, branch, PR,
 head, base, and patch evidence. Adoption resumes review and CI tracking for that

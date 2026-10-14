@@ -74,6 +74,11 @@ def _audit_scope(scope: ReconciliationScope) -> dict[str, object]:
         "manifest_sha256_after": target.digest if target else None,
         "checkpoint_sha256_before": hashlib.sha256(scope.raw_checkpoint).hexdigest(),
         "checkpoint_sha256_after": hashlib.sha256(restored_checkpoint).hexdigest(),
+        "scope_emitter_proof": (
+            scope.scope_emitter_proof.to_document()
+            if scope.scope_emitter_proof is not None
+            else None
+        ),
     }
 
 

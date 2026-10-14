@@ -163,6 +163,7 @@ def _project(
     spawn_task_override: str | None = None,
     legacy_completed_dispatch: bool = False,
     controller_alias: str = "agent-architecture",
+    parent_attempts: int = 1,
 ) -> tuple[Path, RunStore, RunStore, bytes, bytes]:
     accepted_document = _plan_document(
         future_issue_id=None,
@@ -201,6 +202,7 @@ def _project(
         accepted_root,
         runtime_digest,
         controller_alias=controller_alias,
+        attempts=parent_attempts,
     )
     child_store = _create_child(
         state_root,
@@ -244,6 +246,7 @@ def _create_root(
     runtime_digest: str | None = None,
     *,
     controller_alias: str = "agent-architecture",
+    attempts: int = 1,
 ) -> RunStore:
     create(
         "root",
@@ -261,7 +264,7 @@ def _create_root(
     slices["architecture"] = replace(
         slices["architecture"],
         status=SliceStatus.PARKED,
-        attempts=1,
+        attempts=attempts,
         branch=f"main.{controller_alias}",
         worktree=f"/tmp/architecture/{controller_alias}",
         base_ref="main",
@@ -976,6 +979,8 @@ def test_apply_restores_historical_dispatch_without_inventing_invocation_identit
         "parent_dispatch_invocation_id": "invocation-architecture",
         "parent_dispatch_event_seq": 1,
         "parent_dispatch_agent_id": "agent-architecture",
+        "parent_dispatch_attempts": 1,
+        "parent_dispatch_attempt_condition": "positive_with_complete_dispatch_proof",
         "parent_dispatch_owner_record": "dispatch_owner",
         "slice_id": "completed",
         "spawn_action_key": proof["correlation"]["spawn_action_key"],
@@ -1008,6 +1013,70 @@ def test_apply_restores_historical_dispatch_without_inventing_invocation_identit
     assert audit["protected_declaration_proofs"][0]["correlation"] == proof["correlation"]
 
 
+def test_zero_parent_attempts_reconcile_only_with_complete_proof_and_preserve_audit(
+    tmp_path: Path,
+) -> None:
+    state_root, root_store, child_store, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        parent_attempts=0,
+    )
+    root_before = root_store.load().slices["architecture"]
+    child_before = child_store.load().slices["completed"]
+    report = analyze_plan_reconciliation(tmp_path)
+    document = report.to_document()
+    child_report = next(
+        item for item in document["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+    emitter_proof = child_report["scope_emitter_proof"]
+    declaration_proof = child_report["protected_declaration_proofs"][0]
+
+    assert report.can_apply, report.blockers
+    assert emitter_proof["correlation"]["parent_dispatch_attempts"] == 0
+    assert emitter_proof["correlation"]["parent_dispatch_attempt_condition"] == (
+        "zero_with_complete_dispatch_proof"
+    )
+    assert "zero_attempt_counter_with_complete_dispatch_proof" in emitter_proof["evidence"]
+    assert declaration_proof["correlation"]["parent_dispatch_attempts"] == 0
+    assert declaration_proof["correlation"]["parent_dispatch_attempt_condition"] == (
+        "zero_with_complete_dispatch_proof"
+    )
+
+    result = apply_plan_reconciliation(
+        tmp_path,
+        "Restore accepted declarations from complete legacy dispatch proof",
+        report.evidence_fingerprint,
+        actor="operator",
+    )
+
+    root_after = root_store.load().slices["architecture"]
+    child_after = child_store.load().slices["completed"]
+    audit = json.loads((state_root / "plan-reconciliations.jsonl").read_text().splitlines()[0])
+    audit_child = next(
+        item for item in audit["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+    assert result.applied
+    assert root_after.attempts == root_before.attempts == 0
+    assert root_after.dispatch_intent_id == root_before.dispatch_intent_id
+    assert root_after.dispatch_invocation_id == root_before.dispatch_invocation_id
+    assert (
+        root_after.dispatch_authoritative_event_seq == root_before.dispatch_authoritative_event_seq
+    )
+    assert child_after.attempts == child_before.attempts
+    assert child_after.status is SliceStatus.MERGED
+    assert child_after.post_merge == child_before.post_merge
+    assert child_after.pr_number == child_before.pr_number
+    assert audit_child["scope_emitter_proof"]["correlation"]["parent_dispatch_attempts"] == 0
+    assert (
+        audit_child["scope_emitter_proof"]["correlation"]["parent_dispatch_attempt_condition"]
+        == "zero_with_complete_dispatch_proof"
+    )
+    assert len((state_root / "plan-reconciliations.jsonl").read_text().splitlines()) == 1
+
+
 def test_legacy_dispatch_event_change_invalidates_reconciliation_fingerprint(
     tmp_path: Path,
 ) -> None:
@@ -1033,6 +1102,35 @@ def test_legacy_dispatch_event_change_invalidates_reconciliation_fingerprint(
         )
 
     assert error.value.code == "reconciliation_evidence_stale"
+
+
+def test_parent_attempt_counter_change_invalidates_reconciliation_fingerprint(
+    tmp_path: Path,
+) -> None:
+    state_root, root_store, _child_store, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        parent_attempts=0,
+    )
+    report = analyze_plan_reconciliation(tmp_path)
+    document = json.loads(root_store.path.read_text(encoding="utf-8"))
+    document["slices"]["architecture"]["attempts"] = 1
+    root_store.path.write_text(json.dumps(document), encoding="utf-8")
+    before_apply = _tree_bytes(state_root)
+
+    with pytest.raises(PlanRevisionError) as error:
+        apply_plan_reconciliation(
+            tmp_path,
+            "Reject a changed dispatch counter after dry run",
+            report.evidence_fingerprint,
+            actor="operator",
+        )
+
+    assert error.value.code == "reconciliation_evidence_stale"
+    assert _tree_bytes(state_root) == before_apply
 
 
 def test_scope_controller_registration_change_invalidates_fingerprint(tmp_path: Path) -> None:
@@ -1072,10 +1170,12 @@ def test_scope_controller_registration_change_invalidates_fingerprint(tmp_path: 
         ("malformed", "scope_controller_registration_malformed"),
     ],
 )
+@pytest.mark.parametrize("parent_attempts", [0, 1])
 def test_legacy_dispatch_requires_a_valid_scope_controller_registration(
     tmp_path: Path,
     registration_state: str,
     reason_code: str,
+    parent_attempts: int,
 ) -> None:
     state_root, _root, _child, *_ = _project(
         tmp_path,
@@ -1083,6 +1183,7 @@ def test_legacy_dispatch_requires_a_valid_scope_controller_registration(
         accepted_completed_issue_id=None,
         include_completed_spawn_journal=True,
         legacy_completed_dispatch=True,
+        parent_attempts=parent_attempts,
     )
     registration = tmp_path / ".exo" / "agents" / "agent-architecture" / "invocation.json"
     if registration_state == "missing":
@@ -1102,6 +1203,11 @@ def test_legacy_dispatch_requires_a_valid_scope_controller_registration(
     assert proof["correlation"]["dispatch_event_observed_emitter_agent_id"] == (
         "agent-architecture"
     )
+    expected_counter = "zero" if parent_attempts == 0 else "positive"
+    assert (
+        child["scope_emitter_proof"]["correlation"]["parent_dispatch_attempt_condition"]
+        == f"{expected_counter}_dispatch_proof_unproven"
+    )
     assert _tree_bytes(state_root) == before
 
 
@@ -1113,10 +1219,12 @@ def test_legacy_dispatch_requires_a_valid_scope_controller_registration(
         ("wrong_branch", "scope_controller_invocation_branch_mismatch"),
     ],
 )
+@pytest.mark.parametrize("parent_attempts", [0, 1])
 def test_legacy_dispatch_rejects_conflicting_scope_controller_registration(
     tmp_path: Path,
     corruption: str,
     reason_code: str,
+    parent_attempts: int,
 ) -> None:
     state_root, *_ = _project(
         tmp_path,
@@ -1124,6 +1232,7 @@ def test_legacy_dispatch_rejects_conflicting_scope_controller_registration(
         accepted_completed_issue_id=None,
         include_completed_spawn_journal=True,
         legacy_completed_dispatch=True,
+        parent_attempts=parent_attempts,
     )
     registration = tmp_path / ".exo" / "agents" / "agent-architecture" / "invocation.json"
     record = json.loads(registration.read_text(encoding="utf-8"))
@@ -1193,10 +1302,12 @@ def test_legacy_dispatch_requires_proven_parent_scope_identity(tmp_path: Path) -
         ("wrong_emitter_unrelated", "legacy_scope_emitter_mismatch"),
     ],
 )
+@pytest.mark.parametrize("parent_attempts", [0, 1])
 def test_legacy_dispatch_recovery_fails_closed_on_conflicting_or_missing_evidence(
     tmp_path: Path,
     corruption: str,
     reason_code: str,
+    parent_attempts: int,
 ) -> None:
     state_root, _root, child_store, *_ = _project(
         tmp_path,
@@ -1204,6 +1315,7 @@ def test_legacy_dispatch_recovery_fails_closed_on_conflicting_or_missing_evidenc
         accepted_completed_issue_id=None,
         include_completed_spawn_journal=True,
         legacy_completed_dispatch=True,
+        parent_attempts=parent_attempts,
     )
     ledger = tmp_path / ".exo" / "ledger" / "segments" / "segment-000000000001.jsonl"
     if corruption == "missing_event":
@@ -1273,8 +1385,10 @@ def test_legacy_dispatch_resolves_sub_tl_controller_alias(tmp_path: Path) -> Non
     assert proof["correlation"]["dispatch_event_observed_emitter_agent_id"] == alias
 
 
+@pytest.mark.parametrize("parent_attempts", [0, 1])
 def test_scope_controller_registration_recovers_original_owner_after_aggregate_handoff(
     tmp_path: Path,
+    parent_attempts: int,
 ) -> None:
     state_root, root_store, _child_store, *_ = _project(
         tmp_path,
@@ -1282,6 +1396,7 @@ def test_scope_controller_registration_recovers_original_owner_after_aggregate_h
         accepted_completed_issue_id=None,
         include_completed_spawn_journal=True,
         legacy_completed_dispatch=True,
+        parent_attempts=parent_attempts,
     )
     root = root_store.load()
     controller_branch = "main.agent-architecture"
@@ -1324,16 +1439,22 @@ def test_scope_controller_registration_recovers_original_owner_after_aggregate_h
     assert proof["correlation"]["parent_dispatch_owner_record"] == (
         "integration_owner_with_verified_registration"
     )
+    assert proof["correlation"]["parent_dispatch_attempts"] == parent_attempts
     assert state_root.is_dir()
 
 
-def test_integration_owner_id_alone_does_not_prove_scope_controller(tmp_path: Path) -> None:
+@pytest.mark.parametrize("parent_attempts", [0, 1])
+def test_integration_owner_id_alone_does_not_prove_scope_controller(
+    tmp_path: Path,
+    parent_attempts: int,
+) -> None:
     _state_root, root_store, _child_store, *_ = _project(
         tmp_path,
         candidate_completed_task="rewritten completed task",
         accepted_completed_issue_id=None,
         include_completed_spawn_journal=True,
         legacy_completed_dispatch=True,
+        parent_attempts=parent_attempts,
     )
     root = root_store.load()
     owner_id = "root:architecture:integration"
@@ -1358,6 +1479,111 @@ def test_integration_owner_id_alone_does_not_prove_scope_controller(tmp_path: Pa
 
     assert not report["can_apply"]
     assert child["scope_emitter_proof"]["reason_code"] == ("scope_controller_parent_owner_conflict")
+
+
+@pytest.mark.parametrize("parent_attempts", [0, 1])
+@pytest.mark.parametrize(
+    ("corruption", "expected_reason"),
+    [
+        ("intent", "scope_controller_parent_dispatch_unproven"),
+        ("never_dispatched", "scope_controller_parent_dispatch_unproven"),
+        ("invocation", "scope_controller_parent_dispatch_unproven"),
+        ("sequence", "scope_controller_parent_dispatch_unproven"),
+        ("branch", "scope_controller_parent_dispatch_unproven"),
+        ("worktree", "scope_controller_parent_dispatch_unproven"),
+        ("base", "scope_controller_parent_dispatch_unproven"),
+        ("record", "scope_controller_parent_dispatch_conflict"),
+        ("owner", "scope_controller_parent_owner_conflict"),
+    ],
+)
+def test_parent_dispatch_proof_requires_complete_coordinates_at_any_attempt_count(
+    tmp_path: Path,
+    parent_attempts: int,
+    corruption: str,
+    expected_reason: str,
+) -> None:
+    state_root, root_store, _child_store, *_ = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        parent_attempts=parent_attempts,
+    )
+    state = root_store.load()
+    parent_slice = state.slices["architecture"]
+    changes = {
+        "intent": {"dispatch_intent_id": None},
+        "never_dispatched": {
+            "dispatch_intent_id": None,
+            "dispatch_agent_id": None,
+            "dispatch_invocation_id": None,
+            "dispatch_authoritative_event_seq": None,
+            "branch": None,
+            "worktree": None,
+            "base_ref": None,
+        },
+        "invocation": {"dispatch_invocation_id": None},
+        "sequence": {"dispatch_authoritative_event_seq": 0},
+        "branch": {"branch": "main.unrelated"},
+        "worktree": {"worktree": "/tmp/unrelated"},
+        "base": {"base_ref": "unrelated"},
+        "owner": {"dispatch_agent_id": "unrelated-owner"},
+    }
+    phase = state.recursive_fsm
+    slices = {
+        **state.slices,
+        "architecture": replace(parent_slice, **changes.get(corruption, {})),
+    }
+    if corruption == "record":
+        records = phase.pending_by_order[1]
+        phase = replace(
+            phase,
+            pending_by_order={
+                **phase.pending_by_order,
+                1: (replace(records[0], dispatch_intent_id="conflicting-intent"),),
+            },
+        )
+    root_store.checkpoint(
+        phase,
+        slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    before = _tree_bytes(state_root)
+
+    report = analyze_plan_reconciliation(tmp_path).to_document()
+    child = next(
+        item for item in report["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+
+    assert not report["can_apply"]
+    assert child["scope_emitter_proof"]["reason_code"] == expected_reason
+    assert child["scope_emitter_proof"]["correlation"]["parent_dispatch_attempts"] == (
+        parent_attempts
+    )
+    assert _tree_bytes(state_root) == before
+
+
+@pytest.mark.parametrize("attempts", [-1, True, "0"])
+def test_invalid_parent_attempt_counter_fails_runstore_validation_without_writes(
+    tmp_path: Path,
+    attempts: object,
+) -> None:
+    state_root, root_store, _child_store, *_ = _project(tmp_path)
+    document = json.loads(root_store.path.read_text(encoding="utf-8"))
+    document["slices"]["architecture"]["attempts"] = attempts
+    root_store.path.write_text(json.dumps(document), encoding="utf-8")
+    before = _tree_bytes(state_root)
+
+    with pytest.raises(PlanRevisionError) as error:
+        analyze_plan_reconciliation(tmp_path)
+
+    assert error.value.code == "runstore_invalid"
+    assert _tree_bytes(state_root) == before
 
 
 @pytest.mark.parametrize(
@@ -1535,8 +1761,16 @@ def test_apply_refuses_pending_plan_revision_journal_without_replaying_it(
 
 
 def test_apply_rejects_controller_lifecycle_lock_timeout(tmp_path: Path) -> None:
-    state_root, _root, _child, _accepted, _candidate = _project(tmp_path)
+    state_root, _root, _child, _accepted, _candidate = _project(
+        tmp_path,
+        candidate_completed_task="rewritten completed task",
+        accepted_completed_issue_id=None,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        parent_attempts=0,
+    )
     report = analyze_plan_reconciliation(tmp_path)
+    assert report.can_apply
     with RunLock(state_root / "controller-lifecycle.lock"), pytest.raises(LockTimeout):
         apply_plan_reconciliation(
             tmp_path,
@@ -1597,7 +1831,12 @@ def test_pending_reconciliation_journal_replays_on_startup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state_root, _root, _child, _accepted, _candidate = _project(tmp_path)
+    state_root, root_store, _child, _accepted, _candidate = _project(
+        tmp_path,
+        parent_attempts=0,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+    )
     report = analyze_plan_reconciliation(tmp_path)
 
     def stop_recovery(*_args: object, **_kwargs: object) -> None:
@@ -1623,7 +1862,15 @@ def test_pending_reconciliation_journal_replays_on_startup(
 
     assert recover_plan_revision(tmp_path)
     assert not (state_root / "plan-revision-transition.json").exists()
-    assert len((state_root / "plan-reconciliations.jsonl").read_text().splitlines()) == 1
+    records = (state_root / "plan-reconciliations.jsonl").read_text().splitlines()
+    assert len(records) == 1
+    audit = json.loads(records[0])
+    root_attempts = root_store.load().slices["architecture"].attempts
+    assert root_attempts == 0
+    child_scope = next(
+        item for item in audit["scopes"] if item["scope_id"] == "root/sub_tl/architecture"
+    )
+    assert child_scope["scope_emitter_proof"]["correlation"]["parent_dispatch_attempts"] == 0
     assert not analyze_plan_reconciliation(tmp_path).has_drift
 
 
