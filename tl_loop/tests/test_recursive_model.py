@@ -847,7 +847,10 @@ def test_integration_reference_matrix_rejects_every_unlisted_edge() -> None:
         aggregate_head_sha="head",
         aggregate_base_sha="base",
         aggregate_patch_digest="patch",
+        aggregate_head_tree_sha="tree",
         reviewed_leaf_ids=("child/leaf/a",),
+        lineage_commit_shas=("commit",),
+        lineage_proof_digest="lineage-proof",
         receipt_digest="receipt",
     )
     expected = {

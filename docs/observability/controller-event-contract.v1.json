@@ -262,12 +262,15 @@
         "child_manifest_digest",
         "aggregate_pr_number",
         "aggregate_head_sha",
+        "aggregate_head_tree_sha",
         "aggregate_base_sha",
         "aggregate_patch_digest",
         "reviewed_leaf_ids",
+        "lineage_commit_shas",
+        "lineage_proof_digest",
         "receipt_digest"
       ],
-      "string_array_fields": ["reviewed_leaf_ids"]
+      "string_array_fields": ["reviewed_leaf_ids", "lineage_commit_shas"]
     },
     "tl.ordered_recovery_superseded": {
       "fields": [

@@ -162,6 +162,7 @@ from tl_loop.loop.heartbeat import (
     pr_payload,
     pr_terminal_cause,
 )
+from tl_loop.loop.integration_lineage import GitLineageError, verify_aggregate_lineage
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.loop.review import (
@@ -14394,6 +14395,7 @@ def _promote_aggregate_if_child_complete(
     child_store = RunStore(task.name, store.run_dir)
     if (
         current is None
+        or current.pr_number is None
         or candidate_state is None
         or candidate is None
         or not child_store.path.exists()
@@ -14406,7 +14408,31 @@ def _promote_aggregate_if_child_complete(
     }:
         return state
     child_state = child_store.load()
-    evidence = _verified_child_completion_evidence(task, child_state, candidate)
+    watcher = _watcher_snapshot(current.pr_number, config, effects, effects_log)
+    if watcher is None:
+        LOGGER.warning(
+            "[TL loop] aggregate readiness blocked for %s: watcher_unavailable",
+            task.name,
+        )
+        return state
+    refusal = _aggregate_publication_refusal(task, current, candidate, watcher)
+    if refusal is not None:
+        LOGGER.warning(
+            "[TL loop] aggregate readiness blocked for %s: %s",
+            task.name,
+            refusal,
+        )
+        return state
+    repository = (
+        candidate_state.integration_owner_worktree or current.worktree or config.working_dir
+    )
+    evidence = _verified_child_completion_evidence(
+        task,
+        child_state,
+        candidate,
+        watcher=watcher,
+        repository=repository,
+    )
     if evidence is None:
         return state
     _record_controller_event(
@@ -14418,9 +14444,12 @@ def _promote_aggregate_if_child_complete(
             "child_manifest_digest": evidence.child_manifest_digest,
             "aggregate_pr_number": evidence.aggregate_pr_number,
             "aggregate_head_sha": evidence.aggregate_head_sha,
+            "aggregate_head_tree_sha": evidence.aggregate_head_tree_sha,
             "aggregate_base_sha": evidence.aggregate_base_sha,
             "aggregate_patch_digest": evidence.aggregate_patch_digest,
             "reviewed_leaf_ids": list(evidence.reviewed_leaf_ids),
+            "lineage_commit_shas": list(evidence.lineage_commit_shas),
+            "lineage_proof_digest": evidence.lineage_proof_digest,
             "receipt_digest": evidence.receipt_digest,
         },
         config,
@@ -14488,47 +14517,146 @@ def _aggregate_candidate_from_state(
     )
 
 
+def _load_child_readiness_for_watcher(
+    task: SubTLTask,
+    state: RunState,
+    current: SliceState,
+    aggregate: AggregateCandidate,
+    watcher: WatcherObservation | Mapping[str, object],
+    config: TLLoopConfig,
+    store: RunStore,
+) -> IntegrationReadinessEvidence | None:
+    """Load durable child receipts and prove them against one live watcher head."""
+    child_store = RunStore(task.name, store.run_dir)
+    if not child_store.path.exists():
+        _log_readiness_refusal(
+            task.name, "child_checkpoint_missing", "child RunStore is unavailable"
+        )
+        return None
+    try:
+        child_state = child_store.load()
+    except (OSError, ValueError) as error:
+        _log_readiness_refusal(task.name, "child_checkpoint_unavailable", type(error).__name__)
+        return None
+    candidate_state = state.integration.candidates.get(task.name)
+    repository = (
+        (candidate_state.integration_owner_worktree if candidate_state is not None else None)
+        or current.worktree
+        or config.working_dir
+    )
+    refusal = _aggregate_publication_refusal(
+        task, current, aggregate, _as_watcher_observation(watcher)
+    )
+    if refusal is not None:
+        _log_readiness_refusal(task.name, refusal, "live watcher does not confirm the candidate")
+        return None
+    return _verified_child_completion_evidence(
+        task,
+        child_state,
+        aggregate,
+        watcher=watcher,
+        repository=repository,
+    )
+
+
 def _verified_child_completion_evidence(
     task: SubTLTask,
     child_state: RunState,
     aggregate: AggregateCandidate,
+    *,
+    watcher: WatcherObservation | Mapping[str, object],
+    repository: str | Path | None,
 ) -> IntegrationReadinessEvidence | None:
-    """Revalidate reviewed child merges and their immutable receipts."""
+    """Prove completed child receipts are in the authoritative aggregate head."""
     if (
         child_state.run_id != task.name
         or child_state.plan_manifest is None
         or not _child_handoff_ready(child_state, child_state.parent_run_id or "")
         or isinstance(child_state.recursive_fsm, (RecursiveTLFailed, RecursiveTLParked))
     ):
+        _log_readiness_refusal(task.name, "child_run_not_complete", "child run is not complete")
+        return None
+    observation = _as_watcher_observation(watcher)
+    if observation is None:
+        _log_readiness_refusal(task.name, "watcher_malformed", "watcher snapshot is malformed")
+        return None
+    if (
+        observation.found is not True
+        or observation.pr_number != aggregate.pr_number
+        or observation.head_sha != aggregate.head_sha
+        or observation.patch_digest != aggregate.patch_digest
+        or observation.head_reachable is not True
+        or not observation.pr_head_tree_sha
+    ):
+        _log_readiness_refusal(
+            task.name,
+            "aggregate_publication_incomplete",
+            "watcher does not confirm the candidate PR, exact head, patch, reachability, and head tree",
+        )
         return None
     receipts: list[Mapping[str, object]] = []
     reviewed_leaf_ids: list[str] = []
+    lineage_commits: list[str] = []
     for node in child_state.plan_manifest.nodes:
         current = child_state.slices.get(node.name)
         if current is None or current.status is not SliceStatus.MERGED:
+            _log_readiness_refusal(
+                task.name,
+                "child_slice_incomplete",
+                f"planned child {node.name!r} is not durably merged",
+            )
             return None
         if node.kind == "leaf" and current.pr_number is not None:
             receipt = _verified_leaf_merge_receipt(current)
             if receipt is None:
+                _log_readiness_refusal(
+                    task.name,
+                    "child_receipt_invalid",
+                    f"completed leaf {node.name!r} has invalid review, publication, or push evidence",
+                )
                 return None
             reviewed_leaf_ids.append(node.node_id)
             receipts.append(receipt)
+            lineage_commits.extend(
+                (cast(str, receipt["parent_commit_sha"]), cast(str, receipt["pushed_commit"]))
+            )
         elif node.kind == "sub_tl" and node.integration_contract.get("aggregate_pr_required", True):
-            if not _verified_nested_aggregate_receipt(child_state, node.name, current):
+            nested_receipt = _verified_nested_aggregate_receipt(child_state, node.name, current)
+            if nested_receipt is None:
+                _log_readiness_refusal(
+                    task.name,
+                    "nested_aggregate_receipt_invalid",
+                    f"nested aggregate {node.name!r} lacks a valid completed push receipt",
+                )
                 return None
-            receipts.append(
-                {
-                    "slice_id": node.node_id,
-                    "pr_number": current.pr_number,
-                    "head_sha": current.publication.head_sha
-                    if current.publication is not None
-                    else None,
-                    "nested_integration_lifecycle": child_state.integration.candidates[
-                        node.name
-                    ].lifecycle.value,
-                }
+            receipts.append(nested_receipt)
+            lineage_commits.extend(
+                (
+                    cast(str, nested_receipt["parent_commit_sha"]),
+                    cast(str, nested_receipt["pushed_commit"]),
+                )
             )
     if not receipts:
+        _log_readiness_refusal(
+            task.name, "child_receipts_missing", "no completed child receipts found"
+        )
+        return None
+    if repository is None:
+        _log_readiness_refusal(
+            task.name,
+            "aggregate_repository_unavailable",
+            "aggregate owner worktree is not recorded",
+        )
+        return None
+    try:
+        lineage = verify_aggregate_lineage(
+            repository,
+            aggregate.head_sha,
+            observation.pr_head_tree_sha,
+            tuple(lineage_commits),
+        )
+    except GitLineageError as error:
+        _log_readiness_refusal(task.name, error.code, error.detail)
         return None
     payload = {
         "child_run_id": child_state.run_id,
@@ -14540,6 +14668,9 @@ def _verified_child_completion_evidence(
             "base_sha": aggregate.original_base_sha,
             "patch_digest": aggregate.patch_digest,
         },
+        "aggregate_head_tree_sha": lineage.aggregate_tree_sha,
+        "lineage_commit_shas": sorted(set(lineage_commits)),
+        "lineage_proof_digest": lineage.digest,
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -14551,9 +14682,67 @@ def _verified_child_completion_evidence(
         aggregate_head_sha=aggregate.head_sha,
         aggregate_base_sha=aggregate.original_base_sha,
         aggregate_patch_digest=aggregate.patch_digest,
+        aggregate_head_tree_sha=lineage.aggregate_tree_sha,
         reviewed_leaf_ids=tuple(sorted(reviewed_leaf_ids)),
+        lineage_commit_shas=tuple(sorted(set(lineage_commits))),
+        lineage_proof_digest=lineage.digest,
         receipt_digest=digest,
     )
+
+
+def _log_readiness_refusal(slice_id: str, code: str, detail: str) -> None:
+    LOGGER.warning(
+        "[TL loop] aggregate readiness blocked for %s: %s: %s",
+        slice_id,
+        code,
+        detail,
+    )
+
+
+def _aggregate_publication_refusal(
+    task: SubTLTask,
+    current: SliceState,
+    aggregate: AggregateCandidate,
+    watcher: WatcherObservation | Mapping[str, object] | None,
+) -> str | None:
+    """Require one exact, reachable watcher publication before readiness."""
+    watcher = _as_watcher_observation(watcher)
+    if watcher is None:
+        return "watcher_malformed"
+    owner_id = task.agent_id or task.name
+    if _watcher_publication_refused(current, watcher, owner_id):
+        validation = validate_publication_from_watcher(
+            current,
+            watcher,
+            watcher.head_sha,
+            owner_id,
+        )
+        rejection = validation.rejection
+        reason = rejection.reason_code if rejection is not None else "unknown"
+        expected = dict(rejection.expected) if rejection is not None else {}
+        observed = dict(rejection.observed) if rejection is not None else {}
+        return f"publication_provenance_mismatch:{reason} expected={expected} observed={observed}"
+    if _watcher_publication_ownership_unresolved(watcher):
+        return "publication_ownership_unresolved"
+    if watcher.found is not True:
+        return "aggregate_publication_not_found"
+    if watcher.pr_number != aggregate.pr_number:
+        return "aggregate_pr_number_mismatch"
+    if watcher.head_sha != aggregate.head_sha:
+        return "aggregate_head_sha_mismatch"
+    if watcher.patch_digest != aggregate.patch_digest:
+        return "aggregate_patch_digest_mismatch"
+    if watcher.head_branch != current.branch:
+        return "aggregate_head_branch_mismatch"
+    if watcher.base_branch != current.base_ref:
+        return "aggregate_base_branch_mismatch"
+    if watcher.head_reachable is not True:
+        return "aggregate_head_unreachable"
+    if not watcher.pr_head_tree_sha:
+        return "aggregate_head_tree_missing"
+    if watcher.evidence_error:
+        return "aggregate_publication_evidence_error"
+    return None
 
 
 def _verified_leaf_merge_receipt(current: SliceState) -> Mapping[str, object] | None:
@@ -14582,6 +14771,10 @@ def _verified_leaf_merge_receipt(current: SliceState) -> Mapping[str, object] | 
         or not receipt.get("merge_journal_id")
     ):
         return None
+    push_errors: list[str] = []
+    _validate_completed_push_receipt(current, receipt, push_errors)
+    if push_errors:
+        return None
     patch_digest = current.review_patch_digests.get(publication.head_sha)
     try:
         verify_review(current, publication.head_sha, current_patch_digest=patch_digest)
@@ -14595,22 +14788,50 @@ def _verified_leaf_merge_receipt(current: SliceState) -> Mapping[str, object] | 
         "publication_invocation_id": publication.invocation_id,
         "handoff_invocation_id": handoff.invocation_id,
         "merge_journal_id": receipt.get("merge_journal_id"),
+        "parent_commit_sha": receipt.get("parent_commit_sha"),
+        "pushed_commit": receipt.get("pushed_commit"),
+        "bookkeeping_commit": receipt.get("bookkeeping_commit") or receipt.get("pushed_commit"),
+        "observed_remote_head": receipt.get("observed_remote_head"),
         "post_merge_receipt": hashlib.sha256(
             json.dumps(dict(receipt), sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
     }
 
 
-def _verified_nested_aggregate_receipt(state: RunState, slice_id: str, current: SliceState) -> bool:
+def _verified_nested_aggregate_receipt(
+    state: RunState,
+    slice_id: str,
+    current: SliceState,
+) -> Mapping[str, object] | None:
     candidate = state.integration.candidates.get(slice_id)
-    return (
-        candidate is not None
-        and candidate.lifecycle is IntegrationLifecycle.MERGED
-        and candidate.aggregate_pr_number == current.pr_number
-        and current.post_merge is not None
-        and current.post_merge.phase is PostMergePhase.COMPLETE
-        and current.post_merge.evidence.get("head_sha")
-    )
+    receipt = current.post_merge.evidence if current.post_merge is not None else None
+    if (
+        candidate is None
+        or candidate.lifecycle is not IntegrationLifecycle.MERGED
+        or candidate.aggregate_pr_number != current.pr_number
+        or current.status is not SliceStatus.MERGED
+        or current.post_merge is None
+        or current.post_merge.phase is not PostMergePhase.COMPLETE
+        or not receipt
+        or not receipt.get("head_sha")
+        or receipt.get("pr_number") not in {str(current.pr_number), current.pr_number}
+        or not receipt.get("parent_commit_sha")
+    ):
+        return None
+    push_errors: list[str] = []
+    _validate_completed_push_receipt(current, receipt, push_errors)
+    if push_errors:
+        return None
+    return {
+        "slice_id": current.manifest_node_id or current.id,
+        "pr_number": current.pr_number,
+        "head_sha": receipt.get("head_sha"),
+        "parent_commit_sha": receipt.get("parent_commit_sha"),
+        "pushed_commit": receipt.get("pushed_commit"),
+        "bookkeeping_commit": receipt.get("bookkeeping_commit") or receipt.get("pushed_commit"),
+        "observed_remote_head": receipt.get("observed_remote_head"),
+        "nested_integration_lifecycle": candidate.lifecycle.value,
+    }
 
 
 def _ordered_recovery_is_superseded(current: SliceState, owner_run_id: str, slice_id: str) -> bool:
@@ -15612,7 +15833,15 @@ def _integrate_one_candidate(
     """Validate one aggregate candidate, recheck its base, then merge it."""
     current = state.slices[task.name]
     candidate_runtime = _candidate_runtime(state.integration, task.name)
+    aggregate_identity = _aggregate_candidate_from_state(
+        task.name, state.integration.candidates.get(task.name)
+    )
     publication_owner = task.agent_id or task.name
+    if current.pr_number is None or aggregate_identity is None:
+        _log_readiness_refusal(
+            task.name, "aggregate_candidate_missing", "aggregate PR binding is absent"
+        )
+        return state
     first: Mapping[str, object] | None = None
     if candidate_runtime.lifecycle is IntegrationLifecycle.MERGING:
         first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
@@ -15627,6 +15856,17 @@ def _integrate_one_candidate(
             )
             return state
         if _snapshot_bool(first, "merged"):
+            readiness = _load_child_readiness_for_watcher(
+                task,
+                state,
+                current,
+                aggregate_identity,
+                first,
+                config,
+                store,
+            )
+            if readiness is None:
+                return state
             _record_controller_event(
                 task.name,
                 "tl.merge_reconciled",
@@ -15658,7 +15898,24 @@ def _integrate_one_candidate(
             task.name,
         )
         return state
+    refusal = _aggregate_publication_refusal(task, current, aggregate_identity, first)
+    if refusal is not None:
+        _log_readiness_refusal(
+            task.name, refusal, "live aggregate publication does not match its candidate"
+        )
+        return state
     if _snapshot_bool(first, "merged"):
+        readiness = _load_child_readiness_for_watcher(
+            task,
+            state,
+            current,
+            aggregate_identity,
+            first,
+            config,
+            store,
+        )
+        if readiness is None:
+            return state
         merged_head = _snapshot_text(first, "head_sha") or candidate_runtime.head_sha
         merged_patch = (
             _snapshot_text(first, "patch_digest")
@@ -15702,23 +15959,18 @@ def _integrate_one_candidate(
     ci_status = _snapshot_text(first, "ci_status")
     if not all((head_sha, base_sha, patch_digest, merge_tree_sha, ci_status)):
         return state
-    aggregate_identity = _aggregate_candidate_from_state(
-        task.name, state.integration.candidates.get(task.name)
+    if head_sha != aggregate_identity.head_sha or patch_digest != aggregate_identity.patch_digest:
+        return state
+    readiness = _load_child_readiness_for_watcher(
+        task,
+        state,
+        current,
+        aggregate_identity,
+        first,
+        config,
+        store,
     )
-    if (
-        aggregate_identity is None
-        or head_sha != aggregate_identity.head_sha
-        or patch_digest != aggregate_identity.patch_digest
-    ):
-        return state
-    child_store = RunStore(task.name, store.run_dir)
-    if not child_store.path.exists():
-        return state
-    try:
-        child_state = child_store.load()
-    except (OSError, ValueError):
-        return state
-    if _verified_child_completion_evidence(task, child_state, aggregate_identity) is None:
+    if readiness is None:
         return state
     transitioned_integration = _transition_candidate_runtime(
         state.integration, task.name, IntegrationTransition.INTEGRATION_VALIDATED
@@ -15766,6 +16018,23 @@ def _integrate_one_candidate(
         LOGGER.warning(
             "[TL loop] refusing aggregate merge for %s: publication provenance mismatch",
             task.name,
+        )
+        return state
+    if second.pr_number != aggregate_identity.pr_number or second.found is not True:
+        _log_readiness_refusal(
+            task.name,
+            "aggregate_publication_changed",
+            "watcher no longer resolves the same aggregate PR",
+        )
+        return state
+    if (
+        _snapshot_text(second, "head_sha") == readiness.aggregate_head_sha
+        and _snapshot_text(second, "pr_head_tree_sha") != readiness.aggregate_head_tree_sha
+    ):
+        _log_readiness_refusal(
+            task.name,
+            "aggregate_head_tree_changed",
+            "authoritative aggregate head tree changed after readiness verification",
         )
         return state
     if _snapshot_text(second, "base_sha") != base_sha:

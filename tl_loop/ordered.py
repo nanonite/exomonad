@@ -206,7 +206,10 @@ class IntegrationReadinessEvidence:
     aggregate_head_sha: str
     aggregate_base_sha: str
     aggregate_patch_digest: str
+    aggregate_head_tree_sha: str
     reviewed_leaf_ids: tuple[str, ...]
+    lineage_commit_shas: tuple[str, ...]
+    lineage_proof_digest: str
     receipt_digest: str
 
     def __post_init__(self) -> None:
@@ -216,6 +219,8 @@ class IntegrationReadinessEvidence:
             "aggregate_head_sha",
             "aggregate_base_sha",
             "aggregate_patch_digest",
+            "aggregate_head_tree_sha",
+            "lineage_proof_digest",
             "receipt_digest",
         ):
             if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
@@ -224,6 +229,10 @@ class IntegrationReadinessEvidence:
             raise ValueError("integration readiness aggregate_pr_number must be positive")
         if any(not isinstance(item, str) or not item for item in self.reviewed_leaf_ids):
             raise ValueError("integration readiness reviewed_leaf_ids must be non-empty strings")
+        if any(not isinstance(item, str) or not item for item in self.lineage_commit_shas):
+            raise ValueError("integration readiness lineage_commit_shas must be non-empty strings")
+        if not self.lineage_commit_shas:
+            raise ValueError("integration readiness requires child commit lineage")
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,7 @@ import hashlib
 import json
 import multiprocessing
 import queue
+import subprocess
 import threading
 import time
 from collections.abc import Mapping
@@ -167,6 +168,58 @@ class SyntheticQueue:
         assert event.run_seq is not None
         self.acknowledged.append(event.run_seq)
         return event.run_seq
+
+
+def _test_git_output(repository: Path, *arguments: str) -> str | None:
+    result = subprocess.run(
+        ("git", "-C", str(repository), *arguments),
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _test_git_repository(repository: Path) -> str:
+    repository.mkdir(parents=True, exist_ok=True)
+    if _test_git_output(repository, "rev-parse", "--show-toplevel") is None:
+        subprocess.run(
+            ("git", "-C", str(repository), "init", "--initial-branch=main"),
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        subprocess.run(
+            ("git", "-C", str(repository), "config", "user.name", "TL Test"),
+            check=True,
+        )
+        subprocess.run(
+            ("git", "-C", str(repository), "config", "user.email", "tl-test@example.invalid"),
+            check=True,
+        )
+        (repository / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(("git", "-C", str(repository), "add", "base.txt"), check=True)
+        subprocess.run(("git", "-C", str(repository), "commit", "-m", "base"), check=True)
+    head = _test_git_output(repository, "rev-parse", "HEAD")
+    assert head is not None
+    return head
+
+
+def _test_git_commit(repository: Path, filename: str, content: str, message: str) -> str:
+    (repository / filename).write_text(content, encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", filename), check=True)
+    subprocess.run(("git", "-C", str(repository), "commit", "-m", message), check=True)
+    head = _test_git_output(repository, "rev-parse", "HEAD")
+    assert head is not None
+    return head
+
+
+def _test_git_tree(repository: Path, commit: str) -> str:
+    tree = _test_git_output(repository, "rev-parse", f"{commit}^{{tree}}")
+    assert tree is not None
+    return tree
 
 
 def test_event_diagnostics_exposes_non_terminal_timing() -> None:
@@ -899,6 +952,7 @@ class RecordingTransport:
     next_controller_run_seq: int = 1000
     aggregate_reconciliation: JsonObject | None = None
     aggregate_reconciliations: dict[str, JsonObject] = field(default_factory=dict)
+    aggregate_git_evidence: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     def call_tool(
         self,
@@ -972,25 +1026,35 @@ class RecordingTransport:
             if title.startswith("Aggregate ") and " into " in title:
                 slice_id = title.removeprefix("Aggregate ").split(" into ", 1)[0]
                 base_branch = str(arguments.get("base_branch", "main"))
-                self.aggregate_reconciliations[slice_id] = _aggregate_watcher_fixture(
-                    f"{slice_id}-invocation",
+                publication_identity = arguments.get("publication_identity")
+                identity = publication_identity if isinstance(publication_identity, Mapping) else {}
+                invocation_id = str(identity.get("invocation_id") or f"{slice_id}-invocation")
+                head_branch = str(identity.get("head_branch") or f"{base_branch}.{slice_id}")
+                author_agent = str(identity.get("author_agent") or name)
+                head_sha, head_tree = self.aggregate_git_evidence.get(slice_id, ("head-a", ""))
+                reconciliation = _aggregate_watcher_fixture(
+                    invocation_id,
                     slice_id=slice_id,
-                    author_agent=name,
-                    head_branch=f"{base_branch}.{slice_id}",
+                    author_agent=author_agent,
+                    head_branch=head_branch,
                     base_branch=base_branch,
                 )
+                reconciliation["watcher"]["head_sha"] = head_sha
+                if head_tree:
+                    reconciliation["watcher"]["pr_head_tree_sha"] = head_tree
+                self.aggregate_reconciliations[slice_id] = reconciliation
                 return {
                     "success": True,
                     "result": {
                         "pr_number": 43,
-                        "head_sha": "head-a",
+                        "head_sha": head_sha,
                         "patch_digest": "patch-a",
                         "base_sha": "base-a",
-                        "head_branch": f"{base_branch}.{slice_id}",
+                        "head_branch": head_branch,
                         "base_branch": base_branch,
                         "slice_id": slice_id,
-                        "invocation_id": f"{slice_id}-invocation",
-                        "author_agent": name,
+                        "invocation_id": invocation_id,
+                        "author_agent": author_agent,
                     },
                 }
             return {
@@ -1814,6 +1878,7 @@ def test_exited_waiting_child_is_failed_as_process_loss() -> None:
 class IntegrationTransport(RecordingTransport):
     snapshots: list[JsonObject] = field(default_factory=list)
     merge_response: JsonObject | None = None
+    last_snapshot: JsonObject | None = None
 
     def call_tool(
         self,
@@ -1824,7 +1889,20 @@ class IntegrationTransport(RecordingTransport):
     ) -> JsonObject:
         if tool_name == "watcher_pr_state":
             self.calls.append((tool_name, arguments))
-            snapshot = self.snapshots.pop(0)
+            if self.snapshots:
+                self.last_snapshot = self.snapshots.pop(0)
+            snapshot = self.last_snapshot or {"found": False}
+            record = next(
+                (
+                    item
+                    for item in self.aggregate_reconciliations.values()
+                    if item.get("pr_number") == arguments.get("pr_number")
+                ),
+                self.aggregate_reconciliation,
+            )
+            watcher = record.get("watcher") if isinstance(record, Mapping) else None
+            if isinstance(watcher, Mapping):
+                snapshot = {**watcher, **snapshot}
             return {"success": True, "result": snapshot}
         if tool_name == "merge_pr" and self.merge_response is not None:
             self.calls.append((tool_name, arguments))
@@ -1858,14 +1936,16 @@ class OrderedIntegrationTransport(IntegrationTransport):
             sub_tl_id = "alpha" if "alpha" in title else "beta"
             base_branch = str(arguments.get("base_branch", "main"))
             pr_number = 101 if sub_tl_id == "alpha" else 102
-            head_sha = f"head-{sub_tl_id}"
+            head_sha, head_tree = self.aggregate_git_evidence.get(
+                sub_tl_id, (f"head-{sub_tl_id}", "")
+            )
             patch_digest = f"patch-{sub_tl_id}"
             base_sha = "base-alpha" if sub_tl_id == "alpha" else "base-after-alpha"
             head_branch = f"{base_branch}.{sub_tl_id}"
             publication = {
                 "invocation_id": f"{sub_tl_id}-invocation",
                 "slice_id": sub_tl_id,
-                "author_agent": name,
+                "author_agent": sub_tl_id,
                 "succession_invocation_ids": [],
             }
             self.aggregate_reconciliations[sub_tl_id] = {
@@ -1878,6 +1958,7 @@ class OrderedIntegrationTransport(IntegrationTransport):
                     "head_sha": head_sha,
                     "base_sha": base_sha,
                     "patch_digest": patch_digest,
+                    "pr_head_tree_sha": head_tree,
                     "merge_tree_sha": f"tree-{sub_tl_id}",
                     "ci_status": "success",
                     "head_branch": head_branch,
@@ -1899,7 +1980,7 @@ class OrderedIntegrationTransport(IntegrationTransport):
                     "base_branch": base_branch,
                     "slice_id": sub_tl_id,
                     "invocation_id": f"{sub_tl_id}-invocation",
-                    "author_agent": name,
+                    "author_agent": sub_tl_id,
                 },
             }
         if tool_name == "watcher_pr_state":
@@ -2137,9 +2218,12 @@ def _blocked_event(
 def _seed_nested_aggregate_in_review(root_store: RunStore) -> RunState:
     state = root_store.load()
     current = state.slices["architecture"]
+    aggregate_head = (
+        _test_git_output(Path(current.worktree), "rev-parse", "HEAD") if current.worktree else None
+    ) or "e" * 40
     publication = PublicationBinding(
         pr_number=273,
-        head_sha="e" * 40,
+        head_sha=aggregate_head,
         head_branch=current.branch or "main.architecture",
         base_branch="main",
         attempt=1,
@@ -2984,7 +3068,8 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
         leaf_issue_id=42,
     )
     assert child_store is not None
-    _complete_nested_leaf(child_store)
+    repository_path = Path(root_store.load().slices["architecture"].worktree or "")
+    _complete_nested_leaf(child_store, repository=repository_path)
     repository = RepositoryIdentity("https://forge.example.test/test/repository.git")
     root_store.set_repository_identity(repository)
     seeded = _seed_nested_aggregate_in_review(root_store)
@@ -3051,6 +3136,7 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
         "base_sha": "aggregate-base",
         "patch_digest": "aggregate-patch",
         "merge_tree_sha": "aggregate-merge-tree",
+        "pr_head_tree_sha": _test_git_tree(repository_path, aggregate_head),
         "ci_status": "success",
         "head_branch": root_slice.branch,
         "base_branch": root_slice.base_ref,
@@ -3581,11 +3667,31 @@ def _three_level_blocked_owner_stores(
     return plan, root_store, inner_store
 
 
-def _complete_nested_leaf(child_store: RunStore, *, attempt: int = 6) -> RunState:
+def _complete_nested_leaf(
+    child_store: RunStore,
+    *,
+    attempt: int = 6,
+    repository: Path | None = None,
+) -> RunState:
     """Persist complete receipt-backed leaf history for blocker replay tests."""
     state = child_store.load()
     current = state.slices["leaf-a"]
     head_sha = "a" * 40
+    parent_commit_sha = "b" * 40
+    changelog_commit_sha = "c" * 40
+    expected_base_sha = "c" * 40
+    pushed_commit = "d" * 40
+    if repository is not None:
+        expected_base_sha = _test_git_repository(repository)
+        head_sha = _test_git_commit(repository, "leaf-a.txt", "reviewed leaf\n", "leaf merge")
+        parent_commit_sha = head_sha
+        changelog_commit_sha = _test_git_commit(
+            repository, "CHANGELOG.md", "leaf entry\n", "changelog bookkeeping"
+        )
+        pushed_commit = _test_git_commit(
+            repository, "post-merge.txt", "bookkeeping receipt\n", "parent bookkeeping push"
+        )
+        _test_git_commit(repository, "aggregate.txt", "aggregate publication\n", "aggregate head")
     publication = PublicationBinding(
         pr_number=145,
         head_sha=head_sha,
@@ -3623,19 +3729,19 @@ def _complete_nested_leaf(child_store: RunStore, *, attempt: int = 6) -> RunStat
         "head_sha": publication.head_sha,
         "merge_journal_id": "leaf-merge-journal",
         "lane_epoch": "1",
-        "parent_commit_sha": "b" * 40,
+        "parent_commit_sha": parent_commit_sha,
         **closure,
         "changelog_intent_id": "leaf-changelog-intent",
         "changelog_generation": "1",
-        "changelog_commit_sha": "c" * 40,
+        "changelog_commit_sha": changelog_commit_sha,
         "parent_push_intent_id": "leaf-parent-push-intent",
         "push_journal_id": "leaf-push-journal",
-        "expected_base_sha": "c" * 40,
+        "expected_base_sha": expected_base_sha,
         "push_receipt_id": "leaf-push-receipt",
-        "pushed_commit": "d" * 40,
-        "bookkeeping_commit": "d" * 40,
-        "observed_remote_head": "d" * 40,
-        "ancestry_proof": f"ancestor:{'d' * 40}->{'d' * 40}",
+        "pushed_commit": pushed_commit,
+        "bookkeeping_commit": pushed_commit,
+        "observed_remote_head": pushed_commit,
+        "ancestry_proof": f"ancestor:{pushed_commit}->{pushed_commit}",
     }
     post_merge = PostMergeState(PostMergePhase.COMPLETE, evidence)
     completed = replace(
@@ -6076,6 +6182,8 @@ def test_quiescent_convergence_is_not_parked(tmp_path: Path) -> None:
 def test_valid_exact_head_review_still_merges_without_parking(tmp_path: Path) -> None:
     store = _mergeable_review_store(tmp_path)
     transport = IntegrationTransport(
+        spawned_agent_id="aggregate-child",
+        spawned_invocation_id="aggregate-child-invocation",
         snapshots=[
             {
                 "merged": False,
@@ -8158,13 +8266,46 @@ def _multi_leaf_events(run_id: str) -> list[EventEnvelope]:
     ]
 
 
-def _complete_ordered_child_receipts(child_store: RunStore, scope: str) -> RunState:
+def _complete_ordered_child_receipts(
+    child_store: RunStore,
+    scope: str,
+    *,
+    repository: Path | None = None,
+) -> RunState:
     """Persist exact reviewed leaf merges for one synthetic ordered child."""
     state = child_store.load()
+    expected_base = _test_git_repository(repository) if repository is not None else None
     completed: dict[str, SliceState] = {}
     for index, (slice_id, current) in enumerate(sorted(state.slices.items()), start=1):
         pr_number = current.pr_number or 200 + index
         head_sha = f"{scope}-{slice_id}-reviewed-head"
+        parent_commit_sha = f"{scope}-{slice_id}-parent"
+        changelog_commit_sha = f"{scope}-{slice_id}-changelog"
+        pushed_commit = f"{scope}-{slice_id}-pushed"
+        expected_base_sha = f"{scope}-{slice_id}-expected-base"
+        if repository is not None:
+            assert expected_base is not None
+            expected_base_sha = expected_base
+            head_sha = _test_git_commit(
+                repository,
+                f"{scope}-{slice_id}.txt",
+                f"reviewed {scope} {slice_id}\n",
+                f"{scope} {slice_id} reviewed merge",
+            )
+            parent_commit_sha = head_sha
+            changelog_commit_sha = _test_git_commit(
+                repository,
+                f"{scope}-CHANGELOG.md",
+                f"{scope} {slice_id} changelog\n",
+                f"{scope} {slice_id} changelog",
+            )
+            pushed_commit = _test_git_commit(
+                repository,
+                f"{scope}-post-merge-{slice_id}.txt",
+                f"{scope} {slice_id} bookkeeping\n",
+                f"{scope} {slice_id} bookkeeping push",
+            )
+            expected_base = pushed_commit
         base_branch = current.base_ref or "main"
         owner = current.dispatch_agent_id or slice_id
         invocation_id = f"{scope}-{slice_id}-publication"
@@ -8192,7 +8333,7 @@ def _complete_ordered_child_receipts(child_store: RunStore, scope: str) -> RunSt
             "head_sha": head_sha,
             "merge_journal_id": f"{scope}-{slice_id}-merge-journal",
             "lane_epoch": "1",
-            "parent_commit_sha": f"{scope}-{slice_id}-parent",
+            "parent_commit_sha": parent_commit_sha,
         }
         if current.chainlink_issue_id is None:
             receipt.update(
@@ -8214,15 +8355,15 @@ def _complete_ordered_child_receipts(child_store: RunStore, scope: str) -> RunSt
             {
                 "changelog_intent_id": f"{scope}-{slice_id}-changelog-intent",
                 "changelog_generation": "1",
-                "changelog_commit_sha": f"{scope}-{slice_id}-changelog",
+                "changelog_commit_sha": changelog_commit_sha,
                 "parent_push_intent_id": f"{scope}-{slice_id}-parent-push-intent",
                 "push_journal_id": f"{scope}-{slice_id}-push-journal",
-                "expected_base_sha": f"{scope}-{slice_id}-expected-base",
+                "expected_base_sha": expected_base_sha,
                 "push_receipt_id": f"{scope}-{slice_id}-push-receipt",
-                "pushed_commit": f"{scope}-{slice_id}-pushed",
-                "bookkeeping_commit": f"{scope}-{slice_id}-bookkeeping",
-                "observed_remote_head": f"{scope}-{slice_id}-remote-head",
-                "ancestry_proof": f"ancestor:{scope}-{slice_id}-pushed->{scope}-{slice_id}-remote-head",
+                "pushed_commit": pushed_commit,
+                "bookkeeping_commit": pushed_commit,
+                "observed_remote_head": pushed_commit,
+                "ancestry_proof": f"ancestor:{pushed_commit}->{pushed_commit}",
             }
         )
         completed[slice_id] = replace(
@@ -8729,11 +8870,23 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             )
             child_store = RunStore(sub_tl_id, root_store.run_dir)
             child_store.set_plan_manifest(child_manifest, slices=child_slices)
-            _complete_ordered_child_receipts(child_store, sub_tl_id)
+            repository = Path(worktree)
+            _complete_ordered_child_receipts(
+                child_store,
+                sub_tl_id,
+                repository=repository,
+            )
+            aggregate_head = _test_git_output(repository, "rev-parse", "HEAD")
+            assert aggregate_head is not None
+            transport.aggregate_git_evidence[sub_tl_id] = (
+                aggregate_head,
+                _test_git_tree(repository, aggregate_head),
+            )
         current = state.slices["alpha"]
+        alpha_head, alpha_tree = transport.aggregate_git_evidence["alpha"]
         alpha_publication = PublicationBinding(
             pr_number=101,
-            head_sha="head-alpha",
+            head_sha=alpha_head,
             head_branch=current.branch or "main.alpha",
             base_branch="main",
             attempt=1,
@@ -8742,14 +8895,14 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         aggregate = IntegrationCandidateState(
             lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
             aggregate_pr_number=101,
-            aggregate_head_sha="head-alpha",
+            aggregate_head_sha=alpha_head,
             aggregate_patch_digest="patch-alpha",
             aggregate_original_base_sha="base-alpha",
             integration_owner_id="ordered-e2e-run:alpha:integration",
             integration_owner_run_id="alpha",
             integration_owner_branch=current.branch,
             integration_owner_worktree=current.worktree,
-            head_sha="head-alpha",
+            head_sha=alpha_head,
             patch_digest="patch-alpha",
         )
         alpha = replace(
@@ -8795,9 +8948,10 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
                 "found": True,
                 "pr_number": 101,
                 "merged": False,
-                "head_sha": "head-alpha",
+                "head_sha": alpha_head,
                 "base_sha": "base-alpha",
                 "patch_digest": "patch-alpha",
+                "pr_head_tree_sha": alpha_tree,
                 "merge_tree_sha": "tree-alpha",
                 "ci_status": "success",
                 "head_branch": alpha.branch,
@@ -9104,7 +9258,10 @@ def test_ordered_sub_tl_restart_adopts_terminal_child_checkpoint(
     assert result.final_state.slices["adopt-child"].status is SliceStatus.MERGED
 
 
-def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(tmp_path: Path) -> None:
+def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     transport = NamedRecordingTransport()
     child_plan = _plan()
     child_plan = replace(
@@ -9964,6 +10121,10 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
                     author_agent="architecture",
                     head_branch="main.architecture",
                 )
+                aggregate_head, aggregate_tree = self.aggregate_git_evidence["architecture"]
+                self.aggregate_reconciliation["watcher"]["head_sha"] = aggregate_head
+                self.aggregate_reconciliation["watcher"]["pr_head_tree_sha"] = aggregate_tree
+                self.aggregate_reconciliation["head_sha"] = aggregate_head
                 raise SystemExit("simulated controller crash after aggregate publication")
             return super().call_tool(role, name, tool_name, arguments)
 
@@ -9983,6 +10144,22 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
             Path(__file__).parent / "fixtures" / "model_catalog.json"
         ),
     )
+    repository_path = Path(driver_module._sub_tl_worktree(config, state_root, run_id, stages[0]))
+    repository_base = _test_git_repository(repository_path)
+    reviewed_commit = _test_git_commit(
+        repository_path, "issue-811.txt", "reviewed architecture work\n", "PR 45 merge"
+    )
+    changelog_commit = _test_git_commit(
+        repository_path, "CHANGELOG.md", "issue 811 completed\n", "issue 811 changelog"
+    )
+    push_commit = _test_git_commit(
+        repository_path, "issue-811-bookkeeping.txt", "bookkeeping\n", "issue 811 push"
+    )
+    aggregate_head = _test_git_commit(
+        repository_path, "aggregate.txt", "architecture aggregate\n", "aggregate PR 46 head"
+    )
+    aggregate_tree = _test_git_tree(repository_path, aggregate_head)
+    transport.aggregate_git_evidence["architecture"] = (aggregate_head, aggregate_tree)
     with pytest.raises(SystemExit, match="after aggregate publication"):
         run_tl_loop(
             run_id,
@@ -10006,32 +10183,32 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
             "repository": "https://forge.example.com/org/repo.git",
             "parent_branch": "main.architecture",
             "pr_number": "45",
-            "head_sha": "a" * 40,
+            "head_sha": reviewed_commit,
             "merge_journal_id": "merge-45",
-            "lane_epoch": "epoch-1",
-            "parent_commit_sha": "b" * 40,
+            "lane_epoch": "1",
+            "parent_commit_sha": reviewed_commit,
             "issue_id": "811",
             "issue_close_intent_id": "close-811",
             "issue_close_journal_id": "chainlink-close:811",
-            "forgejo_head_sha": "a" * 40,
+            "forgejo_head_sha": reviewed_commit,
             "forgejo_merged": "true",
             "forgejo_pr_number": "45",
             "changelog_intent_id": "changelog-811",
             "changelog_generation": "1",
-            "changelog_commit_sha": "c" * 40,
+            "changelog_commit_sha": changelog_commit,
             "parent_push_intent_id": "push-811",
             "push_journal_id": "push-journal-811",
-            "expected_base_sha": "d" * 40,
+            "expected_base_sha": repository_base,
             "push_receipt_id": "receipt-811",
-            "pushed_commit": "e" * 40,
-            "bookkeeping_commit": "f" * 40,
-            "observed_remote_head": "f" * 40,
-            "ancestry_proof": "push-ancestry-811",
+            "pushed_commit": push_commit,
+            "bookkeeping_commit": push_commit,
+            "observed_remote_head": push_commit,
+            "ancestry_proof": f"ancestor:{push_commit}->{push_commit}",
         },
     )
     leaf_publication = PublicationBinding(
         pr_number=45,
-        head_sha="a" * 40,
+        head_sha=reviewed_commit,
         head_branch=completed_leaf.branch or "main.architecture.leaf-a",
         base_branch="main.architecture",
         attempt=1,
@@ -10039,7 +10216,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     )
     leaf_handoff = HandoffEvidence(
         pr_number=45,
-        head_sha="a" * 40,
+        head_sha=reviewed_commit,
         attempt=1,
         invocation_id="leaf-811-publication-invocation",
         agent_id=completed_leaf.dispatch_agent_id or "leaf-a",
@@ -10049,10 +10226,10 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         completed_leaf,
         status=SliceStatus.MERGED,
         pr_number=45,
-        reviewed_head="a" * 40,
+        reviewed_head=reviewed_commit,
         verdict=Verdict.GO,
-        review_patch_digests={"a" * 40: "leaf-811-patch"},
-        ci_state={"a" * 40: "success"},
+        review_patch_digests={reviewed_commit: "leaf-811-patch"},
+        ci_state={reviewed_commit: "success"},
         publication=leaf_publication,
         handoff=leaf_handoff,
         chainlink_issue_id=811,
@@ -10335,7 +10512,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     assert architecture_slice.dispatch_invocation_id == invocation_id
     aggregate_candidate = adopted.final_state.integration.candidates["architecture"]
     assert aggregate_candidate.aggregate_pr_number == 43
-    assert aggregate_candidate.aggregate_head_sha == "head-a"
+    assert aggregate_candidate.aggregate_head_sha == aggregate_head
     assert aggregate_candidate.aggregate_original_base_sha == "base-a"
     assert aggregate_candidate.aggregate_patch_digest == "patch-a"
     assert aggregate_candidate.integration_owner_id == "root:architecture:integration"
@@ -10380,20 +10557,25 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     )
     assert (
         driver_module._verified_child_completion_evidence(
-            candidate_plan.sub_tls[0], child_store.load(), readiness_candidate
+            candidate_plan.sub_tls[0],
+            child_store.load(),
+            readiness_candidate,
+            watcher=cast(JsonObject, transport.aggregate_reconciliation["watcher"]),
+            repository=repository_path,
         )
         is not None
     )
     waiting_for_review = root_state.slices["architecture"]
     assert waiting_for_review.verdict is None
-    assert waiting_for_review.ci_state.get("head-a") != "success"
+    assert waiting_for_review.ci_state.get(aggregate_head) != "success"
     assert not any(name == "merge_pr" for name, _ in transport.calls)
 
     successful_snapshot = {
-        "head_sha": "head-a",
+        "head_sha": aggregate_head,
         "base_sha": "base-a",
         "patch_digest": "patch-a",
         "merge_tree_sha": "tree-a",
+        "pr_head_tree_sha": aggregate_tree,
         "ci_status": "success",
     }
 
@@ -10967,6 +11149,7 @@ def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approv
 def test_parent_serializes_aggregate_merge_after_base_recheck(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "serialized-run"
     run_tl_loop(
@@ -10978,25 +11161,6 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         root_dir=parent_dir,
     )
     child_store = RunStore("aggregate-child", parent_dir)
-    _complete_ordered_child_receipts(child_store, "serialized")
-    transport = IntegrationTransport(
-        snapshots=[
-            {
-                "head_sha": "head-a",
-                "base_sha": "base-a",
-                "patch_digest": "patch-a",
-                "merge_tree_sha": "tree-a",
-                "ci_status": "success",
-            },
-            {
-                "head_sha": "head-a",
-                "base_sha": "base-a",
-                "patch_digest": "patch-a",
-                "merge_tree_sha": "tree-a",
-                "ci_status": "success",
-            },
-        ]
-    )
     plan = WorkPlan(
         sub_tls=(
             SubTLTask(
@@ -11008,6 +11172,47 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
             ),
         )
     )
+    setup_config = TLLoopConfig(root_dir=tmp_path, run_id="serialized-run")
+    repository = Path(
+        driver_module._sub_tl_worktree(setup_config, tmp_path, "serialized-run", plan.sub_tls[0])
+    )
+    _complete_ordered_child_receipts(child_store, "serialized", repository=repository)
+    aggregate_head = _test_git_output(repository, "rev-parse", "HEAD")
+    assert aggregate_head is not None
+    aggregate_tree = _test_git_tree(repository, aggregate_head)
+    transport = IntegrationTransport(
+        snapshots=[
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+        ]
+    )
+    transport.aggregate_git_evidence["aggregate-child"] = (aggregate_head, aggregate_tree)
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
@@ -11042,10 +11247,14 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
 
     assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
     assert result.final_state.slices["aggregate-child"].verdict is None
-    assert verified == [("base-a", "head-a", "tree-a", "success")]
+    assert (
+        result.final_state.slices["aggregate-child"].dispatch_invocation_id
+        == "aggregate-child-invocation"
+    )
+    assert verified == [("base-a", aggregate_head, "tree-a", "success")]
     candidate = result.final_state.integration.candidates["aggregate-child"]
     assert candidate.validated_base_sha == "base-a"
-    assert candidate.head_sha == "head-a"
+    assert candidate.head_sha == aggregate_head
     assert candidate.patch_digest == "patch-a"
     assert candidate.merge_tree_sha == "tree-a"
     assert candidate.ci_status == "success"
@@ -11055,7 +11264,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         "strategy": "merge",
         "working_dir": ".",
         "expected_base_sha": "base-a",
-        "expected_head_sha": "head-a",
+        "expected_head_sha": aggregate_head,
         "expected_patch_digest": "patch-a",
         "expected_merge_tree_sha": "tree-a",
     }
@@ -11238,7 +11447,10 @@ def test_external_merge_without_dispatch_and_publication_lineage_stays_unresolve
     )
 
 
-def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path) -> None:
+def test_parent_requeues_aggregate_when_base_changes_before_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "serialized-run"
     run_tl_loop(
@@ -11250,39 +11462,6 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
         root_dir=parent_dir,
     )
     child_store = RunStore("aggregate-child", parent_dir)
-    _complete_ordered_child_receipts(child_store, "base-revalidation")
-    transport = IntegrationTransport(
-        snapshots=[
-            {
-                "head_sha": "head-a",
-                "base_sha": "base-a",
-                "patch_digest": "patch-a",
-                "merge_tree_sha": "tree-a",
-                "ci_status": "success",
-            },
-            {
-                "head_sha": "head-a",
-                "base_sha": "base-b",
-                "patch_digest": "patch-a",
-                "merge_tree_sha": "tree-b",
-                "ci_status": "success",
-            },
-            {
-                "head_sha": "head-a",
-                "base_sha": "base-a",
-                "patch_digest": "patch-a",
-                "merge_tree_sha": "tree-a",
-                "ci_status": "success",
-            },
-            {
-                "head_sha": "head-a",
-                "base_sha": "base-b",
-                "patch_digest": "patch-a",
-                "merge_tree_sha": "tree-b",
-                "ci_status": "success",
-            },
-        ]
-    )
     plan = WorkPlan(
         sub_tls=(
             SubTLTask(
@@ -11294,6 +11473,58 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
             ),
         )
     )
+    setup_config = TLLoopConfig(root_dir=tmp_path, run_id="serialized-run")
+    repository = Path(
+        driver_module._sub_tl_worktree(setup_config, tmp_path, "serialized-run", plan.sub_tls[0])
+    )
+    _complete_ordered_child_receipts(
+        child_store,
+        "base-revalidation",
+        repository=repository,
+    )
+    aggregate_head = _test_git_output(repository, "rev-parse", "HEAD")
+    assert aggregate_head is not None
+    aggregate_tree = _test_git_tree(repository, aggregate_head)
+    transport = IntegrationTransport(
+        snapshots=[
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-b",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-b",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
+                "base_sha": "base-b",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-b",
+                "ci_status": "success",
+            },
+        ]
+    )
+    transport.aggregate_git_evidence["aggregate-child"] = (aggregate_head, aggregate_tree)
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
@@ -11337,7 +11568,10 @@ def test_parent_requeues_aggregate_when_base_changes_before_merge(tmp_path: Path
     ("field", "value"),
     (("head_sha", "head-b"), ("patch_digest", "patch-b")),
 )
-def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, value: str) -> None:
+def test_head_or_patch_mismatch_opens_conflict_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str
+) -> None:
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     parent_dir = tmp_path / "mismatch-run"
     child_plan = _plan()
     run_tl_loop(
@@ -11349,9 +11583,19 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
         root_dir=parent_dir,
     )
     child_store = RunStore("aggregate-child", parent_dir)
-    _complete_ordered_child_receipts(child_store, "head-mismatch")
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+    )
+    setup_config = TLLoopConfig(root_dir=tmp_path, run_id="mismatch-run")
+    repository = Path(
+        driver_module._sub_tl_worktree(setup_config, tmp_path, "mismatch-run", plan.sub_tls[0])
+    )
+    _complete_ordered_child_receipts(child_store, "head-mismatch", repository=repository)
+    aggregate_head = _test_git_output(repository, "rev-parse", "HEAD")
+    assert aggregate_head is not None
+    aggregate_tree = _test_git_tree(repository, aggregate_head)
     second_snapshot = {
-        "head_sha": "head-a",
+        "head_sha": aggregate_head,
         "base_sha": "base-a",
         "patch_digest": "patch-a",
         "merge_tree_sha": "tree-a",
@@ -11361,7 +11605,14 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
     transport = IntegrationTransport(
         snapshots=[
             {
-                "head_sha": "head-a",
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
                 "base_sha": "base-a",
                 "patch_digest": "patch-a",
                 "merge_tree_sha": "tree-a",
@@ -11370,9 +11621,7 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
             second_snapshot,
         ]
     )
-    plan = WorkPlan(
-        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
-    )
+    transport.aggregate_git_evidence["aggregate-child"] = (aggregate_head, aggregate_tree)
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
@@ -11407,7 +11656,10 @@ def test_head_or_patch_mismatch_opens_conflict_gate(tmp_path: Path, field: str, 
     assert "tl.gate_opened" in event_types
 
 
-def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> None:
+def test_integration_conflict_repairs_same_aggregate_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "conflict-run"
     run_tl_loop(
@@ -11419,7 +11671,25 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
         root_dir=parent_dir,
     )
     child_store = RunStore("aggregate-child", parent_dir)
-    _complete_ordered_child_receipts(child_store, "conflict")
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "aggregate-child",
+                child_plan,
+                source=SyntheticQueue([]),
+                order=1,
+                chainlink_issue_id=1052,
+            ),
+        )
+    )
+    setup_config = TLLoopConfig(root_dir=tmp_path, run_id="conflict-run")
+    repository = Path(
+        driver_module._sub_tl_worktree(setup_config, tmp_path, "conflict-run", plan.sub_tls[0])
+    )
+    _complete_ordered_child_receipts(child_store, "conflict", repository=repository)
+    aggregate_head = _test_git_output(repository, "rev-parse", "HEAD")
+    assert aggregate_head is not None
+    aggregate_tree = _test_git_tree(repository, aggregate_head)
     backend = ReviewBackend(
         [
             RlmResponse(
@@ -11444,14 +11714,21 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
     transport = IntegrationTransport(
         snapshots=[
             {
-                "head_sha": "head-a",
+                "head_sha": aggregate_head,
                 "base_sha": "base-a",
                 "patch_digest": "patch-a",
                 "merge_tree_sha": "tree-a",
                 "ci_status": "success",
             },
             {
-                "head_sha": "head-a",
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
                 "base_sha": "base-a",
                 "patch_digest": "patch-a",
                 "merge_tree_sha": "tree-a",
@@ -11461,22 +11738,12 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
                 "open": True,
                 "merged": False,
                 "head_branch": "main.aggregate-child",
-                "head_sha": "head-a",
+                "head_sha": aggregate_head,
             },
         ],
         merge_response={"success": False, "error": "merge conflict with parent base"},
     )
-    plan = WorkPlan(
-        sub_tls=(
-            SubTLTask(
-                "aggregate-child",
-                child_plan,
-                source=SyntheticQueue([]),
-                order=1,
-                chainlink_issue_id=1052,
-            ),
-        )
-    )
+    transport.aggregate_git_evidence["aggregate-child"] = (aggregate_head, aggregate_tree)
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
@@ -11515,7 +11782,10 @@ def test_integration_conflict_repairs_same_aggregate_owner(tmp_path: Path) -> No
     assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
 
 
-def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None:
+def test_exhausted_integration_conflict_opens_human_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "gate-run"
     run_tl_loop(
@@ -11527,21 +11797,38 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
         root_dir=parent_dir,
     )
     child_store = RunStore("aggregate-child", parent_dir)
-    _complete_ordered_child_receipts(child_store, "conflict-gate")
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+    )
+    setup_config = TLLoopConfig(root_dir=tmp_path, run_id="gate-run")
+    repository = Path(
+        driver_module._sub_tl_worktree(setup_config, tmp_path, "gate-run", plan.sub_tls[0])
+    )
+    _complete_ordered_child_receipts(child_store, "conflict-gate", repository=repository)
+    aggregate_head = _test_git_output(repository, "rev-parse", "HEAD")
+    assert aggregate_head is not None
+    aggregate_tree = _test_git_tree(repository, aggregate_head)
     backend = ReviewBackend(
         [RlmResponse({"action": "escalate", "reason": "The repair needs a human choice"})]
     )
     transport = IntegrationTransport(
         snapshots=[
             {
-                "head_sha": "head-a",
+                "head_sha": aggregate_head,
                 "base_sha": "base-a",
                 "patch_digest": "patch-a",
                 "merge_tree_sha": "tree-a",
                 "ci_status": "success",
             },
             {
-                "head_sha": "head-a",
+                "head_sha": aggregate_head,
+                "base_sha": "base-a",
+                "patch_digest": "patch-a",
+                "merge_tree_sha": "tree-a",
+                "ci_status": "success",
+            },
+            {
+                "head_sha": aggregate_head,
                 "base_sha": "base-a",
                 "patch_digest": "patch-a",
                 "merge_tree_sha": "tree-a",
@@ -11551,14 +11838,12 @@ def test_exhausted_integration_conflict_opens_human_gate(tmp_path: Path) -> None
                 "open": True,
                 "merged": False,
                 "head_branch": "main.aggregate-child",
-                "head_sha": "head-a",
+                "head_sha": aggregate_head,
             },
         ],
         merge_response={"success": False, "error": "merge conflict with parent base"},
     )
-    plan = WorkPlan(
-        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
-    )
+    transport.aggregate_git_evidence["aggregate-child"] = (aggregate_head, aggregate_tree)
     config = TLLoopConfig(
         max_parallel_slices=1,
         poll_interval=0.001,
@@ -11645,3 +11930,336 @@ def test_restart_internal_head_reset_is_persisted_before_next_action(tmp_path: P
     assert restored.reviewed_head is None
     assert restored.verdict is None
     assert any(name == "emit_controller_event" for name, _ in transport.calls)
+
+
+def test_child_readiness_rejects_unrelated_aggregate_head(tmp_path: Path) -> None:
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        "unrelated-aggregate-head",
+        leaf_issue_id=811,
+    )
+    assert child_store is not None
+    repository = Path(root_store.load().slices["architecture"].worktree or "")
+    _complete_nested_leaf(child_store, repository=repository)
+    _seed_nested_aggregate_in_review(root_store)
+    candidate = driver_module._aggregate_candidate_from_state(
+        "architecture", root_store.load().integration.candidates.get("architecture")
+    )
+    assert candidate is not None
+
+    subprocess.run(
+        ("git", "-C", str(repository), "checkout", "--orphan", "unrelated"),
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "rm", "-rf", "."),
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    unrelated_head = _test_git_commit(repository, "unrelated.txt", "other work\n", "unrelated")
+    unrelated = replace(candidate, head_sha=unrelated_head)
+    watcher = {
+        "found": True,
+        "pr_number": unrelated.pr_number,
+        "head_sha": unrelated.head_sha,
+        "patch_digest": unrelated.patch_digest,
+        "head_reachable": True,
+        "pr_head_tree_sha": _test_git_tree(repository, unrelated_head),
+    }
+    evidence = driver_module._verified_child_completion_evidence(
+        plan.sub_tls[0],
+        child_store.load(),
+        unrelated,
+        watcher=watcher,
+        repository=repository,
+    )
+
+    assert evidence is None
+
+
+def test_child_readiness_rejects_contradictory_push_receipt(tmp_path: Path) -> None:
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        "contradictory-child-push",
+        leaf_issue_id=811,
+    )
+    assert child_store is not None
+    repository = Path(root_store.load().slices["architecture"].worktree or "")
+    child_state = _complete_nested_leaf(child_store, repository=repository)
+    current = child_state.slices["leaf-a"]
+    assert current.post_merge is not None
+    contradictory_receipt = {
+        **current.post_merge.evidence,
+        "observed_remote_head": "f" * 40,
+    }
+    child_state = replace(
+        child_state,
+        slices={
+            **child_state.slices,
+            "leaf-a": replace(
+                current,
+                post_merge=PostMergeState(PostMergePhase.COMPLETE, contradictory_receipt),
+            ),
+        },
+    )
+    _seed_nested_aggregate_in_review(root_store)
+    candidate = driver_module._aggregate_candidate_from_state(
+        "architecture", root_store.load().integration.candidates.get("architecture")
+    )
+    assert candidate is not None
+    watcher = {
+        "found": True,
+        "pr_number": candidate.pr_number,
+        "head_sha": candidate.head_sha,
+        "patch_digest": candidate.patch_digest,
+        "head_reachable": True,
+        "pr_head_tree_sha": _test_git_tree(repository, candidate.head_sha),
+    }
+
+    evidence = driver_module._verified_child_completion_evidence(
+        plan.sub_tls[0],
+        child_state,
+        candidate,
+        watcher=watcher,
+        repository=repository,
+    )
+
+    assert evidence is None
+
+
+def test_driver_does_not_merge_contradictory_child_push_receipt(tmp_path: Path) -> None:
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        "driver-contradictory-child-push",
+        leaf_issue_id=811,
+    )
+    assert child_store is not None
+    repository = Path(root_store.load().slices["architecture"].worktree or "")
+    child_state = _complete_nested_leaf(child_store, repository=repository)
+    current_leaf = child_state.slices["leaf-a"]
+    assert current_leaf.post_merge is not None
+    bad_receipt = {
+        **current_leaf.post_merge.evidence,
+        "observed_remote_head": "f" * 40,
+    }
+    child_state = child_store.checkpoint(
+        child_state.fsm,
+        {
+            **child_state.slices,
+            "leaf-a": replace(
+                current_leaf,
+                post_merge=PostMergeState(PostMergePhase.COMPLETE, bad_receipt),
+            ),
+        },
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    _seed_nested_aggregate_in_review(root_store)
+    state = root_store.load()
+    current = state.slices["architecture"]
+    candidate = state.integration.candidates["architecture"]
+    assert current.publication is not None
+    assert candidate.aggregate_head_sha is not None
+    watcher = {
+        "found": True,
+        "pr_number": candidate.aggregate_pr_number,
+        "merged": False,
+        "head_sha": candidate.aggregate_head_sha,
+        "base_sha": candidate.aggregate_original_base_sha,
+        "patch_digest": candidate.aggregate_patch_digest,
+        "merge_tree_sha": "aggregate-merge-tree",
+        "pr_head_tree_sha": _test_git_tree(repository, candidate.aggregate_head_sha),
+        "ci_status": "success",
+        "head_branch": current.branch,
+        "base_branch": current.base_ref,
+        "head_reachable": True,
+        "publication_ownership_verified": True,
+        "publication_ownership_error": "",
+        "publication": {
+            "invocation_id": current.publication.invocation_id,
+            "slice_id": "architecture",
+            "author_agent": "architecture",
+            "succession_invocation_ids": [],
+        },
+    }
+    transport = IntegrationTransport(snapshots=[watcher])
+
+    result = driver_module._integrate_one_candidate(
+        plan.sub_tls[0],
+        state,
+        replace(_config(), working_dir=str(repository)),
+        EffectClient(transport),
+        root_store,
+        [],
+    )
+
+    assert result.slices["architecture"].status is SliceStatus.IN_REVIEW
+    assert result.integration.candidates["architecture"].lifecycle is (
+        IntegrationLifecycle.AGGREGATE_PR_OPEN
+    )
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+
+
+def test_driver_keeps_aggregate_parked_when_git_lineage_is_unavailable(tmp_path: Path) -> None:
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        "driver-unavailable-aggregate-git",
+        leaf_issue_id=811,
+    )
+    assert child_store is not None
+    repository = Path(root_store.load().slices["architecture"].worktree or "")
+    _complete_nested_leaf(child_store, repository=repository)
+    _seed_nested_aggregate_in_review(root_store)
+    state = root_store.load()
+    current = state.slices["architecture"]
+    candidate = state.integration.candidates["architecture"]
+    assert current.publication is not None
+    assert candidate.aggregate_head_sha is not None
+    unavailable_repository = tmp_path / "unavailable-git-worktree"
+    unavailable_repository.mkdir()
+    candidate = replace(candidate, integration_owner_worktree=str(unavailable_repository))
+    state = root_store.checkpoint(
+        state.fsm,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=replace(
+            state.integration,
+            candidates={**state.integration.candidates, "architecture": candidate},
+        ),
+    )
+    watcher = {
+        "found": True,
+        "pr_number": candidate.aggregate_pr_number,
+        "merged": False,
+        "head_sha": candidate.aggregate_head_sha,
+        "base_sha": candidate.aggregate_original_base_sha,
+        "patch_digest": candidate.aggregate_patch_digest,
+        "merge_tree_sha": "aggregate-merge-tree",
+        "pr_head_tree_sha": _test_git_tree(repository, candidate.aggregate_head_sha),
+        "ci_status": "success",
+        "head_branch": current.branch,
+        "base_branch": current.base_ref,
+        "head_reachable": True,
+        "publication_ownership_verified": True,
+        "publication_ownership_error": "",
+        "publication": {
+            "invocation_id": current.publication.invocation_id,
+            "slice_id": "architecture",
+            "author_agent": "architecture",
+            "succession_invocation_ids": [],
+        },
+    }
+    transport = IntegrationTransport(snapshots=[watcher])
+
+    result = driver_module._integrate_one_candidate(
+        plan.sub_tls[0],
+        state,
+        replace(_config(), working_dir=str(repository)),
+        EffectClient(transport),
+        root_store,
+        [],
+    )
+
+    assert result.slices["architecture"].status is SliceStatus.IN_REVIEW
+    assert result.integration.candidates["architecture"].lifecycle is (
+        IntegrationLifecycle.AGGREGATE_PR_OPEN
+    )
+    assert not any(name == "merge_pr" for name, _ in transport.calls)
+
+
+def test_driver_does_not_merge_unrelated_head_that_matches_candidate_and_watcher(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        "driver-unrelated-aggregate-head",
+        leaf_issue_id=811,
+    )
+    assert child_store is not None
+    repository = Path(root_store.load().slices["architecture"].worktree or "")
+    _complete_nested_leaf(child_store, repository=repository)
+    _seed_nested_aggregate_in_review(root_store)
+    state = root_store.load()
+    current = state.slices["architecture"]
+    candidate = state.integration.candidates["architecture"]
+    assert current.publication is not None
+
+    subprocess.run(
+        ("git", "-C", str(repository), "checkout", "--orphan", "unrelated"),
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "rm", "-rf", "."),
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    unrelated_head = _test_git_commit(repository, "unrelated.txt", "other work\n", "unrelated")
+    unrelated_tree = _test_git_tree(repository, unrelated_head)
+    unrelated_publication = replace(current.publication, head_sha=unrelated_head)
+    unrelated_slice = replace(current, publication=unrelated_publication)
+    unrelated_candidate = replace(
+        candidate,
+        aggregate_head_sha=unrelated_head,
+        head_sha=unrelated_head,
+    )
+    state = root_store.checkpoint(
+        state.fsm,
+        {**state.slices, "architecture": unrelated_slice},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=replace(
+            state.integration,
+            candidates={**state.integration.candidates, "architecture": unrelated_candidate},
+        ),
+    )
+    assert unrelated_publication is not None
+    watcher = {
+        "found": True,
+        "pr_number": unrelated_slice.pr_number,
+        "merged": False,
+        "head_sha": unrelated_head,
+        "base_sha": "aggregate-base",
+        "patch_digest": unrelated_candidate.aggregate_patch_digest,
+        "merge_tree_sha": "aggregate-merge-tree",
+        "pr_head_tree_sha": unrelated_tree,
+        "ci_status": "success",
+        "head_branch": unrelated_slice.branch,
+        "base_branch": unrelated_slice.base_ref,
+        "head_reachable": True,
+        "publication_ownership_verified": True,
+        "publication_ownership_error": "",
+        "publication": {
+            "invocation_id": unrelated_publication.invocation_id,
+            "slice_id": "architecture",
+            "author_agent": "architecture",
+            "succession_invocation_ids": [],
+        },
+    }
+    transport = IntegrationTransport(snapshots=[watcher])
+    result = driver_module._integrate_one_candidate(
+        plan.sub_tls[0],
+        state,
+        replace(_config(), working_dir=str(repository)),
+        EffectClient(transport),
+        root_store,
+        [],
+    )
+
+    assert result.slices["architecture"].status is SliceStatus.IN_REVIEW
+    assert result.current_order == 1
+    assert result.slices["kani"].status is SliceStatus.PENDING
+    assert result.integration.candidates["architecture"].lifecycle is (
+        IntegrationLifecycle.AGGREGATE_PR_OPEN
+    )
+    assert not any(name == "merge_pr" for name, _ in transport.calls)

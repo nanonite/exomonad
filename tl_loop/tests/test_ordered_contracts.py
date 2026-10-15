@@ -173,7 +173,10 @@ def test_every_declared_transition_is_allowed_and_every_other_edge_is_rejected()
         aggregate_head_sha="head-7",
         aggregate_base_sha="base-1",
         aggregate_patch_digest="patch-7",
+        aggregate_head_tree_sha="tree-7",
         reviewed_leaf_ids=("stage/leaf/one",),
+        lineage_commit_shas=("commit-7",),
+        lineage_proof_digest="lineage-digest",
         receipt_digest="receipt-digest",
     )
     for lifecycle in IntegrationLifecycle:
@@ -200,7 +203,10 @@ def test_child_completion_transition_requires_receipts_for_the_bound_candidate()
         aggregate_head_sha="head-7",
         aggregate_base_sha="base-1",
         aggregate_patch_digest="patch-7",
+        aggregate_head_tree_sha="tree-7",
         reviewed_leaf_ids=("stage/leaf/one",),
+        lineage_commit_shas=("commit-7",),
+        lineage_proof_digest="lineage-digest",
         receipt_digest="receipt-digest",
     )
 
