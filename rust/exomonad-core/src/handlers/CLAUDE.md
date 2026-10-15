@@ -138,6 +138,15 @@ Handles effects in the `merge_pr.*` namespace.
 
 Post-merge, the Haskell tool handler runs `git pull` via `process.run` to fast-forward the local branch. If pull fails, the tool response includes guidance to run `git pull --rebase` manually.
 
+For declared sub-TL aggregates, the handler resolves the supplied parent
+approval reference from the active parent RunStore and checks its accepted
+manifest policy, scope, controller epoch, caller identity, repository, and
+compare coordinates. `services::merge_pr` repeats the receipt check immediately
+before the Forgejo effect and rechecks current publication ownership, Git
+compare evidence, and same-head CI. A missing receipt is rejected when the PR
+is known as a declared aggregate. Leaf merges continue through the Haskell
+authenticated exact-head reviewer gate.
+
 ## Delivery Pipeline (`services/delivery.rs`)
 
 All delivery functions are generic over `ctx: &(impl Has* + ...)` — no concrete `Services` type:

@@ -10,6 +10,7 @@ import ExoMonad.Guest.Tools.MergePR
   ( MergePRArgs (..),
     Readiness (..),
     mergeExpectedHeadSha,
+    parentApprovalWatcherMergeGate,
     watcherMergeGate,
   )
 import Proto3.Suite.Types qualified as Protobuf
@@ -33,6 +34,49 @@ mergePrTests =
             assertBool
               ("unexpected merge rejection: " <> TL.unpack (TL.fromStrict reason))
               False,
+      testCase "parent approval accepts aggregate without a reviewer verdict" $ do
+        let watcher =
+              (watcherResponse "" "")
+                { Agent.watcherPrStateResponseReviewState = "pending",
+                  Agent.watcherPrStateResponseReviewId = 0,
+                  Agent.watcherPrStateResponseReviewVerdict = "",
+                  Agent.watcherPrStateResponseReviewHeadSha = "",
+                  Agent.watcherPrStateResponseReviewerAgentId = ""
+                }
+        case parentApprovalWatcherMergeGate 43 hostedResponse watcher of
+          Ready -> pure ()
+          NotReady reason ->
+            assertBool
+              ("unexpected parent-approved aggregate rejection: " <> TL.unpack (TL.fromStrict reason))
+              False,
+      testCase "parent approval still requires current successful CI" $ do
+        let watcher =
+              (watcherResponse "" "")
+                { Agent.watcherPrStateResponseReviewState = "pending",
+                  Agent.watcherPrStateResponseReviewId = 0,
+                  Agent.watcherPrStateResponseReviewVerdict = "",
+                  Agent.watcherPrStateResponseReviewerAgentId = "",
+                  Agent.watcherPrStateResponseCiStatus = "failure"
+                }
+        case parentApprovalWatcherMergeGate 43 hostedResponse watcher of
+          NotReady reason -> assertBool "reports CI failure" ("CI status" `TL.isInfixOf` TL.fromStrict reason)
+          Ready -> assertBool "must block on failed CI" False,
+      testCase "parent approval still requires exact hosted and watcher head" $ do
+        let watcher = (watcherResponse "" "") {Agent.watcherPrStateResponseHeadSha = "other-head"}
+        case parentApprovalWatcherMergeGate 43 hostedResponse watcher of
+          NotReady reason -> assertBool "reports head drift" ("changed" `TL.isInfixOf` TL.fromStrict reason)
+          Ready -> assertBool "must block on head drift" False,
+      testCase "leaf gate still requires authenticated reviewer for the exact head" $ do
+        let watcher =
+              (watcherResponse "" "")
+                { Agent.watcherPrStateResponseReviewState = "pending",
+                  Agent.watcherPrStateResponseReviewId = 0,
+                  Agent.watcherPrStateResponseReviewVerdict = "",
+                  Agent.watcherPrStateResponseReviewerAgentId = ""
+                }
+        case watcherMergeGate 43 hostedResponse watcher of
+          NotReady reason -> assertBool "reports missing review" ("review approval" `TL.isInfixOf` TL.fromStrict reason)
+          Ready -> assertBool "leaf must not inherit parent approval" False,
       testCase "rejects unverified publication ownership" $ do
         let watcher =
               (watcherResponse "review-pr-43-codex" "")
@@ -87,7 +131,8 @@ mergePrTests =
                   mprExpectedHeadSha = Just "caller-head",
                   mprExpectedPatchDigest = Nothing,
                   mprExpectedMergeTreeSha = Nothing,
-                  mprChainlinkIssueId = Nothing
+                  mprChainlinkIssueId = Nothing,
+                  mprAggregateApproval = Nothing
                 }
         assertBool
           "observed head must override a caller-supplied head"

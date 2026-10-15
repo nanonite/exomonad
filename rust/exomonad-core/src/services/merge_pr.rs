@@ -2,7 +2,7 @@ use crate::domain::{BranchName, MergeStrategy, PRNumber};
 use crate::services::agent_resolver::AgentResolver;
 use crate::services::forgejo::ForgejoClient;
 use crate::services::git_worktree::GitWorktreeService;
-use crate::services::pr_registry::verify_current_publication_ownership;
+use crate::services::pr_registry::verified_current_publication_owner;
 use crate::services::repo;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -44,13 +44,18 @@ pub struct PublishedPrEvidence {
     pub patch_digest: String,
 }
 
-pub struct MergeAuthority<'a> {
+pub(crate) struct MergeAuthority<'a> {
     pub resolver: &'a AgentResolver,
     pub project_dir: &'a Path,
+    pub caller_agent_id: String,
+    pub caller_branch: String,
+    pub current_repository_url: String,
+    pub parent_approval:
+        Option<crate::handlers::merge_pr::aggregate_approval::VerifiedParentApproval>,
 }
 
 /// Merge a PR using the Forgejo API.
-pub async fn merge_pr_async(
+pub(crate) async fn merge_pr_async(
     pr_number: PRNumber,
     strategy: &MergeStrategy,
     working_dir: &str,
@@ -88,7 +93,7 @@ pub async fn merge_pr_async(
             head_sha,
         ));
     };
-    if let Err(error) = verify_current_publication_ownership(
+    let publication_owner = match verified_current_publication_owner(
         authority.project_dir,
         authority.resolver,
         pr_number.as_u64(),
@@ -98,11 +103,58 @@ pub async fn merge_pr_async(
     )
     .await
     {
-        return Ok(cas_failure(
-            format!("compare_and_swap: publication ownership verification failed: {error}"),
-            branch_name,
-            head_sha,
-        ));
+        Ok(owner) => owner,
+        Err(error) => {
+            return Ok(cas_failure(
+                format!("compare_and_swap: publication ownership verification failed: {error}"),
+                branch_name,
+                head_sha,
+            ));
+        }
+    };
+    if let Some(approval) = authority.parent_approval.as_ref() {
+        if pr_number.as_u64() != approval.pr_number
+            || pr.state != "open"
+            || pr.merged
+            || pr.head_ref.as_str() != approval.head_branch
+            || pr.base_ref.as_str() != approval.parent_branch
+        {
+            return Ok(cas_failure(
+                "aggregate parent approval does not match the current open PR coordinates"
+                    .to_string(),
+                branch_name,
+                head_sha,
+            ));
+        }
+        if publication_owner == authority.caller_agent_id
+            || authority.caller_branch == pr.head_ref.as_str()
+        {
+            return Ok(cas_failure(
+                "aggregate parent approval cannot be used by the publication owner".to_string(),
+                branch_name,
+                head_sha,
+            ));
+        }
+        let live_repository_url = match repo::get_repository_remote_url(dir).await {
+            Ok(url) => url,
+            Err(error) => {
+                return Ok(cas_failure(
+                    format!("aggregate repository identity could not be revalidated: {error}"),
+                    branch_name,
+                    head_sha,
+                ));
+            }
+        };
+        if live_repository_url != approval.repository_url
+            || authority.current_repository_url != approval.repository_url
+        {
+            return Ok(cas_failure(
+                "aggregate parent approval repository differs from the current repository"
+                    .to_string(),
+                branch_name,
+                head_sha,
+            ));
+        }
     }
     if let Some(expected) = expected.head_sha.filter(|value| !value.is_empty()) {
         if pr.head_sha.as_deref() != Some(expected) {
@@ -149,6 +201,118 @@ pub async fn merge_pr_async(
         };
         if let Err(message) = compare_expected_evidence(&expected, &observed) {
             return Ok(cas_failure(message, branch_name, head_sha));
+        }
+        if let Some(approval) = authority.parent_approval.as_ref() {
+            if observed.base_sha != approval.base_sha
+                || observed.head_sha != approval.head_sha
+                || observed.pr_head_tree_sha != approval.head_tree_sha
+                || observed.patch_digest != approval.patch_digest
+                || observed.merge_tree_sha != approval.merge_tree_sha
+            {
+                return Ok(cas_failure(
+                    "aggregate parent approval compare evidence changed before merge".to_string(),
+                    branch_name,
+                    head_sha,
+                ));
+            }
+            let ci_status = match forgejo
+                .commit_status_for_head(&repo_info.owner, &repo_info.repo, actual_head)
+                .await
+            {
+                Ok(status) => status.as_str(),
+                Err(error) => {
+                    return Ok(cas_failure(
+                        format!("aggregate CI evidence could not be revalidated: {error}"),
+                        branch_name,
+                        head_sha,
+                    ));
+                }
+            };
+            if ci_status != approval.ci_status || !matches!(ci_status, "success" | "neutral") {
+                return Ok(cas_failure(
+                    format!("aggregate CI evidence changed or is not mergeable: {ci_status}"),
+                    branch_name,
+                    head_sha,
+                ));
+            }
+            let current_repository_url = match repo::get_repository_remote_url(dir).await {
+                Ok(url) => url,
+                Err(error) => {
+                    return Ok(cas_failure(
+                        format!(
+                            "aggregate repository identity could not be checked at merge: {error}"
+                        ),
+                        branch_name,
+                        head_sha,
+                    ));
+                }
+            };
+            let refreshed_approval =
+                match crate::handlers::merge_pr::aggregate_approval::validate_parent_approval(
+                    authority.project_dir,
+                    &approval.reference,
+                    pr_number.as_u64(),
+                    &current_repository_url,
+                    &authority.caller_agent_id,
+                    &authority.caller_branch,
+                    authority.resolver,
+                )
+                .await
+                {
+                    Ok(refreshed) => refreshed,
+                    Err(error) => {
+                        return Ok(cas_failure(
+                            format!(
+                                "aggregate parent approval became invalid before merge: {error}"
+                            ),
+                            branch_name,
+                            head_sha,
+                        ));
+                    }
+                };
+            if refreshed_approval.receipt_id != approval.receipt_id
+                || current_repository_url != approval.repository_url
+            {
+                return Ok(cas_failure(
+                    "aggregate parent approval or repository changed before merge".to_string(),
+                    branch_name,
+                    head_sha,
+                ));
+            }
+            let owner_repository_url =
+                match repo::get_repository_remote_url(&refreshed_approval.aggregate_worktree).await
+                {
+                    Ok(url) => url,
+                    Err(error) => {
+                        return Ok(cas_failure(
+                            format!("aggregate owner repository could not be revalidated: {error}"),
+                            branch_name,
+                            head_sha,
+                        ));
+                    }
+                };
+            if owner_repository_url != refreshed_approval.repository_url {
+                return Ok(cas_failure(
+                    "aggregate owner worktree belongs to a different repository".to_string(),
+                    branch_name,
+                    head_sha,
+                ));
+            }
+            if let Err(error) = crate::services::aggregate_lineage::verify_parent_aggregate_lineage(
+                &refreshed_approval.aggregate_worktree,
+                &refreshed_approval.head_sha,
+                &refreshed_approval.head_tree_sha,
+                &refreshed_approval.lineage_commit_shas,
+                &refreshed_approval.lineage_proof_digest,
+            )
+            .await
+            {
+                return Ok(cas_failure(
+                    format!("aggregate Git lineage could not be revalidated: {error}"),
+                    branch_name,
+                    head_sha,
+                ));
+            }
         }
     }
 

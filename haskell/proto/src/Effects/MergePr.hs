@@ -55,7 +55,8 @@ data MergePrRequest
     mergePrRequestExpectedBaseSha :: Hs.Text,
     mergePrRequestExpectedHeadSha :: Hs.Text,
     mergePrRequestExpectedPatchDigest :: Hs.Text,
-    mergePrRequestExpectedMergeTreeSha :: Hs.Text
+    mergePrRequestExpectedMergeTreeSha :: Hs.Text,
+    mergePrRequestAggregateApproval :: (Hs.Maybe Effects.MergePr.AggregateApprovalReference)
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -76,7 +77,8 @@ instance (HsProtobuf.Message MergePrRequest) where
         mergePrRequestExpectedBaseSha,
         mergePrRequestExpectedHeadSha,
         mergePrRequestExpectedPatchDigest,
-        mergePrRequestExpectedMergeTreeSha
+        mergePrRequestExpectedMergeTreeSha,
+        mergePrRequestAggregateApproval
       } =
       Hs.mappend
         ( Hs.mappend
@@ -84,49 +86,60 @@ instance (HsProtobuf.Message MergePrRequest) where
                 ( Hs.mappend
                     ( Hs.mappend
                         ( Hs.mappend
-                            ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 1)
-                                mergePrRequestPrNumber
+                            ( Hs.mappend
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 1)
+                                    mergePrRequestPrNumber
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 2)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        mergePrRequestStrategy
+                                    )
+                                )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 2)
+                                (HsProtobuf.FieldNumber 3)
                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    mergePrRequestStrategy
+                                    mergePrRequestWorkingDir
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 3)
+                            (HsProtobuf.FieldNumber 4)
                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                mergePrRequestWorkingDir
+                                mergePrRequestExpectedBaseSha
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 4)
+                        (HsProtobuf.FieldNumber 5)
                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            mergePrRequestExpectedBaseSha
+                            mergePrRequestExpectedHeadSha
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 5)
+                    (HsProtobuf.FieldNumber 6)
                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        mergePrRequestExpectedHeadSha
+                        mergePrRequestExpectedPatchDigest
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 6)
+                (HsProtobuf.FieldNumber 7)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    mergePrRequestExpectedPatchDigest
+                    mergePrRequestExpectedMergeTreeSha
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 7)
-            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                mergePrRequestExpectedMergeTreeSha
+            (HsProtobuf.FieldNumber 8)
+            ( ( Hs.coerce
+                  @(Hs.Maybe Effects.MergePr.AggregateApprovalReference)
+                  @(HsProtobuf.Nested Effects.MergePr.AggregateApprovalReference)
+              )
+                mergePrRequestAggregateApproval
             )
         )
   decodeMessage _ =
@@ -168,6 +181,15 @@ instance (HsProtobuf.Message MergePrRequest) where
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
                   (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.MergePr.AggregateApprovalReference)
+                @(Hs.Maybe Effects.MergePr.AggregateApprovalReference)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
               )
           )
   dotProto _ =
@@ -212,11 +234,21 @@ instance (HsProtobuf.Message MergePrRequest) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "expected_merge_tree_sha")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        ( HsProtobufAST.Prim
+            ( HsProtobufAST.Named
+                (HsProtobufAST.Single "AggregateApprovalReference")
+            )
+        )
+        (HsProtobufAST.Single "aggregate_approval")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB MergePrRequest) where
-  toJSONPB (MergePrRequest f1 f2 f3 f4 f5 f6 f7) =
+  toJSONPB (MergePrRequest f1 f2 f3 f4 f5 f6 f7 f8) =
     HsJSONPB.object
       [ "pr_number" .= f1,
         "strategy"
@@ -230,9 +262,16 @@ instance (HsJSONPB.ToJSONPB MergePrRequest) where
         "expected_patch_digest"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
         "expected_merge_tree_sha"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "aggregate_approval"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.MergePr.AggregateApprovalReference)
+                   @(HsProtobuf.Nested Effects.MergePr.AggregateApprovalReference)
+               )
+                 f8
+             )
       ]
-  toEncodingPB (MergePrRequest f1 f2 f3 f4 f5 f6 f7) =
+  toEncodingPB (MergePrRequest f1 f2 f3 f4 f5 f6 f7 f8) =
     HsJSONPB.pairs
       [ "pr_number" .= f1,
         "strategy"
@@ -246,7 +285,14 @@ instance (HsJSONPB.ToJSONPB MergePrRequest) where
         "expected_patch_digest"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
         "expected_merge_tree_sha"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "aggregate_approval"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.MergePr.AggregateApprovalReference)
+                   @(HsProtobuf.Nested Effects.MergePr.AggregateApprovalReference)
+               )
+                 f8
+             )
       ]
 
 instance (HsJSONPB.FromJSONPB MergePrRequest) where
@@ -274,6 +320,12 @@ instance (HsJSONPB.FromJSONPB MergePrRequest) where
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "expected_merge_tree_sha")
                 )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.MergePr.AggregateApprovalReference)
+                      @(Hs.Maybe Effects.MergePr.AggregateApprovalReference)
+                  )
+                    (obj .: "aggregate_approval")
+                )
       )
 
 instance (HsJSONPB.ToJSON MergePrRequest) where
@@ -281,6 +333,212 @@ instance (HsJSONPB.ToJSON MergePrRequest) where
   toEncoding = HsJSONPB.toAesonEncoding
 
 instance (HsJSONPB.FromJSON MergePrRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data AggregateApprovalReference
+  = AggregateApprovalReference
+  { aggregateApprovalReferenceReceiptId :: Hs.Text,
+    aggregateApprovalReferenceParentRunId :: Hs.Text,
+    aggregateApprovalReferenceParentScopePath :: (Hs.Vector Hs.Text),
+    aggregateApprovalReferenceChildScopeId :: Hs.Text,
+    aggregateApprovalReferenceControllerEpoch :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData AggregateApprovalReference)
+
+instance (HsProtobuf.Named AggregateApprovalReference) where
+  nameOf _ = Hs.fromString "AggregateApprovalReference"
+
+instance (HsProtobuf.HasDefault AggregateApprovalReference)
+
+instance (HsProtobuf.Message AggregateApprovalReference) where
+  encodeMessage
+    _
+    AggregateApprovalReference
+      { aggregateApprovalReferenceReceiptId,
+        aggregateApprovalReferenceParentRunId,
+        aggregateApprovalReferenceParentScopePath,
+        aggregateApprovalReferenceChildScopeId,
+        aggregateApprovalReferenceControllerEpoch
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 1)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            aggregateApprovalReferenceReceiptId
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 2)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            aggregateApprovalReferenceParentRunId
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 3)
+                    ( ( Hs.coerce
+                          @(Hs.Vector Hs.Text)
+                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      )
+                        aggregateApprovalReferenceParentScopePath
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 4)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    aggregateApprovalReferenceChildScopeId
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 5)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                aggregateApprovalReferenceControllerEpoch
+            )
+        )
+  decodeMessage _ =
+    Hs.pure AggregateApprovalReference
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "receipt_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "parent_run_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "parent_scope_path")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "child_scope_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "controller_epoch")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB AggregateApprovalReference) where
+  toJSONPB (AggregateApprovalReference f1 f2 f3 f4 f5) =
+    HsJSONPB.object
+      [ "receipt_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "parent_run_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "parent_scope_path"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f3
+             ),
+        "child_scope_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "controller_epoch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5)
+      ]
+  toEncodingPB (AggregateApprovalReference f1 f2 f3 f4 f5) =
+    HsJSONPB.pairs
+      [ "receipt_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "parent_run_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "parent_scope_path"
+          .= ( ( Hs.coerce
+                   @(Hs.Vector Hs.Text)
+                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+               )
+                 f3
+             ),
+        "child_scope_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "controller_epoch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5)
+      ]
+
+instance (HsJSONPB.FromJSONPB AggregateApprovalReference) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "AggregateApprovalReference"
+      ( \obj ->
+          Hs.pure AggregateApprovalReference
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "receipt_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "parent_run_id")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "parent_scope_path")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "child_scope_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "controller_epoch")
+                )
+      )
+
+instance (HsJSONPB.ToJSON AggregateApprovalReference) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON AggregateApprovalReference) where
   parseJSON = HsJSONPB.parseJSONPB
 
 data MergePrResponse

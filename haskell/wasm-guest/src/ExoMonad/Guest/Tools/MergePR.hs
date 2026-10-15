@@ -18,6 +18,7 @@ module ExoMonad.Guest.Tools.MergePR
     extractAgentName,
     Readiness (..),
     watcherMergeGate,
+    parentApprovalWatcherMergeGate,
     authenticatedReviewEvidenceGate,
     mergeExpectedHeadSha,
   )
@@ -52,7 +53,7 @@ import ExoMonad.Effects.Log (LogEmitEvent, LogError, LogInfo)
 import ExoMonad.Effects.MergePR (MergePRMergePr)
 import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (Effects, MCPCallOutput, MCPTool (..), errorResult, successResult)
-import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
+import ExoMonad.Guest.Tool.Schema (JsonSchema (..), genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
 import GHC.Generics (Generic)
 import Proto3.Suite.Types qualified as Protobuf
@@ -67,9 +68,54 @@ data MergePRArgs = MergePRArgs
     mprExpectedBaseSha :: Maybe Text,
     mprExpectedHeadSha :: Maybe Text,
     mprExpectedPatchDigest :: Maybe Text,
-    mprExpectedMergeTreeSha :: Maybe Text
+    mprExpectedMergeTreeSha :: Maybe Text,
+    mprAggregateApproval :: Maybe AggregateApprovalRef
   }
   deriving (Show, Eq, Generic)
+
+data AggregateApprovalRef = AggregateApprovalRef
+  { aarReceiptId :: Text,
+    aarParentRunId :: Text,
+    aarParentScopePath :: V.Vector Text,
+    aarChildScopeId :: Text,
+    aarControllerEpoch :: Text
+  }
+  deriving (Show, Eq, Generic)
+
+instance JsonSchema AggregateApprovalRef where
+  toSchema =
+    object
+      [ "type" .= ("object" :: Text),
+        "properties"
+          .= object
+            [ "receipt_id" .= object ["type" .= ("string" :: Text)],
+              "parent_run_id" .= object ["type" .= ("string" :: Text)],
+              "parent_scope_path" .= object ["type" .= ("array" :: Text), "items" .= object ["type" .= ("string" :: Text)]],
+              "child_scope_id" .= object ["type" .= ("string" :: Text)],
+              "controller_epoch" .= object ["type" .= ("string" :: Text)]
+            ],
+        "required" .= (["receipt_id", "parent_run_id", "parent_scope_path", "child_scope_id", "controller_epoch"] :: [Text])
+      ]
+
+instance FromJSON AggregateApprovalRef where
+  parseJSON = withObject "AggregateApprovalRef" $ \v -> do
+    receiptId <- v .: "receipt_id"
+    parentRunId <- v .: "parent_run_id"
+    parentScopePath <- v .: "parent_scope_path"
+    childScopeId <- v .: "child_scope_id"
+    controllerEpoch <- v .: "controller_epoch"
+    when (any (T.null . T.strip) [receiptId, parentRunId, childScopeId, controllerEpoch]) $
+      fail "aggregate approval reference contains an empty coordinate"
+    when (V.null parentScopePath || V.any (T.null . T.strip) parentScopePath) $
+      fail "aggregate approval reference requires a non-empty parent scope path"
+    pure
+      AggregateApprovalRef
+        { aarReceiptId = receiptId,
+          aarParentRunId = parentRunId,
+          aarParentScopePath = parentScopePath,
+          aarChildScopeId = childScopeId,
+          aarControllerEpoch = controllerEpoch
+        }
 
 instance FromJSON MergePRArgs where
   parseJSON = withObject "MergePRArgs" $ \v ->
@@ -82,6 +128,7 @@ instance FromJSON MergePRArgs where
       <*> v .:? "expected_head_sha"
       <*> v .:? "expected_patch_digest"
       <*> v .:? "expected_merge_tree_sha"
+      <*> v .:? "aggregate_approval"
 
 data MergePROutput = MergePROutput
   { mpoSuccess :: Bool,
@@ -106,7 +153,7 @@ instance Aeson.ToJSON MergePROutput where
 
 -- | Shared tool description for merge_pr.
 mergePRDescription :: Text
-mergePRDescription = "Merge a GitHub pull request and fetch changes. Before merging, requires a Forgejo reviewer approval for the exact current PR head and passing CI (success or neutral) for that same head; stale approvals, review changes/comments, pending/failed/unknown CI, and missing evidence are rejected. Pass chainlink_issue_id to close the issue and commit CHANGELOG.md after a successful merge. After merging, verify the build — especially when merging multiple PRs in parallel, as changes may interact."
+mergePRDescription = "Merge a pull request and fetch changes. Leaf PRs require an authenticated Forgejo reviewer approval for the exact current head. A plan-declared aggregate may instead carry its durable parent-approval reference; the host validates that receipt and all current evidence before merging. Both paths require passing CI, verified publication ownership, and exact compare evidence. Stale or missing evidence is rejected. Pass chainlink_issue_id to close an issue after a successful merge."
 
 -- | Shared tool schema for merge_pr.
 mergePRSchema :: Aeson.Object
@@ -115,7 +162,8 @@ mergePRSchema =
     [ ("pr_number", "PR number to merge"),
       ("strategy", "Merge strategy: squash (default), merge, or rebase"),
       ("working_dir", "Working directory for git operations"),
-      ("chainlink_issue_id", "Optional Chainlink issue ID to close and commit CHANGELOG.md after a successful merge")
+      ("chainlink_issue_id", "Optional Chainlink issue ID to close and commit CHANGELOG.md after a successful merge"),
+      ("aggregate_approval", "Durable parent approval reference for a declared aggregate PR; host revalidates it")
     ]
 
 -- | Core merge_pr I/O: self-merge guard + readiness check + merge + cleanup + git pull.
@@ -269,7 +317,9 @@ mergeFromHostedPr args prNum owner repo currentBranch localPrResult = do
       if isSelfMerge
         then pure $ Left $ "Cannot merge your own PR #" <> T.pack (show prNum) <> ". Your parent agent will merge this PR after reviewing. Call notify_parent instead."
         else do
-          let readiness = checkReviewerReadinessFromPR prNum resp
+          let readiness = case mprAggregateApproval args of
+                Just _ -> Ready
+                Nothing -> checkReviewerReadinessFromPR prNum resp
           case readiness of
             NotReady reason -> mergeBlocked reason
             Ready -> do
@@ -286,9 +336,12 @@ mergeFromHostedPr args prNum owner repo currentBranch localPrResult = do
                       <> ": "
                       <> T.pack (show err)
                 Right watcher ->
-                  case watcherMergeGate prNum resp watcher of
-                    Ready -> doMerge args (TL.toStrict (Agent.watcherPrStateResponseHeadSha watcher))
-                    NotReady reason -> mergeBlocked reason
+                  let watcherReadiness = case mprAggregateApproval args of
+                        Just _ -> parentApprovalWatcherMergeGate prNum resp watcher
+                        Nothing -> watcherMergeGate prNum resp watcher
+                   in case watcherReadiness of
+                        Ready -> doMerge args (TL.toStrict (Agent.watcherPrStateResponseHeadSha watcher))
+                        NotReady reason -> mergeBlocked reason
 
 mergeBlocked :: Text -> Eff Effects (Either Text MergePROutput)
 mergeBlocked reason = do
@@ -296,7 +349,15 @@ mergeBlocked reason = do
   pure $ Left reason
 
 watcherMergeGate :: Int -> GH.GetPullRequestResponse -> Agent.WatcherPrStateResponse -> Readiness
-watcherMergeGate prNum resp watcher =
+watcherMergeGate = watcherMergeGatePolicy False
+
+-- | Parent approval replaces only the aggregate reviewer verdict. All live
+-- publication, head, reachability, PR-state, and CI checks remain mandatory.
+parentApprovalWatcherMergeGate :: Int -> GH.GetPullRequestResponse -> Agent.WatcherPrStateResponse -> Readiness
+parentApprovalWatcherMergeGate = watcherMergeGatePolicy True
+
+watcherMergeGatePolicy :: Bool -> Int -> GH.GetPullRequestResponse -> Agent.WatcherPrStateResponse -> Readiness
+watcherMergeGatePolicy allowParentApproval prNum resp watcher =
   let hostedHead = maybe "" (TL.toStrict . GH.pullRequestHeadSha) (GH.getPullRequestResponsePullRequest resp)
       observedHead = TL.toStrict (Agent.watcherPrStateResponseHeadSha watcher)
       reviewState = T.toLower (TL.toStrict (Agent.watcherPrStateResponseReviewState watcher))
@@ -329,15 +390,19 @@ watcherMergeGate prNum resp watcher =
               NotReady $ prefix <> "PR is not open"
           | observedHead /= hostedHead ->
               NotReady $ prefix <> "hosted PR head SHA changed during the merge check"
-          | reviewState /= "approved" ->
+          | not allowParentApproval && reviewState /= "approved" ->
               NotReady $ prefix <> "review approval is not recorded for the current PR head"
           | otherwise ->
-              case authenticatedReviewEvidenceGate prNum observedHead watcher of
-                NotReady reason -> NotReady (prefix <> reason)
-                Ready
-                  | ciStatus == "success" || ciStatus == "neutral" -> Ready
-                  | otherwise ->
-                      NotReady $ prefix <> "CI status for the current PR head is " <> ciStatus
+              if allowParentApproval
+                then mergeCiGate prefix ciStatus
+                else case authenticatedReviewEvidenceGate prNum observedHead watcher of
+                  NotReady reason -> NotReady (prefix <> reason)
+                  Ready -> mergeCiGate prefix ciStatus
+
+mergeCiGate :: Text -> Text -> Readiness
+mergeCiGate prefix ciStatus
+  | ciStatus == "success" || ciStatus == "neutral" = Ready
+  | otherwise = NotReady $ prefix <> "CI status for the current PR head is " <> ciStatus
 
 -- | Require the canonical watcher response to carry authenticated, exact-head
 -- review evidence before allowing the final merge effect.
@@ -441,7 +506,8 @@ runMerge args observedHead = do
             MP.mergePrRequestExpectedBaseSha = maybe "" TL.fromStrict (mprExpectedBaseSha args),
             MP.mergePrRequestExpectedHeadSha = TL.fromStrict (mergeExpectedHeadSha args observedHead),
             MP.mergePrRequestExpectedPatchDigest = maybe "" TL.fromStrict (mprExpectedPatchDigest args),
-            MP.mergePrRequestExpectedMergeTreeSha = maybe "" TL.fromStrict (mprExpectedMergeTreeSha args)
+            MP.mergePrRequestExpectedMergeTreeSha = maybe "" TL.fromStrict (mprExpectedMergeTreeSha args),
+            MP.mergePrRequestAggregateApproval = fmap toProtoAggregateApproval (mprAggregateApproval args)
           }
   result <- suspendEffect @MergePRMergePr req
   case result of
@@ -579,3 +645,13 @@ runMerge args observedHead = do
               mpoPullOk = pullOutcomeOk pullOutcome,
               mpoPullFailure = pullOutcomeFailure pullOutcome
             }
+
+toProtoAggregateApproval :: AggregateApprovalRef -> MP.AggregateApprovalReference
+toProtoAggregateApproval reference =
+  MP.AggregateApprovalReference
+    { MP.aggregateApprovalReferenceReceiptId = TL.fromStrict (aarReceiptId reference),
+      MP.aggregateApprovalReferenceParentRunId = TL.fromStrict (aarParentRunId reference),
+      MP.aggregateApprovalReferenceParentScopePath = V.map TL.fromStrict (aarParentScopePath reference),
+      MP.aggregateApprovalReferenceChildScopeId = TL.fromStrict (aarChildScopeId reference),
+      MP.aggregateApprovalReferenceControllerEpoch = TL.fromStrict (aarControllerEpoch reference)
+    }

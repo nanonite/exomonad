@@ -441,6 +441,28 @@ pub async fn verify_current_publication_ownership(
     base_branch: &str,
     head_sha: &str,
 ) -> Result<()> {
+    verified_current_publication_owner(
+        project_dir,
+        resolver,
+        pr_number,
+        head_branch,
+        base_branch,
+        head_sha,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Return the verified publisher after applying the same exact-coordinate,
+/// resolver-backed ownership checks used by merge readiness.
+pub async fn verified_current_publication_owner(
+    project_dir: &Path,
+    resolver: &AgentResolver,
+    pr_number: u64,
+    head_branch: &str,
+    base_branch: &str,
+    head_sha: &str,
+) -> Result<String> {
     let heads = read_published_heads(project_dir).await?;
     let publication = heads
         .iter()
@@ -480,7 +502,8 @@ pub async fn verify_current_publication_ownership(
         identity.slice_id.as_deref(),
         current_invocation_id.as_deref(),
     )
-    .map_err(|error| anyhow::anyhow!(error.to_string()))
+    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(owner.to_string())
 }
 
 /// Recover a slice's PR number from the durable publication registry when the

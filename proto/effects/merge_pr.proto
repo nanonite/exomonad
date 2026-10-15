@@ -12,6 +12,18 @@ message MergePrRequest {
   string expected_head_sha = 5;
   string expected_patch_digest = 6;
   string expected_merge_tree_sha = 7;
+  // Durable parent approval reference for a plan-declared aggregate PR.
+  // The host resolves this against the active parent RunStore receipt and
+  // revalidates policy, caller authority, repository, and live compare proof.
+  AggregateApprovalReference aggregate_approval = 8;
+}
+
+message AggregateApprovalReference {
+  string receipt_id = 1;
+  string parent_run_id = 2;
+  repeated string parent_scope_path = 3;
+  string child_scope_id = 4;
+  string controller_epoch = 5;
 }
 
 message MergePrResponse {

@@ -1013,6 +1013,16 @@ slice binding as an epic, and never edits the live `plan.json`.
    `reviewer_max_rounds` the outer loop runs: one `roles.tl` guide/escalate
    judgment (see Review Policy, Stuck state).
 
+For a plan-declared sub-TL aggregate with `aggregate_approval_mode: parent`,
+the parent controller records a content-addressed approval receipt in its
+RunStore after live publication, lineage, compare, and CI revalidation. It
+passes only that receipt reference through the existing `merge_pr` tool. The
+Rust merge boundary resolves the active receipt against the parent scope,
+accepted manifest, caller identity, repository, and live PR compare/CI evidence
+before calling Forgejo. Aggregate PRs do not start a root reviewer; leaf PRs
+still require authenticated exact-head Forgejo review. The reserved `reviewer`
+mode fails plan admission until its phase is implemented.
+
 Review orchestration has one path: watcher facts are projected into the typed
 controller input alphabet, `step(state, event)` selects one intent or wait
 reason, and the `EffectJournal` executor performs the effect. A reviewer is one-shot for an

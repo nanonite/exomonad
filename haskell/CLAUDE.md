@@ -86,6 +86,11 @@ The `mode` parameter enables the same record for both schema generation (`AsSche
 
 - **Library/SDK**: `haskell/wasm-guest` provides the SDK for defining MCP tools and hooks.
 
+The `merge_pr` tool accepts a durable `aggregate_approval` reference only for
+the supported parent-approved sub-TL aggregate path. It preserves the common
+live PR ownership, head, reachability, and CI checks; without that reference,
+the tool still requires an authenticated Forgejo review on the exact head.
+
 ## Common Commands
 
 ```bash

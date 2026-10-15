@@ -2,6 +2,7 @@ pub mod agent_control;
 pub mod agent_inbox;
 pub mod agent_resolver;
 pub mod agent_resources;
+pub mod aggregate_lineage;
 pub mod analysis_import;
 pub mod claude_adapter;
 pub mod claude_session_registry;

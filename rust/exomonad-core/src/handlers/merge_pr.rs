@@ -6,6 +6,8 @@ use exomonad_proto::effects::merge_pr::*;
 use std::sync::Arc;
 use tracing::instrument;
 
+pub(crate) mod aggregate_approval;
+
 use crate::services::{
     HasAgentResolver, HasCiStatusMap, HasEventLog, HasForgejoClient, HasGitWorktreeService,
     HasProjectDir, HasSessionMemory,
@@ -76,6 +78,46 @@ impl<
     ) -> EffectResult<MergePrResponse> {
         let pr_number = crate::domain::PRNumber::new(req.pr_number as u64);
         let strategy = crate::domain::MergeStrategy::parse(&req.strategy).effect_err("merge_pr")?;
+        let working_dir = if req.working_dir.is_empty() {
+            "."
+        } else {
+            req.working_dir.as_str()
+        };
+        let repository_url = crate::services::repo::get_repository_remote_url(working_dir)
+            .await
+            .effect_err("merge_pr")?;
+        let approval = match req.aggregate_approval.as_ref() {
+            Some(reference) => Some(
+                aggregate_approval::validate_parent_approval(
+                    self.ctx.project_dir(),
+                    reference,
+                    pr_number.as_u64(),
+                    &repository_url,
+                    ctx.agent_name.as_str(),
+                    ctx.birth_branch.as_str(),
+                    self.ctx.agent_resolver(),
+                )
+                .await
+                .effect_err("merge_pr")?,
+            ),
+            None => {
+                aggregate_approval::reject_unreferenced_aggregate(
+                    self.ctx.project_dir(),
+                    pr_number.as_u64(),
+                    &repository_url,
+                )
+                .effect_err("merge_pr")?;
+                None
+            }
+        };
+        aggregate_approval::validate_request_compare(
+            approval.as_ref(),
+            &req.expected_base_sha,
+            &req.expected_head_sha,
+            &req.expected_patch_digest,
+            &req.expected_merge_tree_sha,
+        )
+        .effect_err("merge_pr")?;
         tracing::info!(
             pr_number = pr_number.as_u64(),
             strategy = strategy.as_str(),
@@ -104,6 +146,10 @@ impl<
                 merge_pr::MergeAuthority {
                     resolver: self.ctx.agent_resolver(),
                     project_dir: self.ctx.project_dir(),
+                    caller_agent_id: ctx.agent_name.to_string(),
+                    caller_branch: ctx.birth_branch.to_string(),
+                    current_repository_url: repository_url,
+                    parent_approval: approval,
                 },
             )
             .await
@@ -321,6 +367,7 @@ mod tests {
             expected_head_sha: String::new(),
             expected_patch_digest: String::new(),
             expected_merge_tree_sha: String::new(),
+            aggregate_approval: None,
         };
 
         // Empty strategy should be handled by the service layer (defaults to "squash")
