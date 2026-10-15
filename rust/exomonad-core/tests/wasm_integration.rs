@@ -17,7 +17,7 @@
 //! Requires: `just wasm-all` to build the WASM binary first.
 
 use async_trait::async_trait;
-use exomonad_core::handlers::AgentHandler;
+use exomonad_core::handlers::{AgentHandler, MergePRHandler};
 use exomonad_core::services::agent_control::AgentControlService;
 use exomonad_core::services::event_log::EventLog;
 use exomonad_core::services::forgejo::ForgejoClient;
@@ -37,6 +37,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "wasm_integration/aggregate_approval_merge.rs"]
+mod aggregate_approval_merge;
 
 static MOCK_AGENT_CLOSE_SELF_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MOCK_EVENTS_NOTIFY_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -58,6 +61,27 @@ fn wasm_binary_bytes() -> Vec<u8> {
         "WASM binary not found at {path:?}. Build with `just wasm-all`."
     );
     std::fs::read(&path).expect("Failed to read WASM binary")
+}
+
+fn test_runtime_builder_with_handlers(
+    agent: impl EffectHandler + 'static,
+    github: impl EffectHandler + 'static,
+    merge_pr: impl EffectHandler + 'static,
+    process: impl EffectHandler + 'static,
+) -> RuntimeBuilder {
+    RuntimeBuilder::new()
+        .with_effect_handler(MockGitHandler)
+        .with_effect_handler(MockLogHandler)
+        .with_effect_handler(MockFsHandler)
+        .with_effect_handler(MockFilePRHandler)
+        .with_effect_handler(merge_pr)
+        .with_effect_handler(MockEventsHandler)
+        .with_effect_handler(MockSessionHandler)
+        .with_effect_handler(MockKvHandler)
+        .with_effect_handler(github)
+        .with_effect_handler(MockCopilotHandler)
+        .with_effect_handler(process)
+        .with_effect_handler(agent)
 }
 
 fn test_runtime_builder() -> RuntimeBuilder {
@@ -97,12 +121,16 @@ async fn build_production_agent_runtime(
     let services = Arc::new(services);
     let agent_control = Arc::new(AgentControlService::new(services.clone()));
 
-    test_runtime_builder()
-        .with_effect_handler(AgentHandler::new(agent_control, services))
-        .with_wasm_bytes(wasm_binary_bytes())
-        .build()
-        .await
-        .expect("build WASM runtime with production AgentHandler")
+    test_runtime_builder_with_handlers(
+        AgentHandler::new(agent_control, services),
+        MockGitHubHandler,
+        MockMergePRHandler,
+        MockProcessHandler,
+    )
+    .with_wasm_bytes(wasm_binary_bytes())
+    .build()
+    .await
+    .expect("build WASM runtime with production AgentHandler")
 }
 
 fn run_git(project_dir: &Path, arguments: &[&str]) {

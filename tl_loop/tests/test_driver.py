@@ -9024,6 +9024,20 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             101,
             102,
         ]
+        merge_arguments = [
+            args for name, args in transport.calls if name == "merge_pr"
+        ]
+        approval_references = [args.get("aggregate_approval") for args in merge_arguments]
+        assert [reference["child_scope_id"] for reference in approval_references] == [
+            "alpha",
+            "beta",
+        ]
+        assert all(
+            reference["parent_run_id"] == "ordered-e2e-run"
+            and reference["parent_scope_path"] == ["ordered-e2e-run"]
+            and reference["receipt_id"]
+            for reference in approval_references
+        )
         aggregate_titles = [
             str(args["title"])
             for name, args in transport.calls
