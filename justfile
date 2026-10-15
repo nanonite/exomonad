@@ -267,9 +267,13 @@ tmux-session-environment-test inside_nix="true" tmpdir="/tmp":
 test-cargo-all: rust-test-all
 
 # Build WASM, then run the Rust host ↔ Haskell WASM integration tests
-test-wasm-integration:
-    just wasm-all
-    nix develop --command cargo nextest run -p exomonad-core --test wasm_integration
+test-wasm-integration: wasm-all
+    #!/usr/bin/env bash
+    set -euo pipefail
+    artifact="$(mktemp)"
+    trap 'rm -f "$artifact"' EXIT
+    nix develop --command env EXOMONAD_PUBLICATION_LOOKUP_ARTIFACT="$artifact" cargo nextest run -p exomonad-core --test wasm_integration
+    EXOMONAD_PUBLICATION_LOOKUP_ARTIFACT="$artifact" {{py}} -m pytest -q tl_loop/tests/test_haskell_guest_contract.py
 
 # Build and run the devswarm role-hook-tests WASM test suite
 role-hook-tests:

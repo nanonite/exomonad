@@ -1,11 +1,15 @@
 //! End-to-end integration tests: Rust host ↔ Haskell WASM plugin via trampoline.
 //!
-//! Loads the actual compiled WASM binary, registers mock effect handlers,
+//! Loads the actual compiled WASM binary, registers test effect handlers,
 //! and verifies the full protobuf encoding/decoding pipeline:
 //!
 //! ```text
-//! WASM guest → yield_effect / suspend → EffectRegistry → mock handler → EffectResponse → WASM guest
+//! WASM guest → yield_effect / suspend → EffectRegistry → effect handler → EffectResponse → WASM guest
 //! ```
+//!
+//! Most cases use mock handlers. The publication lookup regression registers
+//! the production AgentHandler over temporary publication history and mocks
+//! only Forgejo's PR observations.
 //!
 //! All WASM exports return `WasmResult<O>` (Done | Suspend envelope).
 //! `PluginManager::call` (trampoline) is the single dispatch path.
@@ -13,13 +17,26 @@
 //! Requires: `just wasm-all` to build the WASM binary first.
 
 use async_trait::async_trait;
+use exomonad_core::handlers::AgentHandler;
+use exomonad_core::services::agent_control::AgentControlService;
+use exomonad_core::services::event_log::EventLog;
+use exomonad_core::services::forgejo::ForgejoClient;
+use exomonad_core::services::pr_registry::{
+    publish_verified_head, read_published_heads, InvocationSuccession, PublicationProvenance,
+    PublishedHead, SuccessionReason,
+};
+use exomonad_core::services::Services;
 use exomonad_core::{EffectError, EffectHandler, EffectResult, RuntimeBuilder};
 use prost::Message;
 use serde_json::{json, Value};
 use serial_test::serial;
 use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static MOCK_AGENT_CLOSE_SELF_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MOCK_EVENTS_NOTIFY_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -43,12 +60,10 @@ fn wasm_binary_bytes() -> Vec<u8> {
     std::fs::read(&path).expect("Failed to read WASM binary")
 }
 
-async fn build_test_runtime() -> exomonad_core::Runtime {
-    let wasm_bytes = wasm_binary_bytes();
+fn test_runtime_builder() -> RuntimeBuilder {
     RuntimeBuilder::new()
         .with_effect_handler(MockGitHandler)
         .with_effect_handler(MockLogHandler)
-        .with_effect_handler(MockAgentHandler)
         .with_effect_handler(MockFsHandler)
         .with_effect_handler(MockFilePRHandler)
         .with_effect_handler(MockMergePRHandler)
@@ -58,10 +73,267 @@ async fn build_test_runtime() -> exomonad_core::Runtime {
         .with_effect_handler(MockGitHubHandler)
         .with_effect_handler(MockCopilotHandler)
         .with_effect_handler(MockProcessHandler)
-        .with_wasm_bytes(wasm_bytes)
+}
+
+async fn build_test_runtime() -> exomonad_core::Runtime {
+    test_runtime_builder()
+        .with_effect_handler(MockAgentHandler)
+        .with_wasm_bytes(wasm_binary_bytes())
         .build()
         .await
         .expect("Failed to build runtime with WASM plugin")
+}
+
+async fn build_production_agent_runtime(
+    project_dir: &Path,
+    forgejo_client: Arc<ForgejoClient>,
+) -> exomonad_core::Runtime {
+    let mut services = Services::benchmark(project_dir.to_path_buf())
+        .expect("construct isolated production handler services");
+    services.forgejo_client = Some(forgejo_client);
+    services.event_log = Some(Arc::new(
+        EventLog::open(project_dir.join(".exo/logs")).expect("open isolated event log"),
+    ));
+    let services = Arc::new(services);
+    let agent_control = Arc::new(AgentControlService::new(services.clone()));
+
+    test_runtime_builder()
+        .with_effect_handler(AgentHandler::new(agent_control, services))
+        .with_wasm_bytes(wasm_binary_bytes())
+        .build()
+        .await
+        .expect("build WASM runtime with production AgentHandler")
+}
+
+fn run_git(project_dir: &Path, arguments: &[&str]) {
+    let result = Command::new("git")
+        .args(arguments)
+        .current_dir(project_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .status()
+        .expect("git must be available for repository fixture");
+    assert!(result.success(), "git fixture command should succeed");
+}
+
+fn initialize_test_repository(project_dir: &Path) {
+    run_git(project_dir, &["init", "--quiet"]);
+    run_git(
+        project_dir,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://forgejo.local/acme/repo.git",
+        ],
+    );
+}
+
+struct PublicationFixture<'a> {
+    pr_number: u64,
+    slice_id: &'a str,
+    branch: &'a str,
+    head_sha: &'a str,
+    invocation_id: &'a str,
+    author_agent: &'a str,
+    succession: &'a [(&'a str, &'a str)],
+}
+
+fn ledger_publication(fixture: PublicationFixture<'_>) -> PublishedHead {
+    PublishedHead {
+        pr_number: fixture.pr_number,
+        head_branch: fixture.branch.to_string(),
+        base_branch: "main".to_string(),
+        head_sha: fixture.head_sha.to_string(),
+        author_agent: Some(fixture.author_agent.to_string()),
+        author_role: Some("tl".to_string()),
+        provenance: PublicationProvenance::LedgerOwned,
+        slice_id: Some(fixture.slice_id.to_string()),
+        invocation_id: Some(fixture.invocation_id.to_string()),
+        invocation_trigger: Some("resume_pr".to_string()),
+        invocation_runtime: Some("codex".to_string()),
+        invocation_succession: fixture
+            .succession
+            .iter()
+            .map(
+                |(from_invocation_id, to_invocation_id)| InvocationSuccession {
+                    from_invocation_id: (*from_invocation_id).to_string(),
+                    to_invocation_id: (*to_invocation_id).to_string(),
+                    reason: SuccessionReason::SessionRecreate,
+                    recorded_at: 1,
+                },
+            )
+            .collect(),
+    }
+}
+
+async fn mount_open_pr(server: &MockServer, number: u64, branch: &str, sha: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/repos/acme/repo/pulls/{number}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": number,
+            "title": format!("fixture PR {number}"),
+            "body": "temporary integration fixture",
+            "state": "open",
+            "merged": false,
+            "html_url": format!("http://forgejo.local/acme/repo/pulls/{number}"),
+            "head": {"ref": branch, "sha": sha},
+            "base": {"ref": "main", "sha": "fixture-base-sha"}
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_competing_prs(server: &MockServer) {
+    for (number, branch, sha) in [
+        (45, "main.stage", "sha-old"),
+        (46, "main.stage", "sha-selected"),
+        (47, "main.decoy", "sha-decoy"),
+        (48, "main.abandoned", "sha-abandoned"),
+    ] {
+        mount_open_pr(server, number, branch, sha).await;
+    }
+}
+
+async fn seed_publication_history(project_dir: &Path) {
+    let fixtures = [
+        PublicationFixture {
+            pr_number: 45,
+            slice_id: "slice-production",
+            branch: "main.stage",
+            head_sha: "sha-old",
+            invocation_id: "invocation-old",
+            author_agent: "stage-owner",
+            succession: &[("invocation-old", "invocation-old-resumed")],
+        },
+        PublicationFixture {
+            pr_number: 46,
+            slice_id: "slice-production",
+            branch: "main.stage",
+            head_sha: "sha-selected",
+            invocation_id: "invocation-selected",
+            author_agent: "stage-owner",
+            succession: &[
+                ("invocation-selected", "invocation-selected-resume-1"),
+                (
+                    "invocation-selected-resume-1",
+                    "invocation-selected-resume-2",
+                ),
+            ],
+        },
+        PublicationFixture {
+            pr_number: 47,
+            slice_id: "slice-decoy",
+            branch: "main.decoy",
+            head_sha: "sha-decoy",
+            invocation_id: "invocation-decoy",
+            author_agent: "decoy-owner",
+            succession: &[("invocation-decoy", "invocation-decoy-resume")],
+        },
+        PublicationFixture {
+            pr_number: 48,
+            slice_id: "slice-abandoned",
+            branch: "main.abandoned",
+            head_sha: "sha-abandoned",
+            invocation_id: "invocation-abandoned",
+            author_agent: "abandoned-owner",
+            succession: &[],
+        },
+    ];
+    for fixture in fixtures {
+        publish_verified_head(project_dir, ledger_publication(fixture))
+            .await
+            .expect("write isolated publication fixture");
+    }
+    record_abandoned_attempt(project_dir);
+}
+
+fn record_abandoned_attempt(project_dir: &Path) {
+    let event_log = EventLog::open(project_dir.join(".exo/logs")).expect("open test event log");
+    event_log
+        .append(
+            "tl.slice_abandoned",
+            "root",
+            &json!({
+                "slice_id": "slice-abandoned",
+                "attempt": 1,
+                "pr_number": 48,
+                "head_sha": "sha-abandoned",
+                "invocation_id": "invocation-abandoned"
+            }),
+        )
+        .expect("record durable abandonment event");
+}
+
+async fn resolve_slice(runtime: &exomonad_core::Runtime, slice_id: &str) -> Value {
+    call_tool(
+        runtime,
+        "tl",
+        "resolve_live_pr_for_slice",
+        json!({"slice_id": slice_id}),
+    )
+    .await
+}
+
+async fn production_lookup_outputs(runtime: &exomonad_core::Runtime) -> Value {
+    json!({
+        "selected": resolve_slice(runtime, "slice-production").await,
+        "never_published": resolve_slice(runtime, "slice-never-published").await,
+        "all_attempts_abandoned": resolve_slice(runtime, "slice-abandoned").await
+    })
+}
+
+fn assert_selected_publication(output: &Value, selected: &PublishedHead) {
+    assert_tool_success(output, "resolve_live_pr_for_slice");
+    let result = &output["result"];
+    assert_eq!(result["success"], true);
+    assert_eq!(result["resolution"], "live");
+    assert_eq!(result["pr_number"], selected.pr_number);
+    assert_eq!(result["slice_id"], selected.slice_id.as_deref().unwrap());
+    assert_eq!(
+        result["publication"]["invocation_id"],
+        selected.invocation_id.as_deref().unwrap()
+    );
+    assert_eq!(
+        result["publication"]["slice_id"],
+        selected.slice_id.as_deref().unwrap()
+    );
+    assert_eq!(
+        result["publication"]["author_agent"],
+        selected.author_agent.as_deref().unwrap()
+    );
+    let succession_ids = selected
+        .invocation_succession
+        .iter()
+        .map(|record| record.to_invocation_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        result["publication"]["succession_invocation_ids"],
+        json!(succession_ids)
+    );
+}
+
+fn assert_non_adoptable_publications(outputs: &Value) {
+    let never = &outputs["never_published"]["result"];
+    assert_eq!(never["resolution"], "never_published");
+    assert_eq!(never["pr_number"], 0);
+    assert_eq!(never["publication"], Value::Null);
+
+    let abandoned = &outputs["all_attempts_abandoned"]["result"];
+    assert_eq!(abandoned["resolution"], "all_attempts_abandoned");
+    assert_eq!(abandoned["pr_number"], 0);
+    assert_eq!(abandoned["publication"], Value::Null);
+}
+
+fn write_python_contract_artifact(outputs: &Value) {
+    let Some(path) = std::env::var_os("EXOMONAD_PUBLICATION_LOOKUP_ARTIFACT") else {
+        return;
+    };
+    std::fs::write(
+        path,
+        serde_json::to_vec(outputs).expect("serialize production tool results"),
+    )
+    .expect("write production tool result artifact for Python consumer");
 }
 
 /// Helper: call a tool and return the MCPCallOutput JSON.
@@ -605,33 +877,6 @@ impl EffectHandler for MockAgentHandler {
                 }
                 .encode_to_vec())
             }
-            "agent.resolve_live_pr_for_slice" => {
-                let req = ResolveLivePrForSliceRequest::decode(payload)
-                    .expect("mock agent handler should decode resolve_live_pr_for_slice request");
-                if req.slice_id != "slice-live" {
-                    return Err(EffectError::invalid_input(format!(
-                        "unexpected slice: {}",
-                        req.slice_id
-                    )));
-                }
-                Ok(ResolveLivePrForSliceResponse {
-                    success: true,
-                    error: String::new(),
-                    slice_id: req.slice_id,
-                    resolution: LivePrResolutionKind::Live as i32,
-                    pr_number: 46,
-                    publication: Some(PublishedHeadEvidence {
-                        invocation_id: "invocation-live".into(),
-                        slice_id: "slice-live".into(),
-                        author_agent: "stage-agent".into(),
-                        succession_invocation_ids: vec![
-                            "invocation-original".into(),
-                            "invocation-resumed".into(),
-                        ],
-                    }),
-                }
-                .encode_to_vec())
-            }
             _ => Err(EffectError::not_found(format!("mock_agent/{effect_type}"))),
         }
     }
@@ -1051,30 +1296,32 @@ async fn wasm_tl_tools_include_spawn_and_merge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn resolve_live_pr_tool_preserves_registry_publication_evidence() {
-    let runtime = build_test_runtime().await;
-
-    let output = call_tool(
-        &runtime,
-        "tl",
-        "resolve_live_pr_for_slice",
-        json!({"slice_id": "slice-live"}),
-    )
-    .await;
-
-    assert_tool_success(&output, "resolve_live_pr_for_slice");
-    let result = &output["result"];
-    assert_eq!(result["success"], true);
-    assert_eq!(result["slice_id"], "slice-live");
-    assert_eq!(result["resolution"], "live");
-    assert_eq!(result["pr_number"], 46);
-    assert_eq!(result["publication"]["invocation_id"], "invocation-live");
-    assert_eq!(result["publication"]["slice_id"], "slice-live");
-    assert_eq!(result["publication"]["author_agent"], "stage-agent");
+async fn resolve_live_pr_tool_uses_production_publication_history() {
+    let project = tempfile::tempdir().expect("temporary publication test project");
+    initialize_test_repository(project.path());
+    seed_publication_history(project.path()).await;
+    let registry_path = project.path().join(".exo/published-heads.json");
+    let registry_before = std::fs::read(&registry_path).expect("read publication registry");
+    let forgejo = MockServer::start().await;
+    mount_competing_prs(&forgejo).await;
+    let forgejo_client = ForgejoClient::new(&forgejo.uri(), "test-only-token")
+        .expect("construct Forgejo client for local mock server");
+    let runtime = build_production_agent_runtime(project.path(), forgejo_client).await;
+    let selected_record = read_published_heads(project.path())
+        .await
+        .expect("read production publication history")
+        .into_iter()
+        .find(|record| record.pr_number == 46)
+        .expect("selected publication exists in durable history");
+    let outputs = production_lookup_outputs(&runtime).await;
+    assert_selected_publication(&outputs["selected"], &selected_record);
+    assert_non_adoptable_publications(&outputs);
     assert_eq!(
-        result["publication"]["succession_invocation_ids"],
-        json!(["invocation-original", "invocation-resumed"])
+        std::fs::read(&registry_path).expect("re-read publication registry"),
+        registry_before,
+        "live lookup must leave publication history unchanged"
     );
+    write_python_contract_artifact(&outputs);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -600,6 +600,16 @@ When a tracked PR's branch disappears from the open PR list, it was merged/close
 - Emits `agent.sibling_merged` OTel span event
 - Removes the PRState from tracking
 
+### Publication lookup integration coverage
+
+`just test-wasm-integration` runs the WASM tool registry tests and generates a
+temporary JSON result from the production `AgentHandler` reading an isolated
+`.exo/published-heads.json` history. Forgejo PR observations are served by a
+local mock server; publication selection and typed response construction run
+in production code. The same generated tool envelope is passed to the Python
+aggregate lookup consumer before the recipe succeeds. Never describe the
+mocked `MockAgentHandler` path as coverage for publication-history selection.
+
 ## Related Documentation
 
 - [Root CLAUDE.md](../../CLAUDE.md)
