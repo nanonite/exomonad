@@ -18600,7 +18600,12 @@ def _classify_task_blocked_disposition(
     if identity_failure is not None:
         return _unresolved_task_blocked(identity_failure, identity_failure)
     if current.status is SliceStatus.MERGED:
-        proof, missing = _completed_task_blocked_proof(event, current, owner_state)
+        proof, missing = _completed_task_blocked_proof(
+            event,
+            current,
+            owner_state,
+            owner.store,
+        )
         if missing:
             return _TaskBlockedDisposition(
                 "unresolved",
@@ -18611,7 +18616,14 @@ def _classify_task_blocked_disposition(
             {
                 "slice_id": current.id,
                 "attempts": current.attempts,
+                "last_consumed_offset": owner_state.events.last_consumed_offset,
                 "status": current.status.value,
+                "repository_identity": (
+                    owner_state.repository_identity.remote_url
+                    if owner_state.repository_identity is not None
+                    else None
+                ),
+                "chainlink_issue_id": current.chainlink_issue_id,
                 "publication": _publication_evidence_document(current.publication),
                 "handoff": _handoff_evidence_document(current.handoff),
                 "post_merge": dict(current.post_merge.evidence)
@@ -18669,10 +18681,12 @@ def _task_blocked_runtime_identity_failure(
             return "reporter_generation_mismatch"
     if event.task_blocked is not None and event.task_blocked.attempt <= 0:
         return "invalid_blocker_attempt"
-    if current.status is SliceStatus.MERGED and current.attempts not in {
-        0,
-        event.task_blocked.attempt if event.task_blocked is not None else -1,
-    }:
+    if (
+        current.status is SliceStatus.MERGED
+        and current.attempts > 0
+        and event.task_blocked is not None
+        and event.task_blocked.attempt > current.attempts
+    ):
         return "completed_attempt_mismatch"
     return None
 
@@ -18681,6 +18695,7 @@ def _completed_task_blocked_proof(
     event: EventEnvelope,
     current: SliceState,
     state: RunState,
+    store: RunStore,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Validate exact publication, handoff, merge, closure, and push evidence."""
     blocked = event.task_blocked
@@ -18707,7 +18722,6 @@ def _completed_task_blocked_proof(
     assert blocked is not None and publication is not None and handoff is not None
     assert receipt is not None and state.repository_identity is not None
     evidence = receipt.evidence
-    expected_attempt = blocked.attempt
     expected_head = publication.head_sha
     expected_pr = current.pr_number
     _require_completion_match(missing, bool(current.dispatch_intent_id), "dispatch_intent")
@@ -18716,11 +18730,14 @@ def _completed_task_blocked_proof(
         current.dispatch_agent_id is None or handoff.agent_id == current.dispatch_agent_id,
         "dispatch_handoff_agent",
     )
-    _require_completion_match(missing, current.attempts in {0, expected_attempt}, "slice_attempt")
-    _require_completion_match(
-        missing, publication.attempt == expected_attempt, "publication_attempt"
+    attempt_proof, attempt_missing = _completed_attempt_history_proof(
+        event,
+        current,
+        state,
+        publication,
+        handoff,
     )
-    _require_completion_match(missing, handoff.attempt == expected_attempt, "handoff_attempt")
+    missing.extend(attempt_missing)
     _require_completion_match(missing, expected_pr == publication.pr_number, "publication_pr")
     _require_completion_match(missing, handoff.pr_number == publication.pr_number, "handoff_pr")
     _require_completion_match(missing, current.reviewed_head == expected_head, "reviewed_head")
@@ -18734,35 +18751,31 @@ def _completed_task_blocked_proof(
         missing, evidence.get("pr_number") == str(expected_pr), "merge_pr_number"
     )
     _require_completion_match(missing, evidence.get("head_sha") == expected_head, "merge_head_sha")
-    try:
-        receipt_repository = canonical_repository_url(evidence.get("repository", ""))
-    except ValueError:
-        receipt_repository = None
-    _require_completion_match(
-        missing,
-        receipt_repository == state.repository_identity.remote_url,
-        "merge_repository_identity",
+    repository_match = _completed_repository_evidence_match_kind(
+        evidence.get("repository"),
+        state,
     )
+    _require_completion_match(missing, repository_match is not None, "merge_repository_identity")
     _require_completion_match(
         missing,
         bool(evidence.get("merge_journal_id")),
         "merge_journal_receipt",
     )
-    _validate_completed_issue_closure(current, evidence, missing)
+    _validate_completed_issue_closure(current, evidence, missing, store)
     _validate_completed_push_receipt(current, evidence, missing)
     if publication.invocation_id and handoff.invocation_id != publication.invocation_id:
         missing.append("publication_handoff_invocation")
     if current.dispatch_invocation_id and handoff.invocation_id != current.dispatch_invocation_id:
         missing.append("dispatch_handoff_invocation")
-    if blocked.attempt != publication.attempt or blocked.attempt != handoff.attempt:
-        missing.append("blocker_attempt_history")
     if missing:
         return (), tuple(sorted(set(missing)))
     proof = (
-        f"attempt={expected_attempt}",
+        *attempt_proof,
+        f"repository_match={repository_match}",
         f"pr={publication.pr_number}",
         f"head_sha={publication.head_sha}",
         f"merge_journal_id={evidence['merge_journal_id']}",
+        f"issue_id={evidence.get('issue_id') or 'not_applicable'}",
         f"issue_close={evidence.get('issue_close_journal_id') or evidence.get('issue_close_observed_status')}",
         f"push_receipt_id={evidence['push_receipt_id']}",
         f"push_journal_id={evidence['push_journal_id']}",
@@ -18779,17 +18792,82 @@ def _require_completion_match(
         missing.append(evidence_name)
 
 
+def _completed_attempt_history_proof(
+    event: EventEnvelope,
+    current: SliceState,
+    state: RunState,
+    publication: PublicationBinding,
+    handoff: HandoffEvidence,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Prove matching or already-consumed legacy attempt history."""
+    blocked = event.task_blocked
+    if blocked is None:
+        return (), ("blocked_attempt",)
+    if publication.attempt != handoff.attempt:
+        return (), ("publication_handoff_attempt", "handoff_attempt")
+    completed_attempt = publication.attempt
+    if current.attempts == 0:
+        if blocked.attempt != completed_attempt:
+            return (), ("legacy_attempt_history",)
+        return (f"attempt={blocked.attempt}",), ()
+    if blocked.attempt > current.attempts or completed_attempt > current.attempts:
+        return (), ("attempt_exceeds_completed_history",)
+    if blocked.attempt == completed_attempt == current.attempts:
+        return (f"attempt={blocked.attempt}",), ()
+    if event.run_seq is None or state.events.last_consumed_offset < event.run_seq:
+        return (), ("subject_scope_consumed_event",)
+    return (
+        f"blocker_attempt={blocked.attempt}",
+        f"completion_attempt={completed_attempt}",
+        f"slice_attempt_high_water={current.attempts}",
+        f"subject_consumed_offset={state.events.last_consumed_offset}",
+    ), ()
+
+
+def _completed_repository_evidence_match_kind(
+    receipt_repository: object,
+    state: RunState,
+) -> str | None:
+    """Match canonical receipts or a corroborated legacy owner/repo slug."""
+    identity = state.repository_identity
+    if identity is None or not isinstance(receipt_repository, str):
+        return None
+    try:
+        if canonical_repository_url(receipt_repository) == identity.remote_url:
+            return "canonical_url"
+    except ValueError:
+        pass
+    if not _is_legacy_repository_slug(receipt_repository):
+        return None
+    try:
+        owner, repository = repository_api_coordinates(identity.remote_url)
+    except ValueError:
+        return None
+    return "legacy_owner_repo_slug" if receipt_repository == f"{owner}/{repository}" else None
+
+
+def _is_legacy_repository_slug(value: str) -> bool:
+    """Accept only the historical two-component, credential-free slug form."""
+    if value.count("/") != 1 or any(character.isspace() for character in value):
+        return False
+    owner, repository = value.split("/")
+    return all(
+        part
+        and part not in {".", ".."}
+        and part.isascii()
+        and all(character.isalnum() or character in "._-" for character in part)
+        for part in (owner, repository)
+    )
+
+
 def _validate_completed_issue_closure(
     current: SliceState,
     evidence: Mapping[str, str],
     missing: list[str],
+    store: RunStore,
 ) -> None:
     if current.chainlink_issue_id is None:
-        _require_completion_match(
-            missing,
-            evidence.get("issue_close_outcome") == "not_applicable",
-            "optional_issue_closure_receipt",
-        )
+        _validate_legacy_issue_closure(evidence, missing, store, current.id)
         return
     _require_completion_match(
         missing,
@@ -18810,6 +18888,106 @@ def _validate_completed_issue_closure(
             outcome == "closed" and bool(evidence.get("issue_close_journal_id")),
             "issue_close_journal_receipt",
         )
+
+
+def _validate_legacy_issue_closure(
+    evidence: Mapping[str, str],
+    missing: list[str],
+    store: RunStore,
+    slice_id: str,
+) -> None:
+    """Corroborate a receipt-linked legacy issue when the manifest ID is absent."""
+    outcome = evidence.get("issue_close_outcome")
+    issue_id = evidence.get("issue_id")
+    close_intent_id = evidence.get("issue_close_intent_id")
+    close_receipt_id = evidence.get("issue_close_journal_id")
+    closure_fields = (issue_id, close_intent_id, close_receipt_id)
+    if outcome == "not_applicable" and not any(closure_fields):
+        return
+    if outcome not in {None, "closed"}:
+        missing.append("legacy_issue_close_outcome")
+        return
+    if (
+        not isinstance(issue_id, str)
+        or not issue_id.isascii()
+        or not issue_id.isdigit()
+        or int(issue_id) <= 0
+        or str(int(issue_id)) != issue_id
+        or not isinstance(close_intent_id, str)
+        or not close_intent_id
+        or not isinstance(close_receipt_id, str)
+        or not close_receipt_id
+    ):
+        missing.append("legacy_issue_close_receipt")
+        return
+    journal_failure = _legacy_issue_close_journal_failure(
+        store,
+        slice_id,
+        int(issue_id),
+        close_intent_id,
+        close_receipt_id,
+    )
+    if journal_failure is not None:
+        missing.append(journal_failure)
+
+
+def _legacy_issue_close_journal_failure(
+    store: RunStore,
+    slice_id: str,
+    issue_id: int,
+    intent_id: str,
+    receipt_id: str,
+) -> str | None:
+    """Require one confirmed action result matching the historical receipt."""
+    journal_path = store.run_dir / "action-journal.json"
+    if not journal_path.is_file():
+        return "legacy_issue_close_action_journal_missing"
+    try:
+        entries = EffectJournal(store.run_id, journal_path).confirmed_entries(
+            "post_merge_issue_close",
+            slice_id,
+        )
+    except (ActionJournalError, OSError):
+        return "legacy_issue_close_action_journal_unavailable"
+    matches = [
+        entry
+        for entry in entries
+        if _legacy_issue_close_entry_matches(entry, issue_id, intent_id, receipt_id)
+    ]
+    if not matches:
+        return "legacy_issue_close_action_receipt_missing"
+    return "legacy_issue_close_action_receipt_ambiguous" if len(matches) > 1 else None
+
+
+def _legacy_issue_close_entry_matches(
+    entry: Mapping[str, object],
+    issue_id: int,
+    intent_id: str,
+    receipt_id: str,
+) -> bool:
+    """Compare the action intent and returned receipt to legacy checkpoint data."""
+    arguments = entry.get("arguments")
+    raw_result = entry.get("result")
+    if not isinstance(arguments, Mapping) or not isinstance(raw_result, dict):
+        return False
+    if (
+        type(arguments.get("issue_id")) is not int
+        or arguments.get("issue_id") != issue_id
+        or arguments.get("intent_id") != intent_id
+    ):
+        return False
+    try:
+        result = ToolResult.from_raw(cast(JsonObject, raw_result))
+    except (DecodeError, TypeError, ValueError):
+        return False
+    payload = _merge_result_payload(result)
+    observed_issue_id = payload.get("issue_id") if payload is not None else None
+    return bool(
+        payload
+        and type(observed_issue_id) is int
+        and observed_issue_id == issue_id
+        and payload.get("receipt_id") == receipt_id
+    )
 
 
 def _validate_completed_push_receipt(

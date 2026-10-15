@@ -2130,11 +2130,19 @@ def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggr
     plan, root_store, child_store = _nested_blocked_owner_stores(
         tmp_path,
         run_id,
-        leaf_issue_id=42,
     )
     assert child_store is not None
-    completed_state = _complete_nested_leaf(child_store)
+    completed_state = _complete_legacy_shape_nested_leaf(child_store, event_seq=77)
     completed_leaf = completed_state.slices["leaf-a"]
+    assert completed_leaf.chainlink_issue_id is None
+    assert completed_leaf.attempts == 6
+    assert completed_leaf.publication is not None and completed_leaf.publication.attempt == 1
+    assert completed_leaf.handoff is not None and completed_leaf.handoff.attempt == 1
+    assert completed_leaf.post_merge is not None
+    assert completed_leaf.post_merge.evidence["repository"] == "test/repository"
+    assert "issue_close_outcome" not in completed_leaf.post_merge.evidence
+    action_journal_path = child_store.run_dir / "action-journal.json"
+    action_journal_before = action_journal_path.read_bytes()
     _seed_nested_aggregate_in_review(root_store)
     owner_gate = "task-blocked-owner:77"
     root_store.set_gate(owner_gate, GateStatus.PENDING)
@@ -2199,6 +2207,9 @@ def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggr
     assert dispositions[0]["decision"] == "superseded_by_durable_completion"
     assert dispositions[0]["subject_slice_id"] == "leaf-a"
     assert dispositions[0]["reporter_scope_path"] == [run_id, "architecture"]
+    assert "blocker_attempt=6" in dispositions[0]["proof"]
+    assert "completion_attempt=1" in dispositions[0]["proof"]
+    assert "subject_consumed_offset=78" in dispositions[0]["proof"]
     assert root_after.current_order == 1
     assert root_after.slices["architecture"].pr_number == 273
     assert root_after.slices["architecture"].status is SliceStatus.IN_REVIEW
@@ -2209,11 +2220,80 @@ def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggr
     assert child_after.slices["leaf-a"].post_merge == completed_leaf.post_merge
     assert child_after.slices["leaf-a"].handoff == completed_leaf.handoff
     assert child_after.slices["leaf-a"].publication == completed_leaf.publication
-    assert child_after.slices["leaf-a"].attempts == 0
+    assert child_after.slices["leaf-a"].attempts == 6
+    assert action_journal_path.read_bytes() == action_journal_before
     assert not any(
         name in {"spawn_worker", "spawn_leaf", "merge_pr", "chainlink_issue_close"}
         for name, _ in transport.calls
     )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason", "expected_missing"),
+    [
+        ("cursor", "completed_child_evidence_incomplete", "subject_scope_consumed_event"),
+        ("repository", "completed_child_evidence_incomplete", "merge_repository_identity"),
+        (
+            "closure",
+            "completed_child_evidence_incomplete",
+            "legacy_issue_close_action_receipt_missing",
+        ),
+        ("future_attempt", "completed_attempt_mismatch", "completed_attempt_mismatch"),
+    ],
+)
+def test_legacy_completion_shape_requires_attempt_repository_and_closure_corroboration(
+    tmp_path: Path,
+    mutation: str,
+    expected_reason: str,
+    expected_missing: str,
+) -> None:
+    run_id = f"legacy-completion-{mutation}"
+    _, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
+    assert child_store is not None
+    _complete_legacy_shape_nested_leaf(child_store, event_seq=90)
+    _seed_nested_aggregate_in_review(root_store)
+    if mutation == "cursor":
+        child_state = child_store.load()
+        child_store.checkpoint(
+            child_state.recursive_fsm or child_state.fsm,
+            child_state.slices,
+            child_state.budgets,
+            89,
+        )
+    elif mutation == "repository":
+        _rewrite_legacy_completion_evidence(
+            child_store,
+            repository="other/repository",
+        )
+    elif mutation == "closure":
+        _rewrite_legacy_completion_evidence(
+            child_store,
+            issue_close_journal_id="unrelated-close-receipt",
+        )
+    attempt = 7 if mutation == "future_attempt" else 6
+    event = _blocked_event(
+        90,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        attempt=attempt,
+        role="controller",
+    )
+    lookup = driver_module._resolve_task_blocked_owner(event, root_store.load(), root_store)
+    assert lookup.owner is not None
+
+    disposition = driver_module._classify_task_blocked_disposition(
+        event,
+        lookup.owner,
+        child_store.load(),
+        lookup,
+    )
+
+    assert disposition.decision == "unresolved"
+    assert disposition.reason_code == expected_reason
+    assert expected_missing in disposition.missing_proof
 
 
 def test_completed_nested_blocker_with_incomplete_receipts_stays_unresolved(
@@ -3171,6 +3251,122 @@ def _complete_nested_leaf(child_store: RunStore, *, attempt: int = 6) -> RunStat
     return child_store.checkpoint(
         phase,
         {**state.slices, current.id: completed},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+
+def _complete_legacy_shape_nested_leaf(child_store: RunStore, *, event_seq: int) -> RunState:
+    """Persist legacy counters, repo slug, and issue-close proof for replay tests."""
+    state = child_store.load()
+    repository_identity = RepositoryIdentity("https://forge.example.test/test/repository.git")
+    if state.repository_identity is None:
+        state = child_store.set_repository_identity(repository_identity)
+    elif state.repository_identity != repository_identity:
+        raise AssertionError("legacy completion fixture has conflicting repository identity")
+    current = state.slices["leaf-a"]
+    publication = PublicationBinding(
+        pr_number=145,
+        head_sha="a" * 40,
+        head_branch=current.branch or "main.leaf-a",
+        base_branch=current.base_ref or "main",
+        attempt=1,
+        invocation_id="legacy-completion-invocation",
+    )
+    handoff = HandoffEvidence(
+        pr_number=publication.pr_number,
+        head_sha=publication.head_sha,
+        attempt=1,
+        invocation_id=publication.invocation_id or "legacy-completion-invocation",
+        agent_id=current.dispatch_agent_id or current.id,
+        observed_at="2026-10-01T00:00:00Z",
+    )
+    close_intent_id = "legacy-issue-close-intent"
+    close_receipt_id = "legacy-issue-close-receipt"
+    evidence = {
+        "child_id": current.id,
+        "repository": "test/repository",
+        "parent_branch": publication.base_branch,
+        "pr_number": str(publication.pr_number),
+        "head_sha": publication.head_sha,
+        "merge_journal_id": "legacy-merge-journal",
+        "lane_epoch": "1",
+        "parent_commit_sha": "b" * 40,
+        "issue_id": "42",
+        "issue_close_intent_id": close_intent_id,
+        "issue_close_journal_id": close_receipt_id,
+        "changelog_intent_id": "legacy-changelog-intent",
+        "changelog_generation": "1",
+        "changelog_commit_sha": "c" * 40,
+        "parent_push_intent_id": "legacy-parent-push-intent",
+        "push_journal_id": "legacy-push-journal",
+        "expected_base_sha": "c" * 40,
+        "push_receipt_id": "legacy-push-receipt",
+        "pushed_commit": "d" * 40,
+        "bookkeeping_commit": "d" * 40,
+        "observed_remote_head": "d" * 40,
+        "ancestry_proof": f"ancestor:{'d' * 40}->{'d' * 40}",
+    }
+    completed = replace(
+        current,
+        status=SliceStatus.MERGED,
+        attempts=6,
+        pr_number=publication.pr_number,
+        reviewed_head=publication.head_sha,
+        verdict=Verdict.GO,
+        publication=publication,
+        handoff=handoff,
+        post_merge=PostMergeState(PostMergePhase.COMPLETE, evidence),
+        dispatch_invocation_id=None,
+        recovery=None,
+        park_cause=None,
+        park_issue_id=None,
+        park_audit=None,
+    )
+    intent = EffectIntent(
+        "post_merge_issue_close",
+        current.id,
+        {
+            "issue_id": 42,
+            "force": True,
+            "commit_changelog": False,
+            "intent_id": close_intent_id,
+        },
+        True,
+    )
+    journal = EffectJournal(child_store.run_id, child_store.run_dir / "action-journal.json")
+    journal.append(intent)
+    journal.mark_result(
+        intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {"issue_id": 42, "receipt_id": close_receipt_id},
+            }
+        ),
+    )
+    phase = driver_module._phase_after_slice_merge(state, current.id, completed)
+    return child_store.checkpoint(
+        phase,
+        {**state.slices, current.id: completed},
+        state.budgets,
+        max(event_seq + 1, state.events.last_consumed_offset),
+    )
+
+
+def _rewrite_legacy_completion_evidence(
+    store: RunStore,
+    **updates: str,
+) -> RunState:
+    """Change one copied fixture receipt field to exercise strict failures."""
+    state = store.load()
+    current = state.slices["leaf-a"]
+    assert current.post_merge is not None
+    evidence = {**current.post_merge.evidence, **updates}
+    updated = replace(current, post_merge=PostMergeState(current.post_merge.phase, evidence))
+    return store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, current.id: updated},
         state.budgets,
         state.events.last_consumed_offset,
     )
