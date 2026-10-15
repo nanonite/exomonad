@@ -152,11 +152,18 @@ fn test_init_continue_requires_audited_migration_for_legacy_aggregate_defaults()
     let fixture_script = concat!(
         "import sys; from pathlib import Path; ",
         "from tl_loop.tests.test_plan_reconciliation import _project; ",
-        "_project(Path(sys.argv[1]), candidate_issue_id=None, ",
+        "from tl_loop.fsm.scope import TLPRFiled; ",
+        "from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation; ",
+        "_, _, child, accepted, candidate = _project(Path(sys.argv[1]), candidate_issue_id=None, ",
         "legacy_aggregate_review_default=True, ",
         "legacy_completed_issue_binding=True, ",
         "include_completed_spawn_journal=True, legacy_completed_dispatch=True, ",
-        "controller_alias='architecture', five_ordered_stages=True)"
+        "legacy_integration_coordinator_binding=True, ",
+        "terminal_aggregate_handoff=True, controller_alias='architecture', ",
+        "five_ordered_stages=True); ",
+        "assert accepted == candidate; ",
+        "assert isinstance(child.load().recursive_fsm, TLPRFiled); ",
+        "assert analyze_plan_reconciliation(Path(sys.argv[1])).can_apply"
     );
     let fixture_status = Command::new("python3")
         .arg("-c")
@@ -182,6 +189,24 @@ fn test_init_continue_requires_audited_migration_for_legacy_aggregate_defaults()
     let before_candidate = fs::read(&candidate).expect("read unchanged candidate");
     assert_eq!(before_snapshot, before_candidate);
 
+    let dry_run = cargo_bin_cmd!("exomonad")
+        .args(["plan", "reconcile", "--dry-run"])
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value =
+        serde_json::from_slice(&dry_run).expect("decode production reconciliation report");
+    assert!(report["can_apply"]
+        .as_bool()
+        .expect("dry-run can_apply boolean"));
+    let fingerprint = report["evidence_fingerprint"]
+        .as_str()
+        .expect("dry-run evidence fingerprint");
+
     cargo_bin_cmd!("exomonad")
         .args(["init", "--continue"])
         .env("HOME", home.path())
@@ -193,12 +218,28 @@ fn test_init_continue_requires_audited_migration_for_legacy_aggregate_defaults()
         ))
         .stderr(predicate::str::contains("--expected-fingerprint"));
 
+    cargo_bin_cmd!("exomonad")
+        .args([
+            "plan",
+            "reconcile",
+            "--apply",
+            "--reason",
+            "Apply the verified TLPRFiled legacy completion migration",
+            "--expected-fingerprint",
+            fingerprint,
+        ])
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"applied\": true"));
+
     assert_eq!(
-        fs::read(snapshot).expect("snapshot remains unchanged"),
+        fs::read(&snapshot).expect("snapshot remains unchanged after migration"),
         before_snapshot
     );
     assert_eq!(
-        fs::read(candidate).expect("candidate remains unchanged"),
+        fs::read(&candidate).expect("candidate remains unchanged after migration"),
         before_candidate
     );
 }

@@ -12,7 +12,8 @@ import pytest
 from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
-from tl_loop.fsm.scope import TLAllMerged, TLRunning
+from tl_loop.fsm.scope import TLAllMerged, TLFinalizing, TLPRFiled, TLRunning
+from tl_loop.fsm.scope_events import ScopeRole
 from tl_loop.loop.driver import (
     EffectIntent,
     TLLoopConfig,
@@ -267,6 +268,8 @@ def _project(
     persisted_compatible_plan_version: int | None = None,
     five_ordered_stages: bool = False,
     legacy_integration_coordinator_binding: bool = False,
+    terminal_aggregate_handoff: bool = False,
+    terminal_handoff_phase: str = "filed",
 ) -> tuple[Path, RunStore, RunStore, bytes, bytes]:
     accepted_document = _plan_document(
         future_issue_id=None,
@@ -337,6 +340,8 @@ def _project(
         spawn_task_override=spawn_task_override,
         legacy_completed_dispatch=legacy_completed_dispatch,
         controller_alias=controller_alias,
+        terminal_aggregate_handoff=terminal_aggregate_handoff,
+        terminal_handoff_phase=terminal_handoff_phase,
     )
     if legacy_completed_dispatch:
         _record_authoritative_spawn_event(
@@ -466,6 +471,8 @@ def _create_child(
     spawn_task_override: str | None = None,
     legacy_completed_dispatch: bool = False,
     controller_alias: str = "agent-architecture",
+    terminal_aggregate_handoff: bool = False,
+    terminal_handoff_phase: str = "filed",
 ) -> RunStore:
     child_spec = {
         "parent_run_id": "root",
@@ -526,8 +533,32 @@ def _create_child(
         current.node("root/sub_tl/architecture/leaf/future"),
         ChildKind.LEAF,
     )
+    aggregate_pr = 46
+    aggregate_head = "1" * 40
+    aggregate_base = "2" * 40
+    integration_owner = "root:architecture:integration"
+    handoff = {
+        "aggregate_pr": str(aggregate_pr),
+        "head_sha": aggregate_head,
+        "base_sha": aggregate_base,
+        "parent_branch": "main",
+        "handoff": integration_owner,
+    }
     phase = (
-        TLAllMerged(
+        TLFinalizing(
+            role=ScopeRole.NON_ROOT,
+            scope_path=(current.scope_id,),
+            plan_digest=runtime_digest or accepted.digest or "",
+            evidence=handoff,
+        )
+        if terminal_aggregate_handoff and terminal_handoff_phase == "finalizing"
+        else TLPRFiled(
+            **handoff,
+            scope_path=(current.scope_id,),
+            plan_digest=runtime_digest or accepted.digest or "",
+        )
+        if terminal_aggregate_handoff
+        else TLAllMerged(
             scope_path=(current.scope_id,),
             plan_digest=runtime_digest or accepted.digest or "",
             completed_children={"completed": receipt},
@@ -543,12 +574,30 @@ def _create_child(
             post_merge={"completed": receipt},
         )
     )
+    integration = (
+        IntegrationRuntimeState(
+            lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+            aggregate_pr_number=aggregate_pr,
+            aggregate_head_sha=aggregate_head,
+            aggregate_patch_digest=hashlib.sha256(b"architecture aggregate patch").hexdigest(),
+            aggregate_original_base_sha=aggregate_base,
+            integration_owner_id=integration_owner,
+            integration_owner_run_id="architecture",
+            integration_owner_branch=f"main.{controller_alias}",
+            integration_owner_worktree=f"/tmp/architecture/{controller_alias}",
+            head_sha=aggregate_head,
+            patch_digest=hashlib.sha256(b"architecture aggregate patch").hexdigest(),
+        )
+        if terminal_aggregate_handoff
+        else state.integration
+    )
     store.checkpoint(
         phase,
         slices,
         state.budgets,
         state.events.last_consumed_offset,
         plan_manifest=current,
+        integration=integration,
     )
     if include_spawn_journal:
         _record_completed_spawn(
@@ -559,6 +608,21 @@ def _create_child(
             branch_name=f"main.{controller_alias}.agent-completed",
         )
     return store
+
+
+def _legacy_tlprfiled_project(tmp_path: Path) -> tuple[Path, RunStore, RunStore, bytes, bytes]:
+    return _project(
+        tmp_path,
+        candidate_issue_id=None,
+        legacy_aggregate_review_default=True,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        legacy_integration_coordinator_binding=True,
+        legacy_completed_issue_binding=True,
+        controller_alias="architecture",
+        five_ordered_stages=True,
+        terminal_aggregate_handoff=True,
+    )
 
 
 def _record_completed_spawn(
@@ -952,19 +1016,13 @@ def test_apply_accepts_exact_legacy_parent_defaults_with_fsm_and_dispatch_proof(
 def test_apply_migrates_unchanged_legacy_aggregate_defaults_and_keeps_receipts(
     tmp_path: Path,
 ) -> None:
-    state_root, root_store, child_store, accepted_bytes, candidate_bytes = _project(
-        tmp_path,
-        candidate_issue_id=None,
-        legacy_aggregate_review_default=True,
-        include_completed_spawn_journal=True,
-        legacy_completed_dispatch=True,
-        legacy_integration_coordinator_binding=True,
-        legacy_completed_issue_binding=True,
-        controller_alias="architecture",
-        five_ordered_stages=True,
+    state_root, root_store, child_store, accepted_bytes, candidate_bytes = (
+        _legacy_tlprfiled_project(tmp_path)
     )
     assert accepted_bytes == candidate_bytes
     before_child = child_store.load()
+    assert isinstance(before_child.recursive_fsm, TLPRFiled)
+    assert not hasattr(before_child.recursive_fsm, "completed_children")
     before_receipt = before_child.slices["completed"].post_merge
     journal_path = child_store.run_dir / "action-journal.json"
     journal_bytes = journal_path.read_bytes()
@@ -1019,6 +1077,10 @@ def test_apply_migrates_unchanged_legacy_aggregate_defaults_and_keeps_receipts(
     )
     assert root_after.recursive_fsm.plan_digest == root_after.plan_manifest.digest
     assert child_after.recursive_fsm.plan_digest == child_after.plan_manifest.digest
+    assert child_after.recursive_fsm == replace(
+        before_child.recursive_fsm,
+        plan_digest=child_after.plan_manifest.digest,
+    )
     assert (
         root_after.plan_manifest.node("root/sub_tl/architecture").integration_contract[
             "aggregate_review_owner"
@@ -1072,6 +1134,180 @@ def test_apply_migrates_unchanged_legacy_aggregate_defaults_and_keeps_receipts(
     assert len(resumed_plan.sub_tls) == 5
     assert root_after.current_order == 1
     assert root_after.slices["architecture"].status is SliceStatus.PARKED
+
+
+def test_legacy_aggregate_default_reconciliation_accepts_tl_pr_filed_leaf_receipts(
+    tmp_path: Path,
+) -> None:
+    _state_root, _root_store, child_store, accepted_bytes, candidate_bytes = (
+        _legacy_tlprfiled_project(tmp_path)
+    )
+    child_state = child_store.load()
+    assert isinstance(child_state.recursive_fsm, TLPRFiled)
+    assert not hasattr(child_state.recursive_fsm, "completed_children")
+    assert accepted_bytes == candidate_bytes
+
+    analysis = analyze_plan_reconciliation(tmp_path)
+
+    assert analysis.can_apply, analysis.to_document()["blockers"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("scope_path", ("root/sub_tl/wrong",)),
+        ("aggregate_pr", "47"),
+        ("head_sha", "3" * 40),
+        ("base_sha", "4" * 40),
+        ("parent_branch", "release"),
+        ("handoff", "foreign:owner"),
+    ),
+)
+def test_tl_pr_filed_reconciliation_rejects_conflicting_handoff_coordinates(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    _state_root, _root_store, child_store, *_ = _legacy_tlprfiled_project(tmp_path)
+    state = child_store.load()
+    phase = replace(state.recursive_fsm, **{field: value})
+    child_store.checkpoint(
+        phase,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+    analysis = analyze_plan_reconciliation(tmp_path)
+
+    assert not analysis.can_apply
+    assert any(
+        blocker.get("node_id") == "root/sub_tl/architecture/leaf/completed"
+        for blocker in analysis.to_document()["blockers"]
+    )
+
+
+def test_tl_pr_filed_reconciliation_rejects_conflicting_parent_publication_binding(
+    tmp_path: Path,
+) -> None:
+    _state_root, root_store, _child_store, *_ = _legacy_tlprfiled_project(tmp_path)
+    state = root_store.load()
+    candidate = state.integration.candidates["architecture"]
+    conflicting = replace(candidate, aggregate_head_sha="5" * 40)
+    root_store.checkpoint(
+        state.recursive_fsm,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=replace(state.integration, candidates={"architecture": conflicting}),
+        plan_manifest=state.plan_manifest,
+    )
+
+    assert not analyze_plan_reconciliation(tmp_path).can_apply
+
+
+def test_tl_pr_filed_reconciliation_requires_child_publication_coordinates(
+    tmp_path: Path,
+) -> None:
+    _state_root, _root_store, child_store, *_ = _legacy_tlprfiled_project(tmp_path)
+    state = child_store.load()
+    integration = replace(state.integration, aggregate_head_sha=None)
+    child_store.checkpoint(
+        state.recursive_fsm,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+    assert not analyze_plan_reconciliation(tmp_path).can_apply
+
+
+def test_tl_pr_filed_reconciliation_requires_completed_leaf_receipt(
+    tmp_path: Path,
+) -> None:
+    _state_root, _root_store, child_store, *_ = _legacy_tlprfiled_project(tmp_path)
+    state = child_store.load()
+    slices = dict(state.slices)
+    slices["completed"] = replace(slices["completed"], post_merge=None)
+    child_store.checkpoint(
+        state.recursive_fsm,
+        slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+    assert not analyze_plan_reconciliation(tmp_path).can_apply
+
+
+def test_tl_pr_filed_reconciliation_requires_legacy_spawn_journal(
+    tmp_path: Path,
+) -> None:
+    _state_root, _root_store, child_store, *_ = _legacy_tlprfiled_project(tmp_path)
+    (child_store.run_dir / "action-journal.json").unlink()
+
+    assert not analyze_plan_reconciliation(tmp_path).can_apply
+
+
+def test_tl_finalizing_reconciliation_accepts_corroborated_non_root_handoff(
+    tmp_path: Path,
+) -> None:
+    _project(
+        tmp_path,
+        candidate_issue_id=None,
+        legacy_aggregate_review_default=True,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        legacy_integration_coordinator_binding=True,
+        legacy_completed_issue_binding=True,
+        controller_alias="architecture",
+        five_ordered_stages=True,
+        terminal_aggregate_handoff=True,
+        terminal_handoff_phase="finalizing",
+    )
+
+    assert analyze_plan_reconciliation(tmp_path).can_apply
+
+
+def test_tl_pr_filed_reconciliation_apply_rejects_stale_evidence_fingerprint(
+    tmp_path: Path,
+) -> None:
+    _state_root, _root_store, child_store, *_ = _legacy_tlprfiled_project(tmp_path)
+    analysis = analyze_plan_reconciliation(tmp_path)
+    assert analysis.can_apply
+    state = child_store.load()
+    phase = replace(state.recursive_fsm, head_sha="6" * 40)
+    child_store.checkpoint(
+        phase,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+    with pytest.raises(PlanRevisionError, match="inputs changed"):
+        apply_plan_reconciliation(
+            tmp_path,
+            "Reject stale terminal handoff evidence",
+            analysis.evidence_fingerprint,
+            actor="operator",
+        )
 
 
 def test_compatible_legacy_manifest_version_does_not_trigger_migration(tmp_path: Path) -> None:

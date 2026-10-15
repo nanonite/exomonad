@@ -274,6 +274,7 @@ def _collect_scope_tree(
         accepted_plan=accepted_plan,
         candidate_matches_snapshot=candidate_matches_snapshot,
         compatibility_transition=compatibility_transition,
+        parent_scope=view.parent_scope,
     )
     scopes.append(accepted_view)
     blockers.extend(_scope_blockers(accepted_view))
@@ -312,6 +313,7 @@ def _collect_scope_tree(
                 declaration,
                 inputs,
             ),
+            parent_scope=accepted_view,
         )
         child_plan = _nested_plan_document(declaration)
         _collect_scope_tree(

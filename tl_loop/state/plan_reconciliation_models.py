@@ -80,6 +80,7 @@ class ReconciliationScope:
     accepted_plan: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
     candidate_matches_snapshot: bool = False
     compatibility_transition: bool = False
+    parent_scope: ReconciliationScope | None = field(default=None, repr=False, compare=False)
 
     def to_document(self, blocked_node_ids: tuple[str, ...] = ()) -> dict[str, object]:
         phase = self.state.recursive_fsm

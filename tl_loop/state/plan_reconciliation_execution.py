@@ -11,11 +11,13 @@ from typing import TYPE_CHECKING
 
 from tl_loop.fsm.child import ChildRecord
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
-from tl_loop.fsm.scope import TLAllMerged
+from tl_loop.fsm.scope import TLAllMerged, TLFinalizing, TLPRFiled
 from tl_loop.loop.journal import stable_action_key
 from tl_loop.state.plan_revision_diff import changed_node_fields
 
 from .plan_manifest import ManifestNode
+from .plan_reconciliation_handoff import terminal_aggregate_handoff_matches
+from .plan_reconciliation_legacy_dispatch import legacy_leaf_spawn_journal_matches
 from .plan_reconciliation_ownership import _records_for
 from .plan_reconciliation_report import _safe_text
 from .schema import SliceState, SliceStatus
@@ -204,9 +206,11 @@ def _dispatch_identity_is_durable(
     ]
     if len(matches) == 1:
         return _dispatch_record_matches(scope, node, slice_state, matches[0], intent_id)
-    if matches or not isinstance(scope.state.recursive_fsm, TLAllMerged):
+    if matches:
         return False
-    return _legacy_completion_receipt_matches(scope, node, slice_state)
+    if isinstance(scope.state.recursive_fsm, (TLAllMerged, TLFinalizing, TLPRFiled)):
+        return _legacy_completion_receipt_matches(scope, node, slice_state)
+    return False
 
 
 def _dispatch_record_matches(
@@ -432,7 +436,7 @@ def _legacy_completion_receipt_matches(
     node: ManifestNode,
     slice_state: SliceState,
 ) -> bool:
-    completed = _completed_leaf_receipt(scope, node)
+    completed = _completed_leaf_receipt(scope, node, slice_state)
     return (
         completed is not None
         and slice_state.post_merge == completed
@@ -443,14 +447,33 @@ def _legacy_completion_receipt_matches(
 def _completed_leaf_receipt(
     scope: ReconciliationScope,
     node: ManifestNode,
+    slice_state: SliceState,
 ) -> PostMergeState | None:
+    """Read completion from phase-owned receipts without rewriting history.
+
+    TLAllMerged carries its receipt map. Non-root TLFinalizing and TLPRFiled
+    carry an aggregate handoff instead, so they require the unchanged slice
+    receipt plus parent, publication, journal, and ledger corroboration. Root
+    TLDone and running, failed, or parked scopes do not qualify here.
+    """
     phase = scope.state.recursive_fsm
-    if not isinstance(phase, TLAllMerged):
-        return None
-    completed = phase.completed_children.get(node.name)
-    return (
-        completed if completed is not None and completed.phase is PostMergePhase.COMPLETE else None
-    )
+    if isinstance(phase, TLAllMerged):
+        completed = phase.completed_children.get(node.name)
+        return _complete_receipt(completed)
+    if isinstance(phase, (TLFinalizing, TLPRFiled)):
+        receipt = slice_state.post_merge
+        if (
+            receipt is not None
+            and receipt.phase is PostMergePhase.COMPLETE
+            and terminal_aggregate_handoff_matches(scope, phase)
+            and legacy_leaf_spawn_journal_matches(scope, node, slice_state)
+        ):
+            return receipt
+    return None
+
+
+def _complete_receipt(receipt: PostMergeState | None) -> PostMergeState | None:
+    return receipt if receipt is not None and receipt.phase is PostMergePhase.COMPLETE else None
 
 
 def _completion_receipt_coordinates_match(
