@@ -234,6 +234,62 @@
         "integration_owner_id"
       ]
     },
+    "tl.aggregate_dispatch_identity_reconciled": {
+      "fields": [
+        "run_id",
+        "slice_id",
+        "transition_version",
+        "old_dispatch_agent_id",
+        "restored_dispatch_agent_id",
+        "dispatch_intent_id",
+        "dispatch_invocation_id",
+        "dispatch_generation",
+        "aggregate_pr_number",
+        "aggregate_head_sha",
+        "aggregate_branch",
+        "aggregate_base_branch",
+        "candidate_owner_run_id",
+        "candidate_owner_branch",
+        "candidate_owner_worktree",
+        "declared_scope_id",
+        "child_manifest_digest"
+      ]
+    },
+    "tl.aggregate_completion_verified": {
+      "fields": [
+        "slice_id",
+        "child_run_id",
+        "child_manifest_digest",
+        "aggregate_pr_number",
+        "aggregate_head_sha",
+        "aggregate_base_sha",
+        "aggregate_patch_digest",
+        "reviewed_leaf_ids",
+        "receipt_digest"
+      ],
+      "string_array_fields": ["reviewed_leaf_ids"]
+    },
+    "tl.ordered_recovery_superseded": {
+      "fields": [
+        "slice_id",
+        "cause",
+        "invocation_id",
+        "generation",
+        "aggregate_pr_number",
+        "aggregate_head_sha",
+        "receipt_digest"
+      ]
+    },
+    "tl.integrity_reconciliation_cleared": {
+      "fields": [
+        "run_id",
+        "gate_name",
+        "resolved_slice_ids",
+        "evidence",
+        "transition_version"
+      ],
+      "string_array_fields": ["resolved_slice_ids"]
+    },
     "tl.integration_base_invalidated": {
       "fields": ["slice_id", "base_sha", "head_sha", "reason"]
     },

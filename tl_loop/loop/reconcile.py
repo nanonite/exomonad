@@ -757,9 +757,9 @@ def _derive_run_action(
             {"head_sha": integration.head_sha},
         )
     if integration.lifecycle is IntegrationLifecycle.AGGREGATE_PR_OPEN:
-        return Quiescent("await_aggregate_review")
+        return Quiescent("await_aggregate_completion_evidence")
     if integration.lifecycle is IntegrationLifecycle.CODE_REVIEWED:
-        return Quiescent("await_integration_validation")
+        return Quiescent("await_aggregate_completion_evidence")
     if integration.lifecycle is IntegrationLifecycle.MERGING:
         pending_post_merge = next(
             (
@@ -834,9 +834,9 @@ def _derive_candidate_run_action(
         lifecycle = candidate.lifecycle
         current = state.slices.get(candidate_id)
         if lifecycle is IntegrationLifecycle.AGGREGATE_PR_OPEN:
-            return Quiescent("await_aggregate_review")
+            return Quiescent("await_aggregate_completion_evidence")
         if lifecycle is IntegrationLifecycle.CODE_REVIEWED:
-            return Quiescent("await_integration_validation")
+            return Quiescent("await_aggregate_completion_evidence")
         if lifecycle is IntegrationLifecycle.READY_FOR_INTEGRATION:
             return ExternalIntent(
                 "validate_integration",

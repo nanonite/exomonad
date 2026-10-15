@@ -215,22 +215,23 @@ def test_a_legacy_checkpoint_carries_no_edges_and_still_loads() -> None:
     assert PlanManifest.from_document(legacy.to_document()) == legacy
 
 
-#: The digest of a two-leaf, edge-free scope as produced *before* direct leaf
-#: dependencies existed. A manifest is the durable authority an in-flight run
-#: resumes from, so adding the field must not invalidate a document an earlier
-#: controller already wrote. This is pinned rather than recomputed so a future
-#: unconditional ``depends_on`` key in the node payload fails here.
+#: Current edge-free manifests record the leaf-only aggregate review contract.
+#: The separate historical fixture below pins the earlier serializer's digest.
+#: Both are explicit so changes to either versioned shape are reviewed.
 _PRE_DEPENDENCY_MANIFEST_DIGEST = "b06d18fbfc7cfbdc0aec99269537d3e418c4f139f1cca549a304294be60f06a7"
+_CURRENT_EDGE_FREE_MANIFEST_DIGEST = (
+    "b9502e8a979a5bfb6bdfa1aa1b28af9d68ca386976835e10a4d52fac625c2a0c"
+)
 
 #: A real manifest document written by that earlier serializer: no node carries
 #: ``depends_on``, and its recorded digest predates the field.
 _PRE_DEPENDENCY_MANIFEST = Path(__file__).parent / "fixtures/legacy/pre-dependency-manifest.json"
 
 
-def test_an_edge_free_manifest_keeps_the_digest_an_earlier_controller_recorded() -> None:
+def test_current_edge_free_manifest_records_leaf_only_aggregate_review_contract() -> None:
     manifest = build_plan_manifest(_mapping(leaf_a(), leaf_b()), scope_id="root")
 
-    assert manifest.digest == _PRE_DEPENDENCY_MANIFEST_DIGEST
+    assert manifest.digest == _CURRENT_EDGE_FREE_MANIFEST_DIGEST
     assert all("depends_on" not in node for node in _nodes(manifest))
     assert PlanManifest.from_document(manifest.to_document()) == manifest
 

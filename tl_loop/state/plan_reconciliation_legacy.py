@@ -11,7 +11,7 @@ from .schema import RunState
 
 _DEFAULT_INTEGRATION_OWNERS = {
     "leaf_review_owner": "leaf",
-    "aggregate_review_owner": "aggregate",
+    "aggregate_review_owner": "none",
     "aggregate_repair_owner": "aggregate",
 }
 _PROVEN_COMPATIBILITY_SCHEMA_VERSION = 1
@@ -43,6 +43,7 @@ def proven_legacy_default_fields(
         changed = set(changed_node_fields(node, target))
         allowed = _equivalent_order_explicit(node, target, changed)
         allowed.update(_equivalent_integration_owners(node, target, changed))
+        allowed.update(_equivalent_legacy_aggregate_review_phase(node, target, changed))
         if allowed:
             equivalent[node.node_id] = tuple(sorted(allowed))
     return equivalent
@@ -106,3 +107,20 @@ def _equivalent_integration_owners(
         and name not in current
         and accepted.get(name) == default
     }
+
+
+def _equivalent_legacy_aggregate_review_phase(
+    node: ManifestNode,
+    target: ManifestNode,
+    changed: set[str],
+) -> set[str]:
+    """Bind the schema-one aggregate-review default to the leaf-only contract."""
+    field = "integration_contract.aggregate_review_owner"
+    if (
+        field in changed
+        and node.kind == "sub_tl"
+        and node.integration_contract.get("aggregate_review_owner") == "none"
+        and target.integration_contract.get("aggregate_review_owner") == "aggregate"
+    ):
+        return {field}
+    return set()

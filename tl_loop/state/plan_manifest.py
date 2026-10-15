@@ -705,7 +705,7 @@ def _integration_contract(value: object) -> Mapping[str, object]:
             "aggregate_pr_required": True,
             "base_revalidation_required": True,
             "leaf_review_owner": "leaf",
-            "aggregate_review_owner": "aggregate",
+            "aggregate_review_owner": "none",
             "aggregate_repair_owner": "aggregate",
             "merge_strategy": "merge",
         }

@@ -12,6 +12,7 @@ import pytest
 
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.transport import JsonObject
+from tl_loop.events.types import BlockCause
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
@@ -1019,6 +1020,96 @@ def test_zero_task_budget_disables_enforcement(tmp_path: Path) -> None:
 
     assert result.state.slices["slice-a"].status is SliceStatus.SPAWNED
     assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+
+def test_ordered_child_pane_recovery_uses_bounded_same_owner_heartbeat_probe(
+    tmp_path: Path,
+) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    current = replace(
+        state.slices["slice-a"],
+        dispatch_invocation_id="ordered-invocation",
+        dispatch_generation=2,
+    )
+    recovery = begin_recovery(
+        cause=BlockCause.ORDERED_CHILD_PANE_EXITED.value,
+        owner_run_id=state.run_id,
+        slice_attempt=1,
+        owner_agent_id="agent-slice-a",
+        invocation_generation=2,
+        evidence={
+            "invocation_id": "ordered-invocation",
+            "slice_id": "slice-a",
+            "authorization_source": "human",
+        },
+        next_action="resume_same_owner",
+        entered_at=1.0,
+    )
+    persisted = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": replace(current, recovery=recovery)},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    result = heartbeat_once(
+        persisted,
+        store,
+        EffectClient(HeartbeatTransport()),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    updated = result.state.slices["slice-a"]
+    assert result.fired is True
+    assert sum(event.kind == "recovery.probe" for event in result.events) == 1
+    assert updated.recovery is not None
+    assert updated.recovery.cause == BlockCause.ORDERED_CHILD_PANE_EXITED.value
+    assert updated.recovery.phase.value == "waiting_signal"
+    assert updated.recovery.next_probe_at == 40.0
+    assert updated.dispatch_agent_id == "agent-slice-a"
+    assert updated.dispatch_invocation_id == "ordered-invocation"
+    assert updated.dispatch_generation == 2
+
+
+def test_ordered_child_pane_recovery_rejects_a_different_invocation(tmp_path: Path) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    current = replace(
+        state.slices["slice-a"],
+        dispatch_invocation_id="current-invocation",
+        dispatch_generation=2,
+        recovery=begin_recovery(
+            cause=BlockCause.ORDERED_CHILD_PANE_EXITED.value,
+            owner_run_id=state.run_id,
+            slice_attempt=1,
+            owner_agent_id="agent-slice-a",
+            invocation_generation=2,
+            evidence={
+                "invocation_id": "stale-invocation",
+                "slice_id": "slice-a",
+                "authorization_source": "human",
+            },
+            next_action="resume_same_owner",
+            entered_at=1.0,
+        ),
+    )
+    persisted = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    with pytest.raises(HeartbeatError, match="same-owner invocation"):
+        heartbeat_once(
+            persisted,
+            store,
+            EffectClient(HeartbeatTransport()),
+            HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+            now=10.0,
+            project_root=tmp_path,
+        )
 
 
 def test_recovery_wait_is_not_charged_to_execution_budget(tmp_path: Path) -> None:

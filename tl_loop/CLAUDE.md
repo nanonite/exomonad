@@ -179,7 +179,10 @@ the gate, the controller checkpoints the consumed approval before calling
 `file_pr` again. The publication attempt is part of the effect-journal identity,
 so a restart replays that one approved attempt instead of issuing it twice. A
 rejected retry reopens the same gate for a later explicit approval. A successful
-publication clears the park and gate and resumes normal aggregate review.
+publication clears the park and gate. The parent verifies completed child
+receipts, then runs the existing base, head, CI, and merge checks. The current
+workflow has no root aggregate reviewer phase; review remains on leaf PRs before
+they merge into the sub-TL branch.
 
 ## Durable post-merge recovery boundaries
 

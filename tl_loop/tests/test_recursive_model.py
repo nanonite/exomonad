@@ -73,6 +73,7 @@ from tl_loop.ordered import (
     CodeReviewEvidence,
     IntegrationEvidence,
     IntegrationLifecycle,
+    IntegrationReadinessEvidence,
     IntegrationState,
     IntegrationTransition,
     IntegrationTransitionError,
@@ -276,15 +277,11 @@ class RecursivePlanShape:
         if self.depth == 0:
             return {
                 "workers": [{"name": worker_name, "task": "parallel"}],
-                "leaves": [
-                    {"name": leaf_name, "task": "parallel", "chainlink_issue_id": None}
-                ],
+                "leaves": [{"name": leaf_name, "task": "parallel", "chainlink_issue_id": None}],
             }
         return {
             "workers": [{"name": worker_name, "task": "parallel"}],
-            "leaves": [
-                {"name": leaf_name, "task": "parallel", "chainlink_issue_id": None}
-            ],
+            "leaves": [{"name": leaf_name, "task": "parallel", "chainlink_issue_id": None}],
             "sub_tls": [
                 {
                     "name": f"{self.prefix}-scope-{self.depth}-{index}",
@@ -750,6 +747,7 @@ _INTEGRATION_MATRIX: dict[IntegrationLifecycle, frozenset[IntegrationTransition]
     IntegrationLifecycle.RUNNING: frozenset(
         {
             IntegrationTransition.CHILDREN_MERGED,
+            IntegrationTransition.INTEGRATION_CONFLICT,
             IntegrationTransition.FAILED,
             IntegrationTransition.PARKED,
         }
@@ -763,7 +761,9 @@ _INTEGRATION_MATRIX: dict[IntegrationLifecycle, frozenset[IntegrationTransition]
     ),
     IntegrationLifecycle.AGGREGATE_PR_OPEN: frozenset(
         {
-            IntegrationTransition.CODE_REVIEW_ACCEPTED,
+            IntegrationTransition.CHILD_COMPLETION_VERIFIED,
+            IntegrationTransition.BASE_INVALIDATED,
+            IntegrationTransition.INTEGRATION_CONFLICT,
             IntegrationTransition.REPAIR_STARTED,
             IntegrationTransition.FAILED,
             IntegrationTransition.PARKED,
@@ -771,9 +771,10 @@ _INTEGRATION_MATRIX: dict[IntegrationLifecycle, frozenset[IntegrationTransition]
     ),
     IntegrationLifecycle.CODE_REVIEWED: frozenset(
         {
-            IntegrationTransition.CODE_REVIEW_ACCEPTED,
+            IntegrationTransition.CHILD_COMPLETION_VERIFIED,
             IntegrationTransition.BASE_INVALIDATED,
             IntegrationTransition.HEAD_INVALIDATED,
+            IntegrationTransition.INTEGRATION_CONFLICT,
             IntegrationTransition.REPAIR_STARTED,
             IntegrationTransition.FAILED,
             IntegrationTransition.PARKED,
@@ -792,6 +793,7 @@ _INTEGRATION_MATRIX: dict[IntegrationLifecycle, frozenset[IntegrationTransition]
     ),
     IntegrationLifecycle.NEEDS_BASE_REVALIDATION: frozenset(
         {
+            IntegrationTransition.CHILD_COMPLETION_VERIFIED,
             IntegrationTransition.INTEGRATION_VALIDATED,
             IntegrationTransition.BASE_INVALIDATED,
             IntegrationTransition.INTEGRATION_CONFLICT,
@@ -838,9 +840,20 @@ _INTEGRATION_MATRIX: dict[IntegrationLifecycle, frozenset[IntegrationTransition]
 
 
 def test_integration_reference_matrix_rejects_every_unlisted_edge() -> None:
+    readiness = IntegrationReadinessEvidence(
+        child_run_id="child",
+        child_manifest_digest="manifest",
+        aggregate_pr_number=43,
+        aggregate_head_sha="head",
+        aggregate_base_sha="base",
+        aggregate_patch_digest="patch",
+        reviewed_leaf_ids=("child/leaf/a",),
+        receipt_digest="receipt",
+    )
     expected = {
         IntegrationLifecycle.RUNNING: {
             IntegrationTransition.CHILDREN_MERGED: IntegrationLifecycle.CHILDREN_MERGED,
+            IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
             IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
             IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
         },
@@ -850,15 +863,18 @@ def test_integration_reference_matrix_rejects_every_unlisted_edge() -> None:
             IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
         },
         IntegrationLifecycle.AGGREGATE_PR_OPEN: {
-            IntegrationTransition.CODE_REVIEW_ACCEPTED: IntegrationLifecycle.CODE_REVIEWED,
+            IntegrationTransition.CHILD_COMPLETION_VERIFIED: IntegrationLifecycle.READY_FOR_INTEGRATION,
+            IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+            IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
             IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
             IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
             IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
         },
         IntegrationLifecycle.CODE_REVIEWED: {
-            IntegrationTransition.CODE_REVIEW_ACCEPTED: IntegrationLifecycle.READY_FOR_INTEGRATION,
+            IntegrationTransition.CHILD_COMPLETION_VERIFIED: IntegrationLifecycle.READY_FOR_INTEGRATION,
             IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
             IntegrationTransition.HEAD_INVALIDATED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+            IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
             IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
             IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
             IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
@@ -873,6 +889,7 @@ def test_integration_reference_matrix_rejects_every_unlisted_edge() -> None:
             IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
         },
         IntegrationLifecycle.NEEDS_BASE_REVALIDATION: {
+            IntegrationTransition.CHILD_COMPLETION_VERIFIED: IntegrationLifecycle.READY_FOR_INTEGRATION,
             IntegrationTransition.INTEGRATION_VALIDATED: IntegrationLifecycle.INTEGRATION_VALIDATED,
             IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
             IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
@@ -913,8 +930,14 @@ def test_integration_reference_matrix_rejects_every_unlisted_edge() -> None:
         for event in IntegrationTransition:
             if event in allowed:
                 before = IntegrationState(lifecycle)
-                after = transition_integration(before, event)
-                assert after == IntegrationState(expected[lifecycle][event])
+                proof = (
+                    readiness if event is IntegrationTransition.CHILD_COMPLETION_VERIFIED else None
+                )
+                after = transition_integration(before, event, readiness_evidence=proof)
+                expected_state = IntegrationState(expected[lifecycle][event])
+                if proof is not None:
+                    expected_state = replace(expected_state, readiness_evidence=proof)
+                assert after == expected_state
             else:
                 with pytest.raises(IntegrationTransitionError):
                     transition_integration(IntegrationState(lifecycle), event)

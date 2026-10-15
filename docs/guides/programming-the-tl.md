@@ -944,27 +944,29 @@ A direct-leaf dependency chain, with no stage boundary:
 ### Recursive integration and recovery
 
 Each completed child publishes one aggregate candidate owned by the direct
-parent. Review evidence is bound to the candidate's exact PR head and patch
-digest. Integration evidence is a separate check bound to the current parent
-base, integrated head, merge tree, and CI result:
+parent. Leaf review evidence is bound to each leaf PR's exact head and patch
+digest before it merges into the sub-TL branch. The parent verifies completed
+child receipts for the aggregate, then checks integration against the current
+parent base, aggregate head, merge tree, and CI result:
 
 ~~~text
-review_allowed =
-    reviewer_evidence.head_sha == candidate.head_sha
- && reviewer_evidence.patch_digest == candidate.patch_digest
+child_completion_allowed =
+    every_leaf_receipt.reviewed_head matches its merged head
+ && aggregate_publication matches the candidate PR, head, base, and patch
 
 integration_allowed =
-    review_allowed
+    child_completion_allowed
  && integration.base_sha == live_parent_base
  && integration.head_sha == candidate.head_sha
  && integration.merge_tree_sha == live_merge_tree
  && integration.ci_status in {"success", "neutral"}
 ~~~
 
-The parent adjudicates the child result and owns the aggregate PR. A review
-NO-GO forwards the findings to that same aggregate owner through `resume_pr`.
-An integration failure uses the bounded `roles.tl` judgment described above.
-Neither path creates a replacement PR or changes the owner.
+Leaf reviewers adjudicate each leaf PR before it merges into its sub-TL branch.
+The parent owns aggregate integration but does not run an aggregate reviewer
+phase. An integration failure uses the bounded `roles.tl` judgment described
+above. Recovery keeps the same aggregate owner and never creates a replacement
+PR.
 
 The integration lifecycle shown in `status` and `/control` is:
 
@@ -972,14 +974,14 @@ The integration lifecycle shown in `status` and `/control` is:
 |---|---|---|
 | RUNNING | Children are still executing | Wait for child completion |
 | CHILDREN_MERGED | The child fold completed | Open or reuse the aggregate PR |
-| AGGREGATE_PR_OPEN | The aggregate PR and owner are persisted | Collect aggregate review evidence |
-| CODE_REVIEWED | The aggregate head has binding review evidence | Wait for CI and enter integration readiness |
-| READY_FOR_INTEGRATION | Head-bound review and CI are acceptable | Validate base/head/tree/CI evidence |
-| NEEDS_BASE_REVALIDATION | The parent base advanced; the reviewed head remains valid | Refresh integration evidence and CI |
+| AGGREGATE_PR_OPEN | Aggregate PR and owner are persisted | Verify completed leaf receipts and aggregate publication |
+| CODE_REVIEWED | Legacy aggregate-review state retained for compatibility | Reconcile child receipts; do not wait for new aggregate approval |
+| READY_FOR_INTEGRATION | Child receipts and exact aggregate publication are verified | Validate base/head/tree/CI evidence |
+| NEEDS_BASE_REVALIDATION | The parent base advanced; the aggregate head remains valid | Refresh integration evidence and CI |
 | INTEGRATION_VALIDATED | Base, head, tree, patch, and CI all match the snapshot | Persist `MERGING` and call `merge_pr` |
 | MERGING | Merge request was durably started | Reconcile live PR state after restart |
 | MERGED | The aggregate result is recorded | Advance to the next numeric order |
-| REPAIRING_AGGREGATE | Same owner is repairing the aggregate head | Re-review the repaired head |
+| REPAIRING_AGGREGATE | Same owner is repairing the aggregate head | Revalidate the repaired aggregate against child receipts |
 | INTEGRATION_CONFLICT | The candidate cannot merge cleanly | `resume_pr` the same aggregate owner or open the gate |
 | FAILED | The child or integration failed terminally | Inspect the failure and answer any named gate |
 | PARKED | A ceiling or human decision stopped progress | Answer the named gate or revise the plan |

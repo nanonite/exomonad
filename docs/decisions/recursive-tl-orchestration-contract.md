@@ -18,9 +18,10 @@ Last reconciled: 2026-09-03 in #1058
   parent and nested plans establish a new order scope.
 - Do not treat numeric order as merge priority. An order is a dependency
   barrier; same-order children form one parallel block.
-- Do not let a child TL merge, review, revalidate, or repair its aggregate PR.
-  Those responsibilities belong to the direct parent that owns the target
-  branch.
+- Do not let a child TL merge, revalidate, or repair its aggregate PR. Those
+  integration responsibilities belong to the direct parent that owns the
+  target branch. Leaf PRs are reviewed before merging into the sub-TL branch;
+  this implementation phase does not provide a parent aggregate reviewer.
 - Do not release a stage when a remote merge is merely observed. Release
   requires the durable post-merge bookkeeping push to the parent branch.
 - Do not retain `TLDispatching`, `TLMerging`, or `TLWaiting` as canonical
@@ -110,17 +111,19 @@ parallel block is preferred for dispatch, review, or merge.
 
 | Object | Durable identity | Branch/worktree | Owns | Does not own |
 | --- | --- | --- | --- | --- |
-| Root TL | root run ID and root scope path | repository root branch/worktree | root plan, direct-child aggregate review/revalidation/merge/post-merge, stage barriers, root-branch finalization | an unrelated scope; a root “final PR” |
+| Root TL | root run ID and root scope path | repository root branch/worktree | root plan, direct-child aggregate validation/merge/post-merge, stage barriers, root-branch finalization | aggregate reviewer phase; an unrelated scope; a root “final PR” |
 | Non-root TL | recursive scope path, run ID, direct parent run ID | `{parent-branch}.{child-name}` and child worktree | its direct plan, nested child integration, and aggregate publication handoff | review, revalidation, merge, or post-merge recovery of its own aggregate PR; those belong to its direct parent |
 | Worker slice | slice ID, invocation, attempt | worker execution boundary | bounded ephemeral work | a PR or parent integration |
 | Leaf slice | slice ID, invocation, attempt, PR/head | child branch/worktree under its owning scope | implementation and publication evidence | aggregate integration |
 | Sub-TL slice | recursive path, child run, aggregate PR/head | child branch/worktree under its direct parent | durable child handoff and scope result | merging its aggregate PR |
-| Direct parent | parent run and parent branch | direct parent branch | aggregate PR review, exact-head revalidation, compare-guarded merge, post-merge recovery | unrelated repository lanes |
+| Direct parent | parent run and parent branch | direct parent branch | receipt-backed aggregate validation, exact-head/base revalidation, compare-guarded merge, post-merge recovery | aggregate reviewer phase; unrelated repository lanes |
 | Repository lane | parent branch plus lane epoch | one parent branch/worktree | serialized integration and bookkeeping writes | parallel writes to that branch |
 
 The root is the direct parent of its direct sub-TLs. It therefore owns their
-aggregate PR review, exact-head revalidation, merge, and post-merge recovery
-just as any other direct parent does. Root finalization is instead the
+receipt-backed aggregate validation, exact-head/base revalidation, merge, and
+post-merge recovery just as any other direct parent does. Review remains on
+leaf PRs before those PRs merge into the sub-TL branch; the current phase does
+not schedule a root aggregate reviewer. Root finalization is instead the
 root-branch/local-checkout operation; the root does not create an “own final
 PR” as a substitute for that operation. A non-root TL publishes its aggregate
 PR to its direct parent and stops at a durable handoff; its parent continues

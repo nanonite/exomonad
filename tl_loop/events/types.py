@@ -11,6 +11,7 @@ class BlockCause(str, Enum):
     SCOPE_BOUNDARY = "scope_boundary"
     HUMAN_DECISION_REQUIRED = "human_decision_required"
     TOOLING_UNAVAILABLE = "tooling_unavailable"
+    ORDERED_CHILD_PANE_EXITED = "ordered_child_pane_exited"
 
 
 __all__ = ["BlockCause"]

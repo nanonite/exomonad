@@ -51,8 +51,8 @@ dispatch.
 flowchart LR
   plan[ordered sub-TL plan] --> normalize[normalize contiguous orders]
   normalize --> parallel[run same-order children concurrently]
-  parallel --> review[direct-parent review and head gate]
-  review --> evidence[base and head integration evidence]
+  parallel --> receipts[verify reviewed leaf receipts and aggregate publication]
+  receipts --> evidence[base and head integration evidence]
   evidence --> serialize[serialize aggregate merges by sub-TL ID]
   serialize --> next[next numeric order]
   evidence --> revalidate[NEEDS_BASE_REVALIDATION]
@@ -96,13 +96,13 @@ after that child handoff.
 |---|---|---|
 | `RUNNING` | Direct children are executing | Wait for child checkpoints |
 | `CHILDREN_MERGED` | Child work folded into the aggregate branch | Open or reuse the aggregate PR |
-| `AGGREGATE_PR_OPEN` | Aggregate PR and owner coordinates are persisted | Collect aggregate review evidence |
-| `CODE_REVIEWED` | Review is bound to the candidate head and patch | Wait for CI/readiness |
-| `READY_FOR_INTEGRATION` | Direct parent accepted review and CI for the candidate head | Validate base-bound evidence |
+| `AGGREGATE_PR_OPEN` | Aggregate PR and owner coordinates are persisted | Verify completed reviewed-leaf receipts and aggregate publication |
+| `CODE_REVIEWED` | Legacy aggregate-review state retained for compatibility | Reconcile child receipts; do not await new aggregate approval |
+| `READY_FOR_INTEGRATION` | Child receipts and exact aggregate publication are verified | Validate base-bound evidence |
 | `NEEDS_BASE_REVALIDATION` | Watcher observed base movement | Refresh integration CI and evidence |
 | `INTEGRATION_VALIDATED` | Base, head, tree, patch, and CI match the snapshot | Persist `MERGING` and call `merge_pr` |
 | `INTEGRATION_CONFLICT` | Aggregate integration cannot apply cleanly | Same-owner `resume_pr` or a named human gate |
-| `REPAIRING_AGGREGATE` | Same owner is repairing the aggregate head | Re-review the repaired head |
+| `REPAIRING_AGGREGATE` | Same owner is repairing the aggregate head | Revalidate the repaired aggregate against child receipts |
 | `MERGING` | Merge request was persisted | Reconcile watcher state after restart; never duplicate merge |
 | `MERGED` | Merge outcome is authoritative | Advance only after checkpoint |
 | `FAILED` | Child or integration failed terminally | Inspect failure and gate state |

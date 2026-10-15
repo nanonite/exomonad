@@ -138,6 +138,15 @@ _POLICIES = {
     BlockCause.TOOLING_UNAVAILABLE: RecoveryPolicy(
         BlockCause.TOOLING_UNAVAILABLE, 0, 0.0, "none", False, True, ()
     ),
+    BlockCause.ORDERED_CHILD_PANE_EXITED: RecoveryPolicy(
+        BlockCause.ORDERED_CHILD_PANE_EXITED,
+        3,
+        1800.0,
+        "runtime_health",
+        True,
+        False,
+        (30.0, 120.0, 300.0),
+    ),
 }
 POLICIES: Mapping[BlockCause, RecoveryPolicy] = MappingProxyType(_POLICIES)
 

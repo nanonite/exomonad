@@ -191,6 +191,7 @@ from tl_loop.ordered import (
     ChildRecoverySummary,
     IntegrationContract,
     IntegrationLifecycle,
+    IntegrationReadinessEvidence,
     IntegrationState,
     IntegrationTransition,
     IntegrationTransitionError,
@@ -420,10 +421,18 @@ REMOTE_ADVANCE_FAILURE_MARKERS = (
 
 
 def _transition_sub_tl_lifecycle(
-    current: IntegrationLifecycle, event: IntegrationTransition
+    current: IntegrationLifecycle,
+    event: IntegrationTransition,
+    *,
+    candidate: AggregateCandidate | None = None,
+    readiness_evidence: IntegrationReadinessEvidence | None = None,
 ) -> IntegrationLifecycle:
     """Apply the centralized ordered-integration contract to one candidate."""
-    return transition_integration(IntegrationState(lifecycle=current), event).lifecycle
+    return transition_integration(
+        IntegrationState(lifecycle=current, candidate=candidate),
+        event,
+        readiness_evidence=readiness_evidence,
+    ).lifecycle
 
 
 def _candidate_runtime(
@@ -515,6 +524,31 @@ def _persist_candidate_runtime(
         base_revalidation_count=candidate.base_revalidation_count,
         stage_verification=candidate.stage_verification,
         candidates=candidates,
+    )
+
+
+def _transition_candidate_runtime(
+    integration: IntegrationRuntimeState,
+    candidate_id: str,
+    event: IntegrationTransition,
+    *,
+    readiness_evidence: IntegrationReadinessEvidence | None = None,
+) -> IntegrationRuntimeState:
+    """Apply one lifecycle edge and persist both candidate and compatibility views."""
+    current = _candidate_runtime(integration, candidate_id)
+    candidate = _aggregate_candidate_from_state(
+        candidate_id, integration.candidates.get(candidate_id)
+    )
+    lifecycle = _transition_sub_tl_lifecycle(
+        current.lifecycle,
+        event,
+        candidate=candidate,
+        readiness_evidence=readiness_evidence,
+    )
+    transitioned = replace(current, lifecycle=lifecycle)
+    sub_tl_states = {**integration.sub_tl_states, candidate_id: lifecycle}
+    return _persist_candidate_runtime(
+        replace(integration, sub_tl_states=sub_tl_states), candidate_id, transitioned
     )
 
 
@@ -1070,6 +1104,10 @@ class SubTLTask:
             raise ValueError("sub-TL order must be a positive integer")
         if not isinstance(self.integration, IntegrationContract):
             raise TypeError("sub-TL integration must be an IntegrationContract")
+        if self.integration.aggregate_review_owner is ReviewOwner.AGGREGATE:
+            raise ValueError(
+                "root aggregate review phases are unsupported; reviews belong to leaf PRs"
+            )
         if not isinstance(self.order_explicit, bool):
             raise TypeError("sub-TL order_explicit must be a boolean")
         _validate_task_timeout(self.task_timeout_seconds, "sub-TL task_timeout_seconds")
@@ -3469,6 +3507,24 @@ def _run_loop(
         # row belongs to, so the child is renamed before the transition rather
         # than raising an illegal transition against an unknown child.
         fsm_event = _retarget_child_event(fsm_event, event_slice_id)
+        if isinstance(fsm_event, PRMerged):
+            aggregate_slice = state.slices.get(event_slice_id or "")
+            if (
+                aggregate_slice is not None
+                and _is_aggregate_slice(aggregate_slice)
+                and (
+                    aggregate_slice.pr_number is None
+                    or fsm_event.pr_number != aggregate_slice.pr_number
+                )
+            ):
+                _record_historical_child_merge(store, event)
+                diagnostics.filtered += 1
+                _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
+                if not replaying:
+                    diagnostics.acknowledged += 1
+                _release_replayed_event(store, event, replaying)
+                state = store.load()
+                continue
         if _duplicate_event(phase, fsm_event, state):
             diagnostics.filtered += 1
             _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
@@ -8943,6 +8999,8 @@ def _reconcile_nonterminal_slices(
     updated = dict(state.slices)
     conflicts_found = False
     changed = False
+    reconciled_aggregate_identity = False
+    gate_evidence_complete = True
     for current in candidates:
         healed = _heal_stale_reviewer_action(current, effects_log)
         if healed is not None:
@@ -8986,6 +9044,7 @@ def _reconcile_nonterminal_slices(
                 updated[current.id] = reconfirmed
                 changed = True
                 current = reconfirmed
+            state = store.load()
             continue
         if _aggregate_resume_requires_owner_reconciliation(plan, current, watcher, config):
             LOGGER.info(
@@ -9005,6 +9064,22 @@ def _reconcile_nonterminal_slices(
                 current.dispatch_intent_id or "",
             )
         )
+        if aggregate_task is not None:
+            restored = _restore_legacy_aggregate_dispatch_owner(
+                aggregate_task,
+                current,
+                watcher,
+                owner_id,
+                state,
+                config,
+                effects,
+                effects_log,
+            )
+            if restored is not None:
+                current = restored
+                updated[current.id] = restored
+                changed = True
+                reconciled_aggregate_identity = True
         # A watcher-only merge may be adopted when publication provenance
         # validates against the dispatch or active recovery succession. A
         # confirmed, exact merge journal is a separate authority for adopting
@@ -9144,6 +9219,10 @@ def _reconcile_nonterminal_slices(
             authoritative_owner_id=owner_id,
             watcher=watcher,
         )
+        unresolved_for_gate = bool(result.conflicts) or bool(result.missing_evidence)
+        if aggregate_task is not None and set(result.missing_evidence) <= {"review_state"}:
+            unresolved_for_gate = bool(result.conflicts)
+        gate_evidence_complete &= not unresolved_for_gate
         reconciled = _apply_reconciliation_observations(
             current,
             result,
@@ -9260,6 +9339,36 @@ def _reconcile_nonterminal_slices(
 
     if changed:
         checkpoint_phase = _reconciliation_phase(state, updated)
+        clear_integrity_gate = (
+            reconciled_aggregate_identity
+            and gate_evidence_complete
+            and not conflicts_found
+            and any(
+                gate.name == INTEGRITY_RECONCILIATION_GATE_NAME
+                and gate.status is GateStatus.PENDING
+                for gate in state.gates
+            )
+        )
+        if clear_integrity_gate:
+            _record_controller_event(
+                "controller",
+                "tl.integrity_reconciliation_cleared",
+                {
+                    "run_id": state.run_id,
+                    "gate_name": INTEGRITY_RECONCILIATION_GATE_NAME,
+                    "resolved_slice_ids": sorted(
+                        current.id
+                        for current in candidates
+                        if updated[current.id].dispatch_last_boundary
+                        in _AGGREGATE_DISPATCH_BOUNDARIES
+                    ),
+                    "evidence": "all active publication bindings revalidated without conflicts",
+                    "transition_version": 1,
+                },
+                config,
+                effects,
+                effects_log,
+            )
         state = store.checkpoint(
             checkpoint_phase,
             updated,
@@ -9268,10 +9377,133 @@ def _reconcile_nonterminal_slices(
             current_order=state.current_order,
             ordered_stages=state.ordered_stages,
             integration=state.integration,
+            expected_revision=state.revision,
+            clear_gates=((INTEGRITY_RECONCILIATION_GATE_NAME,) if clear_integrity_gate else ()),
         )
+    elif reconciled_aggregate_identity and gate_evidence_complete and not conflicts_found:
+        if any(
+            gate.name == INTEGRITY_RECONCILIATION_GATE_NAME and gate.status is GateStatus.PENDING
+            for gate in state.gates
+        ):
+            _record_controller_event(
+                "controller",
+                "tl.integrity_reconciliation_cleared",
+                {
+                    "run_id": state.run_id,
+                    "gate_name": INTEGRITY_RECONCILIATION_GATE_NAME,
+                    "resolved_slice_ids": sorted(
+                        current.id
+                        for current in candidates
+                        if updated[current.id].dispatch_last_boundary
+                        in _AGGREGATE_DISPATCH_BOUNDARIES
+                    ),
+                    "evidence": "all active publication bindings revalidated without conflicts",
+                    "transition_version": 1,
+                },
+                config,
+                effects,
+                effects_log,
+            )
+            state = store.checkpoint(
+                state.fsm,
+                state.slices,
+                state.budgets,
+                state.events.last_consumed_offset,
+                current_order=state.current_order,
+                ordered_stages=state.ordered_stages,
+                integration=state.integration,
+                expected_revision=state.revision,
+                clear_gates=(INTEGRITY_RECONCILIATION_GATE_NAME,),
+            )
     if conflicts_found:
         state = store.set_gate(INTEGRITY_RECONCILIATION_GATE_NAME, GateStatus.PENDING)
     return state
+
+
+def _restore_legacy_aggregate_dispatch_owner(
+    task: SubTLTask,
+    current: SliceState,
+    watcher: WatcherObservation | Mapping[str, object] | None,
+    owner_id: str | None,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> SliceState | None:
+    """Restore a coordinator-overwritten dispatch owner from exact publication proof."""
+    coordinator_id = f"{state.run_id}:{task.name}:integration"
+    candidate = state.integration.candidates.get(task.name)
+    observation = _as_watcher_observation(watcher)
+    manifest = state.plan_manifest
+    node = (
+        next(
+            (item for item in manifest.nodes if item.name == task.name and item.kind == "sub_tl"),
+            None,
+        )
+        if manifest is not None
+        else None
+    )
+    child_manifest = (
+        manifest.child_manifests.get(node.node_id)
+        if manifest is not None and node is not None
+        else None
+    )
+    if (
+        owner_id is None
+        or current.dispatch_agent_id != coordinator_id
+        or current.dispatch_last_boundary not in _AGGREGATE_DISPATCH_BOUNDARIES
+        or not current.dispatch_intent_id
+        or not current.dispatch_invocation_id
+        or current.dispatch_generation <= 0
+        or child_manifest is None
+        or child_manifest.scope_id != node.node_id
+        or child_manifest.owned_branch != current.branch
+        or child_manifest.parent_integration_target != current.base_ref
+        or candidate is None
+        or candidate.integration_owner_id != coordinator_id
+        or candidate.integration_owner_run_id != task.name
+        or candidate.integration_owner_branch != child_manifest.owned_branch
+        or candidate.aggregate_pr_number != current.pr_number
+        or candidate.aggregate_head_sha is None
+        or observation is None
+        or observation.head_sha != candidate.aggregate_head_sha
+        or observation.patch_digest != candidate.aggregate_patch_digest
+        or candidate.integration_owner_worktree != current.worktree
+    ):
+        return None
+    declared_dispatch = replace(current, dispatch_agent_id=owner_id)
+    publication = _publication_from_watcher(
+        declared_dispatch, observation, observation.head_sha, owner_id
+    )
+    if publication is None or publication.pr_number != candidate.aggregate_pr_number:
+        return None
+    _record_controller_event(
+        task.name,
+        "tl.aggregate_dispatch_identity_reconciled",
+        {
+            "run_id": state.run_id,
+            "slice_id": task.name,
+            "transition_version": 1,
+            "old_dispatch_agent_id": coordinator_id,
+            "restored_dispatch_agent_id": owner_id,
+            "dispatch_intent_id": current.dispatch_intent_id,
+            "dispatch_invocation_id": current.dispatch_invocation_id,
+            "dispatch_generation": current.dispatch_generation,
+            "aggregate_pr_number": publication.pr_number,
+            "aggregate_head_sha": publication.head_sha,
+            "aggregate_branch": publication.head_branch,
+            "aggregate_base_branch": publication.base_branch,
+            "candidate_owner_run_id": candidate.integration_owner_run_id,
+            "candidate_owner_branch": candidate.integration_owner_branch,
+            "candidate_owner_worktree": candidate.integration_owner_worktree,
+            "declared_scope_id": child_manifest.scope_id,
+            "child_manifest_digest": child_manifest.digest,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return replace(current, dispatch_agent_id=owner_id)
 
 
 def _aggregate_resume_requires_owner_reconciliation(
@@ -9939,7 +10171,10 @@ def _apply_reconciliation_observations(
                     HeadEvidenceObserved(
                         head_sha=head_sha,
                         ci_status=ci_status,
-                        bind_reviewed_head=transitioned.reviewed_head in {None, head_sha},
+                        bind_reviewed_head=(
+                            not _is_aggregate_slice(current)
+                            and transitioned.reviewed_head in {None, head_sha}
+                        ),
                     ),
                 )
             effective_agent_id = current.dispatch_agent_id or owner_id
@@ -9958,7 +10193,7 @@ def _apply_reconciliation_observations(
                     )
                 )
             ):
-                attempt = current.publication.attempt if current.publication else current.attempts
+                attempt = publication.attempt
                 updates["handoff"] = HandoffEvidence(
                     pr_number=publication.pr_number,
                     head_sha=head_sha,
@@ -11771,17 +12006,9 @@ def _complete_sub_tl_batch(
                         blocked_by=None,
                     )
                 current = slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW))
-                current = slice_transition(
-                    current,
-                    HeadEvidenceObserved(
-                        head_sha=candidate.head_sha,
-                        bind_reviewed_head=True,
-                    ),
-                )
                 current = replace(
                     current,
                     pr_number=candidate.pr_number,
-                    dispatch_agent_id=owner_id,
                     dispatch_last_boundary="aggregate_pr_open",
                 )
                 status = SliceStatus.IN_REVIEW
@@ -14125,6 +14352,9 @@ def _integrate_stage_candidates(
     if not config.active or _integration_gate_pending(state):
         return state
     for task in sorted(tasks, key=lambda item: item.name):
+        state = _promote_aggregate_if_child_complete(
+            task, state, config, effects, store, effects_log
+        )
         current = state.slices[task.name]
         if _ordered_child_complete(task, current):
             continue
@@ -14133,12 +14363,12 @@ def _integrate_stage_candidates(
             and current.park_cause is ParkCause.PUBLICATION_BLOCKED
         ):
             continue
+        candidate = state.integration.candidates.get(task.name)
         if (
             current.status is not SliceStatus.IN_REVIEW
             or current.pr_number is None
-            or current.reviewed_head is None
-            or current.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}
-            or current.ci_state.get(current.reviewed_head) not in {"success", "neutral"}
+            or candidate is None
+            or candidate.lifecycle is not IntegrationLifecycle.READY_FOR_INTEGRATION
         ):
             return state
         state = _integrate_one_candidate(task, state, config, effects, store, effects_log)
@@ -14147,6 +14377,254 @@ def _integrate_stage_candidates(
                 continue
             break
     return state
+
+
+def _promote_aggregate_if_child_complete(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Move an adopted aggregate to integration only with exact child receipts."""
+    current = state.slices.get(task.name)
+    candidate_state = state.integration.candidates.get(task.name)
+    candidate = _aggregate_candidate_from_state(task.name, candidate_state)
+    child_store = RunStore(task.name, store.run_dir)
+    if (
+        current is None
+        or candidate_state is None
+        or candidate is None
+        or not child_store.path.exists()
+    ):
+        return state
+    if candidate_state.lifecycle not in {
+        IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        IntegrationLifecycle.CODE_REVIEWED,
+        IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+    }:
+        return state
+    child_state = child_store.load()
+    evidence = _verified_child_completion_evidence(task, child_state, candidate)
+    if evidence is None:
+        return state
+    _record_controller_event(
+        task.name,
+        "tl.aggregate_completion_verified",
+        {
+            "slice_id": task.name,
+            "child_run_id": evidence.child_run_id,
+            "child_manifest_digest": evidence.child_manifest_digest,
+            "aggregate_pr_number": evidence.aggregate_pr_number,
+            "aggregate_head_sha": evidence.aggregate_head_sha,
+            "aggregate_base_sha": evidence.aggregate_base_sha,
+            "aggregate_patch_digest": evidence.aggregate_patch_digest,
+            "reviewed_leaf_ids": list(evidence.reviewed_leaf_ids),
+            "receipt_digest": evidence.receipt_digest,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    updated_integration = _transition_candidate_runtime(
+        state.integration,
+        task.name,
+        IntegrationTransition.CHILD_COMPLETION_VERIFIED,
+        readiness_evidence=evidence,
+    )
+    updated_slices = dict(state.slices)
+    if _ordered_recovery_is_superseded(current, state.run_id, task.name):
+        recovery = current.recovery
+        assert recovery is not None
+        _record_controller_event(
+            task.name,
+            "tl.ordered_recovery_superseded",
+            {
+                "slice_id": task.name,
+                "cause": recovery.cause,
+                "invocation_id": recovery.evidence.get("invocation_id"),
+                "generation": recovery.invocation_generation,
+                "aggregate_pr_number": evidence.aggregate_pr_number,
+                "aggregate_head_sha": evidence.aggregate_head_sha,
+                "receipt_digest": evidence.receipt_digest,
+            },
+            config,
+            effects,
+            effects_log,
+        )
+        updated_slices[task.name] = replace(current, recovery=None)
+    return store.checkpoint(
+        _phase_from_state(state),
+        updated_slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=updated_integration,
+        expected_revision=state.revision,
+    )
+
+
+def _aggregate_candidate_from_state(
+    slice_id: str, candidate: IntegrationCandidateState | None
+) -> AggregateCandidate | None:
+    if candidate is None:
+        return None
+    required = (
+        candidate.aggregate_pr_number,
+        candidate.aggregate_head_sha,
+        candidate.aggregate_patch_digest,
+        candidate.aggregate_original_base_sha,
+    )
+    if not all(required):
+        return None
+    return AggregateCandidate(
+        slice_id,
+        cast(int, candidate.aggregate_pr_number),
+        cast(str, candidate.aggregate_head_sha),
+        cast(str, candidate.aggregate_patch_digest),
+        cast(str, candidate.aggregate_original_base_sha),
+    )
+
+
+def _verified_child_completion_evidence(
+    task: SubTLTask,
+    child_state: RunState,
+    aggregate: AggregateCandidate,
+) -> IntegrationReadinessEvidence | None:
+    """Revalidate reviewed child merges and their immutable receipts."""
+    if (
+        child_state.run_id != task.name
+        or child_state.plan_manifest is None
+        or not _child_handoff_ready(child_state, child_state.parent_run_id or "")
+        or isinstance(child_state.recursive_fsm, (RecursiveTLFailed, RecursiveTLParked))
+    ):
+        return None
+    receipts: list[Mapping[str, object]] = []
+    reviewed_leaf_ids: list[str] = []
+    for node in child_state.plan_manifest.nodes:
+        current = child_state.slices.get(node.name)
+        if current is None or current.status is not SliceStatus.MERGED:
+            return None
+        if node.kind == "leaf" and current.pr_number is not None:
+            receipt = _verified_leaf_merge_receipt(current)
+            if receipt is None:
+                return None
+            reviewed_leaf_ids.append(node.node_id)
+            receipts.append(receipt)
+        elif node.kind == "sub_tl" and node.integration_contract.get("aggregate_pr_required", True):
+            if not _verified_nested_aggregate_receipt(child_state, node.name, current):
+                return None
+            receipts.append(
+                {
+                    "slice_id": node.node_id,
+                    "pr_number": current.pr_number,
+                    "head_sha": current.publication.head_sha
+                    if current.publication is not None
+                    else None,
+                    "nested_integration_lifecycle": child_state.integration.candidates[
+                        node.name
+                    ].lifecycle.value,
+                }
+            )
+    if not receipts:
+        return None
+    payload = {
+        "child_run_id": child_state.run_id,
+        "child_manifest_digest": child_state.plan_manifest.digest,
+        "receipts": receipts,
+        "aggregate": {
+            "pr_number": aggregate.pr_number,
+            "head_sha": aggregate.head_sha,
+            "base_sha": aggregate.original_base_sha,
+            "patch_digest": aggregate.patch_digest,
+        },
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return IntegrationReadinessEvidence(
+        child_run_id=child_state.run_id,
+        child_manifest_digest=child_state.plan_manifest.digest,
+        aggregate_pr_number=aggregate.pr_number,
+        aggregate_head_sha=aggregate.head_sha,
+        aggregate_base_sha=aggregate.original_base_sha,
+        aggregate_patch_digest=aggregate.patch_digest,
+        reviewed_leaf_ids=tuple(sorted(reviewed_leaf_ids)),
+        receipt_digest=digest,
+    )
+
+
+def _verified_leaf_merge_receipt(current: SliceState) -> Mapping[str, object] | None:
+    publication = current.publication
+    handoff = current.handoff
+    post_merge = current.post_merge
+    if (
+        publication is None
+        or handoff is None
+        or post_merge is None
+        or post_merge.phase is not PostMergePhase.COMPLETE
+        or current.pr_number != publication.pr_number
+        or current.reviewed_head != publication.head_sha
+        or current.dispatch_agent_id is None
+        or handoff.agent_id != current.dispatch_agent_id
+        or handoff.pr_number != publication.pr_number
+        or handoff.head_sha != publication.head_sha
+        or handoff.invocation_id != publication.invocation_id
+    ):
+        return None
+    receipt = post_merge.evidence
+    if (
+        receipt.get("pr_number") not in {str(publication.pr_number), publication.pr_number}
+        or receipt.get("head_sha") != publication.head_sha
+        or receipt.get("parent_branch") != publication.base_branch
+        or not receipt.get("merge_journal_id")
+    ):
+        return None
+    patch_digest = current.review_patch_digests.get(publication.head_sha)
+    try:
+        verify_review(current, publication.head_sha, current_patch_digest=patch_digest)
+    except ReviewGateError:
+        return None
+    return {
+        "slice_id": current.manifest_node_id or current.id,
+        "pr_number": publication.pr_number,
+        "head_sha": publication.head_sha,
+        "patch_digest": patch_digest,
+        "publication_invocation_id": publication.invocation_id,
+        "handoff_invocation_id": handoff.invocation_id,
+        "merge_journal_id": receipt.get("merge_journal_id"),
+        "post_merge_receipt": hashlib.sha256(
+            json.dumps(dict(receipt), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _verified_nested_aggregate_receipt(state: RunState, slice_id: str, current: SliceState) -> bool:
+    candidate = state.integration.candidates.get(slice_id)
+    return (
+        candidate is not None
+        and candidate.lifecycle is IntegrationLifecycle.MERGED
+        and candidate.aggregate_pr_number == current.pr_number
+        and current.post_merge is not None
+        and current.post_merge.phase is PostMergePhase.COMPLETE
+        and current.post_merge.evidence.get("head_sha")
+    )
+
+
+def _ordered_recovery_is_superseded(current: SliceState, owner_run_id: str, slice_id: str) -> bool:
+    recovery = current.recovery
+    return (
+        recovery is not None
+        and recovery.cause == BlockCause.ORDERED_CHILD_PANE_EXITED.value
+        and recovery.owner_run_id == owner_run_id
+        and recovery.owner_agent_id == current.dispatch_agent_id
+        and recovery.evidence.get("slice_id") == slice_id
+        and recovery.evidence.get("authorization_source") == "human"
+        and recovery.evidence.get("invocation_id") == current.dispatch_invocation_id
+        and recovery.invocation_generation == current.dispatch_generation
+    )
 
 
 def _candidate_lane_key(state: RunState, current: SliceState) -> tuple[str, str]:
@@ -14553,9 +15031,17 @@ def _open_integration_gate(
 ) -> RunState:
     slice_id = task if isinstance(task, str) else task.name
     current = state.slices[slice_id]
-    sub_states = dict(state.integration.sub_tl_states)
-    sub_states[slice_id] = lifecycle
     candidate_runtime = _candidate_runtime(state.integration, slice_id)
+    transitioned = state.integration
+    if candidate_runtime.lifecycle is not lifecycle:
+        transition = {
+            IntegrationLifecycle.NEEDS_BASE_REVALIDATION: IntegrationTransition.BASE_INVALIDATED,
+            IntegrationLifecycle.INTEGRATION_CONFLICT: IntegrationTransition.INTEGRATION_CONFLICT,
+        }.get(lifecycle)
+        if transition is None:
+            raise TLLoopError(f"unsupported integration gate lifecycle {lifecycle.value!r}")
+        transitioned = _transition_candidate_runtime(state.integration, slice_id, transition)
+        candidate_runtime = _candidate_runtime(transitioned, slice_id)
     updated = slice_transition(current, SliceStatusChanged(SliceStatus.IN_REVIEW))
     updated = slice_transition(updated, ActionChanged(None))
     updated = replace(
@@ -14583,8 +15069,9 @@ def _open_integration_gate(
             else candidate_runtime.patch_digest
         ),
     )
+    sub_states = {**transitioned.sub_tl_states, slice_id: lifecycle}
     integration = _persist_candidate_runtime(
-        replace(state.integration, sub_tl_states=sub_states), slice_id, candidate_runtime
+        replace(transitioned, sub_tl_states=sub_states), slice_id, candidate_runtime
     )
     integration = _abandon_owned_lane_integration(
         state, updated, integration, "integration_gate", reason
@@ -14656,6 +15143,12 @@ def _handle_external_base_change(
         head_sha=head_sha,
         patch_digest=patch_digest,
     )
+    invalidated = replace(
+        invalidated,
+        lifecycle=_transition_sub_tl_lifecycle(
+            candidate_runtime.lifecycle, IntegrationTransition.BASE_INVALIDATED
+        ),
+    )
     current = state.slices[task.name]
     return _checkpoint_integration_retry(
         state,
@@ -14699,9 +15192,12 @@ def _handle_integration_revalidation(
         effects_log,
     )
     candidate_runtime = _candidate_runtime(state.integration, task.name)
+    lifecycle = _transition_sub_tl_lifecycle(
+        candidate_runtime.lifecycle, IntegrationTransition.BASE_INVALIDATED
+    )
     invalidated = replace(
         candidate_runtime,
-        lifecycle=IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+        lifecycle=lifecycle,
         validated_base_sha=None,
         merge_tree_sha=None,
         ci_status="unknown",
@@ -14795,9 +15291,11 @@ def _judge_integration_failure(
             ceiling,
         )
     attempt = candidate.tl_intervention_attempts + 1
+    transitioned = _transition_candidate_runtime(
+        state.integration, slice_id, IntegrationTransition.INTEGRATION_CONFLICT
+    )
     reserved = replace(
-        candidate,
-        lifecycle=IntegrationLifecycle.INTEGRATION_CONFLICT,
+        _candidate_runtime(transitioned, slice_id),
         head_sha=head_sha,
         patch_digest=current.review_patch_digests.get(head_sha),
         validated_base_sha=base_sha,
@@ -14808,7 +15306,6 @@ def _judge_integration_failure(
         merge_attempts=candidate.merge_attempts + int(increment_merge_attempt),
         tl_intervention_attempts=attempt,
     )
-    sub_states = {**state.integration.sub_tl_states, slice_id: reserved.lifecycle}
     state = store.checkpoint(
         _phase_from_state(state),
         state.slices,
@@ -14816,9 +15313,7 @@ def _judge_integration_failure(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=_persist_candidate_runtime(
-            replace(state.integration, sub_tl_states=sub_states), slice_id, reserved
-        ),
+        integration=_persist_candidate_runtime(transitioned, slice_id, reserved),
     )
     return _call_integration_judgment(
         slice_id,
@@ -15045,9 +15540,11 @@ def _dispatch_integration_repair(
     if handoff is None:
         raise TLLoopError("delegate integration judgment has no validated handoff")
     current = state.slices[slice_id]
+    transitioning = _transition_candidate_runtime(
+        state.integration, slice_id, IntegrationTransition.REPAIR_STARTED
+    )
     candidate = replace(
-        _candidate_runtime(state.integration, slice_id),
-        lifecycle=IntegrationLifecycle.REPAIRING_AGGREGATE,
+        _candidate_runtime(transitioning, slice_id),
         head_sha=None,
         patch_digest=None,
         validated_base_sha=None,
@@ -15056,7 +15553,6 @@ def _dispatch_integration_repair(
         ci_status="unknown",
         stage_verification="pending",
     )
-    sub_states = {**state.integration.sub_tl_states, slice_id: candidate.lifecycle}
     updated = replace(
         current,
         dispatch_last_boundary="integration_failure",
@@ -15069,9 +15565,7 @@ def _dispatch_integration_repair(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=_persist_candidate_runtime(
-            replace(state.integration, sub_tl_states=sub_states), slice_id, candidate
-        ),
+        integration=_persist_candidate_runtime(transitioning, slice_id, candidate),
     )
     _record_controller_event(
         slice_id,
@@ -15098,6 +15592,7 @@ def _dispatch_integration_repair(
         effects,
         effects_log,
         _guide_repair(handoff, store, slice_id),
+        aggregate_repair=True,
         gate_name_on_failure=(
             INTEGRATION_CONFLICT_GATE_NAME
             if failure_kind == "parent_merge_conflict"
@@ -15173,7 +15668,6 @@ def _integrate_one_candidate(
         merged_base = _snapshot_text(first, "base_sha") or candidate_runtime.validated_base_sha
         reconciled = replace(
             candidate_runtime,
-            lifecycle=IntegrationLifecycle.MERGED,
             head_sha=merged_head,
             patch_digest=merged_patch,
             validated_base_sha=merged_base,
@@ -15208,13 +15702,29 @@ def _integrate_one_candidate(
     ci_status = _snapshot_text(first, "ci_status")
     if not all((head_sha, base_sha, patch_digest, merge_tree_sha, ci_status)):
         return state
-    try:
-        verify_review(current, head_sha, current_patch_digest=patch_digest)
-    except ReviewGateError:
+    aggregate_identity = _aggregate_candidate_from_state(
+        task.name, state.integration.candidates.get(task.name)
+    )
+    if (
+        aggregate_identity is None
+        or head_sha != aggregate_identity.head_sha
+        or patch_digest != aggregate_identity.patch_digest
+    ):
         return state
+    child_store = RunStore(task.name, store.run_dir)
+    if not child_store.path.exists():
+        return state
+    try:
+        child_state = child_store.load()
+    except (OSError, ValueError):
+        return state
+    if _verified_child_completion_evidence(task, child_state, aggregate_identity) is None:
+        return state
+    transitioned_integration = _transition_candidate_runtime(
+        state.integration, task.name, IntegrationTransition.INTEGRATION_VALIDATED
+    )
     integration = replace(
-        candidate_runtime,
-        lifecycle=IntegrationLifecycle.INTEGRATION_VALIDATED,
+        _candidate_runtime(transitioned_integration, task.name),
         head_sha=head_sha,
         patch_digest=patch_digest,
         validated_base_sha=base_sha,
@@ -15230,7 +15740,7 @@ def _integrate_one_candidate(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=_persist_candidate_runtime(state.integration, task.name, integration),
+        integration=_persist_candidate_runtime(transitioned_integration, task.name, integration),
     )
     _record_controller_event(
         task.name,
@@ -15351,6 +15861,9 @@ def _integrate_one_candidate(
         attempt=max(1, current.attempts),
     )
     merge_slice = slice_transition(current, ActionChanged(merge_action))
+    merging_integration = _transition_candidate_runtime(
+        state.integration, task.name, IntegrationTransition.MERGE_STARTED
+    )
     state = store.checkpoint(
         _phase_from_state(state),
         {**state.slices, task.name: merge_slice},
@@ -15358,11 +15871,7 @@ def _integrate_one_candidate(
         state.events.last_consumed_offset,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
-        integration=_persist_candidate_runtime(
-            state.integration,
-            task.name,
-            replace(integration, lifecycle=IntegrationLifecycle.MERGING),
-        ),
+        integration=merging_integration,
     )
     _emit_merge_decision(
         task.name,
@@ -15394,7 +15903,13 @@ def _integrate_one_candidate(
     failure = _merge_failure_classification(merge_result)
     if _merge_result_is_authoritative(merge_result):
         return _checkpoint_aggregate_merged(
-            task, state, store, integration, config, effects, effects_log
+            task,
+            state,
+            store,
+            _candidate_runtime(state.integration, task.name),
+            config,
+            effects,
+            effects_log,
         )
     if failure == "conflict":
         return _handle_integration_conflict(
@@ -15496,8 +16011,18 @@ def _checkpoint_aggregate_merged(
         "aggregate_merged",
         merge_evidence,
     )
-    sub_states = dict(state.integration.sub_tl_states)
-    sub_states[task.name] = IntegrationLifecycle.MERGED
+    try:
+        merged_candidates = _transition_candidate_runtime(
+            state.integration, task.name, IntegrationTransition.MERGED
+        )
+    except IntegrationTransitionError as error:
+        return _block_post_merge_recovery(
+            store,
+            state,
+            task.name,
+            f"aggregate merge lifecycle is not recoverable: {error}",
+        )
+    sub_states = dict(merged_candidates.sub_tl_states)
     candidate_records = dict(state.integration.candidates)
     for sibling in state.ordered_stages:
         if task.name not in sibling.sub_tls:
@@ -15507,10 +16032,13 @@ def _checkpoint_aggregate_merged(
                 sibling_id != task.name
                 and updated_slices[sibling_id].status is SliceStatus.IN_REVIEW
             ):
-                sub_states[sibling_id] = IntegrationLifecycle.NEEDS_BASE_REVALIDATION
                 sibling_runtime = _candidate_runtime(state.integration, sibling_id)
+                sibling_lifecycle = _transition_sub_tl_lifecycle(
+                    sibling_runtime.lifecycle, IntegrationTransition.BASE_INVALIDATED
+                )
+                sub_states[sibling_id] = sibling_lifecycle
                 candidate_records[sibling_id] = IntegrationCandidateState(
-                    lifecycle=IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+                    lifecycle=sibling_lifecycle,
                     aggregate_pr_number=sibling_runtime.aggregate_pr_number,
                     aggregate_head_sha=sibling_runtime.aggregate_head_sha,
                     aggregate_patch_digest=sibling_runtime.aggregate_patch_digest,
@@ -15531,8 +16059,7 @@ def _checkpoint_aggregate_merged(
                     stage_verification="pending",
                 )
     merged_integration = replace(
-        integration,
-        lifecycle=IntegrationLifecycle.MERGED,
+        _candidate_runtime(merged_candidates, task.name),
         aggregate_pr_number=integration.aggregate_pr_number or current.pr_number,
         aggregate_head_sha=integration.aggregate_head_sha
         or integration.head_sha
@@ -15562,7 +16089,8 @@ def _checkpoint_aggregate_merged(
         integration_evidence_at=integration.integration_evidence_at or _now_timestamp(),
         stage_verification="passed",
     )
-    persisted_merged = _persist_candidate_runtime(state.integration, task.name, merged_integration)
+    persisted_merged = _persist_candidate_runtime(merged_candidates, task.name, merged_integration)
+    candidate_records[task.name] = persisted_merged.candidates[task.name]
     remaining = {
         sibling_id: ChildHandle(
             sibling_id,
@@ -16818,20 +17346,6 @@ def _is_aggregate_slice(slice_state: SliceState) -> bool:
     )
 
 
-def _aggregate_awaits_code_review(state: RunState, slice_id: str) -> bool:
-    """Whether an aggregate owner still owes an approval its slice already holds.
-
-    Only these two lifecycles can consume one, so asking first keeps the
-    repeated-verdict guard from writing a checkpoint that advances nothing --
-    and keeps it from reaching an edge the transition table does not offer from
-    wherever the candidate actually is.
-    """
-    return _candidate_runtime(state.integration, slice_id).lifecycle in {
-        IntegrationLifecycle.AGGREGATE_PR_OPEN,
-        IntegrationLifecycle.CODE_REVIEWED,
-    }
-
-
 def _event_review_head(event: EventEnvelope) -> str | None:
     """Return the head a review is about, wherever the row carries it.
 
@@ -16913,6 +17427,13 @@ def _route_review_event(
     current = state.slices.get(slice_id)
     if current is None:
         raise TLLoopError(f"review event references unknown slice {slice_id!r}")
+    if _is_aggregate_slice(current):
+        LOGGER.info(
+            "[TL loop] ignoring unsupported parent aggregate review event slice=%s pr=%s",
+            slice_id,
+            event.pr_number,
+        )
+        return state
     head_sha = _event_review_head(event)
     findings = _event_findings(event)
     if head_sha is None:
@@ -16937,22 +17458,6 @@ def _route_review_event(
                 current.verdict.value,
                 incoming_verdict.value,
             )
-            # A recognised repeat has no verdict to re-derive, but the aggregate
-            # lifecycle edge that verdict implies is still owed to the run. A
-            # restarted aggregate owner resumes holding the approval its slice
-            # already validated, and the watcher's row for that same review is
-            # the only thing that arrives to move its candidate off
-            # ``aggregate_pr_open``. Returning the state unchanged dropped that
-            # binding, and the run then waited on ``await_aggregate_review`` for
-            # a review it had been holding all along.
-            if (
-                current.verdict in {Verdict.GO, Verdict.GO_WITH_NITS}
-                and _is_aggregate_slice(current)
-                and _aggregate_awaits_code_review(state, slice_id)
-            ):
-                return _record_aggregate_review_lifecycle(
-                    store, state, phase, event_seq, slice_id, current.verdict
-                )
             return state
     review_findings = _review_findings(current, head_sha, findings)
     patch_digest = _event_patch_digest(event)
@@ -17122,10 +17627,6 @@ def _route_review_event(
         review_patch_digests=patch_digests,
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
-    if _is_aggregate_slice(updated[slice_id]):
-        state = _record_aggregate_review_lifecycle(
-            store, state, phase, event_seq, slice_id, decision_verdict
-        )
     if decision_verdict is Verdict.NO_GO:
         if _review_rounds_exhausted(state, state.slices[slice_id], config):
             return state
@@ -17145,57 +17646,6 @@ def _route_review_event(
             ),
         )
     return state
-
-
-def _record_aggregate_review_lifecycle(
-    store: RunStore,
-    state: RunState,
-    phase: PhaseValue,
-    event_seq: int,
-    slice_id: str,
-    verdict: Verdict,
-) -> RunState:
-    """Apply hierarchical review outcomes through the ordered transition table."""
-    candidate = _candidate_runtime(state.integration, slice_id)
-    lifecycle = candidate.lifecycle
-    if verdict is Verdict.NO_GO:
-        if lifecycle is not IntegrationLifecycle.REPAIRING_AGGREGATE:
-            lifecycle = transition_integration(
-                IntegrationState(lifecycle=lifecycle),
-                IntegrationTransition.REPAIR_STARTED,
-            ).lifecycle
-    elif verdict in {Verdict.GO, Verdict.GO_WITH_NITS}:
-        if lifecycle is IntegrationLifecycle.REPAIRING_AGGREGATE:
-            lifecycle = transition_integration(
-                IntegrationState(lifecycle=lifecycle),
-                IntegrationTransition.REPAIR_COMPLETED,
-            ).lifecycle
-        if lifecycle is IntegrationLifecycle.AGGREGATE_PR_OPEN:
-            lifecycle = transition_integration(
-                IntegrationState(lifecycle=lifecycle),
-                IntegrationTransition.CODE_REVIEW_ACCEPTED,
-            ).lifecycle
-        if lifecycle is IntegrationLifecycle.CODE_REVIEWED:
-            lifecycle = transition_integration(
-                IntegrationState(lifecycle=lifecycle),
-                IntegrationTransition.CODE_REVIEW_ACCEPTED,
-            ).lifecycle
-    else:
-        raise IntegrationTransitionError(f"unsupported aggregate review verdict {verdict!r}")
-    updated = _persist_candidate_runtime(
-        state.integration,
-        slice_id,
-        replace(candidate, lifecycle=lifecycle),
-    )
-    return store.checkpoint(
-        phase,
-        state.slices,
-        state.budgets,
-        event_seq,
-        current_order=state.current_order,
-        ordered_stages=state.ordered_stages,
-        integration=updated,
-    )
 
 
 def _persist_adjudication_nits(
@@ -17249,6 +17699,13 @@ def _route_ci_event(
     if head_sha is None:
         raise TLLoopError(f"{event.event_type!r} has no head SHA")
     status = _ci_status(event)
+    candidate = state.integration.candidates.get(slice_id)
+    aggregate_head_matches = (
+        _is_aggregate_slice(current)
+        and candidate is not None
+        and candidate.aggregate_head_sha == head_sha
+    )
+    bound_review_head_matches = current.reviewed_head == head_sha or aggregate_head_matches
     updated = dict(state.slices)
     transitioned = slice_transition(
         current,
@@ -17266,7 +17723,7 @@ def _route_ci_event(
     should_repair = (
         config.active
         and status == "failure"
-        and current.reviewed_head == head_sha
+        and bound_review_head_matches
         and current.status is not SliceStatus.REPAIRING
         and current.ci_state.get(head_sha) != "failure"
     )
@@ -17274,7 +17731,7 @@ def _route_ci_event(
         not should_repair
         and status in {"success", "neutral"}
         and current.status is not SliceStatus.REPAIRING
-        and current.reviewed_head == head_sha
+        and bound_review_head_matches
         and _is_aggregate_slice(current)
     ):
         return _reset_integration_failure_attempts(store, state, slice_id)
@@ -17371,6 +17828,7 @@ def _route_repair(
     effects_log: list[EffectIntent],
     repair_with: RepairWith,
     *,
+    aggregate_repair: bool = False,
     gate_name_on_failure: str | None = None,
 ) -> RunState:
     """Resume the slice's existing PR owner through ``repair_with``.
@@ -17382,18 +17840,27 @@ def _route_repair(
     current = state.slices.get(slice_id)
     if current is None or current.pr_number is None:
         raise TLLoopError(f"repair event references slice without PR {slice_id!r}")
+    expected_head_sha = (
+        _candidate_runtime(state.integration, slice_id).head_sha
+        if aggregate_repair
+        else current.reviewed_head
+    )
     repair_arguments = {
         "pr_number": current.pr_number,
-        "expected_head_sha": current.reviewed_head,
+        "expected_head_sha": expected_head_sha,
     }
     repair_action = ActionState(
         ActionKind.REPAIR,
         ActionPhase.IN_FLIGHT,
         intent_id=stable_action_key(state.run_id, "resume_pr", slice_id, repair_arguments),
-        head_sha=current.reviewed_head,
+        head_sha=expected_head_sha,
         attempt=max(1, current.attempts),
     )
-    repairing = slice_transition(current, RepairQueued())
+    repairing = (
+        slice_transition(current, SliceStatusChanged(SliceStatus.REPAIRING))
+        if aggregate_repair
+        else slice_transition(current, RepairQueued())
+    )
     repairing = slice_transition(repairing, ActionChanged(repair_action))
     state = store.checkpoint(
         phase,
@@ -18391,11 +18858,10 @@ def _resolve_task_blocked_reporter(
         candidates.append((owner.path, current.dispatch_invocation_id, current.dispatch_generation))
     if isinstance(reporter_id, str) and reporter_id:
         for index, scope_id in enumerate(owner.path):
-            if reporter_id != scope_id:
-                continue
             scope_path = owner.path[: index + 1]
             if index == 0:
-                candidates.append((scope_path, None, None))
+                if reporter_id == scope_id:
+                    candidates.append((scope_path, None, None))
                 continue
             parent_path = owner.path[:index]
             parent_entry = scopes.get(parent_path)
@@ -18407,6 +18873,7 @@ def _resolve_task_blocked_reporter(
             binding = parent_state.slices.get(scope_id)
             if (
                 binding is not None
+                and reporter_id in {scope_id, binding.dispatch_agent_id}
                 and child_state.parent_run_id == parent_state.run_id
                 and _task_blocked_reporter_binding_is_durable(
                     event,
@@ -18452,6 +18919,23 @@ def _task_blocked_reporter_binding_is_durable(
     """Prove the reporter through the original dispatch or persisted aggregate owner."""
     if binding.dispatch_agent_id == event.agent_id and _sub_tl_dispatch_binding_is_durable(binding):
         return True
+    return _aggregate_reporter_binding_is_durable(
+        event,
+        parent_state,
+        child_name,
+        child_state,
+        binding,
+    )
+
+
+def _aggregate_reporter_binding_is_durable(
+    event: EventEnvelope,
+    parent_state: RunState,
+    child_name: str,
+    child_state: RunState,
+    binding: SliceState,
+) -> bool:
+    """Prove the original subTL reporter while keeping integration ownership separate."""
     candidate = parent_state.integration.candidates.get(child_name)
     if candidate is None:
         return False
@@ -18464,19 +18948,22 @@ def _task_blocked_reporter_binding_is_durable(
         IntegrationLifecycle.MERGED,
     }
     return (
-        event.agent_id == child_name
+        event.agent_id == binding.dispatch_agent_id
         and child_state.run_id == child_name
+        and bool(binding.dispatch_intent_id)
         and binding.status in {SliceStatus.IN_REVIEW, SliceStatus.MERGED}
         and candidate.lifecycle in aggregate_lifecycles
         and bool(candidate.aggregate_patch_digest)
         and bool(candidate.aggregate_original_base_sha)
         and candidate.integration_owner_run_id == child_state.run_id
-        and candidate.integration_owner_id == binding.dispatch_agent_id
+        and candidate.integration_owner_id == f"{parent_state.run_id}:{child_name}:integration"
         and candidate.aggregate_pr_number is not None
         and candidate.aggregate_pr_number == binding.pr_number
         and candidate.integration_owner_branch == binding.branch
         and candidate.integration_owner_branch == child_state.owner_branch
-        and candidate.aggregate_head_sha == binding.reviewed_head
+        and candidate.integration_owner_worktree == binding.worktree
+        and candidate.aggregate_head_sha
+        == (binding.publication.head_sha if binding.publication is not None else None)
         and binding.dispatch_last_boundary in _AGGREGATE_DISPATCH_BOUNDARIES
     )
 
@@ -19429,6 +19916,17 @@ def _quarantine_historical_publication(store: RunStore, event: EventEnvelope, re
     )
 
 
+def _record_historical_child_merge(store: RunStore, event: EventEnvelope) -> None:
+    """Retain a child PR merge that cannot prove its parent's aggregate merge."""
+    store.append_audit_event(
+        {
+            **envelope_document(event),
+            "correlation": "child_merge_does_not_bind_aggregate",
+            "correlation_reason": "event PR number differs from the bound aggregate PR",
+        }
+    )
+
+
 def _record_historical_spawn(store: RunStore, event: EventEnvelope, reason: str) -> None:
     """Retain a spawn row from a predecessor epoch permanently for audit.
 
@@ -20046,7 +20544,9 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                     plan=_work_plan_from_manifest(child),
                     worktree=node.worktree,
                     order=node.order,
-                    integration=_integration_contract(node.integration_contract),
+                    integration=_integration_contract(
+                        node.integration_contract, legacy_manifest=True
+                    ),
                     order_explicit=bool(declaration.get("order_explicit", True)),
                     task_timeout_seconds=_manifest_timeout(declaration),
                     task_timeout_declared="task_timeout_seconds" in declaration,
@@ -20523,7 +21023,7 @@ def _validate_chainlink_issue_bindings(plan: WorkPlan) -> None:
     visit(plan, "plan")
 
 
-def _integration_contract(value: object) -> IntegrationContract:
+def _integration_contract(value: object, *, legacy_manifest: bool = False) -> IntegrationContract:
     if value is None:
         return IntegrationContract()
     if not isinstance(value, Mapping):
@@ -20541,14 +21041,25 @@ def _integration_contract(value: object) -> IntegrationContract:
         raise ValueError(f"sub-TL integration contains unknown keys: {', '.join(unknown)}")
 
     def owner(name: str) -> ReviewOwner:
-        raw = value.get(
-            name,
-            ReviewOwner.LEAF.value if name == "leaf_review_owner" else ReviewOwner.AGGREGATE.value,
+        default = (
+            ReviewOwner.LEAF.value
+            if name == "leaf_review_owner"
+            else ReviewOwner.NONE.value
+            if name == "aggregate_review_owner"
+            else ReviewOwner.AGGREGATE.value
         )
+        raw = value.get(name, default)
+        if name == "aggregate_review_owner" and raw == ReviewOwner.AGGREGATE.value:
+            if not legacy_manifest:
+                raise ValueError(
+                    "aggregate_review_owner='aggregate' is unsupported; "
+                    "root aggregate review phases are not available"
+                )
+            raw = ReviewOwner.NONE.value
         try:
             return ReviewOwner(raw)
         except (TypeError, ValueError) as error:
-            raise ValueError(f"{name} must be 'leaf' or 'aggregate'") from error
+            raise ValueError(f"{name} must be 'leaf', 'aggregate', or 'none'") from error
 
     return IntegrationContract(
         aggregate_pr_required=value.get("aggregate_pr_required", True),

@@ -299,9 +299,7 @@ def test_owned_slice_fields_are_mutated_only_in_slice_transition() -> None:
                 continue
             touched = sorted({k.arg for k in node.keywords if k.arg} & owned)
             if touched:
-                violations.append(
-                    f"{path.relative_to(package_root)}:{node.lineno}: {touched}"
-                )
+                violations.append(f"{path.relative_to(package_root)}:{node.lineno}: {touched}")
 
     assert violations == [], (
         "slice_transition-owned fields must be mutated only through "

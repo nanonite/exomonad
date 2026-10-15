@@ -76,6 +76,7 @@ class IntegrationTransition(str, Enum):
     CHILDREN_MERGED = "children_merged"
     AGGREGATE_PR_OPENED = "aggregate_pr_opened"
     CODE_REVIEW_ACCEPTED = "code_review_accepted"
+    CHILD_COMPLETION_VERIFIED = "child_completion_verified"
     BASE_INVALIDATED = "base_invalidated"
     HEAD_INVALIDATED = "head_invalidated"
     INTEGRATION_VALIDATED = "integration_validated"
@@ -97,6 +98,7 @@ class ReviewOwner(str, Enum):
 
     LEAF = "leaf"
     AGGREGATE = "aggregate"
+    NONE = "none"
 
 
 @dataclass(frozen=True)
@@ -106,7 +108,7 @@ class IntegrationContract:
     aggregate_pr_required: bool = True
     base_revalidation_required: bool = True
     leaf_review_owner: ReviewOwner = ReviewOwner.LEAF
-    aggregate_review_owner: ReviewOwner = ReviewOwner.AGGREGATE
+    aggregate_review_owner: ReviewOwner = ReviewOwner.NONE
     aggregate_repair_owner: ReviewOwner = ReviewOwner.AGGREGATE
     merge_strategy: str = "merge"
 
@@ -195,6 +197,36 @@ class IntegrationEvidence:
 
 
 @dataclass(frozen=True)
+class IntegrationReadinessEvidence:
+    """Receipt-backed child completion bound to one aggregate publication."""
+
+    child_run_id: str
+    child_manifest_digest: str
+    aggregate_pr_number: int
+    aggregate_head_sha: str
+    aggregate_base_sha: str
+    aggregate_patch_digest: str
+    reviewed_leaf_ids: tuple[str, ...]
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "child_run_id",
+            "child_manifest_digest",
+            "aggregate_head_sha",
+            "aggregate_base_sha",
+            "aggregate_patch_digest",
+            "receipt_digest",
+        ):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
+                raise ValueError(f"integration readiness {name} must be non-empty")
+        if type(self.aggregate_pr_number) is not int or self.aggregate_pr_number <= 0:
+            raise ValueError("integration readiness aggregate_pr_number must be positive")
+        if any(not isinstance(item, str) or not item for item in self.reviewed_leaf_ids):
+            raise ValueError("integration readiness reviewed_leaf_ids must be non-empty strings")
+
+
+@dataclass(frozen=True)
 class IntegrationState:
     """Lifecycle plus the evidence that justifies the current stage state."""
 
@@ -202,6 +234,7 @@ class IntegrationState:
     candidate: AggregateCandidate | None = None
     code_review: CodeReviewEvidence | None = None
     integration: IntegrationEvidence | None = None
+    readiness_evidence: IntegrationReadinessEvidence | None = None
 
 
 # Every allowed edge is declared once.  Consumers must use
@@ -211,6 +244,7 @@ _TRANSITIONS: Final[
 ] = {
     IntegrationLifecycle.RUNNING: {
         IntegrationTransition.CHILDREN_MERGED: IntegrationLifecycle.CHILDREN_MERGED,
+        IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
         IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
         IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
     },
@@ -220,15 +254,18 @@ _TRANSITIONS: Final[
         IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
     },
     IntegrationLifecycle.AGGREGATE_PR_OPEN: {
-        IntegrationTransition.CODE_REVIEW_ACCEPTED: IntegrationLifecycle.CODE_REVIEWED,
+        IntegrationTransition.CHILD_COMPLETION_VERIFIED: IntegrationLifecycle.READY_FOR_INTEGRATION,
+        IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
+        IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
         IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
         IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
         IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
     },
     IntegrationLifecycle.CODE_REVIEWED: {
-        IntegrationTransition.CODE_REVIEW_ACCEPTED: IntegrationLifecycle.READY_FOR_INTEGRATION,
+        IntegrationTransition.CHILD_COMPLETION_VERIFIED: IntegrationLifecycle.READY_FOR_INTEGRATION,
         IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
         IntegrationTransition.HEAD_INVALIDATED: IntegrationLifecycle.REPAIRING_AGGREGATE,
+        IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
         IntegrationTransition.REPAIR_STARTED: IntegrationLifecycle.REPAIRING_AGGREGATE,
         IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,
         IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
@@ -243,6 +280,7 @@ _TRANSITIONS: Final[
         IntegrationTransition.PARKED: IntegrationLifecycle.PARKED,
     },
     IntegrationLifecycle.NEEDS_BASE_REVALIDATION: {
+        IntegrationTransition.CHILD_COMPLETION_VERIFIED: IntegrationLifecycle.READY_FOR_INTEGRATION,
         IntegrationTransition.INTEGRATION_VALIDATED: IntegrationLifecycle.INTEGRATION_VALIDATED,
         IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
         IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
@@ -280,16 +318,52 @@ _TRANSITIONS: Final[
 
 
 def transition_integration(
-    state: IntegrationState, event: IntegrationTransition
+    state: IntegrationState,
+    event: IntegrationTransition,
+    *,
+    readiness_evidence: IntegrationReadinessEvidence | None = None,
 ) -> IntegrationState:
-    """Apply one allowed lifecycle edge or reject it centrally."""
+    """Apply one allowed lifecycle edge, requiring proof for integration readiness."""
+    if event is IntegrationTransition.CHILD_COMPLETION_VERIFIED:
+        if readiness_evidence is None:
+            raise IntegrationTransitionError(
+                "child completion transition requires receipt-backed readiness evidence"
+            )
+        if state.candidate is not None and not _readiness_matches_candidate(
+            readiness_evidence, state.candidate
+        ):
+            raise IntegrationTransitionError(
+                "child completion evidence disagrees with the aggregate candidate"
+            )
+    elif readiness_evidence is not None:
+        raise IntegrationTransitionError("readiness evidence is only valid for child completion")
     try:
         next_lifecycle = _TRANSITIONS[state.lifecycle][event]
     except KeyError as error:
         raise IntegrationTransitionError(
             f"cannot apply {event.value} from {state.lifecycle.value}"
         ) from error
-    return replace(state, lifecycle=next_lifecycle)
+    return replace(
+        state,
+        lifecycle=next_lifecycle,
+        readiness_evidence=(
+            readiness_evidence
+            if event is IntegrationTransition.CHILD_COMPLETION_VERIFIED
+            else state.readiness_evidence
+        ),
+    )
+
+
+def _readiness_matches_candidate(
+    evidence: IntegrationReadinessEvidence, candidate: AggregateCandidate
+) -> bool:
+    return (
+        evidence.child_run_id == candidate.sub_tl_id
+        and evidence.aggregate_pr_number == candidate.pr_number
+        and evidence.aggregate_head_sha == candidate.head_sha
+        and evidence.aggregate_patch_digest == candidate.patch_digest
+        and evidence.aggregate_base_sha == candidate.original_base_sha
+    )
 
 
 def allowed_integration_transitions(
@@ -307,6 +381,7 @@ __all__ = [
     "IntegrationContract",
     "IntegrationEvidence",
     "IntegrationLifecycle",
+    "IntegrationReadinessEvidence",
     "IntegrationState",
     "IntegrationTransition",
     "IntegrationTransitionError",

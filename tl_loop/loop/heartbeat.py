@@ -14,7 +14,8 @@ from typing import TypeAlias, cast
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.reader import LedgerReader, LedgerReadError
-from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
+from tl_loop.events.types import BlockCause
+from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery, transition_recovery
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
@@ -951,12 +952,22 @@ def _reconcile_recovery(
     if recovery is None:
         return current, None, False
     try:
+        if recovery.cause == BlockCause.ORDERED_CHILD_PANE_EXITED.value and not (
+            _ordered_recovery_identity_matches(current, slice_state)
+        ):
+            raise RecoveryPolicyError(
+                "ordered child recovery does not match its persisted same-owner invocation"
+            )
         policy = policy_for_cause(recovery.cause)
         probe_result = None
         if row is not None and isinstance(row.get("recovery_probe"), Mapping):
             probe_result = ProbeResult.from_mapping(
                 cast(Mapping[str, object], row["recovery_probe"])
             )
+            if recovery.cause == BlockCause.ORDERED_CHILD_PANE_EXITED.value and not (
+                _ordered_recovery_probe_matches_owner(row, recovery)
+            ):
+                probe_result = None
         decision = decide_recovery(recovery, now=now, probe_result=probe_result)
     except RecoveryPolicyError as error:
         raise HeartbeatError(f"invalid recovery state for {slice_state.id!r}: {error}") from error
@@ -1051,6 +1062,34 @@ def _reconcile_recovery(
         },
     )
     return current, event, True
+
+
+def _ordered_recovery_identity_matches(current: RunState, slice_state: SliceState) -> bool:
+    recovery = slice_state.recovery
+    if recovery is None:
+        return False
+    invocation_id = recovery.evidence.get("invocation_id")
+    return (
+        recovery.owner_run_id == current.run_id
+        and recovery.owner_agent_id is not None
+        and recovery.owner_agent_id == slice_state.dispatch_agent_id
+        and isinstance(invocation_id, str)
+        and invocation_id == slice_state.dispatch_invocation_id
+        and recovery.invocation_generation == slice_state.dispatch_generation
+        and recovery.evidence.get("authorization_source") == "human"
+        and recovery.evidence.get("slice_id") == slice_state.id
+    )
+
+
+def _ordered_recovery_probe_matches_owner(row: JsonMapping, recovery: RecoveryState) -> bool:
+    owner = recovery.owner_agent_id
+    invocation_id = recovery.evidence.get("invocation_id")
+    generation = recovery.invocation_generation
+    return (
+        row.get("agent_id", row.get("agentId")) == owner
+        and row.get("invocation_id", row.get("invocationId")) == invocation_id
+        and row.get("generation", row.get("invocation_generation")) == generation
+    )
 
 
 def _parallel_impact(state: RunState, slice_id: str) -> str:
@@ -1267,9 +1306,9 @@ def _state_handoff_matches_invocation(
     if handoff is None or publication is None or not isinstance(record, Mapping):
         return False
     status = _text(record, "status")
-    terminal = status in {"exited", "failed", "killed", "timed_out"} or record.get(
-        "ended_at"
-    ) is not None
+    terminal = (
+        status in {"exited", "failed", "killed", "timed_out"} or record.get("ended_at") is not None
+    )
     if not terminal:
         return False
     invocation_id = _text(record, "invocation_id")

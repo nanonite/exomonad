@@ -10,6 +10,7 @@ from tl_loop.ordered import (
     CodeReviewEvidence,
     IntegrationEvidence,
     IntegrationLifecycle,
+    IntegrationReadinessEvidence,
     IntegrationState,
     IntegrationTransition,
     IntegrationTransitionError,
@@ -43,6 +44,7 @@ def test_missing_order_preserves_the_legacy_single_stage_contract() -> None:
     assert task.order == 1
     assert task.integration.aggregate_pr_required is True
     assert task.integration.base_revalidation_required is True
+    assert task.integration.aggregate_review_owner.value == "none"
 
 
 def test_contract_rejects_invalid_order_and_integration_keys() -> None:
@@ -164,15 +166,61 @@ def test_evidence_is_bound_to_the_required_dimensions() -> None:
 
 
 def test_every_declared_transition_is_allowed_and_every_other_edge_is_rejected() -> None:
+    readiness = IntegrationReadinessEvidence(
+        child_run_id="stage",
+        child_manifest_digest="manifest-digest",
+        aggregate_pr_number=7,
+        aggregate_head_sha="head-7",
+        aggregate_base_sha="base-1",
+        aggregate_patch_digest="patch-7",
+        reviewed_leaf_ids=("stage/leaf/one",),
+        receipt_digest="receipt-digest",
+    )
     for lifecycle in IntegrationLifecycle:
         state = IntegrationState(lifecycle=lifecycle)
         allowed = allowed_integration_transitions(lifecycle)
         for event in IntegrationTransition:
             if event in allowed:
-                transition_integration(state, event)
+                proof = (
+                    readiness if event is IntegrationTransition.CHILD_COMPLETION_VERIFIED else None
+                )
+                transition_integration(state, event, readiness_evidence=proof)
             else:
                 with pytest.raises(IntegrationTransitionError):
                     transition_integration(state, event)
+
+
+def test_child_completion_transition_requires_receipts_for_the_bound_candidate() -> None:
+    candidate = AggregateCandidate("stage", 7, "head-7", "patch-7", "base-1")
+    state = IntegrationState(IntegrationLifecycle.AGGREGATE_PR_OPEN, candidate=candidate)
+    readiness = IntegrationReadinessEvidence(
+        child_run_id="stage",
+        child_manifest_digest="manifest-digest",
+        aggregate_pr_number=7,
+        aggregate_head_sha="head-7",
+        aggregate_base_sha="base-1",
+        aggregate_patch_digest="patch-7",
+        reviewed_leaf_ids=("stage/leaf/one",),
+        receipt_digest="receipt-digest",
+    )
+
+    with pytest.raises(IntegrationTransitionError, match="requires receipt-backed"):
+        transition_integration(state, IntegrationTransition.CHILD_COMPLETION_VERIFIED)
+    with pytest.raises(IntegrationTransitionError, match="disagrees"):
+        transition_integration(
+            state,
+            IntegrationTransition.CHILD_COMPLETION_VERIFIED,
+            readiness_evidence=IntegrationReadinessEvidence(
+                **{**readiness.__dict__, "aggregate_head_sha": "stale-head"}
+            ),
+        )
+    ready = transition_integration(
+        state,
+        IntegrationTransition.CHILD_COMPLETION_VERIFIED,
+        readiness_evidence=readiness,
+    )
+    assert ready.lifecycle is IntegrationLifecycle.READY_FOR_INTEGRATION
+    assert ready.readiness_evidence == readiness
 
 
 def test_base_and_head_invalidation_have_distinct_recovery_states() -> None:
