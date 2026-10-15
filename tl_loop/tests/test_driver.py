@@ -2000,14 +2000,17 @@ class OrderedIntegrationTransport(IntegrationTransport):
                 return {"success": True, "result": {"found": False}}
             self.snapshot_history.append(dict(snapshot))
             return {"success": True, "result": dict(snapshot)}
-        if tool_name == "emit_controller_event" and self.observed_root_store is not None:
-            if arguments.get("event_type") == "tl.dispatch_confirmed":
-                payload = arguments.get("payload")
-                if isinstance(payload, dict) and payload.get("slice_id") == "beta":
-                    alpha = self.observed_root_store.load().slices["alpha"]
-                    assert alpha.status is SliceStatus.MERGED
-                    assert alpha.post_merge is not None
-                    assert alpha.post_merge.phase is PostMergePhase.COMPLETE
+        if (
+            tool_name == "emit_controller_event"
+            and self.observed_root_store is not None
+            and arguments.get("event_type") == "tl.dispatch_confirmed"
+        ):
+            payload = arguments.get("payload")
+            if isinstance(payload, dict) and payload.get("slice_id") == "beta":
+                alpha = self.observed_root_store.load().slices["alpha"]
+                assert alpha.status is SliceStatus.MERGED
+                assert alpha.post_merge is not None
+                assert alpha.post_merge.phase is PostMergePhase.COMPLETE
         return super().call_tool(role, name, tool_name, arguments)
 
 
@@ -3068,6 +3071,7 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
         leaf_issue_id=42,
     )
     assert child_store is not None
+    root_store.set_controller_epoch("blocker-parent-epoch")
     repository_path = Path(root_store.load().slices["architecture"].worktree or "")
     _complete_nested_leaf(child_store, repository=repository_path)
     repository = RepositoryIdentity("https://forge.example.test/test/repository.git")
@@ -3213,6 +3217,7 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
         max_parallel_slices=1,
         policy=validate_policy(_selector_policy()),
         tl_model_choice=_tl_choice(ReviewBackend([])),
+        agent_id=run_id,
     )
     reconciled_start = driver_module._reconcile_nonterminal_slices(
         plan,
@@ -8808,6 +8813,7 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         keep_alive_on_waiting=False,
         ledger_run_id="ordered-e2e-ledger",
         repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        agent_id="root-controller",
     )
     _install_ordered_invocation(monkeypatch, "beta-invocation")
 
@@ -9312,6 +9318,7 @@ def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(
         poll_interval=0.001,
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        agent_id="root-controller",
     )
 
     first = run_tl_loop(
@@ -10137,6 +10144,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
         keep_alive_on_waiting=False,
         policy=validate_policy(_selector_policy()),
         tl_model_choice=_tl_choice(ReviewBackend([])),
+        agent_id=run_id,
         capabilities=CapabilityMap(
             {"codex/gpt-luna": Difficulty.STANDARD, "claude/sonnet": Difficulty.HARD}
         ),
@@ -11152,15 +11160,6 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "serialized-run"
-    run_tl_loop(
-        "aggregate-child",
-        child_plan,
-        SyntheticQueue(_lifecycle_events("aggregate-child")),
-        EffectClient(RecordingTransport()),
-        config=_config(),
-        root_dir=parent_dir,
-    )
-    child_store = RunStore("aggregate-child", parent_dir)
     plan = WorkPlan(
         sub_tls=(
             SubTLTask(
@@ -11172,6 +11171,33 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
             ),
         )
     )
+    parent_config = TLLoopConfig(
+        root_dir=tmp_path,
+        run_id="serialized-run",
+        branch="main",
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+    )
+    parent_manifest = driver_module._manifest_for_plan(plan, "serialized-run", parent_config)
+    child_node = next(node for node in parent_manifest.nodes if node.name == "aggregate-child")
+    child_manifest = parent_manifest.child_manifests[child_node.node_id]
+    child_config = TLLoopConfig(
+        root_dir=parent_dir,
+        run_id="aggregate-child",
+        branch=child_manifest.owned_branch,
+        keep_alive_on_waiting=False,
+        agent_id="aggregate-child",
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        declared_manifest=child_manifest,
+    )
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(RecordingTransport()),
+        config=child_config,
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
     setup_config = TLLoopConfig(root_dir=tmp_path, run_id="serialized-run")
     repository = Path(
         driver_module._sub_tl_worktree(setup_config, tmp_path, "serialized-run", plan.sub_tls[0])
@@ -11180,7 +11206,18 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
     aggregate_head = _test_git_output(repository, "rev-parse", "HEAD")
     assert aggregate_head is not None
     aggregate_tree = _test_git_tree(repository, aggregate_head)
-    transport = IntegrationTransport(
+
+    class ReceiptCheckingTransport(IntegrationTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "merge_pr":
+                stored = RunStore("serialized-run", tmp_path).load()
+                candidate = stored.integration.candidates["aggregate-child"]
+                reference = cast(JsonObject, arguments["aggregate_approval"])
+                assert candidate.active_aggregate_approval_id == reference["receipt_id"]
+                assert candidate.aggregate_approval_receipts
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = ReceiptCheckingTransport(
         snapshots=[
             {
                 "head_sha": aggregate_head,
@@ -11218,6 +11255,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         poll_interval=0.001,
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        agent_id="root-controller",
     )
     verified: list[tuple[str, str, str, str]] = []
     from tl_loop.loop import driver
@@ -11267,7 +11305,21 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         "expected_head_sha": aggregate_head,
         "expected_patch_digest": "patch-a",
         "expected_merge_tree_sha": "tree-a",
+        "aggregate_approval": {
+            "receipt_id": result.final_state.integration.candidates[
+                "aggregate-child"
+            ].active_aggregate_approval_id,
+            "parent_run_id": "serialized-run",
+            "parent_scope_path": ["serialized-run"],
+            "child_scope_id": "aggregate-child",
+            "controller_epoch": result.final_state.controller_epoch,
+        },
     }
+    approval = result.final_state.integration.candidates["aggregate-child"]
+    assert len(approval.aggregate_approval_receipts) == 1
+    assert (
+        approval.active_aggregate_approval_id == approval.aggregate_approval_receipts[0].receipt_id
+    )
     event_types = {
         arguments["event_type"]
         for name, arguments in transport.calls
@@ -11662,15 +11714,6 @@ def test_integration_conflict_repairs_same_aggregate_owner(
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "conflict-run"
-    run_tl_loop(
-        "aggregate-child",
-        child_plan,
-        SyntheticQueue(_lifecycle_events("aggregate-child")),
-        EffectClient(RecordingTransport()),
-        config=_config(),
-        root_dir=parent_dir,
-    )
-    child_store = RunStore("aggregate-child", parent_dir)
     plan = WorkPlan(
         sub_tls=(
             SubTLTask(
@@ -11682,6 +11725,31 @@ def test_integration_conflict_repairs_same_aggregate_owner(
             ),
         )
     )
+    parent_config = TLLoopConfig(
+        root_dir=tmp_path,
+        run_id="conflict-run",
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+    )
+    parent_manifest = driver_module._manifest_for_plan(plan, "conflict-run", parent_config)
+    child_node = next(node for node in parent_manifest.nodes if node.name == "aggregate-child")
+    child_config = TLLoopConfig(
+        root_dir=parent_dir,
+        run_id="aggregate-child",
+        branch=parent_manifest.child_manifests[child_node.node_id].owned_branch,
+        keep_alive_on_waiting=False,
+        agent_id="aggregate-child",
+        repository_identity=parent_config.repository_identity,
+        declared_manifest=parent_manifest.child_manifests[child_node.node_id],
+    )
+    run_tl_loop(
+        "aggregate-child",
+        child_plan,
+        SyntheticQueue(_lifecycle_events("aggregate-child")),
+        EffectClient(RecordingTransport()),
+        config=child_config,
+        root_dir=parent_dir,
+    )
+    child_store = RunStore("aggregate-child", parent_dir)
     setup_config = TLLoopConfig(root_dir=tmp_path, run_id="conflict-run")
     repository = Path(
         driver_module._sub_tl_worktree(setup_config, tmp_path, "conflict-run", plan.sub_tls[0])
@@ -11751,6 +11819,7 @@ def test_integration_conflict_repairs_same_aggregate_owner(
         tl_model_choice=_tl_choice(backend),
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        agent_id="root-controller",
     )
     result = run_tl_loop(
         "conflict-run",
@@ -11788,18 +11857,34 @@ def test_exhausted_integration_conflict_opens_human_gate(
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "gate-run"
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
+    )
+    parent_config = TLLoopConfig(
+        root_dir=tmp_path,
+        run_id="gate-run",
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+    )
+    parent_manifest = driver_module._manifest_for_plan(plan, "gate-run", parent_config)
+    child_node = next(node for node in parent_manifest.nodes if node.name == "aggregate-child")
+    child_config = TLLoopConfig(
+        root_dir=parent_dir,
+        run_id="aggregate-child",
+        branch=parent_manifest.child_manifests[child_node.node_id].owned_branch,
+        keep_alive_on_waiting=False,
+        agent_id="aggregate-child",
+        repository_identity=parent_config.repository_identity,
+        declared_manifest=parent_manifest.child_manifests[child_node.node_id],
+    )
     run_tl_loop(
         "aggregate-child",
         child_plan,
         SyntheticQueue(_lifecycle_events("aggregate-child")),
         EffectClient(RecordingTransport()),
-        config=_config(),
+        config=child_config,
         root_dir=parent_dir,
     )
     child_store = RunStore("aggregate-child", parent_dir)
-    plan = WorkPlan(
-        sub_tls=(SubTLTask("aggregate-child", child_plan, source=SyntheticQueue([]), order=1),)
-    )
     setup_config = TLLoopConfig(root_dir=tmp_path, run_id="gate-run")
     repository = Path(
         driver_module._sub_tl_worktree(setup_config, tmp_path, "gate-run", plan.sub_tls[0])
@@ -11849,6 +11934,7 @@ def test_exhausted_integration_conflict_opens_human_gate(
         poll_interval=0.001,
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        agent_id="root-controller",
         policy=validate_policy(_selector_policy()),
         tl_model_choice=_tl_choice(backend),
     )

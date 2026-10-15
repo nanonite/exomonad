@@ -110,6 +110,7 @@ class IntegrationContract:
     leaf_review_owner: ReviewOwner = ReviewOwner.LEAF
     aggregate_review_owner: ReviewOwner = ReviewOwner.NONE
     aggregate_repair_owner: ReviewOwner = ReviewOwner.AGGREGATE
+    aggregate_approval_mode: str = "parent"
     merge_strategy: str = "merge"
 
     def __post_init__(self) -> None:
@@ -120,6 +121,8 @@ class IntegrationContract:
         for name in ("leaf_review_owner", "aggregate_review_owner", "aggregate_repair_owner"):
             if not isinstance(getattr(self, name), ReviewOwner):
                 raise TypeError(f"{name} must be a ReviewOwner")
+        if self.aggregate_approval_mode != "parent":
+            raise ValueError("aggregate_approval_mode must be the supported 'parent' mode")
         if self.merge_strategy not in {"merge", "rebase"}:
             raise ValueError("merge_strategy must be 'merge' or 'rebase'")
 

@@ -408,6 +408,7 @@ class EffectClient:
         expected_head_sha: str | None = None,
         expected_patch_digest: str | None = None,
         expected_merge_tree_sha: str | None = None,
+        aggregate_approval: JsonObject | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {"pr_number": pr_number}
         _put(arguments, "chainlink_issue_id", chainlink_issue_id)
@@ -417,6 +418,7 @@ class EffectClient:
         _put(arguments, "expected_head_sha", expected_head_sha)
         _put(arguments, "expected_patch_digest", expected_patch_digest)
         _put(arguments, "expected_merge_tree_sha", expected_merge_tree_sha)
+        _put(arguments, "aggregate_approval", aggregate_approval)
         return self._call("merge_pr", arguments)
 
     def notify_parent(

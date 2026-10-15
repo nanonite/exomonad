@@ -230,6 +230,14 @@ from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
 from tl_loop.select.policy import HarnessPolicy, RolePolicy, load_policy
+from tl_loop.state.aggregate_approval import (
+    AggregateApprovalError,
+    AggregateApprovalReceipt,
+    approval_reference,
+    canonical_digest,
+    ensure_parent_aggregate_approval,
+    parse_aggregate_approval_mode,
+)
 from tl_loop.state.legacy_manifest import (
     LegacyManifestReconciliation,
     reconcile_legacy_manifest,
@@ -470,6 +478,8 @@ def _candidate_runtime(
         base_revalidation_count=candidate.base_revalidation_count,
         tl_intervention_attempts=candidate.tl_intervention_attempts,
         stage_verification=candidate.stage_verification,
+        aggregate_approval_receipts=candidate.aggregate_approval_receipts,
+        active_aggregate_approval_id=candidate.active_aggregate_approval_id,
         candidates={},
     )
 
@@ -501,6 +511,8 @@ def _persist_candidate_runtime(
         base_revalidation_count=candidate.base_revalidation_count,
         tl_intervention_attempts=candidate.tl_intervention_attempts,
         stage_verification=candidate.stage_verification,
+        aggregate_approval_receipts=candidate.aggregate_approval_receipts,
+        active_aggregate_approval_id=candidate.active_aggregate_approval_id,
     )
     # Keep legacy fields as a compatibility view; all ordered production reads
     # use _candidate_runtime and therefore cannot mix sibling evidence.
@@ -15973,8 +15985,12 @@ def _integrate_one_candidate(
     )
     if readiness is None:
         return state
-    transitioned_integration = _transition_candidate_runtime(
-        state.integration, task.name, IntegrationTransition.INTEGRATION_VALIDATED
+    transitioned_integration = (
+        state.integration
+        if candidate_runtime.lifecycle is IntegrationLifecycle.INTEGRATION_VALIDATED
+        else _transition_candidate_runtime(
+            state.integration, task.name, IntegrationTransition.INTEGRATION_VALIDATED
+        )
     )
     integration = replace(
         _candidate_runtime(transitioned_integration, task.name),
@@ -16116,11 +16132,45 @@ def _integrate_one_candidate(
     state, lane_ready = _start_candidate_lane(state, current, live_head_sha, store)
     if not lane_ready:
         return state
+    try:
+        approval_history, approval_receipt = _parent_aggregate_approval(
+            task,
+            state,
+            readiness,
+            store,
+            config,
+            pr_number=current.pr_number,
+            head_sha=live_head_sha,
+            head_tree_sha=readiness.aggregate_head_tree_sha,
+            base_sha=base_sha,
+            patch_digest=live_patch_digest,
+            merge_tree_sha=live_merge_tree_sha,
+            ci_status=live_ci_status,
+        )
+        approval_ref = approval_reference(approval_receipt, state.controller_epoch or "")
+    except (AggregateApprovalError, ValueError) as error:
+        _log_readiness_refusal(task.name, "parent_approval_unavailable", str(error))
+        return state
+    approval_runtime = replace(
+        _candidate_runtime(state.integration, task.name),
+        aggregate_approval_receipts=approval_history,
+        active_aggregate_approval_id=approval_receipt.receipt_id,
+    )
+    state = store.checkpoint(
+        _phase_from_state(state),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=_persist_candidate_runtime(state.integration, task.name, approval_runtime),
+    )
     merge_arguments = {
         "pr_number": current.pr_number,
         "strategy": config.merge_strategy or task.integration.merge_strategy,
         "working_dir": _relative_process_working_dir(config),
         "base_sha": base_sha,
+        "aggregate_approval_receipt_id": approval_receipt.receipt_id,
     }
     merge_intent_id = stable_action_key(state.run_id, "merge_pr", task.name, merge_arguments)
     merge_action = ActionState(
@@ -16166,6 +16216,7 @@ def _integrate_one_candidate(
             expected_head_sha=head_sha,
             expected_patch_digest=patch_digest,
             expected_merge_tree_sha=merge_tree_sha,
+            aggregate_approval=approval_ref,
         ),
         effects_log,
         raise_on_failure=False,
@@ -16209,6 +16260,190 @@ def _integrate_one_candidate(
     if failure is not None:
         raise EffectFailed(f"merge_pr for {task.name!r}: {_merge_failure_reason(merge_result)}")
     return state
+
+
+def _parent_aggregate_approval(
+    task: SubTLTask,
+    state: RunState,
+    readiness: IntegrationReadinessEvidence,
+    store: RunStore,
+    config: TLLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str,
+    head_tree_sha: str,
+    base_sha: str,
+    patch_digest: str,
+    merge_tree_sha: str,
+    ci_status: str,
+) -> tuple[tuple[AggregateApprovalReceipt, ...], AggregateApprovalReceipt]:
+    """Bind parent authorization to the accepted plan and verified aggregate evidence."""
+    coordinates = _parent_aggregate_approval_coordinates(
+        task,
+        state,
+        readiness,
+        store,
+        config,
+        pr_number,
+        head_sha,
+        head_tree_sha,
+        base_sha,
+        patch_digest,
+        merge_tree_sha,
+        ci_status,
+    )
+    existing = _candidate_runtime(state.integration, task.name).aggregate_approval_receipts
+    return ensure_parent_aggregate_approval(existing, coordinates, created_at=_now_timestamp())
+
+
+def _parent_aggregate_approval_coordinates(
+    task: SubTLTask,
+    state: RunState,
+    readiness: IntegrationReadinessEvidence,
+    store: RunStore,
+    config: TLLoopConfig,
+    pr_number: int,
+    head_sha: str,
+    head_tree_sha: str,
+    base_sha: str,
+    patch_digest: str,
+    merge_tree_sha: str,
+    ci_status: str,
+) -> dict[str, object]:
+    """Collect authoritative plan, scope and compare coordinates."""
+    manifest, node = _accepted_aggregate_node(task, state, readiness, config)
+    parent_path = _controller_scope_path(store, config.depth)
+    policy_digest = _approval_policy_digest(manifest, node, readiness)
+    coordinates = _aggregate_scope_coordinates(
+        task, state, config, manifest, readiness, parent_path, policy_digest
+    )
+    compare_coordinates = _aggregate_compare_coordinates(
+        readiness,
+        pr_number,
+        head_sha,
+        head_tree_sha,
+        base_sha,
+        patch_digest,
+        merge_tree_sha,
+        ci_status,
+    )
+    return {**coordinates, **compare_coordinates}
+
+
+def _accepted_aggregate_node(
+    task: SubTLTask,
+    state: RunState,
+    readiness: IntegrationReadinessEvidence,
+    config: TLLoopConfig,
+) -> tuple[PlanManifest, ManifestNode]:
+    """Resolve an aggregate only through its accepted parent declaration."""
+    if parse_aggregate_approval_mode(task.integration.aggregate_approval_mode) != "parent":
+        raise AggregateApprovalError("aggregate approval policy is not parent mode")
+    manifest = state.plan_manifest
+    if manifest is None or state.repository_identity is None:
+        raise AggregateApprovalError("accepted plan and repository identity are required")
+    _validate_parent_controller_identity(state, config)
+    node = next((item for item in manifest.nodes if item.name == task.name), None)
+    if node is None or node.kind != "sub_tl":
+        raise AggregateApprovalError("aggregate is not a declared sub-TL in the accepted plan")
+    if node.child_manifest_digest != readiness.child_manifest_digest:
+        raise AggregateApprovalError("child manifest differs from the accepted parent binding")
+    if node.integration_contract.get("aggregate_pr_required", True) is not True:
+        raise AggregateApprovalError("accepted plan does not require an aggregate PR")
+    if node.integration_contract.get("aggregate_review_owner", "none") != "none":
+        raise AggregateApprovalError("accepted plan requires an unsupported aggregate reviewer")
+    return manifest, node
+
+
+def _validate_parent_controller_identity(state: RunState, config: TLLoopConfig) -> None:
+    """Require a live identified controller on its recorded owner branch."""
+    if not config.agent_id or not state.controller_epoch:
+        raise AggregateApprovalError("current parent controller identity is unavailable")
+    if state.owner_branch and state.owner_branch != config.branch:
+        raise AggregateApprovalError("current branch differs from the declared parent branch")
+
+
+def _approval_policy_digest(
+    manifest: PlanManifest,
+    node: ManifestNode,
+    readiness: IntegrationReadinessEvidence,
+) -> str:
+    """Digest the supported policy together with its accepted plan bindings."""
+    return canonical_digest(
+        {
+            "approval_mode": "parent",
+            "parent_manifest_digest": manifest.digest,
+            "parent_manifest_revision": manifest.manifest_revision,
+            "child_manifest_digest": readiness.child_manifest_digest,
+            "integration_contract": dict(node.integration_contract),
+        }
+    )
+
+
+def _aggregate_scope_coordinates(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    manifest: PlanManifest,
+    readiness: IntegrationReadinessEvidence,
+    parent_path: tuple[str, ...],
+    policy_digest: str,
+) -> dict[str, object]:
+    """Bind actor, repository and accepted scope coordinates."""
+    if state.repository_identity is None:
+        raise AggregateApprovalError("accepted repository identity is required")
+    return {
+        "parent_run_id": state.run_id,
+        "parent_scope_path": list(parent_path),
+        "child_scope_id": task.name,
+        "parent_agent_id": config.agent_id,
+        "parent_branch": config.branch,
+        "repository_url": state.repository_identity.remote_url,
+        "plan_manifest_digest": manifest.digest,
+        "plan_manifest_revision": manifest.manifest_revision,
+        "approval_policy_digest": policy_digest,
+        "child_manifest_digest": readiness.child_manifest_digest,
+    }
+
+
+def _aggregate_compare_coordinates(
+    readiness: IntegrationReadinessEvidence,
+    pr_number: int,
+    head_sha: str,
+    head_tree_sha: str,
+    base_sha: str,
+    patch_digest: str,
+    merge_tree_sha: str,
+    ci_status: str,
+) -> dict[str, object]:
+    """Bind the current PR compare and child-lineage proof."""
+    return {
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "head_tree_sha": head_tree_sha,
+        "base_sha": base_sha,
+        "patch_digest": patch_digest,
+        "merge_tree_sha": merge_tree_sha,
+        "ci_status": ci_status,
+        "readiness_receipt_digest": readiness.receipt_digest,
+        "lineage_proof_digest": readiness.lineage_proof_digest,
+        "lineage_commit_shas": list(readiness.lineage_commit_shas),
+        "reviewed_leaf_ids": list(readiness.reviewed_leaf_ids),
+    }
+
+
+def _controller_scope_path(store: RunStore, depth: int) -> tuple[str, ...]:
+    """Return the canonical .exo/tl-loop path to this controller scope."""
+    if type(depth) is not int or depth < 0 or depth >= len(store.run_dir.parents):
+        raise AggregateApprovalError("controller nesting depth is invalid")
+    root = store.run_dir.parents[depth]
+    try:
+        parts = store.run_dir.relative_to(root).parts
+    except ValueError as error:
+        raise AggregateApprovalError("controller scope is outside the run hierarchy") from error
+    if not parts or parts[-1] != store.run_id:
+        raise AggregateApprovalError("controller scope path does not match its run ID")
+    return tuple(parts)
 
 
 def _checkpoint_aggregate_merged(
@@ -21339,6 +21574,7 @@ def _integration_contract(value: object, *, legacy_manifest: bool = False) -> In
         raise TypeError("sub-TL integration must be an object")
     allowed = {
         "aggregate_pr_required",
+        "aggregate_approval_mode",
         "base_revalidation_required",
         "leaf_review_owner",
         "aggregate_review_owner",
@@ -21348,6 +21584,7 @@ def _integration_contract(value: object, *, legacy_manifest: bool = False) -> In
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise ValueError(f"sub-TL integration contains unknown keys: {', '.join(unknown)}")
+    approval_mode = parse_aggregate_approval_mode(value.get("aggregate_approval_mode"))
 
     def owner(name: str) -> ReviewOwner:
         default = (
@@ -21376,6 +21613,7 @@ def _integration_contract(value: object, *, legacy_manifest: bool = False) -> In
         leaf_review_owner=owner("leaf_review_owner"),
         aggregate_review_owner=owner("aggregate_review_owner"),
         aggregate_repair_owner=owner("aggregate_repair_owner"),
+        aggregate_approval_mode=approval_mode,
         merge_strategy=value.get("merge_strategy", "merge"),
     )
 

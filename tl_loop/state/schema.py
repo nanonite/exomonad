@@ -19,6 +19,11 @@ from tl_loop.ordered import (
     SubTLLifecycle,
 )
 
+from .aggregate_approval import (
+    AggregateApprovalError,
+    AggregateApprovalReceipt,
+    validate_receipt_document,
+)
 from .plan_manifest import ManifestError, PlanManifest
 from .repository_identity import canonical_repository_url
 
@@ -567,6 +572,8 @@ INTEGRATION_CANDIDATE_KEYS = frozenset(
         "base_revalidation_count",
         "tl_intervention_attempts",
         "stage_verification",
+        "aggregate_approval_receipts",
+        "active_aggregate_approval_id",
     }
 )
 INTEGRATION_VERIFICATION_VALUES = frozenset({"pending", "passed", "failed"})
@@ -1006,6 +1013,8 @@ class IntegrationCandidateState:
     base_revalidation_count: int = 0
     tl_intervention_attempts: int = 0
     stage_verification: str = "pending"
+    aggregate_approval_receipts: tuple[AggregateApprovalReceipt, ...] = ()
+    active_aggregate_approval_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1033,6 +1042,8 @@ class IntegrationRuntimeState:
     base_revalidation_count: int = 0
     tl_intervention_attempts: int = 0
     stage_verification: str = "pending"
+    aggregate_approval_receipts: tuple[AggregateApprovalReceipt, ...] = ()
+    active_aggregate_approval_id: str | None = None
     candidates: Mapping[str, IntegrationCandidateState] = field(default_factory=dict)
     lanes: Mapping[str, LaneState] = field(default_factory=dict)
 
@@ -1383,6 +1394,7 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
                     errors.append(
                         (f"{path}.stage_verification", "is not a recognised verification result")
                     )
+                _validate_aggregate_approvals(candidate_id, candidate, path, errors)
                 _validate_integration_evidence_contract(candidate, path, errors)
 
 
@@ -1419,6 +1431,61 @@ def _validate_integration_evidence_contract(
         for key in ("head_sha", "patch_digest", "validated_base_sha", "merge_tree_sha"):
             if not value.get(key):
                 errors.append((f"{path}.{key}", "is required before merge"))
+
+
+def _validate_aggregate_approvals(
+    candidate_id: str,
+    candidate: Mapping[str, object],
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    """Validate immutable aggregate approval history and its active pointer."""
+    raw_receipts = candidate.get("aggregate_approval_receipts", [])
+    if not isinstance(raw_receipts, list):
+        errors.append((f"{path}.aggregate_approval_receipts", "must be an array"))
+        return
+    receipt_ids = _validate_aggregate_approval_history(candidate_id, raw_receipts, path, errors)
+    _validate_active_aggregate_approval(candidate, receipt_ids, path, errors)
+
+
+def _validate_aggregate_approval_history(
+    candidate_id: str,
+    raw_receipts: list[object],
+    path: str,
+    errors: list[tuple[str, str]],
+) -> list[str]:
+    """Validate each immutable receipt and its supersession link."""
+    receipt_ids: list[str] = []
+    for index, raw_receipt in enumerate(raw_receipts):
+        receipt_path = f"{path}.aggregate_approval_receipts[{index}]"
+        try:
+            receipt = validate_receipt_document(raw_receipt)
+        except (AggregateApprovalError, TypeError, ValueError) as error:
+            errors.append((receipt_path, str(error)))
+            continue
+        if receipt.child_scope_id != candidate_id:
+            errors.append((f"{receipt_path}.child_scope_id", "does not match candidate scope"))
+        expected_supersedes = receipt_ids[-1] if receipt_ids else None
+        if receipt.supersedes_receipt_id != expected_supersedes:
+            errors.append(
+                (f"{receipt_path}.supersedes_receipt_id", "does not extend the receipt history")
+            )
+        receipt_ids.append(receipt.receipt_id)
+    return receipt_ids
+
+
+def _validate_active_aggregate_approval(
+    candidate: Mapping[str, object],
+    receipt_ids: list[str],
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    """Require the active approval pointer to name retained immutable history."""
+    active_id = candidate.get("active_aggregate_approval_id")
+    if active_id is not None and (not isinstance(active_id, str) or active_id not in receipt_ids):
+        errors.append(
+            (f"{path}.active_aggregate_approval_id", "must reference retained approval history")
+        )
 
 
 def _validate_lanes(value: object, path: str, errors: list[tuple[str, str]]) -> None:

@@ -63,6 +63,7 @@ from tl_loop.fsm.scope_projection import phase_tag as canonical_phase_tag
 from tl_loop.ordered import ChildRecoverySummary, IntegrationLifecycle, SubTLLifecycle
 from tl_loop.run_ids import ARCHIVED_ROOT_PREFIX, uses_reserved_archive_prefix
 
+from .aggregate_approval import validate_receipt_document
 from .lock import RunLock
 from .migration import (
     MigrationError,
@@ -2430,6 +2431,10 @@ def _encode_integration_candidate(value: IntegrationCandidateState) -> dict[str,
         "merge_attempts": value.merge_attempts,
         "base_revalidation_count": value.base_revalidation_count,
         "stage_verification": value.stage_verification,
+        "aggregate_approval_receipts": [
+            receipt.to_document() for receipt in value.aggregate_approval_receipts
+        ],
+        "active_aggregate_approval_id": value.active_aggregate_approval_id,
     }
     if value.tl_intervention_attempts:
         record["tl_intervention_attempts"] = value.tl_intervention_attempts
@@ -3160,6 +3165,11 @@ def _decode_integration_candidate(value: dict[str, object]) -> IntegrationCandid
         base_revalidation_count=cast(int, value.get("base_revalidation_count", 0)),
         tl_intervention_attempts=cast(int, value.get("tl_intervention_attempts", 0)),
         stage_verification=cast(str, value.get("stage_verification", "pending")),
+        aggregate_approval_receipts=tuple(
+            validate_receipt_document(receipt)
+            for receipt in cast(list[object], value.get("aggregate_approval_receipts", []))
+        ),
+        active_aggregate_approval_id=cast(str | None, value.get("active_aggregate_approval_id")),
     )
 
 

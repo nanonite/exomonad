@@ -200,12 +200,20 @@ def test_missing_error_kind_remains_unknown_for_domain_failure() -> None:
 
 def test_merge_pr_emits_compare_and_swap_evidence() -> None:
     transport = RecordingTransport()
+    approval = {
+        "receipt_id": "approval-a",
+        "parent_run_id": "root-run",
+        "parent_scope_path": ["root-run"],
+        "child_scope_id": "architecture",
+        "controller_epoch": "epoch-current",
+    }
     EffectClient(transport).merge_pr(
         pr_number=7,
         expected_base_sha="base-sha",
         expected_head_sha="head-sha",
         expected_patch_digest="patch-digest",
         expected_merge_tree_sha="tree-sha",
+        aggregate_approval=approval,
     )
 
     assert transport.calls == [
@@ -217,6 +225,7 @@ def test_merge_pr_emits_compare_and_swap_evidence() -> None:
                 "expected_head_sha": "head-sha",
                 "expected_patch_digest": "patch-digest",
                 "expected_merge_tree_sha": "tree-sha",
+                "aggregate_approval": approval,
             },
         )
     ]

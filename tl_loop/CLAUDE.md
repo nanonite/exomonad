@@ -777,6 +777,21 @@ post-merge recovery. Stable child ID order controls aggregate integration,
 independent of dispatch or review completion order. Legacy sub-TL plans without
 `order` remain one order-1 stage.
 
+Aggregate PR integration uses the accepted `aggregate_approval_mode` policy.
+Omission means `parent`; the reserved `reviewer` value is rejected before
+dispatch because aggregate reviewer phases are not implemented. The compatible
+default is deliberately excluded from the historical manifest projection, so
+existing plans do not acquire a new manifest digest. Once child receipts,
+published PR ownership, Git lineage, exact head/tree/base/patch and CI have
+been revalidated, the parent controller persists an immutable approval receipt
+in that candidate's RunStore history before invoking `merge_pr`. The receipt
+binds the parent and child scope, repository, accepted manifest, approval
+policy, compare evidence, reviewed leaves and lineage proof. `merge_pr` carries
+only a receipt reference plus the current controller epoch; the final host
+boundary must resolve and revalidate it. This decision is not a Forgejo review
+and does not change the authenticated exact-head review requirement for leaf
+PRs.
+
 Branches use the coordinate form `{parent}.{name}`. A child PR targets its
 parent branch, recorded as the child slice `base_ref`. Run state records the
 owner branch, owner worktree, parent lineage, and recursion depth. Creating a

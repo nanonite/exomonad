@@ -17,6 +17,7 @@ from tl_loop.plan_dependencies import (
     validate_leaf_dependencies,
 )
 
+from .aggregate_approval import parse_aggregate_approval_mode
 from .serialization import dumps
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -731,7 +732,19 @@ def _integration_contract(value: object) -> Mapping[str, object]:
         }
     if not isinstance(value, Mapping):
         raise ManifestError("integration contract must be an object")
-    return _json_mapping(value, "integration contract")
+    parse_aggregate_approval_mode(value.get("aggregate_approval_mode"))
+    # Parent approval is the compatible default. Keeping it out of the
+    # historical manifest projection avoids changing accepted manifest hashes.
+    persisted = {key: item for key, item in value.items() if key != "aggregate_approval_mode"}
+    defaults = {
+        "aggregate_pr_required": True,
+        "base_revalidation_required": True,
+        "leaf_review_owner": "leaf",
+        "aggregate_review_owner": "none",
+        "aggregate_repair_owner": "aggregate",
+        "merge_strategy": "merge",
+    }
+    return _json_mapping({**defaults, **persisted}, "integration contract")
 
 
 def _node_declaration(value: Mapping[str, object], kind: str) -> Mapping[str, object]:
