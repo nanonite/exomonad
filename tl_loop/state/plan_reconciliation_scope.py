@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
+from .plan_compatibility import aggregate_review_transition_candidate
 from .plan_manifest import ManifestNode, PlanManifest
 from .plan_reconciliation_emitter import child_scope_emitter
 from .plan_reconciliation_guards import _blocker, _node_is_protected, _scope_blockers
@@ -246,7 +247,14 @@ def _collect_scope_tree(
     scopes: list[ReconciliationScope],
     blockers: list[PlanRevisionBlocker],
     accepted_plan: Mapping[str, object],
+    candidate_matches_snapshot: bool,
 ) -> None:
+    compatibility_transition = aggregate_review_transition_candidate(
+        view.current,
+        accepted,
+        accepted_plan,
+        candidate_matches_snapshot=candidate_matches_snapshot,
+    )
     accepted_view = ReconciliationScope(
         run_dir=view.run_dir,
         relative_checkpoint=view.relative_checkpoint,
@@ -263,6 +271,9 @@ def _collect_scope_tree(
         dispatch_event_status=view.dispatch_event_status,
         protected_node_ids=view.protected_node_ids,
         scope_emitter_proof=view.scope_emitter_proof,
+        accepted_plan=accepted_plan,
+        candidate_matches_snapshot=candidate_matches_snapshot,
+        compatibility_transition=compatibility_transition,
     )
     scopes.append(accepted_view)
     blockers.extend(_scope_blockers(accepted_view))
@@ -312,6 +323,7 @@ def _collect_scope_tree(
             scopes=scopes,
             blockers=blockers,
             accepted_plan=child_plan,
+            candidate_matches_snapshot=candidate_matches_snapshot,
         )
 
 

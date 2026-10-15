@@ -26,6 +26,19 @@ def _scope_blockers(view: ReconciliationScope) -> list[PlanRevisionBlocker]:
     target = view.accepted
     if target is None:
         return [_blocker("accepted_scope_missing", view.current.scope_id)]
+    if view.compatibility_transition and view.current.role == "non_root":
+        proof = view.scope_emitter_proof
+        if proof is None or proof.status != "proven":
+            blockers.append(
+                PlanRevisionBlocker(
+                    code="compatibility_scope_binding_unproven",
+                    reason=(
+                        "executed sub-TL identity is not proven by its parent dispatch and "
+                        f"controller registration ({proof.reason_code if proof else 'proof_missing'})"
+                    ),
+                    scope_id=view.current.scope_id,
+                )
+            )
     if not view.parent_manifest_matches:
         blockers.append(_blocker("parent_manifest_mismatch", view.current.scope_id))
     if not view.run_identity_matches:
@@ -55,7 +68,7 @@ def _node_blockers(
 ) -> list[PlanRevisionBlocker]:
     current_nodes = {node.node_id: node for node in view.current.nodes}
     target_nodes = {node.node_id: node for node in target.nodes}
-    legacy_equivalences = proven_legacy_default_fields(view.current, target, view.state)
+    legacy_equivalences = proven_legacy_default_fields(view)
     blockers = []
     for node_id in sorted(set(current_nodes) | set(target_nodes)):
         current, accepted = current_nodes.get(node_id), target_nodes.get(node_id)
@@ -64,8 +77,23 @@ def _node_blockers(
             continue
         if not changed_node_fields(current, accepted):
             continue
-        proof = evaluate_protected_declaration_restore(view, current, accepted)
-        equivalent = legacy_equivalences.get(node_id, ()) + (
+        equivalent_fields = set(legacy_equivalences.get(node_id, ()))
+        declaration_fields = tuple(
+            field
+            for field in changed_node_fields(current, accepted)
+            if field not in equivalent_fields and field != "child_manifest_digest"
+        )
+        proof = (
+            evaluate_protected_declaration_restore(
+                view,
+                current,
+                accepted,
+                fields=declaration_fields,
+            )
+            if declaration_fields
+            else None
+        )
+        equivalent = tuple(equivalent_fields) + (
             proof.fields if proof is not None and proof.proven else ()
         )
         if _protected_change_unproven(view, current, accepted, equivalent):

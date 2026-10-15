@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .plan_compatibility import aggregate_review_transition_candidate
 from .plan_manifest import PlanManifest
 from .plan_reconciliation_declarations import _declaration_changes, _manifest_node_summary
 from .plan_reconciliation_emitter import ScopeEmitterProof
@@ -24,6 +25,7 @@ from .plan_reconciliation_report import (
     _safe_text,
     _stage_projection,
 )
+from .plan_revision_diff import changed_node_fields
 from .plan_revision_types import PlanRevisionBlocker
 from .schema import RunState
 
@@ -32,13 +34,22 @@ def _protected_declaration_proofs(scope: ReconciliationScope) -> list[ProtectedD
     if scope.accepted is None:
         return []
     accepted = {node.node_id: node for node in scope.accepted.nodes}
-    return [
-        proof
-        for node in scope.current.nodes
-        if node.node_id in accepted
-        for proof in (evaluate_protected_declaration_restore(scope, node, accepted[node.node_id]),)
-        if proof is not None
-    ]
+    legacy = proven_legacy_default_fields(scope)
+    proofs = []
+    for node in scope.current.nodes:
+        target = accepted.get(node.node_id)
+        if target is None:
+            continue
+        fields = tuple(
+            field
+            for field in changed_node_fields(node, target)
+            if field not in legacy.get(node.node_id, ()) and field != "child_manifest_digest"
+        )
+        if fields:
+            proof = evaluate_protected_declaration_restore(scope, node, target, fields=fields)
+            if proof is not None:
+                proofs.append(proof)
+    return proofs
 
 
 @dataclass(frozen=True)
@@ -66,15 +77,25 @@ class ReconciliationScope:
     )
     protected_node_ids: tuple[str, ...] = ()
     scope_emitter_proof: ScopeEmitterProof | None = field(default=None, repr=False)
+    accepted_plan: Mapping[str, object] | None = field(default=None, repr=False, compare=False)
+    candidate_matches_snapshot: bool = False
+    compatibility_transition: bool = False
 
     def to_document(self, blocked_node_ids: tuple[str, ...] = ()) -> dict[str, object]:
         phase = self.state.recursive_fsm
         phase_digest = getattr(phase, "plan_digest", None)
         accepted_digest = self.accepted.digest if self.accepted else None
         legacy_equivalences = (
-            proven_legacy_default_fields(self.current, self.accepted, self.state)
-            if self.accepted is not None
-            else {}
+            proven_legacy_default_fields(self) if self.accepted is not None else {}
+        )
+        compatibility_transition = self.compatibility_transition or (
+            self.accepted is not None
+            and aggregate_review_transition_candidate(
+                self.current,
+                self.accepted,
+                self.accepted_plan,
+                candidate_matches_snapshot=self.candidate_matches_snapshot,
+            )
         )
         declaration_proofs = _protected_declaration_proofs(self)
         current_order = getattr(phase, "current_order", None)
@@ -133,7 +154,11 @@ class ReconciliationScope:
                     "fields": list(fields),
                     "manifest_schema_version": self.current.schema_version,
                     "accepted_manifest_sha256": accepted_digest,
-                    "evidence_source": "verified_snapshot_and_matching_fsm_dispatch_identity",
+                    "evidence_source": (
+                        "versioned_aggregate_review_default_transition_v1"
+                        if compatibility_transition
+                        else "verified_snapshot_and_matching_fsm_dispatch_identity"
+                    ),
                 }
                 for node_id, fields in sorted(legacy_equivalences.items())
             ],
@@ -165,6 +190,7 @@ class PlanReconciliationAnalysis:
     blockers: tuple[PlanRevisionBlocker, ...]
     input_hashes: tuple[tuple[str, str | None], ...]
     audit_bytes: bytes | None = field(repr=False, compare=False)
+    compatibility_transition: Mapping[str, object] | None = None
 
     @property
     def can_apply(self) -> bool:
@@ -196,6 +222,11 @@ class PlanReconciliationAnalysis:
             "evidence_fingerprint": self.evidence_fingerprint,
             "snapshot_sha256": self.snapshot_sha256,
             "candidate_sha256": self.candidate_sha256,
+            "compatibility_transition": (
+                dict(self.compatibility_transition)
+                if self.compatibility_transition is not None
+                else None
+            ),
             "can_apply": self.can_apply,
             "has_drift": self.has_drift,
             "inputs": [

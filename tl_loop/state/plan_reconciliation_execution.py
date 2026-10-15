@@ -42,9 +42,11 @@ def evaluate_protected_declaration_restore(
     scope: ReconciliationScope,
     current: ManifestNode,
     accepted: ManifestNode,
+    *,
+    fields: tuple[str, ...] | None = None,
 ) -> ProtectedDeclarationProof | None:
     """Prove only task and issue-ID restoration from the original dispatch."""
-    fields = changed_node_fields(current, accepted)
+    fields = fields or changed_node_fields(current, accepted)
     if not _restorable_declaration_fields(current, accepted, fields):
         return None
     slice_state = scope.state.slices.get(current.name)
@@ -164,10 +166,10 @@ def _completion_evidence_source(scope: ReconciliationScope, slice_id: str) -> st
 
 
 def _fsm_matches_accepted(scope: ReconciliationScope) -> bool:
-    return (
-        scope.accepted is not None
-        and getattr(scope.state.recursive_fsm, "plan_digest", None) == scope.accepted.digest
-    )
+    digest = getattr(scope.state.recursive_fsm, "plan_digest", None)
+    if scope.compatibility_transition and digest == scope.current.digest:
+        return True
+    return scope.accepted is not None and digest == scope.accepted.digest
 
 
 def _slice_binds_declaration(
@@ -623,22 +625,27 @@ def _issue_binding_matches(
         return False
     if current.chainlink_issue_id == accepted.chainlink_issue_id:
         return True
-    if (
-        accepted.chainlink_issue_id is not None
-        or current.chainlink_issue_id is None
-        or getattr(slice_state, "chainlink_issue_id", None) != current.chainlink_issue_id
-    ):
-        return False
     post_merge = getattr(slice_state, "post_merge", None)
     evidence = post_merge.evidence if post_merge is not None else {}
+    if post_merge is None or post_merge.phase is not PostMergePhase.COMPLETE:
+        return False
+    if evidence.get("pr_number") != str(getattr(slice_state, "pr_number", None)):
+        return False
+    if not evidence.get("issue_close_intent_id") or not evidence.get("issue_close_journal_id"):
+        return False
+    if not evidence.get("merge_journal_id"):
+        return False
+    if current.chainlink_issue_id is not None and accepted.chainlink_issue_id is None:
+        return getattr(
+            slice_state, "chainlink_issue_id", None
+        ) == current.chainlink_issue_id and evidence.get("issue_id") == str(
+            current.chainlink_issue_id
+        )
     return (
-        post_merge is not None
-        and post_merge.phase is PostMergePhase.COMPLETE
-        and evidence.get("issue_id") == str(current.chainlink_issue_id)
-        and bool(evidence.get("issue_close_intent_id"))
-        and bool(evidence.get("issue_close_journal_id"))
-        and evidence.get("pr_number") == str(getattr(slice_state, "pr_number", None))
-        and bool(evidence.get("merge_journal_id"))
+        current.chainlink_issue_id is None
+        and accepted.chainlink_issue_id is not None
+        and getattr(slice_state, "chainlink_issue_id", None) is None
+        and evidence.get("issue_id") == str(accepted.chainlink_issue_id)
     )
 
 

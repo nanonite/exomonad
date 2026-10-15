@@ -39,38 +39,72 @@ def _plan_document(
     completed_task: str = "accepted completed task",
     completed_issue_id: int | None = 811,
     controller_alias: str = "agent-architecture",
+    five_ordered_stages: bool = False,
 ):
+    plan = {
+        "sub_tls": [
+            {
+                "name": "architecture",
+                "agent_id": controller_alias,
+                "order": 1,
+                "plan": {
+                    "leaves": [
+                        {
+                            "name": "completed",
+                            "task": completed_task,
+                            "chainlink_issue_id": completed_issue_id,
+                        },
+                        {
+                            "name": "future",
+                            "task": "future work",
+                            "chainlink_issue_id": future_issue_id,
+                        },
+                    ]
+                },
+            }
+        ]
+    }
+    if five_ordered_stages:
+        plan["sub_tls"].extend(
+            {"name": name, "order": order, "plan": {}}
+            for order, name in enumerate(
+                ("kani", "stage-three", "stage-four", "stage-five"),
+                start=2,
+            )
+        )
     return {
         "run_id": "root",
-        "plan": {
-            "sub_tls": [
-                {
-                    "name": "architecture",
-                    "agent_id": controller_alias,
-                    "order": 1,
-                    "plan": {
-                        "leaves": [
-                            {
-                                "name": "completed",
-                                "task": completed_task,
-                                "chainlink_issue_id": completed_issue_id,
-                            },
-                            {
-                                "name": "future",
-                                "task": "future work",
-                                "chainlink_issue_id": future_issue_id,
-                            },
-                        ]
-                    },
-                }
-            ]
-        },
+        "plan": plan,
     }
 
 
 def _manifest(document: dict[str, object]) -> PlanManifest:
     plan = WorkPlan.from_mapping(document["plan"])
     return build_plan_manifest(_manifest_plan(plan), scope_id="root", owned_branch="main")
+
+
+def _manifest_compatibility_version(manifest: PlanManifest, version: int) -> PlanManifest:
+    children = {
+        node_id: _manifest_compatibility_version(child, version)
+        for node_id, child in manifest.child_manifests.items()
+    }
+    nodes = tuple(
+        replace(
+            node,
+            child_manifest_digest=(
+                children[node.node_id].digest if node.node_id in children else None
+            ),
+        )
+        for node in manifest.nodes
+    )
+    return replace(
+        manifest,
+        nodes=nodes,
+        child_manifest_digests={node_id: child.digest for node_id, child in children.items()},
+        child_manifests=children,
+        plan_compatibility_version=version,
+        digest=None,
+    )
 
 
 def _legacy_root_defaults(
@@ -97,6 +131,62 @@ def _legacy_root_defaults(
             contract["leaf_review_owner"] = leaf_review_owner
         nodes.append(replace(node, declaration=declaration, integration_contract=contract))
     return replace(manifest, nodes=tuple(nodes), digest=None)
+
+
+def _legacy_aggregate_review_defaults(manifest: PlanManifest) -> PlanManifest:
+    """Materialize the former aggregate-review default throughout a plan tree."""
+    children = {
+        node_id: _legacy_aggregate_review_defaults(child)
+        for node_id, child in manifest.child_manifests.items()
+    }
+    nodes = tuple(
+        replace(
+            node,
+            integration_contract={
+                **node.integration_contract,
+                "aggregate_review_owner": "aggregate",
+            },
+            child_manifest_digest=(
+                children[node.node_id].digest if node.node_id in children else None
+            ),
+        )
+        for node in manifest.nodes
+    )
+    return replace(
+        manifest,
+        nodes=nodes,
+        child_manifest_digests={node_id: child.digest for node_id, child in children.items()},
+        child_manifests=children,
+        plan_compatibility_version=1,
+        digest=None,
+    )
+
+
+def _legacy_null_completed_issue_binding(manifest: PlanManifest) -> PlanManifest:
+    """Retain the historical null leaf binding while receipts name issue 811."""
+    children = {
+        node_id: _legacy_null_completed_issue_binding(child)
+        for node_id, child in manifest.child_manifests.items()
+    }
+    nodes = tuple(
+        replace(
+            node,
+            chainlink_issue_id=None
+            if node.kind == "leaf" and node.name == "completed"
+            else node.chainlink_issue_id,
+            child_manifest_digest=(
+                children[node.node_id].digest if node.node_id in children else None
+            ),
+        )
+        for node in manifest.nodes
+    )
+    return replace(
+        manifest,
+        nodes=nodes,
+        child_manifest_digests={node_id: child.digest for node_id, child in children.items()},
+        child_manifests=children,
+        digest=None,
+    )
 
 
 def _post_merge_receipt() -> PostMergeState:
@@ -165,22 +255,29 @@ def _project(
     legacy_completed_dispatch: bool = False,
     controller_alias: str = "agent-architecture",
     parent_attempts: int = 1,
+    legacy_aggregate_review_default: bool = False,
+    legacy_completed_issue_binding: bool = False,
+    persisted_compatible_plan_version: int | None = None,
+    five_ordered_stages: bool = False,
+    legacy_integration_coordinator_binding: bool = False,
 ) -> tuple[Path, RunStore, RunStore, bytes, bytes]:
     accepted_document = _plan_document(
         future_issue_id=None,
         completed_issue_id=accepted_completed_issue_id,
         controller_alias=controller_alias,
+        five_ordered_stages=five_ordered_stages,
     )
     candidate_document = _plan_document(
         future_issue_id=candidate_issue_id,
         completed_task=candidate_completed_task,
         completed_issue_id=candidate_completed_issue_id,
         controller_alias=controller_alias,
+        five_ordered_stages=five_ordered_stages,
     )
     accepted_bytes = json.dumps(accepted_document, sort_keys=True).encode()
     candidate_bytes = json.dumps(candidate_document, sort_keys=True).encode()
     state_root = tmp_path / ".exo" / "tl-loop"
-    state_root.mkdir(parents=True)
+    state_root.mkdir(parents=True, exist_ok=True)
     (state_root / "plan.snapshot").write_bytes(accepted_bytes)
     (state_root / "plan.snapshot.sha256").write_text(
         hashlib.sha256(accepted_bytes).hexdigest() + "\n", encoding="ascii"
@@ -189,6 +286,15 @@ def _project(
 
     accepted_root = _manifest(accepted_document)
     current_root = _manifest(candidate_document)
+    if legacy_aggregate_review_default:
+        current_root = _legacy_aggregate_review_defaults(accepted_root)
+        if legacy_completed_issue_binding:
+            current_root = _legacy_null_completed_issue_binding(current_root)
+    elif persisted_compatible_plan_version is not None:
+        current_root = _manifest_compatibility_version(
+            accepted_root,
+            persisted_compatible_plan_version,
+        )
     if legacy_root_defaults:
         current_root = _legacy_root_defaults(
             current_root,
@@ -197,11 +303,21 @@ def _project(
     accepted_child = accepted_root.child_manifests["root/sub_tl/architecture"]
     current_child = current_root.child_manifests["root/sub_tl/architecture"]
     runtime_digest = "0" * 64 if stale_runtime_digest else None
+    root_runtime_digest = (
+        runtime_digest or current_root.digest
+        if legacy_aggregate_review_default or persisted_compatible_plan_version is not None
+        else runtime_digest
+    )
+    child_runtime_digest = (
+        runtime_digest or current_child.digest
+        if legacy_aggregate_review_default or persisted_compatible_plan_version is not None
+        else runtime_digest
+    )
     root_store = _create_root(
         state_root,
         current_root,
         accepted_root,
-        runtime_digest,
+        root_runtime_digest,
         controller_alias=controller_alias,
         attempts=parent_attempts,
     )
@@ -209,7 +325,7 @@ def _project(
         state_root,
         current_child,
         accepted_child,
-        runtime_digest,
+        child_runtime_digest,
         include_spawn_journal=include_completed_spawn_journal,
         spawn_task_override=spawn_task_override,
         legacy_completed_dispatch=legacy_completed_dispatch,
@@ -236,6 +352,29 @@ def _project(
                 sort_keys=True,
             ),
             encoding="utf-8",
+        )
+    if legacy_integration_coordinator_binding:
+        root_state = root_store.load()
+        owner_id = "root:architecture:integration"
+        current_slice = root_state.slices["architecture"]
+        candidate = IntegrationCandidateState(
+            lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+            integration_owner_id=owner_id,
+            integration_owner_run_id="architecture",
+            integration_owner_branch=current_slice.branch,
+            integration_owner_worktree=current_slice.worktree,
+        )
+        root_store.checkpoint(
+            root_state.recursive_fsm,
+            {
+                **root_state.slices,
+                "architecture": replace(current_slice, dispatch_agent_id=owner_id),
+            },
+            root_state.budgets,
+            root_state.events.last_consumed_offset,
+            current_order=root_state.current_order,
+            ordered_stages=root_state.ordered_stages,
+            integration=replace(root_state.integration, candidates={"architecture": candidate}),
         )
     return state_root, root_store, child_store, accepted_bytes, candidate_bytes
 
@@ -298,7 +437,10 @@ def _create_root(
         state.budgets,
         state.events.last_consumed_offset,
         current_order=1,
-        ordered_stages=(OrderedStageState(1, ("architecture",)),),
+        ordered_stages=tuple(
+            OrderedStageState(order, tuple(current.node(node_id).name for node_id in node_ids))
+            for order, node_ids in current.ordered_stages
+        ),
         integration=IntegrationRuntimeState(
             sub_tl_states={"architecture": IntegrationLifecycle.RUNNING}
         ),
@@ -798,6 +940,158 @@ def test_apply_accepts_exact_legacy_parent_defaults_with_fsm_and_dispatch_proof(
     assert result.applied
     assert root_store.load().plan_manifest == _manifest(_plan_document(future_issue_id=None))
     assert (state_root / "plan-reconciliations.jsonl").is_file()
+
+
+def test_apply_migrates_unchanged_legacy_aggregate_defaults_and_keeps_receipts(
+    tmp_path: Path,
+) -> None:
+    state_root, root_store, child_store, accepted_bytes, candidate_bytes = _project(
+        tmp_path,
+        candidate_issue_id=None,
+        legacy_aggregate_review_default=True,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        legacy_integration_coordinator_binding=True,
+        legacy_completed_issue_binding=True,
+        controller_alias="architecture",
+        five_ordered_stages=True,
+    )
+    assert accepted_bytes == candidate_bytes
+    before_child = child_store.load()
+    before_receipt = before_child.slices["completed"].post_merge
+    journal_path = child_store.run_dir / "action-journal.json"
+    journal_bytes = journal_path.read_bytes()
+    ledger_path = tmp_path / ".exo" / "ledger" / "segments" / "segment-000000000001.jsonl"
+    ledger_bytes = ledger_path.read_bytes()
+
+    analysis = analyze_plan_reconciliation(tmp_path)
+
+    assert analysis.can_apply, analysis.to_document()["blockers"]
+    transition = analysis.compatibility_transition
+    assert transition is not None
+    assert transition["persisted_plan_compatibility_version"] == 1
+    assert transition["target_plan_compatibility_version"] == 2
+    assert transition["from"] == "aggregate_review_owner=aggregate"
+    assert transition["to"] == "aggregate_review_owner=none"
+    allowed_fields = transition["allowed_fields"]
+    assert isinstance(allowed_fields, list)
+    assert "integration_contract.aggregate_review_owner" in allowed_fields
+    assert "child_manifest_digest" in allowed_fields
+    affected_nodes = transition["affected_nodes"]
+    assert isinstance(affected_nodes, list)
+    assert any(
+        isinstance(node, dict)
+        and isinstance(node.get("node_id"), str)
+        and node["node_id"].endswith("/leaf/completed")
+        and isinstance(node.get("fields"), list)
+        and "integration_contract.aggregate_review_owner" in node["fields"]
+        for node in affected_nodes
+    )
+
+    def interrupt_after_first_target(_index: int, _target: str) -> None:
+        raise RuntimeError("simulated migration process interruption")
+
+    result = apply_plan_reconciliation(
+        tmp_path,
+        "Apply the audited legacy aggregate-review default migration",
+        analysis.evidence_fingerprint,
+        actor="operator",
+        after_target=interrupt_after_first_target,
+    )
+
+    assert result.applied and result.recovered_during_apply
+    root_after = root_store.load()
+    child_after = child_store.load()
+    assert result.applied
+    assert root_after.plan_manifest == _manifest(
+        _plan_document(future_issue_id=None, five_ordered_stages=True)
+    )
+    assert (
+        child_after.plan_manifest
+        == root_after.plan_manifest.child_manifests["root/sub_tl/architecture"]
+    )
+    assert root_after.recursive_fsm.plan_digest == root_after.plan_manifest.digest
+    assert child_after.recursive_fsm.plan_digest == child_after.plan_manifest.digest
+    assert child_after.slices["completed"].post_merge == before_receipt
+    assert child_after.slices["completed"].status is SliceStatus.MERGED
+    assert child_after.slices["completed"].chainlink_issue_id == 811
+    assert [stage.order for stage in root_after.ordered_stages] == [1, 2, 3, 4, 5]
+    assert [stage.sub_tls for stage in root_after.ordered_stages] == [
+        ("architecture",),
+        ("kani",),
+        ("stage-three",),
+        ("stage-four",),
+        ("stage-five",),
+    ]
+    assert journal_path.read_bytes() == journal_bytes
+    assert ledger_path.read_bytes() == ledger_bytes
+    assert (state_root / "plan.snapshot").read_bytes() == accepted_bytes
+    assert (state_root / "plan.json").read_bytes() == candidate_bytes
+    audit = json.loads((state_root / "plan-reconciliations.jsonl").read_text().splitlines()[0])
+    assert audit["compatibility_transition"]["from"] == "aggregate_review_owner=aggregate"
+    assert audit["compatibility_transition"]["to"] == "aggregate_review_owner=none"
+    replay = analyze_plan_reconciliation(tmp_path)
+    assert not replay.has_drift
+    assert replay.compatibility_transition is None
+    assert not apply_plan_reconciliation(
+        tmp_path,
+        "Replay the already applied compatibility migration",
+        replay.evidence_fingerprint,
+        actor="operator",
+    ).applied
+
+
+def test_compatible_legacy_manifest_version_does_not_trigger_migration(tmp_path: Path) -> None:
+    _state_root, root_store, _child_store, accepted_bytes, candidate_bytes = _project(
+        tmp_path,
+        candidate_issue_id=None,
+        persisted_compatible_plan_version=1,
+    )
+
+    analysis = analyze_plan_reconciliation(tmp_path)
+
+    assert accepted_bytes == candidate_bytes
+    assert analysis.compatibility_transition is None
+    assert not analysis.has_drift
+    assert not analysis.can_apply
+    assert root_store.load().plan_manifest.plan_compatibility_version == 1
+
+
+def test_candidate_plan_drift_does_not_authorize_default_migration(tmp_path: Path) -> None:
+    _state_root, _root_store, _child_store, accepted_bytes, candidate_bytes = _project(
+        tmp_path,
+        candidate_issue_id=812,
+        legacy_aggregate_review_default=True,
+    )
+
+    analysis = analyze_plan_reconciliation(tmp_path)
+
+    assert accepted_bytes != candidate_bytes
+    assert analysis.compatibility_transition is None
+    assert not analysis.can_apply
+
+
+def test_explicit_aggregate_review_policy_is_not_reinterpreted(tmp_path: Path) -> None:
+    _state_root, _root_store, _child_store, *_ = _project(
+        tmp_path,
+        candidate_issue_id=None,
+    )
+    snapshot_path = tmp_path / ".exo" / "tl-loop" / "plan.snapshot"
+    document = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    architecture = document["plan"]["sub_tls"][0]
+    architecture["integration"] = {"aggregate_review_owner": "aggregate"}
+    encoded = json.dumps(document, sort_keys=True).encode()
+    snapshot_path.write_bytes(encoded)
+    (tmp_path / ".exo" / "tl-loop" / "plan.json").write_bytes(encoded)
+    (tmp_path / ".exo" / "tl-loop" / "plan.snapshot.sha256").write_text(
+        hashlib.sha256(encoded).hexdigest() + "\n",
+        encoding="ascii",
+    )
+
+    with pytest.raises(PlanRevisionError) as error:
+        analyze_plan_reconciliation(tmp_path)
+
+    assert error.value.code == "unsupported_aggregate_review_policy"
 
 
 def test_legacy_default_equivalence_does_not_hide_explicit_owner_changes(

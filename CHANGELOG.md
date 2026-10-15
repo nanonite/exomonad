@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Migrate legacy aggregate review defaults with field-specific evidence (#1214)
 - Publish plan compatibility metadata in installed runtime artifacts (#1213)
 - Reconcile ordered pane recovery and scope child merge events (#1210)
 - Integrate child-complete aggregates without root review phases (#1209)

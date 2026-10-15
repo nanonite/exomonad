@@ -10,7 +10,11 @@ from typing import cast
 
 from tl_loop.plan_validation import PlanValidationError, validate_plan_document
 
-from .plan_manifest import ManifestError, PlanManifest, build_plan_manifest
+from .plan_manifest import (
+    ManifestError,
+    PlanManifest,
+    build_plan_manifest,
+)
 from .plan_revision_types import DecodedPlan, PlanRevisionError
 
 
@@ -127,7 +131,12 @@ def preserve_run_settings(previous: Mapping[str, object], candidate: Mapping[str
         raise PlanRevisionError("budgets_changed", "plan revision cannot change run budgets")
 
 
-def build_root_manifest(plan: object, template: PlanManifest) -> PlanManifest:
+def build_root_manifest(
+    plan: object,
+    template: PlanManifest,
+    *,
+    plan_compatibility_version: int | None = None,
+) -> PlanManifest:
     """Build a root candidate with the persisted scope ownership identity."""
     from tl_loop.loop.driver import WorkPlan, _manifest_plan
 
@@ -142,6 +151,11 @@ def build_root_manifest(plan: object, template: PlanManifest) -> PlanManifest:
             owned_branch=template.owned_branch,
             parent_integration_target=template.parent_integration_target,
             manifest_revision=template.manifest_revision,
+            plan_compatibility_version=(
+                template.plan_compatibility_version
+                if plan_compatibility_version is None
+                else plan_compatibility_version
+            ),
         )
     except (ManifestError, TypeError, ValueError) as error:
         raise PlanRevisionError(

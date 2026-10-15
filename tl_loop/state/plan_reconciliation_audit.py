@@ -37,6 +37,11 @@ def _audit_record(
         "candidate_sha256": analysis.candidate_sha256,
         "candidate_sha256_before": analysis.candidate_sha256,
         "candidate_sha256_after": analysis.candidate_sha256,
+        "compatibility_transition": (
+            dict(analysis.compatibility_transition)
+            if analysis.compatibility_transition is not None
+            else None
+        ),
         "scopes": [_audit_scope(scope) for scope in analysis.scopes if _scope_needs_update(scope)],
         "changed_node_ids": list(analysis.changes),
         "protected_declaration_proofs": _audit_declaration_proofs(analysis.scopes),
