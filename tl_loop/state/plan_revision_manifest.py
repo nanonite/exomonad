@@ -12,12 +12,15 @@ from .plan_manifest import ManifestNode, PlanManifest
 def retain_scope_revisions(
     candidate: PlanManifest,
     previous: PlanManifest | None,
+    *,
+    preserve_compatibility_version: bool = True,
 ) -> PlanManifest:
     """Align matching candidate scopes with their current revision numbers."""
     children = {
         node_id: retain_scope_revisions(
             child,
             previous.child_manifests.get(node_id) if previous else None,
+            preserve_compatibility_version=preserve_compatibility_version,
         )
         for node_id, child in candidate.child_manifests.items()
     }
@@ -28,7 +31,12 @@ def retain_scope_revisions(
         else node
         for node in candidate.nodes
     )
-    return rebuild_manifest(candidate, nodes, children, revision)
+    source = (
+        replace(candidate, plan_compatibility_version=previous.plan_compatibility_version, digest=None)
+        if previous is not None and preserve_compatibility_version
+        else candidate
+    )
+    return rebuild_manifest(source, nodes, children, revision)
 
 
 def rebuild_manifest(
@@ -52,6 +60,7 @@ def rebuild_manifest(
         },
         child_manifests=children,
         schema_version=source.schema_version,
+        plan_compatibility_version=source.plan_compatibility_version,
         manifest_revision=revision,
     )
 

@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let controller_build = Command::new(&controller)
         .arg("-c")
-        .arg("import json,sys,zipfile; print(json.loads(zipfile.ZipFile(sys.argv[1]).read('tl_loop/_build_fingerprint.json'))['git_commit'])")
+        .arg("import json,sys,zipfile; f=json.loads(zipfile.ZipFile(sys.argv[1]).read('tl_loop/_build_fingerprint.json')); print(f['git_commit']); print(f['plan_compatibility_version'])")
         .arg(&archive_output)
         .current_dir(repository_root)
         .output()?;
@@ -143,17 +143,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .into());
     }
-    let controller_commit = String::from_utf8(controller_build.stdout)?
-        .trim()
-        .to_owned();
-    if controller_commit.is_empty() {
+    let output = String::from_utf8(controller_build.stdout)?;
+    let mut identity = output.lines();
+    let controller_commit = identity.next().unwrap_or_default().trim();
+    let controller_compatibility = identity.next().unwrap_or_default().trim();
+    if controller_commit.is_empty() || controller_compatibility.parse::<u32>().is_err() {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            "TL controller archive contains an empty build identity",
+            "TL controller archive contains an invalid build or compatibility identity",
         )
         .into());
     }
     println!("cargo:rustc-env=EXOMONAD_TL_LOOP_GIT_COMMIT={controller_commit}");
+    println!(
+        "cargo:rustc-env=EXOMONAD_TL_LOOP_PLAN_COMPATIBILITY_VERSION={controller_compatibility}"
+    );
 
     Ok(())
 }

@@ -5,7 +5,7 @@ use exomonad::config::{
     REVIEWER_MODEL_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV,
 };
 use exomonad_core::services::runtime_manifest::{
-    PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
+    PLAN_COMPATIBILITY_VERSION, PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
 };
 use exomonad_core::services::{
     agent_control::{
@@ -2607,6 +2607,8 @@ const TL_LOOP_PYPROJECT: &str = include_str!("../../../tl_loop/pyproject.toml");
 const TL_LOOP_INTERPRETER_POLICY: &str = include_str!("../../../tl_loop/interpreter_policy.toml");
 const TL_CONTROLLER_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const EXOMONAD_BUILD_GIT_COMMIT: &str = env!("EXOMONAD_BUILD_GIT_COMMIT");
+const EXOMONAD_TL_LOOP_PLAN_COMPATIBILITY_VERSION: &str =
+    env!("EXOMONAD_TL_LOOP_PLAN_COMPATIBILITY_VERSION");
 const EXOMONAD_TL_LOOP_GIT_COMMIT: &str = env!("EXOMONAD_TL_LOOP_GIT_COMMIT");
 
 fn watcher_dashboard_command(cwd: &Path) -> Result<String> {
@@ -4845,6 +4847,10 @@ fn run_tl_loop_preflight(
     if let Some(plan_digest) = expected_plan_digest {
         command.args(["--expected-plan-digest", plan_digest]);
     }
+    command.args([
+        "--expected-plan-compatibility-version",
+        &PLAN_COMPATIBILITY_VERSION.to_string(),
+    ]);
     let status = command
         .status()
         .context("failed to run TL controller preflight")?;
@@ -5028,6 +5034,13 @@ fn validate_runtime_contract(
 
 fn validate_runtime_compatibility(cwd: &Path) -> Result<()> {
     validate_runtime_builds(EXOMONAD_BUILD_GIT_COMMIT, EXOMONAD_TL_LOOP_GIT_COMMIT)?;
+    let controller_compatibility_version = EXOMONAD_TL_LOOP_PLAN_COMPATIBILITY_VERSION
+        .parse::<u32>()
+        .context("TL controller archive has invalid plan compatibility metadata")?;
+    validate_plan_compatibility_versions(
+        PLAN_COMPATIBILITY_VERSION,
+        controller_compatibility_version,
+    )?;
     validate_runtime_contract(
         RUNTIME_PROTOCOL_VERSION,
         PUBLICATION_REGISTRY_SCHEMA_VERSION,
@@ -5038,8 +5051,20 @@ fn validate_runtime_compatibility(cwd: &Path) -> Result<()> {
         controller_build = EXOMONAD_TL_LOOP_GIT_COMMIT,
         protocol_version = RUNTIME_PROTOCOL_VERSION,
         publication_registry_schema = PUBLICATION_REGISTRY_SCHEMA_VERSION,
+        plan_compatibility_version = PLAN_COMPATIBILITY_VERSION,
         "Validated ExoMonad runtime compatibility"
     );
+    Ok(())
+}
+
+fn validate_plan_compatibility_versions(server: u32, controller: u32) -> Result<()> {
+    if controller != server {
+        anyhow::bail!(
+            "incompatible ExoMonad state compatibility metadata: server supports plan compatibility version {}, installed controller declares {}; rebuild and install synchronized artifacts with just install-all-dev",
+            server,
+            controller,
+        );
+    }
     Ok(())
 }
 

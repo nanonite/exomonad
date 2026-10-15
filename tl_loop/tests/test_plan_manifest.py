@@ -20,6 +20,7 @@ from tl_loop.state.plan_manifest import (
     build_plan_manifest,
     validate_manifest_revision,
 )
+from tl_loop.state.plan_revision_manifest import retain_scope_revisions
 from tl_loop.state.schema import SCHEMA_VERSION
 from tl_loop.state.store import RunStore, _decode_recursive_fsm, _encode_fsm
 from tl_loop.tests.checkpoint_fixtures import create
@@ -82,6 +83,33 @@ def test_manifest_digest_is_stable_and_recursive_round_trip() -> None:
     )
     restored = _work_plan_from_manifest(manifest)
     assert restored.sub_tls[0].plan.leaves[0].task == "nested work"
+
+
+def test_plan_compatibility_version_is_persisted_and_bound_by_manifest_digest() -> None:
+    current = build_plan_manifest(_plan(), scope_id="run-1", owned_branch="main")
+    legacy = build_plan_manifest(
+        _plan(),
+        scope_id="run-1",
+        owned_branch="main",
+        plan_compatibility_version=1,
+    )
+
+    assert current.plan_compatibility_version == 2
+    assert current.to_document()["plan_compatibility_version"] == 2
+    assert legacy.plan_compatibility_version == 1
+    assert "plan_compatibility_version" not in legacy.to_document()
+    assert current.digest != legacy.digest
+    assert PlanManifest.from_document(legacy.to_document()) == legacy
+
+    current_controller_candidate = retain_scope_revisions(current, legacy)
+    explicit_migration_target = retain_scope_revisions(
+        current,
+        legacy,
+        preserve_compatibility_version=False,
+    )
+    assert current_controller_candidate.plan_compatibility_version == 1
+    assert current_controller_candidate.digest == legacy.digest
+    assert explicit_migration_target.plan_compatibility_version == 2
 
 
 def test_nested_nodes_target_their_scope_owned_branch() -> None:

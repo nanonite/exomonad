@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from tl_loop.compatibility import PLAN_COMPATIBILITY_VERSION
+
 FINGERPRINT_FILENAME = "_build_fingerprint.json"
 FINGERPRINT_SCHEMA_VERSION = 1
 EXCLUDED_NAMES = frozenset(
@@ -68,6 +70,7 @@ def source_fingerprint(source: Path) -> dict[str, Any]:
         "schema_version": FINGERPRINT_SCHEMA_VERSION,
         "git_commit": git_commit(source),
         "tree_sha256": source_tree_sha256(source),
+        "plan_compatibility_version": PLAN_COMPATIBILITY_VERSION,
     }
 
 
@@ -77,6 +80,7 @@ def _validated(value: object) -> dict[str, Any]:
     schema_version = value.get("schema_version")
     git_sha = value.get("git_commit")
     tree_sha = value.get("tree_sha256")
+    compatibility_version = value.get("plan_compatibility_version")
     if (
         type(schema_version) is not int
         or schema_version != FINGERPRINT_SCHEMA_VERSION
@@ -84,12 +88,15 @@ def _validated(value: object) -> dict[str, Any]:
         or not git_sha
         or not isinstance(tree_sha, str)
         or len(tree_sha) != hashlib.sha256().digest_size * 2
+        or type(compatibility_version) is not int
+        or compatibility_version < 1
     ):
         raise ValueError("controller fingerprint has an unsupported shape")
     return {
         "schema_version": schema_version,
         "git_commit": git_sha,
         "tree_sha256": tree_sha,
+        "plan_compatibility_version": compatibility_version,
     }
 
 
@@ -115,8 +122,16 @@ def fingerprint_report(project_root: Path) -> dict[str, Any]:
         status = "source"
     elif expected is None:
         status = "source-unavailable"
-    elif embedded == expected:
+    elif _same_controller_artifact(embedded, expected):
         status = "current"
     else:
         status = "stale"
     return {"status": status, "source": expected, "archive": embedded}
+
+
+def _same_controller_artifact(embedded: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    """Compare executable contents and state contract, not repository commit labels."""
+    return all(
+        embedded.get(field) == expected.get(field)
+        for field in ("schema_version", "tree_sha256", "plan_compatibility_version")
+    )

@@ -7,6 +7,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
+from tl_loop.compatibility import (
+    MINIMUM_SUPPORTED_PLAN_COMPATIBILITY_VERSION,
+    PLAN_COMPATIBILITY_VERSION,
+)
 from tl_loop.plan_dependencies import (
     DEPENDABLE_CHILD_KIND,
     DependencyValidationError,
@@ -21,6 +25,7 @@ MANIFEST_ROLES = frozenset({"root", "non_root"})
 MANIFEST_KEYS = frozenset(
     {
         "schema_version",
+        "plan_compatibility_version",
         "manifest_revision",
         "scope_id",
         "parent_scope_id",
@@ -247,6 +252,7 @@ class PlanManifest:
     child_manifest_digests: Mapping[str, str] = field(default_factory=dict)
     child_manifests: Mapping[str, PlanManifest] = field(default_factory=dict)
     schema_version: int = MANIFEST_SCHEMA_VERSION
+    plan_compatibility_version: int = PLAN_COMPATIBILITY_VERSION
     manifest_revision: int = 1
     digest: str | None = None
 
@@ -259,6 +265,13 @@ class PlanManifest:
             raise ManifestError(f"manifest role {self.role!r} is not recognized")
         if type(self.schema_version) is not int or self.schema_version != MANIFEST_SCHEMA_VERSION:
             raise ManifestError("manifest schema version is unsupported")
+        if (
+            type(self.plan_compatibility_version) is not int
+            or not MINIMUM_SUPPORTED_PLAN_COMPATIBILITY_VERSION
+            <= self.plan_compatibility_version
+            <= PLAN_COMPATIBILITY_VERSION
+        ):
+            raise ManifestError("plan compatibility version is unsupported")
         if type(self.manifest_revision) is not int or self.manifest_revision < 1:
             raise ManifestError("manifest revision must be positive")
         if self.parent_integration_target is not None:
@@ -321,7 +334,7 @@ class PlanManifest:
         object.__setattr__(self, "digest", computed)
 
     def _payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "schema_version": self.schema_version,
             "manifest_revision": self.manifest_revision,
             "scope_id": self.scope_id,
@@ -339,6 +352,9 @@ class PlanManifest:
                 node_id: child.to_document() for node_id, child in self.child_manifests.items()
             },
         }
+        if self.plan_compatibility_version > MINIMUM_SUPPORTED_PLAN_COMPATIBILITY_VERSION:
+            payload["plan_compatibility_version"] = self.plan_compatibility_version
+        return payload
 
     def to_document(self) -> dict[str, object]:
         """Return the complete durable manifest, including its digest."""
@@ -401,6 +417,7 @@ class PlanManifest:
             },
             child_manifests=children,
             schema_version=_required_int(value, "schema_version"),
+            plan_compatibility_version=_plan_compatibility_version(value),
             manifest_revision=_required_int(value, "manifest_revision"),
             digest=_optional_text(value.get("digest"), "digest"),
         )
@@ -422,6 +439,7 @@ def build_plan_manifest(
     owned_branch: str = "main",
     parent_integration_target: str | None = None,
     manifest_revision: int = 1,
+    plan_compatibility_version: int = PLAN_COMPATIBILITY_VERSION,
 ) -> PlanManifest:
     """Build a canonical manifest from one validated recursive plan mapping."""
     if not isinstance(plan, Mapping):
@@ -468,6 +486,7 @@ def build_plan_manifest(
                     # parent declaration must not manufacture a new digest for
                     # an unchanged nested plan.
                     manifest_revision=1,
+                    plan_compatibility_version=plan_compatibility_version,
                 )
                 child_digest = child.digest
             node = ManifestNode(
@@ -510,6 +529,7 @@ def build_plan_manifest(
         child_manifest_digests=child_digests,
         child_manifests=child_manifests,
         manifest_revision=manifest_revision,
+        plan_compatibility_version=plan_compatibility_version,
     )
 
 
@@ -870,6 +890,16 @@ def _required_int(value: Mapping[str, object], key: str) -> int:
     raw = value.get(key)
     if type(raw) is not int:
         raise ManifestError(f"manifest {key} must be an integer")
+    return raw
+
+
+def _plan_compatibility_version(value: Mapping[str, object]) -> int:
+    raw = value.get(
+        "plan_compatibility_version",
+        MINIMUM_SUPPORTED_PLAN_COMPATIBILITY_VERSION,
+    )
+    if type(raw) is not int:
+        raise ManifestError("manifest plan_compatibility_version must be an integer")
     return raw
 
 

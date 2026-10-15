@@ -1,0 +1,5 @@
+"""Compatibility versions shared by the installed runtime and persisted plans."""
+
+PLAN_COMPATIBILITY_VERSION = 2
+MINIMUM_SUPPORTED_PLAN_COMPATIBILITY_VERSION = 1
+AGGREGATE_REVIEW_DEFAULT_MIGRATION_VERSION = 1
