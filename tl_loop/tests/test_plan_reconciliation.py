@@ -13,7 +13,14 @@ from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.scope import TLAllMerged, TLRunning
-from tl_loop.loop.driver import EffectIntent, WorkPlan, _manifest_plan
+from tl_loop.loop.driver import (
+    EffectIntent,
+    TLLoopConfig,
+    WorkPlan,
+    _manifest_plan,
+    _verify_supplied_plan_before_identity_recovery,
+    _work_plan_from_manifest,
+)
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.lock import LockTimeout, RunLock
@@ -1012,6 +1019,12 @@ def test_apply_migrates_unchanged_legacy_aggregate_defaults_and_keeps_receipts(
     )
     assert root_after.recursive_fsm.plan_digest == root_after.plan_manifest.digest
     assert child_after.recursive_fsm.plan_digest == child_after.plan_manifest.digest
+    assert (
+        root_after.plan_manifest.node("root/sub_tl/architecture").integration_contract[
+            "aggregate_review_owner"
+        ]
+        == "none"
+    )
     assert child_after.slices["completed"].post_merge == before_receipt
     assert child_after.slices["completed"].status is SliceStatus.MERGED
     assert child_after.slices["completed"].chainlink_issue_id == 811
@@ -1039,6 +1052,26 @@ def test_apply_migrates_unchanged_legacy_aggregate_defaults_and_keeps_receipts(
         replay.evidence_fingerprint,
         actor="operator",
     ).applied
+
+    # Prove the migrated checkpoint is accepted by the same driver guard that
+    # checks supplied plan identity before recovery and ordered continuation.
+    resumed_plan = _work_plan_from_manifest(root_after.plan_manifest)
+    _verify_supplied_plan_before_identity_recovery(
+        "root",
+        resumed_plan,
+        root_after,
+        TLLoopConfig(
+            root_dir=tmp_path,
+            project_root=tmp_path,
+            run_id="root",
+            branch="main",
+            session_mode="continue",
+        ),
+        state_root,
+    )
+    assert len(resumed_plan.sub_tls) == 5
+    assert root_after.current_order == 1
+    assert root_after.slices["architecture"].status is SliceStatus.PARKED
 
 
 def test_compatible_legacy_manifest_version_does_not_trigger_migration(tmp_path: Path) -> None:
