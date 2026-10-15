@@ -8,6 +8,7 @@ import multiprocessing
 import queue
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +25,7 @@ from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
-from tl_loop.fsm.phase import TLPhase, TLPlanning, TLWaiting
+from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
 from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
@@ -1971,7 +1972,9 @@ def test_active_loop_records_typed_task_block_without_failing_controller(
 ) -> None:
     run_id = "task-blocked-run"
     cancel_event = threading.Event()
-    source = SyntheticQueue([_blocked_event(1, "leaf-a", run_id)])
+    source = SyntheticQueue(
+        [_blocked_event(1, "leaf-a", run_id, invocation_id=None, generation=None)]
+    )
     outcome: dict[str, BaseException] = {}
 
     class BlockedTransport(RecordingTransport):
@@ -2023,7 +2026,20 @@ def test_active_loop_records_typed_task_block_without_failing_controller(
     assert state.slices["leaf-a"].recovery.cause == ParkCause.BASE_CI_UNSTABLE.value
 
 
-def _blocked_event(run_seq: int, slug: str, run_id: str) -> EventEnvelope:
+def _blocked_event(
+    run_seq: int,
+    slug: str,
+    run_id: str,
+    *,
+    reporter: str | None = None,
+    invocation_id: str | None = "inv-1",
+    generation: int | None = 1,
+    attempt: int = 1,
+    cause: str = "base_ci_unstable",
+    scope_attribution: str = "base",
+    matched_difficulty_rule: str = "standard_slice",
+    role: str = "worker",
+) -> EventEnvelope:
     return project(
         {
             "schema_version": 1,
@@ -2033,28 +2049,817 @@ def _blocked_event(run_seq: int, slug: str, run_id: str) -> EventEnvelope:
             "observed_at": "2026-08-11T00:00:00Z",
             "run_seq": run_seq,
             "type": "agent.task_blocked",
-            "agent_id": slug,
+            "agent_id": reporter or slug,
             "run_id": run_id,
             "session_id": "session-1",
-            "invocation_id": "inv-1",
-            "generation": 1,
+            "invocation_id": invocation_id,
+            "generation": generation,
             "harness": "codex",
-            "role": "worker",
+            "role": role,
             "lifecycle_state": "authoritative",
             "data": {
                 "outcome": "blocked",
                 "slice_id": slug,
-                "cause": "base_ci_unstable",
-                "scope_attribution": "base",
+                "cause": cause,
+                "scope_attribution": scope_attribution,
                 "needs_human": True,
                 "retryable": True,
                 "recovery_action": "repair base CI",
                 "declared_difficulty": "standard",
-                "matched_difficulty_rule": "standard_slice",
-                "attempt": 1,
+                "matched_difficulty_rule": matched_difficulty_rule,
+                "attempt": attempt,
             },
         }
     )
+
+
+def _seed_nested_aggregate_in_review(root_store: RunStore) -> RunState:
+    state = root_store.load()
+    current = state.slices["architecture"]
+    child_state = RunStore("architecture", root_store.run_dir).load()
+    publication = PublicationBinding(
+        pr_number=273,
+        head_sha="e" * 40,
+        head_branch=current.branch or "main.architecture",
+        base_branch="main",
+        attempt=1,
+        invocation_id="aggregate-invocation",
+    )
+    waiting = replace(
+        current,
+        status=SliceStatus.IN_REVIEW,
+        pr_number=publication.pr_number,
+        reviewed_head=publication.head_sha,
+        publication=publication,
+        dispatch_agent_id=f"{root_store.run_id}:architecture:integration",
+        dispatch_last_boundary="aggregate_pr_open",
+        reviewer_agent_id="aggregate-reviewer",
+        verdict=None,
+        ci_state={},
+    )
+    candidate = IntegrationCandidateState(
+        lifecycle=IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        aggregate_pr_number=publication.pr_number,
+        aggregate_head_sha=publication.head_sha,
+        aggregate_patch_digest="aggregate-patch",
+        aggregate_original_base_sha="aggregate-base",
+        integration_owner_id=f"{root_store.run_id}:architecture:integration",
+        integration_owner_run_id="architecture",
+        integration_owner_branch=child_state.owner_branch,
+    )
+    integration = replace(
+        state.integration,
+        candidates={**state.integration.candidates, "architecture": candidate},
+    )
+    return root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "architecture": waiting},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+
+
+def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggregate_gates(
+    tmp_path: Path,
+) -> None:
+    run_id = "completed-nested-blocker"
+    cancel_event = threading.Event()
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        run_id,
+        leaf_issue_id=42,
+    )
+    assert child_store is not None
+    completed_state = _complete_nested_leaf(child_store)
+    completed_leaf = completed_state.slices["leaf-a"]
+    _seed_nested_aggregate_in_review(root_store)
+    owner_gate = "task-blocked-owner:77"
+    root_store.set_gate(owner_gate, GateStatus.PENDING)
+    root_budgets = root_store.load().budgets
+    child_budgets = completed_state.budgets
+    event = _blocked_event(
+        77,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        attempt=6,
+        cause="human_decision_required",
+        scope_attribution="agent_lifecycle",
+        matched_difficulty_rule="missing_handoff:nonzero_exit",
+        role="controller",
+    )
+
+    class ObservingQueue(SyntheticQueue):
+        def acknowledge(self, observed: EventEnvelope) -> int:
+            child = child_store.load().slices["leaf-a"]
+            assert child.status is SliceStatus.MERGED
+            assert child.recovery is None
+            assert child.post_merge == completed_leaf.post_merge
+            assert child_store.load().budgets == child_budgets
+            assert root_store.load().events.last_consumed_offset == observed.run_seq
+            assert not any(gate.name == owner_gate for gate in root_store.load().gates)
+            result = super().acknowledge(observed)
+            cancel_event.set()
+            return result
+
+    source = ObservingQueue([event])
+    transport = RecordingTransport()
+    config = TLLoopConfig(
+        active=True,
+        root_dir=tmp_path,
+        run_id=run_id,
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        cancel_event=cancel_event,
+    )
+    with pytest.raises(LoopCancelled):
+        driver_module._run_loop(
+            run_id,
+            plan,
+            source,
+            EffectClient(transport),
+            config,
+            root_store,
+            root_store.load(),
+            [],
+            TLEventDecoder(),
+        )
+
+    root_after = root_store.load()
+    child_after = child_store.load()
+    dispositions = root_store.task_blocked_dispositions()
+    assert source.acknowledged == [77]
+    assert len(dispositions) == 1
+    assert dispositions[0]["event_id"] == event.event_id
+    assert dispositions[0]["decision"] == "superseded_by_durable_completion"
+    assert dispositions[0]["subject_slice_id"] == "leaf-a"
+    assert dispositions[0]["reporter_scope_path"] == [run_id, "architecture"]
+    assert root_after.current_order == 1
+    assert root_after.slices["architecture"].pr_number == 273
+    assert root_after.slices["architecture"].status is SliceStatus.IN_REVIEW
+    assert root_after.slices["architecture"].verdict is None
+    assert root_after.slices["architecture"].ci_state.get("e" * 40) != "success"
+    assert root_after.slices["kani"].status is SliceStatus.PENDING
+    assert root_after.budgets == root_budgets
+    assert child_after.slices["leaf-a"].post_merge == completed_leaf.post_merge
+    assert child_after.slices["leaf-a"].handoff == completed_leaf.handoff
+    assert child_after.slices["leaf-a"].publication == completed_leaf.publication
+    assert child_after.slices["leaf-a"].attempts == 0
+    assert not any(
+        name in {"spawn_worker", "spawn_leaf", "merge_pr", "chainlink_issue_close"}
+        for name, _ in transport.calls
+    )
+
+
+def test_completed_nested_blocker_with_incomplete_receipts_stays_unresolved(
+    tmp_path: Path,
+) -> None:
+    run_id = "incomplete-completed-blocker"
+    plan, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
+    assert child_store is not None
+    completed = _complete_nested_leaf(child_store)
+    leaf = completed.slices["leaf-a"]
+    assert leaf.handoff is not None
+    child_store.checkpoint(
+        completed.recursive_fsm or completed.fsm,
+        {
+            **completed.slices,
+            "leaf-a": replace(leaf, handoff=replace(leaf.handoff, attempt=5)),
+        },
+        completed.budgets,
+        completed.events.last_consumed_offset,
+    )
+    event = _blocked_event(
+        88,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        attempt=6,
+        role="controller",
+    )
+    source = SyntheticQueue([event])
+    result = driver_module._run_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(RecordingTransport()),
+        TLLoopConfig(root_dir=tmp_path, run_id=run_id),
+        root_store,
+        root_store.load(),
+        [],
+        TLEventDecoder(),
+    )
+
+    child_after = child_store.load().slices["leaf-a"]
+    assert source.acknowledged == []
+    assert root_store.load().events.last_consumed_offset == 0
+    assert root_store.task_blocked_dispositions() == ()
+    assert child_after.status is SliceStatus.MERGED
+    assert child_after.recovery is None
+    assert child_after.handoff is not None
+    assert child_after.handoff.attempt == 5
+    assert any(gate.name == "task-blocked-owner:88" for gate in result.final_state.gates)
+    diagnostic = " ".join(result.diagnostics["unresolved_events"])
+    assert "completed_child_evidence_incomplete" in diagnostic
+    assert "handoff_attempt" in diagnostic
+
+
+def test_foreign_reporter_conflict_is_diagnosed_with_scope_and_alias_evidence(
+    tmp_path: Path,
+) -> None:
+    run_id = "foreign-blocker-reporter"
+    plan, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
+    assert child_store is not None
+    _seed_nested_aggregate_in_review(root_store)
+    event = _blocked_event(
+        89,
+        "leaf-a",
+        run_id,
+        reporter="kani",
+        invocation_id=None,
+        generation=None,
+        role="controller",
+    )
+    source = SyntheticQueue([event])
+    result = driver_module._run_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(RecordingTransport()),
+        TLLoopConfig(root_dir=tmp_path, run_id=run_id),
+        root_store,
+        root_store.load(),
+        [],
+        TLEventDecoder(),
+    )
+
+    assert source.acknowledged == []
+    assert child_store.load().slices["leaf-a"].recovery is None
+    assert root_store.load().events.last_consumed_offset == 0
+    diagnostic = " ".join(result.diagnostics["unresolved_events"])
+    assert "reporter='kani'" in diagnostic
+    assert "subject='leaf-a'" in diagnostic
+    assert "candidate_scopes" in diagnostic
+    assert "agent_id->kani" in diagnostic
+    assert "reporter_scope_unproven" in diagnostic
+
+
+def test_blocker_alias_conflicts_do_not_route_to_a_nested_owner(tmp_path: Path) -> None:
+    run_id = "conflicting-blocker-aliases"
+    plan, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
+    assert child_store is not None
+    event = _blocked_event(
+        91,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        role="controller",
+    )
+    conflicting = replace(event, data={**event.data, "intent_id": "architecture-intent"})
+    lookup = driver_module._resolve_task_blocked_owner(
+        conflicting,
+        root_store.load(),
+        root_store,
+    )
+    assert lookup.owner is None
+    assert lookup.reason_code == "owner_identity_conflict"
+    assert "intent_id->architecture" in lookup.conflicting_aliases
+    assert "consistent_event_aliases" in lookup.missing_proof
+
+    source = SyntheticQueue([conflicting])
+    result = driver_module._run_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(RecordingTransport()),
+        TLLoopConfig(root_dir=tmp_path, run_id=run_id),
+        root_store,
+        root_store.load(),
+        [],
+        TLEventDecoder(),
+    )
+    assert source.acknowledged == []
+    assert child_store.load().slices["leaf-a"].recovery is None
+    diagnostic = " ".join(result.diagnostics["unresolved_events"])
+    assert "intent_id->architecture" in diagnostic
+    assert "consistent_event_aliases" in diagnostic
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    (
+        ("invocation_id", "unbound-invocation", "reporter_invocation_binding_missing"),
+        ("generation", 7, "reporter_generation_mismatch"),
+    ),
+)
+def test_unbound_reporter_invocation_evidence_is_rejected(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    reason: str,
+) -> None:
+    run_id = f"unbound-reporter-{field}"
+    _, root_store, _ = _nested_blocked_owner_stores(tmp_path, run_id)
+    event = _blocked_event(
+        94,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        role="controller",
+    )
+    conflicting = replace(event, **{field: value})
+    lookup = driver_module._resolve_task_blocked_owner(
+        conflicting,
+        root_store.load(),
+        root_store,
+    )
+    assert lookup.owner is not None
+    disposition = driver_module._classify_task_blocked_disposition(
+        conflicting,
+        lookup.owner,
+        lookup.owner.store.load(),
+        lookup,
+    )
+    assert disposition.decision == "unresolved"
+    assert disposition.reason_code == reason
+
+
+def test_unavailable_nested_checkpoint_is_parked_with_scope_diagnostic(tmp_path: Path) -> None:
+    run_id = "unavailable-blocker-child"
+    _, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
+    assert child_store is not None
+    child_store.path.write_text("{ malformed", encoding="utf-8")
+    event = _blocked_event(
+        92,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        role="controller",
+    )
+
+    lookup = driver_module._resolve_task_blocked_owner(event, root_store.load(), root_store)
+
+    assert lookup.owner is None
+    assert lookup.reason_code == "child_state_unavailable"
+    assert lookup.unavailable_paths == ((run_id, "architecture"),)
+    parked = driver_module._park_task_blocked_owner_issue(
+        event,
+        root_store.load(),
+        root_store,
+        lookup,
+        EventDiagnostics(),
+    )
+    assert parked.events.last_consumed_offset == 0
+    assert any(gate.name == "task-blocked-owner:92" for gate in parked.gates)
+    audit = root_store.audited_events()[0]
+    assert audit["unavailable_owner_paths"] == [[run_id, "architecture"]]
+
+
+def test_superseded_event_ack_crash_replays_from_durable_disposition(
+    tmp_path: Path,
+) -> None:
+    run_id = "superseded-ack-crash"
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        run_id,
+        leaf_issue_id=42,
+    )
+    assert child_store is not None
+    _complete_nested_leaf(child_store)
+    _seed_nested_aggregate_in_review(root_store)
+    event = _blocked_event(
+        93,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        attempt=6,
+        role="controller",
+    )
+
+    class CrashAfterCheckpointQueue(SyntheticQueue):
+        def acknowledge(self, observed: EventEnvelope) -> int:
+            assert root_store.load().events.last_consumed_offset == observed.run_seq
+            assert len(root_store.task_blocked_dispositions()) == 1
+            assert not any(gate.name == "task-blocked-owner:93" for gate in root_store.load().gates)
+            raise SystemExit("simulated crash after durable checkpoint")
+
+    with pytest.raises(SystemExit, match="after durable checkpoint"):
+        driver_module._run_loop(
+            run_id,
+            plan,
+            CrashAfterCheckpointQueue([event]),
+            EffectClient(RecordingTransport()),
+            TLLoopConfig(root_dir=tmp_path, run_id=run_id),
+            root_store,
+            root_store.load(),
+            [],
+            TLEventDecoder(),
+        )
+
+    assert root_store.load().events.last_consumed_offset == 93
+    assert len(root_store.task_blocked_dispositions()) == 1
+    cancel_event = threading.Event()
+
+    class RestartQueue(SyntheticQueue):
+        def acknowledge(self, observed: EventEnvelope) -> int:
+            assert observed.event_id == event.event_id
+            assert len(root_store.task_blocked_dispositions()) == 1
+            cancel_event.set()
+            return super().acknowledge(observed)
+
+    source = RestartQueue([event])
+    with pytest.raises(LoopCancelled):
+        driver_module._run_loop(
+            run_id,
+            plan,
+            source,
+            EffectClient(RecordingTransport()),
+            TLLoopConfig(
+                active=True,
+                root_dir=tmp_path,
+                run_id=run_id,
+                poll_interval=0.001,
+                cancel_event=cancel_event,
+            ),
+            root_store,
+            root_store.load(),
+            [],
+            TLEventDecoder(),
+        )
+    assert source.acknowledged == [93]
+    assert len(root_store.task_blocked_dispositions()) == 1
+    assert child_store.load().slices["leaf-a"].status is SliceStatus.MERGED
+
+
+def test_reconciled_blocker_waits_for_aggregate_review_ci_and_merge_before_next_stage(
+    tmp_path: Path,
+) -> None:
+    run_id = "blocker-aggregate-gates"
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        run_id,
+        leaf_issue_id=42,
+    )
+    assert child_store is not None
+    _complete_nested_leaf(child_store)
+    seeded = _seed_nested_aggregate_in_review(root_store)
+    root_slice = seeded.slices["architecture"]
+    assert root_slice.publication is not None
+    aggregate_head = root_slice.publication.head_sha
+    publication_record = {
+        "invocation_id": root_slice.publication.invocation_id,
+        "slice_id": "architecture",
+        "author_agent": "architecture",
+        "succession_invocation_ids": [],
+    }
+    snapshot = {
+        "found": True,
+        "pr_number": root_slice.pr_number,
+        "merged": False,
+        "head_sha": aggregate_head,
+        "base_sha": "aggregate-base",
+        "patch_digest": "aggregate-patch",
+        "merge_tree_sha": "aggregate-merge-tree",
+        "ci_status": "success",
+        "head_branch": root_slice.branch,
+        "base_branch": root_slice.base_ref,
+        "head_reachable": True,
+        "publication_ownership_verified": True,
+        "publication_ownership_error": "",
+        "publication": publication_record,
+    }
+
+    class GateIntegrationTransport(IntegrationTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            if tool_name == "watcher_pr_state":
+                self.calls.append((tool_name, arguments))
+                return {"success": True, "result": dict(snapshot)}
+            if tool_name == "post_merge_changelog_context":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {
+                        "changelog_present": False,
+                        "unreleased_present": False,
+                    },
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = GateIntegrationTransport()
+    blocked = _blocked_event(
+        77,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        attempt=6,
+        role="controller",
+    )
+    review = project(
+        {
+            "schema_version": 1,
+            "event_id": "aggregate-review-78",
+            "id": "aggregate-review-78",
+            "event_time": "2026-10-14T00:00:00Z",
+            "run_seq": 78,
+            "type": "pr.review",
+            "run_id": run_id,
+            "agent_id": "reviewer-session",
+            "session_id": "review-session",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-10-14T00:00:00Z",
+            "pr_number": root_slice.pr_number,
+            "head_sha": aggregate_head,
+            "data": {
+                "slice_id": "architecture",
+                "pr_number": root_slice.pr_number,
+                "head_sha": aggregate_head,
+                "review_head_sha": aggregate_head,
+                "review_id": 1,
+                "verdict": "approved",
+                "findings": [],
+                "patch_digest": "aggregate-patch",
+                "reviewer_agent_id": "aggregate-reviewer",
+                "reviewer_account_authenticated": True,
+                "reviewer_identity_unresolved": False,
+            },
+        }
+    )
+    ci = project(
+        {
+            "schema_version": 1,
+            "event_id": "aggregate-ci-79",
+            "id": "aggregate-ci-79",
+            "event_time": "2026-10-14T00:00:01Z",
+            "run_seq": 79,
+            "type": "ci.status_changed",
+            "run_id": run_id,
+            "agent_id": "watcher",
+            "session_id": "watcher-session",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-10-14T00:00:01Z",
+            "pr_number": root_slice.pr_number,
+            "head_sha": aggregate_head,
+            "data": {
+                "slice_id": "architecture",
+                "pr_number": root_slice.pr_number,
+                "head_sha": aggregate_head,
+                "status": "success",
+            },
+        }
+    )
+
+    class GateObservingQueue(SyntheticQueue):
+        def acknowledge(self, event: EventEnvelope) -> int:
+            current = root_store.load()
+            if event.run_seq == 77:
+                assert current.current_order == 1
+                assert current.slices["kani"].status is SliceStatus.PENDING
+                assert not any(name == "merge_pr" for name, _ in transport.calls)
+                assert not any(
+                    name == "emit_controller_event"
+                    and arguments.get("event_type") == "tl.dispatch_confirmed"
+                    and isinstance(arguments.get("payload"), Mapping)
+                    and arguments["payload"].get("slice_id") == "kani"
+                    for name, arguments in transport.calls
+                )
+            if event.run_seq == 78:
+                assert not any(name == "merge_pr" for name, _ in transport.calls)
+                assert current.slices["architecture"].verdict is Verdict.GO
+                assert current.slices["architecture"].ci_state.get(aggregate_head) is None
+            if event.run_seq == 79:
+                assert current.slices["architecture"].status is SliceStatus.MERGED
+                assert current.current_order == 2
+                assert current.slices["kani"].status is not SliceStatus.PENDING
+            return super().acknowledge(event)
+
+    source = GateObservingQueue([blocked, review, ci])
+    config = replace(
+        _config(),
+        root_dir=tmp_path,
+        run_id=run_id,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        keep_alive_on_waiting=False,
+        max_parallel_slices=1,
+        policy=validate_policy(_selector_policy()),
+        tl_model_choice=_tl_choice(ReviewBackend([])),
+    )
+    integrated = driver_module._run_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(transport),
+        config,
+        root_store,
+        root_store.load(),
+        [],
+        TLEventDecoder(),
+    )
+
+    assert source.acknowledged == [77, 78, 79]
+    assert integrated.final_state.current_order == 2
+    assert integrated.final_state.slices["architecture"].status is SliceStatus.MERGED
+    assert integrated.final_state.slices["architecture"].post_merge is not None
+    assert integrated.final_state.slices["architecture"].post_merge.phase is PostMergePhase.COMPLETE
+    assert [args["pr_number"] for name, args in transport.calls if name == "merge_pr"] == [
+        root_slice.pr_number
+    ]
+    kani_dispatches = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+        and isinstance(arguments.get("payload"), Mapping)
+        and arguments["payload"].get("slice_id") == "kani"
+    ]
+    assert len(kani_dispatches) == 1
+
+    driver_module._run_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config,
+        root_store,
+        root_store.load(),
+        [],
+        TLEventDecoder(),
+    )
+    assert (
+        len(
+            [
+                arguments
+                for name, arguments in transport.calls
+                if name == "emit_controller_event"
+                and arguments.get("event_type") == "tl.dispatch_confirmed"
+                and isinstance(arguments.get("payload"), Mapping)
+                and arguments["payload"].get("slice_id") == "kani"
+            ]
+        )
+        == 1
+    )
+
+
+def test_superseded_blocker_replay_recovers_after_checkpoint_failure_without_duplicate_disposition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "superseded-blocker-restart"
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        tmp_path,
+        run_id,
+        leaf_issue_id=42,
+    )
+    assert child_store is not None
+    _complete_nested_leaf(child_store)
+    _seed_nested_aggregate_in_review(root_store)
+    event = _blocked_event(
+        90,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        attempt=6,
+        role="controller",
+    )
+    original_checkpoint = RunStore.checkpoint
+    failed_clear = False
+
+    def fail_supersession_checkpoint(self: RunStore, *args: Any, **kwargs: Any) -> RunState:
+        nonlocal failed_clear
+        if self.path == root_store.path and kwargs.get("clear_gates") and not failed_clear:
+            failed_clear = True
+            raise OSError("injected crash before supersession checkpoint")
+        return original_checkpoint(self, *args, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", fail_supersession_checkpoint)
+    first_source = SyntheticQueue([event])
+    config = TLLoopConfig(root_dir=tmp_path, run_id=run_id)
+    first = driver_module._run_loop(
+        run_id,
+        plan,
+        first_source,
+        EffectClient(RecordingTransport()),
+        config,
+        root_store,
+        root_store.load(),
+        [],
+        TLEventDecoder(),
+    )
+    assert first_source.acknowledged == []
+    assert root_store.load().events.last_consumed_offset == 0
+    assert len(root_store.task_blocked_dispositions()) == 1
+    assert any(gate.name == "task-blocked-owner:90" for gate in first.final_state.gates)
+
+    monkeypatch.setattr(RunStore, "checkpoint", original_checkpoint)
+    cancel_event = threading.Event()
+
+    class RestartObservingQueue(SyntheticQueue):
+        def acknowledge(self, observed: EventEnvelope) -> int:
+            current = root_store.load()
+            assert current.events.last_consumed_offset == observed.run_seq
+            assert not any(gate.name == "task-blocked-owner:90" for gate in current.gates)
+            assert len(root_store.task_blocked_dispositions()) == 1
+            cancel_event.set()
+            return super().acknowledge(observed)
+
+    restarted_source = RestartObservingQueue([event])
+    with pytest.raises(LoopCancelled):
+        driver_module._run_loop(
+            run_id,
+            plan,
+            restarted_source,
+            EffectClient(RecordingTransport()),
+            replace(config, active=True, cancel_event=cancel_event, poll_interval=0.001),
+            root_store,
+            root_store.load(),
+            [],
+            TLEventDecoder(),
+        )
+    assert restarted_source.acknowledged == [90]
+    assert root_store.load().events.last_consumed_offset == 90
+    assert len(root_store.task_blocked_dispositions()) == 1
+    assert child_store.load().slices["leaf-a"].status is SliceStatus.MERGED
+
+
+def test_nested_controller_reporter_routes_legacy_blocker_to_child_before_ack(
+    tmp_path: Path,
+) -> None:
+    run_id = "nested-controller-reporter"
+    cancel_event = threading.Event()
+    plan, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
+    assert child_store is not None
+
+    class ObservingQueue(SyntheticQueue):
+        def acknowledge(self, event: EventEnvelope) -> int:
+            child = child_store.load().slices["leaf-a"]
+            assert child.recovery is not None
+            assert child.recovery.cause == ParkCause.HUMAN_DECISION_REQUIRED.value
+            assert root_store.load().events.last_consumed_offset == event.run_seq
+            result = super().acknowledge(event)
+            cancel_event.set()
+            return result
+
+    event = _blocked_event(
+        1,
+        "leaf-a",
+        run_id,
+        reporter="architecture",
+        invocation_id=None,
+        generation=None,
+        attempt=1,
+        cause="human_decision_required",
+        scope_attribution="agent_lifecycle",
+        matched_difficulty_rule="missing_handoff:nonzero_exit",
+        role="controller",
+    )
+    source = ObservingQueue([event])
+    config = TLLoopConfig(
+        root_dir=tmp_path,
+        run_id=run_id,
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        cancel_event=cancel_event,
+    )
+
+    with pytest.raises(LoopCancelled):
+        driver_module._run_loop(
+            run_id,
+            plan,
+            source,
+            EffectClient(RecordingTransport()),
+            config,
+            root_store,
+            root_store.load(),
+            [],
+            TLEventDecoder(),
+        )
+
+    assert source.acknowledged == [1]
+    assert child_store.load().slices["leaf-a"].attempts == 1
 
 
 def _nested_blocked_owner_stores(
@@ -2063,10 +2868,19 @@ def _nested_blocked_owner_stores(
     *,
     direct_leaf: bool = False,
     create_child: bool = True,
+    leaf_issue_id: int | None = None,
 ) -> tuple[WorkPlan, RunStore, RunStore | None]:
     """Persist a root stage and its declared child scope for routing tests."""
     child_plan = WorkPlan.from_mapping(
-        {"leaves": [{"name": "leaf-a", "task": "blocked leaf", "chainlink_issue_id": None}]}
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "blocked leaf",
+                    "chainlink_issue_id": leaf_issue_id,
+                }
+            ]
+        }
     )
     root_plan = WorkPlan(
         leaves=(
@@ -2078,7 +2892,12 @@ def _nested_blocked_owner_stores(
         ),
         sub_tls=(
             SubTLTask("architecture", child_plan, order=1),
-            SubTLTask("kani", WorkPlan(), order=2),
+            SubTLTask(
+                "kani",
+                WorkPlan(),
+                order=2,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
         ),
     )
     config = TLLoopConfig(root_dir=root_dir, run_id=run_id)
@@ -2122,19 +2941,239 @@ def _nested_blocked_owner_stores(
         config,
         root_dir=root_store.run_dir,
         run_id="architecture",
+        branch=driver_module.derive_child_branch(config.branch, "architecture"),
         parent_run_id=run_id,
-        parent_branch="main",
+        parent_branch=config.branch,
+        parent_agent_id=run_id,
         depth=1,
         declared_manifest=child_manifest,
     )
     child_slices = _initial_slices(child_plan, child_config, root_store.run_dir, "architecture")
     create(
         "architecture",
-        {"slices": child_slices, "parent_run_id": run_id, "depth": 1},
+        {
+            "slices": child_slices,
+            "owner_branch": child_config.branch,
+            "parent_branch": child_config.parent_branch,
+            "parent_run_id": run_id,
+            "parent_agent_id": child_config.parent_agent_id,
+            "depth": 1,
+        },
         root_dir=root_store.run_dir,
     )
     child_store.set_plan_manifest(child_manifest, slices=child_slices)
+    child_state = child_store.load()
+    dispatched_leaf = replace(
+        child_state.slices["leaf-a"],
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_intent_id="leaf-a-intent",
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="inv-1",
+        dispatch_authoritative_event_seq=0,
+        dispatch_generation=1,
+        dispatch_last_boundary="agent.spawned",
+    )
+    child_store.checkpoint(
+        TLWaiting({"leaf-a": ChildHandle("leaf-a", dispatched_leaf.branch or "", "worker")}),
+        {**child_state.slices, "leaf-a": dispatched_leaf},
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
     return root_plan, root_store, child_store
+
+
+def _three_level_blocked_owner_stores(
+    root_dir: Path,
+    run_id: str,
+) -> tuple[WorkPlan, RunStore, RunStore]:
+    """Persist root -> outer -> inner -> leaf ownership for routing tests."""
+    leaf_plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "deep blocked leaf", "chainlink_issue_id": None}]}
+    )
+    inner_task = SubTLTask("inner", leaf_plan, order=1)
+    outer_plan = WorkPlan(sub_tls=(inner_task,))
+    outer_task = SubTLTask("outer", outer_plan, order=1)
+    plan = WorkPlan(sub_tls=(outer_task,))
+    config = TLLoopConfig(root_dir=root_dir, run_id=run_id)
+    root_manifest = driver_module._manifest_for_plan(plan, run_id, config)
+    root_slices = _initial_slices(plan, config, root_dir, run_id)
+    create(run_id, {"slices": root_slices}, root_dir=root_dir)
+    root_store = RunStore(run_id, root_dir)
+    root_store.set_plan_manifest(root_manifest, slices=root_slices)
+    root_state = root_store.set_ordered_state(
+        1,
+        (driver_module.OrderedStageState(1, ("outer",)),),
+        root_store.load().integration,
+    )
+
+    outer_node = next(node for node in root_manifest.nodes if node.name == "outer")
+    outer_manifest = root_manifest.child_manifests[outer_node.node_id]
+    outer_store = RunStore("outer", root_store.run_dir)
+    outer_config = replace(
+        config,
+        root_dir=root_store.run_dir,
+        run_id="outer",
+        parent_run_id=run_id,
+        depth=1,
+        declared_manifest=outer_manifest,
+    )
+    outer_slices = _initial_slices(outer_plan, outer_config, root_store.run_dir, "outer")
+    create(
+        "outer",
+        {"slices": outer_slices, "parent_run_id": run_id, "depth": 1},
+        root_dir=root_store.run_dir,
+    )
+    outer_store.set_plan_manifest(outer_manifest, slices=outer_slices)
+    outer_state = outer_store.set_ordered_state(
+        1,
+        (driver_module.OrderedStageState(1, ("inner",)),),
+        outer_store.load().integration,
+    )
+
+    inner_node = next(node for node in outer_manifest.nodes if node.name == "inner")
+    inner_manifest = outer_manifest.child_manifests[inner_node.node_id]
+    inner_store = RunStore("inner", outer_store.run_dir)
+    inner_config = replace(
+        config,
+        root_dir=outer_store.run_dir,
+        run_id="inner",
+        parent_run_id="outer",
+        depth=2,
+        declared_manifest=inner_manifest,
+    )
+    inner_slices = _initial_slices(leaf_plan, inner_config, outer_store.run_dir, "inner")
+    create(
+        "inner",
+        {"slices": inner_slices, "parent_run_id": "outer", "depth": 2},
+        root_dir=outer_store.run_dir,
+    )
+    inner_store.set_plan_manifest(inner_manifest, slices=inner_slices)
+    inner_state = inner_store.load()
+
+    for parent_store, parent_state, child_name in (
+        (root_store, root_state, "outer"),
+        (outer_store, outer_state, "inner"),
+    ):
+        child_state = parent_state.slices[child_name]
+        started = replace(
+            child_state,
+            status=SliceStatus.SPAWNED,
+            attempts=1,
+            dispatch_intent_id=f"{child_name}-intent",
+            dispatch_agent_id=child_name,
+            dispatch_authoritative_event_seq=0,
+            dispatch_last_boundary="sub_tl_started",
+        )
+        parent_store.checkpoint(
+            parent_state.recursive_fsm or parent_state.fsm,
+            {**parent_state.slices, child_name: started},
+            parent_state.budgets,
+            parent_state.events.last_consumed_offset,
+            current_order=parent_state.current_order,
+            ordered_stages=parent_state.ordered_stages,
+            integration=parent_state.integration,
+        )
+    active_leaf = replace(
+        inner_state.slices["leaf-a"],
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_intent_id="deep-leaf-intent",
+        dispatch_agent_id="leaf-a",
+        dispatch_invocation_id="deep-leaf-invocation",
+        dispatch_generation=1,
+        dispatch_authoritative_event_seq=0,
+        dispatch_last_boundary="agent.spawned",
+    )
+    inner_store.checkpoint(
+        TLWaiting({"leaf-a": ChildHandle("leaf-a", active_leaf.branch or "", "worker")}),
+        {**inner_state.slices, "leaf-a": active_leaf},
+        inner_state.budgets,
+        inner_state.events.last_consumed_offset,
+    )
+    return plan, root_store, inner_store
+
+
+def _complete_nested_leaf(child_store: RunStore, *, attempt: int = 6) -> RunState:
+    """Persist complete receipt-backed leaf history for blocker replay tests."""
+    state = child_store.load()
+    current = state.slices["leaf-a"]
+    head_sha = "a" * 40
+    publication = PublicationBinding(
+        pr_number=145,
+        head_sha=head_sha,
+        head_branch=current.branch or "main.leaf-a",
+        base_branch=current.base_ref or "main",
+        attempt=attempt,
+        invocation_id="leaf-publication-invocation",
+    )
+    handoff = HandoffEvidence(
+        pr_number=publication.pr_number,
+        head_sha=publication.head_sha,
+        attempt=attempt,
+        invocation_id=publication.invocation_id or "leaf-handoff-invocation",
+        agent_id=current.dispatch_agent_id or current.id,
+        observed_at="2026-10-01T00:00:00Z",
+    )
+    closure = (
+        {
+            "issue_id": str(current.chainlink_issue_id),
+            "issue_close_intent_id": "leaf-issue-close-intent",
+            "issue_close_journal_id": "leaf-issue-close-journal",
+            "issue_close_outcome": "closed",
+        }
+        if current.chainlink_issue_id is not None
+        else {
+            "issue_close_outcome": "not_applicable",
+            "changelog_outcome": "not_applicable",
+        }
+    )
+    evidence = {
+        "child_id": current.id,
+        "repository": "https://forge.example.test/test/repository.git",
+        "parent_branch": publication.base_branch,
+        "pr_number": str(publication.pr_number),
+        "head_sha": publication.head_sha,
+        "merge_journal_id": "leaf-merge-journal",
+        "lane_epoch": "1",
+        "parent_commit_sha": "b" * 40,
+        **closure,
+        "changelog_intent_id": "leaf-changelog-intent",
+        "changelog_generation": "1",
+        "changelog_commit_sha": "c" * 40,
+        "parent_push_intent_id": "leaf-parent-push-intent",
+        "push_journal_id": "leaf-push-journal",
+        "expected_base_sha": "c" * 40,
+        "push_receipt_id": "leaf-push-receipt",
+        "pushed_commit": "d" * 40,
+        "bookkeeping_commit": "d" * 40,
+        "observed_remote_head": "d" * 40,
+        "ancestry_proof": f"ancestor:{'d' * 40}->{'d' * 40}",
+    }
+    post_merge = PostMergeState(PostMergePhase.COMPLETE, evidence)
+    completed = replace(
+        current,
+        status=SliceStatus.MERGED,
+        attempts=0,
+        pr_number=publication.pr_number,
+        reviewed_head=head_sha,
+        verdict=Verdict.GO,
+        publication=publication,
+        handoff=handoff,
+        post_merge=post_merge,
+        dispatch_invocation_id=None,
+        recovery=None,
+        park_cause=None,
+        park_issue_id=None,
+        park_audit=None,
+    )
+    phase = driver_module._phase_after_slice_merge(state, current.id, completed)
+    return child_store.checkpoint(
+        phase,
+        {**state.slices, current.id: completed},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
 
 
 def test_nested_task_blocked_recovers_child_before_ack_and_keeps_ordered_stage_gated(
@@ -2182,6 +3221,60 @@ def test_nested_task_blocked_recovers_child_before_ack_and_keeps_ordered_stage_g
     assert root_state.current_order == 1
     assert root_state.slices["kani"].status is SliceStatus.PENDING
     assert root_state.integration.sub_tl_recovery["architecture"].slice_id == "leaf-a"
+
+
+@pytest.mark.parametrize("reporter", ("outer", "inner"))
+def test_task_blocked_routes_through_multiple_validated_subtl_levels(
+    tmp_path: Path,
+    reporter: str,
+) -> None:
+    run_id = f"three-level-{reporter}"
+    cancel_event = threading.Event()
+    plan, root_store, inner_store = _three_level_blocked_owner_stores(tmp_path, run_id)
+    event = _blocked_event(
+        9,
+        "leaf-a",
+        run_id,
+        reporter=reporter,
+        invocation_id=None,
+        generation=None,
+        attempt=1,
+        role="controller",
+    )
+    lookup = driver_module._resolve_task_blocked_owner(event, root_store.load(), root_store)
+    assert lookup.owner is not None
+    assert lookup.owner.path == (run_id, "outer", "inner")
+    assert lookup.reporter_scope_path[-1] == reporter
+
+    class ObservingQueue(SyntheticQueue):
+        def acknowledge(self, observed: EventEnvelope) -> int:
+            assert inner_store.load().slices["leaf-a"].recovery is not None
+            assert root_store.load().events.last_consumed_offset == observed.run_seq
+            result = super().acknowledge(observed)
+            cancel_event.set()
+            return result
+
+    source = ObservingQueue([event])
+    config = TLLoopConfig(
+        root_dir=tmp_path,
+        run_id=run_id,
+        max_parallel_slices=1,
+        poll_interval=0.001,
+        cancel_event=cancel_event,
+    )
+    result = driver_module._run_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(RecordingTransport()),
+        config,
+        root_store,
+        root_store.load(),
+        [],
+        TLEventDecoder(),
+    )
+    assert source.acknowledged == [9]
+    assert result.final_state.events.last_consumed_offset == 9
 
 
 def test_nested_task_blocked_owner_lookup_parks_missing_or_ambiguous_scope(
@@ -5213,7 +6306,7 @@ def test_historical_publication_rejected_before_reduction_across_recreate(
         [
             pr_filed(1, "inv-current", 45, "head-45"),
             # Establish a real active recovery before the historical replay.
-            _blocked_event(2, leaf, run_id),
+            _blocked_event(2, leaf, run_id, invocation_id="inv-current"),
             # Historical #44 from the predecessor run replays after #45 and the
             # active recovery; it must disturb neither.
             pr_filed(3, "inv-historical", 44, "head-44"),
@@ -5354,7 +6447,7 @@ def test_conflicting_publication_refused_before_reduction_preserves_owner(
     baseline = run(
         [
             pr_filed(1, "inv-current", 45, "head-45"),
-            _blocked_event(2, leaf, run_id),
+            _blocked_event(2, leaf, run_id, invocation_id="inv-current"),
             _event(3, "all_children_done", run_id=run_id),
         ],
         tmp_path / "baseline",
@@ -5366,7 +6459,7 @@ def test_conflicting_publication_refused_before_reduction_preserves_owner(
     conflicting = run(
         [
             pr_filed(1, "inv-current", 45, "head-45"),
-            _blocked_event(2, leaf, run_id),
+            _blocked_event(2, leaf, run_id, invocation_id="inv-current"),
             pr_filed(3, "inv-current", 46, "head-46"),
             pr_filed(4, "inv-current", 47, "head-47", owner="someone-else"),
             pr_filed(5, "inv-current", 48, "head-48", branch="main.other"),
@@ -5781,6 +6874,31 @@ def test_append_audit_event_rejects_conflicting_run_seq(tmp_path: Path) -> None:
     with pytest.raises(QuarantineStorageError):
         store.append_audit_event({"type": "pr.filed", "run_seq": 5, "head_sha": "head-b"})
     assert len(store.audited_events()) == 1
+
+
+def test_task_blocked_disposition_sidecar_is_immutable_and_idempotent(tmp_path: Path) -> None:
+    store = RunStore("blocker-disposition-ledger", tmp_path)
+    disposition = {
+        "disposition_id": "agent.task_blocked:7:event-7",
+        "decision": "superseded_by_durable_completion",
+        "run_seq": 7,
+        "event_id": "event-7",
+        "event_type": "agent.task_blocked",
+        "reporter_id": "architecture",
+        "reporter_scope_path": ["blocker-disposition-ledger", "architecture"],
+        "subject_slice_id": "leaf-a",
+        "owner_path": ["blocker-disposition-ledger", "architecture"],
+        "attempt": 2,
+        "proof": ["attempt=2", "merge_journal_id=merge-journal"],
+        "evidence_digest": "e" * 64,
+    }
+
+    assert store.record_task_blocked_disposition(disposition)
+    assert not store.record_task_blocked_disposition(disposition)
+    assert len(store.task_blocked_dispositions()) == 1
+    with pytest.raises(QuarantineStorageError, match="conflicting disposition"):
+        store.record_task_blocked_disposition({**disposition, "evidence_digest": "f" * 64})
+    assert len(store.task_blocked_dispositions()) == 1
 
 
 def test_audit_migration_retains_conflicting_pending_row(tmp_path: Path) -> None:

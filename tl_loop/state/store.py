@@ -161,6 +161,58 @@ class QuarantineStorageError(RuntimeError):
             self.__cause__ = cause
 
 
+class _TaskBlockedDispositionAlreadyRecorded(Exception):
+    """Abort an atomic write when the exact disposition is already durable."""
+
+
+def _validate_task_blocked_dispositions(value: object) -> None:
+    """Validate the small sidecar used to checkpoint superseded blockers."""
+    if not isinstance(value, Mapping):
+        raise TypeError("root must be an object")
+    if value.get("version") != 1:
+        raise ValueError("unsupported version")
+    revision = value.get("revision")
+    if type(revision) is not int or revision < 0:
+        raise ValueError("revision must be a non-negative integer")
+    entries = value.get("dispositions")
+    if not isinstance(entries, list):
+        raise TypeError("dispositions must be an array")
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise TypeError("disposition entries must be objects")
+        disposition_id = entry.get("disposition_id")
+        if not isinstance(disposition_id, str) or not disposition_id:
+            raise ValueError("disposition_id must be non-empty")
+        if disposition_id in seen:
+            raise ValueError("disposition_id values must be unique")
+        seen.add(disposition_id)
+        if entry.get("decision") != "superseded_by_durable_completion":
+            raise ValueError("decision must be superseded_by_durable_completion")
+        if type(entry.get("run_seq")) is not int or entry.get("run_seq") < 0:
+            raise ValueError("run_seq must be a non-negative integer")
+        for name in ("event_type", "subject_slice_id"):
+            if not isinstance(entry.get(name), str) or not entry.get(name):
+                raise ValueError(f"{name} must be non-empty")
+        reporter_id = entry.get("reporter_id")
+        if reporter_id is not None and (not isinstance(reporter_id, str) or not reporter_id):
+            raise ValueError("reporter_id must be null or non-empty")
+        owner_path = entry.get("owner_path")
+        proof = entry.get("proof")
+        if (
+            not isinstance(owner_path, list)
+            or not owner_path
+            or not all(isinstance(part, str) and part for part in owner_path)
+        ):
+            raise ValueError("owner_path must contain non-empty scope names")
+        if (
+            not isinstance(proof, list)
+            or not proof
+            or not all(isinstance(item, str) and item for item in proof)
+        ):
+            raise ValueError("proof must contain durable evidence references")
+
+
 def _exception_chain(error: BaseException) -> tuple[str, ...]:
     chain: list[str] = []
     seen: set[int] = set()
@@ -268,6 +320,7 @@ class RunStore:
         state_version: int | None = None,
         plan_manifest: PlanManifest | None = None,
         expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
     ) -> RunState:
         """Persist one checkpoint through the shared atomic mutation path."""
         return checkpoint(
@@ -282,6 +335,7 @@ class RunStore:
             state_version=state_version,
             plan_manifest=plan_manifest,
             expected_revision=expected_revision,
+            clear_gates=clear_gates,
         )
 
     def set_plan_manifest(
@@ -946,6 +1000,88 @@ class RunStore:
         """
         return self.run_dir / "event-audit.json"
 
+    @property
+    def task_blocked_disposition_path(self) -> Path:
+        """Path to durable dispositions for nested task-blocked events."""
+        return self.run_dir / "task-blocked-dispositions.json"
+
+    def record_task_blocked_disposition(self, disposition: Mapping[str, object]) -> bool:
+        """Persist one immutable task-blocked disposition exactly once."""
+        normalized = to_jsonable(disposition)
+        if not isinstance(normalized, dict):
+            raise QuarantineStorageError(
+                self.task_blocked_disposition_path, "disposition must be an object"
+            )
+        disposition_id = normalized.get("disposition_id")
+        if not isinstance(disposition_id, str) or not disposition_id:
+            raise QuarantineStorageError(
+                self.task_blocked_disposition_path, "disposition_id must be non-empty"
+            )
+        initial: dict[str, object] = {"version": 1, "revision": 0, "dispositions": []}
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            entries = document.get("dispositions")
+            if not isinstance(entries, list):
+                raise QuarantineStorageError(
+                    self.task_blocked_disposition_path, "dispositions must be an array"
+                )
+            for existing in entries:
+                if not isinstance(existing, dict):
+                    raise QuarantineStorageError(
+                        self.task_blocked_disposition_path,
+                        "disposition entries must be objects",
+                    )
+                if existing.get("disposition_id") != disposition_id:
+                    continue
+                if existing == normalized:
+                    raise _TaskBlockedDispositionAlreadyRecorded
+                raise QuarantineStorageError(
+                    self.task_blocked_disposition_path,
+                    f"conflicting disposition for {disposition_id!r}",
+                )
+            entries.append(normalized)
+            return document
+
+        try:
+            try:
+                apply(
+                    self.run_dir,
+                    mutate,
+                    target_name=self.task_blocked_disposition_path.name,
+                    initial=initial,
+                    validator=_validate_task_blocked_dispositions,
+                )
+            except FileExistsError:
+                apply(
+                    self.run_dir,
+                    mutate,
+                    target_name=self.task_blocked_disposition_path.name,
+                    validator=_validate_task_blocked_dispositions,
+                )
+        except _TaskBlockedDispositionAlreadyRecorded:
+            return False
+        return True
+
+    def task_blocked_dispositions(self) -> tuple[Mapping[str, object], ...]:
+        """Read and validate durable task-blocked event dispositions."""
+        try:
+            document = json.loads(self.task_blocked_disposition_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return ()
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise QuarantineStorageError(
+                self.task_blocked_disposition_path,
+                "read failed or document is malformed",
+                cause=error,
+            ) from error
+        try:
+            _validate_task_blocked_dispositions(document)
+        except (TypeError, ValueError) as error:
+            raise QuarantineStorageError(self.task_blocked_disposition_path, str(error)) from error
+        entries = document["dispositions"]
+        assert isinstance(entries, list)
+        return tuple(MappingProxyType(dict(item)) for item in entries if isinstance(item, dict))
+
     def append_audit_event(self, event: Mapping[str, object]) -> None:
         """Retain one refused historical event permanently for audit.
 
@@ -1331,6 +1467,7 @@ def checkpoint(
     state_version: int | None = None,
     plan_manifest: PlanManifest | None = None,
     expected_revision: int | None = None,
+    clear_gates: Sequence[str] = (),
 ) -> RunState:
     """Atomically update a run's FSM, slices, budget ledger, and event offset."""
     run_directory = _resolve_run_directory(run_id, path, root_dir)
@@ -1350,6 +1487,8 @@ def checkpoint(
         raise ValueError("current_order must be a positive integer")
     if state_version is not None and (type(state_version) is not int or state_version < 0):
         raise ValueError("state_version must be a non-negative integer")
+    if any(not isinstance(name, str) or not name for name in clear_gates):
+        raise ValueError("clear_gates must contain non-empty gate names")
     _assert_encoded_consistent(run_directory / "run.json", encoded_fsm, encoded_slices)
 
     def mutate(document: dict[str, object]) -> dict[str, object]:
@@ -1408,6 +1547,16 @@ def checkpoint(
             _bind_slice_records(document["slices"], manifest)
         document["budgets"] = copy.deepcopy(encoded_budgets)
         document["events"] = {"last_consumed_offset": offset}
+        if clear_gates:
+            gates = document.get("gates")
+            if not isinstance(gates, list):
+                raise CorruptCheckpoint("run state gates are not an array")
+            to_clear = set(clear_gates)
+            document["gates"] = [
+                gate
+                for gate in gates
+                if not isinstance(gate, Mapping) or gate.get("name") not in to_clear
+            ]
         document.setdefault("reducer_version", REDUCER_VERSION)
         if current_order is not None:
             document["current_order"] = current_order

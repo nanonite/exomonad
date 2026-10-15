@@ -884,15 +884,25 @@ class EventDiagnostics:
         event: EventEnvelope,
         reason_code: str,
         candidates: Sequence[str],
+        *,
+        reporter_scope_path: Sequence[str] = (),
+        candidate_paths: Sequence[Sequence[str]] = (),
+        conflicting_aliases: Sequence[str] = (),
+        missing_proof: Sequence[str] = (),
     ) -> None:
         """Retain the stable reason for an unresolved blocked-event owner."""
         key = (event.run_seq or 0, event.event_type)
         if key in self.unresolved_event_keys:
             return
         self.unresolved_event_keys.add(key)
+        blocked = event.task_blocked
         self.unresolved_events.append(
             f"{event.event_type} seq={event.run_seq} reason={reason_code} "
-            f"candidates={list(candidates)}"
+            f"reporter={event.agent_id!r} subject={blocked.slice_id if blocked else None!r} "
+            f"reporter_scope={list(reporter_scope_path)} candidates={list(candidates)} "
+            f"candidate_scopes={[list(path) for path in candidate_paths]} "
+            f"conflicting_aliases={list(conflicting_aliases)} "
+            f"missing_proof={list(missing_proof)}"
         )
         self.rejected += 1
 
@@ -17877,6 +17887,16 @@ class _TaskBlockedOwner:
 
 
 @dataclass(frozen=True)
+class _TaskBlockedScopeIssue:
+    """One scope whose aliases did not resolve consistently."""
+
+    reason_code: str
+    path: tuple[str, ...]
+    state: RunState
+    resolution: IdentityResolution
+
+
+@dataclass(frozen=True)
 class _TaskBlockedOwnerLookup:
     """An unambiguous owner or a stable reason that recovery cannot be routed."""
 
@@ -17885,6 +17905,24 @@ class _TaskBlockedOwnerLookup:
     candidate_paths: tuple[tuple[str, ...], ...] = ()
     unavailable_paths: tuple[tuple[str, ...], ...] = ()
     candidate_slice_ids: tuple[str, ...] = ()
+    reporter_id: str | None = None
+    subject_slice_id: str | None = None
+    reporter_scope_path: tuple[str, ...] = ()
+    reporter_invocation_id: str | None = None
+    reporter_generation: int | None = None
+    conflicting_aliases: tuple[str, ...] = ()
+    missing_proof: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _TaskBlockedDisposition:
+    """Evidence-based decision made before recovery mutates a child scope."""
+
+    decision: str
+    reason_code: str
+    proof: tuple[str, ...] = ()
+    missing_proof: tuple[str, ...] = ()
+    evidence_digest: str | None = None
 
 
 def _route_task_blocked_event(
@@ -17911,6 +17949,51 @@ def _route_task_blocked_event(
         identity = resolve_event_slice(event, owner_state)
         if not identity.resolved or identity.slice_id != owner.slice_id:
             raise TLLoopError("task-blocked owner changed during recovery routing")
+        disposition = _classify_task_blocked_disposition(
+            event,
+            owner,
+            owner_state,
+            lookup,
+        )
+        if disposition.decision == "unresolved":
+            failed = replace(
+                lookup,
+                reason_code=disposition.reason_code,
+                missing_proof=disposition.missing_proof,
+            )
+            return _park_task_blocked_owner_issue(event, state, store, failed, diagnostics), False
+        if disposition.decision == "superseded_by_durable_completion":
+            store.record_task_blocked_disposition(
+                {
+                    "disposition_id": _task_blocked_disposition_id(event),
+                    "decision": disposition.decision,
+                    "run_seq": event.run_seq,
+                    "event_id": event.event_id,
+                    "event_type": event.event_type,
+                    "reporter_id": event.agent_id,
+                    "reporter_scope_path": list(lookup.reporter_scope_path),
+                    "subject_slice_id": owner.slice_id,
+                    "owner_path": list(owner.path),
+                    "attempt": event.task_blocked.attempt if event.task_blocked else None,
+                    "proof": list(disposition.proof),
+                    "evidence_digest": disposition.evidence_digest,
+                }
+            )
+            return _finish_superseded_nested_task_blocked_event(
+                event,
+                plan,
+                event_seq,
+                state,
+                convergence,
+                config,
+                effects,
+                store,
+                source,
+                replaying,
+                diagnostics,
+                effects_log,
+                lookup,
+            )
         owner_state = _record_task_blocked_recovery(
             event,
             owner_state,
@@ -18015,6 +18098,50 @@ def _finish_nested_task_blocked_event(
     return state, True
 
 
+def _finish_superseded_nested_task_blocked_event(
+    event: EventEnvelope,
+    plan: WorkPlan,
+    event_seq: int,
+    state: RunState,
+    convergence: ConvergenceTracker,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    source: EventQueue,
+    replaying: bool,
+    diagnostics: EventDiagnostics,
+    effects_log: list[EffectIntent],
+    lookup: _TaskBlockedOwnerLookup,
+) -> tuple[RunState, bool]:
+    """Project a durable supersession before atomically advancing and acking."""
+    try:
+        if plan.sub_tls:
+            state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
+        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+        latest = store.load()
+        gate_name = _task_blocked_owner_gate_name(event)
+        state = store.checkpoint(
+            _phase_from_state(latest),
+            latest.slices,
+            latest.budgets,
+            max(event_seq, latest.events.last_consumed_offset),
+            current_order=latest.current_order,
+            ordered_stages=latest.ordered_stages,
+            integration=latest.integration,
+            clear_gates=(gate_name,),
+        )
+    except (OSError, ValueError, RuntimeError):
+        failed = replace(lookup, reason_code="superseded_projection_failed")
+        return _park_task_blocked_owner_issue(event, state, store, failed, diagnostics), False
+    _ack_task_blocked_event(event, source, replaying, diagnostics, store)
+    return state, True
+
+
+def _task_blocked_disposition_id(event: EventEnvelope) -> str:
+    """Build a stable key from immutable event identity, never its age or cursor."""
+    return f"{event.event_type}:{event.run_seq}:{event.event_id or 'missing-event-id'}"
+
+
 def _clear_task_blocked_owner_gate(
     event: EventEnvelope,
     state: RunState,
@@ -18045,31 +18172,124 @@ def _resolve_task_blocked_owner(
     state: RunState,
     store: RunStore,
 ) -> _TaskBlockedOwnerLookup:
-    """Find the unique manifest-owned scope for a blocked event."""
+    """Resolve the subject while proving a controller reporter's scope path."""
     matches: list[_TaskBlockedOwner] = []
-    issues: list[tuple[str, tuple[str, ...], str | None]] = []
-    _collect_task_blocked_owners(event, state, store, (state.run_id,), matches, issues)
+    issues: list[_TaskBlockedScopeIssue] = []
+    scopes: dict[tuple[str, ...], tuple[RunState, RunStore]] = {}
+    _collect_task_blocked_owners(
+        event,
+        state,
+        store,
+        (state.run_id,),
+        matches,
+        issues,
+        scopes,
+    )
     paths = tuple(sorted({owner.path for owner in matches}))
     slice_ids = tuple(sorted({owner.slice_id for owner in matches}))
-    if len(matches) == 1 and not issues:
-        return _TaskBlockedOwnerLookup(owner=matches[0], candidate_paths=paths)
     if len(matches) > 1:
         return _TaskBlockedOwnerLookup(
             reason_code="ambiguous_owner",
             candidate_paths=paths,
             candidate_slice_ids=slice_ids,
+            reporter_id=event.agent_id,
+            subject_slice_id=_blocked_subject_id(event),
+            conflicting_aliases=_all_conflicting_aliases(issues),
+            missing_proof=("unique_manifest_owned_subject",),
         )
+    if len(matches) == 1:
+        owner = matches[0]
+        reporter = _resolve_task_blocked_reporter(event, owner, scopes)
+        invalid_issues = [
+            issue
+            for issue in issues
+            if not (
+                _is_proven_reporting_ancestor_issue(
+                    event,
+                    owner,
+                    reporter[0],
+                    issue,
+                    scopes,
+                )
+                or _is_proven_descendant_subject_alias(
+                    event,
+                    owner,
+                    reporter[0],
+                    issue,
+                    scopes,
+                )
+            )
+        ]
+        if reporter[0] is None:
+            return _TaskBlockedOwnerLookup(
+                reason_code=reporter[1],
+                candidate_paths=paths,
+                candidate_slice_ids=slice_ids,
+                reporter_id=event.agent_id,
+                subject_slice_id=owner.slice_id,
+                conflicting_aliases=_all_conflicting_aliases(invalid_issues),
+                missing_proof=(reporter[1],),
+            )
+        if not invalid_issues:
+            reporter_path, reporter_invocation, reporter_generation = reporter[0]
+            return _TaskBlockedOwnerLookup(
+                owner=owner,
+                candidate_paths=paths,
+                reporter_id=event.agent_id,
+                subject_slice_id=owner.slice_id,
+                reporter_scope_path=reporter_path,
+                reporter_invocation_id=reporter_invocation,
+                reporter_generation=reporter_generation,
+            )
+        issues = invalid_issues
     if issues:
-        reason, _, candidate = min(issues, key=lambda item: (item[0], item[1]))
+        issue = min(issues, key=lambda item: (item.reason_code, item.path))
+        reason = issue.reason_code
+        candidate = _blocked_subject_id(event)
         return _TaskBlockedOwnerLookup(
             reason_code=reason,
-            candidate_paths=tuple(sorted({path for _, path, _ in issues})),
+            candidate_paths=tuple(sorted(set(paths) | {entry.path for entry in issues})),
             unavailable_paths=tuple(
-                sorted({path for kind, path, _ in issues if kind != "owner_identity_mismatch"})
+                sorted(
+                    {
+                        entry.path
+                        for entry in issues
+                        if entry.reason_code
+                        not in {"owner_identity_conflict", "repository_identity_conflict"}
+                    }
+                )
             ),
             candidate_slice_ids=(candidate,) if candidate is not None else (),
+            reporter_id=event.agent_id,
+            subject_slice_id=candidate,
+            reporter_scope_path=(reporter[0][0] if len(matches) == 1 and reporter[0] else ()),
+            conflicting_aliases=_all_conflicting_aliases(issues),
+            missing_proof=tuple(
+                sorted(
+                    {
+                        entry.reason_code
+                        for entry in issues
+                        if entry.reason_code
+                        not in {"owner_identity_conflict", "repository_identity_conflict"}
+                    }
+                    | (
+                        {"consistent_event_aliases"}
+                        if any(
+                            entry.reason_code
+                            in {"owner_identity_conflict", "repository_identity_conflict"}
+                            for entry in issues
+                        )
+                        else set()
+                    )
+                )
+            ),
         )
-    return _TaskBlockedOwnerLookup()
+    return _TaskBlockedOwnerLookup(
+        reporter_id=event.agent_id,
+        subject_slice_id=_blocked_subject_id(event),
+        reason_code="owner_not_found",
+        missing_proof=("unique_manifest_owned_subject",),
+    )
 
 
 def _collect_task_blocked_owners(
@@ -18078,14 +18298,21 @@ def _collect_task_blocked_owners(
     store: RunStore,
     path: tuple[str, ...],
     matches: list[_TaskBlockedOwner],
-    issues: list[tuple[str, tuple[str, ...], str | None]],
+    issues: list[_TaskBlockedScopeIssue],
+    scopes: dict[tuple[str, ...], tuple[RunState, RunStore]],
 ) -> None:
     """Walk declared child scopes and collect matching durable owners."""
+    scopes[path] = (state, store)
     resolution = resolve_event_slice(event, state)
     if resolution.resolved and resolution.slice_id is not None:
         matches.append(_TaskBlockedOwner(store, resolution.slice_id, path))
-    elif resolution.candidates:
-        issues.append(("owner_identity_conflict", path, event.task_blocked.slice_id))
+    elif resolution.candidates or resolution.rejected_aliases:
+        reason = (
+            "repository_identity_conflict"
+            if resolution.reason == "repository_identity_conflict"
+            else "owner_identity_conflict"
+        )
+        issues.append(_TaskBlockedScopeIssue(reason, path, state, resolution))
     manifest = state.plan_manifest
     if manifest is None:
         return
@@ -18099,22 +18326,568 @@ def _collect_task_blocked_owners(
         child_path = (*path, node.name)
         if not child_store.path.exists():
             if _manifest_contains_blocked_slice(event, child_manifest):
-                issues.append(("child_state_missing", child_path, event.task_blocked.slice_id))
+                issues.append(
+                    _TaskBlockedScopeIssue("child_state_missing", child_path, state, resolution)
+                )
             continue
         try:
             child_state = child_store.load()
         except (OSError, ValueError):
             if _manifest_contains_blocked_slice(event, child_manifest):
-                issues.append(("child_state_unavailable", child_path, event.task_blocked.slice_id))
+                issues.append(
+                    _TaskBlockedScopeIssue("child_state_unavailable", child_path, state, resolution)
+                )
             continue
         if not _child_owner_checkpoint_matches(state, node.name, child_state, child_manifest):
             if (
                 _manifest_contains_blocked_slice(event, child_manifest)
                 or resolve_event_slice(event, child_state).candidates
             ):
-                issues.append(("owner_identity_mismatch", child_path, event.task_blocked.slice_id))
+                issues.append(
+                    _TaskBlockedScopeIssue("owner_identity_mismatch", child_path, state, resolution)
+                )
             continue
-        _collect_task_blocked_owners(event, child_state, child_store, child_path, matches, issues)
+        _collect_task_blocked_owners(
+            event,
+            child_state,
+            child_store,
+            child_path,
+            matches,
+            issues,
+            scopes,
+        )
+
+
+def _blocked_subject_id(event: EventEnvelope) -> str | None:
+    """Return the typed blocked subject, never deriving it from reporter text."""
+    return event.task_blocked.slice_id if event.task_blocked is not None else None
+
+
+def _all_conflicting_aliases(issues: Sequence[_TaskBlockedScopeIssue]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {alias for issue in issues for alias in issue.resolution.rejected_aliases}
+            | {
+                f"{alias}->{slice_id}"
+                for issue in issues
+                for alias, slice_ids in issue.resolution.evidence.items()
+                for slice_id in slice_ids
+            }
+        )
+    )
+
+
+def _resolve_task_blocked_reporter(
+    event: EventEnvelope,
+    owner: _TaskBlockedOwner,
+    scopes: Mapping[tuple[str, ...], tuple[RunState, RunStore]],
+) -> tuple[tuple[tuple[str, ...], str | None, int | None] | None, str]:
+    """Bind the reporter to a persisted controller scope or dispatch owner."""
+    reporter_id = event.agent_id
+    owner_state, _ = scopes[owner.path]
+    current = owner_state.slices.get(owner.slice_id)
+    candidates: list[tuple[tuple[str, ...], str | None, int | None]] = []
+    if current is not None and reporter_id in {owner.slice_id, current.dispatch_agent_id}:
+        candidates.append((owner.path, current.dispatch_invocation_id, current.dispatch_generation))
+    if isinstance(reporter_id, str) and reporter_id:
+        for index, scope_id in enumerate(owner.path):
+            if reporter_id != scope_id:
+                continue
+            scope_path = owner.path[: index + 1]
+            if index == 0:
+                candidates.append((scope_path, None, None))
+                continue
+            parent_path = owner.path[:index]
+            parent_entry = scopes.get(parent_path)
+            child_entry = scopes.get(scope_path)
+            if parent_entry is None or child_entry is None:
+                continue
+            parent_state, _ = parent_entry
+            child_state, _ = child_entry
+            binding = parent_state.slices.get(scope_id)
+            if (
+                binding is not None
+                and child_state.parent_run_id == parent_state.run_id
+                and _task_blocked_reporter_binding_is_durable(
+                    event,
+                    parent_state,
+                    scope_id,
+                    child_state,
+                    binding,
+                )
+            ):
+                candidates.append(
+                    (
+                        scope_path,
+                        binding.dispatch_invocation_id,
+                        binding.dispatch_generation,
+                    )
+                )
+    if len(candidates) == 1:
+        return candidates[0], "resolved"
+    if len(candidates) > 1:
+        return None, "reporter_scope_ambiguous"
+    if reporter_id is None and current is not None and event.invocation_id:
+        known = {
+            current.dispatch_invocation_id,
+            current.publication.invocation_id if current.publication is not None else None,
+            current.handoff.invocation_id if current.handoff is not None else None,
+        }
+        if event.invocation_id in known:
+            return (
+                owner.path,
+                current.dispatch_invocation_id,
+                current.dispatch_generation,
+            ), "resolved"
+    return None, "reporter_scope_unproven"
+
+
+def _task_blocked_reporter_binding_is_durable(
+    event: EventEnvelope,
+    parent_state: RunState,
+    child_name: str,
+    child_state: RunState,
+    binding: SliceState,
+) -> bool:
+    """Prove the reporter through the original dispatch or persisted aggregate owner."""
+    if binding.dispatch_agent_id == event.agent_id and _sub_tl_dispatch_binding_is_durable(binding):
+        return True
+    candidate = parent_state.integration.candidates.get(child_name)
+    if candidate is None:
+        return False
+    aggregate_lifecycles = {
+        IntegrationLifecycle.AGGREGATE_PR_OPEN,
+        IntegrationLifecycle.CODE_REVIEWED,
+        IntegrationLifecycle.READY_FOR_INTEGRATION,
+        IntegrationLifecycle.INTEGRATION_VALIDATED,
+        IntegrationLifecycle.MERGING,
+        IntegrationLifecycle.MERGED,
+    }
+    return (
+        event.agent_id == child_name
+        and child_state.run_id == child_name
+        and binding.status in {SliceStatus.IN_REVIEW, SliceStatus.MERGED}
+        and candidate.lifecycle in aggregate_lifecycles
+        and bool(candidate.aggregate_patch_digest)
+        and bool(candidate.aggregate_original_base_sha)
+        and candidate.integration_owner_run_id == child_state.run_id
+        and candidate.integration_owner_id == binding.dispatch_agent_id
+        and candidate.aggregate_pr_number is not None
+        and candidate.aggregate_pr_number == binding.pr_number
+        and candidate.integration_owner_branch == binding.branch
+        and candidate.integration_owner_branch == child_state.owner_branch
+        and candidate.aggregate_head_sha == binding.reviewed_head
+        and binding.dispatch_last_boundary in _AGGREGATE_DISPATCH_BOUNDARIES
+    )
+
+
+def _sub_tl_dispatch_binding_is_durable(binding: SliceState) -> bool:
+    return (
+        isinstance(binding.dispatch_intent_id, str)
+        and bool(binding.dispatch_intent_id)
+        and binding.status is not SliceStatus.PENDING
+        and binding.dispatch_last_boundary in RECONCILED_SUB_TL_DISPATCH_BOUNDARIES
+    )
+
+
+def _is_proven_reporting_ancestor_issue(
+    event: EventEnvelope,
+    owner: _TaskBlockedOwner,
+    reporter: tuple[tuple[str, ...], str | None, int | None] | None,
+    issue: _TaskBlockedScopeIssue,
+    scopes: Mapping[tuple[str, ...], tuple[RunState, RunStore]],
+) -> bool:
+    """Ignore only the exact subject alias explained by a bound child reporter."""
+    subject = _blocked_subject_id(event)
+    if issue.reason_code != "owner_identity_conflict" or subject is None or reporter is None:
+        return False
+    reporter_path = reporter[0]
+    if len(reporter_path) <= len(issue.path) or owner.path[: len(issue.path)] != issue.path:
+        return False
+    if owner.path[: len(reporter_path)] != reporter_path or reporter_path[:-1] != issue.path:
+        return False
+    reporter_slice_id = reporter_path[-1]
+    resolution = issue.resolution
+    if resolution.candidates != (reporter_slice_id,):
+        return False
+    if dict(resolution.evidence) != {"agent_id": (reporter_slice_id,)}:
+        return False
+    if set(resolution.rejected_aliases) != {f"slice_id={subject}"}:
+        return False
+    parent_entry = scopes.get(issue.path)
+    child_entry = scopes.get(reporter_path)
+    if parent_entry is None or child_entry is None:
+        return False
+    parent_state, _ = parent_entry
+    child_state, _ = child_entry
+    if parent_state.plan_manifest is None:
+        return False
+    child_node = next(
+        (
+            node
+            for node in parent_state.plan_manifest.nodes
+            if node.kind == "sub_tl" and node.name == reporter_slice_id
+        ),
+        None,
+    )
+    if child_node is None:
+        return False
+    child_manifest = parent_state.plan_manifest.child_manifests.get(child_node.node_id)
+    binding = parent_state.slices.get(reporter_slice_id)
+    return (
+        child_manifest is not None
+        and binding is not None
+        and _child_owner_checkpoint_matches(
+            parent_state,
+            reporter_slice_id,
+            child_state,
+            child_manifest,
+        )
+        and _task_blocked_reporter_binding_is_durable(
+            event,
+            parent_state,
+            reporter_slice_id,
+            child_state,
+            binding,
+        )
+    )
+
+
+def _is_proven_descendant_subject_alias(
+    event: EventEnvelope,
+    owner: _TaskBlockedOwner,
+    reporter: tuple[tuple[str, ...], str | None, int | None] | None,
+    issue: _TaskBlockedScopeIssue,
+    scopes: Mapping[tuple[str, ...], tuple[RunState, RunStore]],
+) -> bool:
+    """Accept an absent local subject only when the exact child binding owns it."""
+    subject = _blocked_subject_id(event)
+    if subject is None or issue.reason_code != "owner_identity_conflict":
+        return False
+    if len(owner.path) <= len(issue.path) or owner.path[: len(issue.path)] != issue.path:
+        return False
+    if issue.resolution.candidates or issue.resolution.evidence:
+        return False
+    if set(issue.resolution.rejected_aliases) != {f"slice_id={subject}"}:
+        return False
+    if reporter is not None:
+        reporter_path = reporter[0]
+        if (
+            owner.path[: len(reporter_path)] == reporter_path
+            and reporter_path[: len(issue.path)] == issue.path
+        ):
+            return True
+    owner_entry = scopes.get(owner.path)
+    if owner_entry is None:
+        return False
+    owner_state, _ = owner_entry
+    current = owner_state.slices.get(owner.slice_id)
+    return current is not None and event.agent_id in {owner.slice_id, current.dispatch_agent_id}
+
+
+def _classify_task_blocked_disposition(
+    event: EventEnvelope,
+    owner: _TaskBlockedOwner,
+    owner_state: RunState,
+    lookup: _TaskBlockedOwnerLookup,
+) -> _TaskBlockedDisposition:
+    """Choose recovery, supersession, or a safe park from persisted evidence."""
+    blocked = event.task_blocked
+    current = owner_state.slices.get(owner.slice_id)
+    if blocked is None or current is None:
+        return _unresolved_task_blocked("subject_checkpoint_missing", "subject_checkpoint")
+    identity_failure = _task_blocked_runtime_identity_failure(event, current, lookup)
+    if identity_failure is not None:
+        return _unresolved_task_blocked(identity_failure, identity_failure)
+    if current.status is SliceStatus.MERGED:
+        proof, missing = _completed_task_blocked_proof(event, current, owner_state)
+        if missing:
+            return _TaskBlockedDisposition(
+                "unresolved",
+                "completed_child_evidence_incomplete",
+                missing_proof=missing,
+            )
+        encoded = json.dumps(
+            {
+                "slice_id": current.id,
+                "attempts": current.attempts,
+                "status": current.status.value,
+                "publication": _publication_evidence_document(current.publication),
+                "handoff": _handoff_evidence_document(current.handoff),
+                "post_merge": dict(current.post_merge.evidence)
+                if current.post_merge is not None
+                else None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return _TaskBlockedDisposition(
+            "superseded_by_durable_completion",
+            "completed_child_receipts_match_blocker",
+            proof=proof,
+            evidence_digest=hashlib.sha256(encoded).hexdigest(),
+        )
+    if current.status in {
+        SliceStatus.SPAWNED,
+        SliceStatus.IN_REVIEW,
+        SliceStatus.REPAIRING,
+        SliceStatus.BLOCKED,
+        SliceStatus.PARKED,
+        SliceStatus.DISPATCH_UNCONFIRMED,
+        SliceStatus.DISPATCH_RETRY_SCHEDULED,
+    }:
+        if current.attempts != blocked.attempt:
+            return _unresolved_task_blocked("blocker_attempt_mismatch", "current_attempt")
+        return _TaskBlockedDisposition(
+            "actionable",
+            "active_child_attempt_matches_blocker",
+            proof=(
+                f"scope={owner.path}",
+                f"dispatch_intent_id={current.dispatch_intent_id or 'legacy-unavailable'}",
+                f"attempt={blocked.attempt}",
+            ),
+        )
+    return _unresolved_task_blocked("child_not_actionable_or_completed", "active_or_complete_state")
+
+
+def _task_blocked_runtime_identity_failure(
+    event: EventEnvelope,
+    current: SliceState,
+    lookup: _TaskBlockedOwnerLookup,
+) -> str | None:
+    """Reject observed invocation or generation conflicts without guessing."""
+    if event.invocation_id is not None:
+        expected = lookup.reporter_invocation_id
+        if expected is None:
+            return "reporter_invocation_binding_missing"
+        if event.invocation_id != expected:
+            return "reporter_invocation_mismatch"
+    if event.generation is not None:
+        if lookup.reporter_generation is None:
+            return "reporter_generation_binding_missing"
+        if event.generation != lookup.reporter_generation:
+            return "reporter_generation_mismatch"
+    if event.task_blocked is not None and event.task_blocked.attempt <= 0:
+        return "invalid_blocker_attempt"
+    if current.status is SliceStatus.MERGED and current.attempts not in {
+        0,
+        event.task_blocked.attempt if event.task_blocked is not None else -1,
+    }:
+        return "completed_attempt_mismatch"
+    return None
+
+
+def _completed_task_blocked_proof(
+    event: EventEnvelope,
+    current: SliceState,
+    state: RunState,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Validate exact publication, handoff, merge, closure, and push evidence."""
+    blocked = event.task_blocked
+    publication = current.publication
+    handoff = current.handoff
+    receipt = current.post_merge
+    missing: list[str] = []
+    if current.verdict is not Verdict.GO:
+        missing.append("accepted_review_verdict")
+    if current.recovery is not None:
+        missing.append("terminal_recovery_absent")
+    if blocked is None:
+        missing.append("blocked_attempt")
+    if publication is None:
+        missing.append("publication_binding")
+    if handoff is None:
+        missing.append("handoff_receipt")
+    if receipt is None or receipt.phase is not PostMergePhase.COMPLETE:
+        missing.append("post_merge_complete_receipt")
+    if state.repository_identity is None:
+        missing.append("repository_identity")
+    if missing:
+        return (), tuple(sorted(set(missing)))
+    assert blocked is not None and publication is not None and handoff is not None
+    assert receipt is not None and state.repository_identity is not None
+    evidence = receipt.evidence
+    expected_attempt = blocked.attempt
+    expected_head = publication.head_sha
+    expected_pr = current.pr_number
+    _require_completion_match(missing, bool(current.dispatch_intent_id), "dispatch_intent")
+    _require_completion_match(
+        missing,
+        current.dispatch_agent_id is None or handoff.agent_id == current.dispatch_agent_id,
+        "dispatch_handoff_agent",
+    )
+    _require_completion_match(missing, current.attempts in {0, expected_attempt}, "slice_attempt")
+    _require_completion_match(
+        missing, publication.attempt == expected_attempt, "publication_attempt"
+    )
+    _require_completion_match(missing, handoff.attempt == expected_attempt, "handoff_attempt")
+    _require_completion_match(missing, expected_pr == publication.pr_number, "publication_pr")
+    _require_completion_match(missing, handoff.pr_number == publication.pr_number, "handoff_pr")
+    _require_completion_match(missing, current.reviewed_head == expected_head, "reviewed_head")
+    _require_completion_match(missing, handoff.head_sha == expected_head, "handoff_head")
+    _require_completion_match(missing, current.branch == publication.head_branch, "head_branch")
+    _require_completion_match(
+        missing, publication.base_branch == evidence.get("parent_branch"), "base_branch"
+    )
+    _require_completion_match(missing, evidence.get("child_id") == current.id, "merge_child_id")
+    _require_completion_match(
+        missing, evidence.get("pr_number") == str(expected_pr), "merge_pr_number"
+    )
+    _require_completion_match(missing, evidence.get("head_sha") == expected_head, "merge_head_sha")
+    try:
+        receipt_repository = canonical_repository_url(evidence.get("repository", ""))
+    except ValueError:
+        receipt_repository = None
+    _require_completion_match(
+        missing,
+        receipt_repository == state.repository_identity.remote_url,
+        "merge_repository_identity",
+    )
+    _require_completion_match(
+        missing,
+        bool(evidence.get("merge_journal_id")),
+        "merge_journal_receipt",
+    )
+    _validate_completed_issue_closure(current, evidence, missing)
+    _validate_completed_push_receipt(current, evidence, missing)
+    if publication.invocation_id and handoff.invocation_id != publication.invocation_id:
+        missing.append("publication_handoff_invocation")
+    if current.dispatch_invocation_id and handoff.invocation_id != current.dispatch_invocation_id:
+        missing.append("dispatch_handoff_invocation")
+    if blocked.attempt != publication.attempt or blocked.attempt != handoff.attempt:
+        missing.append("blocker_attempt_history")
+    if missing:
+        return (), tuple(sorted(set(missing)))
+    proof = (
+        f"attempt={expected_attempt}",
+        f"pr={publication.pr_number}",
+        f"head_sha={publication.head_sha}",
+        f"merge_journal_id={evidence['merge_journal_id']}",
+        f"issue_close={evidence.get('issue_close_journal_id') or evidence.get('issue_close_observed_status')}",
+        f"push_receipt_id={evidence['push_receipt_id']}",
+        f"push_journal_id={evidence['push_journal_id']}",
+    )
+    return proof, ()
+
+
+def _require_completion_match(
+    missing: list[str],
+    matches: bool,
+    evidence_name: str,
+) -> None:
+    if not matches:
+        missing.append(evidence_name)
+
+
+def _validate_completed_issue_closure(
+    current: SliceState,
+    evidence: Mapping[str, str],
+    missing: list[str],
+) -> None:
+    if current.chainlink_issue_id is None:
+        _require_completion_match(
+            missing,
+            evidence.get("issue_close_outcome") == "not_applicable",
+            "optional_issue_closure_receipt",
+        )
+        return
+    _require_completion_match(
+        missing,
+        evidence.get("issue_id") == str(current.chainlink_issue_id),
+        "issue_close_issue_id",
+    )
+    outcome = evidence.get("issue_close_outcome")
+    if outcome == "already_closed":
+        _require_completion_match(
+            missing,
+            evidence.get("issue_close_observed_issue_id") == str(current.chainlink_issue_id)
+            and evidence.get("issue_close_observed_status") == "closed",
+            "issue_already_closed_receipt",
+        )
+    else:
+        _require_completion_match(
+            missing,
+            outcome == "closed" and bool(evidence.get("issue_close_journal_id")),
+            "issue_close_journal_receipt",
+        )
+
+
+def _validate_completed_push_receipt(
+    current: SliceState,
+    evidence: Mapping[str, str],
+    missing: list[str],
+) -> None:
+    try:
+        receipt = PushReceipt(
+            repository=evidence["repository"],
+            parent_branch=evidence["parent_branch"],
+            child_id=evidence["child_id"],
+            lane_epoch=int(evidence["lane_epoch"]),
+            push_intent_id=evidence["parent_push_intent_id"],
+            push_journal_id=evidence["push_journal_id"],
+            push_receipt_id=evidence["push_receipt_id"],
+            expected_base_sha=evidence["expected_base_sha"],
+            pushed_commit=evidence["pushed_commit"],
+            observed_remote_head=evidence["observed_remote_head"],
+            ancestry_proof=evidence["ancestry_proof"],
+        )
+    except (KeyError, TypeError, ValueError):
+        missing.append("typed_parent_push_receipt")
+        return
+    _require_completion_match(missing, receipt.child_id == current.id, "push_child_id")
+    _require_completion_match(
+        missing,
+        receipt.pushed_commit == evidence.get("bookkeeping_commit"),
+        "push_bookkeeping_commit",
+    )
+    _require_completion_match(
+        missing,
+        receipt.observed_remote_head == receipt.pushed_commit,
+        "push_observed_head",
+    )
+    _require_completion_match(
+        missing,
+        receipt.ancestry_proof
+        == f"ancestor:{receipt.pushed_commit}->{receipt.observed_remote_head}",
+        "push_ancestry_proof",
+    )
+
+
+def _publication_evidence_document(publication: PublicationBinding | None) -> object:
+    if publication is None:
+        return None
+    return {
+        "pr_number": publication.pr_number,
+        "head_sha": publication.head_sha,
+        "head_branch": publication.head_branch,
+        "base_branch": publication.base_branch,
+        "attempt": publication.attempt,
+        "invocation_id": publication.invocation_id,
+    }
+
+
+def _handoff_evidence_document(handoff: HandoffEvidence | None) -> object:
+    if handoff is None:
+        return None
+    return {
+        "pr_number": handoff.pr_number,
+        "head_sha": handoff.head_sha,
+        "attempt": handoff.attempt,
+        "invocation_id": handoff.invocation_id,
+        "agent_id": handoff.agent_id,
+        "observed_at": handoff.observed_at,
+    }
+
+
+def _unresolved_task_blocked(
+    reason_code: str,
+    missing_evidence: str,
+) -> _TaskBlockedDisposition:
+    return _TaskBlockedDisposition(
+        "unresolved",
+        reason_code,
+        missing_proof=(missing_evidence,),
+    )
 
 
 def _child_owner_checkpoint_matches(
@@ -18167,7 +18940,15 @@ def _park_task_blocked_owner_issue(
     """Persist a retryable owner-routing park without advancing the event cursor."""
     blocked = event.task_blocked
     reason = lookup.reason_code
-    diagnostics.record_task_blocked_owner_issue(event, reason, lookup.candidate_slice_ids)
+    diagnostics.record_task_blocked_owner_issue(
+        event,
+        reason,
+        lookup.candidate_slice_ids,
+        reporter_scope_path=lookup.reporter_scope_path,
+        candidate_paths=lookup.candidate_paths,
+        conflicting_aliases=lookup.conflicting_aliases,
+        missing_proof=lookup.missing_proof,
+    )
     audit = {
         "run_seq": event.run_seq,
         "event_id": event.event_id,
@@ -18177,6 +18958,9 @@ def _park_task_blocked_owner_issue(
         "observed_slice_id": blocked.slice_id if blocked is not None else None,
         "observed_agent_id": event.agent_id,
         "observed_invocation_id": event.invocation_id,
+        "reporter_scope_path": list(lookup.reporter_scope_path),
+        "conflicting_aliases": list(lookup.conflicting_aliases),
+        "missing_proof": list(lookup.missing_proof),
         "candidate_owner_paths": [list(path) for path in lookup.candidate_paths],
         "unavailable_owner_paths": [list(path) for path in lookup.unavailable_paths],
     }
