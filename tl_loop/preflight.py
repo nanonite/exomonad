@@ -42,6 +42,7 @@ def run_preflight(
     *,
     allow_missing_plan: bool = False,
     expected_plan_digest: str | None = None,
+    expected_plan_compatibility_version: int | None = None,
 ) -> PreflightReport:
     """Validate controller files, policy coverage, and the structured plan."""
     root = Path(project_root).expanduser().resolve()
@@ -58,6 +59,7 @@ def run_preflight(
             f"{fingerprint}. Rebuild and install with just install-all-dev; "
             "--recreate does not update runtime artifacts"
         )
+    _validate_archive_compatibility(fingerprint, expected_plan_compatibility_version)
 
     required = (config_path, policy_path, review_path)
     if not allow_missing_plan:
@@ -90,6 +92,72 @@ def run_preflight(
             for path in (config_path, policy_path, review_path, capability_path, plan_path)
             if path.is_file()
         ),
+    )
+
+
+def run_plan_compatibility_check(
+    project_root: str | Path,
+    *,
+    expected_plan_compatibility_version: int | None = None,
+) -> None:
+    """Require any supported persisted-plan migration before controller startup."""
+    root = Path(project_root).expanduser().resolve()
+    fingerprint = fingerprint_report(root)
+    if fingerprint["status"] == "invalid":
+        raise PreflightError(
+            "invalid TL controller archive compatibility metadata: "
+            f"{fingerprint}. Rebuild and install with just install-all-dev"
+        )
+    _validate_archive_compatibility(fingerprint, expected_plan_compatibility_version)
+    _check_workspace_plan_compatibility(root)
+
+
+def _validate_archive_compatibility(
+    fingerprint: Mapping[str, object],
+    expected_version: int | None,
+) -> None:
+    if expected_version is None:
+        return
+    archive = fingerprint.get("archive")
+    actual_version = (
+        archive.get("plan_compatibility_version") if isinstance(archive, Mapping) else None
+    )
+    if actual_version != expected_version:
+        raise PreflightError(
+            "incompatible installed TL controller compatibility metadata: "
+            f"expected plan compatibility version {expected_version}, found {actual_version!r}"
+        )
+
+
+def _check_workspace_plan_compatibility(project_root: Path) -> None:
+    checkpoint = project_root / ".exo" / "tl-loop" / "root" / "run.json"
+    if not checkpoint.is_file():
+        return
+    try:
+        from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
+
+        analysis = analyze_plan_reconciliation(project_root)
+    except ValueError as error:
+        code = getattr(error, "code", "plan_compatibility_unresolved")
+        raise PreflightError(
+            f"persisted plan compatibility could not be proven ({code}): {error}"
+        ) from error
+    transition = analysis.compatibility_transition
+    if transition is None:
+        return
+    dry_run = "exomonad plan reconcile --dry-run"
+    apply = (
+        'exomonad plan reconcile --apply --reason "Migrate legacy aggregate review defaults" '
+        f"--expected-fingerprint {analysis.evidence_fingerprint}"
+    )
+    if analysis.can_apply:
+        detail = "the audited compatibility transition is ready to apply"
+    else:
+        blockers = ", ".join(sorted({item.code for item in analysis.blockers}))
+        detail = f"the transition is blocked by {blockers or 'unresolved evidence'}"
+    raise PreflightError(
+        "persisted plan migration is required before continuation; "
+        f"{detail}. Review `{dry_run}` and apply only when can_apply is true using `{apply}`"
     )
 
 
@@ -202,9 +270,7 @@ def _validate_plan_spawn_routes(document: object, path: Path) -> None:
                         try:
                             parse_harness_identifier(route)
                         except ValueError as error:
-                            errors.append(
-                                f"{path}:{location}.{kind}[{index}].agent_type: {error}"
-                            )
+                            errors.append(f"{path}:{location}.{kind}[{index}].agent_type: {error}")
                 nested = entry.get("plan")
                 if isinstance(nested, Mapping):
                     visit(nested, f"{location}.{kind}[{index}].plan")

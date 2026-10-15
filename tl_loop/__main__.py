@@ -50,7 +50,7 @@ from tl_loop.plan_validation import (
     validate_plan_document,
     validate_plan_proposal,
 )
-from tl_loop.preflight import PreflightError, run_preflight
+from tl_loop.preflight import PreflightError, run_plan_compatibility_check, run_preflight
 from tl_loop.rlm.plan_acceptance import (
     gate_status_of,
     install_accepted_plan,
@@ -104,6 +104,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "recovery-command",
         "task-budget-reset",
         "preflight",
+        "plan-compatibility-check",
         "-h",
         "--help",
     }:
@@ -141,10 +142,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.project_root,
                 allow_missing_plan=args.allow_missing_plan,
                 expected_plan_digest=args.expected_plan_digest,
+                expected_plan_compatibility_version=args.expected_plan_compatibility_version,
             )
             print(
                 "TL preflight passed: config.toml, harness_policy.toml, review-policy.toml, harness_capability.toml"
             )
+        elif args.command == "plan-compatibility-check":
+            run_plan_compatibility_check(
+                args.project_root,
+                expected_plan_compatibility_version=args.expected_plan_compatibility_version,
+            )
+            print("TL plan compatibility check passed")
         elif args.command == "recovery-command":
             _recovery_command(args)
         elif args.command == "task-budget-reset":
@@ -366,7 +374,16 @@ def _parser() -> argparse.ArgumentParser:
     _add_project_options(preflight)
     preflight.add_argument("--allow-missing-plan", action="store_true")
     preflight.add_argument("--expected-plan-digest")
+    preflight.add_argument("--expected-plan-compatibility-version", type=int)
     preflight.set_defaults(command="preflight")
+
+    compatibility = subcommands.add_parser(
+        "plan-compatibility-check",
+        help="require supported persisted-plan migrations before continuation",
+    )
+    _add_project_options(compatibility)
+    compatibility.add_argument("--expected-plan-compatibility-version", type=int)
+    compatibility.set_defaults(command="plan-compatibility-check")
 
     return parser
 

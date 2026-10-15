@@ -1392,6 +1392,7 @@ def run_tl_loop(
             plan,
             existing_state,
             selected,
+            Path(root_dir),
         )
     identity_required = _repository_identity_required(existing_state, selected)
     if checkpoint_error is not None and not identity_required:
@@ -16462,6 +16463,7 @@ def _verify_supplied_plan_before_identity_recovery(
     plan: WorkPlan | Mapping[str, object] | None,
     state: RunState,
     config: TLLoopConfig,
+    runstore_root: Path,
 ) -> None:
     """Reject stale declarations before identity migration can write a checkpoint."""
     manifest = state.plan_manifest
@@ -16477,12 +16479,50 @@ def _verify_supplied_plan_before_identity_recovery(
             f"{manifest.digest} differs from supplied plan digest {candidate.digest}; "
             "archive the completed run before starting a new plan"
         )
+    project_root = (
+        Path(config.project_root).expanduser().absolute()
+        if config.project_root is not None
+        else runstore_root.expanduser().absolute().parent.parent
+    )
+    migration_message = _plan_compatibility_migration_message(project_root, run_id)
+    if migration_message is not None:
+        raise TLLoopError(migration_message)
     raise TLLoopError(
         "external plan differs from the persisted manifest; use "
         "`exomonad plan revise --dry-run` and apply the audited revision. "
         "If revision analysis reports unversioned drift, inspect "
         "`exomonad plan reconcile --dry-run` and apply only with its "
         "current evidence fingerprint."
+    )
+
+
+def _plan_compatibility_migration_message(project_root: Path, run_id: str) -> str | None:
+    """Use the advertised migration assessment before the generic drift message."""
+    from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
+
+    try:
+        analysis = analyze_plan_reconciliation(project_root, run_id=run_id)
+    except ValueError as error:
+        code = getattr(error, "code", None)
+        if code == "unsupported_aggregate_review_policy":
+            return f"unsupported plan policy: {error}"
+        return None
+    transition = analysis.compatibility_transition
+    if transition is None:
+        return None
+    apply = (
+        'exomonad plan reconcile --apply --reason "Migrate legacy aggregate review defaults" '
+        f"--expected-fingerprint {analysis.evidence_fingerprint}"
+    )
+    if analysis.can_apply:
+        status = "the audited compatibility migration is ready"
+    else:
+        blockers = ", ".join(sorted({item.code for item in analysis.blockers}))
+        status = f"the migration is blocked by {blockers or 'unresolved evidence'}"
+    return (
+        "persisted plan compatibility migration is required before dispatch; "
+        f"{status}. Run `exomonad plan reconcile --dry-run`; apply only when can_apply "
+        f"is true using `{apply}`"
     )
 
 

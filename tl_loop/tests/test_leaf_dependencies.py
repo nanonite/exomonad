@@ -220,7 +220,7 @@ def test_a_legacy_checkpoint_carries_no_edges_and_still_loads() -> None:
 #: Both are explicit so changes to either versioned shape are reviewed.
 _PRE_DEPENDENCY_MANIFEST_DIGEST = "b06d18fbfc7cfbdc0aec99269537d3e418c4f139f1cca549a304294be60f06a7"
 _CURRENT_EDGE_FREE_MANIFEST_DIGEST = (
-    "b9502e8a979a5bfb6bdfa1aa1b28af9d68ca386976835e10a4d52fac625c2a0c"
+    "94645a1d984b7a0cabec1e67194ceb346c1f1aafb18346310dc9be6da7716804"
 )
 
 #: A real manifest document written by that earlier serializer: no node carries

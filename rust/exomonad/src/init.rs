@@ -4860,6 +4860,23 @@ fn run_tl_loop_preflight(
     Ok(())
 }
 
+fn run_tl_loop_plan_compatibility_check(cwd: &Path, package_root: &Path) -> Result<()> {
+    let interpreter = check_tl_loop_python(cwd)?;
+    let compatibility_version = PLAN_COMPATIBILITY_VERSION.to_string();
+    let status = std::process::Command::new(interpreter)
+        .arg(package_root)
+        .args(["plan-compatibility-check", "--project-root"])
+        .arg(cwd)
+        .arg("--expected-plan-compatibility-version")
+        .arg(compatibility_version)
+        .status()
+        .context("failed to run TL plan compatibility check")?;
+    if !status.success() {
+        anyhow::bail!("TL plan compatibility check failed with {status}");
+    }
+    Ok(())
+}
+
 fn recover_tl_loop_plan_revision(cwd: &Path, package_root: &Path) -> Result<()> {
     if !plan_revision_recovery_needed(cwd)? {
         return Ok(());
@@ -6219,6 +6236,9 @@ pub async fn run(
         let _plan_transition_lock = acquire_plan_transition_lock_async(&cwd).await?;
         recover_plan_transition_locked(&cwd, &mut no_transition_failure)?;
         recover_tl_loop_plan_revision(&cwd, &tl_loop_root)?;
+        if mode == SessionMode::Continue {
+            run_tl_loop_plan_compatibility_check(&cwd, &tl_loop_root)?;
+        }
     }
     let mut mode = mode;
     let recreate = mode.is_recreate();
@@ -13338,6 +13358,83 @@ mod tests {
 
         assert!(validation < plan);
         assert!(validation < recreate);
+    }
+
+    #[test]
+    fn continuation_checks_plan_compatibility_before_snapshot_validation() {
+        let source = include_str!("init.rs");
+        let compatibility = source
+            .find("run_tl_loop_plan_compatibility_check(&cwd, &tl_loop_root)?")
+            .expect("continue must run workspace compatibility assessment");
+        let snapshot = source
+            .find("validate_or_record_plan_snapshot_locked(&cwd, mode)?")
+            .expect("continue must validate the saved plan snapshot");
+        let inbox_reset = source
+            .find("if reset_inbox {")
+            .expect("init inbox reset is an externally visible side effect");
+
+        assert!(compatibility < snapshot);
+        assert!(compatibility < inbox_reset);
+    }
+
+    #[test]
+    fn production_controller_command_detects_unchanged_legacy_manifest_shape() {
+        let project = tempfile::tempdir().unwrap();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let fixture_script = concat!(
+            "import sys; from pathlib import Path; ",
+            "from tl_loop.tests.test_plan_reconciliation import _project; ",
+            "_project(Path(sys.argv[1]), candidate_issue_id=None, ",
+            "legacy_aggregate_review_default=True, ",
+            "legacy_completed_issue_binding=True, ",
+            "include_completed_spawn_journal=True, legacy_completed_dispatch=True, ",
+            "controller_alias='architecture', five_ordered_stages=True)"
+        );
+        let fixture_status = Command::new("python3")
+            .arg("-c")
+            .arg(fixture_script)
+            .arg(project.path())
+            .env("PYTHONPATH", &repository)
+            .status()
+            .expect("run Python test fixture builder");
+        assert!(fixture_status.success());
+
+        let archive = project.path().join("tl_loop.pyz");
+        std::fs::write(&archive, TL_LOOP_ARCHIVE).unwrap();
+        let before_snapshot =
+            std::fs::read(project.path().join(".exo/tl-loop/plan.snapshot")).unwrap();
+        let before_candidate =
+            std::fs::read(project.path().join(".exo/tl-loop/plan.json")).unwrap();
+
+        let error = run_tl_loop_plan_compatibility_check(project.path(), &archive).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("TL plan compatibility check failed"));
+        assert_eq!(
+            std::fs::read(project.path().join(".exo/tl-loop/plan.snapshot")).unwrap(),
+            before_snapshot
+        );
+        assert_eq!(
+            std::fs::read(project.path().join(".exo/tl-loop/plan.json")).unwrap(),
+            before_candidate
+        );
+    }
+
+    #[test]
+    fn plan_compatibility_versions_must_match() {
+        validate_plan_compatibility_versions(2, 2).unwrap();
+
+        let error = validate_plan_compatibility_versions(2, 1).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("server supports plan compatibility version 2"));
+        assert!(error
+            .to_string()
+            .contains("installed controller declares 1"));
     }
 
     #[test]

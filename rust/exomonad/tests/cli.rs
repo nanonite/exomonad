@@ -9,6 +9,8 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::path::Path;
+use std::process::Command;
 use tempfile::tempdir;
 
 fn test_hook_json() -> String {
@@ -123,6 +125,81 @@ fn test_init_refuses_a_stale_exomonad_generated_project_root_codex_config() {
     assert!(
         stale.exists(),
         "the refusal must not have edited or deleted the operator's file"
+    );
+}
+
+#[test]
+fn test_init_continue_requires_audited_migration_for_legacy_aggregate_defaults() {
+    let project = tempdir().expect("create temporary project");
+    let home = tempdir().expect("create isolated home");
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("resolve repository root");
+    let archive = home.path().join(".exo/tl_loop.pyz");
+    fs::create_dir_all(archive.parent().expect("archive parent"))
+        .expect("create isolated runtime directory");
+    let archive_status = Command::new("python3")
+        .arg(repository.join("scripts/build_tl_loop_archive.py"))
+        .args(["--source"])
+        .arg(repository.join("tl_loop"))
+        .args(["--output"])
+        .arg(&archive)
+        .status()
+        .expect("build isolated TL controller archive");
+    assert!(archive_status.success());
+
+    let fixture_script = concat!(
+        "import sys; from pathlib import Path; ",
+        "from tl_loop.tests.test_plan_reconciliation import _project; ",
+        "_project(Path(sys.argv[1]), candidate_issue_id=None, ",
+        "legacy_aggregate_review_default=True, ",
+        "legacy_completed_issue_binding=True, ",
+        "include_completed_spawn_journal=True, legacy_completed_dispatch=True, ",
+        "controller_alias='architecture', five_ordered_stages=True)"
+    );
+    let fixture_status = Command::new("python3")
+        .arg("-c")
+        .arg(fixture_script)
+        .arg(project.path())
+        .env("PYTHONPATH", &repository)
+        .status()
+        .expect("build historical workspace fixture");
+    assert!(fixture_status.success());
+    fs::write(project.path().join(".exo/config.toml"), "")
+        .expect("mark fixture as an ExoMonad project");
+    for name in ["harness_policy.toml", "review-policy.toml"] {
+        fs::copy(
+            repository.join(".exo").join(name),
+            project.path().join(".exo").join(name),
+        )
+        .expect("copy required startup policy");
+    }
+
+    let snapshot = project.path().join(".exo/tl-loop/plan.snapshot");
+    let candidate = project.path().join(".exo/tl-loop/plan.json");
+    let before_snapshot = fs::read(&snapshot).expect("read accepted snapshot");
+    let before_candidate = fs::read(&candidate).expect("read unchanged candidate");
+    assert_eq!(before_snapshot, before_candidate);
+
+    cargo_bin_cmd!("exomonad")
+        .args(["init", "--continue"])
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "persisted plan migration is required before continuation",
+        ))
+        .stderr(predicate::str::contains("--expected-fingerprint"));
+
+    assert_eq!(
+        fs::read(snapshot).expect("snapshot remains unchanged"),
+        before_snapshot
+    );
+    assert_eq!(
+        fs::read(candidate).expect("candidate remains unchanged"),
+        before_candidate
     );
 }
 

@@ -7,16 +7,24 @@ import pytest
 
 import tl_loop.preflight as preflight_module
 from tl_loop import __main__ as tl_main
-from tl_loop.preflight import PreflightError, capability_example, run_preflight
+from tl_loop.preflight import (
+    PreflightError,
+    capability_example,
+    run_plan_compatibility_check,
+    run_preflight,
+)
 from tl_loop.select.policy import load_policy
+from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
+from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.store import RunStore
+from tl_loop.tests.test_plan_reconciliation import _project as _legacy_plan_project
 
 ROOT = Path(__file__).parents[2]
 
 
 def _project(tmp_path: Path, *, capability: str | None = "custom") -> Path:
     exo = tmp_path / ".exo"
-    (exo / "tl-loop").mkdir(parents=True)
+    (exo / "tl-loop").mkdir(parents=True, exist_ok=True)
     (exo / "config.toml").write_text("", encoding="utf-8")
     (exo / "review-policy.toml").write_text(
         (ROOT / ".exo" / "review-policy.toml").read_text(encoding="utf-8"),
@@ -93,6 +101,83 @@ def test_incompatible_controller_archive_fails_before_spawn(
 
     with pytest.raises(PreflightError, match="incompatible TL controller archive"):
         run_preflight(project)
+
+
+def test_continue_preflight_requires_and_then_accepts_audited_legacy_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    monkeypatch.setattr(
+        preflight_module,
+        "fingerprint_report",
+        lambda _root: {
+            "status": "current",
+            "archive": {"plan_compatibility_version": 2},
+        },
+    )
+    _legacy_plan_project(
+        project,
+        candidate_issue_id=None,
+        legacy_aggregate_review_default=True,
+        legacy_completed_issue_binding=True,
+        include_completed_spawn_journal=True,
+        legacy_completed_dispatch=True,
+        controller_alias="architecture",
+        five_ordered_stages=True,
+    )
+
+    command = [
+        "plan-compatibility-check",
+        "--project-root",
+        str(project),
+        "--expected-plan-compatibility-version",
+        "2",
+    ]
+    assert tl_main.main(command) == 2
+    with pytest.raises(PreflightError, match="persisted plan migration is required") as error:
+        run_plan_compatibility_check(project, expected_plan_compatibility_version=2)
+
+    report = analyze_plan_reconciliation(project)
+    assert report.can_apply
+    assert "exomonad plan reconcile --dry-run" in str(error.value)
+    assert report.evidence_fingerprint in str(error.value)
+    apply_plan_reconciliation(
+        project,
+        "Migrate the verified legacy aggregate-review default",
+        report.evidence_fingerprint,
+        actor="operator",
+    )
+
+    assert tl_main.main(command) == 0
+
+
+def test_plan_compatibility_check_accepts_compatible_state_across_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _project(tmp_path)
+    _legacy_plan_project(
+        project,
+        candidate_issue_id=None,
+        persisted_compatible_plan_version=1,
+    )
+    monkeypatch.setattr(
+        preflight_module,
+        "fingerprint_report",
+        lambda _root: {
+            "status": "stale",
+            "source": {"git_commit": "workspace-commit", "tree_sha256": "same-tree"},
+            "archive": {
+                "git_commit": "installed-commit",
+                "tree_sha256": "same-tree",
+                "plan_compatibility_version": 2,
+            },
+        },
+    )
+
+    run_plan_compatibility_check(project, expected_plan_compatibility_version=2)
+
+    with pytest.raises(PreflightError, match="expected plan compatibility version 3"):
+        run_plan_compatibility_check(project, expected_plan_compatibility_version=3)
 
 
 def test_missing_and_invalid_plan_fail_preflight(tmp_path: Path) -> None:
