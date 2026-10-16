@@ -9879,6 +9879,8 @@ def _retire_rejected_merge_attempt(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    *,
+    observation: WatcherObservation | None = None,
 ) -> RunState:
     """Retire one proven-rejected merge attempt and derive eligible integration.
 
@@ -9899,12 +9901,28 @@ def _retire_rejected_merge_attempt(
         # Already retired, or a newer attempt replaced it.
         return refreshed
     rejected_attempt = action.attempt
+    integration_candidate = (
+        refreshed.integration.candidates.get(slice_id)
+        if refreshed.integration is not None
+        else None
+    )
+    park_release_reason = _stale_aggregate_timeout_park_release_reason(
+        current, integration_candidate, observation
+    )
     integration = _abandon_owned_lane_integration(
         refreshed, current, refreshed.integration, "merge_not_confirmed", diagnostic
     )
     integration = _derive_eligible_integration_after_nonmerge(integration, slice_id)
     cleared = slice_transition(current, ActionChanged(None))
-    cleared = replace(cleared, park_cause=None, dispatch_error=None)
+    if park_release_reason is not None:
+        cleared = slice_transition(cleared, SliceStatusChanged(SliceStatus.IN_REVIEW))
+        cleared = replace(cleared, park_cause=None, dispatch_error=None)
+    elif current.status is SliceStatus.PARKED:
+        # A terminal merge result resolves the merge action, not the separate
+        # reason this slice was parked. Keep manual/current timeout parks intact.
+        cleared = replace(cleared, dispatch_error=None)
+    else:
+        cleared = replace(cleared, park_cause=None, dispatch_error=None)
     # Record the immutable disposition before clearing its checkpoint action.
     # If the controller stops after the event, the action journal replays this
     # same idempotency key and the next pass can finish the checkpoint. The
@@ -9920,6 +9938,20 @@ def _retire_rejected_merge_attempt(
             "rejected_attempt": rejected_attempt,
             "rejected_error": diagnostic[:500],
             "retired_by": "rejected_journal_terminal_result",
+            "released_park_cause": (
+                ParkCause.TASK_BUDGET_EXCEEDED.value if park_release_reason is not None else None
+            ),
+            "park_release_reason": park_release_reason,
+            "park_release_pr_number": (
+                observation.pr_number
+                if park_release_reason is not None and observation is not None
+                else None
+            ),
+            "park_release_head_sha": (
+                observation.head_sha
+                if park_release_reason is not None and observation is not None
+                else None
+            ),
         },
         config,
         effects,
@@ -9942,6 +9974,72 @@ def _retire_rejected_merge_attempt(
         key,
     )
     return store.load()
+
+
+def _stale_aggregate_timeout_park_release_reason(
+    current: SliceState,
+    candidate: IntegrationCandidateState | None,
+    observation: WatcherObservation | None,
+) -> str | None:
+    """Prove the legacy worker timeout no longer owns an open aggregate stage.
+
+    A timeout park can be released only when the same persisted aggregate
+    publication is still open at the exact action head. The merge rejection
+    alone is insufficient: it resolves only the merge action, not the park.
+    """
+    if (
+        current.status is not SliceStatus.PARKED
+        or current.park_cause is not ParkCause.TASK_BUDGET_EXCEEDED
+    ):
+        return None
+    if current.dispatch_last_boundary != "aggregate_pr_open":
+        return None
+    publication = current.publication
+    if not _parked_timeout_matches_aggregate_candidate(current, candidate):
+        return None
+    if not _watcher_confirms_open_publication(publication, observation):
+        return None
+    return "stale_task_timeout_superseded_by_open_aggregate_publication"
+
+
+def _parked_timeout_matches_aggregate_candidate(
+    current: SliceState,
+    candidate: IntegrationCandidateState | None,
+) -> bool:
+    """Match the persisted merge action and publication to its aggregate."""
+    publication = current.publication
+    action = current.action
+    return bool(
+        publication is not None
+        and action is not None
+        and action.kind is ActionKind.MERGE
+        and publication.pr_number == current.pr_number
+        and publication.head_sha == action.head_sha
+        and candidate is not None
+        and candidate.lifecycle is IntegrationLifecycle.MERGING
+        and candidate.aggregate_pr_number == publication.pr_number
+        and candidate.aggregate_head_sha == publication.head_sha
+    )
+
+
+def _watcher_confirms_open_publication(
+    publication: PublicationBinding | None,
+    observation: WatcherObservation | None,
+) -> bool:
+    """Require authoritative open state for the same published coordinates."""
+    if publication is None or observation is None:
+        return False
+    ownership_ok, _ = observation.ownership_status()
+    return bool(
+        ownership_ok
+        and observation.found is True
+        and observation.pr_number == publication.pr_number
+        and observation.pr_state == "open"
+        and observation.merged is False
+        and observation.head_sha == publication.head_sha
+        and observation.head_branch == publication.head_branch
+        and observation.base_branch == publication.base_branch
+    )
 
 
 def _retire_rejected_merge_results(
@@ -10048,8 +10146,40 @@ def _retire_rejected_merge_results(
                 state = _clear_merge_retirement_gate(state, store, slice_id, key)
                 continue
             if observation.merged is False and same_head:
+                if (
+                    current.status is SliceStatus.PARKED
+                    and current.park_cause is ParkCause.TASK_BUDGET_EXCEEDED
+                    and _stale_aggregate_timeout_park_release_reason(
+                        current,
+                        state.integration.candidates.get(slice_id)
+                        if state.integration is not None
+                        else None,
+                        observation,
+                    )
+                    is None
+                ):
+                    state = _hold_rejected_merge(
+                        state,
+                        store,
+                        slice_id,
+                        entry,
+                        "the rejected merge is resolved, but the task-timeout park is not "
+                        "proven stale by the exact open aggregate publication",
+                        config,
+                        effects,
+                        effects_log,
+                    )
+                    continue
                 state = _retire_rejected_merge_attempt(
-                    state, store, slice_id, entry, diagnostic, config, effects, effects_log
+                    state,
+                    store,
+                    slice_id,
+                    entry,
+                    diagnostic,
+                    config,
+                    effects,
+                    effects_log,
+                    observation=observation,
                 )
                 continue
             if operator_approved:

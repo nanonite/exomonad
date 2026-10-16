@@ -360,7 +360,11 @@
         "rejected_action_key",
         "rejected_attempt",
         "rejected_error",
-        "retired_by"
+        "retired_by",
+        "released_park_cause",
+        "park_release_reason",
+        "park_release_pr_number",
+        "park_release_head_sha"
       ]
     },
     "tl.recovery_boundary": {

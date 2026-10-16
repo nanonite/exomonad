@@ -31,6 +31,9 @@ from tl_loop.state.schema import (
     GateStatus,
     IntegrationCandidateState,
     IntegrationRuntimeState,
+    ParkCause,
+    PublicationBinding,
+    RunState,
     SliceState,
     SliceStatus,
 )
@@ -107,6 +110,37 @@ def _merging_with_rejected_action(store, state, tmp_path: Path) -> tuple[EffectJ
         ),
     )
     return journal, state.slices["slice-a"]
+
+
+def _parked_aggregate_rejection(
+    store, state, tmp_path: Path, *, cause: ParkCause, boundary: str
+) -> tuple[EffectJournal, RunState, SliceState]:
+    journal, _current = _merging_with_rejected_action(store, state, tmp_path)
+    current = store.load().slices["slice-a"]
+    parked = replace(
+        current,
+        status=SliceStatus.PARKED,
+        park_cause=cause,
+        park_audit={"reason": "persisted timeout before aggregate integration"},
+        dispatch_last_boundary=boundary,
+        publication=PublicationBinding(
+            pr_number=99,
+            head_sha="head-a",
+            head_branch="task/slice-a",
+            base_branch="main",
+            attempt=1,
+            invocation_id="invocation-a",
+        ),
+    )
+    latest = store.load()
+    saved = store.checkpoint(
+        FSMState(TLPhase.TLPlanning, ()),
+        {**latest.slices, "slice-a": parked},
+        latest.budgets,
+        latest.events.last_consumed_offset,
+        integration=latest.integration,
+    )
+    return journal, saved, parked
 
 
 def test_rejected_merge_retires_stale_in_flight_and_derives_eligible_integration(
@@ -425,3 +459,90 @@ def test_rejected_merge_with_matching_merged_remote_is_adopted_once(tmp_path: Pa
     assert slice_state.post_merge is not None
     # The original rejected result remains historical evidence.
     assert journal.entry_by_key(key)["status"] == "rejected"
+
+
+def test_exact_open_aggregate_releases_only_the_superseded_timeout_park(
+    tmp_path: Path,
+) -> None:
+    store, state = _load_state(tmp_path)
+    journal, parked_state, parked = _parked_aggregate_rejection(
+        store,
+        state,
+        tmp_path,
+        cause=ParkCause.TASK_BUDGET_EXCEEDED,
+        boundary="aggregate_pr_open",
+    )
+
+    recovered = _reconcile_nonterminal_slices(
+        _PLAN,
+        parked_state,
+        TLLoopConfig(active=True, ledger_run_id="run-1"),
+        FakeClient(),
+        store,
+        journal,
+    )
+
+    released = recovered.slices["slice-a"]
+    assert released.status is SliceStatus.IN_REVIEW
+    assert released.park_cause is None
+    # The old timeout audit remains as historical evidence.
+    assert released.park_audit == parked.park_audit
+    assert released.action is None
+    assert journal.entry_by_key(parked.action.intent_id)["status"] == "rejected"
+
+
+def test_timeout_park_without_aggregate_open_boundary_remains_parked(
+    tmp_path: Path,
+) -> None:
+    store, state = _load_state(tmp_path)
+    journal, parked_state, parked = _parked_aggregate_rejection(
+        store,
+        state,
+        tmp_path,
+        cause=ParkCause.TASK_BUDGET_EXCEEDED,
+        boundary="worker_active",
+    )
+
+    recovered = _reconcile_nonterminal_slices(
+        _PLAN,
+        parked_state,
+        TLLoopConfig(active=True, ledger_run_id="run-1"),
+        FakeClient(),
+        store,
+        journal,
+    )
+
+    retained = recovered.slices["slice-a"]
+    assert retained.status is SliceStatus.PARKED
+    assert retained.park_cause is ParkCause.TASK_BUDGET_EXCEEDED
+    assert retained.park_audit == parked.park_audit
+    assert retained.action == parked.action
+    assert any(gate.name.startswith("tl-merge-retirement-") for gate in recovered.gates)
+
+
+def test_manual_park_is_not_released_by_matching_open_aggregate(
+    tmp_path: Path,
+) -> None:
+    store, state = _load_state(tmp_path)
+    journal, parked_state, parked = _parked_aggregate_rejection(
+        store,
+        state,
+        tmp_path,
+        cause=ParkCause.HUMAN_DECISION_REQUIRED,
+        boundary="aggregate_pr_open",
+    )
+
+    recovered = _reconcile_nonterminal_slices(
+        _PLAN,
+        parked_state,
+        TLLoopConfig(active=True, ledger_run_id="run-1"),
+        FakeClient(),
+        store,
+        journal,
+    )
+
+    retained = recovered.slices["slice-a"]
+    assert retained.status is SliceStatus.PARKED
+    assert retained.park_cause is ParkCause.HUMAN_DECISION_REQUIRED
+    assert retained.park_audit == parked.park_audit
+    assert retained.action is None

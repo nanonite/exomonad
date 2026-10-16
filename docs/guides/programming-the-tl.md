@@ -1005,6 +1005,16 @@ rewritten. An unavailable observation holds; a contradictory one opens
 `tl-merge-retirement-<digest>`. A rejected entry whose PR is authoritatively
 `merged=true` at the same head is adopted as the merge, without a second merge.
 
+Retiring a rejected aggregate merge does not generally release a parked slice.
+The compatibility recovery for a historical worker-timeout park is narrower:
+the saved dispatch boundary must be `aggregate_pr_open`, the persisted
+publication/action/candidate must agree on the PR and exact head, and the
+authoritative watcher must confirm that same PR is still open at the published
+head and branches. Only then does the immutable retirement disposition record
+the released `task_budget_exceeded` park and return the stage to `IN_REVIEW`.
+Manual parks and timeout parks without that aggregate evidence retain their
+status and cause.
+
 #### Recovery/live boundary and work timers
 
 Continuation is a two-phase invocation. During recovery the controller folds

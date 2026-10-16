@@ -8958,6 +8958,11 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             )
             alpha = replace(
                 alpha,
+                status=SliceStatus.PARKED,
+                park_cause=ParkCause.TASK_BUDGET_EXCEEDED,
+                park_audit={
+                    "reason": "legacy worker timeout persisted during aggregate integration"
+                },
                 action=ActionState(
                     ActionKind.MERGE,
                     ActionPhase.IN_FLIGHT,
@@ -9004,6 +9009,8 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             "watcher": {
                 "found": True,
                 "pr_number": 101,
+                "pr_state": "open",
+                "state": "open",
                 "merged": False,
                 "head_sha": alpha_head,
                 "base_sha": "base-alpha",
@@ -9033,6 +9040,24 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         )
         transport.calls.clear()
 
+    def alpha_completion_evidence(root: Path) -> tuple[object, ...]:
+        parent = RunStore("ordered-e2e-run", root)
+        child = RunStore("alpha", parent.run_dir).load()
+        return tuple(
+            (
+                slice_id,
+                current.status,
+                current.reviewed_head,
+                current.publication,
+                current.handoff,
+                current.post_merge.phase if current.post_merge is not None else None,
+                tuple(sorted(current.post_merge.evidence.items()))
+                if current.post_merge is not None
+                else (),
+            )
+            for slice_id, current in sorted(child.slices.items())
+        )
+
     uninterrupted_root = tmp_path / "uninterrupted"
     uninterrupted_transport = OrderedIntegrationTransport(
         spawned_agent_id="beta",
@@ -9043,6 +9068,7 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         uninterrupted_transport,
         with_rejected_merge=True,
     )
+    uninterrupted_alpha_evidence = alpha_completion_evidence(uninterrupted_root)
     uninterrupted_transport.observed_root_store = RunStore("ordered-e2e-run", uninterrupted_root)
     uninterrupted = run_tl_loop(
         "ordered-e2e-run",
@@ -9064,6 +9090,7 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         with_ordered_recovery=True,
         with_rejected_merge=True,
     )
+    replayed_alpha_evidence = alpha_completion_evidence(replayed_root)
     replayed_transport.observed_root_store = RunStore("ordered-e2e-run", replayed_root)
     original_checkpoint = RunStore.checkpoint
     approval_checkpoint_written = False
@@ -9106,6 +9133,10 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
     alpha_approval_id = alpha_approval.active_aggregate_approval_id
     assert alpha_approval_id is not None
     assert checkpointed.slices["alpha"].status is SliceStatus.IN_REVIEW
+    assert checkpointed.slices["alpha"].park_cause is None
+    assert checkpointed.slices["alpha"].park_audit == {
+        "reason": "legacy worker timeout persisted during aggregate integration"
+    }
     assert not any(name == "merge_pr" for name, _ in replayed_transport.calls)
 
     monkeypatch.setattr(RunStore, "checkpoint", original_checkpoint)
@@ -9193,8 +9224,20 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         ]
         assert len(retired_attempts) == 1
         assert retired_attempts[0]["payload"]["slice_id"] == "alpha"
+        assert retired_attempts[0]["payload"]["released_park_cause"] == "task_budget_exceeded"
+        assert (
+            retired_attempts[0]["payload"]["park_release_reason"]
+            == "stale_task_timeout_superseded_by_open_aggregate_publication"
+        )
+        assert retired_attempts[0]["payload"]["park_release_pr_number"] == 101
+        assert (
+            retired_attempts[0]["payload"]["park_release_head_sha"]
+            == (transport.aggregate_git_evidence["alpha"][0])
+        )
         assert result.final_state.integration.candidates["alpha"].merge_attempts == 2
     assert resumed.final_state.slices["alpha"].recovery is None
+    assert alpha_completion_evidence(uninterrupted_root) == uninterrupted_alpha_evidence
+    assert alpha_completion_evidence(replayed_root) == replayed_alpha_evidence
     assert any(
         arguments.get("event_type") == "tl.ordered_recovery_superseded"
         for name, arguments in replayed_transport.calls
@@ -9268,6 +9311,15 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             and arguments.get("event_type") == "tl.dispatch_confirmed"
             and isinstance(arguments.get("payload"), Mapping)
             and arguments["payload"].get("slice_id") == "beta"
+        )
+        == 1
+    )
+    assert (
+        sum(
+            1
+            for name, arguments in replayed_transport.calls
+            if name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.merge_attempt_retired"
         )
         == 1
     )
