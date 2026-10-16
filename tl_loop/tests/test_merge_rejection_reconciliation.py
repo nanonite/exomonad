@@ -14,10 +14,12 @@ from pathlib import Path
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.phase import TLPhase
+from tl_loop.loop import driver
 from tl_loop.loop.driver import (
     EffectIntent,
     TLLoopConfig,
     _reconcile_nonterminal_slices,
+    _retire_rejected_merge_results,
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.ordered import IntegrationLifecycle
@@ -32,7 +34,7 @@ from tl_loop.state.schema import (
     SliceState,
     SliceStatus,
 )
-from tl_loop.tests.test_startup_reconciliation import FakeClient, _load_state, _PLAN
+from tl_loop.tests.test_startup_reconciliation import _PLAN, FakeClient, _load_state
 
 _REJECTION = "No Forgejo reviewer response yet on PR #99."
 
@@ -56,9 +58,7 @@ def _candidate() -> IntegrationCandidateState:
     )
 
 
-def _merging_with_rejected_action(
-    store, state, tmp_path: Path
-) -> tuple[EffectJournal, SliceState]:
+def _merging_with_rejected_action(store, state, tmp_path: Path) -> tuple[EffectJournal, SliceState]:
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
     intent = EffectIntent("merge_pr", "slice-a", {"pr_number": 99}, True)
     journal.append(intent)
@@ -196,6 +196,120 @@ def test_rejected_merge_retirement_is_idempotent_across_restarts(tmp_path: Path)
     assert journal.entry_by_key(key)["status"] == "rejected"
 
 
+def test_retirement_audit_replays_if_checkpoint_fails_after_event(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A crash after disposition emission cannot erase it or duplicate it."""
+    store, state = _load_state(tmp_path)
+    journal, current = _merging_with_rejected_action(store, state, tmp_path)
+
+    class _EventClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(resolved_pr_number=None)
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def emit_controller_event(
+            self, *, event_type: str, payload: dict[str, object]
+        ) -> ToolResult:
+            self.events.append((event_type, payload))
+            return ToolResult(raw={"success": True}, success=True, result={}, error=None)
+
+    client = _EventClient()
+    config = TLLoopConfig(active=True, ledger_run_id="run-1")
+    gate_name = driver._merge_retirement_gate_name(state, "slice-a", current.action.intent_id)
+    store.set_gate(gate_name)
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+
+    original_checkpoint = driver._checkpoint_slice_action
+    checkpoint_calls = 0
+
+    def crash_after_disposition(*args, **kwargs):
+        nonlocal checkpoint_calls
+        checkpoint_calls += 1
+        if checkpoint_calls == 1:
+            raise RuntimeError("simulated crash before retirement checkpoint")
+        return original_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(driver, "_checkpoint_slice_action", crash_after_disposition)
+    try:
+        _retire_rejected_merge_results(approved, config, client, store, journal)
+    except RuntimeError as error:
+        assert "simulated crash" in str(error)
+    else:
+        raise AssertionError("the crash boundary was not exercised")
+
+    state_after_crash = store.load()
+    assert state_after_crash.slices["slice-a"].action is not None
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.APPROVED
+        for gate in state_after_crash.gates
+    )
+    assert len(client.events) == 1
+    retirement = next(
+        entry
+        for entry in journal.snapshot()
+        if entry.get("operation") == "emit_controller_event"
+        and isinstance(entry.get("arguments"), dict)
+        and entry["arguments"].get("event_type") == "tl.merge_attempt_retired"
+    )
+    assert retirement["status"] == "confirmed"
+
+    monkeypatch.setattr(driver, "_checkpoint_slice_action", original_checkpoint)
+    recovered = _retire_rejected_merge_results(state_after_crash, config, client, store, journal)
+
+    assert recovered.slices["slice-a"].action is None
+    assert recovered.integration.candidates["slice-a"].merge_attempts == 1
+    assert not any(g.name == gate_name for g in recovered.gates)
+    assert len(client.events) == 1
+    assert journal.entry_by_key(current.action.intent_id)["status"] == "rejected"
+
+
+def test_old_rejection_does_not_retire_a_newer_merge_action(tmp_path: Path) -> None:
+    store, state = _load_state(tmp_path)
+    journal, _current = _merging_with_rejected_action(store, state, tmp_path)
+    newer_intent = EffectIntent("merge_pr", "slice-a", {"pr_number": 99, "attempt": 2}, True)
+    journal.append(newer_intent)
+    current = store.load().slices["slice-a"]
+    newer_action = ActionState(
+        ActionKind.MERGE,
+        ActionPhase.IN_FLIGHT,
+        intent_id=journal.key_for(newer_intent),
+        head_sha="head-a",
+        attempt=2,
+    )
+    integration = replace(
+        store.load().integration,
+        lifecycle=IntegrationLifecycle.MERGING,
+        sub_tl_states={"slice-a": IntegrationLifecycle.MERGING},
+        candidates={
+            "slice-a": replace(
+                store.load().integration.candidates["slice-a"],
+                lifecycle=IntegrationLifecycle.MERGING,
+                merge_attempts=1,
+            )
+        },
+    )
+    newer_slice = replace(current, action=newer_action)
+    state = store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("slice-a",)),
+        {"slice-a": newer_slice},
+        store.load().budgets,
+        store.load().events.last_consumed_offset,
+        integration=integration,
+    )
+
+    recovered = _retire_rejected_merge_results(
+        state,
+        TLLoopConfig(active=True),
+        FakeClient(merged=False, pr_state="open"),
+        store,
+        journal,
+    )
+
+    assert recovered.slices["slice-a"].action == newer_action
+    assert recovered.integration.candidates["slice-a"].merge_attempts == 1
+
+
 def test_rejected_merge_with_missing_head_holds(tmp_path: Path) -> None:
     """A missing head is not an exact match; unknown evidence must hold."""
     store, state = _load_state(tmp_path)
@@ -256,7 +370,7 @@ def test_live_nonmerge_resolution_bumps_attempt_for_a_distinct_key(tmp_path: Pat
     from tl_loop.loop.driver import _resolve_nonmerged_merge
 
     store, state = _load_state(tmp_path)
-    journal, current = _merging_with_rejected_action(store, state, tmp_path)
+    journal, _current = _merging_with_rejected_action(store, state, tmp_path)
     resolved = _resolve_nonmerged_merge(
         state,
         "slice-a",

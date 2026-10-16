@@ -1836,11 +1836,7 @@ def run_tl_loop(
         inconsistency = _recovery_inconsistency(work_plan, state)
         if inconsistency is not None:
             previous = next(
-                (
-                    gate
-                    for gate in state.gates
-                    if gate.name == RECOVERY_CONSISTENCY_GATE_NAME
-                ),
+                (gate for gate in state.gates if gate.name == RECOVERY_CONSISTENCY_GATE_NAME),
                 None,
             )
             state = store.set_gate(RECOVERY_CONSISTENCY_GATE_NAME, GateStatus.PENDING)
@@ -7958,6 +7954,7 @@ def _checkpoint_slice_action(
     *,
     slice_state: SliceState | None = None,
     integration: IntegrationRuntimeState | None = None,
+    clear_gates: tuple[str, ...] = (),
 ) -> RunState:
     """Persist one direct action phase without changing unrelated run state."""
     current = slice_state or state.slices[slice_id]
@@ -7980,6 +7977,7 @@ def _checkpoint_slice_action(
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
         integration=integration or state.integration,
+        clear_gates=clear_gates,
     )
 
 
@@ -9301,15 +9299,10 @@ def _retire_rejected_merge_attempt(
     integration = _derive_eligible_integration_after_nonmerge(integration, slice_id)
     cleared = slice_transition(current, ActionChanged(None))
     cleared = replace(cleared, park_cause=None, dispatch_error=None)
-    state = _checkpoint_slice_action(
-        store,
-        refreshed,
-        slice_id,
-        None,
-        slice_state=cleared,
-        integration=integration,
-    )
-    state = _clear_merge_retirement_gate(state, store, slice_id, key)
+    # Record the immutable disposition before clearing its checkpoint action.
+    # If the controller stops after the event, the action journal replays this
+    # same idempotency key and the next pass can finish the checkpoint. The
+    # reverse ordering could permanently lose the disposition on a crash.
     _record_controller_event(
         slice_id,
         "tl.merge_attempt_retired",
@@ -9325,6 +9318,17 @@ def _retire_rejected_merge_attempt(
         config,
         effects,
         effects_log,
+    )
+    gate_name = _merge_retirement_gate_name(refreshed, slice_id, key)
+    clear_gates = (gate_name,) if any(gate.name == gate_name for gate in refreshed.gates) else ()
+    state = _checkpoint_slice_action(
+        store,
+        refreshed,
+        slice_id,
+        None,
+        slice_state=cleared,
+        integration=integration,
+        clear_gates=clear_gates,
     )
     LOGGER.info(
         "[TL loop] retired rejected merge attempt slice=%s key=%s",
