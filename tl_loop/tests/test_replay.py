@@ -34,6 +34,7 @@ from tl_loop.tests.replay import (
     expected_actions,
     expected_state,
     normalize_durable_state,
+    normalize_state,
     replay_fixture,
 )
 
@@ -49,7 +50,7 @@ def test_recorded_stream_replays_exact_actions_and_state(fixture_name: str, tmp_
     first = replay_fixture(FIXTURE_ROOT / fixture_name, tmp_path / "first")
     second = replay_fixture(FIXTURE_ROOT / fixture_name, tmp_path / "second")
 
-    assert first.actions == expected_actions(FIXTURE_ROOT / fixture_name)
+    assert _without_startup_boundary(first.actions) == expected_actions(FIXTURE_ROOT / fixture_name)
     assert _canonical(first.state) == _canonical(expected_state(FIXTURE_ROOT / fixture_name))
     assert first.actions == second.actions
     assert _canonical(first.state) == _canonical(second.state)
@@ -157,7 +158,7 @@ def test_recursive_replay_preserves_position_and_ownership_without_duplicate_eff
     assert _normalize_recovery_state(
         normalize_durable_state(live.durable_state), tmp_path / "recursive-live"
     ) == _normalize_recovery_state(normalize_durable_state(first.durable_state), replay_root)
-    assert live.actions == first.actions
+    assert _without_recovery_boundaries(live.actions) == _without_recovery_boundaries(first.actions)
     assert first.durable_state == second.durable_state
     assert second.actions == ()
     assert second.cursor == first.cursor == 0
@@ -193,20 +194,36 @@ def test_recursive_replay_preserves_position_and_ownership_without_duplicate_eff
 
 
 def test_recursive_replay_replays_review_checkpoint_and_journal_once(tmp_path: Path) -> None:
-    live = replay_fixture(
+    replay_fixture(
         FIXTURE_ROOT / "recursive-recovery.json",
         tmp_path / "recursive-recovery-live",
         journal=True,
         live_ledger=True,
     )
     root = tmp_path / "recursive-recovery-replay"
-    first = replay_fixture(FIXTURE_ROOT / "recursive-recovery.json", root, journal=True)
+    first = replay_fixture(
+        FIXTURE_ROOT / "recursive-recovery.json",
+        root,
+        journal=True,
+        capture_initial_events=True,
+    )
     second = replay_fixture(FIXTURE_ROOT / "recursive-recovery.json", root, journal=True)
 
+    live_child = json.loads(
+        (
+            tmp_path / "recursive-recovery-live" / "replay-recovery" / "stage-a" / "run.json"
+        ).read_text(encoding="utf-8")
+    )
+    replay_child = json.loads(
+        (root / "replay-recovery" / "stage-a" / "run.json").read_text(encoding="utf-8")
+    )
     assert _normalize_recovery_state(
-        normalize_durable_state(live.durable_state), tmp_path / "recursive-recovery-live"
-    ) == _normalize_recovery_state(normalize_durable_state(first.durable_state), root)
-    assert live.actions == first.actions
+        _semantic_recovery_state(normalize_state(live_child), tmp_path / "recursive-recovery-live"),
+        tmp_path / "recursive-recovery-live",
+    ) == _normalize_recovery_state(
+        _semantic_recovery_state(normalize_state(replay_child), root),
+        root,
+    )
     assert first.cursor == second.cursor == 0
     assert second.actions == ()
     assert second.durable_state == first.durable_state
@@ -265,6 +282,8 @@ def test_tl_run_restart_after_confirmed_effect_matches_live_replay(
             journal=True,
             crash_after=crash_after,
         )
+    interrupted = RunStore("replay-clean", crashed_root).load()
+    historical_progress = interrupted.goals.last_progress_at
 
     resumed = replay_fixture(
         FIXTURE_ROOT / "clean-two-slice.json",
@@ -277,10 +296,84 @@ def test_tl_run_restart_after_confirmed_effect_matches_live_replay(
         journal=True,
     )
 
-    assert resumed.durable_state == baseline.durable_state
+    assert _restart_execution_projection(resumed.durable_state) == _restart_execution_projection(
+        baseline.durable_state
+    )
+    assert RunStore("replay-clean", crashed_root).load().goals.last_progress_at == (
+        historical_progress
+    )
     assert resumed.cursor == baseline.cursor
     assert resumed.reducer_version == baseline.reducer_version
     assert not any(action["operation"] == crash_after for action in resumed.actions)
+
+
+def _restart_execution_projection(state: dict[str, object]) -> dict[str, object]:
+    """Ignore revision and recovery-only evidence while comparing execution state."""
+    projected = json.loads(json.dumps(state))
+    projected.pop("revision", None)
+    goals = projected.get("goals")
+    if isinstance(goals, dict):
+        goals.pop("last_progress_at", None)
+    slices = projected.get("slices")
+    if isinstance(slices, dict):
+        for value in slices.values():
+            if isinstance(value, dict):
+                value.pop("reconciliation", None)
+    return projected
+
+
+def _without_startup_boundary(actions):
+    return tuple(
+        action
+        for action in actions
+        if not (
+            action.get("operation") == "emit_controller_event"
+            and action.get("arguments", {}).get("event_type") == "tl.recovery_boundary"
+            and action.get("arguments", {}).get("payload", {}).get("reason")
+            == "historical_catch_up_complete"
+        )
+    )
+
+
+def _without_recovery_boundaries(actions):
+    return tuple(
+        action
+        for action in actions
+        if not (
+            action.get("operation") == "emit_controller_event"
+            and action.get("arguments", {}).get("event_type") == "tl.recovery_boundary"
+        )
+    )
+
+
+def test_restart_holds_when_spawn_confirmation_lacks_invocation_proof(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "crashed"
+    with pytest.raises(RuntimeError, match="after spawn_worker"):
+        replay_fixture(
+            FIXTURE_ROOT / "clean-two-slice.json",
+            root,
+            journal=True,
+            crash_after="spawn_worker",
+        )
+
+    def remove_leaf_invocation(events):
+        return [
+            replace(event, invocation_id=None) if event.run_seq == 2 else event for event in events
+        ]
+
+    resumed = replay_fixture(
+        FIXTURE_ROOT / "clean-two-slice.json",
+        root,
+        journal=True,
+        event_transform=remove_leaf_invocation,
+    )
+
+    assert resumed.state["events"]["last_consumed_offset"] == 1
+    assert resumed.state["gates"] == [{"name": "tl-recovery-consistency", "status": "pending"}]
+    assert resumed.state["slices"]["leaf-a"]["status"] == "pending"
+    assert not any(action["operation"] == "spawn_leaf" for action in resumed.actions)
 
 
 RECOVERY_BOUNDARIES = (

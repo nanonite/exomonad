@@ -39,7 +39,14 @@ from tl_loop.events.identity import (
     resolve_event_slice,
 )
 from tl_loop.events.queue import LedgerQueue, start_child_ledger_queue
-from tl_loop.events.reader import FindingKind, LedgerFinding, LedgerReader, LedgerReadError
+from tl_loop.events.reader import (
+    FindingKind,
+    LedgerFinding,
+    LedgerReader,
+    LedgerReadError,
+    LedgerSnapshot,
+    SequenceStatus,
+)
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import (
     AllChildrenDone,
@@ -221,6 +228,7 @@ from tl_loop.rlm.tl_judgment import (
     judge_review_stuck,
 )
 from tl_loop.select.agent_type import (
+    HarnessChoice,
     SelectionFailure,
     parse_harness_identifier,
     select_agent_type,
@@ -347,6 +355,8 @@ from .reconcile import (
 from .shadow import TLEventDecoder, _phase_from_state, _phase_tag, _update_slices
 
 LOGGER = logging.getLogger(__name__)
+STARTUP_DRAIN_EMPTY_POLL_LIMIT = 128
+RECOVERED_DISPATCH_LEDGER_FLOOR = 0
 
 RepairWith = Callable[
     [Mapping[str, object], EffectClient, Callable[[JsonObject], object]],
@@ -976,6 +986,20 @@ class EventDiagnostics:
         }
 
 
+@dataclass(frozen=True)
+class _StartupEvent:
+    event: EventEnvelope
+    quarantined: bool
+    source_backed: bool = False
+
+
+@dataclass(frozen=True)
+class _StartupHistory:
+    events: tuple[_StartupEvent, ...]
+    boundary_run_seq: int
+    error: str | None = None
+
+
 class EventQueue(Protocol):
     """Queue capability consumed by both active and shadow loops."""
 
@@ -984,6 +1008,9 @@ class EventQueue(Protocol):
 
     def acknowledge(self, event: EventEnvelope) -> int:
         """Persist consumption of one event sequence."""
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        """Capture one finite durable event prefix for startup reconciliation."""
 
 
 @dataclass(frozen=True)
@@ -1820,76 +1847,6 @@ def run_tl_loop(
     state = _reconcile_legacy_parked_lanes(state, store, effects_log)
     state = _initialize_ordered_runtime(work_plan, state, store)
     try:
-        state = _reconcile_action_journal(
-            state,
-            store,
-            effects_log,
-            effects=effects,
-            project_root=selected.project_root,
-            ledger_run_id=effective_ledger_run_id,
-        )
-        state = _reconcile_confirmed_repair_actions(state, store, effects_log)
-        state = _reconcile_dispatches(state, selected, effects, store, effects_log)
-        state = _reconcile_nonterminal_slices(
-            work_plan, state, selected, effects, store, effects_log
-        )
-        inconsistency = _recovery_inconsistency(work_plan, state)
-        if inconsistency is not None:
-            previous = next(
-                (gate for gate in state.gates if gate.name == RECOVERY_CONSISTENCY_GATE_NAME),
-                None,
-            )
-            state = store.set_gate(RECOVERY_CONSISTENCY_GATE_NAME, GateStatus.PENDING)
-            if previous is None or previous.status is not GateStatus.PENDING:
-                _record_controller_event(
-                    "controller",
-                    "tl.gate_opened",
-                    {"gate_name": RECOVERY_CONSISTENCY_GATE_NAME, "run_id": state.run_id},
-                    selected,
-                    effects,
-                    effects_log,
-                )
-            _record_recovery_boundary(
-                state,
-                selected,
-                effects,
-                effects_log,
-                reason=f"consistency_hold: {inconsistency}",
-                cursor=state.events.last_consumed_offset,
-                pending_quarantine=len(_replayable_quarantine_documents(store)),
-            )
-            LOGGER.error(
-                "[TL loop] recovery consistency hold run=%s: %s (gate=%s)",
-                run_id,
-                inconsistency,
-                RECOVERY_CONSISTENCY_GATE_NAME,
-            )
-            return TLRunResult(
-                state,
-                tuple(effects_log),
-                (),
-                (),
-                diagnostics={"recovery_consistency": inconsistency},
-                journal_entries=_journal_entries(effects_log),
-            )
-        if any(
-            gate.name == RECOVERY_CONSISTENCY_GATE_NAME and gate.status is GateStatus.PENDING
-            for gate in state.gates
-        ):
-            # The projection is consistent again: close the hold so an operator
-            # is not asked to answer a stale gate.
-            state = store.clear_gate(RECOVERY_CONSISTENCY_GATE_NAME)
-            _record_recovery_boundary(
-                state,
-                selected,
-                effects,
-                effects_log,
-                reason="consistency_restored",
-                cursor=state.events.last_consumed_offset,
-                pending_quarantine=len(_replayable_quarantine_documents(store)),
-            )
-        state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
-        state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
         return _run_loop(
             run_id,
             work_plan,
@@ -1900,6 +1857,7 @@ def run_tl_loop(
             state,
             effects_log,
             decoder or TLEventDecoder(),
+            True,
         )
     except ToolUnavailableError as error:
         return _recover_tool_unavailable(store, effects, effects_log, error)
@@ -3083,6 +3041,7 @@ def _recovery_boundary_payload(
     reason: str,
     cursor: int,
     pending_quarantine: int,
+    boundary_run_seq: int | None = None,
 ) -> dict[str, object]:
     """Describe one recovery/live boundary as auditable evidence."""
     return {
@@ -3091,6 +3050,7 @@ def _recovery_boundary_payload(
         "depth": config.depth,
         "reason": reason,
         "cursor": cursor,
+        "boundary_run_seq": boundary_run_seq,
         "pending_quarantine": pending_quarantine,
         "transition_version": 1,
     }
@@ -3105,6 +3065,7 @@ def _record_recovery_boundary(
     reason: str,
     cursor: int,
     pending_quarantine: int,
+    boundary_run_seq: int | None = None,
 ) -> None:
     """Record why the controller has (or has not) reached live operation."""
     _record_controller_event(
@@ -3116,11 +3077,357 @@ def _record_recovery_boundary(
             reason=reason,
             cursor=cursor,
             pending_quarantine=pending_quarantine,
+            boundary_run_seq=boundary_run_seq,
         ),
         config,
         effects,
         effects_log,
     )
+
+
+def _capture_startup_history(
+    source: EventQueue,
+    state: RunState,
+    store: RunStore,
+) -> _StartupHistory:
+    """Capture one finite source prefix and combine it with retained quarantine."""
+    cursor = state.events.last_consumed_offset
+    boundary = cursor
+    source_events: tuple[EventEnvelope, ...] = ()
+    capture = getattr(source, "capture_snapshot", None)
+    if callable(capture):
+        try:
+            snapshot = capture(cursor)
+        except (OSError, ValueError) as error:
+            return _StartupHistory(
+                (), cursor, f"ledger_snapshot_unavailable: {type(error).__name__}"
+            )
+        boundary_value = getattr(snapshot, "boundary_run_seq", None)
+        sequence_status = getattr(snapshot, "sequence_status", None)
+        if type(boundary_value) is not int or boundary_value < cursor:
+            return _StartupHistory((), cursor, "ledger_snapshot_malformed_boundary")
+        boundary = boundary_value
+        if not isinstance(sequence_status, SequenceStatus):
+            return _StartupHistory((), boundary, "ledger_snapshot_malformed_sequence_status")
+        if sequence_status is SequenceStatus.PARTIAL:
+            return _StartupHistory((), boundary, "ledger_sequence_gap_or_duplicate")
+        if getattr(snapshot, "active_tail", None) is not None:
+            return _StartupHistory((), boundary, "ledger_snapshot_has_incomplete_tail")
+        findings = getattr(snapshot, "findings", ())
+        if not isinstance(findings, (tuple, list)) or not all(
+            isinstance(finding, LedgerFinding) for finding in findings
+        ):
+            return _StartupHistory((), boundary, "ledger_snapshot_malformed_findings")
+        if any(
+            getattr(finding, "kind", None) is FindingKind.MISSING_RUN_SEQ for finding in findings
+        ):
+            return _StartupHistory((), boundary, "ledger_snapshot_missing_run_seq")
+        raw_events = getattr(snapshot, "events", None)
+        if not isinstance(raw_events, (tuple, list)) or not all(
+            isinstance(event, EventEnvelope) for event in raw_events
+        ):
+            return _StartupHistory((), boundary, "ledger_snapshot_malformed_events")
+        source_events = tuple(raw_events)
+        source_sequences = [event.run_seq for event in source_events]
+        if any(sequence is None for sequence in source_sequences):
+            return _StartupHistory((), boundary, "ledger_event_missing_run_seq")
+        typed_sequences = [cast(int, sequence) for sequence in source_sequences]
+        if typed_sequences != sorted(typed_sequences):
+            return _StartupHistory((), boundary, "ledger_snapshot_out_of_order")
+        if any(sequence > boundary for sequence in typed_sequences):
+            return _StartupHistory((), boundary, "ledger_event_exceeds_snapshot_boundary")
+        if len(set(typed_sequences)) != len(typed_sequences):
+            return _StartupHistory((), boundary, "ledger_snapshot_duplicate_run_seq")
+    else:
+        return _StartupHistory(
+            (), cursor, "ledger_snapshot_unavailable: event source has no snapshot"
+        )
+
+    by_sequence: dict[int, _StartupEvent] = {}
+    for event in source_events:
+        sequence = event.run_seq
+        if sequence is None:
+            return _StartupHistory((), boundary, "ledger_event_missing_run_seq")
+        if sequence <= cursor:
+            continue
+        existing = by_sequence.get(sequence)
+        if existing is not None:
+            if existing.event != event:
+                return _StartupHistory((), boundary, f"conflicting_duplicate_run_seq:{sequence}")
+            continue
+        by_sequence[sequence] = _StartupEvent(event, False, True)
+
+    for document in _replayable_quarantine_documents(store):
+        try:
+            event = project(document)
+        except EnvelopeError:
+            return _StartupHistory((), boundary, "quarantined_event_malformed")
+        sequence = event.run_seq
+        if sequence is None:
+            return _StartupHistory((), boundary, "quarantined_event_missing_run_seq")
+        boundary = max(boundary, sequence)
+        existing = by_sequence.get(sequence)
+        if existing is not None:
+            if existing.event != event:
+                return _StartupHistory((), boundary, f"conflicting_quarantine_run_seq:{sequence}")
+            by_sequence[sequence] = _StartupEvent(existing.event, True, existing.source_backed)
+            continue
+        by_sequence[sequence] = _StartupEvent(event, True)
+    return _StartupHistory(
+        tuple(by_sequence[sequence] for sequence in sorted(by_sequence)),
+        boundary,
+    )
+
+
+def _blocking_quarantine_reason(
+    state: RunState,
+    store: RunStore,
+    expected: set[str],
+    ledger_run_id: str,
+) -> str | None:
+    """Keep plan-relevant unresolved evidence from being skipped at startup."""
+    for document in _replayable_quarantine_documents(store):
+        try:
+            event = project(document)
+        except EnvelopeError:
+            return "quarantined_event_malformed"
+        if event.run_id not in {None, ledger_run_id}:
+            continue
+        if event.kind is EventKind.AGENT_TASK_BLOCKED:
+            if _resolve_task_blocked_owner(event, state, store).owner is None:
+                return f"quarantined_blocker_unresolved:{event.run_seq}"
+            continue
+        if not _event_belongs_to_plan(event, expected, state):
+            continue
+        if not resolve_event_slice(event, state, allowed_ids=expected).resolved:
+            return f"quarantined_identity_unresolved:{event.event_type}:{event.run_seq}"
+    return None
+
+
+def _recovery_hold_result(
+    state: RunState,
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    reason: str,
+    boundary_run_seq: int,
+) -> TLRunResult:
+    """Persist a bounded startup hold without dispatching lifecycle work."""
+    previous = next(
+        (gate for gate in state.gates if gate.name == RECOVERY_CONSISTENCY_GATE_NAME),
+        None,
+    )
+    state = store.set_gate(RECOVERY_CONSISTENCY_GATE_NAME, GateStatus.PENDING)
+    if previous is None or previous.status is not GateStatus.PENDING:
+        _record_controller_event(
+            "controller",
+            "tl.gate_opened",
+            {"gate_name": RECOVERY_CONSISTENCY_GATE_NAME, "run_id": state.run_id},
+            config,
+            effects,
+            effects_log,
+        )
+    _record_recovery_boundary(
+        state,
+        config,
+        effects,
+        effects_log,
+        reason=f"consistency_hold: {reason}",
+        cursor=state.events.last_consumed_offset,
+        pending_quarantine=len(_replayable_quarantine_documents(store)),
+        boundary_run_seq=boundary_run_seq,
+    )
+    return TLRunResult(
+        state,
+        tuple(effects_log),
+        (),
+        (),
+        diagnostics={"recovery_consistency": reason},
+        journal_entries=_journal_entries(effects_log),
+    )
+
+
+def _complete_startup_recovery(
+    plan: WorkPlan,
+    state: RunState,
+    source: EventQueue,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    boundary_run_seq: int,
+) -> tuple[RunState, str | None]:
+    """Reconcile durable effects, validate projection, then enable scheduling."""
+    state, inconsistency = _prepare_startup_recovery(
+        plan, state, source, config, effects, store, effects_log, boundary_run_seq
+    )
+    if inconsistency is not None:
+        return state, inconsistency
+    state = _activate_startup_work(
+        plan,
+        state,
+        source,
+        config,
+        effects,
+        store,
+        effects_log,
+        boundary_run_seq,
+    )
+    return state, None
+
+
+def _prepare_startup_recovery(
+    plan: WorkPlan,
+    state: RunState,
+    source: EventQueue,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    boundary_run_seq: int,
+) -> tuple[RunState, str | None]:
+    """Reconcile retained evidence and validate projection before live effects."""
+    state = store.load()
+    state = _reconcile_action_journal(
+        state,
+        store,
+        effects_log,
+        effects=effects,
+        project_root=config.project_root,
+        ledger_run_id=config.ledger_run_id,
+    )
+    state = _reconcile_confirmed_repair_actions(state, store, effects_log)
+    state = _reconcile_dispatches(state, config, effects, store, effects_log)
+    state = _reconcile_nonterminal_slices(plan, state, config, effects, store, effects_log)
+    inconsistency = _recovery_inconsistency(plan, state)
+    if inconsistency is not None:
+        return state, inconsistency
+    if any(
+        gate.name == RECOVERY_CONSISTENCY_GATE_NAME and gate.status is GateStatus.PENDING
+        for gate in state.gates
+    ):
+        state = store.clear_gate(RECOVERY_CONSISTENCY_GATE_NAME)
+        _record_recovery_boundary(
+            state,
+            config,
+            effects,
+            effects_log,
+            reason="consistency_restored",
+            cursor=state.events.last_consumed_offset,
+            pending_quarantine=len(_replayable_quarantine_documents(store)),
+            boundary_run_seq=boundary_run_seq,
+        )
+    return state, None
+
+
+def _activate_startup_work(
+    plan: WorkPlan,
+    state: RunState,
+    source: EventQueue,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    boundary_run_seq: int,
+) -> RunState:
+    """Enable lifecycle scheduling only after finite history is reconciled."""
+    _record_recovery_boundary(
+        state,
+        config,
+        effects,
+        effects_log,
+        reason="historical_catch_up_complete",
+        cursor=state.events.last_consumed_offset,
+        pending_quarantine=len(_replayable_quarantine_documents(store)),
+        boundary_run_seq=boundary_run_seq,
+    )
+    state = _dispatch_children(plan, state, config, effects, effects_log, store)
+    state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
+    return state
+
+
+def _apply_deferred_startup_recovery(
+    plan: WorkPlan,
+    state: RunState,
+    review_events: Sequence[EventEnvelope],
+    ci_events: Sequence[EventEnvelope],
+    convergence: ConvergenceTracker,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Apply only final replayed failure actions after catch-up is complete."""
+    reviewed: set[tuple[str, str]] = set()
+    for event in review_events:
+        slice_id = _review_slice_id(event, state)
+        head_sha = _event_review_head(event)
+        if slice_id is None or head_sha is None or (slice_id, head_sha) in reviewed:
+            continue
+        reviewed.add((slice_id, head_sha))
+        current = state.slices.get(slice_id)
+        if (
+            current is None
+            or current.status is SliceStatus.REPAIRING
+            or current.reviewed_head != head_sha
+            or current.verdict is not Verdict.NO_GO
+            or _review_rounds_exhausted(state, current, config)
+        ):
+            continue
+        reasons = [
+            {
+                "severity": finding.get("severity", "blocking"),
+                "file": finding.get("path", "review"),
+                "line": 0,
+                "claim": finding.get("rationale", "review requested changes"),
+            }
+            for finding in current.review_findings.get(head_sha, ())
+        ]
+        state = _route_repair(
+            store,
+            state,
+            _phase_from_state(state),
+            max(state.events.last_consumed_offset, event.run_seq or 0),
+            slice_id,
+            config,
+            effects,
+            effects_log,
+            _forward_findings_repair(
+                {"verdict": Verdict.NO_GO.value, "reasons": reasons}, store, current
+            ),
+        )
+    failed_ci: dict[tuple[str, str], EventEnvelope] = {}
+    for event in ci_events:
+        slice_id = _review_slice_id(event, state)
+        if slice_id is None or event.head_sha is None:
+            continue
+        key = (slice_id, event.head_sha)
+        if _ci_status(event) == "failure":
+            failed_ci[key] = event
+        else:
+            failed_ci.pop(key, None)
+    for (slice_id, head_sha), event in failed_ci.items():
+        current = state.slices.get(slice_id)
+        if (
+            current is None
+            or current.status is SliceStatus.REPAIRING
+            or current.ci_state.get(head_sha) != "failure"
+        ):
+            continue
+        state = _route_ci_event(
+            store,
+            state,
+            _phase_from_state(state),
+            event,
+            max(state.events.last_consumed_offset, event.run_seq or 0),
+            config,
+            effects,
+            effects_log,
+            allow_lifecycle_effects=True,
+            reconcile_deferred=True,
+        )
+    return state
 
 
 def _recovery_inconsistency(plan: WorkPlan, state: RunState) -> str | None:
@@ -3175,6 +3482,7 @@ def _run_loop(
     state: RunState,
     effects_log: list[EffectIntent],
     decoder: TLEventDecoder,
+    startup_recovery: bool = False,
 ) -> TLRunResult:
     """Shared loop body; active mode changes only effect execution."""
     phase = _phase_from_state(state)
@@ -3209,30 +3517,37 @@ def _run_loop(
             if slice_state.dispatch_started_at is not None
         }
     )
-    # Move any legacy audit-marked pending rows to permanent audit storage
-    # before replay selection so they are never replayed or released.
+    # Move legacy audit rows first, then capture one finite source prefix. New
+    # ledger writes after this snapshot remain ordinary live input.
     _migrate_audit_marked_quarantine(store)
-    quarantined: list[EventEnvelope] = []
-    for document in _replayable_quarantine_documents(store):
-        try:
-            event = project(document)
-        except EnvelopeError as error:
-            LOGGER.error("Ignoring malformed quarantined event: %s", error)
-            continue
-        quarantined.append(event)
+    history = (
+        _capture_startup_history(source, state, store)
+        if startup_recovery
+        else _StartupHistory((), state.events.last_consumed_offset)
+    )
+    if history.error is not None:
+        return _recovery_hold_result(
+            state,
+            store,
+            config,
+            effects,
+            effects_log,
+            history.error,
+            history.boundary_run_seq,
+        )
+    startup_events = list(history.events)
+    startup_event_index = 0
+    startup_drain_empty_polls = 0
+    startup_drain_duplicate_polls = 0
+    quarantined = [entry.event for entry in startup_events if entry.quarantined]
+    deferred_reviews: list[EventEnvelope] = []
+    deferred_ci: list[EventEnvelope] = []
     if state.goals.controller_started_at is None:
         state = store.set_goals(
             replace(state.goals, controller_started_at=diagnostics.controller_started_at)
         )
-    # Historical catch-up boundary: while replayable quarantine evidence that
-    # existed at startup is still being applied, no finalization or live
-    # convergence runs and no work timer is armed. ``recovery_pending`` is a
-    # bounded startup flag, not the live quarantine list: once the finite
-    # startup set has been applied (or no startup row is currently replayable)
-    # live operation resumes, and unresolved startup rows stay quarantined for
-    # later retry without gating the heartbeat or finalization. Rows quarantined
-    # during normal running never re-enable recovery.
-    recovery_pending = bool(quarantined)
+    # Catch-up is a captured finite prefix, not a poll-until-empty rule.
+    recovery_pending = bool(startup_events)
     if recovery_pending:
         _record_recovery_boundary(
             state,
@@ -3241,8 +3556,43 @@ def _run_loop(
             effects_log,
             reason="historical_catch_up_pending",
             cursor=state.events.last_consumed_offset,
-            pending_quarantine=len(quarantined),
+            pending_quarantine=sum(event.quarantined for event in startup_events),
+            boundary_run_seq=history.boundary_run_seq,
         )
+    elif startup_recovery:
+        blocker = _blocking_quarantine_reason(
+            state, store, expected, config.ledger_run_id or run_id
+        )
+        if blocker is not None:
+            return _recovery_hold_result(
+                state,
+                store,
+                config,
+                effects,
+                effects_log,
+                blocker,
+                history.boundary_run_seq,
+            )
+        state, inconsistency = _complete_startup_recovery(
+            plan,
+            state,
+            source,
+            config,
+            effects,
+            store,
+            effects_log,
+            history.boundary_run_seq,
+        )
+        if inconsistency is not None:
+            return _recovery_hold_result(
+                state,
+                store,
+                config,
+                effects,
+                effects_log,
+                inconsistency,
+                history.boundary_run_seq,
+            )
     if not recovery_pending:
         if (
             not plan.sub_tls
@@ -3318,10 +3668,11 @@ def _run_loop(
                     effects_log,
                 )
         phase = _phase_from_state(state)
-        if _is_terminal_phase(phase):
+        if _is_terminal_phase(phase) and not recovery_pending:
             break
         if (
-            isinstance(convergence.last_decision, Quiescent)
+            not recovery_pending
+            and isinstance(convergence.last_decision, Quiescent)
             and not config.keep_alive_on_waiting
             and not _source_has_pending(source)
         ):
@@ -3338,21 +3689,190 @@ def _run_loop(
             raise LoopCancelled(f"TL controller {run_id!r} was cancelled")
         _record_reader_findings(source, diagnostics)
         replaying = False
-        replay_index = _replayable_event_index(quarantined, state, expected)
-        if replay_index is not None:
-            event = quarantined.pop(replay_index)
-            replaying = True
-        else:
-            event = _next_event(source, config)
-            if recovery_pending:
-                # The finite startup catch-up pass has done all it can right
-                # now: no startup row is currently replayable. Release the live
-                # gate; still-unresolved startup rows remain quarantined and are
-                # retried by later iterations, but they no longer suppress the
-                # heartbeat, finalization, or convergence.
+        catching_up = False
+        event: EventEnvelope | None = None
+        if recovery_pending:
+            next_startup_event = (
+                startup_events[startup_event_index]
+                if startup_event_index < len(startup_events)
+                else None
+            )
+            next_startup_seq = (
+                next_startup_event.event.run_seq if next_startup_event is not None else None
+            )
+            replay_index = _replayable_event_index(quarantined, state, expected)
+            replay_seq = quarantined[replay_index].run_seq if replay_index is not None else None
+            replay_before_next = replay_index is not None and (
+                next_startup_seq is None
+                or replay_seq is not None
+                and replay_seq <= next_startup_seq
+            )
+            if replay_before_next:
+                event = quarantined.pop(cast(int, replay_index))
+                replaying = True
+                catching_up = True
+                if replay_seq == next_startup_seq:
+                    startup_event_index += 1
+            elif next_startup_event is not None:
+                if next_startup_event.quarantined and not next_startup_event.source_backed:
+                    startup_event_index += 1
+                    event = None
+                    continue
+                try:
+                    queued_event = _next_event(source, config)
+                except LoopCancelled:
+                    raise
+                except (OSError, ValueError) as error:
+                    return _recovery_hold_result(
+                        state,
+                        store,
+                        config,
+                        effects,
+                        effects_log,
+                        f"ledger_snapshot_drain_unavailable:{type(error).__name__}",
+                        history.boundary_run_seq,
+                    )
+                catching_up = True
+                if (
+                    queued_event is not None
+                    and queued_event.run_seq is not None
+                    and queued_event.run_seq <= state.events.last_consumed_offset
+                ):
+                    source.acknowledge(queued_event)
+                    diagnostics.filtered += 1
+                    diagnostics.acknowledged += 1
+                    startup_drain_duplicate_polls += 1
+                    if startup_drain_duplicate_polls >= STARTUP_DRAIN_EMPTY_POLL_LIMIT:
+                        return _recovery_hold_result(
+                            state,
+                            store,
+                            config,
+                            effects,
+                            effects_log,
+                            "ledger_snapshot_duplicate_delivery_limit",
+                            history.boundary_run_seq,
+                        )
+                    queued_event = None
+                if queued_event is None:
+                    startup_drain_empty_polls += 1
+                    if startup_drain_empty_polls >= STARTUP_DRAIN_EMPTY_POLL_LIMIT:
+                        return _recovery_hold_result(
+                            state,
+                            store,
+                            config,
+                            effects,
+                            effects_log,
+                            "ledger_snapshot_drain_timeout",
+                            history.boundary_run_seq,
+                        )
+                elif queued_event != next_startup_event.event:
+                    return _recovery_hold_result(
+                        state,
+                        store,
+                        config,
+                        effects,
+                        effects_log,
+                        "ledger_snapshot_queue_mismatch",
+                        history.boundary_run_seq,
+                    )
+                else:
+                    startup_drain_empty_polls = 0
+                    startup_drain_duplicate_polls = 0
+                    startup_event_index += 1
+                    event = queued_event
+                    replaying = False
+            else:
+                blocker = _blocking_quarantine_reason(
+                    state, store, expected, config.ledger_run_id or run_id
+                )
+                if blocker is not None:
+                    return _recovery_hold_result(
+                        state,
+                        store,
+                        config,
+                        effects,
+                        effects_log,
+                        blocker,
+                        history.boundary_run_seq,
+                    )
+                state, inconsistency = _prepare_startup_recovery(
+                    plan,
+                    state,
+                    source,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    history.boundary_run_seq,
+                )
+                if inconsistency is not None:
+                    return _recovery_hold_result(
+                        state,
+                        store,
+                        config,
+                        effects,
+                        effects_log,
+                        inconsistency,
+                        history.boundary_run_seq,
+                    )
+                state = _apply_deferred_startup_recovery(
+                    plan,
+                    state,
+                    deferred_reviews,
+                    deferred_ci,
+                    convergence,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                )
+                state = _activate_startup_work(
+                    plan,
+                    state,
+                    source,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    history.boundary_run_seq,
+                )
+                before_finalization_phase = _phase_from_state(state)
+                state = _maybe_finalize_scope(state, store, config, effects, effects_log)
+                phase = _phase_from_state(state)
+                if phase != before_finalization_phase:
+                    _emit_phase_change(
+                        run_id,
+                        before_finalization_phase,
+                        phase,
+                        config,
+                        effects,
+                        effects_log,
+                    )
+                decision = derive_next_action(
+                    state,
+                    reviewer_max_rounds=convergence.reviewer_max_rounds,
+                    review_freshness_window_secs=convergence.review_freshness_window_secs,
+                    now=convergence.review_now,
+                )
+                if not _is_terminal_phase(phase) and not isinstance(decision, Quiescent):
+                    state = _apply_convergence(
+                        state, convergence, store, config, effects, effects_log
+                    )
+                phase = _phase_from_state(state)
                 recovery_pending = False
+        if event is None:
+            if not recovery_pending and _is_terminal_phase(_phase_from_state(state)):
+                break
+            replay_index = _replayable_event_index(quarantined, state, expected)
+            if replay_index is not None:
+                event = quarantined.pop(replay_index)
+                replaying = True
+            else:
+                event = _next_event(source, config)
         _record_reader_findings(source, diagnostics)
         if event is None:
+            if recovery_pending:
+                continue
             if config.heartbeat is not None and not recovery_pending:
                 heartbeat = heartbeat_once(
                     state,
@@ -3408,7 +3928,11 @@ def _run_loop(
                         _emit_phase_change(
                             run_id, before_phase, phase, config, effects, effects_log
                         )
-            if _sub_tls_waiting_for_integration(plan, state) and not config.keep_alive_on_waiting:
+            if (
+                not recovery_pending
+                and _sub_tls_waiting_for_integration(plan, state)
+                and not config.keep_alive_on_waiting
+            ):
                 return TLRunResult(
                     state,
                     tuple(effects_log),
@@ -3424,7 +3948,11 @@ def _run_loop(
             # scope finalization) is entirely internal to already-persisted
             # state. Drain it here instead of relying on the next ledger
             # event, which will never come.
-            if not plan.sub_tls:
+            if (
+                not recovery_pending
+                and not plan.sub_tls
+                and not _is_terminal_phase(_phase_from_state(state))
+            ):
                 state = _drain_direct_scope_convergence(
                     state, convergence, store, config, effects, effects_log
                 )
@@ -3458,6 +3986,9 @@ def _run_loop(
                 event_seq,
             )
             continue
+        spawn_slice_hint, spawn_alias_conflict = _uncheckpointed_spawn_slice_hint(
+            event, state, plan
+        )
         gate_name = event.data.get("gate_name")
         if (
             event.event_type == "tl.gate_answered"
@@ -3469,13 +4000,17 @@ def _run_loop(
                 diagnostics.acknowledged += 1
             diagnostics.correlated += 1
             state = store.load()
-            if event.data.get("decision") == GateStatus.APPROVED.value and plan.sub_tls:
+            if (
+                not catching_up
+                and event.data.get("decision") == GateStatus.APPROVED.value
+                and plan.sub_tls
+            ):
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
                 state = _apply_convergence(state, convergence, store, config, effects, effects_log)
                 phase = _phase_from_state(state)
             _release_replayed_event(store, event, replaying)
-            if _is_terminal_phase(phase):
+            if _is_terminal_phase(phase) and not catching_up:
                 break
             continue
         if event.kind is EventKind.AGENT_TASK_BLOCKED:
@@ -3492,6 +4027,7 @@ def _run_loop(
                 store,
                 source,
                 effects_log,
+                allow_lifecycle_effects=not catching_up,
             )
             if not routed:
                 return TLRunResult(
@@ -3506,7 +4042,7 @@ def _run_loop(
             phase = _phase_from_state(state)
             continue
         resolution = resolve_event_slice(event, state, allowed_ids=expected)
-        if not _event_belongs_to_plan(event, expected, state):
+        if not _event_belongs_to_plan(event, expected, state) and spawn_slice_hint is None:
             if _is_reconcilable_identity_event(event):
                 if not replaying:
                     quarantined.append(event)
@@ -3525,41 +4061,104 @@ def _run_loop(
                 diagnostics.acknowledged += 1
             state = store.load()
             continue
-        state = _note_authoritative_event(store, state, checkpoint_seq)
+        if catching_up and spawn_slice_hint is not None:
+            if spawn_alias_conflict:
+                return _recovery_hold_result(
+                    state,
+                    store,
+                    config,
+                    effects,
+                    effects_log,
+                    "spawn_confirmation_conflicting_slice_aliases",
+                    history.boundary_run_seq,
+                )
+            state, disposition, reason = _restore_dispatch_from_confirmation(
+                event,
+                spawn_slice_hint,
+                state,
+                config,
+                store,
+                effects_log,
+            )
+            if disposition == "hold":
+                return _recovery_hold_result(
+                    state,
+                    store,
+                    config,
+                    effects,
+                    effects_log,
+                    reason or "spawn_confirmation_unresolved",
+                    history.boundary_run_seq,
+                )
+            if disposition == "historical":
+                _record_historical_spawn(store, event, DISPATCH_EPOCH_MISMATCH)
+                diagnostics.filtered += 1
+                _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
+                if not replaying:
+                    diagnostics.acknowledged += 1
+                _release_replayed_event(store, event, replaying)
+                state = store.load()
+                continue
+        state = _note_authoritative_event(
+            store, state, checkpoint_seq, update_progress=not catching_up
+        )
         diagnostics.last_authoritative_event_seq = event_seq
         diagnostics.last_observed_progress_at = state.goals.last_progress_at
-        if config.heartbeat is not None:
+        if config.heartbeat is not None and not catching_up:
             state = _note_heartbeat_progress(store, state)
         direct_reviewer_verdict = event.event_type == "pr.review" and "verdict" in event.data
         if event.kind in {EventKind.PR_REVIEW, EventKind.COPILOT_REVIEW}:
             diagnostics.correlated += 1
             if _review_workflow_enabled(config) or direct_reviewer_verdict:
                 state = _route_review_event(
-                    plan, store, state, phase, event, checkpoint_seq, config, effects, effects_log
+                    plan,
+                    store,
+                    state,
+                    phase,
+                    event,
+                    checkpoint_seq,
+                    config,
+                    effects,
+                    effects_log,
+                    allow_lifecycle_effects=not catching_up,
                 )
             else:
                 state = _record_review_event(store, state, phase, event, checkpoint_seq)
-            if plan.sub_tls:
+            if plan.sub_tls and not catching_up:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
-            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+            if catching_up:
+                deferred_reviews.append(event)
+            else:
+                state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
-            if _is_terminal_phase(phase):
+            if _is_terminal_phase(phase) and not catching_up:
                 break
             continue
         if event.kind is EventKind.CI_STATUS_CHANGED:
             diagnostics.correlated += 1
             state = _route_ci_event(
-                store, state, phase, event, checkpoint_seq, config, effects, effects_log
+                store,
+                state,
+                phase,
+                event,
+                checkpoint_seq,
+                config,
+                effects,
+                effects_log,
+                allow_lifecycle_effects=not catching_up,
             )
-            if plan.sub_tls:
+            if plan.sub_tls and not catching_up:
                 state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
                 phase = _phase_from_state(state)
-            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+            if catching_up:
+                deferred_ci.append(event)
+            else:
+                state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
-            if _is_terminal_phase(phase):
+            if _is_terminal_phase(phase) and not catching_up:
                 break
             continue
         if event.kind is EventKind.AGENT_SPAWN_FAILED:
@@ -3645,24 +4244,26 @@ def _run_loop(
             )
             previous_state = state
             state = store.checkpoint(next_phase, next_slices, state.budgets, checkpoint_seq)
-            _emit_slice_status_changes(
-                previous_state.slices,
-                next_slices,
-                config,
-                effects,
-                effects_log,
-            )
-            _emit_dispatch_confirmation(
-                previous_state.slices,
-                next_slices,
-                event,
-                event_slice_id,
-                config,
-                effects,
-                effects_log,
-                state.controller_epoch,
-            )
-            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+            if not catching_up:
+                _emit_slice_status_changes(
+                    previous_state.slices,
+                    next_slices,
+                    config,
+                    effects,
+                    effects_log,
+                )
+                _emit_dispatch_confirmation(
+                    previous_state.slices,
+                    next_slices,
+                    event,
+                    event_slice_id,
+                    config,
+                    effects,
+                    effects_log,
+                    state.controller_epoch,
+                )
+            if not catching_up:
+                state = _apply_convergence(state, convergence, store, config, effects, effects_log)
             _ack_event(source, event, replaying, diagnostics)
             _release_replayed_event(store, event, replaying)
             diagnostics.correlated += 1
@@ -3674,9 +4275,10 @@ def _run_loop(
                     _phase_tag(next_phase),
                 )
             )
-            _emit_phase_change(run_id, phase, next_phase, config, effects, effects_log)
+            if not catching_up:
+                _emit_phase_change(run_id, phase, next_phase, config, effects, effects_log)
             phase = next_phase
-            if _is_terminal_phase(phase):
+            if _is_terminal_phase(phase) and not catching_up:
                 break
             continue
         try:
@@ -3853,29 +4455,31 @@ def _run_loop(
             )
         previous_state = state
         state = store.checkpoint(next_phase, next_slices, state.budgets, checkpoint_seq)
-        _emit_slice_status_changes(
-            previous_state.slices,
-            next_slices,
-            config,
-            effects,
-            effects_log,
-        )
-        _emit_dispatch_confirmation(
-            previous_state.slices,
-            next_slices,
-            event,
-            event_slice_id,
-            config,
-            effects,
-            effects_log,
-            state.controller_epoch,
-        )
+        if not catching_up:
+            _emit_slice_status_changes(
+                previous_state.slices,
+                next_slices,
+                config,
+                effects,
+                effects_log,
+            )
+            _emit_dispatch_confirmation(
+                previous_state.slices,
+                next_slices,
+                event,
+                event_slice_id,
+                config,
+                effects,
+                effects_log,
+                state.controller_epoch,
+            )
         if (
             isinstance(phase, RecursiveTLRunning)
             and isinstance(fsm_event, ChildSpawned)
             and not transitions
             and isinstance(event.data.get("shadow_event"), Mapping)
             and event.data["shadow_event"].get("kind") == "child_spawned"
+            and not catching_up
         ):
             _emit_phase_change(
                 run_id,
@@ -3891,7 +4495,8 @@ def _run_loop(
         before_tag = _phase_tag(phase)
         after_tag = _phase_tag(next_phase)
         transitions.append(LoopTransition(event_seq, event.event_type, before_tag, after_tag))
-        _emit_phase_change(run_id, phase, next_phase, config, effects, effects_log)
+        if not catching_up:
+            _emit_phase_change(run_id, phase, next_phase, config, effects, effects_log)
         LOGGER.info(
             "[TL loop] transition run_id=%s event_seq=%d before=%s after=%s",
             run_id,
@@ -3900,10 +4505,11 @@ def _run_loop(
             after_tag.value,
         )
         phase = next_phase
-        if _reopens_dispatch_pass(plan, config):
+        if not catching_up and _reopens_dispatch_pass(plan, config):
             state = _dispatch_children(plan, state, config, effects, effects_log, store)
-        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
-        if _is_terminal_phase(phase):
+        if not catching_up:
+            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+        if _is_terminal_phase(phase) and not catching_up:
             break
     else:
         if config.test_harness:
@@ -10963,7 +11569,7 @@ def _confirm_dispatch_event(
             dispatch_last_boundary=DISPATCH_CONFIRMED_BOUNDARY,
             dispatch_error=None,
             dispatch_agent_id=agent_id,
-            dispatch_invocation_id=event.invocation_id,
+            dispatch_invocation_id=_event_dispatch_invocation_id(event),
             dispatch_authoritative_event_seq=event_seq,
         ),
     }
@@ -11019,6 +11625,16 @@ def _event_dispatch_epoch(event: EventEnvelope) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _event_dispatch_invocation_id(event: EventEnvelope) -> str | None:
+    """Read the spawned child's invocation from either supported envelope shape."""
+    values = {
+        value
+        for value in (event.invocation_id, event.data.get("invocation_id"))
+        if isinstance(value, str) and value
+    }
+    return next(iter(values)) if len(values) == 1 else None
+
+
 def _event_dispatch_generation(event: EventEnvelope) -> int | None:
     value = event.data.get("dispatch_generation")
     return value if type(value) is int and value >= 0 else None
@@ -11027,6 +11643,480 @@ def _event_dispatch_generation(event: EventEnvelope) -> int | None:
 def _event_slice_hint(event: EventEnvelope) -> str | None:
     value = event.data.get("slice_id") or event.slice_id
     return value if isinstance(value, str) and value else None
+
+
+def _dispatch_intent_id_for(state: RunState, slice_id: str, attempt: int) -> str:
+    """Derive the stable intent for one declared run generation and attempt."""
+    identity = f"{state.run_id}:{slice_id}:{attempt}:{state.generation_id or ''}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
+
+def _uncheckpointed_spawn_slice_hint(
+    event: EventEnvelope,
+    state: RunState,
+    plan: WorkPlan,
+) -> tuple[str | None, bool]:
+    """Find one pending declared slice whose spawn row can restore its checkpoint."""
+    if not _is_spawn_confirmation_event(event):
+        return None, False
+    declared = {task.name for task in (*plan.workers, *plan.leaves)}
+    pending = {
+        name: current
+        for name, current in state.slices.items()
+        if name in declared
+        and current.status in {SliceStatus.PENDING, SliceStatus.READY}
+        and current.dispatch_intent_id is None
+    }
+    shadow = event.data.get("shadow_event")
+    shadow_slug = shadow.get("slug") if isinstance(shadow, Mapping) else None
+    raw_aliases = (
+        event.slice_id,
+        event.data.get("slice_id"),
+        event.data.get("slug"),
+        shadow_slug,
+    )
+    aliases = {value for value in raw_aliases if isinstance(value, str) and value}
+    named = aliases & pending.keys()
+    if len(named) > 1:
+        return None, True
+    if named:
+        slice_id = next(iter(named))
+        return slice_id, aliases != {slice_id}
+    intent_id = _event_dispatch_intent_id(event)
+    if intent_id is None:
+        return None, False
+    matches = [
+        name
+        for name, current in pending.items()
+        if intent_id == _dispatch_intent_id_for(state, name, current.attempts + 1)
+    ]
+    return (matches[0], False) if len(matches) == 1 else (None, len(matches) > 1)
+
+
+def _restore_dispatch_from_confirmation(
+    event: EventEnvelope,
+    slice_id: str,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> tuple[RunState, str | None, str | None]:
+    """Restore a lost dispatch checkpoint only from its exact durable spawn row."""
+    current = state.slices.get(slice_id)
+    if (
+        current is None
+        or current.status not in {SliceStatus.PENDING, SliceStatus.READY}
+        or current.dispatch_intent_id is not None
+    ):
+        return state, None, None
+    event_epoch = _event_dispatch_epoch(event)
+    if (
+        state.controller_epoch is not None
+        and event_epoch is not None
+        and event_epoch != state.controller_epoch
+    ):
+        return state, "historical", DISPATCH_EPOCH_MISMATCH
+    if not dependencies_satisfied(state.slices, slice_id):
+        return state, "hold", "spawn_confirmation_precedes_declared_dependencies"
+    attempt = current.attempts + 1
+    expected_intent = _dispatch_intent_id_for(state, slice_id, attempt)
+    intent_ids = _spawn_event_intent_ids(event)
+    if intent_ids != {expected_intent}:
+        return state, "hold", "spawn_confirmation_intent_mismatch"
+    if not _spawn_event_generation_matches(event, attempt, state.controller_epoch):
+        return state, "hold", "spawn_confirmation_generation_mismatch"
+    identity, error = _spawn_event_identity(event, current, slice_id, config)
+    if error is not None or identity is None:
+        return state, "hold", error or "spawn_confirmation_identity_incomplete"
+    start_time = _spawn_event_timestamp(event)
+    if start_time is None:
+        return state, "hold", "spawn_confirmation_timestamp_malformed"
+    owner_id, invocation_id, branch, agent_type, model, resolved_harness = identity
+    choice, choice_error = _recovered_spawn_choice(
+        current,
+        state,
+        config,
+        agent_type,
+        model,
+        resolved_harness,
+    )
+    if choice_error is not None:
+        return state, "hold", choice_error
+    journal_error = _reconcile_spawn_journal_from_confirmation(
+        effects_log,
+        slice_id,
+        expected_intent,
+        owner_id,
+        invocation_id,
+        branch,
+    )
+    if journal_error is not None:
+        return state, "hold", journal_error
+    audit_error = _audit_dispatch_checkpoint_restoration(event, store)
+    if audit_error is not None:
+        return state, "hold", audit_error
+    try:
+        restored_state = _persist_restored_dispatch(
+            state,
+            current,
+            slice_id,
+            attempt,
+            expected_intent,
+            start_time,
+            branch,
+            agent_type,
+            model,
+            resolved_harness,
+            choice,
+            store,
+        )
+    except (OSError, ValueError, TimeoutError) as error:
+        return state, "hold", f"spawn_checkpoint_restore_failed:{type(error).__name__}"
+    return restored_state, "restored", None
+
+
+def _recovered_spawn_choice(
+    current: SliceState,
+    state: RunState,
+    config: TLLoopConfig,
+    agent_type: str,
+    model: str | None,
+    resolved_harness: str,
+) -> tuple[HarnessChoice | None, str | None]:
+    """Recompute the charge from the active policy and compare its route evidence."""
+    if config.policy is None:
+        return None, None
+    try:
+        capabilities = config.capabilities or load_capability()
+        choice = select_agent_type(
+            current,
+            config.role,
+            state.budgets,
+            config.policy,
+            capabilities,
+            config.learned_policy,
+            requested_harness=current.requested_harness,
+        )
+    except (OSError, ValueError):
+        return None, "spawn_confirmation_policy_or_capability_unavailable"
+    if choice is None:
+        return None, "spawn_confirmation_policy_no_longer_selects_a_harness"
+    route = parse_harness_identifier(choice.harness)
+    try:
+        expected_model = _selected_spawn_model(choice, route, config)
+    except (OSError, ValueError):
+        return None, "spawn_confirmation_model_catalog_unavailable"
+    if (
+        choice.harness != resolved_harness
+        or route.agent_type != agent_type
+        or expected_model != model
+    ):
+        return None, "spawn_confirmation_route_differs_from_current_policy"
+    return choice, None
+
+
+def _selected_spawn_model(
+    choice: HarnessChoice,
+    route: HarnessRoute,
+    config: TLLoopConfig,
+) -> str | None:
+    if config.catalog is None:
+        return route.model
+    if config.requested_model:
+        return select_model(choice.harness, config.catalog, config.requested_model).model_id
+    return select_model_for_difficulty(
+        choice.harness,
+        config.catalog,
+        choice.difficulty,
+        escalated=choice.reason == "escalated_after_no_go",
+    ).model_id
+
+
+def _audit_dispatch_checkpoint_restoration(event: EventEnvelope, store: RunStore) -> str | None:
+    try:
+        store.append_audit_event(
+            {
+                **envelope_document(event),
+                "correlation": "dispatch_checkpoint_restored",
+                "correlation_reason": "exact current-plan spawn intent restored a missing checkpoint",
+            }
+        )
+    except QuarantineStorageError:
+        return "spawn_confirmation_audit_conflict"
+    return None
+
+
+def _persist_restored_dispatch(
+    state: RunState,
+    current: SliceState,
+    slice_id: str,
+    attempt: int,
+    intent_id: str,
+    started_at: float,
+    branch: str,
+    agent_type: str,
+    model: str | None,
+    resolved_harness: str,
+    choice: HarnessChoice | None,
+    store: RunStore,
+) -> RunState:
+    def update(document: dict[str, object]) -> dict[str, object]:
+        return _record_restored_dispatch_document(
+            document,
+            slice_id,
+            attempt,
+            intent_id,
+            started_at,
+            branch,
+            agent_type,
+            model,
+            resolved_harness,
+            RECOVERED_DISPATCH_LEDGER_FLOOR,
+            state.controller_epoch,
+        )
+
+    if choice is not None and not _spawn_charge_already_recorded(state, current, choice):
+        apply_spawn_and_charge(store.run_dir, choice, current, update)
+        return store.load()
+    dispatching = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCHING))
+    restored = replace(
+        dispatching,
+        attempts=attempt,
+        agent_type=agent_type,
+        model=model,
+        resolved_harness=resolved_harness,
+        branch=branch,
+        dispatch_intent_id=intent_id,
+        dispatch_started_at=started_at,
+        dispatch_last_boundary="dispatch_intended",
+        dispatch_error=None,
+        dispatch_error_code=None,
+        dispatch_ledger_floor=RECOVERED_DISPATCH_LEDGER_FLOOR,
+        dispatch_generation=attempt if state.controller_epoch is not None else 0,
+        dispatch_next_attempt_at=None,
+        dispatch_retry_for_attempt=0,
+        dispatch_agent_id=None,
+        dispatch_invocation_id=None,
+        dispatch_authoritative_event_seq=None,
+        park_cause=None,
+    )
+    return store.checkpoint(
+        state.fsm,
+        {**state.slices, slice_id: restored},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+
+def _record_restored_dispatch_document(
+    document: dict[str, object],
+    slice_id: str,
+    attempt: int,
+    intent_id: str,
+    started_at: float,
+    branch: str,
+    agent_type: str,
+    model: str | None,
+    resolved_harness: str,
+    ledger_floor: int,
+    controller_epoch: str | None,
+) -> dict[str, object]:
+    slices = document.get("slices")
+    if not isinstance(slices, dict) or not isinstance(slices.get(slice_id), dict):
+        raise TypeError("restored dispatch slice is missing from checkpoint")
+    slices[slice_id].update(
+        {
+            "status": SliceStatus.DISPATCHING.value,
+            "attempts": attempt,
+            "agent_type": agent_type,
+            "model": model,
+            "resolved_harness": resolved_harness,
+            "branch": branch,
+            "dispatch_intent_id": intent_id,
+            "dispatch_started_at": started_at,
+            "dispatch_last_boundary": "dispatch_intended",
+            "dispatch_error": None,
+            "dispatch_error_code": None,
+            "dispatch_ledger_floor": ledger_floor,
+            "dispatch_generation": attempt if controller_epoch is not None else 0,
+            "dispatch_next_attempt_at": None,
+            "dispatch_retry_for_attempt": 0,
+            "dispatch_agent_id": None,
+            "dispatch_invocation_id": None,
+            "dispatch_authoritative_event_seq": None,
+            "park_cause": None,
+        }
+    )
+    return document
+
+
+def _spawn_charge_already_recorded(
+    state: RunState,
+    current: SliceState,
+    choice: HarnessChoice,
+) -> bool:
+    charges = [
+        charge
+        for charge in state.budgets.charges
+        if charge.slice_id == current.id and charge.attempt == current.attempts + 1
+    ]
+    if not charges:
+        return False
+    if len(charges) != 1:
+        raise ValueError("multiple budget charges match restored dispatch")
+    charge = charges[0]
+    if charge.harness != choice.harness or charge.estimated_tokens != choice.estimated_cost:
+        raise ValueError("budget charge disagrees with restored dispatch route")
+    return True
+
+
+def _spawn_event_intent_ids(event: EventEnvelope) -> set[str]:
+    values: set[str] = set()
+    direct = event.data.get("intent_id")
+    if isinstance(direct, str) and direct:
+        values.add(direct)
+    shadow = event.data.get("shadow_event")
+    nested = shadow.get("intent_id") if isinstance(shadow, Mapping) else None
+    if isinstance(nested, str) and nested:
+        values.add(nested)
+    return values
+
+
+def _spawn_event_generation_matches(
+    event: EventEnvelope,
+    attempt: int,
+    controller_epoch: str | None,
+) -> bool:
+    reported_attempt = event.data.get("attempt")
+    if reported_attempt is not None and (
+        type(reported_attempt) is not int or reported_attempt != attempt
+    ):
+        return False
+    reported_generation = _event_dispatch_generation(event)
+    expected_generation = attempt if controller_epoch is not None else 0
+    return reported_generation is None or reported_generation == expected_generation
+
+
+def _spawn_event_identity(
+    event: EventEnvelope,
+    current: SliceState,
+    slice_id: str,
+    config: TLLoopConfig,
+) -> tuple[tuple[str, str, str, str, str | None, str] | None, str | None]:
+    """Validate owner, invocation, route and branch against one declared slice."""
+    shadow = event.data.get("shadow_event")
+    shadow_data = shadow if isinstance(shadow, Mapping) else {}
+    owner = event.data.get("child_agent")
+    if not isinstance(owner, str) or not owner:
+        owner = event.agent_id if event.kind is EventKind.AGENT_NOTIFY_PARENT else None
+    if event.kind is EventKind.AGENT_NOTIFY_PARENT and event.agent_id != owner:
+        return None, "spawn_confirmation_owner_alias_mismatch"
+    invocation_id = _event_dispatch_invocation_id(event)
+    if invocation_id is None:
+        return None, "spawn_confirmation_invocation_missing_or_conflicting"
+    branch = event.data.get("branch") or shadow_data.get("branch")
+    expected_branch = current.branch or derive_child_branch(config.branch, slice_id)
+    if not isinstance(branch, str) or branch != expected_branch:
+        return None, "spawn_confirmation_branch_mismatch"
+    raw_agent_type = event.data.get("agent_type") or shadow_data.get("agent_type")
+    if not isinstance(raw_agent_type, str) or not raw_agent_type:
+        return None, "spawn_confirmation_agent_type_missing"
+    model_value = event.data.get("model")
+    model = model_value if isinstance(model_value, str) and model_value else None
+    if "/" in raw_agent_type:
+        try:
+            route = parse_harness_identifier(raw_agent_type)
+        except ValueError:
+            return None, "spawn_confirmation_agent_type_malformed"
+        agent_type = route.agent_type
+        model = route.model
+        resolved_harness = raw_agent_type
+    else:
+        agent_type = raw_agent_type
+        resolved_harness = f"{agent_type}/{model}" if model else agent_type
+    if not owner:
+        return None, "spawn_confirmation_owner_missing"
+    return (owner, invocation_id, branch, agent_type, model, resolved_harness), None
+
+
+def _spawn_event_timestamp(event: EventEnvelope) -> float | None:
+    try:
+        observed = datetime.fromisoformat(event.observed_at)
+    except ValueError:
+        return None
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        return None
+    return observed.timestamp()
+
+
+def _reconcile_spawn_journal_from_confirmation(
+    effects_log: list[EffectIntent],
+    slice_id: str,
+    intent_id: str,
+    owner_id: str,
+    invocation_id: str,
+    branch: str,
+) -> str | None:
+    if not isinstance(effects_log, EffectJournal):
+        return None
+    expected_operation = (
+        "spawn_worker"
+        if any(
+            entry.get("operation") == "spawn_worker" and entry.get("target") == slice_id
+            for entry in effects_log.snapshot()
+        )
+        else "spawn_leaf"
+    )
+    for entry in effects_log.snapshot():
+        if entry.get("operation") != expected_operation or entry.get("target") != slice_id:
+            continue
+        arguments = entry.get("arguments")
+        if not isinstance(arguments, Mapping) or arguments.get("intent_id") != intent_id:
+            continue
+        if entry.get("status") == "rejected":
+            return "spawn_confirmation_conflicts_with_rejected_action_result"
+        if entry.get("status") == "confirmed" and not _spawn_journal_result_matches(
+            entry, owner_id, invocation_id, branch
+        ):
+            return "spawn_confirmation_conflicts_with_confirmed_action_result"
+        key = entry.get("key")
+        if entry.get("status") in {"intended", "unknown"} and isinstance(key, str):
+            effects_log.resolve_by_key(
+                key,
+                status="confirmed",
+                result={
+                    "success": True,
+                    "result": {
+                        "agent_id": owner_id,
+                        "invocation_id": invocation_id,
+                        "branch": branch,
+                        "reconciled_from_spawn_event": True,
+                    },
+                },
+            )
+    return None
+
+
+def _spawn_journal_result_matches(
+    entry: Mapping[str, object],
+    owner_id: str,
+    invocation_id: str,
+    branch: str,
+) -> bool:
+    result = entry.get("result")
+    if not isinstance(result, Mapping):
+        return False
+    if result.get("success") is not True:
+        return False
+    payload = result.get("result")
+    if not isinstance(payload, Mapping):
+        return True
+    expected = {
+        "agent_id": owner_id,
+        "invocation_id": invocation_id,
+        "branch": branch,
+    }
+    return all(payload.get(key, value) == value for key, value in expected.items())
 
 
 def _record_dispatch_correlation_failure(
@@ -18060,8 +19150,7 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
     # in flight. A state that predates the field falls back to the empty
     # generation: stable for that state, and distinct from any state that has
     # one.
-    identity = f"{state.run_id}:{name}:{attempt}:{state.generation_id or ''}"
-    intent_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    intent_id = _dispatch_intent_id_for(state, name, attempt)
     started_at = time.time() if config.active else 0.0
     return DispatchAttempt(
         intent_id,
@@ -18500,6 +19589,9 @@ def _route_review_event(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    *,
+    allow_lifecycle_effects: bool = True,
+    reconcile_deferred: bool = False,
 ) -> RunState:
     slice_id = _review_slice_id(event, state)
     if slice_id is None:
@@ -18523,6 +19615,7 @@ def _route_review_event(
         incoming_verdict is not None
         and current.reviewed_head == head_sha
         and current.verdict is not None
+        and not reconcile_deferred
     ):
         incoming_review_id = event.data.get("review_id")
         existing_review_id = (
@@ -18708,7 +19801,9 @@ def _route_review_event(
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     if decision_verdict is Verdict.NO_GO:
-        if _review_rounds_exhausted(state, state.slices[slice_id], config):
+        if not allow_lifecycle_effects or _review_rounds_exhausted(
+            state, state.slices[slice_id], config
+        ):
             return state
         return _route_repair(
             store,
@@ -18768,6 +19863,9 @@ def _route_ci_event(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    *,
+    allow_lifecycle_effects: bool = True,
+    reconcile_deferred: bool = False,
 ) -> RunState:
     slice_id = _review_slice_id(event, state)
     if slice_id is None:
@@ -18801,11 +19899,12 @@ def _route_ci_event(
     )
     state = store.checkpoint(phase, updated, state.budgets, event_seq)
     should_repair = (
-        config.active
+        allow_lifecycle_effects
+        and config.active
         and status == "failure"
         and bound_review_head_matches
         and current.status is not SliceStatus.REPAIRING
-        and current.ci_state.get(head_sha) != "failure"
+        and (reconcile_deferred or current.ci_state.get(head_sha) != "failure")
     )
     if (
         not should_repair
@@ -19485,6 +20584,8 @@ def _route_task_blocked_event(
     store: RunStore,
     source: EventQueue,
     effects_log: list[EffectIntent],
+    *,
+    allow_lifecycle_effects: bool = True,
 ) -> tuple[RunState, bool]:
     """Record blocked recovery at its owner before acknowledging the root event."""
     lookup = _resolve_task_blocked_owner(event, state, store)
@@ -19540,6 +20641,7 @@ def _route_task_blocked_event(
                 diagnostics,
                 effects_log,
                 lookup,
+                allow_lifecycle_effects,
             )
         owner_state = _record_task_blocked_recovery(
             event,
@@ -19565,6 +20667,7 @@ def _route_task_blocked_event(
             diagnostics,
             effects_log,
             lookup,
+            allow_lifecycle_effects,
         )
     return _finish_nested_task_blocked_event(
         event,
@@ -19580,6 +20683,7 @@ def _route_task_blocked_event(
         diagnostics,
         effects_log,
         lookup,
+        allow_lifecycle_effects,
     )
 
 
@@ -19595,10 +20699,12 @@ def _finish_local_task_blocked_event(
     diagnostics: EventDiagnostics,
     effects_log: list[EffectIntent],
     lookup: _TaskBlockedOwnerLookup,
+    allow_lifecycle_effects: bool,
 ) -> tuple[RunState, bool]:
     """Finish a block owned by this scope, parking convergence write failures."""
     try:
-        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+        if allow_lifecycle_effects:
+            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
         state = _clear_task_blocked_owner_gate(event, state, store)
     except (OSError, ValueError, RuntimeError):
         failed = replace(lookup, reason_code="owner_convergence_failed")
@@ -19621,6 +20727,7 @@ def _finish_nested_task_blocked_event(
     diagnostics: EventDiagnostics,
     effects_log: list[EffectIntent],
     lookup: _TaskBlockedOwnerLookup,
+    allow_lifecycle_effects: bool,
 ) -> tuple[RunState, bool]:
     """Checkpoint parent progress, project recovery, then acknowledge the event."""
     try:
@@ -19634,9 +20741,10 @@ def _finish_nested_task_blocked_event(
         failed = replace(lookup, reason_code="parent_checkpoint_failed")
         return _park_task_blocked_owner_issue(event, state, store, failed, diagnostics), False
     try:
-        if plan.sub_tls:
+        if allow_lifecycle_effects and plan.sub_tls:
             state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
-        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+        if allow_lifecycle_effects:
+            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
         state = _clear_task_blocked_owner_gate(event, state, store)
     except (OSError, ValueError, RuntimeError):
         failed = replace(lookup, reason_code="parent_projection_failed")
@@ -19659,12 +20767,14 @@ def _finish_superseded_nested_task_blocked_event(
     diagnostics: EventDiagnostics,
     effects_log: list[EffectIntent],
     lookup: _TaskBlockedOwnerLookup,
+    allow_lifecycle_effects: bool,
 ) -> tuple[RunState, bool]:
     """Project a durable supersession before atomically advancing and acking."""
     try:
-        if plan.sub_tls:
+        if allow_lifecycle_effects and plan.sub_tls:
             state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
-        state = _apply_convergence(state, convergence, store, config, effects, effects_log)
+        if allow_lifecycle_effects:
+            state = _apply_convergence(state, convergence, store, config, effects, effects_log)
         latest = store.load()
         gate_name = _task_blocked_owner_gate_name(event)
         state = store.checkpoint(
@@ -21824,13 +22934,18 @@ def _note_heartbeat_progress(store: RunStore, state: RunState) -> RunState:
     return store.set_goals(replace(state.goals, last_progress_at=time.time()))
 
 
-def _note_authoritative_event(store: RunStore, state: RunState, event_seq: int) -> RunState:
-    now = time.time()
+def _note_authoritative_event(
+    store: RunStore,
+    state: RunState,
+    event_seq: int,
+    *,
+    update_progress: bool = True,
+) -> RunState:
     return store.set_goals(
         replace(
             state.goals,
             last_authoritative_event_seq=event_seq,
-            last_progress_at=now,
+            last_progress_at=time.time() if update_progress else state.goals.last_progress_at,
         )
     )
 

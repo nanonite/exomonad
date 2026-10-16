@@ -16,6 +16,7 @@ from .reader import (
     LedgerFinding,
     LedgerReader,
     LedgerReadError,
+    LedgerSnapshot,
     ReadResult,
     SequenceStatus,
 )
@@ -126,6 +127,23 @@ class LedgerQueue:
         """Persist an event's run sequence after successful handling."""
         return self.reader.acknowledge(event)
 
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        """Read one finite startup prefix without sharing tailer cache state."""
+        snapshot_reader = LedgerReader(
+            self.reader.segments_dir,
+            run_dir=self.reader.run_dir,
+            ledger_run_id=self.reader.ledger_run_id,
+            scope_agent_id=self.reader.scope_agent_id,
+        )
+        try:
+            return snapshot_reader.capture_snapshot(cursor)
+        except LedgerReadError as error:
+            raise QueueError(
+                cursor=cursor,
+                sequence_status=self.sequence_status,
+                cause=error,
+            ) from error
+
     @property
     def findings(self) -> tuple[LedgerFinding, ...]:
         """Return deduplicated hard findings observed by the tailer."""
@@ -203,7 +221,12 @@ class LedgerQueue:
         with self._lock:
             self._sequence_status = result.sequence_status
             for finding in result.findings:
-                key = (finding.kind.value, finding.event_type, str(finding.segment), finding.line_number)
+                key = (
+                    finding.kind.value,
+                    finding.event_type,
+                    str(finding.segment),
+                    finding.line_number,
+                )
                 if key not in self._finding_keys:
                     self._finding_keys.add(key)
                     self._findings.append(finding)

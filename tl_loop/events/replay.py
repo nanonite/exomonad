@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from .envelope import EventEnvelope
+from .reader import LedgerSnapshot, SequenceStatus
 
 
 class ReplayError(RuntimeError):
@@ -45,6 +46,7 @@ class ReplayEventSource:
 
     events: list[EventEnvelope]
     start_cursor: int = 0
+    capture_initial_events: bool = True
     acknowledged: list[int] = field(default_factory=list)
     _cursor: int = field(init=False, repr=False)
     _delivered: int = field(init=False, default=0, repr=False)
@@ -74,6 +76,30 @@ class ReplayEventSource:
             raise ReplayTruncated(self._cursor, consumed=self._delivered)
         self._delivered += 1
         return self.events.pop(0)
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        """Expose the fixed replay prefix while ignoring duplicate delivery rows."""
+        if not self.capture_initial_events and cursor <= self.start_cursor:
+            return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, ())
+        by_sequence: dict[int, EventEnvelope] = {}
+        ordered: list[EventEnvelope] = []
+        for event in self.events:
+            sequence = event.run_seq
+            if sequence is None or sequence <= cursor:
+                continue
+            existing = by_sequence.get(sequence)
+            if existing is None:
+                by_sequence[sequence] = event
+                ordered.append(event)
+            elif existing != event:
+                ordered.append(event)
+        boundary = max(by_sequence, default=cursor)
+        return LedgerSnapshot(
+            tuple(ordered),
+            boundary,
+            SequenceStatus.UNKNOWN,
+            (),
+        )
 
     def acknowledge(self, event: EventEnvelope) -> int:
         """Advance the cursor monotonically after reducer success."""

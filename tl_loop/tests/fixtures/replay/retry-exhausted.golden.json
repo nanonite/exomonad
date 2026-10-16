@@ -1,7 +1,4 @@
 {
-  "repository_identity": {
-    "remote_url": "https://forge.example.com/org/repo.git"
-  },
   "budgets": {
     "ledger": {
       "tokens": 0,
@@ -18,7 +15,20 @@
     ]
   },
   "gates": [],
-  "revision": 2,
+  "goals": {
+    "completion_predicate": "",
+    "controller_started_at": "<timestamp>",
+    "deadline": 0.0,
+    "last_heartbeat_at": null,
+    "last_progress_at": null,
+    "objective": ""
+  },
+  "repository_identity": {
+    "remote_url": "https://forge.example.com/org/repo.git"
+  },
+  "reviewer_max_rounds": 5,
+  "reviewer_max_rounds_source": "policy_file",
+  "revision": 4,
   "run_id": "<run-id>",
   "slices": {
     "leaf-a": {
@@ -35,7 +45,6 @@
       ],
       "pr_number": null,
       "repair_attempts": 0,
-      "review_findings": {},
       "review_contract": {
         "acceptance_criteria": [
           "Run-state test plan: just tl-loop-test",
@@ -45,6 +54,7 @@
         ],
         "digest": "8b8f11362e3aa144fc0dc4777705bc3d431b7dc47d65e1334ea365432051ff3b"
       },
+      "review_findings": {},
       "reviewed_head": null,
       "reviewer_attempt": {},
       "status": "pending",

@@ -11,7 +11,7 @@ from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.envelope import project
 from tl_loop.events.identity import envelope_document, resolve_event_slice
 from tl_loop.events.queue import LedgerQueue
-from tl_loop.events.reader import LedgerReader
+from tl_loop.events.reader import LedgerReader, LedgerSnapshot
 from tl_loop.fsm.phase import ChildHandle, TLWaiting
 from tl_loop.loop.driver import LeafTask, TLLoopConfig, WorkPlan, run_tl_loop
 from tl_loop.state.schema import BudgetLedger, RepositoryIdentity, SliceState, SliceStatus
@@ -201,6 +201,9 @@ class _RecordingLedgerQueue:
         sequence = self.queue.acknowledge(event)
         self.acknowledged.append(sequence)
         return sequence
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        return self.queue.capture_snapshot(cursor)
 
     def close(self) -> None:
         self.queue.close(timeout=5)

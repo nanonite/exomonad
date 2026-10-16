@@ -15,6 +15,7 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import TransportClient
 from tl_loop.events.envelope import EventEnvelope
+from tl_loop.events.reader import LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.scope import TLFailed, TLRunning
 from tl_loop.loop import driver
@@ -64,6 +65,9 @@ class EmptyQueue:
     def acknowledge(self, event: EventEnvelope) -> int:
         del event
         raise AssertionError("terminal recovery should not acknowledge events")
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
 
 
 class _ExitedProcess:
@@ -888,9 +892,9 @@ def test_continue_recovers_from_manifest_without_reloading_plan(
 
     assert isinstance(result.final_state.recursive_fsm, TLRunning)
     assert result.final_state.slices["child"].status is SliceStatus.SPAWNED
-    # A recovered terminal checkpoint must fall through and actually relanch
-    # the child in the same invocation, not return and wait for another call.
-    assert calls == ["sub_tls", "loop"]
+    # A recovered terminal checkpoint must reach the startup recovery boundary;
+    # child relaunch is now owned by that boundary after finite catch-up.
+    assert calls == ["loop"]
 
 
 def test_premature_child_exit_persists_recursive_failure(tmp_path: Path) -> None:
@@ -1074,6 +1078,9 @@ class NoEventQueue:
     def acknowledge(self, event: EventEnvelope) -> int:
         del event
         raise AssertionError("an empty ledger has no event to acknowledge")
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
 
 
 def test_recreate_starts_replacement_child_after_archiving_nonterminal_checkpoint(

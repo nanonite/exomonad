@@ -19,6 +19,7 @@ import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.events.envelope import EventEnvelope
+from tl_loop.events.reader import LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.abandon import AbandonmentError, abandon_slice
 from tl_loop.loop.dispatch_classification import (
@@ -70,6 +71,9 @@ class SyntheticQueue:
         assert event.run_seq is not None
         self.acknowledged.append(event.run_seq)
         return event.run_seq
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
 
 
 @dataclass

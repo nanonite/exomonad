@@ -31,6 +31,7 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope
+from tl_loop.events.reader import LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.scope import TLFailed
 from tl_loop.loop.driver import (
     LeafTask,
@@ -86,6 +87,9 @@ class EmptyQueue:
     def acknowledge(self, event: EventEnvelope) -> int:
         del event
         raise AssertionError("a terminal continuation must not acknowledge ledger events")
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
 
 
 class RecordingTransport:

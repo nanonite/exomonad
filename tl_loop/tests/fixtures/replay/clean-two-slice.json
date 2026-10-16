@@ -34,6 +34,7 @@
       "type": "agent.notify_parent",
       "agent_id": "worker-a",
       "run_id": null,
+      "invocation_id": "worker-a-invocation-1",
       "session_id": "replay-session",
       "lifecycle_state": "observed",
       "data": {
@@ -56,6 +57,7 @@
       "type": "agent.notify_parent",
       "agent_id": "leaf-a",
       "run_id": null,
+      "invocation_id": "leaf-a-invocation-1",
       "session_id": "replay-session",
       "lifecycle_state": "observed",
       "data": {
@@ -78,6 +80,7 @@
       "type": "agent.notify_parent",
       "agent_id": "worker-a",
       "run_id": null,
+      "invocation_id": "worker-a-invocation-1",
       "session_id": "replay-session",
       "lifecycle_state": "observed",
       "data": {
@@ -97,6 +100,7 @@
       "type": "agent.notify_parent",
       "agent_id": "leaf-a",
       "run_id": null,
+      "invocation_id": "leaf-a-invocation-1",
       "session_id": "replay-session",
       "lifecycle_state": "observed",
       "data": {

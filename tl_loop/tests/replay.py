@@ -175,11 +175,13 @@ def replay_fixture(
     *,
     event_transform: Callable[[list[EventEnvelope]], Sequence[EventEnvelope]] | None = None,
     max_events: int = 32,
+    keep_alive_on_waiting: bool = True,
     journal: bool = False,
     production_clock: bool = False,
     session_mode: str | None = None,
     crash_after: str | None = None,
     live_ledger: bool = False,
+    capture_initial_events: bool | None = None,
     child_event_transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]]
     | None = None,
 ) -> ReplayResult:
@@ -194,6 +196,8 @@ def replay_fixture(
     plan = _plan_with_replay_sources(
         _mapping(spec["plan"], "plan"),
         spec.get("child_events"),
+        scope_state_dir=Path(root_dir) / run_id,
+        capture_initial_events=capture_initial_events,
         child_event_transform=child_event_transform,
     )
     _seed_controller_epochs(root_dir, spec)
@@ -226,7 +230,14 @@ def replay_fixture(
             child_event_transform=child_event_transform,
         )
     else:
-        source = RecordedEventSource(events)
+        source = RecordedEventSource(
+            events,
+            capture_initial_events=(
+                capture_initial_events
+                if capture_initial_events is not None
+                else RunStore(run_id, root_dir).path.exists()
+            ),
+        )
     policy = load_policy(POLICY_ROOT / _string(spec["policy"], "policy"))
     capability = CapabilityMap({"codex/gpt-luna": Difficulty.STANDARD})
     effects = EffectClient(transport)
@@ -243,6 +254,7 @@ def replay_fixture(
         max_workers=2,
         max_leaves=1,
         max_events=max_events,
+        keep_alive_on_waiting=keep_alive_on_waiting,
         poll_interval=0.001,
         review_policy_path=FIXTURE_ROOT / "review-policy.toml",
         review_clock=None if production_clock else lambda: REPLAY_REVIEW_NOW,
@@ -468,6 +480,8 @@ def _plan_with_replay_sources(
     value: Mapping[str, object],
     child_events: object,
     *,
+    scope_state_dir: Path | None = None,
+    capture_initial_events: bool | None = None,
     child_event_transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]]
     | None = None,
 ) -> WorkPlan:
@@ -478,7 +492,7 @@ def _plan_with_replay_sources(
     if not isinstance(child_events, Mapping):
         raise TypeError("fixture.child_events must be an object")
 
-    def bind(current: WorkPlan) -> WorkPlan:
+    def bind(current: WorkPlan, state_dir: Path | None) -> WorkPlan:
         children: list[SubTLTask] = []
         for task in current.sub_tls:
             child_plan = task.plan
@@ -486,6 +500,7 @@ def _plan_with_replay_sources(
                 child_plan = WorkPlan.from_mapping(child_plan)
             if not isinstance(child_plan, WorkPlan):
                 raise TypeError(f"sub-TL {task.name!r} has no WorkPlan")
+            child_state_dir = state_dir / task.name if state_dir is not None else None
             source_value = child_events.get(task.name)
             source = task.source
             if source_value is not None:
@@ -494,11 +509,24 @@ def _plan_with_replay_sources(
                         cast(list[Mapping[str, object]], source_value)
                     )
                 events = _events(source_value)
-                source = RecordedEventSource(events)
-            children.append(replace(task, plan=bind(child_plan), source=source))
+                source = RecordedEventSource(
+                    events,
+                    capture_initial_events=(
+                        capture_initial_events
+                        if capture_initial_events is not None
+                        else child_state_dir is None or (child_state_dir / "run.json").exists()
+                    ),
+                )
+            children.append(
+                replace(
+                    task,
+                    plan=bind(child_plan, child_state_dir),
+                    source=source,
+                )
+            )
         return replace(current, sub_tls=tuple(children))
 
-    return bind(plan)
+    return bind(plan, scope_state_dir)
 
 
 def _write_ledger_segment(segments: Path, rows: list[Mapping[str, object]]) -> None:

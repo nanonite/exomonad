@@ -37,12 +37,16 @@ def _run(
     *,
     live_ledger: bool,
     transform=None,
+    capture_initial_events: bool | None = None,
+    keep_alive_on_waiting: bool = True,
 ):
     return replay_fixture(
         FIXTURE_ROOT / "recursive-recovery.json",
         root,
         journal=True,
         live_ledger=live_ledger,
+        capture_initial_events=capture_initial_events,
+        keep_alive_on_waiting=keep_alive_on_waiting,
         child_event_transform=transform,
     )
 
@@ -64,18 +68,41 @@ def test_recursive_replay_disturbances_preserve_durable_position(tmp_path: Path,
     assert disturbed.cursor == baseline.cursor
 
 
-def test_recursive_live_ledger_and_replay_sources_are_equivalent(tmp_path: Path) -> None:
-    live = _run(tmp_path / "live", live_ledger=True, transform=_duplicate_review)
-    replay = _run(tmp_path / "replay", live_ledger=False, transform=_duplicate_review)
-
-    assert _normalize_recovery_state(
-        normalize_durable_state(live.durable_state), tmp_path / "live"
-    ) == _normalize_recovery_state(
-        normalize_durable_state(replay.durable_state), tmp_path / "replay"
+def test_recursive_startup_holds_duplicate_sequence_before_advancing(tmp_path: Path) -> None:
+    live = _run(
+        tmp_path / "live",
+        live_ledger=True,
+        transform=_duplicate_review,
+        keep_alive_on_waiting=False,
     )
-    assert live.actions == replay.actions
-    assert _journal_shape(live.journal_entries) == _journal_shape(replay.journal_entries)
-    assert live.cursor == replay.cursor
+    root = live.durable_state
+    assert root["current_order"] == 1
+    assert root["slices"]["stage-a"]["status"] == "spawned"
+    assert root["slices"]["stage-b"]["status"] == "pending"
+
+    child = json.loads(
+        (tmp_path / "live" / "replay-recovery" / "stage-a" / "run.json").read_text(encoding="utf-8")
+    )
+    assert child["events"]["last_consumed_offset"] == 0
+    assert child["gates"] == [{"name": "tl-recovery-consistency", "status": "pending"}]
+    assert child["slices"]["child-leaf"]["status"] == "pending"
+    assert not any(action["operation"] in {"spawn_leaf", "merge_pr"} for action in live.actions)
+
+    replay_root = tmp_path / "replay"
+    baseline = _run(replay_root / "baseline", live_ledger=False)
+    disturbed = _run(
+        replay_root / "disturbed",
+        live_ledger=False,
+        transform=_duplicate_review,
+    )
+    assert _normalize_recovery_state(
+        normalize_durable_state(disturbed.durable_state), replay_root / "disturbed"
+    ) == _normalize_recovery_state(
+        normalize_durable_state(baseline.durable_state), replay_root / "baseline"
+    )
+    assert disturbed.actions == baseline.actions
+    assert _journal_shape(disturbed.journal_entries) == _journal_shape(baseline.journal_entries)
+    assert disturbed.cursor == baseline.cursor
 
 
 def test_recursive_truncation_fails_closed_with_partial_checkpoint(tmp_path: Path) -> None:

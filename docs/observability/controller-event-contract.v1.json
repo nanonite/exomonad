@@ -370,6 +370,7 @@
         "depth",
         "reason",
         "cursor",
+        "boundary_run_seq",
         "pending_quarantine",
         "transition_version"
       ]

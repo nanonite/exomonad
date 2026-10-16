@@ -115,6 +115,17 @@ class ReadResult:
         return len(self.events)
 
 
+@dataclass(frozen=True)
+class LedgerSnapshot:
+    """One finite startup view of all committed rows through a run-sequence."""
+
+    events: tuple[EventEnvelope, ...]
+    boundary_run_seq: int
+    sequence_status: SequenceStatus
+    findings: tuple[LedgerFinding, ...]
+    active_tail: ActiveTail | None = None
+
+
 class LedgerReader:
     """Replay mapped TL events from immutable, lexically ordered segments."""
 
@@ -165,6 +176,31 @@ class LedgerReader:
         if type(effective_cursor) is not int or effective_cursor < 0:
             raise ValueError("replay cursor must be a non-negative integer")
         read_rows = self._read_rows()
+        return self._project_rows(read_rows, effective_cursor)
+
+    def capture_snapshot(self, cursor: int | None = None) -> LedgerSnapshot:
+        """Capture one bounded ledger prefix for startup catch-up."""
+        effective_cursor = self.cursor() if cursor is None else cursor
+        if type(effective_cursor) is not int or effective_cursor < 0:
+            raise ValueError("replay cursor must be a non-negative integer")
+        read_rows = self._read_rows()
+        result = self._project_rows(read_rows, effective_cursor)
+        sequences = [
+            value
+            for row in read_rows.rows
+            if type(value := row.document.get("run_seq")) is int and value >= 0
+        ]
+        boundary = max(sequences, default=effective_cursor)
+        return LedgerSnapshot(
+            result.events,
+            max(effective_cursor, boundary),
+            result.sequence_status,
+            result.findings,
+            result.active_tail,
+        )
+
+    def _project_rows(self, read_rows: _RowsRead, effective_cursor: int) -> ReadResult:
+        """Project one already-captured row set without rereading the ledger."""
         rows = _resolve_superseded(list(read_rows.rows))
         status = sequence_status(_run_sequences(row.document for row in rows))
         findings: list[LedgerFinding] = []
@@ -265,8 +301,7 @@ class LedgerReader:
         if event.run_seq is not None:
             self._learn_descendant_agents(event)
         return (
-            event.agent_id in self._scoped_agent_ids
-            or event.parent_agent_id == self.scope_agent_id
+            event.agent_id in self._scoped_agent_ids or event.parent_agent_id == self.scope_agent_id
         )
 
     def _learn_descendant_agents(self, event: EventEnvelope) -> None:

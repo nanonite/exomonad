@@ -22,8 +22,8 @@ from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableErro
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.envelope import EventEnvelope, project
-from tl_loop.events.queue import LedgerQueue
-from tl_loop.events.reader import LedgerReader
+from tl_loop.events.queue import LedgerQueue, QueueError
+from tl_loop.events.reader import LedgerReader, LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
 from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
@@ -168,6 +168,10 @@ class SyntheticQueue:
         assert event.run_seq is not None
         self.acknowledged.append(event.run_seq)
         return event.run_seq
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        """Synthetic queued events represent post-start live input by default."""
+        return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
 
 
 def _test_git_output(repository: Path, *arguments: str) -> str | None:
@@ -12480,6 +12484,223 @@ def test_recovery_consistency_hold_blocks_live_dispatch(tmp_path: Path) -> None:
         name in {"spawn_leaf", "spawn_worker", "spawn_reviewer", "merge_pr"}
         for name, _ in transport.calls
     )
+
+
+def test_finite_startup_prefix_drains_before_dispatch_and_live_events(
+    tmp_path: Path,
+) -> None:
+    """The production driver drains its captured prefix before effects or live reads."""
+    run_id = "finite-startup-prefix"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    historical = _canonical_event(1, "inbox.message", "worker-a", run_id)
+    live_events = [_canonical_event(2, "agent.spawned", "worker-a", run_id)] + [
+        _event(3, "child_completed", "worker-a", run_id=run_id),
+        _event(4, "all_children_done", run_id=run_id),
+    ]
+
+    class FiniteSnapshotQueue(SyntheticQueue):
+        snapshot_count = 0
+
+        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+            self.snapshot_count += 1
+            return SimpleNamespace(
+                events=(historical,) if cursor < 1 else (),
+                boundary_run_seq=1,
+                sequence_status=SequenceStatus.COMPLETE,
+                findings=(),
+                active_tail=None,
+            )
+
+        def acknowledge(self, observed: EventEnvelope) -> int:
+            if observed.run_seq == 1:
+                assert not any(name == "spawn_worker" for name, _ in transport.calls)
+            elif observed.run_seq in {2, 3, 4}:
+                assert any(name == "spawn_worker" for name, _ in transport.calls)
+            return super().acknowledge(observed)
+
+    source = FiniteSnapshotQueue([historical, *live_events])
+    transport = RecordingTransport()
+    result = run_tl_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(transport),
+        config=replace(_config(), keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    assert source.snapshot_count == 1
+    assert source.acknowledged == [1, 2, 3, 4]
+    assert [name for name, _ in transport.calls].count("spawn_worker") == 1
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    boundary_index = next(
+        index
+        for index, (name, arguments) in enumerate(transport.calls)
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.recovery_boundary"
+        and cast(dict[str, Any], arguments["payload"]).get("reason")
+        == "historical_catch_up_complete"
+    )
+    dispatch_index = next(
+        index for index, (name, _) in enumerate(transport.calls) if name == "spawn_worker"
+    )
+    assert boundary_index < dispatch_index
+
+
+def test_incomplete_startup_ledger_holds_before_live_dispatch(tmp_path: Path) -> None:
+    """A gap in the captured ledger prefix cannot release startup work."""
+    run_id = "incomplete-startup-ledger"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+
+    class IncompleteSnapshotQueue(SyntheticQueue):
+        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                events=(),
+                boundary_run_seq=cursor + 2,
+                sequence_status=SequenceStatus.PARTIAL,
+                findings=(),
+                active_tail=None,
+            )
+
+    transport = RecordingTransport()
+    result = run_tl_loop(
+        run_id,
+        plan,
+        IncompleteSnapshotQueue([]),
+        EffectClient(transport),
+        config=replace(_config(), keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    assert result.diagnostics["recovery_consistency"] == "ledger_sequence_gap_or_duplicate"
+    assert any(
+        gate.name == driver_module.RECOVERY_CONSISTENCY_GATE_NAME
+        and gate.status is GateStatus.PENDING
+        for gate in result.final_state.gates
+    )
+    assert not any(
+        name in {"spawn_worker", "spawn_leaf", "spawn_reviewer", "merge_pr"}
+        for name, _ in transport.calls
+    )
+
+
+def test_missing_startup_snapshot_capability_holds_before_dispatch(tmp_path: Path) -> None:
+    """A source without a durable startup boundary cannot start runnable work."""
+    run_id = "missing-startup-snapshot"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+
+    class MissingSnapshotQueue:
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            del timeout
+            raise queue.Empty
+
+        def acknowledge(self, event: EventEnvelope) -> int:
+            del event
+            raise AssertionError("an empty source cannot acknowledge an event")
+
+    transport = RecordingTransport()
+    result = run_tl_loop(
+        run_id,
+        plan,
+        MissingSnapshotQueue(),
+        EffectClient(transport),
+        config=replace(_config(), keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    assert result.diagnostics["recovery_consistency"] == (
+        "ledger_snapshot_unavailable: event source has no snapshot"
+    )
+    assert not any(name == "spawn_worker" for name, _ in transport.calls)
+
+
+def test_unavailable_startup_snapshot_preserves_reader_error_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    run_id = "unavailable-startup-snapshot"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+
+    class UnavailableSnapshotQueue(SyntheticQueue):
+        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+            raise QueueError(
+                cursor=cursor,
+                sequence_status=SequenceStatus.UNKNOWN,
+                cause=OSError("ledger unavailable"),
+            )
+
+    transport = RecordingTransport()
+    with pytest.raises(QueueError, match="OSError: ledger unavailable"):
+        run_tl_loop(
+            run_id,
+            plan,
+            UnavailableSnapshotQueue([]),
+            EffectClient(transport),
+            config=replace(_config(), keep_alive_on_waiting=False),
+            root_dir=tmp_path,
+        )
+    assert not any(name == "spawn_worker" for name, _ in transport.calls)
+
+
+def test_startup_snapshot_queue_mismatch_holds_without_acknowledging(tmp_path: Path) -> None:
+    run_id = "startup-snapshot-queue-mismatch"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    expected = _canonical_event(1, "inbox.message", "worker-a", run_id)
+    observed = _canonical_event(2, "agent.spawned", "worker-a", run_id)
+
+    class MismatchedQueue(SyntheticQueue):
+        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                events=(expected,),
+                boundary_run_seq=1,
+                sequence_status=SequenceStatus.COMPLETE,
+                findings=(),
+                active_tail=None,
+            )
+
+    transport = RecordingTransport()
+    source = MismatchedQueue([observed])
+    result = run_tl_loop(
+        run_id,
+        plan,
+        source,
+        EffectClient(transport),
+        config=replace(_config(), keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    assert result.diagnostics["recovery_consistency"] == "ledger_snapshot_queue_mismatch"
+    assert source.acknowledged == []
+    assert not any(name == "spawn_worker" for name, _ in transport.calls)
+
+
+def test_startup_snapshot_drain_timeout_parks_before_dispatch(tmp_path: Path, monkeypatch) -> None:
+    run_id = "startup-snapshot-drain-timeout"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    historical = _canonical_event(1, "inbox.message", "worker-a", run_id)
+
+    class MissingRowQueue(SyntheticQueue):
+        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                events=(historical,),
+                boundary_run_seq=1,
+                sequence_status=SequenceStatus.COMPLETE,
+                findings=(),
+                active_tail=None,
+            )
+
+    monkeypatch.setattr(driver_module, "STARTUP_DRAIN_EMPTY_POLL_LIMIT", 1)
+    transport = RecordingTransport()
+    result = run_tl_loop(
+        run_id,
+        plan,
+        MissingRowQueue([]),
+        EffectClient(transport),
+        config=replace(_config(), keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    assert result.diagnostics["recovery_consistency"] == "ledger_snapshot_drain_timeout"
+    assert not any(name == "spawn_worker" for name, _ in transport.calls)
 
 
 class _PollWorkersTransport(RecordingTransport):

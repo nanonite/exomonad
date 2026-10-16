@@ -37,6 +37,46 @@ def test_replay_from_arbitrary_run_seq_returns_exact_cross_segment_suffix(tmp_pa
     assert result.sequence_status is SequenceStatus.COMPLETE
 
 
+def test_startup_snapshot_has_a_finite_watermark(tmp_path: Path) -> None:
+    events = _fixture_events()
+    segments = tmp_path / "segments"
+    _write_segment(segments, 1, events[:2])
+    reader = LedgerReader(segments)
+
+    snapshot = reader.capture_snapshot(cursor=101)
+
+    assert [event.run_seq for event in snapshot.events] == [102]
+    assert snapshot.boundary_run_seq == 102
+    assert snapshot.sequence_status is SequenceStatus.COMPLETE
+
+    _write_segment(segments, 2, events[2:4])
+
+    assert snapshot.boundary_run_seq == 102
+    assert [event.run_seq for event in snapshot.events] == [102]
+    later = reader.capture_snapshot(cursor=101)
+    assert [event.run_seq for event in later.events] == [102, 103, 104]
+    assert later.boundary_run_seq == 104
+
+
+def test_startup_snapshot_preserves_gap_and_partial_tail_evidence(tmp_path: Path) -> None:
+    events = _fixture_events()
+    segments = tmp_path / "segments"
+    _write_segment(segments, 1, [events[0], events[2]])
+
+    gap = LedgerReader(segments).capture_snapshot(cursor=100)
+
+    assert gap.sequence_status is SequenceStatus.PARTIAL
+    assert gap.boundary_run_seq == 103
+
+    active_path = segments / "segment-000000000002.jsonl"
+    active_path.write_bytes(b'{"type":"agent.spawned"')
+    partial = LedgerReader(segments).capture_snapshot(cursor=103)
+
+    assert partial.active_tail is not None
+    assert partial.active_tail.segment == active_path
+    assert partial.boundary_run_seq == 103
+
+
 def test_reader_finds_terminal_invocation_payload_with_shared_segment_parser(
     tmp_path: Path,
 ) -> None:
