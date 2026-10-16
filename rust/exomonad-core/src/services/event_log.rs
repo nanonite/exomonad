@@ -33,6 +33,13 @@ pub fn canonical_review_wakeup_data(
         .or_insert_with(|| serde_json::Value::from(pr_number));
     data.entry("head_sha".to_string())
         .or_insert_with(|| serde_json::Value::String(head_sha.to_string()));
+    if matches!(
+        data.get("kind").and_then(serde_json::Value::as_str),
+        Some("approved" | "reviewer_approved")
+    ) {
+        data.entry("findings".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    }
     serde_json::Value::Object(data)
 }
 
@@ -356,6 +363,18 @@ mod tests {
         assert_eq!(data["branch"], "main.worker");
         assert_eq!(data["pr_number"], 7);
         assert_eq!(data["head_sha"], "abc123");
+    }
+
+    #[test]
+    fn canonical_approval_wakeup_marks_an_empty_findings_list() {
+        let data = canonical_review_wakeup_data(
+            "main.worker",
+            7,
+            "abc123",
+            &serde_json::json!({"kind": "approved"}),
+        );
+
+        assert_eq!(data["findings"], serde_json::json!([]));
     }
 
     #[test]

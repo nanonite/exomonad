@@ -170,12 +170,64 @@ class GitHubState:
 
     def merge_pr(self, number):
         if number in self.prs:
-            self.prs[number]["state"] = "closed"
+            pr = self.prs[number]
+            merge_commit = pr["head"]["sha"]
+            if os.environ.get("MOCK_ADVANCE_BASE_ON_MERGE") == "1":
+                merge_commit = self._advance_base_branch(pr)
+                if merge_commit is None:
+                    return False
+            pr["state"] = "closed"
+            pr["merged"] = True
+            pr["merge_commit_sha"] = merge_commit
             self.prs[number]["updated_at"] = datetime.datetime.now(
                 datetime.timezone.utc
             ).isoformat()
             return True
         return False
+
+    def _advance_base_branch(self, pr):
+        remote_dir = os.environ.get("REMOTE_DIR")
+        if not remote_dir:
+            return None
+        base_branch = pr["base"]["ref"]
+        base_sha = resolve_sha(base_branch)
+        head_sha = resolve_sha(pr["head"]["ref"])
+        if not base_sha or not head_sha:
+            return None
+        tree = run_fixture_git(
+            ["merge-tree", "--write-tree", base_sha, head_sha],
+            fixture_root=remote_dir,
+            cwd=remote_dir,
+        )
+        if tree.returncode != 0 or not tree.stdout.strip():
+            return None
+        commit = run_fixture_git(
+            [
+                "-c",
+                "user.name=Exomonad E2E Forgejo",
+                "-c",
+                "user.email=forgejo-e2e@example.invalid",
+                "commit-tree",
+                tree.stdout.strip().splitlines()[0],
+                "-p",
+                base_sha,
+                "-p",
+                head_sha,
+                "-m",
+                f"Merge PR #{pr['number']}",
+            ],
+            fixture_root=remote_dir,
+            cwd=remote_dir,
+        )
+        if commit.returncode != 0 or not commit.stdout.strip():
+            return None
+        commit_sha = commit.stdout.strip()
+        update = run_fixture_git(
+            ["update-ref", f"refs/heads/{base_branch}", commit_sha, base_sha],
+            fixture_root=remote_dir,
+            cwd=remote_dir,
+        )
+        return commit_sha if update.returncode == 0 else None
 
     def add_review(self, pr_number, review_state, body="", commit_id=None, login="copilot[bot]"):
         """Add a review to a PR's review queue."""
@@ -264,8 +316,21 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length).decode("utf-8")
         return json.loads(body) if body else {}
 
+    def _authenticated_login(self):
+        token = self.headers.get("Authorization", "").removeprefix("token ")
+        return {
+            "test-token-e2e": "exomonad-e2e",
+            "reviewer-token-e2e": "reviewer-e2e",
+        }.get(token)
+
     def do_GET(self):
         path = self._api_path()
+
+        if path == "/user":
+            login = self._authenticated_login()
+            if login is None:
+                return self._send_error(401, "Invalid token")
+            return self._send_json({"login": login})
 
         # GET /repos/{owner}/{repo}/pulls
         m = re.match(r"^/repos/([^/]+)/([^/]+)/pulls$", path)
@@ -449,7 +514,8 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
                 event = data.get("event", "APPROVED")
                 body = data.get("body", "")
                 commit_id = data.get("commit_id")
-                review = state.add_review(pr_number, event, body, commit_id)
+                login = self._authenticated_login() or "copilot[bot]"
+                review = state.add_review(pr_number, event, body, commit_id, login)
                 return self._send_json(review, 200)
             except json.JSONDecodeError:
                 return self._send_error(400, "Invalid JSON")
@@ -459,7 +525,12 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         if m:
             pr_number = int(m.group(3))
             if state.merge_pr(pr_number):
-                return self._send_json({"merged": True, "sha": "abc123"})
+                return self._send_json(
+                    {
+                        "merged": True,
+                        "sha": state.prs[pr_number]["merge_commit_sha"],
+                    }
+                )
             return self._send_error(404, "PR not found")
 
         # POST /repos/{owner}/{repo}/pulls

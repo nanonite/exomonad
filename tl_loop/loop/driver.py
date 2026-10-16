@@ -16090,26 +16090,9 @@ def _promote_aggregate_if_child_complete(
         readiness_evidence=evidence,
     )
     updated_slices = dict(state.slices)
-    if _ordered_recovery_is_superseded(current, state.run_id, task.name):
-        recovery = current.recovery
-        assert recovery is not None
-        _record_controller_event(
-            task.name,
-            "tl.ordered_recovery_superseded",
-            {
-                "slice_id": task.name,
-                "cause": recovery.cause,
-                "invocation_id": recovery.evidence.get("invocation_id"),
-                "generation": recovery.invocation_generation,
-                "aggregate_pr_number": evidence.aggregate_pr_number,
-                "aggregate_head_sha": evidence.aggregate_head_sha,
-                "receipt_digest": evidence.receipt_digest,
-            },
-            config,
-            effects,
-            effects_log,
-        )
-        updated_slices[task.name] = replace(current, recovery=None)
+    updated_slices[task.name] = _supersede_ordered_recovery_after_proof(
+        current, state.run_id, task.name, evidence, config, effects, effects_log
+    )
     return store.checkpoint(
         _phase_from_state(state),
         updated_slices,
@@ -16473,6 +16456,39 @@ def _ordered_recovery_is_superseded(current: SliceState, owner_run_id: str, slic
         and recovery.evidence.get("invocation_id") == current.dispatch_invocation_id
         and recovery.invocation_generation == current.dispatch_generation
     )
+
+
+def _supersede_ordered_recovery_after_proof(
+    current: SliceState,
+    owner_run_id: str,
+    slice_id: str,
+    evidence: IntegrationReadinessEvidence,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> SliceState:
+    """Clear an ordered pane recovery only after aggregate readiness is proven."""
+    if not _ordered_recovery_is_superseded(current, owner_run_id, slice_id):
+        return current
+    recovery = current.recovery
+    assert recovery is not None
+    _record_controller_event(
+        slice_id,
+        "tl.ordered_recovery_superseded",
+        {
+            "slice_id": slice_id,
+            "cause": recovery.cause,
+            "invocation_id": recovery.evidence.get("invocation_id"),
+            "generation": recovery.invocation_generation,
+            "aggregate_pr_number": evidence.aggregate_pr_number,
+            "aggregate_head_sha": evidence.aggregate_head_sha,
+            "receipt_digest": evidence.receipt_digest,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return replace(current, recovery=None)
 
 
 def _candidate_lane_key(state: RunState, current: SliceState) -> tuple[str, str]:
@@ -17599,6 +17615,20 @@ def _integrate_one_candidate(
     )
     if readiness is None:
         return state
+    reconciled_current = _supersede_ordered_recovery_after_proof(
+        current, state.run_id, task.name, readiness, config, effects, effects_log
+    )
+    if reconciled_current is not current:
+        state = store.checkpoint(
+            _phase_from_state(state),
+            {**state.slices, task.name: reconciled_current},
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=state.current_order,
+            ordered_stages=state.ordered_stages,
+            expected_revision=state.revision,
+        )
+        current = state.slices[task.name]
     transitioned_integration = (
         state.integration
         if candidate_runtime.lifecycle is IntegrationLifecycle.INTEGRATION_VALIDATED

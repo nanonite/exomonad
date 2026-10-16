@@ -720,7 +720,7 @@ def _derive_run_action(
             None,
         )
         if pending_post_merge is not None:
-            return ExternalIntent("post_merge_recovery", pending_post_merge.id, {})
+            return _post_merge_recovery_intent(pending_post_merge)
         return InternalTransition("terminal", "aggregate_merged")
     if integration.lifecycle in {IntegrationLifecycle.FAILED, IntegrationLifecycle.PARKED}:
         return Quiescent(f"aggregate_{integration.lifecycle.value.lower()}")
@@ -774,7 +774,7 @@ def _derive_run_action(
             None,
         )
         if pending_post_merge is not None:
-            return ExternalIntent("post_merge_recovery", pending_post_merge.id, {})
+            return _post_merge_recovery_intent(pending_post_merge)
         return Quiescent("await_merge_recovery")
     if integration.lifecycle is IntegrationLifecycle.CHILDREN_MERGED:
         return ExternalIntent(
@@ -877,7 +877,7 @@ def _derive_candidate_run_action(
                     or current.post_merge.phase is not PostMergePhase.COMPLETE
                 )
             ):
-                return ExternalIntent("post_merge_recovery", candidate_id, {})
+                return _post_merge_recovery_intent(current)
             return Quiescent("await_merge_recovery")
         if lifecycle is IntegrationLifecycle.MERGED:
             if (
@@ -888,7 +888,7 @@ def _derive_candidate_run_action(
                     or current.post_merge.phase is not PostMergePhase.COMPLETE
                 )
             ):
-                return ExternalIntent("post_merge_recovery", candidate_id, {})
+                return _post_merge_recovery_intent(current)
             continue
         if lifecycle in {IntegrationLifecycle.FAILED, IntegrationLifecycle.PARKED}:
             return Quiescent(f"aggregate_{lifecycle.value.lower()}")
@@ -900,6 +900,25 @@ def _derive_candidate_run_action(
             )
         return Quiescent("await_aggregate_progress")
     return InternalTransition("terminal", "aggregate_merged")
+
+
+def _post_merge_recovery_intent(current: SliceState) -> ExternalIntent:
+    """Give each persisted post-merge evidence boundary a distinct action key.
+
+    Checkpoints do not always advance the run-level state version. Including a
+    digest of the post-merge state lets convergence proceed after real durable
+    progress while keeping an unchanged, repeatedly proposed action detectable.
+    """
+    post_merge = current.post_merge
+    phase = post_merge.phase.value if post_merge is not None else "missing"
+    evidence = post_merge.evidence if post_merge is not None else {}
+    encoded = dumps_json(dict(evidence), sort_keys=True, separators=(",", ":"))
+    evidence_digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return ExternalIntent(
+        "post_merge_recovery",
+        current.id,
+        {"post_merge_phase": phase, "post_merge_evidence_sha256": evidence_digest},
+    )
 
 
 def _candidate_ids_in_order(state: RunState) -> tuple[str, ...]:
@@ -950,7 +969,7 @@ def _derive_slice_action(
     )
     if state.status is SliceStatus.MERGED:
         if state.post_merge is None or state.post_merge.phase is not PostMergePhase.COMPLETE:
-            return ExternalIntent("post_merge_recovery", state.id, {})
+            return _post_merge_recovery_intent(state)
         return InternalTransition("terminal", "merged")
     if (
         state.verdict is not None

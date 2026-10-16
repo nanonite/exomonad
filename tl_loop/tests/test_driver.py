@@ -8826,6 +8826,7 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         transport: OrderedIntegrationTransport,
         *,
         with_ordered_recovery: bool = False,
+        with_rejected_merge: bool = False,
     ) -> None:
         root_manifest = driver_module._manifest_for_plan(plan, "ordered-e2e-run", config)
         root_slices = _initial_slices(plan, config, parent_root, "ordered-e2e-run")
@@ -8928,6 +8929,52 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             dispatch_authoritative_event_seq=0,
             dispatch_last_boundary="aggregate_pr_open",
         )
+        if with_rejected_merge:
+            rejected_intent = EffectIntent(
+                "merge_pr",
+                "alpha",
+                {"pr_number": 101, "attempt": 1},
+                True,
+            )
+            journal = EffectJournal(
+                "ordered-e2e-run",
+                root_store.run_dir / "action-journal.json",
+            )
+            journal.append(rejected_intent)
+            journal.mark_result(
+                rejected_intent,
+                ToolResult(
+                    raw={
+                        "success": False,
+                        "error": "No Forgejo reviewer response yet on PR #101.",
+                    },
+                    success=False,
+                    result={
+                        "success": False,
+                        "error": "No Forgejo reviewer response yet on PR #101.",
+                    },
+                    error="No Forgejo reviewer response yet on PR #101.",
+                ),
+            )
+            alpha = replace(
+                alpha,
+                action=ActionState(
+                    ActionKind.MERGE,
+                    ActionPhase.IN_FLIGHT,
+                    intent_id=journal.key_for(rejected_intent),
+                    head_sha=alpha_head,
+                    attempt=1,
+                ),
+            )
+            aggregate = replace(
+                aggregate,
+                lifecycle=IntegrationLifecycle.MERGING,
+                validated_base_sha="base-alpha",
+                merge_tree_sha="tree-alpha",
+                integration_evidence_at="2026-10-16T00:00:00Z",
+                ci_status="success",
+                stage_verification="passed",
+            )
         if with_ordered_recovery:
             alpha = replace(
                 alpha,
@@ -8991,7 +9038,11 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         spawned_agent_id="beta",
         spawned_invocation_id="beta-invocation",
     )
-    seed_child_scopes(uninterrupted_root, uninterrupted_transport)
+    seed_child_scopes(
+        uninterrupted_root,
+        uninterrupted_transport,
+        with_rejected_merge=True,
+    )
     uninterrupted_transport.observed_root_store = RunStore("ordered-e2e-run", uninterrupted_root)
     uninterrupted = run_tl_loop(
         "ordered-e2e-run",
@@ -9007,7 +9058,12 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         spawned_agent_id="beta",
         spawned_invocation_id="beta-invocation",
     )
-    seed_child_scopes(replayed_root, replayed_transport, with_ordered_recovery=True)
+    seed_child_scopes(
+        replayed_root,
+        replayed_transport,
+        with_ordered_recovery=True,
+        with_rejected_merge=True,
+    )
     replayed_transport.observed_root_store = RunStore("ordered-e2e-run", replayed_root)
     resumed = run_tl_loop(
         "ordered-e2e-run",
@@ -9071,6 +9127,15 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             and result.final_state.slices[name].post_merge.phase is PostMergePhase.COMPLETE
             for name in ("alpha", "beta")
         )
+        retired_attempts = [
+            arguments
+            for name, arguments in transport.calls
+            if name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.merge_attempt_retired"
+        ]
+        assert len(retired_attempts) == 1
+        assert retired_attempts[0]["payload"]["slice_id"] == "alpha"
+        assert result.final_state.integration.candidates["alpha"].merge_attempts == 2
     assert resumed.final_state.slices["alpha"].recovery is None
     assert any(
         arguments.get("event_type") == "tl.ordered_recovery_superseded"
@@ -9089,6 +9154,31 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         resumed.final_state.slices["beta"].pr_number,
     )
     assert len([name for name, _ in replayed_transport.calls if name == "file_pr"]) == 1
+    for root in (uninterrupted_root, replayed_root):
+        journal = EffectJournal(
+            "ordered-e2e-run",
+            RunStore("ordered-e2e-run", root).run_dir / "action-journal.json",
+        )
+        entries = journal.snapshot()
+        rejected = [
+            entry
+            for entry in entries
+            if entry.get("operation") == "merge_pr"
+            and entry.get("target") == "alpha"
+            and entry.get("status") == "rejected"
+        ]
+        successful = [
+            entry
+            for entry in entries
+            if entry.get("operation") == "merge_pr"
+            and entry.get("target") == "alpha"
+            and entry.get("status") == "confirmed"
+        ]
+        assert len(rejected) == 1
+        assert rejected[0]["error"] == "No Forgejo reviewer response yet on PR #101."
+        assert rejected[0]["result"]["success"] is False
+        assert len(successful) == 1
+        assert successful[0]["arguments"]["attempt"] == 2
 
 
 def test_failed_ordered_sub_tl_blocks_higher_order_work(tmp_path: Path) -> None:

@@ -33,6 +33,7 @@ def main() -> None:
     parser.add_argument("--head-branch", default="main.leaf-a")
     parser.add_argument("--head-sha", required=True)
     parser.add_argument("--slice-id", default="leaf-a")
+    parser.add_argument("--reviewer-token", required=True)
     args = parser.parse_args()
 
     repo = Path(args.repo)
@@ -48,14 +49,22 @@ def main() -> None:
         },
     )
     pr_number = pr["number"]
-    post(
-        args.mock_url,
-        f"/api/v1/repos/owner/repo/pulls/{pr_number}/reviews",
-        {"event": "APPROVED", "commit_id": args.head_sha},
+    request = urllib.request.Request(
+        args.mock_url + f"/api/v1/repos/owner/repo/pulls/{pr_number}/reviews",
+        data=json.dumps({"event": "APPROVED", "commit_id": args.head_sha}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"token {args.reviewer_token}",
+        },
+        method="POST",
     )
+    with urllib.request.urlopen(request) as response:
+        review = json.load(response)
+    if type(review.get("id")) is not int or review["id"] <= 0:
+        raise ValueError("mock Forgejo review omitted its durable ID")
 
-    # published-heads.json: durable record that a PR was filed for this
-    # slice, exactly as file_pr would have written before the crash.
+    # published-heads.json: an isolated registry fixture for the already-filed
+    # PR. The continuation under test exercises the production merge tool.
     published_heads = {
         "schema_version": 1,
         "heads": [
@@ -126,27 +135,22 @@ def main() -> None:
     # the exact PR/head-bound Review invocation, not from editable PR metadata
     # or the current identity registry.
     reviewer_agent = f"review-pr-{pr_number}-codex"
-    reviewer_dir = repo / ".exo" / "agents" / reviewer_agent
-    reviewer_dir.mkdir(parents=True, exist_ok=True)
-    (reviewer_dir / "invocation.json").write_text(
+    events = repo / ".exo" / "events"
+    events.mkdir(parents=True, exist_ok=True)
+    (events / "reviewer-invocations.jsonl").write_text(
         json.dumps(
             {
-                "invocation_id": f"seed-review-invocation-{pr_number}",
-                "runtime": "codex",
-                "trigger": "review",
-                "mode": "interactive",
-                "routing": {"window_id": "@42"},
-                "started_at": 1700000000,
-                "ended_at": 1700000060,
-                "status": "exited",
-                "exit_code": 0,
-                "pr_number": pr_number,
-                "head_sha": args.head_sha,
-                "generation": 1,
-                "runtime_agent_id": reviewer_agent,
-            },
-            indent=2,
+                "type": "agent.invocation.finished",
+                "agent_id": reviewer_agent,
+                "data": {
+                    "trigger": "review",
+                    "pr_number": pr_number,
+                    "head_sha": args.head_sha,
+                    "runtime_agent_id": reviewer_agent,
+                },
+            }
         )
+        + "\n"
     )
 
     print(f"{pr_number} {args.head_sha}")

@@ -14,20 +14,21 @@ set -euo pipefail
 # call there. That failure is expected and tolerated: those phases assert
 # tmux window state and server socket health, not controller outcomes.
 #
-# Phase 7 exercises what phases 1-6 deliberately don't: automatic
-# continuation of a real nonterminal checkpoint through the embedded
-# controller, the real watcher poller, and the real ledger, ending in an
-# observable next lifecycle action (recovered review/CI evidence durably
-# written back to the checkpoint) -- not just tmux window repair. TL
-# controller crash/resume *decision logic* is covered separately and
-# thoroughly by tests/e2e/ordered-recursive at the Python-controller level;
-# this phase covers what that harness cannot: the real embedded `tl_loop.pyz`
-# archive, launched by the real binary, resuming a checkpoint that was
-# already on disk when `exomonad init` started.
+# Phase 7 exercises what phases 1-6 deliberately don't: continuation of a
+# reviewed, completed leaf through the embedded controller, real watcher,
+# real ledger, and production merge tool. It verifies merge and post-merge
+# completion, not just tmux repair. The checkpoint's review, handoff, and
+# publication evidence are seeded from exact mock-Forgejo records so this
+# phase tests the installed controller/tool boundary without simulating an
+# agent or claiming a reviewer was recovered from the event stream.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/harness.sh
 source "$SCRIPT_DIR/../lib/harness.sh"
+
+# This recovery fixture never invokes a model. Keep project scaffolding
+# deterministic when the isolated Codex home has no host model configuration.
+export EXOMONAD_CODEX_MODEL="${EXOMONAD_CODEX_MODEL:-e2e-unused-model}"
 
 SESSION="e2e-init-recovery"
 CONTINUATION_SESSION="e2e-init-recovery-continuation"
@@ -169,12 +170,36 @@ e2e_log "PASS: exactly one TL window survived five exomonad init invocations acr
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-e2e_phase "Phase 7" "Seeding a real nonterminal checkpoint and confirming automatic continuation..."
+e2e_phase "Phase 7" "Seeding a reviewed checkpoint and confirming production merge continuation..."
 
 CONT_DIR="$WORK_DIR/continuation"
 CONT_REPO="$CONT_DIR/repo"
 CONT_REMOTE="$CONT_DIR/remote/owner/repo.git"
+CONT_HOME="$CONT_DIR/home"
 mkdir -p "$CONT_DIR"
+mkdir -p "$CONT_HOME/.exo"
+python3 "$PROJECT_ROOT/scripts/build_tl_loop_archive.py" \
+    --source "$PROJECT_ROOT/tl_loop" --output "$CONT_HOME/.exo/tl_loop.pyz"
+python3 "$PROJECT_ROOT/scripts/check_tl_loop_archive.py" \
+    "$CONT_HOME/.exo/tl_loop.pyz" --source "$PROJECT_ROOT/tl_loop"
+CONTROLLER_ARCHIVE_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
+    "$CONT_HOME/.exo/tl_loop.pyz")"
+BUILD_ID="$(python3 -c 'import json,sys,zipfile; print(json.loads(zipfile.ZipFile(sys.argv[1]).read("tl_loop/_build_fingerprint.json"))["git_commit"])' \
+    "$CONT_HOME/.exo/tl_loop.pyz")"
+e2e_log "Built isolated controller archive sha256=$CONTROLLER_ARCHIVE_SHA256 build=$BUILD_ID"
+cat > "$CONT_DIR/git-ssh" <<'EOF'
+#!/bin/sh
+E2E_GIT_REMOTE_DIR="@REMOTE@"
+case "$*" in
+    *git-upload-pack*) exec git-upload-pack "${E2E_GIT_REMOTE_DIR:?}" ;;
+    *git-receive-pack*) exec git-receive-pack "${E2E_GIT_REMOTE_DIR:?}" ;;
+    *) exit 64 ;;
+esac
+EOF
+sed -i "s|@REMOTE@|$CONT_REMOTE|" "$CONT_DIR/git-ssh"
+chmod +x "$CONT_DIR/git-ssh"
+export GIT_SSH_COMMAND="$CONT_DIR/git-ssh"
+export E2E_GIT_REMOTE_DIR="$CONT_REMOTE"
 
 # Bare remote lives at .../owner/repo.git: exomonad's owner/repo parser reads
 # the last two path segments of the git remote URL, independent of what
@@ -199,7 +224,7 @@ LEAF_SHA="$(git -C "$CONT_REPO" rev-parse main.leaf-a)"
 
 MOCK_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 MOCK_URL="http://127.0.0.1:$MOCK_PORT"
-REMOTE_DIR="$CONT_REMOTE" MOCK_LOG="$CONT_DIR/mock.log" \
+REMOTE_DIR="$CONT_REMOTE" MOCK_LOG="$CONT_DIR/mock.log" MOCK_ADVANCE_BASE_ON_MERGE=1 \
     python3 "$PROJECT_ROOT/tests/e2e/mock_github.py" --port "$MOCK_PORT" \
     > "$CONT_DIR/mock.stderr" 2>&1 &
 MOCK_PID=$!
@@ -212,6 +237,11 @@ curl -fsS "$MOCK_URL/api/v1/admin/actions/runners" >/dev/null \
 
 cd "$CONT_REPO"
 "$EXOMONAD_BIN" new > "$CONT_DIR/new.log" 2>&1 || { cat "$CONT_DIR/new.log"; e2e_fail "'exomonad new' failed for the continuation fixture"; }
+# Keep Git operations local while exposing the canonical SSH remote as the
+# repository identity consumed by the controller and merge host.
+git remote set-url origin "git@forgejo-e2e:owner/repo.git"
+git remote set-url --push origin "git@forgejo-e2e:owner/repo.git"
+git config core.sshCommand "$CONT_DIR/git-ssh"
 mkdir -p .exo/wasm
 for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
     ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
@@ -220,7 +250,15 @@ cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
 cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
 cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
 mkdir -p .exo/tl-loop
-printf '{"run_id":"root","plan":{"leaves":[{"name":"leaf-a","task":"leaf-a change"}]}}\n' > .exo/tl-loop/plan.json
+printf '{"run_id":"root","plan":{"leaves":[{"name":"leaf-a","task":"leaf-a change","chainlink_issue_id":null}]}}\n' > .exo/tl-loop/plan.json
+cp .exo/tl-loop/plan.json .exo/tl-loop/plan.snapshot
+python3 - <<'PY'
+from hashlib import sha256
+from pathlib import Path
+
+snapshot = Path(".exo/tl-loop/plan.snapshot").read_bytes()
+Path(".exo/tl-loop/plan.snapshot.sha256").write_text(sha256(snapshot).hexdigest() + "\n")
+PY
 cat > .exo/config.toml <<EOF
 shell_command = "bash"
 tmux_session = "$CONTINUATION_SESSION"
@@ -229,18 +267,21 @@ poll_interval = 1
 spawn_agent_type = "codex"
 forgejo_url = "$MOCK_URL"
 forgejo_token = "test-token-e2e"
+forgejo_reviewer_token = "reviewer-token-e2e"
 EOF
 
 read -r PR_NUMBER HEAD_SHA < <(
     python3 "$SCRIPT_DIR/seed_publication.py" \
         --mock-url "$MOCK_URL" --repo "$CONT_REPO" \
-        --head-branch "main.leaf-a" --head-sha "$LEAF_SHA" --slice-id "leaf-a"
+        --head-branch "main.leaf-a" --head-sha "$LEAF_SHA" --slice-id "leaf-a" \
+        --reviewer-token "reviewer-token-e2e"
 )
 [[ "$HEAD_SHA" == "$LEAF_SHA" ]] || e2e_fail "seed_publication.py returned an unexpected head SHA"
 e2e_log "Filed and approved PR #$PR_NUMBER against the mock Forgejo (head=$HEAD_SHA)"
 
 PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_checkpoint.py" \
-    --repo "$CONT_REPO" --pr-number "$PR_NUMBER" --branch "main.leaf-a" --slice-id "leaf-a"
+    --repo "$CONT_REPO" --mock-url "$MOCK_URL" --pr-number "$PR_NUMBER" \
+    --head-sha "$HEAD_SHA" --branch "main.leaf-a" --slice-id "leaf-a"
 
 BEFORE_STATUS="$(python3 -c "
 import json
@@ -249,12 +290,15 @@ s = d['slices']['leaf-a']
 print(s['reviewed_head'], s['verdict'], d['events']['last_consumed_offset'])
 ")"
 read -r before_reviewed_head before_verdict before_offset <<< "$BEFORE_STATUS"
-[[ "$before_reviewed_head" == "None" && "$before_verdict" == "None" && "$before_offset" == "0" ]] \
+[[ "$before_reviewed_head" == "$HEAD_SHA" && "$before_verdict" == "GO" && "$before_offset" == "0" ]] \
     || e2e_fail "seeded checkpoint was not in the expected pre-recovery state: $BEFORE_STATUS"
-e2e_log "Seeded nonterminal checkpoint: pr_number=$PR_NUMBER reviewed_head=None verdict=None (awaiting recovery)"
+e2e_log "Seeded reviewed checkpoint: pr_number=$PR_NUMBER reviewed_head=$HEAD_SHA verdict=GO (awaiting integration)"
 
 tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null || true
-"$EXOMONAD_BIN" init --session "$CONTINUATION_SESSION" > "$CONT_DIR/init.log" 2>&1 || true
+HOME="$CONT_HOME" "$EXOMONAD_BIN" init --continue --session "$CONTINUATION_SESSION" \
+    > "$CONT_DIR/init.log" 2>&1 || true
+rg -Fq "server_build=\"$BUILD_ID\" controller_build=\"$BUILD_ID\"" "$CONT_DIR/init.log" \
+    || { cat "$CONT_DIR/init.log"; e2e_fail "continuation binary and controller compatibility fingerprints did not match"; }
 
 AFTER_STATUS=""
 for _ in $(seq 1 50); do
@@ -262,19 +306,28 @@ for _ in $(seq 1 50); do
 import json
 d = json.load(open('.exo/tl-loop/root/run.json'))
 s = d['slices']['leaf-a']
-print(s['reviewed_head'], s['verdict'], d['events']['last_consumed_offset'])
+post = s.get('post_merge') or {}
+phase = post.get('phase') if isinstance(post, dict) else None
+journal = json.load(open('.exo/tl-loop/root/action-journal.json'))
+merges = [entry for entry in journal if entry.get('operation') == 'merge_pr' and entry.get('target') == 'leaf-a' and entry.get('status') == 'confirmed']
+print(s['reviewed_head'], s['verdict'], s['status'], phase, len(merges), d['events']['last_consumed_offset'])
 " 2>/dev/null)" || AFTER_STATUS=""
-    [[ -n "$AFTER_STATUS" ]] && [[ "$AFTER_STATUS" != "None None 0" ]] && break
+    [[ "$AFTER_STATUS" == "$HEAD_SHA GO merged complete 1 "* ]] && break
     sleep 0.2
 done
-read -r after_reviewed_head after_verdict after_offset <<< "$AFTER_STATUS"
+read -r after_reviewed_head after_verdict after_status after_post_merge after_merge_count after_offset <<< "$AFTER_STATUS"
 
-if [[ "$after_reviewed_head" != "$HEAD_SHA" || "$after_verdict" != "GO" ]]; then
+if [[ "$after_reviewed_head" != "$HEAD_SHA" || "$after_verdict" != "GO" \
+    || "$after_status" != "merged" || "$after_post_merge" != "complete" \
+    || "$after_merge_count" != "1" ]]; then
     cat "$CONT_DIR/init.log"
-    e2e_fail "embedded controller did not recover review evidence after restart: got '$AFTER_STATUS', expected reviewed_head=$HEAD_SHA verdict=GO"
+    cat "$CONT_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true
+    e2e_fail "embedded controller did not merge and finish the reviewed leaf after restart: got '$AFTER_STATUS'"
 fi
 [[ "$after_offset" -gt 0 ]] || e2e_fail "embedded controller did not consume any ledger events during recovery"
-e2e_log "PASS: embedded controller resumed the nonterminal checkpoint, the real watcher observed the approved+green PR through the real ledger (offset 0 -> $after_offset), and recovered reviewed_head=$after_reviewed_head verdict=$after_verdict as its next lifecycle action"
+[[ "$(rg -c 'pulls/1/merge' "$CONT_DIR/mock.log" || true)" == "1" ]] \
+    || e2e_fail "production merge tool did not issue exactly one Forgejo merge request"
+e2e_log "PASS: bundled controller resumed the reviewed checkpoint, used the production merge tool once, and completed post-merge bookkeeping (offset 0 -> $after_offset, head=$after_reviewed_head)"
 
 echo ""
 echo "============================================"
