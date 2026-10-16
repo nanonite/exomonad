@@ -11260,8 +11260,11 @@ def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approv
     assert transport.aggregate_publication_calls == 2
 
 
+@pytest.mark.parametrize("crash_after_approval", [False, True], ids=["uninterrupted", "restart"])
 def test_parent_serializes_aggregate_merge_after_base_recheck(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_after_approval: bool,
 ) -> None:
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
@@ -11380,23 +11383,86 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         return original_verify(state, **live)
 
     monkeypatch.setattr(driver, "verify_integration", record_verify)
-    result = run_tl_loop(
-        "serialized-run",
-        plan,
-        SyntheticQueue([]),
-        EffectClient(transport),
-        config=config,
-        root_dir=tmp_path,
-    )
+    original_checkpoint = RunStore.checkpoint
+    approval_checkpoint_written = False
+
+    def crash_after_approval_checkpoint(
+        store: RunStore,
+        *args: Any,
+        **checkpoint_args: Any,
+    ) -> RunState:
+        nonlocal approval_checkpoint_written
+        state = original_checkpoint(store, *args, **checkpoint_args)
+        if (
+            store.run_id == "serialized-run"
+            and not approval_checkpoint_written
+            and state.integration is not None
+            and "aggregate-child" in state.integration.candidates
+        ):
+            candidate = state.integration.candidates["aggregate-child"]
+            if candidate.active_aggregate_approval_id and candidate.aggregate_approval_receipts:
+                approval_checkpoint_written = True
+                raise SystemExit("simulated crash after aggregate approval checkpoint")
+        return state
+
+    receipt_id_before_restart: str | None = None
+    if crash_after_approval:
+        monkeypatch.setattr(RunStore, "checkpoint", crash_after_approval_checkpoint)
+        with pytest.raises(SystemExit, match="after aggregate approval checkpoint"):
+            run_tl_loop(
+                "serialized-run",
+                plan,
+                SyntheticQueue([]),
+                EffectClient(transport),
+                config=config,
+                root_dir=tmp_path,
+            )
+
+        assert approval_checkpoint_written
+        state_after_crash = RunStore("serialized-run", tmp_path).load()
+        approval_before_restart = state_after_crash.integration.candidates["aggregate-child"]
+        assert len(approval_before_restart.aggregate_approval_receipts) == 1
+        receipt_id_before_restart = approval_before_restart.active_aggregate_approval_id
+        assert receipt_id_before_restart is not None
+        assert state_after_crash.slices["aggregate-child"].status is SliceStatus.IN_REVIEW
+        assert not any(name == "merge_pr" for name, _ in transport.calls)
+        monkeypatch.setattr(RunStore, "checkpoint", original_checkpoint)
+
+        result = run_tl_loop(
+            "serialized-run",
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=tmp_path,
+        )
+    else:
+        result = run_tl_loop(
+            "serialized-run",
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=tmp_path,
+        )
 
     assert result.final_state.slices["aggregate-child"].status is SliceStatus.MERGED
+    assert result.final_state.slices["aggregate-child"].post_merge is not None
+    assert result.final_state.slices["aggregate-child"].post_merge.phase is PostMergePhase.COMPLETE
     assert result.final_state.slices["aggregate-child"].verdict is None
     assert (
         result.final_state.slices["aggregate-child"].dispatch_invocation_id
         == "aggregate-child-invocation"
     )
-    assert verified == [("base-a", aggregate_head, "tree-a", "success")]
+    assert verified and all(
+        item == ("base-a", aggregate_head, "tree-a", "success") for item in verified
+    )
+    if not crash_after_approval:
+        assert verified == [("base-a", aggregate_head, "tree-a", "success")]
     candidate = result.final_state.integration.candidates["aggregate-child"]
+    if receipt_id_before_restart is not None:
+        assert candidate.active_aggregate_approval_id == receipt_id_before_restart
+    assert len(candidate.aggregate_approval_receipts) == 1
     assert candidate.validated_base_sha == "base-a"
     assert candidate.head_sha == aggregate_head
     assert candidate.patch_digest == "patch-a"
@@ -11431,14 +11497,16 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
         for name, arguments in transport.calls
         if name == "emit_controller_event"
     }
-    assert {
+    expected_events = {
         "tl.stage_started",
-        "tl.stage_completed",
         "tl.aggregate_pr_opened",
         "tl.integration_validated",
         "tl.integration_revalidated",
         "tl.merge_decided",
-    } <= event_types
+    }
+    if not crash_after_approval:
+        expected_events.add("tl.stage_completed")
+    assert expected_events <= event_types
 
 
 def test_restart_during_merging_without_publication_lineage_stays_unresolved(
