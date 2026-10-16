@@ -12797,6 +12797,85 @@ def test_finite_startup_prefix_drains_before_dispatch_and_live_events(
     assert boundary_index < dispatch_index
 
 
+def test_production_driver_accepts_contiguous_interior_supersession_history(
+    tmp_path: Path,
+) -> None:
+    """Startup uses raw ledger continuity even when projection removes a row."""
+    run_id = "driver-interior-supersession"
+    segments = tmp_path / "segments"
+    segments.mkdir()
+    rows = [
+        {
+            "event_id": f"source-{sequence}",
+            "id": f"source-{sequence}",
+            "schema_version": 1,
+            "event_time": "2026-10-16T00:00:00Z",
+            "observed_at": "2026-10-16T00:00:00Z",
+            "run_seq": sequence,
+            "type": "test.unmapped_history",
+            "run_id": run_id,
+            "session_id": "session-test",
+            "source": "test",
+            "lifecycle_state": "emitted",
+            "data": {},
+        }
+        for sequence in range(101, 104)
+    ]
+    rows.append(
+        {
+            **rows[-1],
+            "event_id": "source-104",
+            "id": "source-104",
+            "run_seq": 104,
+            "type": "event.superseded",
+            "data": {"superseded_event_id": "source-102", "reason": "corrected"},
+        }
+    )
+    (segments / "segment-000000000001.jsonl").write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    reader = LedgerReader(segments, ledger_run_id=run_id)
+
+    class ReaderBackedSource:
+        def capture_snapshot(self, cursor: int):
+            return reader.capture_snapshot(cursor)
+
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            del timeout
+            raise queue.Empty
+
+        def acknowledge(self, event: EventEnvelope) -> int:
+            assert event.run_seq is not None
+            return event.run_seq
+
+    snapshot = reader.capture_snapshot(cursor=0)
+    assert snapshot.events == ()
+    assert snapshot.boundary_run_seq == 104
+    assert snapshot.sequence_status is SequenceStatus.COMPLETE
+
+    transport = RecordingTransport()
+    result = run_tl_loop(
+        run_id,
+        WorkPlan(),
+        ReaderBackedSource(),
+        EffectClient(transport),
+        config=replace(_config(), keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLDone
+    assert result.diagnostics.get("recovery_consistency") is None
+    assert any(
+        name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.recovery_boundary"
+        and cast(dict[str, Any], arguments["payload"]).get("reason")
+        == "historical_catch_up_complete"
+        for name, arguments in transport.calls
+    )
+    assert result.final_state.events.last_consumed_offset <= 104
+
+
 def test_incomplete_startup_ledger_holds_before_live_dispatch(tmp_path: Path) -> None:
     """A gap in the captured ledger prefix cannot release startup work."""
     run_id = "incomplete-startup-ledger"

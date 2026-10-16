@@ -201,8 +201,10 @@ class LedgerReader:
 
     def _project_rows(self, read_rows: _RowsRead, effective_cursor: int) -> ReadResult:
         """Project one already-captured row set without rereading the ledger."""
+        # Sequence continuity describes the immutable source prefix. Apply it
+        # before supersession removes rows from the semantic projection.
+        status = sequence_status(_run_sequences(row.document for row in read_rows.rows))
         rows = _resolve_superseded(list(read_rows.rows))
-        status = sequence_status(_run_sequences(row.document for row in rows))
         findings: list[LedgerFinding] = []
         projected: list[EventEnvelope] = []
         projected_rows: list[tuple[LedgerRow, EventEnvelope]] = []

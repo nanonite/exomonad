@@ -282,6 +282,30 @@ def test_superseded_event_does_not_drive_projection(tmp_path: Path) -> None:
     assert result.sequence_status is SequenceStatus.COMPLETE
 
 
+def test_interior_supersession_preserves_source_sequence_continuity(tmp_path: Path) -> None:
+    """Semantic removal cannot make a contiguous committed prefix look gapped."""
+    rows = deepcopy(_fixture_events()[:3])
+    supersession = {
+        **rows[-1],
+        "event_id": "00000000-0000-4000-8000-000000000104",
+        "id": "00000000-0000-4000-8000-000000000104",
+        "run_seq": 104,
+        "type": "event.superseded",
+        "data": {
+            "superseded_event_id": rows[1]["event_id"],
+            "reason": "corrected",
+        },
+    }
+    segments = tmp_path / "segments"
+    _write_segment(segments, 1, [*rows, supersession])
+
+    result = LedgerReader(segments).capture_snapshot(cursor=100)
+
+    assert [event.run_seq for event in result.events] == [101, 103]
+    assert result.boundary_run_seq == 104
+    assert result.sequence_status is SequenceStatus.COMPLETE
+
+
 def test_active_segment_partial_tail_is_retried_after_append(tmp_path: Path) -> None:
     event = _fixture_events()[0]
     encoded = json.dumps(
