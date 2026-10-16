@@ -12581,6 +12581,114 @@ def test_live_heartbeat_resumes_when_startup_quarantine_never_resolves(
     )
 
 
+def test_replay_does_not_read_work_clock_before_live_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """A replayable historical row cannot start or consume active-work time."""
+    from tl_loop.loop.heartbeat import HeartbeatConfig
+
+    run_id = "work-clock-replay-boundary"
+    plan_document = {"workers": [{"name": "worker-a", "task": "task"}]}
+    case = _confirmed_worker(tmp_path, run_id=run_id)
+    store = RunStore(run_id, tmp_path)
+    store.set_plan_manifest(
+        build_plan_manifest(plan_document, scope_id=run_id), slices=case.state.slices
+    )
+    current = replace(
+        case.state.slices["worker-a"],
+        dispatch_started_at=time.time() - 23 * 24 * 60 * 60,
+        task_timeout_seconds=3600.0,
+        task_timeout_source="project",
+    )
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("worker-a",)),
+        {"worker-a": current},
+        case.state.budgets,
+        8,
+    )
+    store.quarantine_event(
+        {
+            "schema_version": 1,
+            "event_id": "replayed-spawn-confirmation",
+            "id": "replayed-spawn-confirmation",
+            "event_time": "2026-09-30T16:22:12Z",
+            "observed_at": "2026-09-30T16:22:12Z",
+            "run_seq": 9,
+            "type": "agent.spawned",
+            "agent_id": "root",
+            "run_id": run_id,
+            "session_id": "session-1",
+            "invocation_id": None,
+            "generation": None,
+            "lifecycle_state": "emitted",
+            "data": {
+                "agent_type": "worker",
+                "intent_id": case.intent_id,
+                "slug": "worker-a",
+                "task_summary": "task",
+            },
+        }
+    )
+
+    class _AfterCatchupQueue(SyntheticQueue):
+        live_poll_started = False
+
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            self.live_poll_started = True
+            return super().get(timeout)
+
+    source = _AfterCatchupQueue([])
+
+    class _ReplayGuardClock:
+        calls = 0
+
+        def __call__(self) -> float:
+            assert source.live_poll_started, "work clock was read before historical catch-up"
+            self.calls += 1
+            return self.calls * 0.01
+
+    work_clock = _ReplayGuardClock()
+    cancel = threading.Event()
+    transport = _PollWorkersTransport()
+    transport.cancel_event = cancel
+    fallback = threading.Timer(3.0, cancel.set)
+    fallback.start()
+    try:
+        with pytest.raises(LoopCancelled):
+            run_tl_loop(
+                run_id,
+                WorkPlan.from_mapping(plan_document),
+                cast(Any, source),
+                EffectClient(transport),
+                config=replace(
+                    _config(),
+                    run_id=run_id,
+                    ledger_run_id=run_id,
+                    repository_identity=None,
+                    keep_alive_on_waiting=True,
+                    max_parallel_slices=None,
+                    policy=None,
+                    project_root=tmp_path,
+                    work_clock=work_clock,
+                    heartbeat=HeartbeatConfig(
+                        interval_seconds=0.001,
+                        stall_threshold_seconds=1000.0,
+                        task_timeout_seconds=3600.0,
+                    ),
+                    cancel_event=cancel,
+                ),
+                root_dir=tmp_path,
+            )
+    finally:
+        fallback.cancel()
+
+    assert source.live_poll_started
+    assert work_clock.calls > 0, "the live active worker did not start its invocation clock"
+    assert not store.quarantined_events(), "the historical spawn confirmation was not replayed"
+    assert store.load().slices["worker-a"].status is SliceStatus.SPAWNED
+    assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+
 def test_recovery_consistency_gate_clears_when_projection_is_restored(tmp_path: Path) -> None:
     """A transient inconsistency closes its own hold on the next recovery."""
     run_id = "recovery-consistency-restore-run"
@@ -12618,8 +12726,12 @@ def test_recovery_consistency_gate_clears_when_projection_is_restored(tmp_path: 
     )
 
     held = run_tl_loop(
-        run_id, plan, SyntheticQueue([]), EffectClient(RecordingTransport()),
-        config=config, root_dir=tmp_path,
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=config,
+        root_dir=tmp_path,
     )
     assert any(
         gate.name == driver_module.RECOVERY_CONSISTENCY_GATE_NAME
@@ -12637,8 +12749,12 @@ def test_recovery_consistency_gate_clears_when_projection_is_restored(tmp_path: 
         integration=replace(loaded.integration, candidates={}),
     )
     restored = run_tl_loop(
-        run_id, plan, SyntheticQueue([]), EffectClient(RecordingTransport()),
-        config=config, root_dir=tmp_path,
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=config,
+        root_dir=tmp_path,
     )
 
     assert not any(
