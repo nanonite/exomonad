@@ -134,6 +134,8 @@ def heartbeat_once(
     current invocation has actually been executing work must not manufacture a
     deadline from historical timestamps.
     """
+    if active_work is not None:
+        _stop_ineligible_work_clocks(state, active_work)
     current_time = time.time() if now is None else now
     if not heartbeat_due(state.goals, current_time, config.interval_seconds):
         return HeartbeatResult(False, False, state, (), ())
@@ -194,6 +196,8 @@ def heartbeat_once(
             # through the terminal-invocation evidence path before deciding it is stale.
             row = None
         if row is None:
+            if active_work is not None:
+                active_work.stop(slice_state.id)
             runtime_agent_id = slice_state.dispatch_agent_id or slice_state.id
             terminal, evidence = _missing_worker_evidence(
                 Path(project_root),
@@ -305,7 +309,10 @@ def heartbeat_once(
         active_work_elapsed: float | None = None
         if active_work is not None:
             if _slice_is_active_work(slice_state):
-                active_work.mark_active(slice_state.id)
+                active_work.mark_active(
+                    slice_state.id,
+                    activity_identity=_worker_activity_identity(slice_state, row),
+                )
                 active_work_elapsed = active_work.elapsed(slice_state.id)
             else:
                 active_work.stop(slice_state.id)
@@ -779,6 +786,32 @@ def _slice_is_active_work(slice_state: SliceState) -> bool:
     if slice_state.status not in {SliceStatus.SPAWNED, SliceStatus.REPAIRING}:
         return False
     return not (slice_state.action is not None and slice_state.action.kind is ActionKind.MERGE)
+
+
+def _stop_ineligible_work_clocks(state: RunState, active_work: ActiveWorkClock) -> None:
+    """Forget timers for slices no longer eligible before any early return."""
+    for slice_id in active_work.snapshot():
+        slice_state = state.slices.get(slice_id)
+        if slice_state is None or not _slice_is_active_work(slice_state):
+            active_work.stop(slice_id)
+
+
+def _worker_activity_identity(
+    slice_state: SliceState,
+    row: Mapping[str, object],
+) -> tuple[str | int | None, ...]:
+    """Bind an active interval to its dispatch and observed worker invocation."""
+    invocation_id = _text(row, "invocation_id") or _text(row, "invocationId")
+    generation = row.get("generation", row.get("invocation_generation"))
+    if type(generation) is not int or generation < 0:
+        generation = None
+    return (
+        slice_state.dispatch_intent_id,
+        slice_state.dispatch_generation,
+        slice_state.attempts,
+        invocation_id,
+        generation,
+    )
 
 
 def _active_slices(state: RunState) -> tuple[SliceState, ...]:

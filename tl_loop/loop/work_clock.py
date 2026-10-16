@@ -27,27 +27,45 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
+ActivityIdentity = tuple[str | int | None, ...]
+
 
 class ActiveWorkClock:
-    """Tracks the monotonic start of proven active work per slice."""
+    """Tracks monotonic starts for proven work and its observed invocation."""
 
     def __init__(self, now: Callable[[], float] | None = None) -> None:
         self._now = now or time.monotonic
-        self._started: dict[str, float] = {}
+        self._started: dict[str, tuple[ActivityIdentity | None, float]] = {}
 
-    def mark_active(self, slice_id: str) -> None:
+    def mark_active(
+        self,
+        slice_id: str,
+        *,
+        activity_identity: ActivityIdentity | None = None,
+    ) -> None:
         """Start timing this slice if it is not already being timed.
 
-        Repeated observations never move the start forward: the first proof of
-        active work in this invocation fixes the deadline.
+        Repeated observations of one invocation never move its start forward.
+        A newly observed invocation gets a fresh active interval. A timer
+        seeded without identity can be bound to the first observation without
+        losing already measured active time.
         """
-        self._started.setdefault(slice_id, self._now())
+        previous = self._started.get(slice_id)
+        if previous is not None:
+            previous_identity, previous_start = previous
+            if previous_identity == activity_identity:
+                return
+            if previous_identity is None:
+                self._started[slice_id] = (activity_identity, previous_start)
+                return
+        self._started[slice_id] = (activity_identity, self._now())
 
     def elapsed(self, slice_id: str) -> float | None:
         """Return active-work seconds in this invocation, or None if untimed."""
-        start = self._started.get(slice_id)
-        if start is None:
+        entry = self._started.get(slice_id)
+        if entry is None:
             return None
+        _, start = entry
         return max(0.0, self._now() - start)
 
     def stop(self, slice_id: str) -> None:
@@ -62,4 +80,4 @@ class ActiveWorkClock:
 
     def snapshot(self) -> dict[str, float]:
         """Return a defensive copy for diagnostics/tests."""
-        return dict(self._started)
+        return {slice_id: start for slice_id, (_, start) in self._started.items()}

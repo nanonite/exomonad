@@ -52,6 +52,7 @@ class HeartbeatTransport:
 
     pane_alive: bool = True
     worker_present: bool = True
+    worker_invocation_id: str | None = None
     report_missing_agents: bool = False
     pr_state: str = "open"
     merged: bool = False
@@ -80,22 +81,19 @@ class HeartbeatTransport:
                 if isinstance(requested, list) and requested and isinstance(requested[0], str)
                 else "slice-a"
             )
+            worker = {
+                "name": worker_name,
+                "pane_alive": self.pane_alive,
+                "lifecycle_status": "ACTIVE",
+            }
+            if self.worker_invocation_id is not None:
+                worker["invocation_id"] = self.worker_invocation_id
             return cast(
                 JsonObject,
                 {
                     "success": True,
                     "result": {
-                        "workers": (
-                            [
-                                {
-                                    "name": worker_name,
-                                    "pane_alive": self.pane_alive,
-                                    "lifecycle_status": "ACTIVE",
-                                }
-                            ]
-                            if self.worker_present
-                            else []
-                        ),
+                        "workers": [worker] if self.worker_present else [],
                         "dead_workers": [],
                         "missing_agents": (
                             [worker_name]
@@ -1307,9 +1305,7 @@ def test_the_pr_classification_helpers_are_public() -> None:
     assert driver.pr_terminal_cause is heartbeat.pr_terminal_cause
 
 
-def _spawned_with_historical_dispatch(
-    tmp_path: Path, *, started_at: float, budget: float = 3600.0
-):
+def _spawned_with_historical_dispatch(tmp_path: Path, *, started_at: float, budget: float = 3600.0):
     store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
     current = state.slices["slice-a"]
     updated = replace(
@@ -1335,9 +1331,7 @@ def test_between_invocation_downtime_consumes_zero_work_budget(tmp_path: Path) -
     starts at zero, so no park or pane close happens.
     """
     twenty_three_days = 23 * 24 * 60 * 60
-    store, state = _spawned_with_historical_dispatch(
-        tmp_path, started_at=1_790_111_703.52
-    )
+    store, state = _spawned_with_historical_dispatch(tmp_path, started_at=1_790_111_703.52)
     transport = HeartbeatTransport()
 
     now_clock = _MutableClock(5000.0)
@@ -1452,3 +1446,147 @@ def test_active_worker_times_out_at_its_invocation_budget_not_before(tmp_path: P
     parked = late.state.slices["slice-a"]
     assert parked.status is SliceStatus.PARKED
     assert parked.park_cause is ParkCause.TASK_BUDGET_EXCEEDED
+
+
+def test_missing_worker_row_does_not_consume_active_work_budget(tmp_path: Path) -> None:
+    """A missing observation ends the timed interval until work is seen again."""
+    store, state = _spawned_with_historical_dispatch(tmp_path, started_at=1.0, budget=5.0)
+    transport = HeartbeatTransport()
+    now_clock = _MutableClock(100.0)
+    active_work = ActiveWorkClock(now_clock)
+    effects = EffectClient(transport)
+    config = HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=100.0)
+
+    active = heartbeat_once(
+        state,
+        store,
+        effects,
+        config,
+        now=100.0,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+    assert active_work.snapshot() == {"slice-a": 100.0}
+
+    now_clock.value = 101.0
+    transport.worker_present = False
+    missing = heartbeat_once(
+        active.state,
+        store,
+        effects,
+        config,
+        now=101.0,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+    assert missing.state.slices["slice-a"].status is SliceStatus.SPAWNED
+    assert active_work.snapshot() == {}
+
+    now_clock.value = 1000.0
+    transport.worker_present = True
+    returned = heartbeat_once(
+        missing.state,
+        store,
+        effects,
+        config,
+        now=1000.0,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+    assert returned.state.slices["slice-a"].status is SliceStatus.SPAWNED
+    assert active_work.snapshot() == {"slice-a": 1000.0}
+    assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+    now_clock.value = 1005.1
+    expired = heartbeat_once(
+        returned.state,
+        store,
+        effects,
+        config,
+        now=1005.1,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+    assert expired.state.slices["slice-a"].status is SliceStatus.PARKED
+    assert expired.state.slices["slice-a"].park_cause is ParkCause.TASK_BUDGET_EXCEEDED
+
+
+def test_replacement_worker_invocation_starts_a_fresh_active_interval(
+    tmp_path: Path,
+) -> None:
+    store, state = _spawned_with_historical_dispatch(tmp_path, started_at=1.0, budget=5.0)
+    transport = HeartbeatTransport(worker_invocation_id="worker-invocation-a")
+    now_clock = _MutableClock(100.0)
+    active_work = ActiveWorkClock(now_clock)
+    effects = EffectClient(transport)
+    config = HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=100.0)
+
+    first = heartbeat_once(
+        state,
+        store,
+        effects,
+        config,
+        now=100.0,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+    now_clock.value = 101.0
+    transport.worker_invocation_id = "worker-invocation-b"
+    replacement = heartbeat_once(
+        first.state,
+        store,
+        effects,
+        config,
+        now=101.0,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+
+    assert replacement.state.slices["slice-a"].status is SliceStatus.SPAWNED
+    assert active_work.snapshot() == {"slice-a": 101.0}
+
+    now_clock.value = 105.5
+    still_active = heartbeat_once(
+        replacement.state,
+        store,
+        effects,
+        config,
+        now=105.5,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+    assert still_active.state.slices["slice-a"].status is SliceStatus.SPAWNED
+    assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+
+def test_heartbeat_clears_timer_when_slice_becomes_parked_before_poll(
+    tmp_path: Path,
+) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    active_work = ActiveWorkClock(_MutableClock(100.0))
+    active_work.mark_active("slice-a")
+    current = state.slices["slice-a"]
+    parked = replace(
+        current,
+        status=SliceStatus.PARKED,
+        park_cause=ParkCause.TASK_BUDGET_EXCEEDED,
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": parked},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport()),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=0.0,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+
+    assert result.fired is False
+    assert active_work.snapshot() == {}
