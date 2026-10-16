@@ -992,6 +992,48 @@ Restart reads the persisted stage, owner, PR, head, base, evidence, and
 attempt counters; it never treats a missing event as permission to duplicate a
 spawn, PR, review, repair, or merge.
 
+A terminal rejected `merge_pr` result is authoritative history: the merge did
+not happen. Startup reconciliation retires that attempt only on exact evidence
+(the persisted action's intent id resolves to a rejected `merge_pr` entry for
+the same slice, a fresh authoritative watcher observation resolves the same
+PR/head, and it proves `merged=false`). It clears the stale in-flight action,
+returns the candidate to `READY_FOR_INTEGRATION` through the typed
+`merge_not_confirmed` edge, advances the merge attempt counter so a new
+approved attempt has a distinct action identity, and appends a
+`tl.merge_attempt_retired` disposition. The original rejected entry is never
+rewritten. An unavailable observation holds; a contradictory one opens
+`tl-merge-retirement-<digest>`. A rejected entry whose PR is authoritatively
+`merged=true` at the same head is adopted as the merge, without a second merge.
+
+#### Recovery/live boundary and work timers
+
+Continuation is a two-phase invocation. During recovery the controller folds
+persisted evidence (journal outcomes, watcher observations, ordered/checkpoint
+projections), retires proven-rejected attempts, and validates
+cursor/ordered-stage/candidate consistency; it performs no live scheduling or
+work-timer enforcement. While replayable quarantine evidence is pending it
+records a `tl.recovery_boundary` audit event, defers finalization/convergence,
+and arms no timer. A recovered projection that disagrees (missing manifest,
+negative cursor, ordered plan without stages, candidate or stage member with no
+slice) opens `tl-recovery-consistency` and holds with the specific diagnostic.
+Only then does live operation resume.
+
+Work timeouts are scoped to the current invocation and to proven active work:
+
+~~~text
+eligible = recovery_complete and work_is_active and clock_epoch == current_invocation
+budget_charged = current_invocation_active_elapsed >= slice_budget   (monotonic)
+~~~
+
+Between-invocation downtime and replay/catch-up consume zero budget: each
+invocation builds a fresh monotonic `ActiveWorkClock` whose start table is
+empty until live operation observes proven active work, and the historical
+`dispatch_started_at` is never subtracted from the current time. Only a slice
+executing producer/repair work in this invocation is timed; a completed
+producer awaiting parent aggregate integration is never timed, so aggregate
+integration cannot be expired by a worker budget. Historical timestamps and the
+`deadline_ledger` remain audit facts and are not rewritten.
+
 #### Ordered-child recovery gates
 
 A terminal ordered child whose controller stopped before authoritative
