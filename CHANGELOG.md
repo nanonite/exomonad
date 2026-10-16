@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Verify continuation recovery across merge and replay crash boundaries (#1226)
 - Fix startup catch-up before enabling live effects and timers (#1225)
 - Fix work timers to exclude replay and between-invocation downtime (#1224)
 - Fix stale in-flight merges after proven journal rejection (#1223)
