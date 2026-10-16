@@ -9237,6 +9237,40 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         assert rejected[0]["result"]["success"] is False
         assert len(successful) == 1
         assert successful[0]["arguments"]["attempt"] == 2
+    resumed_again = run_tl_loop(
+        "ordered-e2e-run",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(replayed_transport),
+        config=replace(config, max_workers=1),
+        root_dir=replayed_root,
+    )
+    assert resumed_again.final_state.fsm.phase is TLPhase.TLDone
+    assert [args["pr_number"] for name, args in replayed_transport.calls if name == "merge_pr"] == [
+        101,
+        102,
+    ]
+    assert (
+        len(
+            [
+                arguments
+                for name, arguments in replayed_transport.calls
+                if name == "file_pr" and str(arguments.get("title", "")).startswith("Aggregate ")
+            ]
+        )
+        == 1
+    )
+    assert (
+        sum(
+            1
+            for name, arguments in replayed_transport.calls
+            if name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.dispatch_confirmed"
+            and isinstance(arguments.get("payload"), Mapping)
+            and arguments["payload"].get("slice_id") == "beta"
+        )
+        == 1
+    )
 
 
 def test_failed_ordered_sub_tl_blocks_higher_order_work(tmp_path: Path) -> None:
