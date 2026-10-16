@@ -9,6 +9,7 @@ import logging
 import math
 import multiprocessing
 import queue as queue_module
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -1834,7 +1835,24 @@ def run_tl_loop(
         )
         inconsistency = _recovery_inconsistency(work_plan, state)
         if inconsistency is not None:
+            previous = next(
+                (
+                    gate
+                    for gate in state.gates
+                    if gate.name == RECOVERY_CONSISTENCY_GATE_NAME
+                ),
+                None,
+            )
             state = store.set_gate(RECOVERY_CONSISTENCY_GATE_NAME, GateStatus.PENDING)
+            if previous is None or previous.status is not GateStatus.PENDING:
+                _record_controller_event(
+                    "controller",
+                    "tl.gate_opened",
+                    {"gate_name": RECOVERY_CONSISTENCY_GATE_NAME, "run_id": state.run_id},
+                    selected,
+                    effects,
+                    effects_log,
+                )
             _record_recovery_boundary(
                 state,
                 selected,
@@ -1857,6 +1875,22 @@ def run_tl_loop(
                 (),
                 diagnostics={"recovery_consistency": inconsistency},
                 journal_entries=_journal_entries(effects_log),
+            )
+        if any(
+            gate.name == RECOVERY_CONSISTENCY_GATE_NAME and gate.status is GateStatus.PENDING
+            for gate in state.gates
+        ):
+            # The projection is consistent again: close the hold so an operator
+            # is not asked to answer a stale gate.
+            state = store.clear_gate(RECOVERY_CONSISTENCY_GATE_NAME)
+            _record_recovery_boundary(
+                state,
+                selected,
+                effects,
+                effects_log,
+                reason="consistency_restored",
+                cursor=state.events.last_consumed_offset,
+                pending_quarantine=len(_replayable_quarantine_documents(store)),
             )
         state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
         state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
@@ -3104,17 +3138,34 @@ def _recovery_inconsistency(plan: WorkPlan, state: RunState) -> str | None:
         return "checkpoint has no immutable plan manifest"
     if state.events.last_consumed_offset < 0:
         return "checkpoint cursor is negative"
+    planned_sub_tls = {task.name for task in plan.sub_tls}
     if plan.sub_tls and not state.ordered_stages:
         return "ordered plan has no persisted stages"
-    if state.current_order < 1:
-        return "ordered plan has an invalid current order"
+    if plan.sub_tls:
+        orders = [stage.order for stage in state.ordered_stages]
+        if any(order < 1 for order in orders):
+            return "ordered plan has a non-positive stage order"
+        if len(set(orders)) != len(orders):
+            return "ordered plan has duplicate stage orders"
+        if sorted(orders) != list(range(1, len(orders) + 1)):
+            return "ordered stage orders are not contiguous from one"
+        if state.current_order < 1:
+            return "ordered plan has an invalid current order"
+        if state.current_order > max(orders) + 1:
+            return "current order is beyond the final ordered stage"
+        if len(orders) != len(plan.ordered_stages):
+            return "persisted ordered stages do not match the accepted plan"
     for candidate_id in state.integration.candidates:
         if candidate_id not in state.slices:
             return f"integration candidate {candidate_id!r} has no slice"
+        if candidate_id not in planned_sub_tls:
+            return f"integration candidate {candidate_id!r} is not a declared sub-TL"
     for stage in state.ordered_stages:
         for member in stage.sub_tls:
             if member not in state.slices:
                 return f"ordered stage member {member!r} has no slice"
+            if member not in planned_sub_tls:
+                return f"ordered stage member {member!r} is not a declared sub-TL"
     return None
 
 
@@ -3177,10 +3228,14 @@ def _run_loop(
         state = store.set_goals(
             replace(state.goals, controller_started_at=diagnostics.controller_started_at)
         )
-    # Historical catch-up boundary: while replayable quarantine evidence is
-    # still pending, no finalization or live convergence runs and no work timer
-    # is armed. The events below are applied first through the normal reducers;
-    # only once the finite pending set is empty does live operation resume.
+    # Historical catch-up boundary: while replayable quarantine evidence that
+    # existed at startup is still being applied, no finalization or live
+    # convergence runs and no work timer is armed. ``recovery_pending`` is a
+    # bounded startup flag, not the live quarantine list: once the finite
+    # startup set has been applied (or no startup row is currently replayable)
+    # live operation resumes, and unresolved startup rows stay quarantined for
+    # later retry without gating the heartbeat or finalization. Rows quarantined
+    # during normal running never re-enable recovery.
     recovery_pending = bool(quarantined)
     if recovery_pending:
         _record_recovery_boundary(
@@ -3250,7 +3305,7 @@ def _run_loop(
         phase = _phase_from_state(state)
 
     while not config.test_harness or len(consumed) < config.max_events:
-        if not quarantined and not (
+        if not recovery_pending and not (
             isinstance(_phase_from_state(state), RecursiveTLAllMerged)
             and _source_has_pending(source)
         ):
@@ -3293,9 +3348,16 @@ def _run_loop(
             replaying = True
         else:
             event = _next_event(source, config)
+            if recovery_pending:
+                # The finite startup catch-up pass has done all it can right
+                # now: no startup row is currently replayable. Release the live
+                # gate; still-unresolved startup rows remain quarantined and are
+                # retried by later iterations, but they no longer suppress the
+                # heartbeat, finalization, or convergence.
+                recovery_pending = False
         _record_reader_findings(source, diagnostics)
         if event is None:
-            if config.heartbeat is not None and not quarantined:
+            if config.heartbeat is not None and not recovery_pending:
                 heartbeat = heartbeat_once(
                     state,
                     store,
@@ -7437,7 +7499,6 @@ def _execute_direct_merge_intent(
 def _derive_eligible_integration_after_nonmerge(
     integration: IntegrationRuntimeState,
     slice_id: str,
-    diagnostic: str,
 ) -> IntegrationRuntimeState:
     """Return one candidate to an integration-eligible lifecycle after a
     disproved merge attempt.
@@ -7449,20 +7510,25 @@ def _derive_eligible_integration_after_nonmerge(
     approval/integration path can derive a fresh, evidence-bound attempt. Only
     the exact ``MERGING`` lifecycle is moved; every other lifecycle is left for
     its own owner to reconcile.
+
+    Retiring an attempt also advances the candidate's merge-attempt counter, so
+    the next approved attempt gets a distinct action identity instead of
+    colliding with the journal entry just retired. This is applied uniformly on
+    the startup retirement pass and every live non-merge resolution.
+
+    An impossible transition is a bug, not a recoverable state: it is raised
+    rather than swallowed, so the caller never clears the action and bumps the
+    counter while leaving the candidate stuck at ``MERGING``.
     """
     if _candidate_runtime(integration, slice_id).lifecycle is not IntegrationLifecycle.MERGING:
         return integration
-    try:
-        return _transition_candidate_runtime(
-            integration, slice_id, IntegrationTransition.MERGE_NOT_CONFIRMED
-        )
-    except IntegrationTransitionError:
-        LOGGER.warning(
-            "[TL loop] candidate %s could not retire its unconfirmed merge: %s",
-            slice_id,
-            diagnostic,
-        )
-        return integration
+    transitioned = _transition_candidate_runtime(
+        integration, slice_id, IntegrationTransition.MERGE_NOT_CONFIRMED
+    )
+    runtime = _candidate_runtime(transitioned, slice_id)
+    return _persist_candidate_runtime(
+        transitioned, slice_id, replace(runtime, merge_attempts=runtime.merge_attempts + 1)
+    )
 
 
 def _resolve_nonmerged_merge(
@@ -7494,9 +7560,7 @@ def _resolve_nonmerged_merge(
         diagnostic,
     )
     if not terminal:
-        integration = _derive_eligible_integration_after_nonmerge(
-            integration, slice_id, diagnostic
-        )
+        integration = _derive_eligible_integration_after_nonmerge(integration, slice_id)
     updated = _checkpoint_slice_action(
         store,
         refreshed,
@@ -9137,11 +9201,18 @@ def _reconfirm_park(
 
 
 def _merge_retirement_gate_name(state: RunState, slice_id: str, key: str) -> str:
-    """Return a per-occurrence gate for a rejected merge whose outcome conflicts."""
+    """Name a per-slice, per-occurrence gate for a rejected merge hold.
+
+    The slice id is part of the name so an operator can tell which slice the
+    decision is about; the digest over the run, slice, and rejected action key
+    makes a later contradictory occurrence a new decision instead of a silent
+    reuse of an already-answered gate.
+    """
     occurrence = {"run_id": state.run_id, "slice_id": slice_id, "key": key}
     encoded = json.dumps(occurrence, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-    return f"{MERGE_RETIREMENT_GATE_PREFIX}{digest}"
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    token = re.sub(r"[^A-Za-z0-9._-]", "-", slice_id) or "slice"
+    return f"{MERGE_RETIREMENT_GATE_PREFIX}{token}-{digest}"
 
 
 def _hold_rejected_merge(
@@ -9150,18 +9221,48 @@ def _hold_rejected_merge(
     slice_id: str,
     entry: Mapping[str, object],
     diagnostic: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
 ) -> RunState:
-    """Open a bounded actionable hold for a rejected merge we cannot converge."""
+    """Open a bounded actionable hold for a rejected merge we cannot converge.
+
+    The gate is a real operator decision: approving it authorizes treating the
+    rejected attempt as a proven non-merge (retire + fresh attempt), while
+    rejecting it keeps the entry held with no retry.
+    """
     key = str(entry.get("key") or "")
     gate_name = _merge_retirement_gate_name(state, slice_id, key)
-    if not any(gate.name == gate_name for gate in state.gates):
+    previous = next((gate for gate in state.gates if gate.name == gate_name), None)
+    if previous is None or previous.status is not GateStatus.PENDING:
         state = store.set_gate(gate_name, GateStatus.PENDING)
+        _record_controller_event(
+            "controller",
+            "tl.gate_opened",
+            {"gate_name": gate_name, "run_id": state.run_id},
+            config,
+            effects,
+            effects_log,
+        )
         LOGGER.warning(
             "[TL loop] rejected merge for %s needs operator reconciliation: %s (gate=%s)",
             slice_id,
             diagnostic,
             gate_name,
         )
+    return state
+
+
+def _clear_merge_retirement_gate(
+    state: RunState,
+    store: RunStore,
+    slice_id: str,
+    key: str,
+) -> RunState:
+    """Close the retirement hold once its exact occurrence is resolved."""
+    gate_name = _merge_retirement_gate_name(state, slice_id, key)
+    if any(gate.name == gate_name for gate in state.gates):
+        return store.clear_gate(gate_name)
     return state
 
 
@@ -9180,9 +9281,9 @@ def _retire_rejected_merge_attempt(
     The original rejected journal entry is preserved byte-for-byte: it is
     historical evidence. The corrective disposition is a durable controller
     event plus a checkpoint projection that clears the stale in-flight action
-    and returns the candidate to ``READY_FOR_INTEGRATION``. The candidate's
-    merge attempt counter advances so a genuinely new approved attempt gets a
-    distinct action identity instead of replaying the old rejection forever.
+    and returns the candidate to ``READY_FOR_INTEGRATION``. Retiring advances
+    the candidate's merge-attempt counter so a genuinely new approved attempt
+    gets a distinct action identity instead of replaying the old rejection.
     """
     refreshed = store.load()
     current = refreshed.slices.get(slice_id)
@@ -9197,11 +9298,7 @@ def _retire_rejected_merge_attempt(
     integration = _abandon_owned_lane_integration(
         refreshed, current, refreshed.integration, "merge_not_confirmed", diagnostic
     )
-    integration = _derive_eligible_integration_after_nonmerge(integration, slice_id, diagnostic)
-    runtime = _candidate_runtime(integration, slice_id)
-    integration = _persist_candidate_runtime(
-        integration, slice_id, replace(runtime, merge_attempts=runtime.merge_attempts + 1)
-    )
+    integration = _derive_eligible_integration_after_nonmerge(integration, slice_id)
     cleared = slice_transition(current, ActionChanged(None))
     cleared = replace(cleared, park_cause=None, dispatch_error=None)
     state = _checkpoint_slice_action(
@@ -9212,6 +9309,7 @@ def _retire_rejected_merge_attempt(
         slice_state=cleared,
         integration=integration,
     )
+    state = _clear_merge_retirement_gate(state, store, slice_id, key)
     _record_controller_event(
         slice_id,
         "tl.merge_attempt_retired",
@@ -9281,90 +9379,116 @@ def _retire_rejected_merge_results(
             continue
         if current.pr_number is None:
             continue
+        key = str(entry.get("key") or "")
+        gate = next(
+            (
+                candidate_gate
+                for candidate_gate in state.gates
+                if candidate_gate.name == _merge_retirement_gate_name(state, slice_id, key)
+            ),
+            None,
+        )
+        operator_approved = gate is not None and gate.status is GateStatus.APPROVED
         # A read-only observation, never journaled: unavailable remote facts
-        # leave the rejected entry and checkpoint untouched for a later pass.
+        # leave the rejected entry and checkpoint untouched while the hold gate
+        # records the decision that is still needed.
+        watcher: ToolResult | None = None
+        observation: WatcherObservation | None = None
         try:
             watcher = effects.watcher_pr_state(pr_number=current.pr_number)
+            observation = _watcher_result_observation(watcher)
         except (ConnectionError, OSError, RuntimeError, TimeoutError) as error:
             LOGGER.warning(
-                "[TL loop] rejected merge for %s is not retired: watcher unavailable: %s",
+                "[TL loop] rejected merge for %s: watcher unavailable: %s",
                 slice_id,
                 error,
             )
-            continue
-        observation = _watcher_result_observation(watcher)
-        if watcher is None or observation is None:
-            LOGGER.warning(
-                "[TL loop] rejected merge for %s is not retired: watcher unavailable",
-                slice_id,
-            )
-            continue
-        if _watcher_publication_refused(
-            current, watcher, current.dispatch_agent_id or current.id
-        ) or _watcher_publication_ownership_unresolved(watcher):
-            LOGGER.warning(
-                "[TL loop] rejected merge for %s is not retired: publication refused",
-                slice_id,
-            )
-            continue
-        diagnostic = str(entry.get("error") or "merge_pr was rejected")
-        same_head = not (
-            observation.head_sha and action.head_sha and observation.head_sha != action.head_sha
+        refused = watcher is not None and (
+            _watcher_publication_refused(current, watcher, current.dispatch_agent_id or current.id)
+            or _watcher_publication_ownership_unresolved(watcher)
         )
-        if observation.merged is True:
-            if not same_head:
-                state = _hold_rejected_merge(
+        diagnostic = str(entry.get("error") or "merge_pr was rejected")
+        if observation is not None and not refused:
+            # Require an exact, present head on both sides. A missing head is
+            # not a match: unknown evidence must hold rather than authorize a
+            # retry or an adoption.
+            same_head = bool(
+                isinstance(observation.head_sha, str)
+                and observation.head_sha
+                and isinstance(action.head_sha, str)
+                and action.head_sha
+                and observation.head_sha == action.head_sha
+            )
+            if observation.merged is True and same_head:
+                state = _reconcile_merged_slice(
+                    state,
+                    slice_id,
+                    observation.pr_number or current.pr_number,
+                    action.intent_id,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    boundary="rejected_journal_remote_merge_reconciled",
+                    merge_evidence={
+                        **dict(entry.get("arguments") or {}),
+                        **_watcher_merge_evidence(observation),
+                    },
+                )
+                state = _clear_merge_retirement_gate(state, store, slice_id, key)
+                continue
+            if observation.merged is False and same_head:
+                state = _retire_rejected_merge_attempt(
+                    state, store, slice_id, entry, diagnostic, config, effects, effects_log
+                )
+                continue
+            if operator_approved:
+                state = _retire_rejected_merge_attempt(
                     state,
                     store,
                     slice_id,
                     entry,
-                    "rejected merge conflicts with a merged PR at a different head",
+                    "operator approved retirement of the held rejected merge attempt "
+                    f"via gate {_merge_retirement_gate_name(state, slice_id, key)}",
+                    config,
+                    effects,
+                    effects_log,
                 )
                 continue
-            state = _reconcile_merged_slice(
+            reason = (
+                f"rejected merge head {action.head_sha!r} does not exactly match observed "
+                f"head {observation.head_sha!r}"
+                if observation.merged is False
+                else "rejected merge conflicts with a merged PR whose head does not match "
+                "the rejected attempt"
+                if observation.merged is True
+                else "authoritative observation did not prove the rejected merge outcome"
+            )
+            state = _hold_rejected_merge(
+                state, store, slice_id, entry, reason, config, effects, effects_log
+            )
+            continue
+        if operator_approved:
+            state = _retire_rejected_merge_attempt(
                 state,
+                store,
                 slice_id,
-                observation.pr_number or current.pr_number,
-                action.intent_id,
+                entry,
+                "operator approved retirement of the held rejected merge attempt "
+                f"via gate {_merge_retirement_gate_name(state, slice_id, key)} "
+                "without an authoritative observation",
                 config,
                 effects,
-                store,
                 effects_log,
-                boundary="rejected_journal_remote_merge_reconciled",
-                merge_evidence={
-                    **dict(entry.get("arguments") or {}),
-                    **_watcher_merge_evidence(observation),
-                },
             )
             continue
-        if observation.merged is not False:
-            state = _hold_rejected_merge(
-                state,
-                store,
-                slice_id,
-                entry,
-                "authoritative observation did not prove the rejected merge outcome",
-            )
-            continue
-        if not same_head:
-            state = _hold_rejected_merge(
-                state,
-                store,
-                slice_id,
-                entry,
-                f"rejected merge head {action.head_sha} does not match observed head "
-                f"{observation.head_sha}",
-            )
-            continue
-        state = _retire_rejected_merge_attempt(
-            state,
-            store,
-            slice_id,
-            entry,
-            diagnostic,
-            config,
-            effects,
-            effects_log,
+        reason = (
+            "publication provenance refused the authoritative observation"
+            if refused
+            else "authoritative observation is unavailable"
+        )
+        state = _hold_rejected_merge(
+            state, store, slice_id, entry, reason, config, effects, effects_log
         )
     return state
 

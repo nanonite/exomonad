@@ -322,7 +322,7 @@ poll_interval = 60           # optional — GitHub poll cycle in seconds (defaul
 # TL loop operational timeouts (seconds). Lifecycle progress is driven by authoritative events.
   tl_transport_timeout_seconds = 10.0           # UDS RPC timeout to the local server (default: 10)
   tl_active_tail_timeout_seconds = 30.0         # ledger tailer active-tail timeout (default: 30)
-  tl_task_timeout_seconds = 3600.0              # project task ceiling; 0 disables enforcement
+  tl_task_timeout_seconds = 3600.0              # per-invocation active-work ceiling; 0 disables enforcement
   tl_preflight_runtime_paths = [".my-tool/runtime/"] # extra relative runtime paths ignored by spawn preflight
 # TL loop dispatch-retry budget. Only a refusal that PROVES nothing was created is
 # retried; an ambiguous refusal is held for evidence and never re-driven. The limit
@@ -395,6 +395,17 @@ overrides project `tl_task_timeout_seconds`, which defaults to 3600 seconds.
 A value of `0` or explicit `null` means no ceiling. Elapsed time never infers
 that a worker is dead or stalled; it may enforce only this declared, typed,
 journaled task ceiling.
+
+That ceiling is **invocation-scoped and active-work-scoped**, not a wall-clock
+lifetime for the task. Each controller invocation builds a fresh monotonic work
+clock; the budget is charged only while the invocation is actually executing
+proven producer/repair work for the slice. Between-invocation downtime and
+replay/catch-up charge zero, the historical `dispatch_started_at` is never
+subtracted from the current time (it stays as audit evidence), a completed
+producer awaiting parent aggregate integration is never timed, and an inactive
+interval stops charging. Consequently a controller that keeps crash-restarting
+does not accumulate toward the ceiling across invocations, and `0`/`null`
+remains the only way to remove the ceiling entirely.
 
 **Multiple git remotes:** By default, PR/CI operations (`file_pr`, `merge_pr`, the
 Forgejo watcher, and pushes) auto-detect the git remote to use, preferring one

@@ -12480,3 +12480,175 @@ def test_recovery_consistency_hold_blocks_live_dispatch(tmp_path: Path) -> None:
         name in {"spawn_leaf", "spawn_worker", "spawn_reviewer", "merge_pr"}
         for name, _ in transport.calls
     )
+
+
+class _PollWorkersTransport(RecordingTransport):
+    """RecordingTransport that answers heartbeat liveness polling."""
+
+    cancel_event: object | None = None
+
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        if tool_name == "poll_workers":
+            self.calls.append((tool_name, arguments))
+            agents = arguments.get("agents", [])
+            rows = [
+                {"name": str(agent), "pane_alive": True}
+                for agent in agents
+                if isinstance(agent, str)
+            ]
+            if self.cancel_event is not None:
+                self.cancel_event.set()  # type: ignore[attr-defined]
+            return {"success": True, "result": {"workers": rows, "missing_agents": []}}
+        return super().call_tool(role, name, tool_name, arguments)
+
+
+def test_live_heartbeat_resumes_when_startup_quarantine_never_resolves(
+    tmp_path: Path,
+) -> None:
+    """A startup row that never resolves must not disable live operation (#1225).
+
+    The recovery gate is bounded by the startup catch-up pass, not by whatever
+    is still sitting in the live quarantine list. A stray foreign row left at
+    startup (and any resolvable-impossible row appended later) therefore cannot
+    switch off the heartbeat, finalization, or convergence for the run.
+    """
+    from tl_loop.loop.heartbeat import HeartbeatConfig
+
+    run_id = "recovery-unresolvable-run"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    case = _confirmed_worker(tmp_path, run_id=run_id)
+    store = RunStore(run_id, tmp_path)
+    store.set_plan_manifest(
+        build_plan_manifest({"workers": [{"name": "worker-a", "task": "task"}]}, scope_id=run_id),
+        slices=case.state.slices,
+    )
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("worker-a",)),
+        case.state.slices,
+        case.state.budgets,
+        8,
+    )
+    store.quarantine_event(
+        {
+            "type": "pr.filed",
+            "run_seq": 902,
+            "run_id": run_id,
+            "agent_id": "foreign-agent",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "data": {"slice_id": "foreign-slice", "pr_number": 78, "head_sha": "head-78"},
+        }
+    )
+    cancel = threading.Event()
+    transport = _PollWorkersTransport()
+    transport.cancel_event = cancel
+    # Fallback so a regressed (gated) heartbeat cannot hang the test.
+    fallback = threading.Timer(3.0, cancel.set)
+    fallback.start()
+    try:
+        run_tl_loop(
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=replace(
+                _config(),
+                run_id=run_id,
+                ledger_run_id=run_id,
+                repository_identity=None,
+                keep_alive_on_waiting=True,
+                max_parallel_slices=None,
+                policy=None,
+                project_root=tmp_path,
+                heartbeat=HeartbeatConfig(
+                    interval_seconds=0.001,
+                    stall_threshold_seconds=1000.0,
+                    task_timeout_seconds=0.0,
+                ),
+                cancel_event=cancel,
+            ),
+            root_dir=tmp_path,
+        )
+    except LoopCancelled:
+        pass
+    finally:
+        fallback.cancel()
+
+    assert any(name == "poll_workers" for name, _ in transport.calls), (
+        "live heartbeat never ran while an unresolvable startup row stayed quarantined"
+    )
+
+
+def test_recovery_consistency_gate_clears_when_projection_is_restored(tmp_path: Path) -> None:
+    """A transient inconsistency closes its own hold on the next recovery."""
+    run_id = "recovery-consistency-restore-run"
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("architecture", WorkPlan(), order=1, chainlink_issue_id=1052),)
+    )
+    config = replace(
+        _config(),
+        run_id=run_id,
+        ledger_run_id=run_id,
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        keep_alive_on_waiting=False,
+        max_parallel_slices=None,
+        policy=None,
+    )
+    manifest = driver_module._manifest_for_plan(plan, run_id, config)
+    store = RunStore(run_id, tmp_path)
+    slices = _initial_slices(plan, config, tmp_path, run_id)
+    create(
+        run_id,
+        {
+            "slices": slices,
+            "repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"},
+        },
+        root_dir=tmp_path,
+    )
+    store.set_plan_manifest(manifest)
+    store.set_ordered_state(
+        1,
+        (OrderedStageState(1, ("architecture",)),),
+        IntegrationRuntimeState(
+            sub_tl_states={"architecture": IntegrationLifecycle.RUNNING},
+            candidates={"ghost": IntegrationCandidateState()},
+        ),
+    )
+
+    held = run_tl_loop(
+        run_id, plan, SyntheticQueue([]), EffectClient(RecordingTransport()),
+        config=config, root_dir=tmp_path,
+    )
+    assert any(
+        gate.name == driver_module.RECOVERY_CONSISTENCY_GATE_NAME
+        and gate.status is GateStatus.PENDING
+        for gate in held.final_state.gates
+    )
+
+    # The backing slice appears / the bogus candidate is gone: consistent again.
+    loaded = store.load()
+    store.checkpoint(
+        loaded.fsm,
+        loaded.slices,
+        loaded.budgets,
+        loaded.events.last_consumed_offset,
+        integration=replace(loaded.integration, candidates={}),
+    )
+    restored = run_tl_loop(
+        run_id, plan, SyntheticQueue([]), EffectClient(RecordingTransport()),
+        config=config, root_dir=tmp_path,
+    )
+
+    assert not any(
+        gate.name == driver_module.RECOVERY_CONSISTENCY_GATE_NAME
+        for gate in restored.final_state.gates
+    )
+    reasons = [
+        cast("dict[str, Any]", entry["arguments"])["payload"]["reason"]
+        for entry in restored.journal_entries
+        if entry.get("operation") == "emit_controller_event"
+        and cast("dict[str, Any]", entry["arguments"]).get("event_type") == "tl.recovery_boundary"
+    ]
+    assert "consistency_restored" in reasons

@@ -26,6 +26,7 @@ from tl_loop.state.schema import (
     ActionPhase,
     ActionState,
     FSMState,
+    GateStatus,
     IntegrationCandidateState,
     IntegrationRuntimeState,
     SliceState,
@@ -192,4 +193,121 @@ def test_rejected_merge_retirement_is_idempotent_across_restarts(tmp_path: Path)
     # The counter advanced exactly once, not once per restart.
     assert candidate.merge_attempts == 1
     # The original rejected result is preserved byte-for-byte.
+    assert journal.entry_by_key(key)["status"] == "rejected"
+
+
+def test_rejected_merge_with_missing_head_holds(tmp_path: Path) -> None:
+    """A missing head is not an exact match; unknown evidence must hold."""
+    store, state = _load_state(tmp_path)
+    journal, current = _merging_with_rejected_action(store, state, tmp_path)
+    key = current.action.intent_id
+
+    class _MissingHeadClient(FakeClient):
+        def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
+            payload = super().watcher_pr_state(pr_number=pr_number)
+            if payload.result is not None:
+                payload.result["head_sha"] = ""
+            return payload
+
+    client = _MissingHeadClient(merged=False, pr_state="open", resolved_pr_number=99)
+    config = TLLoopConfig(active=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    slice_state = recovered.slices["slice-a"]
+    assert slice_state.action is not None and slice_state.action.intent_id == key
+    assert recovered.integration.candidates["slice-a"].lifecycle is IntegrationLifecycle.MERGING
+    assert any(g.name.startswith("tl-merge-retirement-") for g in recovered.gates)
+    assert journal.entry_by_key(key)["status"] == "rejected"
+
+
+def test_operator_approved_retirement_gate_retires_and_clears_the_gate(tmp_path: Path) -> None:
+    """The hold gate is a real decision: approving it retires the attempt."""
+    store, state = _load_state(tmp_path)
+    journal, current = _merging_with_rejected_action(store, state, tmp_path)
+    key = current.action.intent_id
+    config = TLLoopConfig(active=True)
+
+    # First pass with no usable observation opens the hold gate.
+    opened = _reconcile_nonterminal_slices(
+        _PLAN, state, config, FakeClient(resolved_pr_number=None), store, journal
+    )
+    gate = next(g for g in opened.gates if g.name.startswith("tl-merge-retirement-"))
+    assert gate.status is GateStatus.PENDING
+    assert opened.slices["slice-a"].action is not None
+
+    # Operator approves; the next pass retires and closes the gate.
+    approved = store.load()
+    approved = store.answer_gate(gate.name, GateStatus.APPROVED)
+    retired = _reconcile_nonterminal_slices(
+        _PLAN, approved, config, FakeClient(resolved_pr_number=None), store, journal
+    )
+
+    assert retired.slices["slice-a"].action is None
+    candidate = retired.integration.candidates["slice-a"]
+    assert candidate.lifecycle is IntegrationLifecycle.READY_FOR_INTEGRATION
+    assert candidate.merge_attempts == 1
+    assert not any(g.name == gate.name for g in retired.gates)
+    assert journal.entry_by_key(key)["status"] == "rejected"
+
+
+def test_live_nonmerge_resolution_bumps_attempt_for_a_distinct_key(tmp_path: Path) -> None:
+    """A live non-merge resolution advances the attempt like the startup pass."""
+    from tl_loop.loop.driver import _resolve_nonmerged_merge
+
+    store, state = _load_state(tmp_path)
+    journal, current = _merging_with_rejected_action(store, state, tmp_path)
+    resolved = _resolve_nonmerged_merge(
+        state,
+        "slice-a",
+        store,
+        journal,
+        journal_key=None,
+        diagnostic="authoritative watcher state says the merge did not happen",
+    )
+
+    candidate = resolved.integration.candidates["slice-a"]
+    assert candidate.lifecycle is IntegrationLifecycle.READY_FOR_INTEGRATION
+    assert candidate.merge_attempts == 1
+    assert resolved.slices["slice-a"].action is None
+
+
+def test_rejected_merge_with_indeterminate_outcome_holds(tmp_path: Path) -> None:
+    """An observation that does not state merged true/false must not act."""
+    store, state = _load_state(tmp_path)
+    journal, current = _merging_with_rejected_action(store, state, tmp_path)
+    key = current.action.intent_id
+
+    class _IndeterminateClient(FakeClient):
+        def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
+            payload = super().watcher_pr_state(pr_number=pr_number)
+            if payload.result is not None:
+                payload.result.pop("merged", None)
+            return payload
+
+    client = _IndeterminateClient(merged=False, pr_state="open", resolved_pr_number=99)
+    config = TLLoopConfig(active=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    assert recovered.slices["slice-a"].action is not None
+    assert recovered.integration.candidates["slice-a"].lifecycle is IntegrationLifecycle.MERGING
+    assert any(g.name.startswith("tl-merge-retirement-") for g in recovered.gates)
+    assert journal.entry_by_key(key)["status"] == "rejected"
+
+
+def test_rejected_merge_with_matching_merged_remote_is_adopted_once(tmp_path: Path) -> None:
+    """A rejection plus a merged remote at the same head adopts the real merge."""
+    store, state = _load_state(tmp_path)
+    journal, current = _merging_with_rejected_action(store, state, tmp_path)
+    key = current.action.intent_id
+    client = FakeClient(merged=True, pr_state="closed")
+    config = TLLoopConfig(active=True)
+
+    recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
+
+    slice_state = recovered.slices["slice-a"]
+    assert slice_state.status is SliceStatus.MERGED
+    assert slice_state.post_merge is not None
+    # The original rejected result remains historical evidence.
     assert journal.entry_by_key(key)["status"] == "rejected"

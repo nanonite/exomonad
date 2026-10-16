@@ -51,7 +51,13 @@ class ActiveWorkClock:
         return max(0.0, self._now() - start)
 
     def stop(self, slice_id: str) -> None:
-        """Freeze timing for a slice that is no longer active work."""
+        """Forget timing for a slice that is no longer active work.
+
+        This is a reset, not a pause: the next interval in which the slice is
+        proven active work starts its own clock. That is deliberate -- an
+        inactive interval must not consume budget, and each fresh active
+        interval is bounded on its own rather than by accumulated wall time.
+        """
         self._started.pop(slice_id, None)
 
     def snapshot(self) -> dict[str, float]:

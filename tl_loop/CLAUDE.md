@@ -320,6 +320,18 @@ watcher_pr_state effects, then persists reconciled slice state through the
 shared writer. Synthetic heartbeat events are deterministic observations; they
 do not consume ledger sequence numbers or charge budgets.
 
+Task-budget enforcement is invocation-scoped and active-work-scoped. Each
+invocation constructs one monotonic `ActiveWorkClock`; `_enforce_task_budget`
+charges only that clock's elapsed time for slices the controller has proven to
+be actively executing producer/repair work in this invocation. It never
+subtracts the historical `dispatch_started_at`, so between-invocation downtime
+and replay/catch-up consume zero, and a completed producer awaiting parent
+aggregate integration (IN_REVIEW holding a merge action, or a dispatch boundary
+that proves the producer finished) is never timed. An interval in which the
+slice is not active work forgets its start, so the next active interval is
+bounded on its own. Historical timestamps and the `deadline_ledger` remain
+audit facts and are not rewritten to make a deadline pass.
+
 Dead panes remain authoritative process failures and use the existing M5.3 park
 path with stall_detected, including needs-human issue creation and dependent
 blocking. A live pane with no progress only emits a wave.stalled observation;
