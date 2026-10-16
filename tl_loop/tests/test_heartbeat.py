@@ -22,7 +22,11 @@ from tl_loop.loop.heartbeat import (
     _result_object,
     heartbeat_once,
 )
+from tl_loop.loop.work_clock import ActiveWorkClock
 from tl_loop.state.schema import (
+    ActionKind,
+    ActionPhase,
+    ActionState,
     DeadlineLedger,
     ParkCause,
     RunState,
@@ -30,6 +34,16 @@ from tl_loop.state.schema import (
 )
 from tl_loop.state.store import RunStore
 from tl_loop.tests.checkpoint_fixtures import create
+
+
+class _MutableClock:
+    """A monotonic clock a test can advance by hand."""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
 
 
 @dataclass
@@ -933,6 +947,10 @@ def test_task_budget_exceeded_is_journaled_killed_and_parked(tmp_path: Path) -> 
         encoding="utf-8",
     )
     transport = HeartbeatTransport()
+    now_clock = _MutableClock(1.0)
+    active_work = ActiveWorkClock(now_clock)
+    active_work.mark_active("slice-a")
+    now_clock.value = 10.25
 
     result = heartbeat_once(
         state,
@@ -941,6 +959,7 @@ def test_task_budget_exceeded_is_journaled_killed_and_parked(tmp_path: Path) -> 
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
         now=10.25,
         project_root=tmp_path,
+        active_work=active_work,
     )
 
     invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
@@ -1286,3 +1305,150 @@ def test_the_pr_classification_helpers_are_public() -> None:
     assert "pr_terminal_cause" in heartbeat.__all__
     assert driver.pr_payload is heartbeat.pr_payload
     assert driver.pr_terminal_cause is heartbeat.pr_terminal_cause
+
+
+def _spawned_with_historical_dispatch(
+    tmp_path: Path, *, started_at: float, budget: float = 3600.0
+):
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    current = state.slices["slice-a"]
+    updated = replace(
+        current,
+        dispatch_started_at=started_at,
+        task_timeout_seconds=budget,
+        task_timeout_source="project",
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    return store, state
+
+
+def test_between_invocation_downtime_consumes_zero_work_budget(tmp_path: Path) -> None:
+    """A 23-day-old producer timestamp cannot expire this invocation.
+
+    The historical wall timestamp stays visible as audit (its old deadline is
+    preserved on the deadline ledger), but the fresh invocation's work clock
+    starts at zero, so no park or pane close happens.
+    """
+    twenty_three_days = 23 * 24 * 60 * 60
+    store, state = _spawned_with_historical_dispatch(
+        tmp_path, started_at=1_790_111_703.52
+    )
+    transport = HeartbeatTransport()
+
+    now_clock = _MutableClock(5000.0)
+    active_work = ActiveWorkClock(now_clock)
+    active_work.mark_active("slice-a")
+    now_clock.value = 5000.5
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=1_790_111_703.52 + twenty_three_days,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.status is SliceStatus.SPAWNED
+    assert observed.park_cause is None
+    assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+    # Audit history is preserved, not rewritten to make a deadline pass.
+    assert observed.deadline_ledger is not None
+    assert observed.deadline_ledger.execution_deadline_at == 1_790_111_703.52 + 3600.0
+
+
+def test_completed_aggregate_integration_is_never_active_work(tmp_path: Path) -> None:
+    """A finished producer awaiting parent integration cannot be budget-killed."""
+    store, state = _state(
+        tmp_path,
+        status="in_review",
+        heartbeat_at=0.0,
+        pr_number=46,
+        reviewed_head="head-a",
+    )
+    current = state.slices["slice-a"]
+    updated = replace(
+        current,
+        dispatch_started_at=1_790_111_703.52,
+        task_timeout_seconds=3600.0,
+        task_timeout_source="project",
+        action=ActionState(
+            ActionKind.MERGE,
+            ActionPhase.IN_FLIGHT,
+            intent_id="merge-key",
+            head_sha="head-a",
+            attempt=1,
+        ),
+    )
+    state = store.checkpoint(
+        state.fsm,
+        {**state.slices, "slice-a": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    transport = HeartbeatTransport()
+
+    class _RaisingClock:
+        def __call__(self) -> float:
+            raise AssertionError("work clock must not be read for inactive work")
+
+    active_work = ActiveWorkClock(_RaisingClock())
+
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=1_790_111_703.52 + 30 * 24 * 60 * 60,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+
+    observed = result.state.slices["slice-a"]
+    assert observed.status is SliceStatus.IN_REVIEW
+    assert observed.park_cause is None
+    assert not any(name == "close_worker_pane" for name, _ in transport.calls)
+
+
+def test_active_worker_times_out_at_its_invocation_budget_not_before(tmp_path: Path) -> None:
+    """Live active work still times out -- measured only from this invocation."""
+    store, state = _spawned_with_historical_dispatch(tmp_path, started_at=1.0, budget=5.0)
+    transport = HeartbeatTransport()
+    now_clock = _MutableClock(100.0)
+    active_work = ActiveWorkClock(now_clock)
+    active_work.mark_active("slice-a")
+
+    # 4.5s of live work: under the 5s budget, no park.
+    now_clock.value = 104.5
+    early = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=100.0),
+        now=104.5,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+    assert early.state.slices["slice-a"].status is SliceStatus.SPAWNED
+
+    # Repeated polling must not move the start forward: 6.0s of live work parks.
+    now_clock.value = 106.0
+    late = heartbeat_once(
+        early.state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=100.0),
+        now=106.0,
+        project_root=tmp_path,
+        active_work=active_work,
+    )
+    parked = late.state.slices["slice-a"]
+    assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is ParkCause.TASK_BUDGET_EXCEEDED

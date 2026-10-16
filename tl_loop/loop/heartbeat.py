@@ -34,7 +34,9 @@ from tl_loop.loop.recovery_policy import (
     policy_for_cause,
     schedule_probe,
 )
+from tl_loop.loop.work_clock import ActiveWorkClock
 from tl_loop.state.schema import (
+    ActionKind,
     DeadlineLedger,
     GoalState,
     ParkCause,
@@ -123,8 +125,15 @@ def heartbeat_once(
     now: float | None = None,
     project_root: Path | str,
     review_replay: ReviewReplay | None = None,
+    active_work: ActiveWorkClock | None = None,
 ) -> HeartbeatResult:
-    """Poll liveness and reconcile one idle wave through the durable store."""
+    """Poll liveness and reconcile one idle wave through the durable store.
+
+    ``active_work`` carries the invocation-scoped work timing. When it is None
+    no task budget is ever charged: a controller that cannot prove how long the
+    current invocation has actually been executing work must not manufacture a
+    deadline from historical timestamps.
+    """
     current_time = time.time() if now is None else now
     if not heartbeat_due(state.goals, current_time, config.interval_seconds):
         return HeartbeatResult(False, False, state, (), ())
@@ -293,6 +302,13 @@ def heartbeat_once(
                     )
                 )
             continue
+        active_work_elapsed: float | None = None
+        if active_work is not None:
+            if _slice_is_active_work(slice_state):
+                active_work.mark_active(slice_state.id)
+                active_work_elapsed = active_work.elapsed(slice_state.id)
+            else:
+                active_work.stop(slice_state.id)
         budget_event = _enforce_task_budget(
             current=store.load(),
             slice_state=slice_state,
@@ -302,6 +318,7 @@ def heartbeat_once(
             now=current_time,
             project_root=Path(project_root),
             store=store,
+            active_work_elapsed=active_work_elapsed,
         )
         if budget_event is not None:
             events.append(budget_event)
@@ -611,6 +628,7 @@ def _enforce_task_budget(
     now: float,
     project_root: Path,
     store: RunStore,
+    active_work_elapsed: float | None,
 ) -> SyntheticHeartbeatEvent | None:
     # Recovery is a declared blocker, not leaf execution. Its bounded wait is
     # governed by the recovery policy and must not consume the task budget.
@@ -621,11 +639,16 @@ def _enforce_task_budget(
     if budget is None and budget_source is None:
         budget = config.task_timeout_seconds
         budget_source = "built_in"
-    if budget is None or budget <= 0 or slice_state.dispatch_started_at is None:
+    if budget is None or budget <= 0:
         return None
-    elapsed = max(0.0, now - slice_state.dispatch_started_at)
-    if elapsed < budget:
+    # The work clock is the ONLY deadline authority. A missing clock value means
+    # this invocation has no proven active work for the slice: elapsed wall time
+    # (including between-invocation downtime and replay) must charge nothing.
+    if active_work_elapsed is None:
         return None
+    if active_work_elapsed < budget:
+        return None
+    elapsed = active_work_elapsed
     terminal, terminal_evidence = _missing_worker_evidence(
         project_root, slice_state, poll_workers_missing=False
     )
@@ -739,6 +762,23 @@ def _mark_invocation_timed_out(
         temporary.replace(path)
     except OSError:
         LOGGER.warning("Unable to persist timed-out invocation record: %s", path)
+
+
+def _slice_is_active_work(slice_state: SliceState) -> bool:
+    """Whether this invocation is executing work for the slice right now.
+
+    Proven active work is a producer/repair invocation the controller is
+    running in this invocation, evidenced by the slice's own lifecycle. A
+    completed producer awaiting parent integration (``IN_REVIEW`` with an open
+    aggregate PR) is not active work: its worker budget may not expire
+    integration. A parked/inactive slice, or one suspended on a declared
+    recovery wait, is likewise not active.
+    """
+    if slice_state.recovery is not None:
+        return False
+    if slice_state.status not in {SliceStatus.SPAWNED, SliceStatus.REPAIRING}:
+        return False
+    return not (slice_state.action is not None and slice_state.action.kind is ActionKind.MERGE)
 
 
 def _active_slices(state: RunState) -> tuple[SliceState, ...]:

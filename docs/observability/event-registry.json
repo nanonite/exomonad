@@ -145,6 +145,8 @@
     {"type": "tl.integration_revalidated", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.integration_validated", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.merge_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.merge_attempt_retired", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.recovery_boundary", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.handoff_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.review_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "worker.terminal_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},

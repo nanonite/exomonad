@@ -352,6 +352,28 @@
     "tl.merge_reconciled": {
       "fields": ["slice_id", "pr_number", "head_sha", "reconciliation"]
     },
+    "tl.merge_attempt_retired": {
+      "fields": [
+        "run_id",
+        "slice_id",
+        "transition_version",
+        "rejected_action_key",
+        "rejected_attempt",
+        "rejected_error",
+        "retired_by"
+      ]
+    },
+    "tl.recovery_boundary": {
+      "fields": [
+        "run_id",
+        "scope_id",
+        "depth",
+        "reason",
+        "cursor",
+        "pending_quarantine",
+        "transition_version"
+      ]
+    },
     "tl.handoff_reconciled": {
       "fields": ["slice_id", "pr_number", "head_sha", "invocation_id", "outcome", "reason", "source"]
     },

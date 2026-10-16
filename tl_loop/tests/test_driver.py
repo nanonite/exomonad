@@ -12361,3 +12361,122 @@ def test_driver_does_not_merge_unrelated_head_that_matches_candidate_and_watcher
         IntegrationLifecycle.AGGREGATE_PR_OPEN
     )
     assert not any(name == "merge_pr" for name, _ in transport.calls)
+
+
+def test_recovery_boundary_is_recorded_while_quarantine_is_pending(tmp_path: Path) -> None:
+    """Historical catch-up is an explicit boundary before live operation (#1225)."""
+    run_id = "recovery-boundary-run"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    case = _confirmed_worker(tmp_path, run_id=run_id)
+    store = RunStore(run_id, tmp_path)
+    store.set_plan_manifest(
+        build_plan_manifest({"workers": [{"name": "worker-a", "task": "task"}]}, scope_id=run_id),
+        slices=case.state.slices,
+    )
+    store.checkpoint(
+        FSMState(TLPhase.TLWaiting, ("worker-a",)),
+        case.state.slices,
+        case.state.budgets,
+        8,
+    )
+    store.quarantine_event(
+        {
+            "type": "pr.filed",
+            "run_seq": 901,
+            "run_id": run_id,
+            "agent_id": "foreign-agent",
+            "lifecycle_state": "observed",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "data": {"slice_id": "foreign-slice", "pr_number": 77, "head_sha": "head-77"},
+        }
+    )
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(_worker_transport()),
+        config=replace(
+            _config(),
+            run_id=run_id,
+            ledger_run_id=run_id,
+            repository_identity=None,
+            keep_alive_on_waiting=False,
+            max_parallel_slices=None,
+            policy=None,
+        ),
+        root_dir=tmp_path,
+    )
+
+    boundary = [
+        entry
+        for entry in result.journal_entries
+        if entry.get("operation") == "emit_controller_event"
+        and cast("dict[str, Any]", entry["arguments"]).get("event_type") == "tl.recovery_boundary"
+    ]
+    assert boundary, "the recovery boundary was not recorded"
+    payload = cast("dict[str, Any]", cast("dict[str, Any]", boundary[0]["arguments"])["payload"])
+    assert payload["reason"] == "historical_catch_up_pending"
+    assert payload["pending_quarantine"] == 1
+    assert payload["cursor"] == 8
+    # The pending history was retained, not skipped to reach live mode.
+    assert store.quarantined_events()
+
+
+def test_recovery_consistency_hold_blocks_live_dispatch(tmp_path: Path) -> None:
+    """An inconsistent recovered projection holds behind a named gate (#1225)."""
+    run_id = "recovery-consistency-run"
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("architecture", WorkPlan(), order=1, chainlink_issue_id=1052),)
+    )
+    config = replace(
+        _config(),
+        run_id=run_id,
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        keep_alive_on_waiting=False,
+        max_parallel_slices=None,
+        policy=None,
+    )
+    manifest = driver_module._manifest_for_plan(plan, run_id, config)
+    store = RunStore(run_id, tmp_path)
+    slices = _initial_slices(plan, config, tmp_path, run_id)
+    create(
+        run_id,
+        {
+            "slices": slices,
+            "repository_identity": {"remote_url": "https://forge.example.com/org/repo.git"},
+        },
+        root_dir=tmp_path,
+    )
+    store.set_plan_manifest(manifest)
+    # A candidate with no backing slice is exactly the kind of projection
+    # disagreement recovery must refuse to schedule on.
+    store.set_ordered_state(
+        1,
+        (OrderedStageState(1, ("architecture",)),),
+        IntegrationRuntimeState(
+            sub_tl_states={"architecture": IntegrationLifecycle.RUNNING},
+            candidates={"ghost": IntegrationCandidateState()},
+        ),
+    )
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert any(
+        gate.name == driver_module.RECOVERY_CONSISTENCY_GATE_NAME
+        and gate.status is GateStatus.PENDING
+        for gate in result.final_state.gates
+    )
+    assert "ghost" in result.diagnostics["recovery_consistency"]
+    assert not any(
+        name in {"spawn_leaf", "spawn_worker", "spawn_reviewer", "merge_pr"}
+        for name, _ in transport.calls
+    )

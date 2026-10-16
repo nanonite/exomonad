@@ -812,6 +812,7 @@ _INTEGRATION_MATRIX: dict[IntegrationLifecycle, frozenset[IntegrationTransition]
     IntegrationLifecycle.MERGING: frozenset(
         {
             IntegrationTransition.MERGED,
+            IntegrationTransition.MERGE_NOT_CONFIRMED,
             IntegrationTransition.BASE_INVALIDATED,
             IntegrationTransition.INTEGRATION_CONFLICT,
             IntegrationTransition.FAILED,
@@ -907,6 +908,9 @@ def test_integration_reference_matrix_rejects_every_unlisted_edge() -> None:
         },
         IntegrationLifecycle.MERGING: {
             IntegrationTransition.MERGED: IntegrationLifecycle.MERGED,
+            IntegrationTransition.MERGE_NOT_CONFIRMED: (
+                IntegrationLifecycle.READY_FOR_INTEGRATION
+            ),
             IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
             IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
             IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,

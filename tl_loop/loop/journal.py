@@ -126,6 +126,19 @@ class EffectJournal(list[Any]):
             None,
         )
 
+    def entry_by_key(self, key: str) -> Mapping[str, object] | None:
+        """Read one durable entry by its stable action/effect identity."""
+        if not key:
+            return None
+        return next(
+            (
+                entry
+                for entry in self._read()
+                if isinstance(entry, dict) and entry.get("key") == key
+            ),
+            None,
+        )
+
     def probe(self, intent: Any) -> EffectProbe:
         """Read one effect outcome without dispatching or guessing."""
         entry = self.existing(intent)

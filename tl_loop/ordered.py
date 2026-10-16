@@ -81,6 +81,7 @@ class IntegrationTransition(str, Enum):
     HEAD_INVALIDATED = "head_invalidated"
     INTEGRATION_VALIDATED = "integration_validated"
     MERGE_STARTED = "merge_started"
+    MERGE_NOT_CONFIRMED = "merge_not_confirmed"
     MERGED = "merged"
     REPAIR_STARTED = "repair_started"
     REPAIR_COMPLETED = "repair_completed"
@@ -307,6 +308,7 @@ _TRANSITIONS: Final[
     },
     IntegrationLifecycle.MERGING: {
         IntegrationTransition.MERGED: IntegrationLifecycle.MERGED,
+        IntegrationTransition.MERGE_NOT_CONFIRMED: IntegrationLifecycle.READY_FOR_INTEGRATION,
         IntegrationTransition.BASE_INVALIDATED: IntegrationLifecycle.NEEDS_BASE_REVALIDATION,
         IntegrationTransition.INTEGRATION_CONFLICT: IntegrationLifecycle.INTEGRATION_CONFLICT,
         IntegrationTransition.FAILED: IntegrationLifecycle.FAILED,

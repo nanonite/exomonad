@@ -187,6 +187,7 @@ from tl_loop.loop.schedule import (
     suspend_dependents,
     withhold_unsatisfiable_dependents,
 )
+from tl_loop.loop.work_clock import ActiveWorkClock
 from tl_loop.ordered import (
     AggregateCandidate,
     ChildRecoverySummary,
@@ -379,6 +380,8 @@ AGGREGATE_PUBLICATION_GATE_PREFIX = "tl-aggregate-publication-blocked-"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 CHAINLINK_BINDING_RECONCILIATION_GATE_NAME = "chainlink-issue-binding-reconciliation"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
+MERGE_RETIREMENT_GATE_PREFIX = "tl-merge-retirement-"
+RECOVERY_CONSISTENCY_GATE_NAME = "tl-recovery-consistency"
 ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
 MAX_CONVERGENCE_STEPS = 8
 MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS = 8
@@ -1147,6 +1150,7 @@ class TLLoopConfig:
     dispatch_retry_base_delay_seconds: float = DEFAULT_RETRY_BASE_DELAY_SECONDS
     dispatch_retry_max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
     wall_clock: Callable[[], float] | None = None
+    work_clock: Callable[[], float] | None = None
     heartbeat: HeartbeatConfig | None = None
     goals: GoalState | None = None
     merge_strategy: str | None = None
@@ -1209,6 +1213,8 @@ class TLLoopConfig:
             raise ValueError("dispatch_retry_max_delay_seconds must be at least the base delay")
         if self.wall_clock is not None and not callable(self.wall_clock):
             raise TypeError("wall_clock must be a zero-argument callable or null")
+        if self.work_clock is not None and not callable(self.work_clock):
+            raise TypeError("work_clock must be a zero-argument callable or null")
         if self.max_parallel_slices is not None and (
             type(self.max_parallel_slices) is not int or self.max_parallel_slices < 0
         ):
@@ -1826,6 +1832,32 @@ def run_tl_loop(
         state = _reconcile_nonterminal_slices(
             work_plan, state, selected, effects, store, effects_log
         )
+        inconsistency = _recovery_inconsistency(work_plan, state)
+        if inconsistency is not None:
+            state = store.set_gate(RECOVERY_CONSISTENCY_GATE_NAME, GateStatus.PENDING)
+            _record_recovery_boundary(
+                state,
+                selected,
+                effects,
+                effects_log,
+                reason=f"consistency_hold: {inconsistency}",
+                cursor=state.events.last_consumed_offset,
+                pending_quarantine=len(_replayable_quarantine_documents(store)),
+            )
+            LOGGER.error(
+                "[TL loop] recovery consistency hold run=%s: %s (gate=%s)",
+                run_id,
+                inconsistency,
+                RECOVERY_CONSISTENCY_GATE_NAME,
+            )
+            return TLRunResult(
+                state,
+                tuple(effects_log),
+                (),
+                (),
+                diagnostics={"recovery_consistency": inconsistency},
+                journal_entries=_journal_entries(effects_log),
+            )
         state = _dispatch_children(work_plan, state, selected, effects, effects_log, store)
         state = _run_sub_tls(work_plan, state, selected, source, effects, store, effects_log)
         return _run_loop(
@@ -3014,6 +3046,78 @@ def _maybe_finalize_scope(
     return _maybe_finalize_non_root_scope(state, store)
 
 
+def _recovery_boundary_payload(
+    state: RunState,
+    config: TLLoopConfig,
+    *,
+    reason: str,
+    cursor: int,
+    pending_quarantine: int,
+) -> dict[str, object]:
+    """Describe one recovery/live boundary as auditable evidence."""
+    return {
+        "run_id": state.run_id,
+        "scope_id": state.plan_manifest.scope_id if state.plan_manifest is not None else None,
+        "depth": config.depth,
+        "reason": reason,
+        "cursor": cursor,
+        "pending_quarantine": pending_quarantine,
+        "transition_version": 1,
+    }
+
+
+def _record_recovery_boundary(
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    *,
+    reason: str,
+    cursor: int,
+    pending_quarantine: int,
+) -> None:
+    """Record why the controller has (or has not) reached live operation."""
+    _record_controller_event(
+        "controller",
+        "tl.recovery_boundary",
+        _recovery_boundary_payload(
+            state,
+            config,
+            reason=reason,
+            cursor=cursor,
+            pending_quarantine=pending_quarantine,
+        ),
+        config,
+        effects,
+        effects_log,
+    )
+
+
+def _recovery_inconsistency(plan: WorkPlan, state: RunState) -> str | None:
+    """Validate the recovered projection before any live scheduling or timer.
+
+    Returns a specific diagnostic when the checkpoint, ordered stages, or
+    integration candidates disagree, so the run holds behind an actionable gate
+    instead of scheduling work on an inconsistent projection.
+    """
+    if state.plan_manifest is None:
+        return "checkpoint has no immutable plan manifest"
+    if state.events.last_consumed_offset < 0:
+        return "checkpoint cursor is negative"
+    if plan.sub_tls and not state.ordered_stages:
+        return "ordered plan has no persisted stages"
+    if state.current_order < 1:
+        return "ordered plan has an invalid current order"
+    for candidate_id in state.integration.candidates:
+        if candidate_id not in state.slices:
+            return f"integration candidate {candidate_id!r} has no slice"
+    for stage in state.ordered_stages:
+        for member in stage.sub_tls:
+            if member not in state.slices:
+                return f"ordered stage member {member!r} has no slice"
+    return None
+
+
 def _run_loop(
     run_id: str,
     plan: WorkPlan,
@@ -3047,6 +3151,10 @@ def _run_loop(
         review_now=config.review_clock() if config.review_clock is not None else None,
     )
     heartbeat_events: list[SyntheticHeartbeatEvent] = []
+    # One invocation-scoped work clock: fresh start table, monotonic source.
+    # Nothing marks a slice active during catch-up/replay, so no work-time
+    # clock is read until live operation observes proven active work.
+    active_work_clock = ActiveWorkClock(config.work_clock)
     diagnostics = EventDiagnostics(
         task_started_at={
             slice_id: slice_state.dispatch_started_at
@@ -3069,49 +3177,67 @@ def _run_loop(
         state = store.set_goals(
             replace(state.goals, controller_started_at=diagnostics.controller_started_at)
         )
-    if (
-        not plan.sub_tls
-        and not _source_has_pending(source)
-        and _scope_has_pending_post_merge(state)
-    ):
-        state = _drain_direct_scope_convergence(
-            state, convergence, store, config, effects, effects_log
-        )
-    before_finalization_phase = _phase_from_state(state)
-    state = _maybe_finalize_scope(state, store, config, effects, effects_log)
-    after_finalization_phase = _phase_from_state(state)
-    if after_finalization_phase != before_finalization_phase:
-        _emit_phase_change(
-            run_id,
-            before_finalization_phase,
-            after_finalization_phase,
+    # Historical catch-up boundary: while replayable quarantine evidence is
+    # still pending, no finalization or live convergence runs and no work timer
+    # is armed. The events below are applied first through the normal reducers;
+    # only once the finite pending set is empty does live operation resume.
+    recovery_pending = bool(quarantined)
+    if recovery_pending:
+        _record_recovery_boundary(
+            state,
             config,
             effects,
             effects_log,
+            reason="historical_catch_up_pending",
+            cursor=state.events.last_consumed_offset,
+            pending_quarantine=len(quarantined),
         )
-    phase = _phase_from_state(state)
-    if isinstance(state.recursive_fsm, RecursiveTLAllMerged) and not _source_has_pending(source):
-        return TLRunResult(
-            state,
-            tuple(effects_log),
-            tuple(transitions),
-            tuple(consumed),
-            diagnostics=diagnostics.snapshot(),
-            journal_entries=_journal_entries(effects_log),
-        )
-    if not expected and not plan.sub_tls and not _is_terminal_phase(phase):
-        if not isinstance(phase, RecursiveTLAllMerged):
-            raise TLLoopError("empty scope did not reach a canonical completion boundary")
-        return TLRunResult(
-            state,
-            tuple(effects_log),
-            tuple(transitions),
-            tuple(consumed),
-            diagnostics=diagnostics.snapshot(),
-            journal_entries=_journal_entries(effects_log),
-        )
+    if not recovery_pending:
+        if (
+            not plan.sub_tls
+            and not _source_has_pending(source)
+            and _scope_has_pending_post_merge(state)
+        ):
+            state = _drain_direct_scope_convergence(
+                state, convergence, store, config, effects, effects_log
+            )
+        before_finalization_phase = _phase_from_state(state)
+        state = _maybe_finalize_scope(state, store, config, effects, effects_log)
+        after_finalization_phase = _phase_from_state(state)
+        if after_finalization_phase != before_finalization_phase:
+            _emit_phase_change(
+                run_id,
+                before_finalization_phase,
+                after_finalization_phase,
+                config,
+                effects,
+                effects_log,
+            )
+        phase = _phase_from_state(state)
+        if isinstance(state.recursive_fsm, RecursiveTLAllMerged) and not _source_has_pending(
+            source
+        ):
+            return TLRunResult(
+                state,
+                tuple(effects_log),
+                tuple(transitions),
+                tuple(consumed),
+                diagnostics=diagnostics.snapshot(),
+                journal_entries=_journal_entries(effects_log),
+            )
+        if not expected and not plan.sub_tls and not _is_terminal_phase(phase):
+            if not isinstance(phase, RecursiveTLAllMerged):
+                raise TLLoopError("empty scope did not reach a canonical completion boundary")
+            return TLRunResult(
+                state,
+                tuple(effects_log),
+                tuple(transitions),
+                tuple(consumed),
+                diagnostics=diagnostics.snapshot(),
+                journal_entries=_journal_entries(effects_log),
+            )
 
-    if not isinstance(
+    if not recovery_pending and not isinstance(
         derive_next_action(
             state,
             reviewer_max_rounds=convergence.reviewer_max_rounds,
@@ -3124,7 +3250,7 @@ def _run_loop(
         phase = _phase_from_state(state)
 
     while not config.test_harness or len(consumed) < config.max_events:
-        if not (
+        if not quarantined and not (
             isinstance(_phase_from_state(state), RecursiveTLAllMerged)
             and _source_has_pending(source)
         ):
@@ -3169,13 +3295,14 @@ def _run_loop(
             event = _next_event(source, config)
         _record_reader_findings(source, diagnostics)
         if event is None:
-            if config.heartbeat is not None:
+            if config.heartbeat is not None and not quarantined:
                 heartbeat = heartbeat_once(
                     state,
                     store,
                     effects,
                     config.heartbeat,
                     project_root=config.project_root,
+                    active_work=active_work_clock,
                     review_replay=lambda replay_state, replay_slice, replay_watcher: (
                         _replay_watcher_review_if_needed(
                             plan,
@@ -7307,6 +7434,37 @@ def _execute_direct_merge_intent(
     )
 
 
+def _derive_eligible_integration_after_nonmerge(
+    integration: IntegrationRuntimeState,
+    slice_id: str,
+    diagnostic: str,
+) -> IntegrationRuntimeState:
+    """Return one candidate to an integration-eligible lifecycle after a
+    disproved merge attempt.
+
+    A rejected or non-confirmed merge leaves the candidate at ``MERGING`` while
+    its action is cleared. Without this edge the candidate waits forever for a
+    merge event that no longer exists. ``MERGE_NOT_CONFIRMED`` is the typed
+    retirement edge back to ``READY_FOR_INTEGRATION`` so the normal aggregate
+    approval/integration path can derive a fresh, evidence-bound attempt. Only
+    the exact ``MERGING`` lifecycle is moved; every other lifecycle is left for
+    its own owner to reconcile.
+    """
+    if _candidate_runtime(integration, slice_id).lifecycle is not IntegrationLifecycle.MERGING:
+        return integration
+    try:
+        return _transition_candidate_runtime(
+            integration, slice_id, IntegrationTransition.MERGE_NOT_CONFIRMED
+        )
+    except IntegrationTransitionError:
+        LOGGER.warning(
+            "[TL loop] candidate %s could not retire its unconfirmed merge: %s",
+            slice_id,
+            diagnostic,
+        )
+        return integration
+
+
 def _resolve_nonmerged_merge(
     state: RunState,
     slice_id: str,
@@ -7335,6 +7493,10 @@ def _resolve_nonmerged_merge(
         "merge_not_confirmed",
         diagnostic,
     )
+    if not terminal:
+        integration = _derive_eligible_integration_after_nonmerge(
+            integration, slice_id, diagnostic
+        )
     updated = _checkpoint_slice_action(
         store,
         refreshed,
@@ -8974,6 +9136,239 @@ def _reconfirm_park(
     return refreshed if refreshed is not None else None
 
 
+def _merge_retirement_gate_name(state: RunState, slice_id: str, key: str) -> str:
+    """Return a per-occurrence gate for a rejected merge whose outcome conflicts."""
+    occurrence = {"run_id": state.run_id, "slice_id": slice_id, "key": key}
+    encoded = json.dumps(occurrence, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return f"{MERGE_RETIREMENT_GATE_PREFIX}{digest}"
+
+
+def _hold_rejected_merge(
+    state: RunState,
+    store: RunStore,
+    slice_id: str,
+    entry: Mapping[str, object],
+    diagnostic: str,
+) -> RunState:
+    """Open a bounded actionable hold for a rejected merge we cannot converge."""
+    key = str(entry.get("key") or "")
+    gate_name = _merge_retirement_gate_name(state, slice_id, key)
+    if not any(gate.name == gate_name for gate in state.gates):
+        state = store.set_gate(gate_name, GateStatus.PENDING)
+        LOGGER.warning(
+            "[TL loop] rejected merge for %s needs operator reconciliation: %s (gate=%s)",
+            slice_id,
+            diagnostic,
+            gate_name,
+        )
+    return state
+
+
+def _retire_rejected_merge_attempt(
+    state: RunState,
+    store: RunStore,
+    slice_id: str,
+    entry: Mapping[str, object],
+    diagnostic: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Retire one proven-rejected merge attempt and derive eligible integration.
+
+    The original rejected journal entry is preserved byte-for-byte: it is
+    historical evidence. The corrective disposition is a durable controller
+    event plus a checkpoint projection that clears the stale in-flight action
+    and returns the candidate to ``READY_FOR_INTEGRATION``. The candidate's
+    merge attempt counter advances so a genuinely new approved attempt gets a
+    distinct action identity instead of replaying the old rejection forever.
+    """
+    refreshed = store.load()
+    current = refreshed.slices.get(slice_id)
+    if current is None:
+        return refreshed
+    key = str(entry.get("key") or "")
+    action = current.action
+    if action is None or action.intent_id != key:
+        # Already retired, or a newer attempt replaced it.
+        return refreshed
+    rejected_attempt = action.attempt
+    integration = _abandon_owned_lane_integration(
+        refreshed, current, refreshed.integration, "merge_not_confirmed", diagnostic
+    )
+    integration = _derive_eligible_integration_after_nonmerge(integration, slice_id, diagnostic)
+    runtime = _candidate_runtime(integration, slice_id)
+    integration = _persist_candidate_runtime(
+        integration, slice_id, replace(runtime, merge_attempts=runtime.merge_attempts + 1)
+    )
+    cleared = slice_transition(current, ActionChanged(None))
+    cleared = replace(cleared, park_cause=None, dispatch_error=None)
+    state = _checkpoint_slice_action(
+        store,
+        refreshed,
+        slice_id,
+        None,
+        slice_state=cleared,
+        integration=integration,
+    )
+    _record_controller_event(
+        slice_id,
+        "tl.merge_attempt_retired",
+        {
+            "run_id": state.run_id,
+            "slice_id": slice_id,
+            "transition_version": 1,
+            "rejected_action_key": key,
+            "rejected_attempt": rejected_attempt,
+            "rejected_error": diagnostic[:500],
+            "retired_by": "rejected_journal_terminal_result",
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    LOGGER.info(
+        "[TL loop] retired rejected merge attempt slice=%s key=%s",
+        slice_id,
+        key,
+    )
+    return store.load()
+
+
+def _retire_rejected_merge_results(
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Converge terminal rejected merge results into the integration projection.
+
+    A rejected ``merge_pr`` journal entry is authoritative history: the merge
+    did not happen. Startup reconciliation only scanned intended/unknown
+    entries, so a rejected result left the slice's MERGE action stuck
+    ``IN_FLIGHT`` and its candidate at ``MERGING`` forever, waiting for a merge
+    event that never arrives.
+
+    This pass acts only on exact evidence: the persisted action's intent id
+    resolves to a rejected merge entry for the same slice, a fresh authoritative
+    observation resolves the same PR/head, and that observation says the merge
+    did not happen. Every other outcome -- an unavailable observation, a
+    present-but-refused publication record, a handled/in-flight action, or a
+    contradictory merged observation -- is held, adopted, or left to its own
+    authoritative owner.
+    """
+    if not isinstance(effects_log, EffectJournal):
+        return state
+    state = store.load()
+    for slice_id, current in list(state.slices.items()):
+        action = current.action
+        if (
+            action is None
+            or action.kind is not ActionKind.MERGE
+            or not action.intent_id
+            or action.phase not in {ActionPhase.IN_FLIGHT, ActionPhase.UNKNOWN}
+        ):
+            continue
+        entry = effects_log.entry_by_key(action.intent_id)
+        if (
+            entry is None
+            or entry.get("operation") != "merge_pr"
+            or entry.get("target") != slice_id
+            or entry.get("status") != "rejected"
+        ):
+            continue
+        if current.pr_number is None:
+            continue
+        # A read-only observation, never journaled: unavailable remote facts
+        # leave the rejected entry and checkpoint untouched for a later pass.
+        try:
+            watcher = effects.watcher_pr_state(pr_number=current.pr_number)
+        except (ConnectionError, OSError, RuntimeError, TimeoutError) as error:
+            LOGGER.warning(
+                "[TL loop] rejected merge for %s is not retired: watcher unavailable: %s",
+                slice_id,
+                error,
+            )
+            continue
+        observation = _watcher_result_observation(watcher)
+        if watcher is None or observation is None:
+            LOGGER.warning(
+                "[TL loop] rejected merge for %s is not retired: watcher unavailable",
+                slice_id,
+            )
+            continue
+        if _watcher_publication_refused(
+            current, watcher, current.dispatch_agent_id or current.id
+        ) or _watcher_publication_ownership_unresolved(watcher):
+            LOGGER.warning(
+                "[TL loop] rejected merge for %s is not retired: publication refused",
+                slice_id,
+            )
+            continue
+        diagnostic = str(entry.get("error") or "merge_pr was rejected")
+        same_head = not (
+            observation.head_sha and action.head_sha and observation.head_sha != action.head_sha
+        )
+        if observation.merged is True:
+            if not same_head:
+                state = _hold_rejected_merge(
+                    state,
+                    store,
+                    slice_id,
+                    entry,
+                    "rejected merge conflicts with a merged PR at a different head",
+                )
+                continue
+            state = _reconcile_merged_slice(
+                state,
+                slice_id,
+                observation.pr_number or current.pr_number,
+                action.intent_id,
+                config,
+                effects,
+                store,
+                effects_log,
+                boundary="rejected_journal_remote_merge_reconciled",
+                merge_evidence={
+                    **dict(entry.get("arguments") or {}),
+                    **_watcher_merge_evidence(observation),
+                },
+            )
+            continue
+        if observation.merged is not False:
+            state = _hold_rejected_merge(
+                state,
+                store,
+                slice_id,
+                entry,
+                "authoritative observation did not prove the rejected merge outcome",
+            )
+            continue
+        if not same_head:
+            state = _hold_rejected_merge(
+                state,
+                store,
+                slice_id,
+                entry,
+                f"rejected merge head {action.head_sha} does not match observed head "
+                f"{observation.head_sha}",
+            )
+            continue
+        state = _retire_rejected_merge_attempt(
+            state,
+            store,
+            slice_id,
+            entry,
+            diagnostic,
+            config,
+            effects,
+            effects_log,
+        )
+    return state
+
+
 def _reconcile_nonterminal_slices(
     plan: WorkPlan,
     state: RunState,
@@ -8983,6 +9378,7 @@ def _reconcile_nonterminal_slices(
     effects_log: list[EffectIntent],
 ) -> RunState:
     """Rebuild safe derived fields before the cursor advances."""
+    state = _retire_rejected_merge_results(state, config, effects, store, effects_log)
     candidates = [
         slice_state
         for slice_state in state.slices.values()
@@ -16171,6 +16567,10 @@ def _integrate_one_candidate(
         "working_dir": _relative_process_working_dir(config),
         "base_sha": base_sha,
         "aggregate_approval_receipt_id": approval_receipt.receipt_id,
+        # A retirement of a proven-rejected attempt advances this counter, so a
+        # genuinely new approved attempt has a distinct action identity and can
+        # never silently replay the old rejection from the durable journal.
+        "attempt": _candidate_runtime(state.integration, task.name).merge_attempts + 1,
     }
     merge_intent_id = stable_action_key(state.run_id, "merge_pr", task.name, merge_arguments)
     merge_action = ActionState(
