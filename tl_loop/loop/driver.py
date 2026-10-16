@@ -15996,7 +15996,14 @@ def _integrate_stage_candidates(
             current.status is not SliceStatus.IN_REVIEW
             or current.pr_number is None
             or candidate is None
-            or candidate.lifecycle is not IntegrationLifecycle.READY_FOR_INTEGRATION
+            # A restart can land after validation and parent approval were
+            # checkpointed but before MERGING. Re-enter the full integration
+            # validator for that durable intermediate state.
+            or candidate.lifecycle
+            not in {
+                IntegrationLifecycle.READY_FOR_INTEGRATION,
+                IntegrationLifecycle.INTEGRATION_VALIDATED,
+            }
         ):
             return state
         state = _integrate_one_candidate(task, state, config, effects, store, effects_log)

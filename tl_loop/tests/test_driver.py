@@ -9065,14 +9065,64 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         with_rejected_merge=True,
     )
     replayed_transport.observed_root_store = RunStore("ordered-e2e-run", replayed_root)
-    resumed = run_tl_loop(
-        "ordered-e2e-run",
-        plan,
-        SyntheticQueue([]),
-        EffectClient(replayed_transport),
-        config=replace(config, max_workers=1),
-        root_dir=replayed_root,
-    )
+    original_checkpoint = RunStore.checkpoint
+    approval_checkpoint_written = False
+
+    def crash_after_alpha_approval(
+        store: RunStore,
+        *args: Any,
+        **checkpoint_args: Any,
+    ) -> RunState:
+        nonlocal approval_checkpoint_written
+        state = original_checkpoint(store, *args, **checkpoint_args)
+        if (
+            store.run_id == "ordered-e2e-run"
+            and not approval_checkpoint_written
+            and state.integration is not None
+            and "alpha" in state.integration.candidates
+        ):
+            candidate = state.integration.candidates["alpha"]
+            if candidate.active_aggregate_approval_id and candidate.aggregate_approval_receipts:
+                approval_checkpoint_written = True
+                raise SystemExit("simulated crash after alpha approval before merge")
+        return state
+
+    monkeypatch.setattr(RunStore, "checkpoint", crash_after_alpha_approval)
+    with pytest.raises(SystemExit, match="after alpha approval before merge"):
+        run_tl_loop(
+            "ordered-e2e-run",
+            plan,
+            SyntheticQueue([]),
+            EffectClient(replayed_transport),
+            config=replace(config, max_workers=1),
+            root_dir=replayed_root,
+        )
+
+    assert approval_checkpoint_written
+    checkpointed = RunStore("ordered-e2e-run", replayed_root).load()
+    alpha_approval = checkpointed.integration.candidates["alpha"]
+    assert alpha_approval.lifecycle is IntegrationLifecycle.INTEGRATION_VALIDATED
+    assert len(alpha_approval.aggregate_approval_receipts) == 1
+    alpha_approval_id = alpha_approval.active_aggregate_approval_id
+    assert alpha_approval_id is not None
+    assert checkpointed.slices["alpha"].status is SliceStatus.IN_REVIEW
+    assert not any(name == "merge_pr" for name, _ in replayed_transport.calls)
+
+    monkeypatch.setattr(RunStore, "checkpoint", original_checkpoint)
+    restart_cancel = threading.Event()
+    restart_deadline = threading.Timer(10, restart_cancel.set)
+    restart_deadline.start()
+    try:
+        resumed = run_tl_loop(
+            "ordered-e2e-run",
+            plan,
+            SyntheticQueue([]),
+            EffectClient(replayed_transport),
+            config=replace(config, max_workers=1, cancel_event=restart_cancel),
+            root_dir=replayed_root,
+        )
+    finally:
+        restart_deadline.cancel()
 
     for result, transport in (
         (uninterrupted, uninterrupted_transport),
@@ -9096,6 +9146,14 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             and reference["receipt_id"]
             for reference in approval_references
         )
+        if result is resumed:
+            assert result.final_state.integration.candidates[
+                "alpha"
+            ].active_aggregate_approval_id == (alpha_approval_id)
+            assert (
+                len(result.final_state.integration.candidates["alpha"].aggregate_approval_receipts)
+                == 1
+            )
         aggregate_titles = [
             str(args["title"])
             for name, args in transport.calls
