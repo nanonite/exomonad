@@ -27,7 +27,7 @@ pub(super) fn validate_parent_scope(
         || controller_epoch != reference.controller_epoch
         || receipt.parent_run_id != reference.parent_run_id
         || receipt.parent_scope_path != reference.parent_scope_path
-        || receipt.child_scope_id != reference.child_scope_id
+        || receipt.candidate_key != reference.candidate_key
         || receipt.parent_agent_id != caller_agent_id
         || receipt.parent_branch != caller_branch
         || string_at(state, "/owner_branch")? != receipt.parent_branch
@@ -74,6 +74,13 @@ pub(super) async fn validate_parent_identity(
         .and_then(Value::as_object)
         .context("parent RunStore has no accepted plan manifest")?;
     let manifest_scope = string_value(manifest.get("scope_id"), "plan manifest scope")?;
+    let receipt_parent_scope = receipt
+        .parent_manifest_scope_id
+        .as_deref()
+        .context("legacy aggregate approval must be renewed from the accepted manifest")?;
+    if manifest_scope != receipt_parent_scope {
+        anyhow::bail!("aggregate approval parent manifest scope differs from the accepted plan");
+    }
     let is_root = manifest.get("role").and_then(Value::as_str) == Some("root");
     let identity_scope_matches = if is_root {
         identity.slice_id.is_none()

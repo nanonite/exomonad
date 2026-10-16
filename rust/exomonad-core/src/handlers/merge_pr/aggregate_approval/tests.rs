@@ -4,7 +4,9 @@ use crate::services::agent_control::{AgentType, Topology};
 use crate::services::agent_resolver::{AgentIdentityRecord, AgentResolver};
 use exomonad_proto::effects::merge_pr::AggregateApprovalReference;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const REPOSITORY: &str = "https://forge.example.test/org/repo.git";
 
@@ -26,7 +28,7 @@ impl Fixture {
                 receipt_id: String::new(),
                 parent_run_id: "root-run".to_string(),
                 parent_scope_path: vec!["root-run".to_string()],
-                child_scope_id: "architecture".to_string(),
+                candidate_key: "architecture".to_string(),
                 controller_epoch: "epoch-current".to_string(),
             },
             receipt: Value::Null,
@@ -57,7 +59,11 @@ impl Fixture {
             "policy_mode": "parent",
             "parent_run_id": "root-run",
             "parent_scope_path": ["root-run"],
-            "child_scope_id": "architecture",
+            "parent_manifest_scope_id": "root-run",
+            "candidate_key": "architecture",
+            "child_run_id": "architecture",
+            "child_manifest_node_id": "root-run/sub_tl/architecture",
+            "child_manifest_scope_id": "root-run/sub_tl/architecture",
             "parent_agent_id": "root",
             "parent_branch": "main",
             "repository_url": self.repository,
@@ -89,7 +95,7 @@ impl Fixture {
         let child_digest = self.child_manifest_digest();
         let child_manifest = self.child_manifest_document();
         let node = json!({
-            "node_id": "architecture-node",
+            "node_id": "root-run/sub_tl/architecture",
             "parent_id": "root-run",
             "kind": "sub_tl",
             "name": "architecture",
@@ -115,11 +121,11 @@ impl Fixture {
             "role": "root",
             "owned_branch": "main",
             "parent_integration_target": null,
-            "source_order": ["architecture-node"],
+            "source_order": ["root-run/sub_tl/architecture"],
             "nodes": [node],
-            "ordered_stages": [{"order": 1, "nodes": ["architecture-node"]}],
-            "child_manifest_digests": {"architecture-node": child_digest},
-            "child_manifests": {"architecture-node": child_manifest},
+            "ordered_stages": [{"order": 1, "nodes": ["root-run/sub_tl/architecture"]}],
+            "child_manifest_digests": {"root-run/sub_tl/architecture": child_digest},
+            "child_manifests": {"root-run/sub_tl/architecture": child_manifest},
         })
     }
 
@@ -127,7 +133,7 @@ impl Fixture {
         json!({
             "schema_version": 1,
             "manifest_revision": 2,
-            "scope_id": "architecture",
+            "scope_id": "root-run/sub_tl/architecture",
             "parent_scope_id": "root-run",
             "role": "non_root",
             "owned_branch": "main.architecture",
@@ -249,6 +255,40 @@ impl Fixture {
     }
 }
 
+fn production_python_artifact(request: Value) -> Value {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let generator = repository_root.join("tl_loop/tests/fixtures/aggregate_approval_producer.py");
+    let python_venv = repository_root.join("tl_loop/.venv/bin/python");
+    let python = if python_venv.exists() {
+        python_venv
+    } else {
+        PathBuf::from("python3")
+    };
+    let mut process = Command::new(python)
+        .arg(generator)
+        .env("PYTHONPATH", &repository_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start production Python approval producer");
+    process
+        .stdin
+        .take()
+        .expect("producer stdin")
+        .write_all(&serde_json::to_vec(&request).expect("producer request JSON"))
+        .expect("send producer request");
+    let output = process
+        .wait_with_output()
+        .expect("wait for Python producer");
+    assert!(
+        output.status.success(),
+        "production Python approval producer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("Python-generated approval artifact")
+}
+
 #[tokio::test]
 async fn accepts_active_parent_receipt_for_declared_aggregate() {
     let fixture = Fixture::new();
@@ -276,6 +316,99 @@ async fn accepts_active_parent_receipt_for_declared_aggregate() {
         &approval.merge_tree_sha,
     )
     .expect("request compare must bind the receipt");
+}
+
+#[tokio::test]
+async fn accepts_python_produced_nested_scope_with_distinct_run_and_manifest_ids() {
+    let directory = tempfile::tempdir().expect("temporary nested workspace");
+    let project = directory.path();
+    let scope_root = project.join(".exo/tl-loop");
+    let parent_scope_id = "root-run/sub_tl/architecture";
+    let artifact = production_python_artifact(json!({
+        "parent_scope_path": ["root-run", "architecture"],
+        "ancestor_child_branches": ["main.architecture"],
+        "scope_root": scope_root,
+        "root_branch": "main",
+        "parent_run_id": "architecture",
+        "parent_agent_id": "architecture",
+        "parent_branch": "main.architecture",
+        "child_run_id": "component",
+        "child_branch": "main.architecture.component",
+        "child_task": "Nested component work",
+        "repository_url": REPOSITORY,
+        "controller_epoch": "nested-epoch",
+        "pr_number": 47,
+        "head_sha": "c".repeat(40),
+        "head_tree_sha": "d".repeat(40),
+        "base_sha": "e".repeat(40),
+        "patch_digest": "f".repeat(64),
+        "merge_tree_sha": "1".repeat(40),
+        "ci_status": "success",
+        "readiness_receipt_digest": "2".repeat(64),
+        "lineage_proof_digest": "3".repeat(64),
+        "lineage_commit_shas": ["c".repeat(40)],
+        "worktree": ".exo/worktrees/component",
+    }));
+    assert_eq!(artifact["parent_manifest_scope_id"], parent_scope_id);
+    assert_eq!(
+        artifact["child_manifest_node_id"],
+        "root-run/sub_tl/architecture/sub_tl/component"
+    );
+    let reference = AggregateApprovalReference {
+        receipt_id: artifact["receipt_id"].as_str().unwrap().to_string(),
+        parent_run_id: "architecture".to_string(),
+        parent_scope_path: vec!["root-run".to_string(), "architecture".to_string()],
+        candidate_key: "component".to_string(),
+        controller_epoch: "nested-epoch".to_string(),
+    };
+    for checkpoint in artifact["checkpoints"].as_array().unwrap() {
+        let mut path = scope_root.clone();
+        for segment in checkpoint["scope_path"].as_array().unwrap() {
+            path.push(segment.as_str().unwrap());
+        }
+        fs::create_dir_all(&path).expect("create scope checkpoint directory");
+        fs::write(
+            path.join(RUN_FILENAME),
+            serde_json::to_vec(&checkpoint["state"]).unwrap(),
+        )
+        .expect("write Python-generated checkpoint");
+    }
+    fs::create_dir_all(project.join(".exo/worktrees/component"))
+        .expect("create nested aggregate worktree");
+    let resolver = AgentResolver::load(project.to_path_buf()).await;
+    resolver
+        .register(AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("architecture").unwrap(),
+            slug: Slug::try_from_str("architecture").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.architecture").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: Path::new(".exo/worktrees/architecture").to_path_buf(),
+            display_name: "nested parent controller".to_string(),
+            topology: Topology::SharedDir,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some(parent_scope_id.to_string()),
+        })
+        .await
+        .expect("register nested parent identity");
+
+    let approval = validate_parent_approval(
+        project,
+        &reference,
+        47,
+        REPOSITORY,
+        "architecture",
+        "main.architecture",
+        &resolver,
+    )
+    .await
+    .expect("Python-generated nested approval should validate");
+
+    assert_eq!(approval.head_branch, "main.architecture.component");
+    assert_eq!(approval.reference.parent_run_id, "architecture");
+    assert_eq!(approval.reference.candidate_key, "component");
 }
 
 #[tokio::test]
@@ -359,7 +492,7 @@ async fn refuses_stale_epoch_repository_and_cross_scope_receipts() {
     .contains("repository"));
 
     let mut sibling = fixture.reference.clone();
-    sibling.child_scope_id = "sibling".to_string();
+    sibling.candidate_key = "sibling".to_string();
     assert!(validate_parent_approval(
         fixture.project_dir(),
         &sibling,
@@ -419,6 +552,54 @@ async fn refuses_forged_or_superseded_receipts_and_changed_compare() {
     .unwrap_err()
     .to_string()
     .contains("head"));
+}
+
+#[test]
+fn legacy_receipt_history_can_be_superseded_but_not_reactivated() {
+    let fixture = Fixture::new();
+    let checkpoint = fixture.project_dir().join(".exo/tl-loop/root-run/run.json");
+    let mut state: Value = serde_json::from_slice(&fs::read(&checkpoint).unwrap()).unwrap();
+    let mut legacy = fixture.receipt.clone();
+    let old_candidate = legacy["candidate_key"].clone();
+    for field in [
+        "parent_manifest_scope_id",
+        "candidate_key",
+        "child_run_id",
+        "child_manifest_node_id",
+        "child_manifest_scope_id",
+    ] {
+        legacy.as_object_mut().unwrap().remove(field);
+    }
+    legacy["child_scope_id"] = old_candidate;
+    legacy["receipt_id"] = json!("");
+    let legacy_id = canonical_receipt_id(&legacy).unwrap();
+    legacy["receipt_id"] = json!(legacy_id);
+    let parsed_legacy = parse_receipt(&legacy).expect("old receipt remains decodable");
+    assert!(parsed_legacy.legacy_identity);
+    assert_eq!(parsed_legacy.candidate_key, "architecture");
+
+    let mut current = fixture.receipt.clone();
+    current["supersedes_receipt_id"] = json!(legacy_id);
+    current["receipt_id"] = json!("");
+    let current_id = canonical_receipt_id(&current).unwrap();
+    current["receipt_id"] = json!(current_id);
+    let candidate = &mut state["integration"]["candidates"]["architecture"];
+    candidate["aggregate_approval_receipts"] = json!([legacy.clone(), current]);
+    candidate["active_aggregate_approval_id"] = json!(current_id);
+    fs::write(&checkpoint, serde_json::to_vec(&state).unwrap()).unwrap();
+    let mut current_reference = fixture.reference.clone();
+    current_reference.receipt_id = current_id.clone();
+    let active = active_receipt(&state, &current_reference).expect("latest decision is active");
+    assert_eq!(active.receipt_id, current_id);
+
+    let mut legacy_only = state;
+    let candidate = &mut legacy_only["integration"]["candidates"]["architecture"];
+    candidate["aggregate_approval_receipts"] = json!([legacy]);
+    candidate["active_aggregate_approval_id"] = json!(legacy_id);
+    let mut old_reference = fixture.reference.clone();
+    old_reference.receipt_id = legacy_id;
+    let error = active_receipt(&legacy_only, &old_reference).unwrap_err();
+    assert!(error.to_string().contains("must be renewed"), "{error}");
 }
 
 #[test]

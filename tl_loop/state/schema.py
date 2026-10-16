@@ -1463,8 +1463,8 @@ def _validate_aggregate_approval_history(
         except (AggregateApprovalError, TypeError, ValueError) as error:
             errors.append((receipt_path, str(error)))
             continue
-        if receipt.child_scope_id != candidate_id:
-            errors.append((f"{receipt_path}.child_scope_id", "does not match candidate scope"))
+        if receipt.candidate_key != candidate_id:
+            errors.append((f"{receipt_path}.candidate_key", "does not match candidate key"))
         expected_supersedes = receipt_ids[-1] if receipt_ids else None
         if receipt.supersedes_receipt_id != expected_supersedes:
             errors.append(

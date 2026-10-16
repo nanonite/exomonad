@@ -340,7 +340,7 @@ data AggregateApprovalReference
   { aggregateApprovalReferenceReceiptId :: Hs.Text,
     aggregateApprovalReferenceParentRunId :: Hs.Text,
     aggregateApprovalReferenceParentScopePath :: (Hs.Vector Hs.Text),
-    aggregateApprovalReferenceChildScopeId :: Hs.Text,
+    aggregateApprovalReferenceCandidateKey :: Hs.Text,
     aggregateApprovalReferenceControllerEpoch :: Hs.Text
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
@@ -359,7 +359,7 @@ instance (HsProtobuf.Message AggregateApprovalReference) where
       { aggregateApprovalReferenceReceiptId,
         aggregateApprovalReferenceParentRunId,
         aggregateApprovalReferenceParentScopePath,
-        aggregateApprovalReferenceChildScopeId,
+        aggregateApprovalReferenceCandidateKey,
         aggregateApprovalReferenceControllerEpoch
       } =
       Hs.mappend
@@ -392,7 +392,7 @@ instance (HsProtobuf.Message AggregateApprovalReference) where
             ( HsProtobuf.encodeMessageField
                 (HsProtobuf.FieldNumber 4)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    aggregateApprovalReferenceChildScopeId
+                    aggregateApprovalReferenceCandidateKey
                 )
             )
         )
@@ -459,7 +459,7 @@ instance (HsProtobuf.Message AggregateApprovalReference) where
       HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 4)
         (HsProtobufAST.Prim HsProtobufAST.String)
-        (HsProtobufAST.Single "child_scope_id")
+        (HsProtobufAST.Single "candidate_key")
         []
         "",
       HsProtobufAST.DotProtoField
@@ -484,7 +484,7 @@ instance (HsJSONPB.ToJSONPB AggregateApprovalReference) where
                )
                  f3
              ),
-        "child_scope_id"
+        "candidate_key"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
         "controller_epoch"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5)
@@ -502,7 +502,7 @@ instance (HsJSONPB.ToJSONPB AggregateApprovalReference) where
                )
                  f3
              ),
-        "child_scope_id"
+        "candidate_key"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
         "controller_epoch"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5)
@@ -527,7 +527,7 @@ instance (HsJSONPB.FromJSONPB AggregateApprovalReference) where
                     (obj .: "parent_scope_path")
                 )
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
-                    (obj .: "child_scope_id")
+                    (obj .: "candidate_key")
                 )
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "controller_epoch")

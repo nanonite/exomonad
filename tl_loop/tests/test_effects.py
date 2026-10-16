@@ -204,7 +204,7 @@ def test_merge_pr_emits_compare_and_swap_evidence() -> None:
         "receipt_id": "approval-a",
         "parent_run_id": "root-run",
         "parent_scope_path": ["root-run"],
-        "child_scope_id": "architecture",
+        "candidate_key": "architecture",
         "controller_epoch": "epoch-current",
     }
     EffectClient(transport).merge_pr(

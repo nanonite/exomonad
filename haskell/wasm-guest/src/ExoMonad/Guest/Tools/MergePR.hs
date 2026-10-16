@@ -77,7 +77,7 @@ data AggregateApprovalRef = AggregateApprovalRef
   { aarReceiptId :: Text,
     aarParentRunId :: Text,
     aarParentScopePath :: V.Vector Text,
-    aarChildScopeId :: Text,
+    aarCandidateKey :: Text,
     aarControllerEpoch :: Text
   }
   deriving (Show, Eq, Generic)
@@ -91,10 +91,10 @@ instance JsonSchema AggregateApprovalRef where
             [ "receipt_id" .= object ["type" .= ("string" :: Text)],
               "parent_run_id" .= object ["type" .= ("string" :: Text)],
               "parent_scope_path" .= object ["type" .= ("array" :: Text), "items" .= object ["type" .= ("string" :: Text)]],
-              "child_scope_id" .= object ["type" .= ("string" :: Text)],
+              "candidate_key" .= object ["type" .= ("string" :: Text)],
               "controller_epoch" .= object ["type" .= ("string" :: Text)]
             ],
-        "required" .= (["receipt_id", "parent_run_id", "parent_scope_path", "child_scope_id", "controller_epoch"] :: [Text])
+        "required" .= (["receipt_id", "parent_run_id", "parent_scope_path", "candidate_key", "controller_epoch"] :: [Text])
       ]
 
 instance FromJSON AggregateApprovalRef where
@@ -102,9 +102,9 @@ instance FromJSON AggregateApprovalRef where
     receiptId <- v .: "receipt_id"
     parentRunId <- v .: "parent_run_id"
     parentScopePath <- v .: "parent_scope_path"
-    childScopeId <- v .: "child_scope_id"
+    candidateKey <- v .: "candidate_key"
     controllerEpoch <- v .: "controller_epoch"
-    when (any (T.null . T.strip) [receiptId, parentRunId, childScopeId, controllerEpoch]) $
+    when (any (T.null . T.strip) [receiptId, parentRunId, candidateKey, controllerEpoch]) $
       fail "aggregate approval reference contains an empty coordinate"
     when (V.null parentScopePath || V.any (T.null . T.strip) parentScopePath) $
       fail "aggregate approval reference requires a non-empty parent scope path"
@@ -113,7 +113,7 @@ instance FromJSON AggregateApprovalRef where
         { aarReceiptId = receiptId,
           aarParentRunId = parentRunId,
           aarParentScopePath = parentScopePath,
-          aarChildScopeId = childScopeId,
+          aarCandidateKey = candidateKey,
           aarControllerEpoch = controllerEpoch
         }
 
@@ -652,6 +652,6 @@ toProtoAggregateApproval reference =
     { MP.aggregateApprovalReferenceReceiptId = TL.fromStrict (aarReceiptId reference),
       MP.aggregateApprovalReferenceParentRunId = TL.fromStrict (aarParentRunId reference),
       MP.aggregateApprovalReferenceParentScopePath = V.map TL.fromStrict (aarParentScopePath reference),
-      MP.aggregateApprovalReferenceChildScopeId = TL.fromStrict (aarChildScopeId reference),
+      MP.aggregateApprovalReferenceCandidateKey = TL.fromStrict (aarCandidateKey reference),
       MP.aggregateApprovalReferenceControllerEpoch = TL.fromStrict (aarControllerEpoch reference)
     }

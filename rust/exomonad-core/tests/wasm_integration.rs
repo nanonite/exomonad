@@ -55,7 +55,9 @@ fn mock_last_spawn_leaf_model() -> &'static Mutex<Option<String>> {
 
 fn wasm_binary_bytes() -> Vec<u8> {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let path = manifest.join("../../.exo/wasm/wasm-guest-devswarm.wasm");
+    let path = std::env::var_os("EXOMONAD_TEST_WASM")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| manifest.join("../../.exo/wasm/wasm-guest-devswarm.wasm"));
     assert!(
         path.exists(),
         "WASM binary not found at {path:?}. Build with `just wasm-all`."

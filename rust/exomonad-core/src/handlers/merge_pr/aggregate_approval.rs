@@ -13,7 +13,9 @@ mod scope;
 use plan::{resolve_aggregate_worktree, validate_plan_and_candidate};
 #[cfg(test)]
 use receipt::canonical_receipt_id;
-use receipt::{canonical_digest, parse_receipt, ParentApprovalReceipt};
+use receipt::{
+    canonical_digest, manifest_digest, parse_receipt, valid_sha256, ParentApprovalReceipt,
+};
 use scope::{validate_parent_identity, validate_parent_scope, validate_repository};
 
 const RUN_FILENAME: &str = "run.json";
@@ -49,6 +51,7 @@ pub(crate) async fn validate_parent_approval(
     let state = read_scope_checkpoint(project_dir, &scope_path)?;
     let receipt = active_receipt(&state, reference)?;
     validate_parent_scope(&state, reference, &receipt, caller_agent_id, caller_branch)?;
+    validate_parent_manifest_lineage(project_dir, &scope_path, &state, &receipt)?;
     validate_repository(&state, &receipt, current_repository_url)?;
     validate_parent_identity(&state, &receipt, caller_agent_id, caller_branch, resolver).await?;
     let (head_branch, worktree_path) = validate_plan_and_candidate(&state, &receipt, pr_number)?;
@@ -70,6 +73,178 @@ pub(crate) async fn validate_parent_approval(
         lineage_proof_digest: receipt.lineage_proof_digest,
         lineage_commit_shas: receipt.lineage_commit_shas,
     })
+}
+
+fn validate_parent_manifest_lineage(
+    project_dir: &Path,
+    scope_path: &[String],
+    current_state: &Value,
+    receipt: &ParentApprovalReceipt,
+) -> Result<()> {
+    let mut checkpoint = read_scope_checkpoint(project_dir, &scope_path[..1])?;
+    validate_scope_checkpoint_identity(&checkpoint, &scope_path[0], 0, &receipt.repository_url)?;
+    let root_manifest = checkpoint
+        .get("plan_manifest")
+        .and_then(Value::as_object)
+        .context("root scope has no accepted plan manifest")?;
+    validate_manifest_digest(root_manifest)?;
+    if root_manifest.get("scope_id").and_then(Value::as_str) != Some(scope_path[0].as_str())
+        || root_manifest
+            .get("parent_scope_id")
+            .is_some_and(|value| !value.is_null())
+        || root_manifest.get("role").and_then(Value::as_str) != Some("root")
+    {
+        anyhow::bail!("aggregate parent scope path does not begin at its accepted root manifest");
+    }
+
+    for index in 1..scope_path.len() {
+        validate_scope_checkpoint_identity(
+            &checkpoint,
+            &scope_path[index - 1],
+            index - 1,
+            &receipt.repository_url,
+        )?;
+        let child_prefix = &scope_path[..=index];
+        let parent_manifest = checkpoint
+            .get("plan_manifest")
+            .and_then(Value::as_object)
+            .context("aggregate ancestor has no accepted plan manifest")?;
+        let parent_scope = parent_manifest
+            .get("scope_id")
+            .and_then(Value::as_str)
+            .context("aggregate ancestor manifest scope is missing")?
+            .to_string();
+        validate_manifest_digest(parent_manifest)?;
+        if parent_manifest.get("owned_branch").and_then(Value::as_str)
+            != checkpoint.get("owner_branch").and_then(Value::as_str)
+        {
+            anyhow::bail!("aggregate ancestor branch differs from its accepted manifest");
+        }
+        let child_run_id = &scope_path[index];
+        let expected_node_id = format!("{parent_scope}/sub_tl/{child_run_id}");
+        let node = parent_manifest
+            .get("nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .find(|node| {
+                node.get("kind").and_then(Value::as_str) == Some("sub_tl")
+                    && node.get("name").and_then(Value::as_str) == Some(child_run_id)
+            })
+            .context("aggregate runtime scope is not declared by its accepted parent")?;
+        if node.get("node_id").and_then(Value::as_str) != Some(expected_node_id.as_str())
+            || node.get("parent_id").and_then(Value::as_str) != Some(parent_scope.as_str())
+        {
+            anyhow::bail!("aggregate ancestor declaration has conflicting canonical node identity");
+        }
+        let child_manifest = parent_manifest
+            .get("child_manifests")
+            .and_then(Value::as_object)
+            .and_then(|items| items.get(&expected_node_id))
+            .and_then(Value::as_object)
+            .context("accepted ancestor manifest lacks its declared child manifest")?;
+        let declared_digest = node
+            .get("child_manifest_digest")
+            .and_then(Value::as_str)
+            .context("accepted ancestor declaration lacks its child manifest digest")?
+            .to_string();
+        let indexed_digest = parent_manifest
+            .get("child_manifest_digests")
+            .and_then(Value::as_object)
+            .and_then(|items| items.get(&expected_node_id))
+            .and_then(Value::as_str);
+        if child_manifest.get("scope_id").and_then(Value::as_str) != Some(expected_node_id.as_str())
+            || child_manifest
+                .get("parent_scope_id")
+                .and_then(Value::as_str)
+                != Some(parent_scope.as_str())
+            || child_manifest.get("owned_branch").and_then(Value::as_str)
+                != node.get("owned_branch").and_then(Value::as_str)
+            || indexed_digest != Some(declared_digest.as_str())
+            || manifest_digest(child_manifest)? != declared_digest
+            || child_manifest.get("digest").and_then(Value::as_str)
+                != Some(declared_digest.as_str())
+        {
+            anyhow::bail!("accepted ancestor child manifest does not match its exact declaration");
+        }
+
+        checkpoint = if index + 1 == scope_path.len() {
+            current_state.clone()
+        } else {
+            read_scope_checkpoint(project_dir, child_prefix)?
+        };
+        validate_scope_checkpoint_identity(
+            &checkpoint,
+            child_run_id,
+            index,
+            &receipt.repository_url,
+        )?;
+        let child_state_manifest = checkpoint
+            .get("plan_manifest")
+            .and_then(Value::as_object)
+            .context("nested parent checkpoint has no accepted plan manifest")?;
+        if checkpoint.get("run_id").and_then(Value::as_str) != Some(child_run_id.as_str())
+            || child_state_manifest.get("scope_id").and_then(Value::as_str)
+                != Some(expected_node_id.as_str())
+            || child_state_manifest
+                .get("parent_scope_id")
+                .and_then(Value::as_str)
+                != Some(parent_scope.as_str())
+            || manifest_digest(child_state_manifest)? != declared_digest
+            || child_state_manifest
+                .get("owned_branch")
+                .and_then(Value::as_str)
+                != checkpoint.get("owner_branch").and_then(Value::as_str)
+        {
+            anyhow::bail!("nested parent checkpoint differs from its accepted ancestor binding");
+        }
+    }
+
+    let current_manifest = current_state
+        .get("plan_manifest")
+        .and_then(Value::as_object)
+        .context("parent RunStore has no accepted plan manifest")?;
+    let accepted_parent_scope = receipt
+        .parent_manifest_scope_id
+        .as_deref()
+        .context("legacy aggregate approval must be renewed from the accepted manifest")?;
+    if current_manifest.get("scope_id").and_then(Value::as_str) != Some(accepted_parent_scope)
+        || manifest_digest(current_manifest)? != receipt.plan_manifest_digest
+    {
+        anyhow::bail!("parent manifest identity is not proven by the runtime scope ancestry");
+    }
+    Ok(())
+}
+
+fn validate_scope_checkpoint_identity(
+    checkpoint: &Value,
+    expected_run_id: &str,
+    expected_depth: usize,
+    expected_repository: &str,
+) -> Result<()> {
+    let depth = u64::try_from(expected_depth).context("scope depth exceeds the supported range")?;
+    if checkpoint.get("run_id").and_then(Value::as_str) != Some(expected_run_id)
+        || checkpoint.get("depth").and_then(Value::as_u64) != Some(depth)
+        || checkpoint
+            .pointer("/repository_identity/remote_url")
+            .and_then(Value::as_str)
+            != Some(expected_repository)
+    {
+        anyhow::bail!("runtime parent path, depth, or repository differs from its checkpoint");
+    }
+    Ok(())
+}
+
+fn validate_manifest_digest(manifest: &serde_json::Map<String, Value>) -> Result<()> {
+    let stored = manifest
+        .get("digest")
+        .and_then(Value::as_str)
+        .context("accepted scope manifest digest is missing")?;
+    if !valid_sha256(stored) || manifest_digest(manifest)? != stored {
+        anyhow::bail!("accepted scope manifest digest is malformed or inconsistent");
+    }
+    Ok(())
 }
 
 pub(super) fn validate_request_compare(
@@ -192,7 +367,7 @@ fn validate_reference(reference: &AggregateApprovalReference) -> Result<Vec<Stri
     let path = &reference.parent_scope_path;
     if reference.receipt_id.trim().is_empty()
         || reference.parent_run_id.trim().is_empty()
-        || reference.child_scope_id.trim().is_empty()
+        || reference.candidate_key.trim().is_empty()
         || reference.controller_epoch.trim().is_empty()
         || path.is_empty()
         || path.last().map(String::as_str) != Some(reference.parent_run_id.as_str())
@@ -248,7 +423,7 @@ fn active_receipt(
     let candidate = state
         .pointer(&format!(
             "/integration/candidates/{}",
-            escape_json_pointer(&reference.child_scope_id)
+            escape_json_pointer(&reference.candidate_key)
         ))
         .and_then(Value::as_object)
         .context("aggregate approval candidate is absent from its parent RunStore")?;
@@ -270,7 +445,7 @@ fn active_receipt(
     let mut selected = None;
     for (index, value) in history.iter().enumerate() {
         let receipt = parse_receipt(value)?;
-        if receipt.child_scope_id != reference.child_scope_id
+        if receipt.candidate_key != reference.candidate_key
             || receipt.supersedes_receipt_id != prior_id
         {
             anyhow::bail!("aggregate approval history has a broken scope or supersession link");
@@ -283,7 +458,12 @@ fn active_receipt(
             selected = Some(receipt);
         }
     }
-    selected.context("active aggregate approval receipt is not retained in history")
+    let selected =
+        selected.context("active aggregate approval receipt is not retained in history")?;
+    if selected.legacy_identity {
+        anyhow::bail!("legacy aggregate approval must be renewed from the accepted manifest");
+    }
+    Ok(selected)
 }
 pub(super) fn escape_json_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")

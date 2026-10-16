@@ -16315,7 +16315,7 @@ def _parent_aggregate_approval_coordinates(
     parent_path = _controller_scope_path(store, config.depth)
     policy_digest = _approval_policy_digest(manifest, node, readiness)
     coordinates = _aggregate_scope_coordinates(
-        task, state, config, manifest, readiness, parent_path, policy_digest
+        task, state, config, manifest, node, readiness, parent_path, policy_digest
     )
     compare_coordinates = _aggregate_compare_coordinates(
         readiness,
@@ -16385,6 +16385,7 @@ def _aggregate_scope_coordinates(
     state: RunState,
     config: TLLoopConfig,
     manifest: PlanManifest,
+    node: ManifestNode,
     readiness: IntegrationReadinessEvidence,
     parent_path: tuple[str, ...],
     policy_digest: str,
@@ -16392,10 +16393,17 @@ def _aggregate_scope_coordinates(
     """Bind actor, repository and accepted scope coordinates."""
     if state.repository_identity is None:
         raise AggregateApprovalError("accepted repository identity is required")
+    child_manifest = manifest.child_manifests.get(node.node_id)
+    if child_manifest is None:
+        raise AggregateApprovalError("accepted parent manifest has no declared child manifest")
     return {
         "parent_run_id": state.run_id,
         "parent_scope_path": list(parent_path),
-        "child_scope_id": task.name,
+        "parent_manifest_scope_id": manifest.scope_id,
+        "candidate_key": task.name,
+        "child_run_id": node.name,
+        "child_manifest_node_id": node.node_id,
+        "child_manifest_scope_id": child_manifest.scope_id,
         "parent_agent_id": config.agent_id,
         "parent_branch": config.branch,
         "repository_url": state.repository_identity.remote_url,

@@ -22,7 +22,8 @@ message AggregateApprovalReference {
   string receipt_id = 1;
   string parent_run_id = 2;
   repeated string parent_scope_path = 3;
-  string child_scope_id = 4;
+  // Candidate map key in the parent RunStore; distinct from manifest scope IDs.
+  string candidate_key = 4;
   string controller_epoch = 5;
 }
 

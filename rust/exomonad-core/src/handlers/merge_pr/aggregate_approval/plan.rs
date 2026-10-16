@@ -11,6 +11,18 @@ pub(super) fn validate_plan_and_candidate(
     receipt: &ParentApprovalReceipt,
     pr_number: u64,
 ) -> Result<(String, String)> {
+    let parent_manifest_scope_id = receipt
+        .parent_manifest_scope_id
+        .as_deref()
+        .context("legacy aggregate approval must be renewed from the accepted manifest")?;
+    let child_run_id = receipt
+        .child_run_id
+        .as_deref()
+        .context("legacy aggregate approval has no canonical child run identity")?;
+    let child_manifest_node_id = receipt
+        .child_manifest_node_id
+        .as_deref()
+        .context("legacy aggregate approval has no canonical child node identity")?;
     let manifest = state
         .get("plan_manifest")
         .and_then(Value::as_object)
@@ -21,7 +33,8 @@ pub(super) fn validate_plan_and_candidate(
         || stored_manifest_digest != receipt.plan_manifest_digest
         || manifest.get("manifest_revision").and_then(Value::as_u64)
             != Some(receipt.plan_manifest_revision)
-        || string_value(manifest.get("scope_id"), "plan manifest scope")? != receipt.parent_run_id
+        || string_value(manifest.get("scope_id"), "plan manifest scope")?
+            != parent_manifest_scope_id
     {
         anyhow::bail!("aggregate approval does not match the accepted plan manifest revision");
     }
@@ -42,10 +55,20 @@ pub(super) fn validate_plan_and_candidate(
         .iter()
         .filter_map(Value::as_object)
         .find(|node| {
-            node.get("name").and_then(Value::as_str) == Some(receipt.child_scope_id.as_str())
+            node.get("name").and_then(Value::as_str) == Some(child_run_id)
                 && node.get("kind").and_then(Value::as_str) == Some("sub_tl")
         })
         .context("aggregate approval child is not a declared sub-TL")?;
+    let expected_child_id = format!("{}/sub_tl/{}", parent_manifest_scope_id, child_run_id);
+    if receipt.candidate_key != child_run_id
+        || string_value(node.get("node_id"), "aggregate manifest node ID")?
+            != child_manifest_node_id
+        || child_manifest_node_id != expected_child_id
+        || string_value(node.get("parent_id"), "aggregate manifest parent ID")?
+            != parent_manifest_scope_id
+    {
+        anyhow::bail!("aggregate candidate key and canonical manifest declaration do not agree");
+    }
     let contract = node
         .get("integration_contract")
         .and_then(Value::as_object)
@@ -83,7 +106,7 @@ pub(super) fn validate_plan_and_candidate(
     if canonical_digest(&policy)? != receipt.approval_policy_digest {
         anyhow::bail!("aggregate approval policy digest differs from the accepted plan policy");
     }
-    let child_id_pointer = escape_json_pointer(&receipt.child_scope_id);
+    let child_id_pointer = escape_json_pointer(&receipt.candidate_key);
     let candidate = state
         .pointer(&format!("/integration/candidates/{child_id_pointer}"))
         .and_then(Value::as_object)
@@ -112,7 +135,7 @@ pub(super) fn validate_plan_and_candidate(
         || string_value(
             candidate.get("integration_owner_run_id"),
             "aggregate owner run",
-        )? != receipt.child_scope_id
+        )? != child_run_id
         || string_value(
             candidate.get("integration_owner_branch"),
             "aggregate owner branch",
@@ -178,9 +201,17 @@ fn validate_child_manifest_binding(
         .and_then(|manifests| manifests.get(node_id))
         .and_then(Value::as_object)
         .context("accepted parent manifest is missing the child declaration")?;
-    if string_value(child.get("scope_id"), "child manifest scope")? != receipt.child_scope_id
+    let child_manifest_scope_id = receipt
+        .child_manifest_scope_id
+        .as_deref()
+        .context("legacy aggregate approval has no canonical child scope identity")?;
+    let parent_manifest_scope_id = receipt
+        .parent_manifest_scope_id
+        .as_deref()
+        .context("legacy aggregate approval has no canonical parent scope identity")?;
+    if string_value(child.get("scope_id"), "child manifest scope")? != child_manifest_scope_id
         || string_value(child.get("parent_scope_id"), "child parent scope")?
-            != receipt.parent_run_id
+            != parent_manifest_scope_id
         || string_value(child.get("owned_branch"), "child manifest branch")?
             != string_value(node.get("owned_branch"), "aggregate head branch")?
         || manifest_digest(child)? != receipt.child_manifest_digest

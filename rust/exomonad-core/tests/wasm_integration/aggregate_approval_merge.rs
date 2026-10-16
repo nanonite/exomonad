@@ -12,8 +12,9 @@ use exomonad_core::EffectHandler;
 use exomonad_proto::effects::{agent, github};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -24,6 +25,7 @@ const REPOSITORY_URL: &str = "ssh://forgejo.test/acme/repo.git";
 const PR_NUMBER: u64 = 46;
 const PARENT_RUN: &str = "root-run";
 const CHILD_SCOPE: &str = "architecture";
+const CHILD_MANIFEST_ID: &str = "root-run/sub_tl/architecture";
 const PARENT_BRANCH: &str = "main";
 const HEAD_BRANCH: &str = "main.architecture";
 const CONTROLLER_EPOCH: &str = "epoch-current";
@@ -60,6 +62,7 @@ struct Fixture {
     merge_tree_sha: String,
     receipt_id: String,
     reference: Value,
+    superseded_reference: Value,
 }
 
 impl Fixture {
@@ -112,6 +115,7 @@ impl Fixture {
             merge_tree_sha,
             receipt_id: String::new(),
             reference: Value::Null,
+            superseded_reference: Value::Null,
         };
         fixture.write_authoritative_state();
         fixture.write_publication_history().await;
@@ -180,68 +184,16 @@ impl Fixture {
     }
 
     fn write_authoritative_state(&mut self) {
-        let child_payload = json!({
-            "schema_version": 1,
-            "manifest_revision": 2,
-            "scope_id": CHILD_SCOPE,
-            "parent_scope_id": PARENT_RUN,
-            "role": "non_root",
-            "owned_branch": HEAD_BRANCH,
-            "nodes": [{"node_id": "issue-slice", "kind": "leaf", "name": "issue-slice"}],
-        });
-        let child_digest = digest(&child_payload);
-        let mut child_manifest = child_payload.clone();
-        child_manifest["digest"] = json!(child_digest);
-        let contract = json!({
-            "aggregate_pr_required": true,
-            "aggregate_review_owner": "none",
-            "aggregate_approval_mode": "parent",
-            "base_revalidation_required": true,
-            "leaf_review_owner": "leaf",
-            "aggregate_repair_owner": "aggregate",
-            "merge_strategy": "merge",
-        });
-        let node = json!({
-            "node_id": "architecture-node",
-            "parent_id": PARENT_RUN,
-            "kind": "sub_tl",
-            "name": CHILD_SCOPE,
-            "source_index": 0,
-            "order": 1,
-            "task": "Integrate reviewed architecture work",
-            "agent_type": "codex",
-            "chainlink_issue_id": null,
-            "boundary": ["architecture.txt"],
-            "depends_on": [],
-            "owned_branch": HEAD_BRANCH,
-            "parent_integration_target": PARENT_BRANCH,
-            "worktree": ".exo/worktrees/architecture",
-            "declaration": {},
-            "integration_contract": contract,
-            "child_manifest_digest": child_digest,
-        });
-        let manifest_payload = json!({
-            "schema_version": 1,
-            "manifest_revision": 2,
-            "scope_id": PARENT_RUN,
-            "parent_scope_id": null,
-            "role": "root",
-            "owned_branch": PARENT_BRANCH,
-            "parent_integration_target": null,
-            "source_order": ["architecture-node"],
-            "nodes": [node],
-            "ordered_stages": [{"order": 1, "nodes": ["architecture-node"]}],
-            "child_manifest_digests": {"architecture-node": child_digest},
-            "child_manifests": {"architecture-node": child_manifest},
-        });
-        let plan_digest = digest(&manifest_payload);
-        let approval_policy = json!({
-            "approval_mode": "parent",
-            "parent_manifest_digest": plan_digest,
-            "parent_manifest_revision": 2,
-            "child_manifest_digest": child_digest,
-            "integration_contract": contract,
-        });
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let generator =
+            repository_root.join("tl_loop/tests/fixtures/aggregate_approval_producer.py");
+        let python_venv = repository_root.join("tl_loop/.venv/bin/python");
+        let python = if python_venv.exists() {
+            python_venv
+        } else {
+            PathBuf::from("python3")
+        };
+        let scope_root = self.project_dir.join(".exo/tl-loop");
         let lineage_proof = json!({
             "aggregate_head_sha": self.head_sha,
             "aggregate_tree_sha": self.head_tree_sha,
@@ -252,19 +204,19 @@ impl Fixture {
             }],
         });
         let lineage_proof_digest = digest(&lineage_proof);
-        let receipt = json!({
-            "receipt_id": "",
-            "policy_mode": "parent",
-            "parent_run_id": PARENT_RUN,
+        let request = json!({
             "parent_scope_path": [PARENT_RUN],
-            "child_scope_id": CHILD_SCOPE,
+            "ancestor_child_branches": [],
+            "scope_root": scope_root,
+            "root_branch": PARENT_BRANCH,
+            "parent_run_id": PARENT_RUN,
             "parent_agent_id": "root",
             "parent_branch": PARENT_BRANCH,
+            "child_run_id": CHILD_SCOPE,
+            "child_branch": HEAD_BRANCH,
+            "child_task": "Integrate reviewed architecture work",
             "repository_url": REPOSITORY_URL,
-            "plan_manifest_digest": plan_digest,
-            "plan_manifest_revision": 2,
-            "approval_policy_digest": digest(&approval_policy),
-            "child_manifest_digest": child_digest,
+            "controller_epoch": CONTROLLER_EPOCH,
             "pr_number": PR_NUMBER,
             "head_sha": self.head_sha,
             "head_tree_sha": self.head_tree_sha,
@@ -275,60 +227,52 @@ impl Fixture {
             "readiness_receipt_digest": "2222222222222222222222222222222222222222222222222222222222222222",
             "lineage_proof_digest": lineage_proof_digest,
             "lineage_commit_shas": [self.head_sha],
-            "reviewed_leaf_ids": ["issue-slice"],
-            "created_at": "2026-10-15T22:00:00Z",
-            "supersedes_receipt_id": null,
+            "worktree": ".exo/worktrees/architecture",
         });
-        let receipt_id = receipt_id(&receipt);
-        let mut receipt = receipt;
-        receipt["receipt_id"] = json!(receipt_id);
-        self.receipt_id = receipt_id;
-        self.reference = json!({
-            "receipt_id": self.receipt_id,
-            "parent_run_id": PARENT_RUN,
-            "parent_scope_path": [PARENT_RUN],
-            "child_scope_id": CHILD_SCOPE,
-            "controller_epoch": CONTROLLER_EPOCH,
-        });
-
-        let mut manifest = manifest_payload;
-        manifest["digest"] = json!(plan_digest);
-        let candidate = json!({
-            "lifecycle": "MERGING",
-            "aggregate_pr_number": PR_NUMBER,
-            "aggregate_head_sha": self.head_sha,
-            "aggregate_patch_digest": self.patch_digest,
-            "aggregate_original_base_sha": self.base_sha,
-            "integration_owner_id": "root-run:architecture:integration",
-            "integration_owner_run_id": CHILD_SCOPE,
-            "integration_owner_branch": HEAD_BRANCH,
-            "integration_owner_worktree": ".exo/worktrees/architecture",
-            "head_sha": self.head_sha,
-            "patch_digest": self.patch_digest,
-            "validated_base_sha": self.base_sha,
-            "merge_tree_sha": self.merge_tree_sha,
-            "ci_status": "success",
-            "aggregate_approval_receipts": [receipt],
-            "active_aggregate_approval_id": self.receipt_id,
-        });
-        let state = json!({
-            "version": 5,
-            "revision": 4,
-            "run_id": PARENT_RUN,
-            "depth": 0,
-            "owner_branch": PARENT_BRANCH,
-            "controller_epoch": CONTROLLER_EPOCH,
-            "repository_identity": {"remote_url": REPOSITORY_URL},
-            "plan_manifest": manifest,
-            "integration": {"candidates": {(CHILD_SCOPE): candidate}},
-        });
-        let scope = self.project_dir.join(".exo/tl-loop").join(PARENT_RUN);
-        std::fs::create_dir_all(&scope).expect("create root scope checkpoint");
-        std::fs::write(
-            scope.join("run.json"),
-            serde_json::to_vec(&state).expect("serialize parent RunStore"),
-        )
-        .expect("write parent RunStore");
+        let mut process = Command::new(python)
+            .arg(generator)
+            .env("PYTHONPATH", &repository_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start production Python approval producer");
+        process
+            .stdin
+            .take()
+            .expect("producer stdin")
+            .write_all(&serde_json::to_vec(&request).expect("producer request JSON"))
+            .expect("send producer request");
+        let output = process
+            .wait_with_output()
+            .expect("wait for Python producer");
+        assert!(
+            output.status.success(),
+            "production Python approval producer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let artifact: Value = serde_json::from_slice(&output.stdout).expect("Python artifact JSON");
+        self.receipt_id = artifact["receipt_id"]
+            .as_str()
+            .expect("receipt ID")
+            .to_string();
+        self.reference = artifact["reference"].clone();
+        self.superseded_reference = artifact["superseded_reference"].clone();
+        assert_eq!(artifact["parent_manifest_scope_id"], PARENT_RUN);
+        assert_eq!(artifact["child_manifest_node_id"], CHILD_MANIFEST_ID);
+        assert_eq!(artifact["child_manifest_scope_id"], CHILD_MANIFEST_ID);
+        for checkpoint in artifact["checkpoints"].as_array().expect("checkpoint list") {
+            let mut scope = scope_root.clone();
+            for segment in checkpoint["scope_path"].as_array().expect("scope path") {
+                scope.push(segment.as_str().expect("scope path segment"));
+            }
+            std::fs::create_dir_all(&scope).expect("create generated scope checkpoint directory");
+            std::fs::write(
+                scope.join("run.json"),
+                serde_json::to_vec(&checkpoint["state"]).expect("serialize generated RunStore"),
+            )
+            .expect("write Python-generated RunStore");
+        }
         self.write_resolver_identities();
     }
 
@@ -689,13 +633,35 @@ fn changed_policy_checkpoint(checkpoint: &[u8]) -> Vec<u8> {
 fn changed_lineage_checkpoint(checkpoint: &[u8], reference: &mut Value) -> Vec<u8> {
     let mut state: Value = serde_json::from_slice(checkpoint).expect("parent state JSON");
     let candidate = &mut state["integration"]["candidates"][CHILD_SCOPE];
-    let receipt = &mut candidate["aggregate_approval_receipts"][0];
+    let last_receipt = candidate["aggregate_approval_receipts"]
+        .as_array()
+        .expect("approval history")
+        .len()
+        - 1;
+    let receipt = &mut candidate["aggregate_approval_receipts"][last_receipt];
     receipt["lineage_proof_digest"] = json!("a".repeat(64));
     let updated_id = receipt_id(receipt);
     receipt["receipt_id"] = json!(updated_id);
     candidate["active_aggregate_approval_id"] = json!(updated_id);
     reference["receipt_id"] = json!(updated_id);
     serde_json::to_vec(&state).expect("updated lineage checkpoint JSON")
+}
+
+fn changed_manifest_binding_checkpoint(checkpoint: &[u8], reference: &mut Value) -> Vec<u8> {
+    let mut state: Value = serde_json::from_slice(checkpoint).expect("parent state JSON");
+    let candidate = &mut state["integration"]["candidates"][CHILD_SCOPE];
+    let history = candidate["aggregate_approval_receipts"]
+        .as_array_mut()
+        .expect("approval history");
+    let receipt = history.last_mut().expect("active approval receipt");
+    let forged_node = format!("{PARENT_RUN}/sub_tl/sibling");
+    receipt["child_manifest_node_id"] = json!(forged_node);
+    receipt["child_manifest_scope_id"] = json!(forged_node);
+    let updated_id = receipt_id(receipt);
+    receipt["receipt_id"] = json!(updated_id);
+    candidate["active_aggregate_approval_id"] = json!(updated_id);
+    reference["receipt_id"] = json!(updated_id);
+    serde_json::to_vec(&state).expect("updated manifest-binding checkpoint JSON")
 }
 
 fn assert_merge_effect_rejected(output: &Value, label: &str) {
@@ -789,10 +755,18 @@ async fn compiled_merge_tool_uses_production_handler_for_parent_approval() {
     let forgejo = ForgejoClient::new(&server.uri(), "fixture-token").expect("Forgejo client");
     let runtime = build_production_merge_runtime(&fixture, forgejo, state.clone()).await;
 
+    let superseded = run_merge_tool(&runtime, &fixture, fixture.superseded_reference.clone()).await;
+    assert_tool_error(&superseded, "superseded A approval from A-B-A history");
+    assert_eq!(state.merge_calls.load(Ordering::SeqCst), 0);
+
     let merged = run_merge_tool(&runtime, &fixture, fixture.reference.clone()).await;
 
     assert_tool_success(&merged, "merge_pr");
-    assert_eq!(state.merge_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.merge_calls.load(Ordering::SeqCst),
+        1,
+        "tool reported success without reaching the merge boundary: {merged:#}"
+    );
     assert_eq!(
         git_dir_output(&fixture.bare_repository, &["rev-parse", "refs/heads/main"]),
         fixture.head_sha
@@ -846,8 +820,13 @@ async fn production_merge_boundary_rejects_stale_and_forged_parent_approval() {
     let forged = run_merge_tool(&runtime, &fixture, forged_receipt).await;
     assert_merge_effect_rejected(&forged, "forged receipt reference");
 
+    let mut wrong_parent = fixture.reference.clone();
+    wrong_parent["parent_run_id"] = json!("unrelated-parent");
+    let wrong_parent = run_merge_tool(&runtime, &fixture, wrong_parent).await;
+    assert_merge_effect_rejected(&wrong_parent, "wrong parent run identity");
+
     let mut cross_scope = fixture.reference.clone();
-    cross_scope["child_scope_id"] = json!("sibling");
+    cross_scope["candidate_key"] = json!("sibling");
     let cross_scope = run_merge_tool(&runtime, &fixture, cross_scope).await;
     assert_merge_effect_rejected(&cross_scope, "cross-scope receipt reference");
 
@@ -859,6 +838,14 @@ async fn production_merge_boundary_rejects_stale_and_forged_parent_approval() {
     write_checkpoint(&fixture, &changed_policy_checkpoint(&original_checkpoint));
     let changed_policy = run_merge_tool(&runtime, &fixture, fixture.reference.clone()).await;
     assert_merge_effect_rejected(&changed_policy, "changed accepted policy");
+    write_checkpoint(&fixture, &original_checkpoint);
+
+    let mut manifest_reference = fixture.reference.clone();
+    let invalid_manifest =
+        changed_manifest_binding_checkpoint(&original_checkpoint, &mut manifest_reference);
+    write_checkpoint(&fixture, &invalid_manifest);
+    let mismatched_manifest = run_merge_tool(&runtime, &fixture, manifest_reference).await;
+    assert_merge_effect_rejected(&mismatched_manifest, "forged canonical manifest binding");
     write_checkpoint(&fixture, &original_checkpoint);
 
     *state.forgejo_head_sha.lock().expect("Forgejo head lock") =
@@ -899,7 +886,7 @@ async fn production_merge_handler_rejects_a_worker_caller_for_parent_approval() 
         receipt_id: fixture.receipt_id.clone(),
         parent_run_id: PARENT_RUN.to_string(),
         parent_scope_path: vec![PARENT_RUN.to_string()],
-        child_scope_id: CHILD_SCOPE.to_string(),
+        candidate_key: CHILD_SCOPE.to_string(),
         controller_epoch: CONTROLLER_EPOCH.to_string(),
     };
     let request = exomonad_proto::effects::merge_pr::MergePrRequest {

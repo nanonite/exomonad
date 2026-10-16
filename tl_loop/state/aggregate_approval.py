@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class AggregateApprovalError(ValueError):
@@ -20,7 +20,11 @@ _PARENT_APPROVAL_COORDINATES = frozenset(
     {
         "parent_run_id",
         "parent_scope_path",
-        "child_scope_id",
+        "parent_manifest_scope_id",
+        "candidate_key",
+        "child_run_id",
+        "child_manifest_node_id",
+        "child_manifest_scope_id",
         "parent_agent_id",
         "parent_branch",
         "repository_url",
@@ -47,7 +51,11 @@ _RECEIPT_FIELDS = frozenset(
         "policy_mode",
         "parent_run_id",
         "parent_scope_path",
-        "child_scope_id",
+        "parent_manifest_scope_id",
+        "candidate_key",
+        "child_run_id",
+        "child_manifest_node_id",
+        "child_manifest_scope_id",
         "parent_agent_id",
         "parent_branch",
         "repository_url",
@@ -70,6 +78,16 @@ _RECEIPT_FIELDS = frozenset(
         "supersedes_receipt_id",
     }
 )
+_LEGACY_IDENTITY_FIELDS = frozenset(
+    {
+        "parent_manifest_scope_id",
+        "candidate_key",
+        "child_run_id",
+        "child_manifest_node_id",
+        "child_manifest_scope_id",
+    }
+)
+_LEGACY_RECEIPT_FIELDS = (_RECEIPT_FIELDS - _LEGACY_IDENTITY_FIELDS) | {"child_scope_id"}
 _RECEIPT_NON_TEXT_FIELDS = frozenset(
     {
         "policy_mode",
@@ -127,7 +145,8 @@ def _matching_parent_approval(
     current_policy: Mapping[str, object],
 ) -> AggregateApprovalReceipt | None:
     """Reuse a prior decision only when its complete coordinates match."""
-    for receipt in existing:
+    if existing:
+        receipt = existing[-1]
         prior = receipt.to_document()
         for key in ("receipt_id", "created_at", "supersedes_receipt_id"):
             prior.pop(key)
@@ -159,11 +178,13 @@ def approval_reference(
     """Build the non-authoritative lookup reference checked by the host."""
     if not isinstance(controller_epoch, str) or not controller_epoch.strip():
         raise AggregateApprovalError("current controller epoch is required for merge authorization")
+    if receipt.parent_manifest_scope_id is None or receipt.child_manifest_node_id is None:
+        raise AggregateApprovalError("legacy approval must be renewed from the accepted manifest")
     return {
         "receipt_id": receipt.receipt_id,
         "parent_run_id": receipt.parent_run_id,
         "parent_scope_path": list(receipt.parent_scope_path),
-        "child_scope_id": receipt.child_scope_id,
+        "candidate_key": receipt.candidate_key,
         "controller_epoch": controller_epoch,
     }
 
@@ -175,7 +196,11 @@ class AggregateApprovalReceipt:
     receipt_id: str
     parent_run_id: str
     parent_scope_path: tuple[str, ...]
-    child_scope_id: str
+    parent_manifest_scope_id: str | None
+    candidate_key: str
+    child_run_id: str | None
+    child_manifest_node_id: str | None
+    child_manifest_scope_id: str | None
     parent_agent_id: str
     parent_branch: str
     repository_url: str
@@ -196,12 +221,13 @@ class AggregateApprovalReceipt:
     reviewed_leaf_ids: tuple[str, ...]
     created_at: str
     supersedes_receipt_id: str | None = None
+    legacy_document: Mapping[str, object] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         for name in (
             "receipt_id",
             "parent_run_id",
-            "child_scope_id",
+            "candidate_key",
             "parent_agent_id",
             "parent_branch",
             "repository_url",
@@ -221,6 +247,22 @@ class AggregateApprovalReceipt:
                 raise AggregateApprovalError(f"{name} must be non-empty")
         if not self.parent_scope_path or self.parent_scope_path[-1] != self.parent_run_id:
             raise AggregateApprovalError("parent_scope_path must end at parent_run_id")
+        if self.legacy_document is None and (
+            self.parent_manifest_scope_id is None
+            or self.child_run_id is None
+            or self.child_manifest_node_id is None
+            or self.child_manifest_scope_id is None
+        ):
+            raise AggregateApprovalError("current approval is missing canonical manifest identity")
+        if self.legacy_document is None and self.candidate_key != self.child_run_id:
+            raise AggregateApprovalError(
+                "aggregate candidate key must match its declared child run"
+            )
+        if (
+            self.legacy_document is None
+            and self.child_manifest_node_id != self.child_manifest_scope_id
+        ):
+            raise AggregateApprovalError("child manifest node and canonical scope IDs must match")
         if type(self.plan_manifest_revision) is not int or self.plan_manifest_revision < 1:
             raise AggregateApprovalError("plan_manifest_revision must be positive")
         if type(self.pr_number) is not int or self.pr_number <= 0:
@@ -236,12 +278,18 @@ class AggregateApprovalReceipt:
 
     def to_document(self) -> dict[str, object]:
         """Return the closed JSON projection used by RunStore and MCP refs."""
+        if self.legacy_document is not None:
+            return dict(self.legacy_document)
         return {
             "receipt_id": self.receipt_id,
             "policy_mode": "parent",
             "parent_run_id": self.parent_run_id,
             "parent_scope_path": list(self.parent_scope_path),
-            "child_scope_id": self.child_scope_id,
+            "parent_manifest_scope_id": self.parent_manifest_scope_id,
+            "candidate_key": self.candidate_key,
+            "child_run_id": self.child_run_id,
+            "child_manifest_node_id": self.child_manifest_node_id,
+            "child_manifest_scope_id": self.child_manifest_scope_id,
             "parent_agent_id": self.parent_agent_id,
             "parent_branch": self.parent_branch,
             "repository_url": self.repository_url,
@@ -274,12 +322,12 @@ def validate_receipt_document(value: object) -> AggregateApprovalReceipt:
     """Decode a durable receipt and verify its content-derived ID."""
     if not isinstance(value, Mapping):
         raise AggregateApprovalError("aggregate approval receipt must be an object")
-    if set(value) != _RECEIPT_FIELDS:
+    if set(value) not in {_RECEIPT_FIELDS, _LEGACY_RECEIPT_FIELDS}:
         raise AggregateApprovalError("aggregate approval receipt fields are incomplete or unknown")
     if value.get("policy_mode") != "parent":
         raise UnsupportedAggregateApprovalMode("approval receipt policy is not parent mode")
     receipt = _decode_receipt(value)
-    expected_id = canonical_digest(approval_identity(receipt.to_document()))
+    expected_id = canonical_digest(approval_identity(value))
     if receipt.receipt_id != expected_id:
         raise AggregateApprovalError("aggregate approval receipt ID does not match its contents")
     return receipt
@@ -287,6 +335,8 @@ def validate_receipt_document(value: object) -> AggregateApprovalReceipt:
 
 def _decode_receipt(value: Mapping[str, object]) -> AggregateApprovalReceipt:
     """Decode validated fields into the immutable receipt value."""
+    if set(value) == _LEGACY_RECEIPT_FIELDS:
+        return _decode_legacy_receipt(value)
     path = _string_tuple(value.get("parent_scope_path"), "parent_scope_path")
     commits = _string_tuple(value.get("lineage_commit_shas"), "lineage_commit_shas")
     leaves = _string_tuple(value.get("reviewed_leaf_ids"), "reviewed_leaf_ids", allow_empty=True)
@@ -303,6 +353,36 @@ def _decode_receipt(value: Mapping[str, object]) -> AggregateApprovalReceipt:
         plan_manifest_revision=revision,
         pr_number=pr_number,
         supersedes_receipt_id=_nullable_text(value.get("supersedes_receipt_id")),
+    )
+
+
+def _decode_legacy_receipt(value: Mapping[str, object]) -> AggregateApprovalReceipt:
+    """Retain the pre-canonical-identity format for audited reapproval on resume."""
+    path = _string_tuple(value.get("parent_scope_path"), "parent_scope_path")
+    commits = _string_tuple(value.get("lineage_commit_shas"), "lineage_commit_shas")
+    leaves = _string_tuple(value.get("reviewed_leaf_ids"), "reviewed_leaf_ids", allow_empty=True)
+    revision = value.get("plan_manifest_revision")
+    pr_number = value.get("pr_number")
+    if type(revision) is not int or type(pr_number) is not int:
+        raise AggregateApprovalError("receipt revision and PR number must be integers")
+    text_fields = _LEGACY_RECEIPT_FIELDS - _RECEIPT_NON_TEXT_FIELDS
+    text_values = {
+        ("candidate_key" if key == "child_scope_id" else key): _required_text(value.get(key), key)
+        for key in text_fields
+    }
+    return AggregateApprovalReceipt(
+        **text_values,
+        parent_manifest_scope_id=None,
+        child_run_id=None,
+        child_manifest_node_id=None,
+        child_manifest_scope_id=None,
+        parent_scope_path=path,
+        lineage_commit_shas=commits,
+        reviewed_leaf_ids=leaves,
+        plan_manifest_revision=revision,
+        pr_number=pr_number,
+        supersedes_receipt_id=_nullable_text(value.get("supersedes_receipt_id")),
+        legacy_document=dict(value),
     )
 
 

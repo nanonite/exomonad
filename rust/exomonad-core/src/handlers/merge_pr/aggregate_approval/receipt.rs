@@ -11,7 +11,15 @@ pub(super) struct ParentApprovalReceipt {
     pub(super) policy_mode: String,
     pub(super) parent_run_id: String,
     pub(super) parent_scope_path: Vec<String>,
-    pub(super) child_scope_id: String,
+    pub(super) parent_manifest_scope_id: Option<String>,
+    pub(super) candidate_key: String,
+    pub(super) child_run_id: Option<String>,
+    pub(super) child_manifest_node_id: Option<String>,
+    pub(super) child_manifest_scope_id: Option<String>,
+    #[serde(default, skip_serializing)]
+    child_scope_id: Option<String>,
+    #[serde(skip)]
+    pub(super) legacy_identity: bool,
     pub(super) parent_agent_id: String,
     pub(super) parent_branch: String,
     pub(super) repository_url: String,
@@ -42,6 +50,39 @@ pub(super) fn parse_receipt(value: &Value) -> Result<ParentApprovalReceipt> {
         "policy_mode",
         "parent_run_id",
         "parent_scope_path",
+        "parent_manifest_scope_id",
+        "candidate_key",
+        "child_run_id",
+        "child_manifest_node_id",
+        "child_manifest_scope_id",
+        "parent_agent_id",
+        "parent_branch",
+        "repository_url",
+        "plan_manifest_digest",
+        "plan_manifest_revision",
+        "approval_policy_digest",
+        "child_manifest_digest",
+        "pr_number",
+        "head_sha",
+        "head_tree_sha",
+        "base_sha",
+        "patch_digest",
+        "merge_tree_sha",
+        "ci_status",
+        "readiness_receipt_digest",
+        "lineage_proof_digest",
+        "lineage_commit_shas",
+        "reviewed_leaf_ids",
+        "created_at",
+        "supersedes_receipt_id",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let legacy_expected = [
+        "receipt_id",
+        "policy_mode",
+        "parent_run_id",
+        "parent_scope_path",
         "child_scope_id",
         "parent_agent_id",
         "parent_branch",
@@ -66,11 +107,26 @@ pub(super) fn parse_receipt(value: &Value) -> Result<ParentApprovalReceipt> {
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let legacy_identity = actual == legacy_expected;
+    if actual != expected && !legacy_identity {
         anyhow::bail!("aggregate approval receipt has missing or unknown fields");
     }
-    let receipt: ParentApprovalReceipt = serde_json::from_value(value.clone())
+    let mut normalized = value.clone();
+    if legacy_identity {
+        let normalized_object = normalized
+            .as_object_mut()
+            .context("legacy aggregate approval receipt is not an object")?;
+        let child_scope_id = normalized_object
+            .get("child_scope_id")
+            .and_then(Value::as_str)
+            .context("legacy aggregate approval child scope is malformed")?
+            .to_string();
+        normalized_object.insert("candidate_key".to_string(), Value::String(child_scope_id));
+    }
+    let mut receipt: ParentApprovalReceipt = serde_json::from_value(normalized)
         .context("aggregate approval receipt fields are malformed")?;
+    receipt.legacy_identity = legacy_identity;
     validate_receipt(&receipt, value)?;
     Ok(receipt)
 }
@@ -79,7 +135,6 @@ fn validate_receipt(receipt: &ParentApprovalReceipt, original: &Value) -> Result
     let text = [
         receipt.receipt_id.as_str(),
         receipt.parent_run_id.as_str(),
-        receipt.child_scope_id.as_str(),
         receipt.parent_agent_id.as_str(),
         receipt.parent_branch.as_str(),
         receipt.repository_url.as_str(),
@@ -95,7 +150,26 @@ fn validate_receipt(receipt: &ParentApprovalReceipt, original: &Value) -> Result
         receipt.lineage_proof_digest.as_str(),
         receipt.created_at.as_str(),
     ];
-    if text.iter().any(|value| value.trim().is_empty()) {
+    if text.iter().any(|value| value.trim().is_empty())
+        || (!receipt.legacy_identity
+            && [
+                receipt.parent_manifest_scope_id.as_deref(),
+                Some(receipt.candidate_key.as_str()),
+                receipt.child_run_id.as_deref(),
+                receipt.child_manifest_node_id.as_deref(),
+                receipt.child_manifest_scope_id.as_deref(),
+            ]
+            .iter()
+            .any(|value| match value {
+                Some(text) => text.trim().is_empty(),
+                None => true,
+            }))
+        || (receipt.legacy_identity
+            && receipt
+                .child_scope_id
+                .as_deref()
+                .is_none_or(|scope| scope.trim().is_empty()))
+    {
         anyhow::bail!("aggregate approval receipt contains an empty required field");
     }
     if receipt.policy_mode != "parent"
@@ -115,6 +189,9 @@ fn validate_receipt(receipt: &ParentApprovalReceipt, original: &Value) -> Result
         || !is_sorted_unique(&receipt.reviewed_leaf_ids)
         || receipt.parent_scope_path.is_empty()
         || receipt.parent_scope_path.last() != Some(&receipt.parent_run_id)
+        || (!receipt.legacy_identity
+            && (receipt.child_run_id.as_deref() != Some(receipt.candidate_key.as_str())
+                || receipt.child_manifest_node_id != receipt.child_manifest_scope_id))
     {
         anyhow::bail!("aggregate approval receipt violates its parent-mode evidence contract");
     }

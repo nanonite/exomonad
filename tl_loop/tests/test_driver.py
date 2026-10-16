@@ -9024,11 +9024,9 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             101,
             102,
         ]
-        merge_arguments = [
-            args for name, args in transport.calls if name == "merge_pr"
-        ]
+        merge_arguments = [args for name, args in transport.calls if name == "merge_pr"]
         approval_references = [args.get("aggregate_approval") for args in merge_arguments]
-        assert [reference["child_scope_id"] for reference in approval_references] == [
+        assert [reference["candidate_key"] for reference in approval_references] == [
             "alpha",
             "beta",
         ]
@@ -11325,7 +11323,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
             ].active_aggregate_approval_id,
             "parent_run_id": "serialized-run",
             "parent_scope_path": ["serialized-run"],
-            "child_scope_id": "aggregate-child",
+            "candidate_key": "aggregate-child",
             "controller_epoch": result.final_state.controller_epoch,
         },
     }
