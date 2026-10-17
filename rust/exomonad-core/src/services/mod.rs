@@ -22,6 +22,7 @@ pub mod filesystem;
 pub mod forgejo;
 pub mod forgejo_ci;
 pub mod git;
+pub mod git_mutation;
 pub mod git_worktree;
 pub mod github;
 pub mod guidance_adapters;
@@ -91,6 +92,10 @@ pub use self::expected_events::{
 };
 pub use self::filesystem::FileSystemService;
 pub use self::forgejo::ForgejoClient;
+pub use self::git_mutation::{
+    GitMutationError, GitMutationLease, GitMutationLeaseSet, GitMutationPaths, GitMutationResource,
+    GitMutationSafety,
+};
 pub use self::git_worktree::GitWorktreeService;
 pub use self::github::GitHubClient;
 pub use self::guidance_adapters::{
