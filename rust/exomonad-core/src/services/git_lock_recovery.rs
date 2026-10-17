@@ -9,6 +9,7 @@ use crate::services::git_mutation::{
     ensure_safe_lease_directory, GitMutationError, GitMutationLease, GitMutationResource,
     GitMutationSafety,
 };
+use crate::services::git_recovery_ledger::read_git_recovery_events;
 #[cfg(target_os = "linux")]
 use nix::fcntl::{renameat2, RenameFlags};
 use serde::{Deserialize, Serialize};
@@ -211,24 +212,16 @@ fn matching_proof(
     paths: &super::git_mutation::GitMutationPaths,
     snapshot: &NativeGitLockSnapshot,
 ) -> Result<Option<LocatedProof>, String> {
-    let records = event_log
-        .ledger()
-        .read_events()
-        .map_err(|_| "cannot read the native lock ownership audit ledger".to_string())?;
+    let records = read_git_recovery_events(event_log, &[LOCK_HELD_EVENT], Duration::from_secs(2))?;
     let mut matches = Vec::new();
     for record in records {
-        if record.event.event_type != LOCK_HELD_EVENT {
-            continue;
-        }
         let proof_version = record
-            .event
             .data
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| "native lock ownership event has no supported schema".to_string())?;
         if proof_version != u64::from(PROOF_SCHEMA_VERSION) {
             if record
-                .event
                 .data
                 .get("index_lock_file")
                 .and_then(serde_json::Value::as_str)
@@ -240,11 +233,11 @@ fn matching_proof(
             }
             continue;
         }
-        let proof: ManagedNativeLockProof = serde_json::from_value(record.event.data)
+        let proof: ManagedNativeLockProof = serde_json::from_value(record.data)
             .map_err(|_| "native lock ownership event is malformed".to_string())?;
         if proof_matches_paths(&proof, paths) && proof.lock == *snapshot {
             matches.push(LocatedProof {
-                event_id: record.event.event_id,
+                event_id: record.event_id,
                 proof,
             });
         }
@@ -283,24 +276,27 @@ fn reconcile_absent_lock(
     event_log: &EventLog,
     inspector: &dyn ProcessInspector,
 ) -> NativeLockRecoveryVerdict {
-    let records = match event_log.ledger().read_events() {
+    let records = match read_git_recovery_events(
+        event_log,
+        &[QUARANTINED_EVENT, QUARANTINE_INTENT_EVENT],
+        Duration::from_secs(2),
+    ) {
         Ok(records) => records,
-        Err(_) => {
+        Err(error) => {
             return uncertain(
                 &paths.index_lock_file,
-                "cannot inspect prior lock recovery events",
+                &format!("cannot inspect prior lock recovery events: {error:?}"),
             )
         }
     };
     for record in records.iter().rev() {
-        if record.event.event_type == QUARANTINED_EVENT {
-            let audit: QuarantineReceiptData =
-                match serde_json::from_value(record.event.data.clone()) {
-                    Ok(audit) => audit,
-                    Err(_) => {
-                        return uncertain(&paths.index_lock_file, "quarantine receipt is malformed")
-                    }
-                };
+        if record.event_type == QUARANTINED_EVENT {
+            let audit: QuarantineReceiptData = match serde_json::from_value(record.data.clone()) {
+                Ok(audit) => audit,
+                Err(_) => {
+                    return uncertain(&paths.index_lock_file, "quarantine receipt is malformed")
+                }
+            };
             if !proof_matches_paths(&audit.proof, paths) {
                 continue;
             }
@@ -308,15 +304,14 @@ fn reconcile_absent_lock(
                 paths,
                 event_log,
                 inspector,
-                record.event.event_id.clone(),
+                record.event_id.clone(),
                 audit,
             );
         }
     }
     for record in records.iter().rev() {
-        if record.event.event_type == QUARANTINE_INTENT_EVENT {
-            let audit: QuarantineAuditData = match serde_json::from_value(record.event.data.clone())
-            {
+        if record.event_type == QUARANTINE_INTENT_EVENT {
+            let audit: QuarantineAuditData = match serde_json::from_value(record.data.clone()) {
                 Ok(audit) => audit,
                 Err(_) => {
                     return uncertain(&paths.index_lock_file, "quarantine intent is malformed")
@@ -329,7 +324,7 @@ fn reconcile_absent_lock(
                 paths,
                 event_log,
                 inspector,
-                record.event.event_id.clone(),
+                record.event_id.clone(),
                 audit,
             );
         }
@@ -583,7 +578,8 @@ fn verify_proof_event(
     expected: &ManagedNativeLockProof,
     path: &Path,
 ) -> Result<(), Box<NativeLockRecoveryVerdict>> {
-    let records = event_log.ledger().read_events().map_err(|_| {
+    let records = read_git_recovery_events(event_log, &[LOCK_HELD_EVENT], Duration::from_secs(2))
+        .map_err(|_| {
         Box::new(uncertain(
             path,
             "cannot verify the ownership proof linked by lock recovery",
@@ -591,7 +587,7 @@ fn verify_proof_event(
     })?;
     let matching = records
         .into_iter()
-        .filter(|record| record.event.event_id == proof_event_id)
+        .filter(|record| record.event_id == proof_event_id)
         .collect::<Vec<_>>();
     if matching.len() != 1 {
         return Err(Box::new(uncertain(
@@ -599,15 +595,8 @@ fn verify_proof_event(
             "lock recovery references a missing or ambiguous ownership proof event",
         )));
     }
-    let record = &matching[0].event;
-    if record.event_type != LOCK_HELD_EVENT {
-        return Err(Box::new(uncertain(
-            path,
-            "lock recovery proof reference names a different event type",
-        )));
-    }
     let proof: ManagedNativeLockProof =
-        serde_json::from_value(record.data.clone()).map_err(|_| {
+        serde_json::from_value(matching[0].data.clone()).map_err(|_| {
             Box::new(uncertain(
                 path,
                 "referenced native lock ownership proof is malformed",
@@ -827,13 +816,10 @@ fn find_audit_event(
     data: &serde_json::Value,
     path: &Path,
 ) -> Result<Option<String>, String> {
-    let records = event_log
-        .ledger()
-        .read_events()
-        .map_err(|_| format!("cannot inspect lock recovery audit at {}", path.display()))?;
+    let records = read_git_recovery_events(event_log, &[event_type], Duration::from_secs(2))
+        .map_err(|_| format!("cannot inspect lock recovery audit at {:?}", path))?;
     Ok(records.into_iter().find_map(|record| {
-        (record.event.event_type == event_type && record.event.data == *data)
-            .then_some(record.event.event_id)
+        (record.event_type == event_type && record.data == *data).then_some(record.event_id)
     }))
 }
 

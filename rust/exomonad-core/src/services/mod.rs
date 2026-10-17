@@ -25,6 +25,7 @@ pub mod git;
 pub mod git_lock_owner;
 pub mod git_lock_recovery;
 pub mod git_mutation;
+mod git_recovery_ledger;
 pub mod git_worktree;
 pub mod github;
 pub mod guidance_adapters;

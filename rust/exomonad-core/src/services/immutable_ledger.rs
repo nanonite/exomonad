@@ -195,6 +195,11 @@ impl LedgerWriter {
         Ok(paths)
     }
 
+    /// Return the directory containing the immutable event segments.
+    pub fn segments_dir(&self) -> &Path {
+        &self.segments_dir
+    }
+
     /// Replay every valid event, preserving segment and line provenance.
     pub fn read_events(&self) -> Result<Vec<LedgerRecord>> {
         let mut records = Vec::new();

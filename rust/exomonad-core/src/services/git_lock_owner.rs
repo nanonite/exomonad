@@ -2,12 +2,14 @@
 
 use crate::services::event_log::EventLog;
 use crate::services::git_mutation::{GitMutationError, GitMutationLease, GitMutationResource};
+use crate::services::git_recovery_ledger::read_git_recovery_events;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::time::Duration;
 
 pub(crate) const PROOF_SCHEMA_VERSION: u32 = 2;
 const LOCK_EVIDENCE_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -207,15 +209,15 @@ fn find_proof_event(
     event_log: &EventLog,
     proof: &serde_json::Value,
 ) -> Result<Option<String>, GitMutationError> {
-    let records = event_log.ledger().read_events().map_err(|_| {
+    let records = read_git_recovery_events(event_log, &[LOCK_HELD_EVENT], Duration::from_secs(2))
+        .map_err(|_| {
         uncertain(
             event_log.dir(),
             "cannot inspect prior native lock proof events",
         )
     })?;
     Ok(records.into_iter().find_map(|record| {
-        (record.event.event_type == LOCK_HELD_EVENT && record.event.data == *proof)
-            .then_some(record.event.event_id)
+        (record.event_type == LOCK_HELD_EVENT && record.data == *proof).then_some(record.event_id)
     }))
 }
 
