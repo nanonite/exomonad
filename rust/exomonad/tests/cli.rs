@@ -37,6 +37,29 @@ fn minimal_hook_json() -> String {
     .to_string()
 }
 
+fn init_cli_git_repository(path: &Path) {
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("run Git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_git(&["init", "-q", "-b", "main"]);
+    run_git(&["config", "user.name", "init preflight test"]);
+    run_git(&["config", "user.email", "init-preflight@example.invalid"]);
+    fs::write(path.join("tracked.txt"), "tracked\n").unwrap();
+    run_git(&["add", "tracked.txt"]);
+    run_git(&["commit", "-q", "-m", "fixture"]);
+}
+
 /// When the server is not running, hook should fail open: exit 0, print allow JSON.
 #[test]
 fn test_hook_fails_open_when_server_unreachable() -> Result<(), Box<dyn std::error::Error>> {
@@ -129,9 +152,85 @@ fn test_init_refuses_a_stale_exomonad_generated_project_root_codex_config() {
 }
 
 #[test]
+fn init_exits_nonzero_and_preserves_state_for_an_unproven_git_index_lock() {
+    let project = tempdir().expect("create temporary project");
+    let home = tempdir().expect("create isolated home");
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("resolve repository root");
+    let archive = home.path().join(".exo/tl_loop.pyz");
+    fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    let archive_status = Command::new("python3")
+        .arg(repository.join("scripts/build_tl_loop_archive.py"))
+        .args(["--source"])
+        .arg(repository.join("tl_loop"))
+        .args(["--output"])
+        .arg(&archive)
+        .status()
+        .expect("build isolated TL controller archive");
+    assert!(archive_status.success());
+    init_cli_git_repository(project.path());
+    fs::create_dir_all(project.path().join(".exo/tl-loop/root")).unwrap();
+    fs::write(project.path().join(".exo/config.toml"), "").unwrap();
+    let checkpoint = project.path().join(".exo/tl-loop/root/run.json");
+    let journal = project.path().join(".exo/tl-loop/root/actions.jsonl");
+    let manual_hold = project.path().join(".exo/tl-loop/root/manual-hold.json");
+    fs::write(&checkpoint, br#"{"fsm":{"phase":"tl_failed"}}"#).unwrap();
+    fs::write(&journal, b"retained journal\n").unwrap();
+    fs::write(&manual_hold, b"retained manual hold\n").unwrap();
+    let lock = project.path().join(".git/index.lock");
+    fs::write(&lock, b"").unwrap();
+    let saved_checkpoint = fs::read(&checkpoint).unwrap();
+    let saved_journal = fs::read(&journal).unwrap();
+    let saved_manual_hold = fs::read(&manual_hold).unwrap();
+    let saved_index = fs::read(project.path().join(".git/index")).unwrap();
+
+    let output = cargo_bin_cmd!("exomonad")
+        .args(["init", "--continue"])
+        .env("HOME", home.path())
+        .current_dir(project.path())
+        .output()
+        .expect("run init against the isolated project");
+
+    assert!(
+        !output.status.success(),
+        "unsafe init unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Git mutation readiness is uncertain"),
+        "missing lock-readiness diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{:?}", lock)),
+        "missing exact lock path: {stderr}"
+    );
+    assert!(
+        stderr.contains("ledger"),
+        "missing retained audit location: {stderr}"
+    );
+    assert!(stderr.contains("Do not remove or overwrite the lock"));
+    assert!(stderr.contains("exomonad init --continue"));
+    assert!(lock.exists(), "uncertain native lock must be retained");
+    assert_eq!(fs::read(&checkpoint).unwrap(), saved_checkpoint);
+    assert_eq!(fs::read(&journal).unwrap(), saved_journal);
+    assert_eq!(fs::read(&manual_hold).unwrap(), saved_manual_hold);
+    assert_eq!(
+        fs::read(project.path().join(".git/index")).unwrap(),
+        saved_index
+    );
+    assert!(
+        !project.path().join(".exo/logs/init.jsonl").exists(),
+        "init must stop before recording a new workflow invocation"
+    );
+}
+
+#[test]
 fn test_init_continue_requires_audited_migration_for_legacy_aggregate_defaults() {
     let project = tempdir().expect("create temporary project");
     let home = tempdir().expect("create isolated home");
+    init_cli_git_repository(project.path());
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()

@@ -17,7 +17,9 @@ use exomonad_core::services::{
         remove_published_heads_for_prs, PublishedHead,
     },
     repo::{get_repo_info, RepoInfo},
-    AgentIdentityRecord, AgentType, ForgejoClient, GitWorktreeService,
+    AgentIdentityRecord, AgentType, EventLog, ForgejoClient, GitLockRecoveryReceipt,
+    GitMutationError, GitMutationResource, GitMutationSafety, GitWorktreeService,
+    NativeLockRecoveryVerdict,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
+
+const INIT_GIT_READINESS_WAIT: Duration = Duration::from_secs(2);
 
 /// Explicit lifecycle choice for an `exomonad init` invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2871,6 +2875,121 @@ pub(crate) fn acquire_init_lifecycle_lock(
     }
     claude_teams_bridge::file_lock::FileLock::acquire(&lock_target, Duration::from_secs(3600))
         .context("failed to acquire project init lifecycle lock")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InitGitReadiness {
+    Clear,
+    Recovered(GitLockRecoveryReceipt),
+}
+
+fn ensure_init_git_mutation_readiness(
+    project_dir: &Path,
+    wait: Duration,
+) -> Result<InitGitReadiness> {
+    let safety = GitMutationSafety::new(project_dir.to_path_buf());
+    let operation_id = format!("init-readiness-{}", uuid::Uuid::new_v4().simple());
+    let lease_set = safety
+        .acquire_set(
+            project_dir,
+            &[GitMutationResource::SharedRefs, GitMutationResource::Index],
+            &operation_id,
+            wait,
+        )
+        .map_err(|error| init_git_lease_error(project_dir, wait, error))?;
+    let index_lease = lease_set
+        .leases()
+        .iter()
+        .find(|lease| lease.resource == GitMutationResource::Index)
+        .context("Git readiness acquired no active-index lease")?;
+    let event_log = EventLog::open(project_dir.join(".exo/logs")).with_context(|| {
+        format!(
+            "Git mutation readiness cannot open its recovery ledger at {:?}; no Git lock was changed",
+            project_dir.join(".exo/ledger/segments")
+        )
+    })?;
+    let verdict = safety.reconcile_native_index_lock(index_lease, &event_log, wait);
+    classify_init_git_readiness(project_dir, &index_lease.paths.index_lock_file, verdict)
+}
+
+fn classify_init_git_readiness(
+    project_dir: &Path,
+    native_index_lock: &Path,
+    verdict: NativeLockRecoveryVerdict,
+) -> Result<InitGitReadiness> {
+    match verdict {
+        NativeLockRecoveryVerdict::Clear => Ok(InitGitReadiness::Clear),
+        NativeLockRecoveryVerdict::Recovered(receipt) => Ok(InitGitReadiness::Recovered(receipt)),
+        NativeLockRecoveryVerdict::Busy {
+            path,
+            owners,
+            reason,
+        } => {
+            let owners = owners
+                .iter()
+                .map(|owner| {
+                    format!(
+                        "pid={} start_identity={}",
+                        owner.pid, owner.start_time_ticks
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Git mutation readiness is busy at {:?}: {}{}; native lock and project state are unchanged. Wait for that writer to finish, then retry `exomonad init --continue`.",
+                path,
+                reason,
+                if owners.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({owners})")
+                }
+            );
+        }
+        NativeLockRecoveryVerdict::Uncertain { path, reason } => {
+            anyhow::bail!(
+                "Git mutation readiness is uncertain at {:?} (native index lock {:?}): {}. The lock and all evidence are retained; audit records are under {:?}. Do not remove or overwrite the lock. No existing command authorizes recovery without a matching managed-process proof; preserve these files and escalate for a supported recovery procedure. Retry `exomonad init --continue` only after that procedure resolves the lock.",
+                path,
+                native_index_lock,
+                reason,
+                project_dir.join(".exo/ledger/segments")
+            );
+        }
+    }
+}
+
+fn init_git_lease_error(
+    project_dir: &Path,
+    wait: Duration,
+    error: GitMutationError,
+) -> anyhow::Error {
+    let ledger = project_dir.join(".exo/ledger/segments");
+    match error {
+        GitMutationError::Busy {
+            resource,
+            path,
+            waited_ms,
+        } => anyhow::anyhow!(
+            "Git mutation readiness remained busy acquiring the {resource} lease at {:?} for {waited_ms}ms (bounded wait {}ms). No Git lock or project state was changed. Wait for the ExoMonad writer to finish, then retry `exomonad init --continue`; recovery audit is under {:?}.",
+            path,
+            wait.as_millis(),
+            ledger
+        ),
+        GitMutationError::Uncertain { path, reason } => anyhow::anyhow!(
+            "Git mutation readiness is uncertain at {:?}: {}. No native lock was removed; retain the lock and evidence, and retry `exomonad init --continue` only after a supported owner/recovery decision. Audit location: {:?}.",
+            path,
+            reason,
+            ledger
+        ),
+        GitMutationError::UnsupportedPlatform => anyhow::anyhow!(
+            "Git mutation readiness cannot be established on this platform; no controller was started. Audit location: {:?}.",
+            ledger
+        ),
+        GitMutationError::InvalidOperationId => anyhow::anyhow!(
+            "Git mutation readiness could not create a safe operation identity; no controller was started. Audit location: {:?}.",
+            ledger
+        ),
+    }
 }
 
 pub(crate) fn acquire_plan_transition_lock(
@@ -6231,6 +6350,17 @@ pub async fn run(
     validate_runtime_compatibility(&cwd)?;
     let tl_loop_root = tl_loop_package_root()?;
     let init_lifecycle_lock = acquire_init_lifecycle_lock_async(&cwd).await?;
+    if !recreate_dry_run {
+        match ensure_init_git_mutation_readiness(&cwd, INIT_GIT_READINESS_WAIT)? {
+            InitGitReadiness::Clear => {}
+            InitGitReadiness::Recovered(receipt) => info!(
+                quarantine_file = %receipt.quarantine_file,
+                proof_event_id = %receipt.proof_event_id,
+                receipt_event_id = %receipt.receipt_event_id,
+                "Recovered a proven orphan native Git lock before init"
+            ),
+        }
+    }
     let mut no_transition_failure = None;
     {
         let _plan_transition_lock = acquire_plan_transition_lock_async(&cwd).await?;
@@ -11849,6 +11979,143 @@ mod tests {
             run_fixture_git_command(tmp.path(), &["remote", "add", name, url]).unwrap();
         }
         tmp
+    }
+
+    fn init_temp_git_repo_with_index() -> tempfile::TempDir {
+        let project = init_temp_git_repo(&[]);
+        std::fs::write(project.path().join(".git/info/exclude"), ".exo/\n").unwrap();
+        std::fs::write(project.path().join("tracked.txt"), "base\n").unwrap();
+        run_fixture_git_command(project.path(), &["add", "tracked.txt"]).unwrap();
+        project
+    }
+
+    #[test]
+    fn git_init_readiness_accepts_clear_index_and_preserves_ordinary_edits() {
+        let project = init_temp_git_repo_with_index();
+        std::fs::write(project.path().join("tracked.txt"), "operator edit\n").unwrap();
+        std::fs::write(project.path().join("untracked.txt"), "keep me\n").unwrap();
+        let index_before = std::fs::read(project.path().join(".git/index")).unwrap();
+        let status_before = run_fixture_git_command(project.path(), &["status", "--porcelain"])
+            .unwrap()
+            .stdout;
+
+        assert_eq!(
+            ensure_init_git_mutation_readiness(project.path(), Duration::ZERO).unwrap(),
+            InitGitReadiness::Clear
+        );
+
+        assert_eq!(
+            std::fs::read(project.path().join(".git/index")).unwrap(),
+            index_before
+        );
+        assert_eq!(
+            run_fixture_git_command(project.path(), &["status", "--porcelain"])
+                .unwrap()
+                .stdout,
+            status_before
+        );
+    }
+
+    #[test]
+    fn git_init_readiness_refuses_unknown_lock_without_touching_run_evidence() {
+        let project = init_temp_git_repo_with_index();
+        let lock = project.path().join(".git/index.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let root = project.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        let checkpoint = root.join("run.json");
+        let journal = root.join("actions.jsonl");
+        let manual_hold = root.join("manual-hold.json");
+        std::fs::write(&checkpoint, br#"{"fsm":{"phase":"tl_failed"}}"#).unwrap();
+        std::fs::write(&journal, b"retained journal\n").unwrap();
+        std::fs::write(&manual_hold, b"retained manual hold\n").unwrap();
+        let before_index = std::fs::read(project.path().join(".git/index")).unwrap();
+        let before_status = run_fixture_git_command(project.path(), &["status", "--porcelain"])
+            .unwrap()
+            .stdout;
+        let before_checkpoint = std::fs::read(&checkpoint).unwrap();
+        let before_journal = std::fs::read(&journal).unwrap();
+        let before_manual_hold = std::fs::read(&manual_hold).unwrap();
+
+        let error = ensure_init_git_mutation_readiness(project.path(), Duration::ZERO)
+            .expect_err("an unattributed native lock is not safe to recover");
+        let diagnostic = format!("{error:#}");
+
+        assert!(diagnostic.contains("Git mutation readiness is uncertain"));
+        assert!(diagnostic.contains(&format!("{:?}", lock)));
+        assert!(diagnostic.contains("ledger"));
+        assert!(diagnostic.contains("Do not remove or overwrite the lock"));
+        assert!(diagnostic.contains("exomonad init --continue"));
+        assert!(lock.exists());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(project.path().join(".git/index")).unwrap(),
+            before_index
+        );
+        assert_eq!(
+            run_fixture_git_command(project.path(), &["status", "--porcelain"])
+                .unwrap()
+                .stdout,
+            before_status
+        );
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), before_checkpoint);
+        assert_eq!(std::fs::read(&journal).unwrap(), before_journal);
+        assert_eq!(std::fs::read(&manual_hold).unwrap(), before_manual_hold);
+    }
+
+    #[test]
+    fn git_init_readiness_classifies_recovery_and_safe_holds() {
+        let project = Path::new("/tmp/init readiness fixture");
+        let lock = project.join(".git/index.lock");
+        let receipt = GitLockRecoveryReceipt {
+            proof_event_id: "proof-event".to_string(),
+            intent_event_id: "intent-event".to_string(),
+            receipt_event_id: "receipt-event".to_string(),
+            quarantine_file: "/tmp/quarantine/lock".to_string(),
+            lock: exomonad_core::services::NativeGitLockSnapshot {
+                device: 1,
+                inode: 2,
+                size: 0,
+                modified_seconds: 3,
+                modified_nanoseconds: 4,
+                changed_seconds: 5,
+                changed_nanoseconds: 6,
+                contents_sha256: "empty".to_string(),
+            },
+        };
+        assert_eq!(
+            classify_init_git_readiness(
+                project,
+                &lock,
+                NativeLockRecoveryVerdict::Recovered(receipt.clone()),
+            )
+            .unwrap(),
+            InitGitReadiness::Recovered(receipt)
+        );
+        let busy = classify_init_git_readiness(
+            project,
+            &lock,
+            NativeLockRecoveryVerdict::Busy {
+                path: lock.clone(),
+                owners: Vec::new(),
+                reason: "active writer".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(busy.to_string().contains("Git mutation readiness is busy"));
+        let uncertain = classify_init_git_readiness(
+            project,
+            &lock,
+            NativeLockRecoveryVerdict::Uncertain {
+                path: lock.clone(),
+                reason: "owner proof unavailable".to_string(),
+            },
+        )
+        .unwrap_err();
+        let diagnostic = format!("{uncertain:#}");
+        assert!(diagnostic.contains("owner proof unavailable"));
+        assert!(diagnostic.contains("Do not remove or overwrite the lock"));
+        assert!(diagnostic.contains("exomonad init --continue"));
     }
 
     #[test]
