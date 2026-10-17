@@ -23,6 +23,7 @@ pub mod forgejo;
 pub mod forgejo_ci;
 pub mod git;
 pub mod git_lock_owner;
+pub mod git_lock_recovery;
 pub mod git_mutation;
 pub mod git_worktree;
 pub mod github;
@@ -97,6 +98,7 @@ pub use self::git_lock_owner::{
     capture_managed_process_identity, record_managed_native_lock_proof, ManagedNativeLockProof,
     ManagedProcessIdentity, NativeGitLockSnapshot, RecordedManagedNativeLockProof,
 };
+pub use self::git_lock_recovery::{GitLockRecoveryReceipt, NativeLockRecoveryVerdict};
 pub use self::git_mutation::{
     GitMutationError, GitMutationLease, GitMutationLeaseSet, GitMutationPaths, GitMutationResource,
     GitMutationSafety,

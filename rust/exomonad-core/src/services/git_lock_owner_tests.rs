@@ -97,6 +97,14 @@ impl ProcessInspector for FakeInspector {
             Ok(false)
         }
     }
+
+    fn process_holders(
+        &self,
+        _device: u64,
+        _inode: u64,
+    ) -> Result<Vec<ManagedProcessIdentity>, String> {
+        Ok(Vec::new())
+    }
 }
 
 fn procfs_fixture(root: &Path, pid: u32, start_ticks: u64, lock_path: &Path) {
@@ -428,6 +436,14 @@ impl ProcessInspector for MutatingInspector {
         file.write_all(b"changed during ownership check")
             .map_err(|error| error.to_string())?;
         Ok(true)
+    }
+
+    fn process_holders(
+        &self,
+        _device: u64,
+        _inode: u64,
+    ) -> Result<Vec<ManagedProcessIdentity>, String> {
+        Ok(Vec::new())
     }
 }
 

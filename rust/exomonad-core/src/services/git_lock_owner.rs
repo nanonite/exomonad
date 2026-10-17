@@ -9,9 +9,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 
-const PROOF_SCHEMA_VERSION: u32 = 1;
+pub(crate) const PROOF_SCHEMA_VERSION: u32 = 2;
 const LOCK_EVIDENCE_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const LOCK_HELD_EVENT: &str = "git.native_lock.held";
+pub(crate) const LOCK_HELD_EVENT: &str = "git.native_lock.held";
 
 /// A PID paired with its kernel process start identity to reject PID reuse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,10 +39,15 @@ pub struct ManagedNativeLockProof {
     pub schema_version: u32,
     pub operation_id_sha256: String,
     pub worktree_root: String,
+    pub worktree_root_sha256: String,
     pub git_dir: String,
+    pub git_dir_sha256: String,
     pub common_git_dir: String,
+    pub common_git_dir_sha256: String,
     pub index_file: String,
+    pub index_file_sha256: String,
     pub index_lock_file: String,
+    pub index_lock_file_sha256: String,
     pub index_lease_file_sha256: String,
     pub owner: ManagedProcessIdentity,
     pub lock: NativeGitLockSnapshot,
@@ -55,9 +60,14 @@ pub struct RecordedManagedNativeLockProof {
     pub proof: ManagedNativeLockProof,
 }
 
-trait ProcessInspector {
+pub(crate) trait ProcessInspector {
     fn start_time_ticks(&self, pid: u32) -> Result<Option<u64>, String>;
     fn holds_inode(&self, pid: u32, device: u64, inode: u64) -> Result<bool, String>;
+    fn process_holders(
+        &self,
+        device: u64,
+        inode: u64,
+    ) -> Result<Vec<ManagedProcessIdentity>, String>;
 }
 
 /// Capture the process start identity immediately after spawning a managed Git child.
@@ -139,11 +149,16 @@ fn record_proof_with(
         schema_version: PROOF_SCHEMA_VERSION,
         operation_id_sha256: digest(lease.operation_id.as_bytes()),
         worktree_root: paths.worktree_root.to_string_lossy().into_owned(),
+        worktree_root_sha256: digest_git_path(&paths.worktree_root),
         git_dir: paths.git_dir.to_string_lossy().into_owned(),
+        git_dir_sha256: digest_git_path(&paths.git_dir),
         common_git_dir: paths.common_git_dir.to_string_lossy().into_owned(),
+        common_git_dir_sha256: digest_git_path(&paths.common_git_dir),
         index_file: paths.index_file.to_string_lossy().into_owned(),
+        index_file_sha256: digest_git_path(&paths.index_file),
         index_lock_file: paths.index_lock_file.to_string_lossy().into_owned(),
-        index_lease_file_sha256: digest_path(&paths.index_lease_file),
+        index_lock_file_sha256: digest_git_path(&paths.index_lock_file),
+        index_lease_file_sha256: digest_git_path(&paths.index_lease_file),
         owner: owner.clone(),
         lock,
     };
@@ -204,7 +219,7 @@ fn find_proof_event(
     }))
 }
 
-fn snapshot_lock(path: &Path) -> Result<NativeGitLockSnapshot, GitMutationError> {
+pub(crate) fn snapshot_lock(path: &Path) -> Result<NativeGitLockSnapshot, GitMutationError> {
     let before = fs::symlink_metadata(path).map_err(|error| {
         uncertain(
             path,
@@ -343,7 +358,7 @@ fn hash_file(path: &Path, file: &File) -> Result<String, GitMutationError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn digest_path(path: &Path) -> String {
+pub(crate) fn digest_git_path(path: &Path) -> String {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -367,7 +382,7 @@ fn uncertain(path: &Path, reason: &str) -> GitMutationError {
 }
 
 #[derive(Debug, Clone)]
-struct ProcFsInspector {
+pub(crate) struct ProcFsInspector {
     root: PathBuf,
 }
 
@@ -381,7 +396,7 @@ impl Default for ProcFsInspector {
 
 impl ProcFsInspector {
     #[cfg(test)]
-    fn under(root: PathBuf) -> Self {
+    pub(crate) fn under(root: PathBuf) -> Self {
         Self { root }
     }
 }
@@ -445,6 +460,42 @@ impl ProcessInspector for ProcFsInspector {
             }
         }
         Ok(false)
+    }
+
+    fn process_holders(
+        &self,
+        device: u64,
+        inode: u64,
+    ) -> Result<Vec<ManagedProcessIdentity>, String> {
+        let processes = fs::read_dir(&self.root)
+            .map_err(|error| format!("cannot enumerate process identities ({})", error.kind()))?;
+        let mut holders = Vec::new();
+        for entry in processes {
+            let entry = entry.map_err(|error| {
+                format!("cannot enumerate process identities ({})", error.kind())
+            })?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+            else {
+                continue;
+            };
+            let Some(start_time_ticks) = self.start_time_ticks(pid)? else {
+                continue;
+            };
+            if !self.holds_inode(pid, device, inode)? {
+                continue;
+            }
+            if self.start_time_ticks(pid)? != Some(start_time_ticks) {
+                return Err("process identity changed during descriptor inspection".to_string());
+            }
+            holders.push(ManagedProcessIdentity {
+                pid,
+                start_time_ticks,
+            });
+        }
+        Ok(holders)
     }
 }
 

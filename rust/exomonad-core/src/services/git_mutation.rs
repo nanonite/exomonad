@@ -100,6 +100,7 @@ pub struct GitMutationLease {
     pub paths: GitMutationPaths,
     pub resource: GitMutationResource,
     pub operation_id: String,
+    pub(crate) index_override: Option<PathBuf>,
 }
 
 /// Several leases acquired in the shared global order: refs before index.
@@ -317,6 +318,7 @@ impl GitMutationSafety {
                             paths,
                             resource,
                             operation_id: operation_id.to_string(),
+                            index_override: index_override.map(PathBuf::from),
                         });
                     }
                     Ok(None) if started.elapsed() < wait => {
@@ -486,7 +488,7 @@ fn path_digest(path: &Path) -> String {
     }
 }
 
-fn ensure_safe_lease_directory(path: &Path) -> Result<(), GitMutationError> {
+pub(crate) fn ensure_safe_lease_directory(path: &Path) -> Result<(), GitMutationError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(uncertain(path, "mutation lease directory is a symlink"));
