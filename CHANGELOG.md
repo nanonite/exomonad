@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Stop and reap managed process groups on timeout or cancellation (#1241)
 - Fix continuation recovery for failed roots with parked aggregate integrations (#1227)
 - Verify continuation recovery across merge and replay crash boundaries (#1226)
 - Fix startup catch-up before enabling live effects and timers (#1225)

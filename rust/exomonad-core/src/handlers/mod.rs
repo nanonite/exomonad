@@ -32,6 +32,7 @@ pub mod log;
 pub mod memory;
 pub mod merge_pr;
 pub mod process;
+mod process_supervision;
 pub mod session;
 pub mod tasks;
 pub mod tl;

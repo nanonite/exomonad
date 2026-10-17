@@ -29,9 +29,15 @@ Handles effects in the `process.*` namespace, providing ad-hoc process execution
 
 ### Design
 
-- No service layer — `tokio::process::Command` is simple enough to inline
 - Working dir resolved from `ctx.working_dir` (pre-computed in `EffectContext` at construction)
-- Timeout via `tokio::time::timeout` wrapping `.output()`
+- Unix commands run in a dedicated process group. Timeout sends TERM, waits a
+  bounded grace period, then sends KILL and reaps the direct child.
+- Dropping a running effect kills its owned group; normal and nonzero exits
+  also clean up leftover group members before returning the original result.
+- Process logs use a generated operation ID and PID/start/group identity. They
+  do not include command arguments or environment values.
+- Non-Unix fallback supervises and reaps the direct child only; it reports
+  unresolved cleanup when cancellation cannot verify helper-process exit.
 - No command allowlist — trusts WASM author
 
 ## EventEffects Handler (`handlers/events.rs`)
