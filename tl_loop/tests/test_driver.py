@@ -21,7 +21,7 @@ import tl_loop.loop.driver as driver_module
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject, TransportClient
-from tl_loop.events.envelope import EventEnvelope, project
+from tl_loop.events.envelope import EventEnvelope, EventKind, project
 from tl_loop.events.queue import LedgerQueue, QueueError
 from tl_loop.events.reader import LedgerReader, LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.child import ChildKind, ChildRecord
@@ -30,6 +30,7 @@ from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
 from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
+from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
@@ -8827,6 +8828,7 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         *,
         with_ordered_recovery: bool = False,
         with_rejected_merge: bool = False,
+        with_failed_root: bool = False,
     ) -> None:
         root_manifest = driver_module._manifest_for_plan(plan, "ordered-e2e-run", config)
         root_slices = _initial_slices(plan, config, parent_root, "ordered-e2e-run")
@@ -9027,7 +9029,11 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
             },
         }
         root_store.checkpoint(
-            state.recursive_fsm or state.fsm,
+            (
+                RecursiveTLFailed("recursive child is not recoverable")
+                if with_failed_root
+                else state.recursive_fsm or state.fsm
+            ),
             {**state.slices, "alpha": alpha},
             state.budgets,
             state.events.last_consumed_offset,
@@ -9038,6 +9044,8 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
                 candidates={**state.integration.candidates, "alpha": aggregate},
             ),
         )
+        if with_failed_root:
+            root_store.set_gate("tl-ordered-child-recovery-ambiguous", GateStatus.PENDING)
         transport.calls.clear()
 
     def alpha_completion_evidence(root: Path) -> tuple[object, ...]:
@@ -9089,6 +9097,7 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         replayed_transport,
         with_ordered_recovery=True,
         with_rejected_merge=True,
+        with_failed_root=True,
     )
     replayed_alpha_evidence = alpha_completion_evidence(replayed_root)
     replayed_transport.observed_root_store = RunStore("ordered-e2e-run", replayed_root)
@@ -9115,16 +9124,56 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         return state
 
     monkeypatch.setattr(RunStore, "checkpoint", crash_after_alpha_approval)
+
+    class CatchupQueue(SyntheticQueue):
+        def __init__(self) -> None:
+            alpha_head = replayed_transport.aggregate_git_evidence["alpha"][0]
+            event = EventEnvelope(
+                kind=EventKind.PR_PUBLISHED,
+                event_type="pr.published",
+                run_seq=1,
+                run_id="ordered-e2e-ledger",
+                agent_id=None,
+                slice_id="alpha",
+                session_id=None,
+                invocation_id=None,
+                generation=None,
+                harness=None,
+                role=None,
+                lifecycle_state="observed",
+                observed_at="2026-10-17T00:00:00Z",
+                pr_number=101,
+                head_sha=alpha_head,
+                review_kind=None,
+                notification=None,
+                review_state=None,
+                ci_status=None,
+                data={"pr_number": 101, "head_sha": alpha_head, "verified": True},
+            )
+            super().__init__([event])
+            self.snapshot_calls = 0
+
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            self.snapshot_calls += 1
+            return LedgerSnapshot(
+                tuple(self.events), cursor + len(self.events), SequenceStatus.COMPLETE, (), None
+            )
+
+    catchup_queue = CatchupQueue()
     with pytest.raises(SystemExit, match="after alpha approval before merge"):
         run_tl_loop(
             "ordered-e2e-run",
             plan,
-            SyntheticQueue([]),
+            catchup_queue,
             EffectClient(replayed_transport),
-            config=replace(config, max_workers=1),
+            config=replace(config, max_workers=1, session_mode="continue"),
             root_dir=replayed_root,
         )
 
+    assert catchup_queue.snapshot_calls == 1
+    checkpointed = RunStore("ordered-e2e-run", replayed_root).load()
+    assert checkpointed.events.last_consumed_offset == 1
+    assert catchup_queue.acknowledged == [1]
     assert approval_checkpoint_written
     checkpointed = RunStore("ordered-e2e-run", replayed_root).load()
     alpha_approval = checkpointed.integration.candidates["alpha"]
@@ -9137,6 +9186,37 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
     assert checkpointed.slices["alpha"].park_audit == {
         "reason": "legacy worker timeout persisted during aggregate integration"
     }
+    assert not any(
+        gate.name == "tl-ordered-child-recovery-ambiguous" for gate in checkpointed.gates
+    )
+    recovery_journal = EffectJournal(
+        "ordered-e2e-run",
+        RunStore("ordered-e2e-run", replayed_root).run_dir / "action-journal.json",
+    )
+    assert any(
+        entry.get("operation") == "emit_controller_event"
+        and isinstance(entry.get("arguments"), Mapping)
+        and entry["arguments"].get("event_type") == "tl.phase_changed"
+        and isinstance(entry["arguments"].get("payload"), Mapping)
+        and entry["arguments"]["payload"].get("from_phase") == "tl_failed"
+        and entry["arguments"]["payload"].get("to_phase") == "tl_waiting"
+        for entry in recovery_journal.snapshot()
+    )
+    superseded_boundaries = [
+        cast(Mapping[str, Any], entry["arguments"]["payload"])
+        for entry in recovery_journal.snapshot()
+        if entry.get("operation") == "emit_controller_event"
+        and isinstance(entry.get("arguments"), Mapping)
+        and entry["arguments"].get("event_type") == "tl.recovery_boundary"
+        and isinstance(entry["arguments"].get("payload"), Mapping)
+        and str(entry["arguments"]["payload"].get("reason", "")).startswith(
+            "ordered_recovery_gate_superseded:"
+        )
+    ]
+    assert len(superseded_boundaries) == 1
+    superseded_reason = cast(str, superseded_boundaries[0]["reason"])
+    assert "reason_code=no_failed_child_after_replay" in superseded_reason
+    assert len(superseded_reason.split("previous_failure_sha256=", 1)[1].split(";", 1)[0]) == 64
     assert not any(name == "merge_pr" for name, _ in replayed_transport.calls)
 
     monkeypatch.setattr(RunStore, "checkpoint", original_checkpoint)

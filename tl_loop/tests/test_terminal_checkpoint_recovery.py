@@ -1,4 +1,4 @@
-"""Synthetic terminal checkpoint recovery acceptance (#1112, #1117).
+"""Synthetic terminal checkpoint continuation recovery acceptance.
 
 A recorded production run ended with the root and its ``recreate-stage`` child
 both at ``tl_failed``: the leaf ``recreated-leaf`` was parked for
@@ -7,20 +7,16 @@ child controller then died on the ``{'cicoIssueId': 9001}`` escalation result.
 The leaf later republished its head as PR #102.
 
 This module synthesizes that shape from scratch under the test's temporary
-directory. It never reads or writes any recorded checkpoint, escalation, or PR,
-and it drives the real ``--continue`` code path (``run_tl_loop`` with
-``session_mode="continue"``) instead of ``exomonad init``.
-
-The recorded answer is encoded as an assertion: ``--continue`` alone does not
-recover this checkpoint. It keeps ``tl_failed`` and opens the named
-``tl-ordered-child-recovery-recreate-stage`` gate, so the operator must resolve
-the parked publication ownership and answer that gate (or use the recreate
-path) before the child is relaunched.
+directory. It never reads or writes a recorded checkpoint, escalation, or PR.
+It drives the real ``--continue`` controller path, verifies replay precedes the
+producer-retry proof, and confirms that the retained nonretryable child failure
+is derived again with its specific gate after replay.
 """
 
 from __future__ import annotations
 
 import json
+import queue
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -30,7 +26,7 @@ import pytest
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
-from tl_loop.events.envelope import EventEnvelope
+from tl_loop.events.envelope import EventEnvelope, EventKind
 from tl_loop.events.reader import LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.scope import TLFailed
 from tl_loop.loop.driver import (
@@ -347,7 +343,7 @@ def test_pending_recovery_gate_is_not_duplicated_on_repeat(tmp_path: Path) -> No
 def test_continue_alone_keeps_the_recorded_failure_and_names_the_gate(
     tmp_path: Path,
 ) -> None:
-    """The answer for the synthetic checkpoint: a named gate, not a continuation."""
+    """Replay keeps the unprovable child blocked behind its named gate."""
     parent_store, plan, config = _terminal_failed_checkpoints(tmp_path)
     before = _leaf_evidence(parent_store)
     assert before["park_issue_id"] == ESCALATION_ISSUE
@@ -360,11 +356,89 @@ def test_continue_alone_keeps_the_recorded_failure_and_names_the_gate(
     assert transport.calls == []
     state = result.final_state
     assert isinstance(state.recursive_fsm, TLFailed)
-    assert state.recursive_fsm.reason == "recursive child is not recoverable"
+    assert "child exit is not a retryable" in state.recursive_fsm.reason
+    assert CHAINLINK_FAILURE in state.recursive_fsm.reason
     assert state.fsm.phase.value == "tl_failed"
     assert [gate.name for gate in state.gates] == [f"{GATE_PREFIX}{CHILD}"]
     assert result.diagnostics["recovery_gate"] == f"{GATE_PREFIX}{CHILD}"
     # The child checkpoint keeps PR #102, escalation #9001, and its own failure.
+    assert _leaf_evidence(parent_store) == before
+
+
+def test_continue_replays_before_deriving_a_genuine_child_failure(tmp_path: Path) -> None:
+    """A failed root is re-evaluated after a real retained event is consumed."""
+    parent_store, plan, config = _terminal_failed_checkpoints(tmp_path)
+    before = _leaf_evidence(parent_store)
+    replay_event = EventEnvelope(
+        kind=EventKind.PR_PUBLISHED,
+        event_type="pr.published",
+        run_seq=1,
+        run_id=ROOT_RUN,
+        agent_id=None,
+        slice_id=CHILD,
+        session_id=None,
+        invocation_id=None,
+        generation=None,
+        harness=None,
+        role=None,
+        lifecycle_state="observed",
+        observed_at="2026-10-17T00:00:00Z",
+        pr_number=PR_102,
+        head_sha=HEAD_102,
+        review_kind=None,
+        notification=None,
+        review_state=None,
+        ci_status=None,
+        data={"pr_number": PR_102, "head_sha": HEAD_102, "verified": True},
+    )
+
+    class ReplayQueue(EmptyQueue):
+        def __init__(self) -> None:
+            self.snapshot_calls = 0
+            self.acknowledged: list[int] = []
+            self.pending = [replay_event]
+
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            del timeout
+            if not self.pending:
+                raise queue.Empty
+            return self.pending.pop(0)
+
+        def acknowledge(self, event: EventEnvelope) -> int:
+            assert event.run_seq is not None
+            self.acknowledged.append(event.run_seq)
+            return event.run_seq
+
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            self.snapshot_calls += 1
+            return LedgerSnapshot(
+                (replay_event,),
+                cursor + 1,
+                SequenceStatus.COMPLETE,
+                (),
+                None,
+            )
+
+    source = ReplayQueue()
+    transport = RecordingTransport()
+    result = run_tl_loop(
+        ROOT_RUN,
+        plan,
+        source,
+        _read_only(transport),
+        config=config,
+        root_dir=parent_store.root_dir,
+        budgets=BudgetLedger(0, 0),
+    )
+
+    assert source.snapshot_calls == 1
+    assert source.acknowledged == [1]
+    assert result.final_state.events.last_consumed_offset == 1
+    assert isinstance(result.final_state.recursive_fsm, TLFailed)
+    assert "child exit is not a retryable" in result.final_state.recursive_fsm.reason
+    assert CHAINLINK_FAILURE in result.final_state.recursive_fsm.reason
+    assert result.diagnostics["recovery_gate"] == f"{GATE_PREFIX}{CHILD}"
+    assert transport.calls == []
     assert _leaf_evidence(parent_store) == before
 
 

@@ -249,6 +249,7 @@ def test_rejected_plan_proposal_emits_bounded_reason_without_body(
 
 def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) -> None:
     captured: dict[str, dict[str, object]] = {}
+    monkeypatch.setenv("EXOMONAD_AGENT_ID", "root-controller")
 
     class EmptySource:
         def start(self) -> EmptySource:
@@ -314,6 +315,7 @@ def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) ->
     assert captured["ledger_queue"]["active_tail_timeout"] == 60.0
     assert captured["tlloop_config"]["task_timeout_seconds"] == 90.0
     assert captured["tlloop_config"]["task_timeout_source"] == "project"
+    assert captured["tlloop_config"]["agent_id"] == "root-controller"
     assert captured["tlloop_config"]["enable_reviewer_spawn"] is True
     # The operator's dispatch-retry budget reaches the controller verbatim.
     assert captured["tlloop_config"]["dispatch_retry_limit"] == 7

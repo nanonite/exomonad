@@ -1513,6 +1513,7 @@ def run_tl_loop(
         # Before anything reads the gates, so a parked run resumed from a
         # pre-#1119 checkpoint resolves the same per-slice name this code opens.
         existing_state = _migrate_legacy_dispatch_gates(store, existing_state)
+    continued_failed_root_reason = _continued_failed_root_reason(existing_state, selected)
     if existing_state is not None and _is_terminal_phase(_phase_from_state(existing_state)):
         if plan is not None:
             persisted_manifest = existing_state.plan_manifest
@@ -1530,105 +1531,106 @@ def run_tl_loop(
                     f"{persisted_manifest.digest} differs from supplied plan digest "
                     f"{candidate.digest}; archive the completed run before starting a new plan"
                 )
-        terminal_recovery_reopened = False
-        if (
-            selected.session_mode == "continue"
-            and isinstance(existing_state.recursive_fsm, RecursiveTLFailed)
-            and existing_state.plan_manifest is not None
-        ):
-            recovery_plan = (
-                plan
-                if isinstance(plan, WorkPlan)
-                else WorkPlan.from_mapping(plan)
-                if plan is not None
-                else _work_plan_from_manifest(existing_state.plan_manifest)
-            )
-            decision = _ordered_terminal_recovery_decision(
-                existing_state,
-                recovery_plan,
-                selected,
-                store,
-            )
-            if decision is not None:
-                if not decision.recoverable:
-                    state = _hold_ordered_recovery_gate(store, decision)
-                    return TLRunResult(
-                        state,
-                        (),
-                        (),
-                        (),
-                        (),
-                        {
-                            "reducer_version": state.reducer_version,
-                            "cursor": state.events.last_consumed_offset,
-                            "ordered_recovery": decision.reason,
-                            "recovery_gate": decision.gate_name,
-                            "recovery_gate_status": (
-                                decision.gate_status.value
-                                if decision.gate_status is not None
-                                else GateStatus.PENDING.value
-                            ),
-                        },
-                        (),
+        if continued_failed_root_reason is None:
+            terminal_recovery_reopened = False
+            if (
+                selected.session_mode == "continue"
+                and isinstance(existing_state.recursive_fsm, RecursiveTLFailed)
+                and existing_state.plan_manifest is not None
+            ):
+                recovery_plan = (
+                    plan
+                    if isinstance(plan, WorkPlan)
+                    else WorkPlan.from_mapping(plan)
+                    if plan is not None
+                    else _work_plan_from_manifest(existing_state.plan_manifest)
+                )
+                decision = _ordered_terminal_recovery_decision(
+                    existing_state,
+                    recovery_plan,
+                    selected,
+                    store,
+                )
+                if decision is not None:
+                    if not decision.recoverable:
+                        state = _hold_ordered_recovery_gate(store, decision)
+                        return TLRunResult(
+                            state,
+                            (),
+                            (),
+                            (),
+                            (),
+                            {
+                                "reducer_version": state.reducer_version,
+                                "cursor": state.events.last_consumed_offset,
+                                "ordered_recovery": decision.reason,
+                                "recovery_gate": decision.gate_name,
+                                "recovery_gate_status": (
+                                    decision.gate_status.value
+                                    if decision.gate_status is not None
+                                    else GateStatus.PENDING.value
+                                ),
+                            },
+                            (),
+                        )
+                    existing_state = _reopen_ordered_scope(
+                        existing_state,
+                        recovery_plan,
+                        store,
+                        decision.task_name,
+                        authorized=decision.authorized,
                     )
+                    selected = replace(
+                        selected,
+                        ordered_recovery_child=decision.task_name,
+                        branch=existing_state.owner_branch or selected.branch,
+                        worktree=existing_state.owner_worktree or selected.worktree,
+                    )
+                    terminal_recovery_reopened = True
+            if selected.ordered_recovery and isinstance(
+                existing_state.recursive_fsm, RecursiveTLFailed
+            ):
+                recovery_plan = (
+                    plan
+                    if isinstance(plan, WorkPlan)
+                    else WorkPlan.from_mapping(plan)
+                    if plan is not None
+                    else _work_plan_from_manifest(existing_state.plan_manifest)
+                )
                 existing_state = _reopen_ordered_scope(
                     existing_state,
                     recovery_plan,
                     store,
-                    decision.task_name,
-                    authorized=decision.authorized,
-                )
-                selected = replace(
-                    selected,
-                    ordered_recovery_child=decision.task_name,
-                    branch=existing_state.owner_branch or selected.branch,
-                    worktree=existing_state.owner_worktree or selected.worktree,
+                    None,
                 )
                 terminal_recovery_reopened = True
-        if selected.ordered_recovery and isinstance(
-            existing_state.recursive_fsm, RecursiveTLFailed
-        ):
-            recovery_plan = (
-                plan
-                if isinstance(plan, WorkPlan)
-                else WorkPlan.from_mapping(plan)
-                if plan is not None
-                else _work_plan_from_manifest(existing_state.plan_manifest)
-            )
-            existing_state = _reopen_ordered_scope(
-                existing_state,
-                recovery_plan,
-                store,
-                None,
-            )
-            terminal_recovery_reopened = True
-        # Fall through to the live loop when a recovery reopened this terminal
-        # checkpoint so the recovered child is actually relaunched in this
-        # invocation instead of requiring a second controller call.
-        if not terminal_recovery_reopened:
-            if existing_state.reducer_version != REDUCER_VERSION:
-                raise TLLoopError(
-                    f"checkpoint reducer_version {existing_state.reducer_version} is incompatible "
-                    f"with reducer {REDUCER_VERSION}"
+            # Fall through to the live loop when a recovery reopened this terminal
+            # checkpoint so the recovered child is actually relaunched in this
+            # invocation instead of requiring a second controller call.
+            if not terminal_recovery_reopened:
+                if existing_state.reducer_version != REDUCER_VERSION:
+                    raise TLLoopError(
+                        f"checkpoint reducer_version {existing_state.reducer_version} is incompatible "
+                        f"with reducer {REDUCER_VERSION}"
+                    )
+                terminal_ledger_id = selected.ledger_run_id or existing_state.ledger_run_id
+                terminal_log: list[EffectIntent] = (
+                    EffectJournal(run_id, store.run_dir / "action-journal.json")
+                    if terminal_ledger_id is not None
+                    else []
                 )
-            terminal_ledger_id = selected.ledger_run_id or existing_state.ledger_run_id
-            terminal_log: list[EffectIntent] = (
-                EffectJournal(run_id, store.run_dir / "action-journal.json")
-                if terminal_ledger_id is not None
-                else []
-            )
-            return TLRunResult(
-                existing_state,
-                (),
-                (),
-                (),
-                (),
-                {
-                    "reducer_version": existing_state.reducer_version,
-                    "cursor": existing_state.events.last_consumed_offset,
-                },
-                _journal_entries(terminal_log),
-            )
+                return TLRunResult(
+                    existing_state,
+                    (),
+                    (),
+                    (),
+                    (),
+                    {
+                        "reducer_version": existing_state.reducer_version,
+                        "cursor": existing_state.events.last_consumed_offset,
+                    },
+                    _journal_entries(terminal_log),
+                )
     manifest: PlanManifest
     if existing_state is not None and existing_state.plan_manifest is not None:
         persisted_manifest = existing_state.plan_manifest
@@ -1846,6 +1848,17 @@ def run_tl_loop(
     effects_log.extend(identity_effects)
     state = _reconcile_legacy_parked_lanes(state, store, effects_log)
     state = _initialize_ordered_runtime(work_plan, state, store)
+    if continued_failed_root_reason is not None:
+        previous_phase = _phase_from_state(state)
+        state = _reopen_ordered_scope(state, work_plan, store, None)
+        _emit_phase_change(
+            run_id,
+            previous_phase,
+            _phase_from_state(state),
+            selected,
+            effects,
+            effects_log,
+        )
     try:
         return _run_loop(
             run_id,
@@ -1858,6 +1871,7 @@ def run_tl_loop(
             effects_log,
             decoder or TLEventDecoder(),
             True,
+            continued_failed_root_reason,
         )
     except ToolUnavailableError as error:
         return _recover_tool_unavailable(store, effects, effects_log, error)
@@ -2224,6 +2238,21 @@ def _ordered_recovery_gate_name(task_name: str | None) -> str:
     return f"{ORDERED_RECOVERY_GATE_PREFIX}{task_name or 'ambiguous'}"
 
 
+def _continued_failed_root_reason(state: RunState | None, config: TLLoopConfig) -> str | None:
+    """Return the saved root failure only as input to a fresh continue replay."""
+    if (
+        state is None
+        or config.session_mode != "continue"
+        or state.plan_manifest is None
+        or state.plan_manifest.role != "root"
+    ):
+        return None
+    phase = _phase_from_state(state)
+    if isinstance(phase, (TLFailed, RecursiveTLFailed)):
+        return phase.reason
+    return None
+
+
 def _ordered_terminal_recovery_decision(
     state: RunState,
     plan: WorkPlan,
@@ -2279,8 +2308,6 @@ def _ordered_recovery_proof(
     """Classify a failed ordered child without guessing ownership or effects."""
     failed_phase = state.recursive_fsm
     if not plan.sub_tls or not isinstance(failed_phase, RecursiveTLFailed):
-        return None
-    if not failed_phase.reason.startswith("recursive child"):
         return None
     tasks_by_name = {task.name: task for task in plan.sub_tls}
     stage = next(
@@ -2781,7 +2808,21 @@ def _reopen_ordered_scope(
     elif pending_by_order:
         current_order = min(pending_by_order)
     else:
-        raise TLLoopError("ordered recovery found no pending child to reopen")
+        complete = RecursiveTLAllMerged(
+            scope_path=planning.scope_path,
+            plan_digest=planning.plan_digest,
+            completed_children=post_merge,
+        )
+        return store.checkpoint(
+            complete,
+            state.slices,
+            state.budgets,
+            state.events.last_consumed_offset,
+            current_order=max(1, state.current_order),
+            ordered_stages=state.ordered_stages,
+            integration=state.integration,
+            expected_revision=expected_revision,
+        )
     slices = dict(state.slices)
     if target_name is not None:
         target = slices[target_name]
@@ -3257,13 +3298,26 @@ def _complete_startup_recovery(
     store: RunStore,
     effects_log: list[EffectIntent],
     boundary_run_seq: int,
-) -> tuple[RunState, str | None]:
+    continued_failed_root_reason: str | None = None,
+) -> tuple[RunState, str | None, bool]:
     """Reconcile durable effects, validate projection, then enable scheduling."""
     state, inconsistency = _prepare_startup_recovery(
         plan, state, source, config, effects, store, effects_log, boundary_run_seq
     )
     if inconsistency is not None:
-        return state, inconsistency
+        return state, inconsistency, False
+    state = _reconcile_continued_root_failure(
+        plan,
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        continued_failed_root_reason,
+    )
+    if continued_failed_root_reason is not None and _is_terminal_phase(_phase_from_state(state)):
+        return state, None, True
+    config = _continued_ordered_recovery_config(state, config)
     state = _activate_startup_work(
         plan,
         state,
@@ -3274,7 +3328,200 @@ def _complete_startup_recovery(
         effects_log,
         boundary_run_seq,
     )
-    return state, None
+    return state, None, False
+
+
+def _reconcile_continued_root_failure(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    previous_failure_reason: str | None,
+) -> RunState:
+    """Re-derive a prior failed root only after startup evidence is reconciled."""
+    if previous_failure_reason is None:
+        return state
+    phase = _phase_from_state(state)
+    if _is_terminal_phase(phase):
+        return state
+    if not plan.sub_tls:
+        return state
+    stage = next(
+        (stage for stage in plan.ordered_stages if stage.order == state.current_order),
+        None,
+    )
+    if stage is None:
+        return state
+    failed = [
+        name
+        for name in stage.sub_tls
+        if state.slices.get(name) is not None and state.slices[name].status is SliceStatus.FAILED
+    ]
+    if not failed:
+        return _clear_superseded_ambiguous_recovery_gate(
+            state,
+            stage.sub_tls,
+            previous_failure_reason,
+            config,
+            effects,
+            store,
+            effects_log,
+        )
+    proof_state = replace(
+        state,
+        recursive_fsm=RecursiveTLFailed(
+            previous_failure_reason,
+            scope_path=getattr(phase, "scope_path", ("root",)),
+        ),
+    )
+    decision = _ordered_terminal_recovery_decision(proof_state, plan, config, store)
+    if decision is None:
+        return state
+    if not decision.recoverable:
+        state = _hold_ordered_recovery_gate(store, decision)
+        return _persist_rederived_root_failure(
+            state,
+            decision.reason,
+            config,
+            effects,
+            store,
+            effects_log,
+        )
+    return _reopen_ordered_scope(
+        state,
+        plan,
+        store,
+        decision.task_name,
+        authorized=decision.authorized,
+    )
+
+
+def _clear_superseded_ambiguous_recovery_gate(
+    state: RunState,
+    stage_members: Sequence[str],
+    previous_failure_reason: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Retire only the old zero-failed-child diagnostic after replay proves it stale."""
+    gate = next(
+        (
+            gate
+            for gate in state.gates
+            if gate.name == _ordered_recovery_gate_name(None) and gate.status is GateStatus.PENDING
+        ),
+        None,
+    )
+    if gate is None:
+        return state
+    if any(
+        state.slices.get(member) is not None and state.slices[member].status is SliceStatus.FAILED
+        for member in stage_members
+    ):
+        return state
+    state = store.clear_gate(gate.name)
+    previous_failure_sha256 = hashlib.sha256(previous_failure_reason.encode("utf-8")).hexdigest()
+    recovery_reason = (
+        "ordered_recovery_gate_superseded:"
+        f"gate={gate.name};"
+        "reason_code=no_failed_child_after_replay;"
+        f"previous_failure_sha256={previous_failure_sha256};"
+        f"stage_members={','.join(stage_members)}"
+    )
+    _record_controller_event(
+        "controller",
+        "tl.recovery_boundary",
+        {
+            "scope_id": (state.plan_manifest.scope_id if state.plan_manifest is not None else None),
+            "depth": config.depth,
+            "reason": recovery_reason,
+            "cursor": state.events.last_consumed_offset,
+            "boundary_run_seq": None,
+            "pending_quarantine": 0,
+            "transition_version": 1,
+        },
+        config,
+        effects,
+        effects_log,
+    )
+    return state
+
+
+def _persist_rederived_root_failure(
+    state: RunState,
+    reason: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Persist the failure found by this replay instead of reviving the old verdict."""
+    before_phase = _phase_from_state(state)
+    failed = RecursiveTLFailed(
+        reason,
+        scope_path=getattr(before_phase, "scope_path", ("root",)),
+    )
+    state = store.checkpoint(
+        failed,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    _emit_phase_change(
+        state.run_id,
+        before_phase,
+        _phase_from_state(state),
+        config,
+        effects,
+        effects_log,
+    )
+    return state
+
+
+def _continued_ordered_recovery_config(
+    state: RunState,
+    config: TLLoopConfig,
+) -> TLLoopConfig:
+    """Restore the producer-retry route selected by post-replay proof."""
+    phase = state.recursive_fsm
+    if not isinstance(phase, RecursiveTLRunning):
+        return config
+    target = phase.evidence.get("ordered_recovery_child")
+    if not target or target == "scope":
+        return config
+    return replace(
+        config,
+        ordered_recovery_child=target,
+        branch=state.owner_branch or config.branch,
+        worktree=state.owner_worktree or config.worktree,
+    )
+
+
+def _terminal_recovery_diagnostics(
+    state: RunState,
+    diagnostics: Mapping[str, object],
+) -> dict[str, object]:
+    """Expose the fresh replay's terminal decision and any still-pending gate."""
+    result = dict(diagnostics)
+    phase = _phase_from_state(state)
+    if not isinstance(phase, (TLFailed, RecursiveTLFailed)):
+        return result
+    result["ordered_recovery"] = phase.reason
+    gate = next(
+        (gate for gate in state.gates if gate.name.startswith(ORDERED_RECOVERY_GATE_PREFIX)),
+        None,
+    )
+    if gate is not None:
+        result["recovery_gate"] = gate.name
+        result["recovery_gate_status"] = gate.status.value
+    return result
 
 
 def _prepare_startup_recovery(
@@ -3483,6 +3730,7 @@ def _run_loop(
     effects_log: list[EffectIntent],
     decoder: TLEventDecoder,
     startup_recovery: bool = False,
+    continued_failed_root_reason: str | None = None,
 ) -> TLRunResult:
     """Shared loop body; active mode changes only effect execution."""
     phase = _phase_from_state(state)
@@ -3573,7 +3821,7 @@ def _run_loop(
                 blocker,
                 history.boundary_run_seq,
             )
-        state, inconsistency = _complete_startup_recovery(
+        state, inconsistency, terminal_after_replay = _complete_startup_recovery(
             plan,
             state,
             source,
@@ -3582,6 +3830,7 @@ def _run_loop(
             store,
             effects_log,
             history.boundary_run_seq,
+            continued_failed_root_reason,
         )
         if inconsistency is not None:
             return _recovery_hold_result(
@@ -3593,6 +3842,16 @@ def _run_loop(
                 inconsistency,
                 history.boundary_run_seq,
             )
+        if terminal_after_replay:
+            return TLRunResult(
+                state,
+                tuple(effects_log),
+                tuple(transitions),
+                tuple(consumed),
+                diagnostics=_terminal_recovery_diagnostics(state, diagnostics.snapshot()),
+                journal_entries=_journal_entries(effects_log),
+            )
+        config = _continued_ordered_recovery_config(state, config)
     if not recovery_pending:
         if (
             not plan.sub_tls
@@ -3826,6 +4085,27 @@ def _run_loop(
                     store,
                     effects_log,
                 )
+                state = _reconcile_continued_root_failure(
+                    plan,
+                    state,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    continued_failed_root_reason,
+                )
+                if continued_failed_root_reason is not None and _is_terminal_phase(
+                    _phase_from_state(state)
+                ):
+                    return TLRunResult(
+                        state,
+                        tuple(effects_log),
+                        tuple(transitions),
+                        tuple(consumed),
+                        diagnostics=_terminal_recovery_diagnostics(state, diagnostics.snapshot()),
+                        journal_entries=_journal_entries(effects_log),
+                    )
+                config = _continued_ordered_recovery_config(state, config)
                 state = _activate_startup_work(
                     plan,
                     state,
@@ -3881,13 +4161,13 @@ def _run_loop(
                     config.heartbeat,
                     project_root=config.project_root,
                     active_work=active_work_clock,
-                    review_replay=lambda replay_state, replay_slice, replay_watcher: (
+                    review_replay=lambda replay_state, replay_slice, replay_watcher, replay_config=config: (
                         _replay_watcher_review_if_needed(
                             plan,
                             replay_state,
                             replay_slice,
                             replay_watcher,
-                            config,
+                            replay_config,
                             effects,
                             store,
                             effects_log,

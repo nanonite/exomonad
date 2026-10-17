@@ -512,6 +512,7 @@ def _run_controller(args: argparse.Namespace) -> TLRunResult:
         run_id=run_id,
         plan_revision=getattr(args, "plan_revision", 1),
         session_mode=session_mode,
+        agent_id=os.environ.get("EXOMONAD_AGENT_ID"),
         ledger_run_id=ledger_run_id,
         role="worker",
         enable_reviewer_spawn=True,

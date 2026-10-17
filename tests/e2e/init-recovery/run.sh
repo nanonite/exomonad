@@ -32,6 +32,7 @@ export EXOMONAD_CODEX_MODEL="${EXOMONAD_CODEX_MODEL:-e2e-unused-model}"
 
 SESSION="e2e-init-recovery"
 CONTINUATION_SESSION="e2e-init-recovery-continuation"
+AGGREGATE_SESSION="e2e-init-aggregate-recovery"
 MOCK_PID=""
 
 e2e_preflight tmux git curl python3
@@ -46,6 +47,7 @@ cleanup() {
     set +e
     tmux kill-session -t "$SESSION" 2>/dev/null
     tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+    tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null
     if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
         kill "$MOCK_PID" 2>/dev/null
         wait "$MOCK_PID" 2>/dev/null
@@ -58,6 +60,7 @@ trap cleanup EXIT INT TERM
 
 e2e_create_work_dir "init-recovery"
 
+if [[ "${E2E_AGGREGATE_ONLY:-0}" != "1" ]]; then
 e2e_phase "Phase 1" "Creating scratch repository..."
 REMOTE_DIR="$WORK_DIR/remote.git"
 git init --bare "$REMOTE_DIR" -q
@@ -72,6 +75,8 @@ cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
 mkdir -p .exo/tl-loop
 printf '{"run_id":"root","plan":{"leaves":[]}}\n' > .exo/tl-loop/plan.json
 e2e_write_basic_config "$SESSION"
+FIRST_SERVER_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+printf 'port = %s\n' "$FIRST_SERVER_PORT" >> .exo/config.toml
 export FORGEJO_TOKEN="test-token-e2e"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
@@ -259,11 +264,13 @@ from pathlib import Path
 snapshot = Path(".exo/tl-loop/plan.snapshot").read_bytes()
 Path(".exo/tl-loop/plan.snapshot.sha256").write_text(sha256(snapshot).hexdigest() + "\n")
 PY
+CONT_SERVER_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 cat > .exo/config.toml <<EOF
 shell_command = "bash"
 tmux_session = "$CONTINUATION_SESSION"
 yolo = true
 poll_interval = 1
+port = $CONT_SERVER_PORT
 spawn_agent_type = "codex"
 forgejo_url = "$MOCK_URL"
 forgejo_token = "test-token-e2e"
@@ -328,8 +335,248 @@ fi
 [[ "$(rg -c 'pulls/1/merge' "$CONT_DIR/mock.log" || true)" == "1" ]] \
     || e2e_fail "production merge tool did not issue exactly one Forgejo merge request"
 e2e_log "PASS: bundled controller resumed the reviewed checkpoint, used the production merge tool once, and completed post-merge bookkeeping (offset 0 -> $after_offset, head=$after_reviewed_head)"
+fi
+
+e2e_phase "Phase 8" "Recovering a failed root with a parked aggregate through actual init --continue..."
+
+if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
+    kill "$MOCK_PID" 2>/dev/null || true
+    wait "$MOCK_PID" 2>/dev/null || true
+    MOCK_PID=""
+fi
+
+AGG_DIR="$WORK_DIR/aggregate-recovery"
+AGG_REPO="$AGG_DIR/repo"
+AGG_REMOTE="$AGG_DIR/remote/owner/repo.git"
+AGG_HOME="$AGG_DIR/home"
+mkdir -p "$AGG_DIR" "$AGG_HOME/.exo" "$(dirname "$AGG_REMOTE")" "$AGG_REPO"
+python3 "$PROJECT_ROOT/scripts/build_tl_loop_archive.py" \
+    --source "$PROJECT_ROOT/tl_loop" --output "$AGG_HOME/.exo/tl_loop.pyz"
+python3 "$PROJECT_ROOT/scripts/check_tl_loop_archive.py" \
+    "$AGG_HOME/.exo/tl_loop.pyz" --source "$PROJECT_ROOT/tl_loop"
+AGGREGATE_ARCHIVE_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
+    "$AGG_HOME/.exo/tl_loop.pyz")"
+AGGREGATE_BUILD_ID="$(python3 -c 'import json,sys,zipfile; print(json.loads(zipfile.ZipFile(sys.argv[1]).read("tl_loop/_build_fingerprint.json"))["git_commit"])' \
+    "$AGG_HOME/.exo/tl_loop.pyz")"
+e2e_log "Built aggregate recovery archive sha256=$AGGREGATE_ARCHIVE_SHA256 build=$AGGREGATE_BUILD_ID"
+
+git init --bare -q "$AGG_REMOTE"
+git -C "$AGG_REPO" init -q -b main
+git -C "$AGG_REPO" remote add origin "file://$AGG_REMOTE"
+git -C "$AGG_REPO" config user.name "Exomonad aggregate recovery E2E"
+git -C "$AGG_REPO" config user.email "aggregate-recovery-e2e@example.invalid"
+git -C "$AGG_REPO" commit --allow-empty -q -m "aggregate recovery base"
+git -C "$AGG_REPO" push -u origin main -q
+
+AGG_MOCK_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+AGG_MOCK_URL="http://127.0.0.1:$AGG_MOCK_PORT"
+REMOTE_DIR="$AGG_REMOTE" MOCK_LOG="$AGG_DIR/mock.log" MOCK_ADVANCE_BASE_ON_MERGE=1 \
+    python3 "$PROJECT_ROOT/tests/e2e/mock_github.py" --port "$AGG_MOCK_PORT" \
+    > "$AGG_DIR/mock.stderr" 2>&1 &
+MOCK_PID=$!
+for _ in $(seq 1 50); do
+    curl -fsS "$AGG_MOCK_URL/api/v1/admin/actions/runners" >/dev/null 2>&1 && break
+    sleep 0.1
+done
+curl -fsS "$AGG_MOCK_URL/api/v1/admin/actions/runners" >/dev/null \
+    || { cat "$AGG_DIR/mock.stderr"; e2e_fail "aggregate recovery mock Forgejo API did not become ready"; }
+
+cd "$AGG_REPO"
+HOME="$AGG_HOME" "$EXOMONAD_BIN" new > "$AGG_DIR/new.log" 2>&1 \
+    || { cat "$AGG_DIR/new.log"; e2e_fail "'exomonad new' failed for aggregate recovery fixture"; }
+mkdir -p .exo/wasm
+for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
+    ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
+done
+if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
+    rm -rf .exo/roles
+    cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
+fi
+cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
+cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
+cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
+cat > "$AGG_DIR/git-ssh" <<'EOF'
+#!/bin/sh
+E2E_GIT_REMOTE_DIR="@REMOTE@"
+case "$*" in
+    *git-upload-pack*) exec git-upload-pack "${E2E_GIT_REMOTE_DIR:?}" ;;
+    *git-receive-pack*) exec git-receive-pack "${E2E_GIT_REMOTE_DIR:?}" ;;
+    *) exit 64 ;;
+esac
+EOF
+sed -i "s|@REMOTE@|$AGG_REMOTE|" "$AGG_DIR/git-ssh"
+chmod +x "$AGG_DIR/git-ssh"
+git remote set-url origin "git@forgejo-e2e:owner/repo.git"
+git remote set-url --push origin "git@forgejo-e2e:owner/repo.git"
+git config core.sshCommand "$AGG_DIR/git-ssh"
+export GIT_SSH_COMMAND="$AGG_DIR/git-ssh"
+export E2E_GIT_REMOTE_DIR="$AGG_REMOTE"
+
+PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_aggregate_checkpoint.py" \
+    --repo "$AGG_REPO" --mock-url "$AGG_MOCK_URL" --output "$AGG_DIR/seed.json" \
+    > "$AGG_DIR/seed.log" \
+    || { cat "$AGG_DIR/seed.log"; cat "$AGG_DIR/mock.stderr"; e2e_fail "failed to seed failed-root aggregate recovery state"; }
+AGGREGATE_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_pr"])' "$AGG_DIR/seed.json")"
+LEAF_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf_pr"])' "$AGG_DIR/seed.json")"
+LEAF_RECEIPT_SHA256="$(python3 -c 'import hashlib,json,sys; d=json.load(open(sys.argv[1])); r=json.load(open(d["child"])); e=r["slices"]["issue-811"]["post_merge"]["evidence"]; print(hashlib.sha256(json.dumps(e,sort_keys=True,separators=(",", ":")).encode()).hexdigest())' "$AGG_DIR/seed.json")"
+ARCHITECTURE_INVOCATION_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
+    "$AGG_REPO/.exo/agents/architecture/invocation.json")"
+AGGREGATE_SERVER_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+cat > .exo/config.toml <<EOF
+shell_command = "bash"
+tmux_session = "$AGGREGATE_SESSION"
+yolo = true
+poll_interval = 1
+port = $AGGREGATE_SERVER_PORT
+spawn_agent_type = "codex"
+forgejo_url = "$AGG_MOCK_URL"
+forgejo_token = "test-token-e2e"
+forgejo_reviewer_token = "reviewer-token-e2e"
+EOF
+
+tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null || true
+tmux new-session -d -s "$AGGREGATE_SESSION" -n TL "sleep 0.2; exit 0"
+tmux set-window-option -t "$AGGREGATE_SESSION:TL" remain-on-exit on
+for _ in $(seq 1 30); do
+    [[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{pane_dead}' | awk '$1 == "TL" { print $2; exit }')" == "1" ]] && break
+    sleep 0.1
+done
+DEAD_TL_ID="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{window_id} #{pane_dead}' | awk '$1 == "TL" { print $2, $3; exit }')"
+[[ "${DEAD_TL_ID##* }" == "1" ]] || e2e_fail "aggregate fixture did not start with an exited TL pane"
+read -r DEAD_TL_WINDOW _ <<< "$DEAD_TL_ID"
+
+HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
+    "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+    > "$AGG_DIR/init.log" 2>&1 || true
+rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init.log" \
+    || { cat "$AGG_DIR/init.log"; e2e_fail "aggregate continuation binary/archive fingerprints did not match"; }
+
+AGGREGATE_RESULT=""
+for _ in $(seq 1 240); do
+    AGGREGATE_RESULT="$(python3 - "$AGG_REPO/.exo/tl-loop/root/run.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print("missing")
+    raise SystemExit(0)
+state = json.loads(path.read_text())
+fsm = state.get("fsm", {})
+slices = state.get("slices", {})
+architecture = slices.get("architecture", {})
+kani = slices.get("kani", {})
+post = architecture.get("post_merge") or {}
+phase = post.get("phase") if isinstance(post, dict) else None
+print(
+    state.get("phase", fsm.get("phase", "unknown")),
+    state.get("current_order", -1),
+    architecture.get("status", "missing"),
+    phase or "none",
+    kani.get("status", "missing"),
+    kani.get("dispatch_intent_id") or "none",
+)
+PY
+    2>/dev/null)" || AGGREGATE_RESULT=""
+    [[ "$AGGREGATE_RESULT" == "tl_done 2 merged complete merged "* ]] && break
+    sleep 0.25
+done
+read -r final_phase final_order architecture_status architecture_post kani_status kani_intent <<< "$AGGREGATE_RESULT"
+if [[ "$final_phase" != "tl_done" || "$final_order" != "2" \
+    || "$architecture_status" != "merged" || "$architecture_post" != "complete" \
+    || "$kani_status" != "merged" || "$kani_intent" == "none" ]]; then
+    cat "$AGG_DIR/init.log"
+    cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true
+    e2e_fail "failed-root aggregate did not recover through integration and the next stage: '$AGGREGATE_RESULT'"
+fi
+
+python3 - "$AGG_REPO" "$AGGREGATE_PR" "$LEAF_PR" "$LEAF_RECEIPT_SHA256" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+aggregate_pr = int(sys.argv[2])
+leaf_pr = int(sys.argv[3])
+expected_receipt = sys.argv[4]
+root_dir = repo / ".exo/tl-loop/root"
+root = json.loads((root_dir / "run.json").read_text())
+child = json.loads((root_dir / "architecture/run.json").read_text())
+leaf_evidence = child["slices"]["issue-811"]["post_merge"]["evidence"]
+receipt_hash = hashlib.sha256(
+    json.dumps(leaf_evidence, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+assert receipt_hash == expected_receipt, "completed issue #811 receipt changed during recovery"
+assert child["fsm"]["phase"] == "tl_pr_filed", "architecture handoff phase was changed"
+assert leaf_evidence["pr_number"] == str(leaf_pr)
+assert leaf_evidence["issue_id"] == "811"
+assert leaf_evidence["issue_close_outcome"] == "closed"
+assert not any(
+    identity.get("slice_id") == "issue-811"
+    for identity_path in (repo / ".exo/agents").glob("*/identity.json")
+    for identity in [json.loads(identity_path.read_text())]
+), "completed issue #811 was dispatched as a new worker"
+assert not any(gate["name"] == "tl-ordered-child-recovery-ambiguous" for gate in root["gates"])
+candidate = root["integration"]["candidates"]["architecture"]
+assert candidate["lifecycle"] == "MERGED"
+assert candidate["aggregate_pr_number"] == aggregate_pr
+assert candidate["active_aggregate_approval_id"]
+assert len(candidate["aggregate_approval_receipts"]) == 1
+journal = json.loads((root_dir / "action-journal.json").read_text())
+aggregate_merges = [
+    entry
+    for entry in journal
+    if entry.get("operation") == "merge_pr" and entry.get("target") == "architecture"
+]
+assert sum(entry.get("status") == "rejected" for entry in aggregate_merges) == 1
+assert sum(entry.get("status") == "confirmed" for entry in aggregate_merges) == 1
+kani_dispatches = [
+    entry
+    for entry in journal
+    if entry.get("operation") == "emit_controller_event"
+    and entry.get("target") == "kani"
+    and isinstance(entry.get("arguments"), dict)
+    and entry["arguments"].get("event_type") == "tl.dispatch_confirmed"
+    and isinstance(entry["arguments"].get("payload"), dict)
+    and entry["arguments"]["payload"].get("boundary") == "sub_tl_started"
+]
+assert len(kani_dispatches) == 1, f"expected one Kani stage dispatch, found {len(kani_dispatches)}"
+assert not any(
+    entry.get("operation") == "spawn_reviewer" and entry.get("target") == "architecture"
+    for entry in journal
+), "aggregate recovery started a root reviewer"
+PY
+
+[[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
+    || e2e_fail "production merge tool did not integrate the aggregate exactly once"
+[[ "$(rg -c "pulls/$LEAF_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
+    || e2e_fail "completed leaf PR was merged again during aggregate recovery"
+[[ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
+    "$AGG_REPO/.exo/agents/architecture/invocation.json")" == "$ARCHITECTURE_INVOCATION_SHA256" ]] \
+    || e2e_fail "completed architecture producer invocation changed during aggregate recovery"
+read -r RECOVERED_TL_WINDOW RECOVERED_TL_DEAD < <(
+    tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{window_id} #{pane_dead}' \
+        | awk '$1 == "TL" { print $2, $3; exit }'
+)
+[[ "$RECOVERED_TL_WINDOW" != "$DEAD_TL_WINDOW" ]] \
+    || e2e_fail "init --continue did not replace the existing exited TL pane"
+[[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc TL || true)" == "1" ]] \
+    || e2e_fail "aggregate recovery created duplicate TL windows"
+
+HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
+    "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+    > "$AGG_DIR/init-repeat.log" 2>&1 || true
+[[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
+    || e2e_fail "repeated continuation duplicated the aggregate merge"
+e2e_log "PASS: actual init --continue replayed the failed root, adopted PR #$AGGREGATE_PR, preserved merged leaf PR #$LEAF_PR, and dispatched Kani once (archive=$AGGREGATE_ARCHIVE_SHA256, build=$AGGREGATE_BUILD_ID)"
 
 echo ""
 echo "============================================"
-echo "  init-recovery E2E: all phases passed"
+if [[ "${E2E_AGGREGATE_ONLY:-0}" == "1" ]]; then
+    echo "  aggregate init-recovery E2E: passed"
+else
+    echo "  init-recovery E2E: all phases passed"
+fi
 echo "============================================"

@@ -791,7 +791,7 @@ e2e-init-recovery:
 # Check the init-recovery E2E harness without launching tmux
 check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/run.sh
-    {{py}} -m py_compile tests/e2e/init-recovery/seed_checkpoint.py tests/e2e/init-recovery/seed_publication.py
+    {{py}} -m py_compile tests/e2e/init-recovery/seed_checkpoint.py tests/e2e/init-recovery/seed_publication.py tests/e2e/init-recovery/seed_aggregate_checkpoint.py
 
 # Run the real-server --continue identity-preservation and corruption
 # classification acceptance scenario (chainlink #1019).

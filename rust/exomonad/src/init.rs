@@ -5282,7 +5282,7 @@ fn root_has_approved_ordered_recovery(value: &Value) -> bool {
     })
 }
 
-fn root_tl_needs_resume(project_dir: &Path) -> Result<bool> {
+fn root_tl_needs_resume(project_dir: &Path, continue_mode: bool) -> Result<bool> {
     let run_path = project_dir.join(".exo/tl-loop/root/run.json");
     if !run_path.exists() {
         return Ok(true);
@@ -5302,10 +5302,10 @@ fn root_tl_needs_resume(project_dir: &Path) -> Result<bool> {
         })?;
     match phase {
         "tl_done" => Ok(false),
-        // A failed root normally stays terminal. An approved recovery gate for a
-        // specifically failed ordered child is the exception: launch the TL so
-        // its checkpoint proof can consume that authorization and reopen it.
-        "tl_failed" => Ok(root_has_approved_ordered_recovery(&value)),
+        // `--continue` always launches a fresh recovery invocation for a failed
+        // root. The controller replays retained evidence and derives the current
+        // verdict; it does not treat the previous TLFailed label as authority.
+        "tl_failed" => Ok(continue_mode || root_has_approved_ordered_recovery(&value)),
         "tl_planning" | "tl_dispatching" | "tl_running" | "tl_waiting" | "tl_merging"
         | "tl_all_merged" | "tl_pr_filed" => Ok(true),
         other => Err(anyhow::anyhow!(
@@ -5764,7 +5764,7 @@ async fn reconcile_existing_session(
         }
         None => false,
     };
-    let root_needs_resume = root_tl_needs_resume(project_dir)?;
+    let root_needs_resume = root_tl_needs_resume(project_dir, continue_mode)?;
     if matches!(
         tl_window_recovery_action(restart_tl, tl_alive, root_needs_resume),
         TlWindowRecoveryAction::Keep
@@ -11958,44 +11958,56 @@ mod tests {
     }
 
     #[test]
-    fn root_tl_resume_requires_missing_or_nonterminal_checkpoint() {
+    fn continue_resumes_failed_root_but_start_still_honors_only_approved_recovery() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(root_tl_needs_resume(dir.path()).unwrap());
+        assert!(root_tl_needs_resume(dir.path(), true).unwrap());
 
         let root = dir.path().join(".exo/tl-loop/root");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_waiting"}}"#).unwrap();
-        assert!(root_tl_needs_resume(dir.path()).unwrap());
+        assert!(root_tl_needs_resume(dir.path(), true).unwrap());
 
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_running"}}"#).unwrap();
-        assert!(root_tl_needs_resume(dir.path()).unwrap());
+        assert!(root_tl_needs_resume(dir.path(), true).unwrap());
 
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_done"}}"#).unwrap();
-        assert!(!root_tl_needs_resume(dir.path()).unwrap());
+        assert!(!root_tl_needs_resume(dir.path(), true).unwrap());
 
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_failed"}}"#).unwrap();
-        assert!(!root_tl_needs_resume(dir.path()).unwrap());
+        assert!(root_tl_needs_resume(dir.path(), true).unwrap());
+        assert!(!root_tl_needs_resume(dir.path(), false).unwrap());
+        assert_eq!(
+            tl_window_recovery_action(
+                false,
+                false,
+                root_tl_needs_resume(dir.path(), true).unwrap(),
+            ),
+            TlWindowRecoveryAction::RemoveAndRelaunch,
+            "--continue must replace an exited TL pane for a saved failed root"
+        );
 
         std::fs::write(
             root.join("run.json"),
             r#"{"fsm":{"phase":"tl_failed"},"gates":[{"name":"tl-ordered-child-recovery-child-a","status":"approved"}],"slices":{"child-a":{"status":"failed"}}}"#,
         )
         .unwrap();
-        assert!(root_tl_needs_resume(dir.path()).unwrap());
+        assert!(root_tl_needs_resume(dir.path(), true).unwrap());
+        assert!(root_tl_needs_resume(dir.path(), false).unwrap());
 
         std::fs::write(
             root.join("run.json"),
             r#"{"fsm":{"phase":"tl_failed"},"gates":[{"name":"tl-ordered-child-recovery-child-a","status":"approved"}],"slices":{"child-a":{"status":"pending"}}}"#,
         )
         .unwrap();
-        assert!(!root_tl_needs_resume(dir.path()).unwrap());
+        assert!(root_tl_needs_resume(dir.path(), true).unwrap());
+        assert!(!root_tl_needs_resume(dir.path(), false).unwrap());
 
         std::fs::write(root.join("run.json"), r#"{"phase":"done"}"#).unwrap();
-        let error = root_tl_needs_resume(dir.path()).unwrap_err();
+        let error = root_tl_needs_resume(dir.path(), true).unwrap_err();
         assert!(error.to_string().contains("unsupported TL checkpoint"));
 
         std::fs::write(root.join("run.json"), r#"{"fsm":{"phase":"tl_waiting"}}"#).unwrap();
-        assert!(root_tl_needs_resume(dir.path()).unwrap());
+        assert!(root_tl_needs_resume(dir.path(), true).unwrap());
     }
 
     #[test]
@@ -12005,7 +12017,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("run.json"), b"{not-json").unwrap();
 
-        let error = root_tl_needs_resume(dir.path()).unwrap_err();
+        let error = root_tl_needs_resume(dir.path(), true).unwrap_err();
         assert!(error.to_string().contains("invalid TL checkpoint"));
     }
 

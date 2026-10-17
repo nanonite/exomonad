@@ -295,7 +295,8 @@ def test_rejected_gate_is_never_re_armed_to_pending(tmp_path: Path) -> None:
     assert after.gates[0].status is GateStatus.REJECTED
     assert result.diagnostics["recovery_gate_status"] == GateStatus.REJECTED.value
     assert isinstance(result.final_state.recursive_fsm, TLFailed)
-    assert after.recursive_fsm == before.recursive_fsm
+    assert after.recursive_fsm == result.final_state.recursive_fsm
+    assert after.recursive_fsm.reason != before.recursive_fsm.reason
 
 
 def test_approved_recovery_reopens_the_child_with_a_fresh_invocation(tmp_path: Path) -> None:
@@ -891,9 +892,9 @@ def test_continue_recovers_from_manifest_without_reloading_plan(
     )
 
     assert isinstance(result.final_state.recursive_fsm, TLRunning)
-    assert result.final_state.slices["child"].status is SliceStatus.SPAWNED
-    # A recovered terminal checkpoint must reach the startup recovery boundary;
-    # child relaunch is now owned by that boundary after finite catch-up.
+    assert result.final_state.slices["child"].status is SliceStatus.FAILED
+    # Entry removes only the old root verdict. Child retry remains deferred to
+    # post-replay reconciliation, rather than being approved before catch-up.
     assert calls == ["loop"]
 
 
