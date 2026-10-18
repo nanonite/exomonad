@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Prevent abandoned Git writers during managed process cancellation (#1231)
 - Audit managed Git process identity and lock ownership (#1242)
 - Stop and reap managed process groups on timeout or cancellation (#1241)
 - Fix continuation recovery for failed roots with parked aggregate integrations (#1227)
