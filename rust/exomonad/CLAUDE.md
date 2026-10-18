@@ -224,6 +224,10 @@ cargo build -p exomonad          # Build Rust binary
 # Unit tests
 cargo test -p exomonad
 
+# Actual-binary init Git-lock readiness (Linux, tmux, complete /proc visibility
+# for the orphan-recovery success branch)
+cargo test -p exomonad --test init_git_lock_readiness -- --nocapture
+
 # MCP integration tests (wrapper script manages server lifecycle)
 just test-mcp
 
@@ -237,6 +241,12 @@ echo '{"session_id":"test","hook_event_name":"PreToolUse","tool_name":"Write","t
 ```
 
 E2E tests live in `tests/e2e/{name}/` and follow a standard pattern: `run.sh` creates a temp repo, configures companions (test subject + Claude testrunner), and runs `exomonad init` as the last line. See root `CLAUDE.md` § "E2E Test Pattern" for the full convention.
+
+The init Git-lock readiness integration test obtains a durable lock-owner proof
+through the production process handler, then invokes the built `exomonad init`
+binary in a disposable repository and tmux server. Its successful quarantine
+branch requires Linux process-descriptor visibility; a restricted `/proc` host
+must instead observe a nonzero, state-preserving readiness refusal.
 
 ## Server Routes
 
