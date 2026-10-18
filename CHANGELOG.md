@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Resume merged aggregates through post-merge recovery instead of publication lookup (#1234)
 - Preserve precise Git outcomes and stable synchronization attempts (#1233)
 - Use one durable owner for local synchronization after PR merges (#1232)
 - Prevent abandoned Git writers during managed process cancellation (#1231)
