@@ -34,6 +34,91 @@ SESSION="e2e-init-recovery"
 CONTINUATION_SESSION="e2e-init-recovery-continuation"
 AGGREGATE_SESSION="e2e-init-aggregate-recovery"
 MOCK_PID=""
+WASM_ARTIFACT_DIR=""
+
+build_guest_wasm() {
+    local role="$1"
+    local package="wasm-guest-$role"
+    local build_dir="$WORK_DIR/wasm-build"
+    mkdir -p "$build_dir" "$WASM_ARTIFACT_DIR"
+    (
+        cd "$PROJECT_ROOT"
+        nix develop .#wasm --command bash -c '
+            set -euo pipefail
+            export PATH="$PWD/.codex/tmp/bin:$PATH"
+            build_dir="$1"
+            package="$2"
+            artifact_dir="$3"
+            wasm32-wasi-cabal build --project-file=cabal.project.wasm \
+                --builddir="$build_dir" "$package"
+            mapfile -t artifacts < <(find "$build_dir" -type f -name "$package.wasm" -print)
+            if (( ${#artifacts[@]} != 1 )); then
+                printf "expected one fresh %s artifact under %s, found %s\\n" \
+                    "$package" "$build_dir" "${#artifacts[@]}" >&2
+                exit 1
+            fi
+            install -m 0644 "${artifacts[0]}" "$artifact_dir/$package.wasm"
+            sha256sum "$artifact_dir/$package.wasm"
+        ' e2e-wasm-build "$build_dir" "$package" "$WASM_ARTIFACT_DIR"
+    )
+}
+
+install_verified_wasm_and_roles() {
+    mkdir -p .exo/wasm
+    for wasm_file in "$WASM_ARTIFACT_DIR"/wasm-guest-*.wasm; do
+        [[ -s "$wasm_file" ]] || e2e_fail "verified scratch WASM artifact is missing: $wasm_file"
+        ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
+    done
+    if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
+        rm -rf .exo/roles
+        cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
+    fi
+}
+
+count_pull_publications() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+log_path = Path(sys.argv[1])
+count = 0
+if log_path.is_file():
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        path = str(request.get("path", "")).split("?", 1)[0]
+        if request.get("method") == "POST" and path.endswith("/api/v1/repos/owner/repo/pulls"):
+            count += 1
+print(count)
+PY
+}
+
+assert_init_status() {
+    local status="$1"
+    local log_path="$2"
+    local context="$3"
+    if [[ "$status" -eq 0 ]]; then
+        return
+    fi
+    if rg -Fq 'open terminal failed: not a terminal' "$log_path"; then
+        e2e_log "$context returned the known detached-terminal status after init completed"
+        return
+    fi
+    cat "$log_path"
+    e2e_fail "$context exited with status $status"
+}
+
+assert_one_live_window() {
+    local role="$1"
+    local count state
+    count="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc "$role" || true)"
+    [[ "$count" == "1" ]] || e2e_fail "repeat init did not retain exactly one $role window"
+    state="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{pane_dead}' | awk -v role="$role" '$1 == role { print $2, $3; exit }')"
+    [[ "${state##* }" == "0" ]] || e2e_fail "repeat init returned without a live $role window"
+}
 
 run_managed_lock_fixture() {
     local test_name="$1"
@@ -73,14 +158,8 @@ print(json.dumps({
 PY
 }
 
-e2e_require_commands just
-e2e_phase "Build" "Rebuilding production guest WASM from the current source..."
-just wasm-all
-GUEST_WASM="$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm"
-[[ -s "$GUEST_WASM" ]] || e2e_fail "fresh devswarm guest WASM was not installed"
-GUEST_WASM_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$GUEST_WASM")"
-e2e_log "Fresh production guest WASM sha256=$GUEST_WASM_SHA256"
-e2e_preflight tmux git curl python3
+e2e_phase "Phase 0" "Checking preconditions..."
+e2e_require_commands nix tmux git curl python3
 
 cleanup() {
     local code=$?
@@ -104,9 +183,25 @@ cleanup() {
     (exit "$code")
     e2e_cleanup
 }
+e2e_create_work_dir "init-recovery"
 trap cleanup EXIT INT TERM
 
-e2e_create_work_dir "init-recovery"
+e2e_phase "Runtime build" "Building the current ExoMonad binary before the disposable run..."
+nix develop --command cargo build -p exomonad
+e2e_find_exomonad
+
+WASM_ARTIFACT_DIR="$WORK_DIR/wasm-artifacts"
+e2e_phase "WASM build" "Building production guest WASM into isolated scratch output..."
+build_guest_wasm devswarm
+build_guest_wasm e2e-test
+GUEST_WASM="$WASM_ARTIFACT_DIR/wasm-guest-devswarm.wasm"
+E2E_WASM="$WASM_ARTIFACT_DIR/wasm-guest-e2e-test.wasm"
+[[ -s "$GUEST_WASM" && -s "$E2E_WASM" ]] \
+    || e2e_fail "isolated current-source guest WASM artifacts are missing"
+GUEST_WASM_SHA256="$(sha256sum "$GUEST_WASM" | cut -d ' ' -f 1)"
+E2E_WASM_SHA256="$(sha256sum "$E2E_WASM" | cut -d ' ' -f 1)"
+e2e_log "Fresh devswarm WASM sha256=$GUEST_WASM_SHA256"
+e2e_log "Fresh e2e-test WASM sha256=$E2E_WASM_SHA256"
 
 if [[ "${E2E_AGGREGATE_ONLY:-0}" != "1" ]]; then
 e2e_phase "Phase 1" "Creating scratch repository..."
@@ -116,7 +211,7 @@ e2e_init_repo "Exomonad init-recovery E2E" "init-recovery-e2e@example.invalid"
 git remote add origin "$REMOTE_DIR"
 git push -u origin main -q
 e2e_run_exomonad_new
-e2e_install_project_wasm_and_roles
+install_verified_wasm_and_roles
 cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
 cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
 cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
@@ -436,14 +531,7 @@ curl -fsS "$AGG_MOCK_URL/api/v1/admin/actions/runners" >/dev/null \
 cd "$AGG_REPO"
 HOME="$AGG_HOME" "$EXOMONAD_BIN" new > "$AGG_DIR/new.log" 2>&1 \
     || { cat "$AGG_DIR/new.log"; e2e_fail "'exomonad new' failed for aggregate recovery fixture"; }
-mkdir -p .exo/wasm
-for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
-    ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
-done
-if [[ -d "$PROJECT_ROOT/.exo/roles" ]]; then
-    rm -rf .exo/roles
-    cp -r "$PROJECT_ROOT/.exo/roles" .exo/roles
-fi
+install_verified_wasm_and_roles
 cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
 cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
 cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
@@ -482,6 +570,9 @@ ARCHITECTURE_INVOCATION_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.
 AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)"
 [[ "$AGGREGATE_MERGE_REQUESTS_BEFORE" == "1" ]] \
     || e2e_fail "fixture did not record exactly one authoritative remote aggregate merge"
+PULL_PUBLICATIONS_BEFORE="$(count_pull_publications "$AGG_DIR/mock.log")"
+[[ "$PULL_PUBLICATIONS_BEFORE" == "2" ]] \
+    || e2e_fail "fixture expected only its leaf and aggregate PR publications, found $PULL_PUBLICATIONS_BEFORE"
 e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR at remote head $AGGREGATE_REMOTE_HEAD with local parent HEAD still at $AGGREGATE_BASE_SHA"
 LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
 printf '%s\n' "$LOCAL_EDIT_STATE_BEFORE" > "$AGG_DIR/local-edits-before.json"
@@ -514,12 +605,15 @@ DEAD_TL_ID="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{win
 [[ "${DEAD_TL_ID##* }" == "1" ]] || e2e_fail "aggregate fixture did not start with an exited TL pane"
 read -r DEAD_TL_WINDOW _ <<< "$DEAD_TL_ID"
 
+AGG_INIT_STATUS=0
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
-    > "$AGG_DIR/init.log" 2>&1 || true
+    > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
 rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init.log" \
     || { cat "$AGG_DIR/init.log"; e2e_fail "aggregate continuation binary/archive fingerprints did not match"; }
 if rg -Fq 'cannot inspect managed process descriptors (permission denied)' "$AGG_DIR/init.log"; then
+    [[ "$AGG_INIT_STATUS" -ne 0 ]] \
+        || e2e_fail "limited-inspection refusal returned success instead of a nonzero init status"
     [[ -e "$AGG_REPO/.git/index.lock" && ! -s "$AGG_REPO/.git/index.lock" ]] \
         || e2e_fail "limited-inspection refusal changed or removed the zero-byte native lock"
     [[ "$(capture_local_edit_state)" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
@@ -551,8 +645,11 @@ assert not any(
 PY
     e2e_fail "positive init recovery is unavailable: this runtime cannot inspect /proc descriptors (permission denied); fail-closed refusal preserved the lock and local edits, and the complete fixture is retained at $WORK_DIR"
 fi
+assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "first aggregate init --continue"
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || true)" == "1" ]] \
     || { cat "$AGG_DIR/init.log"; e2e_fail "init did not report exactly one proven lock recovery"; }
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
+    || e2e_fail "first continuation published a new PR instead of adopting the existing aggregate"
 
 AGGREGATE_RESULT=""
 for _ in $(seq 1 240); do
@@ -692,6 +789,8 @@ run_managed_lock_fixture assert_managed_lock_quarantined_once_for_e2e
 
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "continuation repeated the aggregate merge instead of resuming local synchronization"
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
+    || e2e_fail "continuation published a replacement aggregate PR"
 [[ "$(rg -c "pulls/$LEAF_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
     || e2e_fail "completed leaf PR was merged again during aggregate recovery"
 [[ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
@@ -706,18 +805,27 @@ read -r RECOVERED_TL_WINDOW RECOVERED_TL_DEAD < <(
 [[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc TL || true)" == "1" ]] \
     || e2e_fail "aggregate recovery created duplicate TL windows"
 
+REPEAT_INIT_STATUS=0
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
-    > "$AGG_DIR/init-repeat.log" 2>&1 || true
+    > "$AGG_DIR/init-repeat.log" 2>&1 || REPEAT_INIT_STATUS=$?
+assert_init_status "$REPEAT_INIT_STATUS" "$AGG_DIR/init-repeat.log" "repeated aggregate init --continue"
+rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init-repeat.log" \
+    || { cat "$AGG_DIR/init-repeat.log"; e2e_fail "repeat init did not attach using the verified binary/archive"; }
+assert_one_live_window Server
+assert_one_live_window Watcher
+assert_one_live_window TL
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "repeated continuation duplicated the aggregate merge"
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
+    || e2e_fail "repeat init published a replacement aggregate PR"
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init-repeat.log" || true)" == "0" ]] \
     || e2e_fail "repeated init reported an already-completed lock recovery again"
 LOCAL_EDIT_STATE_AFTER_REPEAT="$(capture_local_edit_state)"
 [[ "$LOCAL_EDIT_STATE_AFTER_REPEAT" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
     || e2e_fail "repeated continuation changed unrelated local edits"
 run_managed_lock_fixture assert_managed_lock_quarantined_once_for_e2e
-e2e_log "PASS: actual init --continue resumed a previously merged aggregate without repeating merge/publication/leaf work, recovered one proven lock, preserved local edits, completed bookkeeping, and dispatched Kani once (archive=$AGGREGATE_ARCHIVE_SHA256, guest=$GUEST_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
+e2e_log "PASS: actual init --continue resumed a previously merged aggregate without repeating merge/publication/leaf work, recovered one proven lock, preserved local edits, completed bookkeeping, and dispatched Kani once (archive=$AGGREGATE_ARCHIVE_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
 
 echo ""
 echo "============================================"

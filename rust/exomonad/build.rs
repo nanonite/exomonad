@@ -38,6 +38,52 @@ fn collect_tl_loop_files(
     Ok(())
 }
 
+fn git_metadata_path(repository_root: &Path, input: &str) -> Option<PathBuf> {
+    let repository = repository_root.to_str()?;
+    let output = Command::new("git")
+        .args(["-C", repository, "rev-parse", "--git-path", input])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    Some(if path.is_absolute() {
+        path
+    } else {
+        repository_root.join(path)
+    })
+}
+
+fn current_branch_ref(repository_root: &Path) -> Option<String> {
+    let Some(repository) = repository_root.to_str() else {
+        return None;
+    };
+    let Ok(output) = Command::new("git")
+        .args(["-C", repository, "symbolic-ref", "--quiet", "HEAD"])
+        .output()
+    else {
+        return None;
+    };
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn register_git_revision_inputs(repository_root: &Path) {
+    for input in ["HEAD", "packed-refs"] {
+        if let Some(path) = git_metadata_path(repository_root, input) {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    if let Some(branch_ref) = current_branch_ref(repository_root) {
+        if let Some(path) = git_metadata_path(repository_root, &branch_ref) {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "CARGO_MANIFEST_DIR is not set"))
@@ -51,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "exomonad must be nested under the repository root",
             )
         })?;
+    register_git_revision_inputs(repository_root);
     let server_build = Command::new("git")
         .args([
             "-C",
