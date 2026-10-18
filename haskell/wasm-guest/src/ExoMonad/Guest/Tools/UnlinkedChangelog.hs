@@ -60,6 +60,7 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
     parseRemoteHead,
     postMergePushGitArgs,
     refName,
+    resolveSelectedRemoteAt,
     runGitAt,
     validToken,
   )
@@ -320,21 +321,25 @@ unlinkedChangelogEntryCore args =
         _ -> outcome "entry_write_failed" "parent head moved after synchronization" Nothing
 
     push commitSha = do
-      remote <- remoteHead
-      case remote of
-        Right observed | observed == commitSha -> added commitSha observed
-        _ -> do
-          pushed <- runGitAt wd (postMergePushGitArgs (uceParentBranch args) (uceExpectedBaseSha args))
-          case pushed of
-            Left err -> resetThen "entry_push_failed" err
-            Right _ -> do
-              observed <- remoteHead
-              case observed of
-                Left err -> outcome "entry_added" ("push succeeded but the remote head could not be read: " <> err) (Just (commitSha, commitSha))
-                Right headSha -> added commitSha headSha
+      selectedRemote <- resolveSelectedRemoteAt wd
+      case selectedRemote of
+        Left err -> outcome "entry_push_failed" err Nothing
+        Right remote -> do
+          observed <- remoteHead remote
+          case observed of
+            Right headSha | headSha == commitSha -> added commitSha headSha
+            _ -> do
+              pushed <- runGitAt wd (postMergePushGitArgs remote (uceParentBranch args) (uceExpectedBaseSha args))
+              case pushed of
+                Left err -> resetThen "entry_push_failed" err
+                Right _ -> do
+                  observedAfterPush <- remoteHead remote
+                  case observedAfterPush of
+                    Left err -> outcome "entry_added" ("push succeeded but the remote head could not be read: " <> err) (Just (commitSha, commitSha))
+                    Right headSha -> added commitSha headSha
 
-    remoteHead = do
-      listed <- runGitAt wd ["ls-remote", "--exit-code", "origin", refName (uceParentBranch args)]
+    remoteHead remote = do
+      listed <- runGitAt wd ["ls-remote", "--exit-code", remote, refName (uceParentBranch args)]
       pure (listed >>= parseRemoteHead)
 
     added commitSha observed = outcome "entry_added" "" (Just (commitSha, observed))

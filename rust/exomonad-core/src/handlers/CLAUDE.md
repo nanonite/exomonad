@@ -152,7 +152,7 @@ Handles effects in the `merge_pr.*` namespace.
 
 `gh pr merge` runs WITHOUT `--delete-branch` because worktree branches cannot be deleted while checked out. Verified orphan cleanup removes eligible worktrees and their local branches afterward.
 
-Post-merge, the Haskell tool handler runs `git pull` via `process.run` to fast-forward the local branch. If pull fails, the tool response includes guidance to run `git pull --rebase` manually.
+The merge handler confirms the remote Forgejo merge only. It does not fetch, pull, or fast-forward local branches. The durable TL `post_merge_parent_sync` boundary owns local fetch and fast-forward, validates the resulting Git evidence, and checkpoints its receipt before issue/changelog/push bookkeeping advances. A synchronization refusal does not revoke the remote merge result.
 
 For declared sub-TL aggregates, the handler resolves the supplied parent
 approval reference from the active parent RunStore and checks its accepted

@@ -89,6 +89,8 @@ unlinkedChangelogTests =
                   ok "",
                   ok "",
                   ok "entry",
+                  failed "",
+                  ok "origin",
                   ok "base\trefs/heads/main",
                   ok "",
                   ok "entry\trefs/heads/main"
@@ -105,6 +107,8 @@ unlinkedChangelogTests =
                   ok "",
                   ok "",
                   ok "entry",
+                  failed "",
+                  ok "origin",
                   ok "other\trefs/heads/main",
                   failed "stale info",
                   ok ""
@@ -124,6 +128,8 @@ unlinkedChangelogTests =
                   ok "entry",
                   ok "base",
                   ok ("chore: record changelog for merged slice slice-a\n\n" <> intentTrailer "intent-1"),
+                  failed "",
+                  ok "origin",
                   ok "entry\trefs/heads/main"
                 ]
         assertEqual "outcome" (Just "entry_added") (field "outcome" result)

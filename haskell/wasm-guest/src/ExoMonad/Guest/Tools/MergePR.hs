@@ -28,13 +28,9 @@ import Control.Monad (void, when)
 import Control.Monad.Freer (Eff)
 import Data.Aeson (FromJSON, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
-import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BSL
-import Data.Map qualified as Map
-import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Data.Text.Encoding qualified as TE
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Effects.Agent qualified as Agent
@@ -44,14 +40,12 @@ import Effects.Git qualified as Git
 import Effects.Github qualified as GH
 import Effects.Log qualified as Log
 import Effects.MergePr qualified as MP
-import Effects.Process qualified as Proc
 import ExoMonad.Effects.Agent (AgentCleanup, AgentWatcherPrState)
 import ExoMonad.Effects.FilePR (FilePRLocalPrGet)
 import ExoMonad.Effects.Git (GitGetBranch, GitGetRepoInfo)
 import ExoMonad.Effects.GitHub (GitHubGetPullRequest)
 import ExoMonad.Effects.Log (LogEmitEvent, LogError, LogInfo)
 import ExoMonad.Effects.MergePR (MergePRMergePr)
-import ExoMonad.Effects.Process (ProcessRun)
 import ExoMonad.Guest.Tool.Class (Effects, MCPCallOutput, MCPTool (..), errorResult, successResult)
 import ExoMonad.Guest.Tool.Schema (JsonSchema (..), genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect, suspendEffect_)
@@ -134,26 +128,22 @@ data MergePROutput = MergePROutput
   { mpoSuccess :: Bool,
     mpoMessage :: Text,
     mpoGitFetched :: Bool,
-    mpoBranchName :: Text,
-    mpoPullOk :: Bool,
-    mpoPullFailure :: Maybe Text
+    mpoBranchName :: Text
   }
   deriving (Show, Eq, Generic)
 
 instance Aeson.ToJSON MergePROutput where
-  toJSON (MergePROutput s m g b p pf) =
+  toJSON (MergePROutput s m g b) =
     object
       [ "success" .= s,
         "message" .= m,
         "git_fetched" .= g,
-        "branch_name" .= b,
-        "pull_ok" .= p,
-        "pull_failure" .= pf
+        "branch_name" .= b
       ]
 
 -- | Shared tool description for merge_pr.
 mergePRDescription :: Text
-mergePRDescription = "Merge a pull request and fetch changes. Leaf PRs require an authenticated Forgejo reviewer approval for the exact current head. A plan-declared aggregate may instead carry its durable parent-approval reference; the host validates that receipt and all current evidence before merging. Both paths require passing CI, verified publication ownership, and exact compare evidence. Stale or missing evidence is rejected. Pass chainlink_issue_id to close an issue after a successful merge."
+mergePRDescription = "Merge a pull request after live readiness checks. Local parent synchronization and post-merge bookkeeping belong to the durable TL post-merge flow; this tool does not pull. Leaf PRs require an authenticated Forgejo reviewer approval for the exact current head. A plan-declared aggregate may instead carry its durable parent-approval reference; the host validates that receipt and all current evidence before merging. Both paths require passing CI, verified publication ownership, and exact compare evidence. Stale or missing evidence is rejected. Pass chainlink_issue_id to close an issue after a successful merge."
 
 -- | Shared tool schema for merge_pr.
 mergePRSchema :: Aeson.Object
@@ -166,7 +156,7 @@ mergePRSchema =
       ("aggregate_approval", "Durable parent approval reference for a declared aggregate PR; host revalidates it")
     ]
 
--- | Core merge_pr I/O: self-merge guard + readiness check + merge + cleanup + git pull.
+-- | Core merge_pr I/O: self-merge guard + readiness check + remote merge + cleanup.
 -- Returns Left on error, Right MergePROutput on success.
 mergePRCore :: MergePRArgs -> Eff Effects (Either Text MergePROutput)
 mergePRCore args = do
@@ -206,9 +196,9 @@ mergePRCore args = do
 mergePRRender :: MergePROutput -> MCPCallOutput
 mergePRRender output =
   let nextText =
-        if mpoPullOk output
-          then "Verify build: cargo check --workspace. Especially important after parallel merges — changes may interact."
-          else pullFailureNext output
+        if mpoSuccess output
+          then "The remote merge is confirmed. The durable post-merge flow owned by the TL controller handles local synchronization and bookkeeping."
+          else "The remote merge was not confirmed. Reconcile the PR state before retrying."
    in successResult $
         object
           [ "success" .= mpoSuccess output,
@@ -219,43 +209,6 @@ mergePRRender output =
 
 -- | Forgejo reviewer readiness.
 data Readiness = Ready | NotReady Text
-
-data PullOutcome = PullOutcome
-  { pullOutcomeOk :: Bool,
-    pullOutcomeFailure :: Maybe Text
-  }
-
-pullFailureNext :: MergePROutput -> Text
-pullFailureNext output =
-  fromMaybe "git pull failed" (mpoPullFailure output)
-    <> ". Run 'git pull --rebase' manually to sync your local branch. Then verify build: cargo check --workspace."
-
-pullFailureSummary :: Int -> Text -> Text -> Text
-pullFailureSummary exitCode stdout stderr =
-  commandFailureSummary "git pull" exitCode stdout stderr
-
-commandFailureSummary :: Text -> Int -> Text -> Text -> Text
-commandFailureSummary label exitCode stdout stderr =
-  label
-    <> " failed (exit code "
-    <> T.pack (show exitCode)
-    <> "): "
-    <> firstDiagnosticLine stderr stdout
-
-firstDiagnosticLine :: Text -> Text -> Text
-firstDiagnosticLine stderr stdout =
-  let candidates = filter (not . T.null) (map T.strip (T.lines stderr <> T.lines stdout))
-   in truncateText 240 (fromMaybe "no stderr or stdout captured" (safeHead candidates))
-
-safeHead :: [a] -> Maybe a
-safeHead [] = Nothing
-safeHead (x : _) = Just x
-
-truncateText :: Int -> Text -> Text
-truncateText limit value =
-  if T.length value <= limit
-    then value
-    else T.take limit value <> "..."
 
 mergeFromLocalPr :: MergePRArgs -> Int -> Text -> Text -> Text -> FPR.LocalPrResponse -> Eff Effects (Either Text MergePROutput)
 mergeFromLocalPr args prNum owner repo currentBranch localPr = do
@@ -535,105 +488,27 @@ runMerge args observedHead = do
 
       void $ suspendEffect_ @LogInfo (Log.InfoRequest {Log.infoRequestMessage = TL.fromStrict $ "MergePR: " <> mergeMsg, Log.infoRequestFields = ""})
 
-      pullOutcome <-
-        if mergeSuccess
-          then do
-            let eventPayload =
-                  BSL.toStrict $
-                    Aeson.encode $
-                      object
-                        [ "pr_number" .= mprPrNumber args,
-                          "success" .= True,
-                          "head_sha" .= headShaValue,
-                          "head_sha_finding" .= headShaFinding
-                        ]
-            void $
-              suspendEffect_ @LogEmitEvent
-                ( Log.EmitEventRequest
-                    { Log.emitEventRequestEventType = "pr.merged",
-                      Log.emitEventRequestPayload = eventPayload,
-                      Log.emitEventRequestTimestamp = 0
-                    }
-                )
-
-            -- Fast-forward local branch after merge
-            pullOutcomeStatus <- do
-              let pullReq =
-                    Proc.RunRequest
-                      { Proc.runRequestCommand = "git",
-                        Proc.runRequestArgs = V.fromList ["pull"],
-                        Proc.runRequestWorkingDir = maybe "" TL.fromStrict (mprWorkingDir args),
-                        Proc.runRequestEnv = Map.empty,
-                        Proc.runRequestTimeoutMs = 30000
-                      }
-              pullResult <- suspendEffect @ProcessRun pullReq
-              case pullResult of
-                Left err -> do
-                  let failure = "git pull failed before exit code was captured: " <> T.pack (show err)
-                  void $
-                    suspendEffect_ @LogError
-                      ( Log.ErrorRequest
-                          { Log.errorRequestMessage = TL.fromStrict $ "MergePR: " <> failure,
-                            Log.errorRequestFields = ""
-                          }
-                      )
-                  pure PullOutcome {pullOutcomeOk = False, pullOutcomeFailure = Just failure}
-                Right pullResp
-                  | Proc.runResponseExitCode pullResp == 0 ->
-                      pure PullOutcome {pullOutcomeOk = True, pullOutcomeFailure = Nothing}
-                  | otherwise -> do
-                      let exitCode = fromIntegral (Proc.runResponseExitCode pullResp)
-                          stdoutText = TL.toStrict (Proc.runResponseStdout pullResp)
-                          stderrText = TL.toStrict (Proc.runResponseStderr pullResp)
-                          failure = pullFailureSummary exitCode stdoutText stderrText
-                          fields =
-                            TE.encodeUtf8 $
-                              "exit_code="
-                                <> T.pack (show exitCode)
-                                <> "\nstdout:\n"
-                                <> stdoutText
-                                <> "\nstderr:\n"
-                                <> stderrText
-                      void $
-                        suspendEffect_ @LogError
-                          ( Log.ErrorRequest
-                              { Log.errorRequestMessage = TL.fromStrict $ "MergePR: " <> failure,
-                                Log.errorRequestFields = fields
-                              }
-                          )
-                      pure PullOutcome {pullOutcomeOk = False, pullOutcomeFailure = Just failure}
-
-            -- Auto-cleanup: close agent tab, remove worktree, unregister
-            case extractAgentName branchName of
-              Just slug -> do
-                let cleanupReq =
-                      Agent.CleanupRequest
-                        { Agent.cleanupRequestIssue = TL.fromStrict slug,
-                          Agent.cleanupRequestForce = True,
-                          Agent.cleanupRequestSubrepo = ""
-                        }
-                cleanupResult <- suspendEffect @AgentCleanup cleanupReq
-                case cleanupResult of
-                  Left cleanupErr ->
-                    void $
-                      suspendEffect_ @LogInfo
-                        ( Log.InfoRequest
-                            { Log.infoRequestMessage = TL.fromStrict $ "MergePR: cleanup failed (non-fatal): " <> T.pack (show cleanupErr),
-                              Log.infoRequestFields = ""
-                            }
-                        )
-                  Right _ ->
-                    void $
-                      suspendEffect_ @LogInfo
-                        ( Log.InfoRequest
-                            { Log.infoRequestMessage = TL.fromStrict $ "MergePR: cleaned up agent " <> slug,
-                              Log.infoRequestFields = ""
-                            }
-                        )
-              Nothing -> pure ()
-
-            pure pullOutcomeStatus
-          else pure PullOutcome {pullOutcomeOk = True, pullOutcomeFailure = Nothing}
+      if mergeSuccess
+        then do
+          let eventPayload =
+                BSL.toStrict $
+                  Aeson.encode $
+                    object
+                      [ "pr_number" .= mprPrNumber args,
+                        "success" .= True,
+                        "head_sha" .= headShaValue,
+                        "head_sha_finding" .= headShaFinding
+                      ]
+          void $
+            suspendEffect_ @LogEmitEvent
+              ( Log.EmitEventRequest
+                  { Log.emitEventRequestEventType = "pr.merged",
+                    Log.emitEventRequestPayload = eventPayload,
+                    Log.emitEventRequestTimestamp = 0
+                  }
+              )
+          cleanupMergedAgent branchName
+        else pure ()
 
       pure $
         Right $
@@ -641,10 +516,35 @@ runMerge args observedHead = do
             { mpoSuccess = mergeSuccess,
               mpoMessage = mergeMsg,
               mpoGitFetched = gitFetched,
-              mpoBranchName = branchName,
-              mpoPullOk = pullOutcomeOk pullOutcome,
-              mpoPullFailure = pullOutcomeFailure pullOutcome
+              mpoBranchName = branchName
             }
+
+cleanupMergedAgent :: Text -> Eff Effects ()
+cleanupMergedAgent branchName =
+  case extractAgentName branchName of
+    Nothing -> pure ()
+    Just slug -> do
+      let cleanupReq =
+            Agent.CleanupRequest
+              { Agent.cleanupRequestIssue = TL.fromStrict slug,
+                Agent.cleanupRequestForce = True,
+                Agent.cleanupRequestSubrepo = ""
+              }
+      cleanupResult <- suspendEffect @AgentCleanup cleanupReq
+      case cleanupResult of
+        Left cleanupErr ->
+          logCleanupMessage $ "cleanup failed (non-fatal): " <> T.pack (show cleanupErr)
+        Right _ -> logCleanupMessage $ "cleaned up agent " <> slug
+
+logCleanupMessage :: Text -> Eff Effects ()
+logCleanupMessage message =
+  void $
+    suspendEffect_ @LogInfo
+      ( Log.InfoRequest
+          { Log.infoRequestMessage = TL.fromStrict $ "MergePR: " <> message,
+            Log.infoRequestFields = ""
+          }
+      )
 
 toProtoAggregateApproval :: AggregateApprovalRef -> MP.AggregateApprovalReference
 toProtoAggregateApproval reference =

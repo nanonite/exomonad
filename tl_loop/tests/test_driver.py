@@ -6136,7 +6136,10 @@ def test_approved_run_gate_retries_in_live_controller(tmp_path: Path) -> None:
                 "pr_state": "closed",
             },
         ],
-        merge_response={"success": True, "result": {"merged": True}},
+        merge_response={
+            "success": True,
+            "result": {"merged": True, "git_fetched": False},
+        },
     )
     resumed = _apply_convergence(
         approved, tracker, store, config, EffectClient(resumed_transport), journal
@@ -6227,6 +6230,8 @@ def test_valid_exact_head_review_still_merges_without_parking(tmp_path: Path) ->
     )
 
     assert result.slices["leaf-a"].status is SliceStatus.MERGED
+    assert result.slices["leaf-a"].post_merge is not None
+    assert result.slices["leaf-a"].post_merge.phase.value != "not_started"
     assert not any(name == "chainlink_issue_create" for name, _ in transport.calls)
     assert not any(
         name == "emit_controller_event"
@@ -6413,6 +6418,7 @@ def test_convergence_executes_journaled_direct_merge_with_compare_evidence(tmp_p
     assert merge_arguments["expected_merge_tree_sha"] == "tree-a"
     merge_entries = journal.confirmed_entries("merge_pr", "leaf-a")
     assert len(merge_entries) == 1
+    assert len(journal.confirmed_entries("post_merge_parent_sync", "leaf-a")) == 1
 
 
 def test_slice_recovery_is_projected_into_the_canonical_scope_before_release(

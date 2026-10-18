@@ -39,6 +39,8 @@ module ExoMonad.Guest.Tools.PostMergeRecovery
     interpretGitResult,
     runGitAt,
     parseRemoteHead,
+    resolveSelectedRemoteAt,
+    selectRemote,
     refName,
     validToken,
     logInfo,
@@ -328,146 +330,147 @@ postMergeParentSyncCore args = do
   case validateParentSync args of
     Left err -> pure $ Left err
     Right () -> do
-      branch <- runGitAt (pmpWorkingDir args) ["branch", "--show-current"]
-      case branch of
+      selectedRemote <- resolveSelectedRemoteAt (pmpWorkingDir args)
+      case selectedRemote of
         Left err -> pure $ Left err
-        Right current
-          | T.strip current /= pmpParentBranch args ->
-              pure $ Left "parent synchronization requires the requested branch to be checked out"
-          | otherwise -> do
-              fetched <-
-                runGitAt
-                  (pmpWorkingDir args)
-                  (postMergeParentSyncFetchArgs (pmpParentBranch args))
-              case fetched of
-                Left err -> pure $ Left err
-                Right _ -> do
-                  merged <-
-                    runGitAt
-                      (pmpWorkingDir args)
-                      (postMergeParentSyncMergeArgs (pmpParentBranch args))
-                  case merged of
+        Right remote -> do
+          branch <- runGitAt (pmpWorkingDir args) ["branch", "--show-current"]
+          case branch of
+            Left err -> pure $ Left err
+            Right current
+              | T.strip current /= pmpParentBranch args ->
+                  pure $ Left "parent synchronization requires the requested branch to be checked out"
+              | otherwise -> do
+                  fetched <- runGitAt (pmpWorkingDir args) (postMergeParentSyncFetchArgs remote (pmpParentBranch args))
+                  case fetched of
                     Left err -> pure $ Left err
                     Right _ -> do
-                      parentCommit <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
-                      remoteHead <- runGitAt (pmpWorkingDir args) ["rev-parse", remoteRef (pmpParentBranch args)]
-                      case (parentCommit, remoteHead) of
-                        (Right parent, Right remote)
-                          | parent /= remote -> pure $ Left "parent synchronization produced divergent local and remote heads"
-                          | otherwise -> do
-                              integration <- verifyMergeIntegrationAt (pmpWorkingDir args) args parent
-                              case integration of
-                                Left err -> pure $ Left err
-                                Right integrationProof ->
-                                  pure $
-                                    Right
-                                      ( object
-                                          [ "child_id" .= pmpChildId args,
-                                            "pr_number" .= pmpPrNumber args,
-                                            "repository" .= pmpRepository args,
-                                            "parent_branch" .= pmpParentBranch args,
-                                            "merged_head_sha" .= pmpMergedHeadSha args,
-                                            "expected_base_sha" .= pmpExpectedBaseSha args,
-                                            "lane_epoch" .= pmpLaneEpoch args,
-                                            "parent_commit_sha" .= parent,
-                                            "remote_head_sha" .= remote,
-                                            "ancestry_proof" .= legacyProof integrationProof,
-                                            "merge_integration_proof" .= integrationProof
-                                          ]
-                                      )
-                        _ -> pure $ Left "parent synchronization could not read authoritative heads"
+                      merged <- runGitAt (pmpWorkingDir args) (postMergeParentSyncMergeArgs remote (pmpParentBranch args))
+                      case merged of
+                        Left err -> pure $ Left err
+                        Right _ -> do
+                          parentCommit <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+                          remoteHead <- runGitAt (pmpWorkingDir args) ["rev-parse", remoteRef remote (pmpParentBranch args)]
+                          case (parentCommit, remoteHead) of
+                            (Right parent, Right observedRemote)
+                              | parent /= observedRemote -> pure $ Left "parent synchronization produced divergent local and remote heads"
+                              | otherwise -> do
+                                  integration <- verifyMergeIntegrationAt (pmpWorkingDir args) args parent
+                                  case integration of
+                                    Left err -> pure $ Left err
+                                    Right integrationProof ->
+                                      pure $
+                                        Right
+                                          ( object
+                                              [ "child_id" .= pmpChildId args,
+                                                "pr_number" .= pmpPrNumber args,
+                                                "repository" .= pmpRepository args,
+                                                "parent_branch" .= pmpParentBranch args,
+                                                "remote_name" .= remote,
+                                                "merged_head_sha" .= pmpMergedHeadSha args,
+                                                "expected_base_sha" .= pmpExpectedBaseSha args,
+                                                "lane_epoch" .= pmpLaneEpoch args,
+                                                "parent_commit_sha" .= parent,
+                                                "remote_head_sha" .= observedRemote,
+                                                "ancestry_proof" .= legacyProof integrationProof,
+                                                "merge_integration_proof" .= integrationProof
+                                              ]
+                                          )
+                            _ -> pure $ Left "parent synchronization could not read authoritative heads"
 
 postMergeRemoteReconcileCore :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Eff effs (Either Text Value)
 postMergeRemoteReconcileCore args = do
   case validateParentSync args of
     Left err -> pure $ Left err
     Right () -> do
-      branch <- runGitAt (pmpWorkingDir args) ["branch", "--show-current"]
-      case branch of
+      selectedRemote <- resolveSelectedRemoteAt (pmpWorkingDir args)
+      case selectedRemote of
         Left err -> pure $ Left err
-        Right current
-          | T.strip current /= pmpParentBranch args ->
-              pure $ Left "remote reconciliation requires the requested branch to be checked out"
-          | otherwise -> do
-              fetched <-
-                runGitAt
-                  (pmpWorkingDir args)
-                  (postMergeParentSyncFetchArgs (pmpParentBranch args))
-              case fetched of
-                Left err -> pure $ Left err
-                Right _ -> do
-                  remoteBefore <-
-                    runGitAt
-                      (pmpWorkingDir args)
-                      ["rev-parse", remoteRef (pmpParentBranch args)]
-                  localHead <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
-                  case (remoteBefore, localHead) of
-                    (Right remote, Right local)
-                      | remote == pmpExpectedBaseSha args ->
-                          pure $ Left "remote reconciliation found no parent-branch advancement"
-                      | local == pmpExpectedBaseSha args ->
-                          pure $ Left "remote reconciliation found no local bookkeeping to rebuild"
-                      | otherwise -> do
-                          baseReachable <-
-                            runGitAt
-                              (pmpWorkingDir args)
-                              ["merge-base", "--is-ancestor", pmpExpectedBaseSha args, local]
-                          case baseReachable of
-                            Left err -> pure $ Left ("failed parent-base ancestry check: " <> err)
-                            Right _ -> do
-                              rebased <-
+        Right remote -> do
+          branch <- runGitAt (pmpWorkingDir args) ["branch", "--show-current"]
+          case branch of
+            Left err -> pure $ Left err
+            Right current
+              | T.strip current /= pmpParentBranch args ->
+                  pure $ Left "remote reconciliation requires the requested branch to be checked out"
+              | otherwise -> do
+                  fetched <- runGitAt (pmpWorkingDir args) (postMergeParentSyncFetchArgs remote (pmpParentBranch args))
+                  case fetched of
+                    Left err -> pure $ Left err
+                    Right _ -> do
+                      remoteBefore <-
+                        runGitAt
+                          (pmpWorkingDir args)
+                          ["rev-parse", remoteRef remote (pmpParentBranch args)]
+                      localHead <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+                      case (remoteBefore, localHead) of
+                        (Right remoteHeadBefore, Right local)
+                          | remoteHeadBefore == pmpExpectedBaseSha args ->
+                              pure $ Left "remote reconciliation found no parent-branch advancement"
+                          | local == pmpExpectedBaseSha args ->
+                              pure $ Left "remote reconciliation found no local bookkeeping to rebuild"
+                          | otherwise -> do
+                              baseReachable <-
                                 runGitAt
                                   (pmpWorkingDir args)
-                                  (postMergeRemoteReconcileRebaseArgs (pmpParentBranch args) (pmpExpectedBaseSha args))
-                              case rebased of
-                                Left err -> do
-                                  _ <- runGitAt (pmpWorkingDir args) ["rebase", "--abort"]
-                                  pure $ Left ("failed to rebuild bookkeeping on the advanced parent: " <> err)
+                                  ["merge-base", "--is-ancestor", pmpExpectedBaseSha args, local]
+                              case baseReachable of
+                                Left err -> pure $ Left ("failed parent-base ancestry check: " <> err)
                                 Right _ -> do
-                                  rebuilt <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
-                                  remoteAfter <-
+                                  rebased <-
                                     runGitAt
                                       (pmpWorkingDir args)
-                                      ["rev-parse", remoteRef (pmpParentBranch args)]
-                                  case (rebuilt, remoteAfter) of
-                                    (Right rebuiltHead, Right remoteHead)
-                                      | remoteHead /= remote ->
-                                          pure $ Left "parent branch advanced during bookkeeping rebuild; recovery must restart"
-                                      | otherwise -> do
-                                          remoteProof <-
-                                            verifyAncestryAt
-                                              (pmpWorkingDir args)
-                                              remoteHead
-                                              rebuiltHead
-                                          integration <-
-                                            verifyReconcileIntegrationAt
-                                              (pmpWorkingDir args)
-                                              args
-                                              rebuiltHead
-                                          case (remoteProof, integration) of
-                                            (Right remoteAncestry, Right integrationProof) ->
-                                              pure $
-                                                Right
-                                                  ( object
-                                                      [ "child_id" .= pmpChildId args,
-                                                        "pr_number" .= pmpPrNumber args,
-                                                        "repository" .= pmpRepository args,
-                                                        "parent_branch" .= pmpParentBranch args,
-                                                        "merged_head_sha" .= pmpMergedHeadSha args,
-                                                        "expected_base_sha" .= pmpExpectedBaseSha args,
-                                                        "lane_epoch" .= pmpLaneEpoch args,
-                                                        "parent_commit_sha" .= rebuiltHead,
-                                                        "rebuilt_commit_sha" .= rebuiltHead,
-                                                        "remote_head_sha" .= remoteHead,
-                                                        "new_base_sha" .= remoteHead,
-                                                        "remote_ancestry_proof" .= remoteAncestry,
-                                                        "ancestry_proof" .= legacyProof integrationProof,
-                                                        "merge_integration_proof" .= integrationProof
-                                                      ]
-                                                  )
-                                            _ -> pure $ Left "bookkeeping rebuild could not prove the rebuilt integration"
-                                    _ -> pure $ Left "bookkeeping rebuild could not read authoritative heads"
-                    _ -> pure $ Left "remote reconciliation could not read authoritative heads"
+                                      (postMergeRemoteReconcileRebaseArgs remote (pmpParentBranch args) (pmpExpectedBaseSha args))
+                                  case rebased of
+                                    Left err -> do
+                                      _ <- runGitAt (pmpWorkingDir args) ["rebase", "--abort"]
+                                      pure $ Left ("failed to rebuild bookkeeping on the advanced parent: " <> err)
+                                    Right _ -> do
+                                      rebuilt <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+                                      remoteAfter <-
+                                        runGitAt
+                                          (pmpWorkingDir args)
+                                          ["rev-parse", remoteRef remote (pmpParentBranch args)]
+                                      case (rebuilt, remoteAfter) of
+                                        (Right rebuiltHead, Right remoteHead)
+                                          | remoteHead /= remoteHeadBefore ->
+                                              pure $ Left "parent branch advanced during bookkeeping rebuild; recovery must restart"
+                                          | otherwise -> do
+                                              remoteProof <-
+                                                verifyAncestryAt
+                                                  (pmpWorkingDir args)
+                                                  remoteHead
+                                                  rebuiltHead
+                                              integration <-
+                                                verifyReconcileIntegrationAt
+                                                  (pmpWorkingDir args)
+                                                  args
+                                                  rebuiltHead
+                                              case (remoteProof, integration) of
+                                                (Right remoteAncestry, Right integrationProof) ->
+                                                  pure $
+                                                    Right
+                                                      ( object
+                                                          [ "child_id" .= pmpChildId args,
+                                                            "pr_number" .= pmpPrNumber args,
+                                                            "repository" .= pmpRepository args,
+                                                            "parent_branch" .= pmpParentBranch args,
+                                                            "remote_name" .= remote,
+                                                            "merged_head_sha" .= pmpMergedHeadSha args,
+                                                            "expected_base_sha" .= pmpExpectedBaseSha args,
+                                                            "lane_epoch" .= pmpLaneEpoch args,
+                                                            "parent_commit_sha" .= rebuiltHead,
+                                                            "rebuilt_commit_sha" .= rebuiltHead,
+                                                            "remote_head_sha" .= remoteHead,
+                                                            "new_base_sha" .= remoteHead,
+                                                            "remote_ancestry_proof" .= remoteAncestry,
+                                                            "ancestry_proof" .= legacyProof integrationProof,
+                                                            "merge_integration_proof" .= integrationProof
+                                                          ]
+                                                      )
+                                                _ -> pure $ Left "bookkeeping rebuild could not prove the rebuilt integration"
+                                        _ -> pure $ Left "bookkeeping rebuild could not read authoritative heads"
+                        _ -> pure $ Left "remote reconciliation could not read authoritative heads"
 
 postMergeChangelogCore :: (Member SuspendYield effs) => PostMergeChangelogArgs -> Eff effs (Either Text Value)
 postMergeChangelogCore args = do
@@ -530,46 +533,55 @@ postMergePushCore args = do
   case validatePush args of
     Left err -> pure $ Left err
     Right () -> do
-      branch <- runGitAt (pmpuWorkingDir args) ["branch", "--show-current"]
-      case branch of
+      selectedRemote <- resolveSelectedRemoteAt (pmpuWorkingDir args)
+      case selectedRemote of
         Left err -> pure $ Left err
-        Right current
-          | T.strip current /= pmpuParentBranch args ->
-              pure $ Left "parent bookkeeping push requires the requested parent branch to be checked out"
-          | otherwise -> do
-              pushed <-
-                runGitAt
-                  (pmpuWorkingDir args)
-                  (postMergePushGitArgs (pmpuParentBranch args) (pmpuExpectedBaseSha args))
-              case pushed of
-                Left err -> pure $ Left err
-                Right _ -> do
-                  remote <- runGitAt (pmpuWorkingDir args) ["ls-remote", "--exit-code", "origin", refName (pmpuParentBranch args)]
-                  case remote >>= parseRemoteHead of
+        Right remote -> do
+          branch <- runGitAt (pmpuWorkingDir args) ["branch", "--show-current"]
+          case branch of
+            Left err -> pure $ Left err
+            Right current
+              | T.strip current /= pmpuParentBranch args ->
+                  pure $ Left "parent bookkeeping push requires the requested parent branch to be checked out"
+              | otherwise -> do
+                  pushed <-
+                    runGitAt
+                      (pmpuWorkingDir args)
+                      (postMergePushGitArgs remote (pmpuParentBranch args) (pmpuExpectedBaseSha args))
+                  case pushed of
                     Left err -> pure $ Left err
-                    Right remoteHead
-                      | remoteHead /= pmpuPushedCommit args -> pure $ Left "parent bookkeeping push returned a different remote head"
-                      | otherwise -> do
-                          ancestry <- verifyAncestryAt (pmpuWorkingDir args) (pmpuPushedCommit args) remoteHead
-                          case ancestry of
-                            Left err -> pure $ Left err
-                            Right proof ->
-                              pure $
-                                Right
-                                  ( object
-                                      [ "repository" .= pmpuRepository args,
-                                        "parent_branch" .= pmpuParentBranch args,
-                                        "child_id" .= pmpuChildId args,
-                                        "lane_epoch" .= pmpuLaneEpoch args,
-                                        "push_intent_id" .= pmpuPushIntentId args,
-                                        "push_journal_id" .= pmpuPushJournalId args,
-                                        "push_receipt_id" .= receiptId args,
-                                        "expected_base_sha" .= pmpuExpectedBaseSha args,
-                                        "pushed_commit" .= pmpuPushedCommit args,
-                                        "observed_remote_head" .= remoteHead,
-                                        "ancestry_proof" .= proof
-                                      ]
-                                  )
+                    Right _ -> do
+                      observed <-
+                        runGitAt
+                          (pmpuWorkingDir args)
+                          ["ls-remote", "--exit-code", remote, refName (pmpuParentBranch args)]
+                      case observed >>= parseRemoteHead of
+                        Left err -> pure $ Left err
+                        Right remoteHead
+                          | remoteHead /= pmpuPushedCommit args ->
+                              pure $ Left "parent bookkeeping push returned a different remote head"
+                          | otherwise -> do
+                              ancestry <- verifyAncestryAt (pmpuWorkingDir args) (pmpuPushedCommit args) remoteHead
+                              case ancestry of
+                                Left err -> pure $ Left err
+                                Right proof ->
+                                  pure $
+                                    Right
+                                      ( object
+                                          [ "repository" .= pmpuRepository args,
+                                            "parent_branch" .= pmpuParentBranch args,
+                                            "remote_name" .= remote,
+                                            "child_id" .= pmpuChildId args,
+                                            "lane_epoch" .= pmpuLaneEpoch args,
+                                            "push_intent_id" .= pmpuPushIntentId args,
+                                            "push_journal_id" .= pmpuPushJournalId args,
+                                            "push_receipt_id" .= receiptId args,
+                                            "expected_base_sha" .= pmpuExpectedBaseSha args,
+                                            "pushed_commit" .= pmpuPushedCommit args,
+                                            "observed_remote_head" .= remoteHead,
+                                            "ancestry_proof" .= proof
+                                          ]
+                                      )
 
 runGitAt :: (Member SuspendYield effs) => Maybe Text -> [Text] -> Eff effs (Either Text Text)
 runGitAt workingDir args = do
@@ -593,17 +605,48 @@ runGitAt workingDir args = do
       logInfo ("post-merge git after: exit=" <> T.pack (show exitCode))
       pure (interpretGitResult exitCode stdout stderr)
 
--- | Git argv for fetching the direct parent branch before synchronization.
-postMergeParentSyncFetchArgs :: Text -> [Text]
-postMergeParentSyncFetchArgs branch = ["fetch", "--prune", "origin", branch]
+resolveSelectedRemoteAt :: (Member SuspendYield effs) => Maybe Text -> Eff effs (Either Text Text)
+resolveSelectedRemoteAt workingDir = do
+  configured <- runGitAt workingDir ["config", "--get", "exomonad.remote"]
+  remotes <- runGitAt workingDir ["remote"]
+  pure $ do
+    names <- remotes >>= parseRemoteNames
+    selectRemote configured names
 
-postMergeRemoteReconcileRebaseArgs :: Text -> Text -> [Text]
-postMergeRemoteReconcileRebaseArgs branch base =
-  ["rebase", "--onto", remoteRef branch, base, "HEAD"]
+parseRemoteNames :: Text -> Either Text [Text]
+parseRemoteNames output =
+  let names = filter (not . T.null) (map T.strip (T.lines output))
+   in if null names || any (not . validToken) names
+        then Left "Git remote inspection returned no valid remote names"
+        else Right names
+
+selectRemote :: Either Text Text -> [Text] -> Either Text Text
+selectRemote configured names =
+  case configured of
+    Right remote
+      | remote `elem` names -> Right remote
+      | otherwise -> Left "configured exomonad.remote is not a configured Git remote"
+    Left err
+      | isMissingConfigValue err ->
+          if "origin" `elem` names
+            then Right "origin"
+            else Left "post-merge synchronization needs exomonad.remote or an origin remote"
+    Left err -> Left ("could not resolve configured Git remote: " <> err)
+
+isMissingConfigValue :: Text -> Bool
+isMissingConfigValue value = value == "git command failed (1):" || value == "git command failed (1): "
+
+-- | Git argv for fetching the direct parent branch before synchronization.
+postMergeParentSyncFetchArgs :: Text -> Text -> [Text]
+postMergeParentSyncFetchArgs remote branch = ["fetch", "--prune", remote, branch]
+
+postMergeRemoteReconcileRebaseArgs :: Text -> Text -> Text -> [Text]
+postMergeRemoteReconcileRebaseArgs remote branch base =
+  ["rebase", "--onto", remoteRef remote branch, base, "HEAD"]
 
 -- | Git argv for fast-forwarding the checked-out parent branch.
-postMergeParentSyncMergeArgs :: Text -> [Text]
-postMergeParentSyncMergeArgs branch = ["merge", "--ff-only", remoteRef branch]
+postMergeParentSyncMergeArgs :: Text -> Text -> [Text]
+postMergeParentSyncMergeArgs remote branch = ["merge", "--ff-only", remoteRef remote branch]
 
 -- | Git argv for staging the generated changelog entry.
 postMergeChangelogStageArgs :: [Text]
@@ -620,12 +663,12 @@ postMergeChangelogCommitArgs issueId =
   ]
 
 -- | Git argv for the compare-and-swap parent push boundary.
-postMergePushGitArgs :: Text -> Text -> [Text]
-postMergePushGitArgs branch base =
+postMergePushGitArgs :: Text -> Text -> Text -> [Text]
+postMergePushGitArgs remote branch base =
   [ "push",
     "--porcelain",
     forceLease branch base,
-    "origin",
+    remote,
     "HEAD:" <> refName branch
   ]
 
@@ -739,8 +782,8 @@ legacyProof proof = case proof of
   AncestryMergeIntegrationProof _ _ _ ancestry -> ancestry
   SquashMergeIntegrationProof _ _ _ _ _ _ _ _ _ _ -> "squash-tree-match"
 
-remoteRef :: Text -> Text
-remoteRef branch = "origin/" <> branch
+remoteRef :: Text -> Text -> Text
+remoteRef remote branch = remote <> "/" <> branch
 
 refName :: Text -> Text
 refName branch = "refs/heads/" <> branch

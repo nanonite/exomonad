@@ -1,13 +1,11 @@
 use crate::domain::{BranchName, MergeStrategy, PRNumber};
 use crate::services::agent_resolver::AgentResolver;
 use crate::services::forgejo::ForgejoClient;
-use crate::services::git_worktree::GitWorktreeService;
 use crate::services::pr_registry::verified_current_publication_owner;
 use crate::services::repo;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
 use tokio::process::Command;
 use tokio::time::Duration;
 use tracing::{error, info};
@@ -17,6 +15,7 @@ const MERGE_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct MergePROutput {
     pub success: bool,
     pub message: String,
+    /// Kept for protocol compatibility; `merge_pr` does not fetch or integrate locally.
     pub git_fetched: bool,
     pub branch_name: BranchName,
     pub head_sha: Option<String>,
@@ -60,7 +59,6 @@ pub(crate) async fn merge_pr_async(
     strategy: &MergeStrategy,
     working_dir: &str,
     expected: MergeExpectedEvidence<'_>,
-    git_wt: Arc<GitWorktreeService>,
     forgejo: Option<&ForgejoClient>,
     authority: MergeAuthority<'_>,
 ) -> Result<MergePROutput> {
@@ -352,29 +350,10 @@ pub(crate) async fn merge_pr_async(
 
     info!(pr_number = pr_number.as_u64(), "PR merged successfully");
 
-    let dir_path = std::path::PathBuf::from(dir);
-    let git_wt_clone = git_wt.clone();
-    let git_result = tokio::task::spawn_blocking(move || git_wt_clone.fetch(&dir_path)).await;
-
-    let git_fetched = match git_result {
-        Ok(Ok(())) => {
-            info!("git fetch succeeded");
-            true
-        }
-        Ok(Err(e)) => {
-            info!(error = %e, "git fetch failed");
-            false
-        }
-        Err(e) => {
-            info!(error = %e, "git fetch spawn_blocking failed");
-            false
-        }
-    };
-
     Ok(MergePROutput {
         success: true,
         message: format!("PR #{} merged via {}", pr_number, strategy),
-        git_fetched,
+        git_fetched: false,
         branch_name,
         head_sha,
     })

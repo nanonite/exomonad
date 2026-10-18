@@ -2,14 +2,18 @@
 
 module ExoMonad.Guest.Tools.MergePRTest (mergePrTests) where
 
+import Data.Aeson qualified as Aeson
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Effects.Agent qualified as Agent
 import Effects.Github qualified as GH
 import ExoMonad.Guest.Tools.MergePR
   ( MergePRArgs (..),
+    MergePROutput (..),
     Readiness (..),
     mergeExpectedHeadSha,
+    mergePRRender,
     parentApprovalWatcherMergeGate,
     watcherMergeGate,
   )
@@ -136,7 +140,29 @@ mergePrTests =
                 }
         assertBool
           "observed head must override a caller-supplied head"
-          (mergeExpectedHeadSha args "head-a" == "head-a")
+          (mergeExpectedHeadSha args "head-a" == "head-a"),
+      testCase "remote merge result leaves local synchronization to the durable flow" $ do
+        let output =
+              Aeson.toJSON $
+                mergePRRender
+                  MergePROutput
+                    { mpoSuccess = True,
+                      mpoMessage = "PR #43 merged",
+                      mpoGitFetched = False,
+                      mpoBranchName = "main.slice-a"
+                    }
+        case output of
+          Aeson.Object envelope ->
+            case KeyMap.lookup "result" envelope of
+              Just (Aeson.Object result) -> do
+                assertBool "remote merge success remains authoritative" (KeyMap.lookup "success" result == Just (Aeson.Bool True))
+                assertBool "merge tool does not claim a fetch" (KeyMap.lookup "git_fetched" result == Just (Aeson.Bool False))
+                case KeyMap.lookup "next" result of
+                  Just (Aeson.String next) ->
+                    assertBool "next action names the durable sync owner" ("durable post-merge flow" `TL.isInfixOf` TL.fromStrict next)
+                  _ -> assertBool "next action is present" False
+              _ -> assertBool "tool result is an object" False
+          _ -> assertBool "tool response is an object" False
     ]
 
 hostedResponse :: GH.GetPullRequestResponse

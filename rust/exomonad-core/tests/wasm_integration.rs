@@ -40,6 +40,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "wasm_integration/aggregate_approval_merge.rs"]
 mod aggregate_approval_merge;
+#[path = "wasm_integration/post_merge_sync.rs"]
+mod post_merge_sync;
 
 static MOCK_AGENT_CLOSE_SELF_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MOCK_EVENTS_NOTIFY_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -999,7 +1001,7 @@ impl EffectHandler for MockMergePRHandler {
             "merge_pr.merge_pr" => Ok(MergePrResponse {
                 success: true,
                 message: "Merged PR #42".into(),
-                git_fetched: true,
+                git_fetched: false,
                 branch_name: String::new(),
                 head_sha: String::new(),
             }
@@ -1225,6 +1227,48 @@ impl EffectHandler for MockProcessHandler {
             }
             _ => Err(EffectError::not_found(format!(
                 "mock_process/{effect_type}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingProcessHandler {
+    calls: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl EffectHandler for RecordingProcessHandler {
+    fn namespace(&self) -> &str {
+        "process"
+    }
+
+    async fn handle(
+        &self,
+        effect_type: &str,
+        payload: &[u8],
+        _ctx: &exomonad_core::effects::EffectContext,
+    ) -> EffectResult<Vec<u8>> {
+        use exomonad_proto::effects::process::*;
+
+        match effect_type {
+            "process.run" => {
+                let request = RunRequest::decode(payload).map_err(|error| {
+                    EffectError::custom("decode", format!("decode RunRequest: {error}"))
+                })?;
+                self.calls
+                    .lock()
+                    .expect("process call recording lock")
+                    .push(request.args);
+                Ok(RunResponse {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }
+                .encode_to_vec())
+            }
+            _ => Err(EffectError::not_found(format!(
+                "recording_process/{effect_type}"
             ))),
         }
     }
@@ -1967,7 +2011,18 @@ async fn wasm_file_pr_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn wasm_merge_pr_roundtrip() {
-    let runtime = build_test_runtime().await;
+    let process = RecordingProcessHandler::default();
+    let process_calls = process.calls.clone();
+    let runtime = test_runtime_builder_with_handlers(
+        MockAgentHandler,
+        MockGitHubHandler,
+        MockMergePRHandler,
+        process,
+    )
+    .with_wasm_bytes(wasm_binary_bytes())
+    .build()
+    .await
+    .expect("build WASM runtime with process call recording");
 
     let output = call_tool(
         &runtime,
@@ -1980,6 +2035,24 @@ async fn wasm_merge_pr_roundtrip() {
     .await;
 
     assert_tool_success(&output, "merge_pr");
+    assert_eq!(
+        output["result"]["success"], true,
+        "remote merge result: {output:#}"
+    );
+    assert_eq!(
+        output["result"]["git_fetched"], false,
+        "merge tool must not claim local synchronization: {output:#}"
+    );
+    assert!(
+        process_calls.lock().expect("process calls lock").is_empty(),
+        "compiled merge tool must not issue hidden Git process operations"
+    );
+    assert!(
+        output["result"]["next"]
+            .as_str()
+            .is_some_and(|next| next.contains("durable post-merge")),
+        "response must direct local sync to its durable owner: {output:#}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -9,8 +9,8 @@ use tracing::instrument;
 pub(crate) mod aggregate_approval;
 
 use crate::services::{
-    HasAgentResolver, HasCiStatusMap, HasEventLog, HasForgejoClient, HasGitWorktreeService,
-    HasProjectDir, HasSessionMemory,
+    HasAgentResolver, HasCiStatusMap, HasEventLog, HasForgejoClient, HasProjectDir,
+    HasSessionMemory,
 };
 
 pub struct MergePRHandler<C> {
@@ -20,7 +20,6 @@ pub struct MergePRHandler<C> {
 impl<
         C: HasForgejoClient
             + HasEventLog
-            + HasGitWorktreeService
             + HasProjectDir
             + HasCiStatusMap
             + HasSessionMemory
@@ -36,7 +35,6 @@ impl<
 impl<
         C: HasForgejoClient
             + HasEventLog
-            + HasGitWorktreeService
             + HasProjectDir
             + HasCiStatusMap
             + HasSessionMemory
@@ -62,7 +60,6 @@ impl<
 impl<
         C: HasForgejoClient
             + HasEventLog
-            + HasGitWorktreeService
             + HasProjectDir
             + HasCiStatusMap
             + HasSessionMemory
@@ -141,7 +138,6 @@ impl<
                     merge_tree_sha: crate::handlers::non_empty(req.expected_merge_tree_sha.clone())
                         .as_deref(),
                 },
-                self.ctx.git_worktree_service().clone(),
                 self.ctx.forgejo_client().map(|arc| arc.as_ref()),
                 merge_pr::MergeAuthority {
                     resolver: self.ctx.agent_resolver(),
@@ -306,21 +302,21 @@ mod tests {
         let response = MergePrResponse {
             success: true,
             message: "PR #42 merged via squash".to_string(),
-            git_fetched: true,
+            git_fetched: false,
             branch_name: "main.fix-auth-codex".to_string(),
             head_sha: "verified-sha".to_string(),
         };
 
         assert!(response.success);
         assert!(response.message.contains("42"));
-        assert!(response.git_fetched);
+        assert!(!response.git_fetched);
         assert_eq!(response.branch_name, "main.fix-auth-codex");
         assert_eq!(response.head_sha, "verified-sha");
     }
 
     #[test]
     fn merge_pr_capture_records_merge_result() {
-        let capture = merge_pr_capture(42, "squash", "success", true, "main.fix-auth-codex");
+        let capture = merge_pr_capture(42, "squash", "success", false, "main.fix-auth-codex");
 
         assert_eq!(capture.kind, MemoryKind::MergeResult);
         assert!(capture.summary.contains("Merged PR #42"));
@@ -330,7 +326,7 @@ mod tests {
         assert_eq!(metadata["pr_number"], 42);
         assert_eq!(metadata["strategy"], "squash");
         assert_eq!(metadata["status"], "success");
-        assert_eq!(metadata["git_fetched"], true);
+        assert_eq!(metadata["git_fetched"], false);
         assert_eq!(metadata["branch"], "main.fix-auth-codex");
     }
 

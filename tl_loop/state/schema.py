@@ -669,6 +669,7 @@ RECONCILIATION_KEYS = frozenset(
         "merge_head_sha",
         "merge_journal_id",
         "remote_head_sha",
+        "remote_name",
         "ancestry_proof",
     }
 )
@@ -1843,6 +1844,7 @@ def _reconciliation(value: object, path: str, errors: list[tuple[str, str]]) -> 
         "merge_head_sha",
         "merge_journal_id",
         "remote_head_sha",
+        "remote_name",
         "ancestry_proof",
     ):
         _nullable_string(reconciliation, key, f"{path}.reconciliation", errors)

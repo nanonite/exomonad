@@ -4,7 +4,9 @@ module ExoMonad.Guest.Tools.PostMergeRecoveryTest (postMergeRecoveryTests) where
 
 import Control.Monad.Freer (run)
 import Control.Monad.Freer.Coroutine (Status (Continue, Done), runC)
-import Data.Aeson (Value, decode, encode, object, toJSON, (.=))
+import Data.Aeson (Result (..), Value, decode, encode, object, toJSON, (.=))
+import Data.Aeson qualified as Aeson
+import Data.Aeson.KeyMap qualified as KeyMap
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.ByteString.Lazy.Char8 qualified as L8
@@ -12,6 +14,7 @@ import Data.Int (Int32)
 import Data.List qualified as List
 import Data.Text (Text)
 import Data.Text.Lazy qualified as TL
+import Data.Vector qualified as V
 import Data.Word (Word8)
 import Effects.Envelope qualified as Envelope
 import Effects.Process qualified as Proc
@@ -34,8 +37,9 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
     postMergeRemoteReconcileCore,
     postMergeRemoteReconcileRebaseArgs,
     postMergeRemoteReconcileSchema,
+    selectRemote,
   )
-import Proto3.Suite.Class (toLazyByteString)
+import Proto3.Suite.Class (Message, fromByteString, toLazyByteString)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertEqual, testCase)
 
@@ -74,16 +78,33 @@ postMergeRecoveryTests =
         assertEqual "parent sync JSON arguments" (Just expected) (decode (encode value))
         assertEqual
           "fetch argv"
-          ["fetch", "--prune", "origin", "main"]
-          (postMergeParentSyncFetchArgs "main")
+          ["fetch", "--prune", "forgejo", "main"]
+          (postMergeParentSyncFetchArgs "forgejo" "main")
         assertEqual
           "merge argv"
-          ["merge", "--ff-only", "origin/main"]
-          (postMergeParentSyncMergeArgs "main")
+          ["merge", "--ff-only", "forgejo/main"]
+          (postMergeParentSyncMergeArgs "forgejo" "main")
         assertEqual
           "remote rebuild argv"
-          ["rebase", "--onto", "origin/main", "base-head", "HEAD"]
-          (postMergeRemoteReconcileRebaseArgs "main" "base-head"),
+          ["rebase", "--onto", "forgejo/main", "base-head", "HEAD"]
+          (postMergeRemoteReconcileRebaseArgs "forgejo" "main" "base-head"),
+      testCase "remote selection honors the explicit pin and rejects stale pins" $ do
+        assertEqual
+          "configured remote pin"
+          (Right "forgejo")
+          (selectRemote (Right "forgejo") ["origin", "forgejo"])
+        assertEqual
+          "default remote"
+          (Right "origin")
+          (selectRemote (Left "git command failed (1):") ["origin", "upstream"])
+        assertEqual
+          "remote choice is not guessed when origin and the explicit pin are absent"
+          (Left "post-merge synchronization needs exomonad.remote or an origin remote")
+          (selectRemote (Left "git command failed (1):") ["forgejo", "upstream"])
+        assertEqual
+          "configured remote must exist"
+          (Left "configured exomonad.remote is not a configured Git remote")
+          (selectRemote (Right "missing") ["origin"]),
       testCase "changelog arguments and argv are stable" $ do
         let value =
               object
@@ -148,10 +169,32 @@ postMergeRecoveryTests =
           [ "push",
             "--porcelain",
             "--force-with-lease=refs/heads/main:base-head",
-            "origin",
+            "forgejo",
             "HEAD:refs/heads/main"
           ]
-          (postMergePushGitArgs "main" "base-head"),
+          (postMergePushGitArgs "forgejo" "main" "base-head"),
+      testCase "parent sync uses configured remote for fetch and fast-forward" $ do
+        let responses =
+              [ processResponse 0 "forgejo" "",
+                processResponse 0 "origin\nforgejo" "",
+                processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "" ""
+              ]
+            (result, processArgs) = runParentSyncWithRequests squashArgs responses
+        case result of
+          Right (Aeson.Object fields) ->
+            assertEqual "receipt names selected remote" (Just (Aeson.String "forgejo")) (KeyMap.lookup "remote_name" fields)
+          _ -> assertBool "selected-remote synchronization has an authoritative receipt" False
+        assertBool
+          "fetch explicitly names selected remote and branch"
+          (["fetch", "--prune", "forgejo", "main"] `elem` processArgs)
+        assertBool
+          "fast-forward names selected remote tracking branch"
+          (["merge", "--ff-only", "forgejo/main"] `elem` processArgs),
       testCase "missing required boundary arguments fail closed" $ do
         assertEqual
           "parent sync requires all identity fields"
@@ -170,6 +213,15 @@ postMergeRecoveryTests =
           "stderr is preserved in the failure"
           (Left "git command failed (128): rejected by remote")
           (interpretGitResult 128 "ignored stdout" "rejected by remote\n"),
+      testCase "fetch permission refusal cannot produce a sync receipt" $ do
+        let responses =
+              [ processResponse 0 "main" "",
+                processResponse 128 "" "permission denied"
+              ]
+        assertEqual
+          "permission refusal is a failed sync boundary"
+          (Left "git command failed (128): permission denied")
+          (runParentSyncWithArgs squashArgs responses),
       testCase "squash merge accepts exact Forgejo and Git tree proof" $ do
         let args =
               PostMergeParentSyncArgs
@@ -206,6 +258,7 @@ postMergeRecoveryTests =
                     "pr_number" .= (43 :: Int),
                     "repository" .= ("org/repo" :: Text),
                     "parent_branch" .= ("main" :: Text),
+                    "remote_name" .= ("origin" :: Text),
                     "merged_head_sha" .= ("pr-head" :: Text),
                     "expected_base_sha" .= ("base-head" :: Text),
                     "lane_epoch" .= (7 :: Int),
@@ -364,6 +417,7 @@ postMergeRecoveryTests =
                     "pr_number" .= (43 :: Int),
                     "repository" .= ("org/repo" :: Text),
                     "parent_branch" .= ("main" :: Text),
+                    "remote_name" .= ("origin" :: Text),
                     "merged_head_sha" .= ("merged-head" :: Text),
                     "expected_base_sha" .= ("old-base" :: Text),
                     "lane_epoch" .= (7 :: Int),
@@ -425,6 +479,7 @@ postMergeRecoveryTests =
                     "pr_number" .= (43 :: Int),
                     "repository" .= ("org/repo" :: Text),
                     "parent_branch" .= ("main" :: Text),
+                    "remote_name" .= ("origin" :: Text),
                     "merged_head_sha" .= ("pr-head" :: Text),
                     "expected_base_sha" .= ("merge-commit" :: Text),
                     "lane_epoch" .= (7 :: Int),
@@ -511,10 +566,49 @@ runParentSync args responses =
       resume (parentResponseFor responses processCount request)
         >>= handleResponses (if erType request == "process.run" then processCount + 1 else processCount)
 
+runParentSyncWithArgs :: PostMergeParentSyncArgs -> [Value] -> Either Text Value
+runParentSyncWithArgs args responses =
+  fst (runParentSyncWithRequests args (parentSyncPrefix <> responses))
+  where
+    parentSyncPrefix =
+      [ processResponse 1 "" "",
+        processResponse 0 "origin" ""
+      ]
+
+runParentSyncWithRequests :: PostMergeParentSyncArgs -> [Value] -> (Either Text Value, [[Text]])
+runParentSyncWithRequests args responses =
+  run $ runC (postMergeParentSyncCore args) >>= handleResponses 0 []
+  where
+    handleResponses _ requests (Done result) = pure (result, reverse requests)
+    handleResponses processCount requests (Continue request resume) = do
+      let response =
+            if erType request == "process.run" && processCount < length responses
+              then responses !! processCount
+              else processResponse 1 "" "unexpected process request"
+          captured =
+            if erType request == "process.run"
+              then maybe requests (: requests) (processRequestArgs request)
+              else requests
+      resume response
+        >>= handleResponses (if erType request == "process.run" then processCount + 1 else processCount) captured
+
+processRequestArgs :: EffectRequest -> Maybe [Text]
+processRequestArgs request = do
+  bytes <- case Aeson.fromJSON (erPayload request) :: Result [Word8] of
+    Success value -> Just value
+    Error _ -> Nothing
+  decoded <- decodeRequestBytes bytes
+  pure (TL.toStrict <$> V.toList (Proc.runRequestArgs decoded))
+
+decodeRequestBytes :: (Message a) => [Word8] -> Maybe a
+decodeRequestBytes = either (const Nothing) Just . fromByteString . BS.pack
+
 parentResponseFor :: [Value] -> Int -> EffectRequest -> Value
 parentResponseFor responses processCount request
   | erType request /= "process.run" = encodedEffectResponse BS.empty
-  | processCount < length responses = responses !! processCount
+  | processCount == 0 = processResponse 1 "" ""
+  | processCount == 1 = processResponse 0 "origin" ""
+  | processCount - 2 < length responses = responses !! (processCount - 2)
   | otherwise = processResponse 1 "" "unexpected process request"
 
 runRemoteReconcile :: PostMergeParentSyncArgs -> Either Text Value
@@ -540,16 +634,18 @@ remoteResponseFor processCount request
   | erType request /= "process.run" = encodedEffectResponse BS.empty
   | otherwise =
       case processCount of
-        0 -> processResponse 0 "main" ""
-        1 -> processResponse 0 "" ""
-        2 -> processResponse 0 "remote-head" ""
-        3 -> processResponse 0 "local-bookkeeping" ""
-        4 -> processResponse 0 "" ""
-        5 -> processResponse 0 "" ""
-        6 -> processResponse 0 "rebuilt-head" ""
-        7 -> processResponse 0 "remote-head" ""
-        8 -> processResponse 0 "" ""
-        9 -> processResponse 0 "" ""
+        0 -> processResponse 1 "" ""
+        1 -> processResponse 0 "origin" ""
+        2 -> processResponse 0 "main" ""
+        3 -> processResponse 0 "" ""
+        4 -> processResponse 0 "remote-head" ""
+        5 -> processResponse 0 "local-bookkeeping" ""
+        6 -> processResponse 0 "" ""
+        7 -> processResponse 0 "" ""
+        8 -> processResponse 0 "rebuilt-head" ""
+        9 -> processResponse 0 "remote-head" ""
+        10 -> processResponse 0 "" ""
+        11 -> processResponse 0 "" ""
         _ -> processResponse 1 "" "unexpected process request"
 
 responseFor :: Int -> EffectRequest -> Value

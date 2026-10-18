@@ -12,6 +12,7 @@ use exomonad_core::EffectHandler;
 use exomonad_proto::effects::{agent, github};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -63,6 +64,29 @@ struct Fixture {
     receipt_id: String,
     reference: Value,
     superseded_reference: Value,
+}
+
+struct EnvironmentOverride {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvironmentOverride {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvironmentOverride {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.as_ref() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
 }
 
 impl Fixture {
@@ -749,6 +773,9 @@ fn git_bytes(directory: &Path, arguments: &[&str]) -> Vec<u8> {
 #[serial]
 async fn compiled_merge_tool_uses_production_handler_for_parent_approval() {
     let fixture = Fixture::new().await;
+    let ssh_script = fixture.bare_repository.with_extension("ssh-fixture.sh");
+    let _ssh_command =
+        EnvironmentOverride::set("GIT_SSH_COMMAND", &format!("sh {}", ssh_script.display()));
     let state = forgejo_state(&fixture, Outcome::Merge);
     let server = MockServer::start().await;
     mount_forgejo(&server, state.clone()).await;
@@ -763,6 +790,10 @@ async fn compiled_merge_tool_uses_production_handler_for_parent_approval() {
 
     assert_tool_success(&merged, "merge_pr");
     assert_eq!(
+        merged["result"]["git_fetched"], false,
+        "merge success must not claim that durable local synchronization completed: {merged:#}"
+    );
+    assert_eq!(
         state.merge_calls.load(Ordering::SeqCst),
         1,
         "tool reported success without reaching the merge boundary: {merged:#}"
@@ -770,6 +801,19 @@ async fn compiled_merge_tool_uses_production_handler_for_parent_approval() {
     assert_eq!(
         git_dir_output(&fixture.bare_repository, &["rev-parse", "refs/heads/main"]),
         fixture.head_sha
+    );
+    assert_eq!(
+        git_output(&fixture.project_dir, &["rev-parse", "HEAD"]),
+        fixture.base_sha,
+        "the merge tool must leave local parent integration to the durable sync effect"
+    );
+    assert_eq!(
+        git_output(
+            &fixture.project_dir,
+            &["rev-parse", "refs/remotes/origin/main"]
+        ),
+        fixture.base_sha,
+        "the merge tool must not refresh parent tracking refs as a second sync owner"
     );
 
     let replay = run_merge_tool(&runtime, &fixture, fixture.reference.clone()).await;

@@ -22,6 +22,20 @@ def test_valid_run_state_document_is_accepted() -> None:
     validate(_valid_document())
 
 
+def test_reconciliation_can_retain_selected_remote_coordinate() -> None:
+    document = _valid_document()
+    _slice(document, "slice-a")["reconciliation"] = {
+        "confirmed_stage": "integrated",
+        "next_action": "sync-parent",
+        "authoritative_evidence": [],
+        "missing_evidence": [],
+        "conflicts": [],
+        "remote_name": "forgejo",
+    }
+
+    validate(document)
+
+
 def test_current_runnable_checkpoint_requires_repository_identity() -> None:
     document = _valid_document()
     slice_state = _slice(document, "slice-a")

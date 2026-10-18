@@ -6909,6 +6909,7 @@ def _run_parent_sync(
         {
             "remote_head_sha": payload["remote_head_sha"],
             "ancestry_proof": payload["ancestry_proof"],
+            **({"remote_name": payload["remote_name"]} if "remote_name" in payload else {}),
         },
     )
 
@@ -6971,6 +6972,7 @@ def _parent_sync_effect(
     raw_payload = _merge_result_payload(result)
     if raw_payload is None:
         raise ValueError("parent synchronization returned no authoritative receipt")
+    payload = _include_selected_remote(payload, raw_payload)
     if (
         payload["ancestry_proof"]
         != (f"ancestor:{arguments['merged_head_sha']}->{payload['parent_commit_sha']}")
@@ -7234,6 +7236,7 @@ def _remote_reconcile_effect(
     raw_payload = _merge_result_payload(result)
     if raw_payload is None:
         raise ValueError("remote rebuild returned no authoritative receipt")
+    payload = _include_selected_remote(payload, raw_payload)
     _validate_remote_reconcile_proof(raw_payload, arguments, payload)
     return arguments, payload
 
@@ -8033,6 +8036,8 @@ def _recover_remote_advance(
     rebuilt_evidence = dict(committed_slice.post_merge.evidence)
     rebuilt_evidence["lane_epoch"] = str(next_epoch)
     rebuilt_evidence["expected_base_sha"] = observed_remote_head
+    if "remote_name" in payload:
+        rebuilt_evidence["remote_name"] = payload["remote_name"]
     committed_slice = replace(
         committed_slice,
         post_merge=replace(
@@ -8100,6 +8105,23 @@ def _required_effect_result(
         else:
             raise ValueError(f"post-merge effect receipt is missing {field_name}")
     return values
+
+
+def _include_selected_remote(
+    receipt: Mapping[str, str], raw_payload: Mapping[str, object]
+) -> Mapping[str, str]:
+    """Retain current selected-remote evidence while accepting legacy receipts."""
+    if "remote_name" not in raw_payload:
+        return receipt
+    remote_name = raw_payload["remote_name"]
+    if (
+        not isinstance(remote_name, str)
+        or not remote_name
+        or remote_name.startswith("-")
+        or any(char.isspace() or char == "\x00" for char in remote_name)
+    ):
+        raise ValueError("post-merge receipt has an invalid selected remote name")
+    return {**receipt, "remote_name": remote_name}
 
 
 def _require_matching_text(

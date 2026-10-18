@@ -18,6 +18,7 @@ from tl_loop.loop.driver import (
     _advance_post_merge_boundary,
     _attach_forgejo_merge_evidence,
     _forgejo_merge_evidence,
+    _include_selected_remote,
     _reconcile_merged_slice,
     _refresh_post_merge_evidence,
     _remote_reconcile_effect,
@@ -321,6 +322,7 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
                         **arguments,
                         "parent_commit_sha": "merge-commit",
                         "remote_head_sha": "merge-commit",
+                        "remote_name": "forgejo",
                         "ancestry_proof": "squash-tree-match",
                         "merge_integration_proof": proof,
                     },
@@ -353,6 +355,7 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
                         "rebuilt_commit_sha": "rebuilt-bookkeeping",
                         "remote_head_sha": "advanced-parent",
                         "new_base_sha": "advanced-parent",
+                        "remote_name": "forgejo",
                         "remote_ancestry_proof": ("ancestor:advanced-parent->rebuilt-bookkeeping"),
                         "ancestry_proof": "squash-tree-match",
                         "merge_integration_proof": proof,
@@ -376,6 +379,7 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
     assert arguments["prospective_merge_tree_sha"] == "merged-tree"
     assert arguments["reviewed_pr_head_tree_sha"] == "pr-tree"
     assert payload["new_base_sha"] == "advanced-parent"
+    assert payload["remote_name"] == "forgejo"
     assert len(journal.confirmed_entries("post_merge_remote_reconcile", "slice-a")) == 1
 
     advanced = _advance_post_merge_boundary(
@@ -387,7 +391,11 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
         journal,
         store,
     )
-    assert advanced.slices["slice-a"].post_merge.phase.value == "parent_branch_synced"
+    assert advanced.slices["slice-a"].post_merge.phase.value == "parent_branch_synced", (
+        advanced.slices["slice-a"].dispatch_error,
+        advanced.slices["slice-a"].post_merge.evidence,
+    )
+    assert advanced.slices["slice-a"].reconciliation["remote_name"] == "forgejo"
     assert journal.pending_entries() == []
     assert len(journal.confirmed_entries("post_merge_parent_sync", "slice-a")) == 1
 
@@ -398,6 +406,14 @@ def test_squash_receipt_accepts_exact_forgejo_and_tree_binding() -> None:
         _arguments(),
         _receipt(),
     )
+
+
+def test_selected_remote_receipt_is_optional_for_legacy_and_validated_when_present() -> None:
+    receipt = _receipt()
+    assert _include_selected_remote(receipt, {}) is receipt
+    assert _include_selected_remote(receipt, {"remote_name": "forgejo"})["remote_name"] == "forgejo"
+    with pytest.raises(ValueError, match="invalid selected remote name"):
+        _include_selected_remote(receipt, {"remote_name": "--upload-pack=bad"})
 
 
 @pytest.mark.parametrize(
