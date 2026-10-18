@@ -119,11 +119,13 @@ impl ProcessEffects for ProcessHandler {
 
         let git_process = if is_git_executable(&req.command) {
             validate_git_target(&req.args, &req.env)?;
-            validate_git_working_directory(&ctx.working_dir, &resolved_dir)?;
+            validate_git_working_directory(&ctx.working_dir, &resolved_dir, &req.env)?;
             Some(
                 GitProcessContext::prepare(
                     &self.project_dir,
                     &ctx.working_dir,
+                    &resolved_dir,
+                    &req.env,
                     &operation_id,
                     ctx.agent_name.as_ref(),
                     ctx.birth_branch.as_str(),
@@ -242,6 +244,26 @@ mod tests {
                 .expect("literal validated string is non-empty"),
             working_dir: working_dir.to_path_buf(),
         }
+    }
+
+    fn run_git_fixture_output(path: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("test environment has Git on PATH")
+    }
+
+    fn assert_git_fixture_succeeded(output: std::process::Output, args: &[&str]) {
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -363,6 +385,50 @@ mod tests {
 
         let err = handler.run(req, &ctx).await.unwrap_err();
         assert!(matches!(err, EffectError::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn process_handler_rejects_nested_bare_git_repository_before_ref_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let initialize_outer = ["init", "-q", "-b", "main"];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(root, &initialize_outer),
+            &initialize_outer,
+        );
+
+        let nested_bare = root.join("nested-bare.git");
+        std::fs::create_dir(&nested_bare).unwrap();
+        let initialize_nested = ["init", "-q", "--bare", "."];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&nested_bare, &initialize_nested),
+            &initialize_nested,
+        );
+        let head_before = std::fs::read(nested_bare.join("HEAD")).unwrap();
+
+        let handler = ProcessHandler::with_project_dir(root.to_path_buf());
+        let context = test_ctx_at(root);
+        let request = RunRequest {
+            command: "git".into(),
+            args: vec![
+                "symbolic-ref".into(),
+                "HEAD".into(),
+                "refs/heads/escaped".into(),
+            ],
+            working_dir: "nested-bare.git".into(),
+            env: std::collections::HashMap::new(),
+            timeout_ms: 5_000,
+        };
+
+        let error = handler.run(request, &context).await.unwrap_err();
+
+        assert!(error.to_string().contains("different repository"));
+        assert_eq!(
+            std::fs::read(nested_bare.join("HEAD")).unwrap(),
+            head_before
+        );
+        assert!(!nested_bare.join("refs/heads/escaped").exists());
+        assert!(!root.join(".exo/logs").exists());
     }
 
     #[tokio::test]

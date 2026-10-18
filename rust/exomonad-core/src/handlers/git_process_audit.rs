@@ -9,8 +9,8 @@ use crate::services::{
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 const GIT_PROCESS_LEASE_WAIT: Duration = Duration::from_secs(2);
@@ -27,11 +27,14 @@ impl GitProcessContext {
     pub(crate) async fn prepare(
         project_dir: &Path,
         worktree: &Path,
+        command_directory: &Path,
+        request_env: &HashMap<String, String>,
         operation_id: &str,
         agent_id: &str,
         birth_branch: &str,
     ) -> EffectResult<Self> {
         let leases = acquire_git_leases(project_dir, worktree, operation_id).await?;
+        validate_git_working_directory(worktree, command_directory, request_env)?;
         let event_log = open_event_log(project_dir)?;
         let context = Self {
             leases,
@@ -181,13 +184,23 @@ pub(crate) fn validate_git_target(
 pub(crate) fn validate_git_working_directory(
     worktree_root: &Path,
     command_directory: &Path,
+    request_env: &HashMap<String, String>,
 ) -> EffectResult<()> {
     let root = canonical_directory(worktree_root)?;
     let directory = canonical_directory(command_directory)?;
-    if !directory.starts_with(&root) || contains_nested_git_boundary(&root, &directory)? {
+    if !directory.starts_with(&root) {
         return Err(EffectError::custom(
             "git_mutation_unavailable",
             "managed Git process working_dir does not resolve inside its declared worktree; use the owning worktree root",
+        ));
+    }
+
+    let declared_git_dir = effective_git_dir(&root, request_env)?;
+    let command_git_dir = effective_git_dir(&directory, request_env)?;
+    if declared_git_dir != command_git_dir {
+        return Err(EffectError::custom(
+            "git_mutation_unavailable",
+            "managed Git process working_dir resolves to a different repository; use the owning worktree root",
         ));
     }
     Ok(())
@@ -202,31 +215,37 @@ fn canonical_directory(path: &Path) -> EffectResult<std::path::PathBuf> {
     })
 }
 
-fn contains_nested_git_boundary(root: &Path, directory: &Path) -> EffectResult<bool> {
-    let mut ancestor = directory;
-    while ancestor != root {
-        if has_git_marker(ancestor)? {
-            return Ok(true);
-        }
-        ancestor = ancestor.parent().ok_or_else(|| {
-            EffectError::custom(
-                "git_mutation_unavailable",
-                "managed Git process working_dir ancestry could not be verified",
-            )
-        })?;
+fn effective_git_dir(
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+) -> EffectResult<std::path::PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(directory)
+        .envs(request_env)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .map_err(|_| git_identity_unavailable())?;
+    if !output.status.success() {
+        return Err(git_identity_unavailable());
     }
-    Ok(false)
+    let git_dir = std::str::from_utf8(&output.stdout)
+        .map_err(|_| git_identity_unavailable())?
+        .trim();
+    if git_dir.is_empty() {
+        return Err(git_identity_unavailable());
+    }
+    canonical_directory(Path::new(git_dir))
 }
 
-fn has_git_marker(directory: &Path) -> EffectResult<bool> {
-    match fs::symlink_metadata(directory.join(".git")) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(EffectError::custom(
-            "git_mutation_unavailable",
-            "managed Git process repository boundary could not be inspected",
-        )),
-    }
+fn git_identity_unavailable() -> EffectError {
+    EffectError::custom(
+        "git_mutation_unavailable",
+        "managed Git process repository identity could not be verified before spawn",
+    )
 }
 
 fn command_overrides_git_target(args: &[String]) -> bool {
@@ -338,19 +357,30 @@ mod tests {
     fn managed_git_cwd_rejects_nested_repositories_and_external_symlinks() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
+        let init = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
         let nested = root.join("nested");
         fs::create_dir(&nested).unwrap();
-        assert!(validate_git_working_directory(root, &nested).is_ok());
+        assert!(validate_git_working_directory(root, &nested, &HashMap::new()).is_ok());
 
         fs::write(nested.join(".git"), "gitdir: elsewhere\n").unwrap();
-        assert!(validate_git_working_directory(root, &nested).is_err());
+        assert!(validate_git_working_directory(root, &nested, &HashMap::new()).is_err());
         fs::remove_file(nested.join(".git")).unwrap();
 
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(outside.path(), root.join("external-link")).unwrap();
-            assert!(validate_git_working_directory(root, &root.join("external-link")).is_err());
+            assert!(validate_git_working_directory(
+                root,
+                &root.join("external-link"),
+                &HashMap::new(),
+            )
+            .is_err());
         }
     }
 }
