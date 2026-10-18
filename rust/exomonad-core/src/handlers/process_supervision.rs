@@ -12,6 +12,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 
 const TERM_GRACE: Duration = Duration::from_millis(200);
 const KILL_WAIT: Duration = Duration::from_secs(2);
@@ -27,6 +28,13 @@ pub(crate) enum ProcessRunError {
     Output(io::ErrorKind),
     #[error("managed process exceeded its timeout")]
     Timeout,
+    #[error("managed process was cancelled by its caller")]
+    Cancelled {
+        pid: u32,
+        start_identity: Option<u64>,
+        process_group_id: Option<u32>,
+        cleanup_diagnostic: Option<&'static str>,
+    },
     #[error("managed process group cleanup is unresolved: {0}")]
     Cleanup(&'static str),
     #[error("managed Git process audit could not be persisted")]
@@ -118,6 +126,7 @@ pub(crate) async fn run_supervised(
     timeout: Option<Duration>,
     operation_id: &str,
     git_audit: Option<GitProcessAudit<'_>>,
+    cancellation: &mut oneshot::Receiver<()>,
 ) -> Result<ProcessRunOutput, ProcessRunError> {
     configure_command(command);
     let mut child = command
@@ -156,14 +165,33 @@ pub(crate) async fn run_supervised(
         pid,
         start_identity,
         git_audit.as_ref(),
+        cancellation,
     )
     .await
     {
         Ok(status) => status,
         Err(error) => {
-            cancel_process_group(process_group_id, &mut child).await?;
-            group_guard.disarm();
+            let cleanup_diagnostic = match cancel_process_group(process_group_id, &mut child).await
+            {
+                Ok(()) => {
+                    group_guard.disarm();
+                    None
+                }
+                Err(ProcessRunError::Cleanup(reason)) => Some(reason),
+                Err(_) => Some("managed process group cleanup did not complete"),
+            };
             let _ = tokio::join!(join_reader(stdout), join_reader(stderr));
+            if matches!(&error, ProcessRunError::Cancelled { .. }) {
+                return Err(ProcessRunError::Cancelled {
+                    pid,
+                    start_identity,
+                    process_group_id: group_id_for_record(pid),
+                    cleanup_diagnostic,
+                });
+            }
+            if let Some(reason) = cleanup_diagnostic {
+                return Err(ProcessRunError::Cleanup(reason));
+            }
             return Err(error);
         }
     };
@@ -186,6 +214,7 @@ async fn wait_for_process(
     pid: u32,
     start_identity: Option<u64>,
     git_audit: Option<&GitProcessAudit<'_>>,
+    cancellation: &mut oneshot::Receiver<()>,
 ) -> Result<ExitStatus, ProcessRunError> {
     let started_at = tokio::time::Instant::now();
     let mut lock_proof_recorded = false;
@@ -204,7 +233,17 @@ async fn wait_for_process(
         if timeout.is_some_and(|budget| started_at.elapsed() >= budget) {
             return Err(ProcessRunError::Timeout);
         }
-        tokio::time::sleep(GROUP_POLL).await;
+        tokio::select! {
+            _ = &mut *cancellation => {
+                return Err(ProcessRunError::Cancelled {
+                    pid,
+                    start_identity,
+                    process_group_id: group_id_for_record(pid),
+                    cleanup_diagnostic: None,
+                });
+            }
+            _ = tokio::time::sleep(GROUP_POLL) => {}
+        }
     }
 }
 

@@ -91,14 +91,34 @@ impl GitProcessContext {
         process: Option<&ProcessRunOutput>,
         exit_code: Option<i32>,
     ) -> EffectResult<()> {
+        self.record_finished_with_identity(
+            outcome,
+            process.map(|result| result.pid),
+            process.and_then(|result| result.start_identity),
+            process.and_then(|result| result.process_group_id),
+            exit_code,
+            None,
+        )
+    }
+
+    pub(crate) fn record_finished_with_identity(
+        &self,
+        outcome: &str,
+        process_id: Option<u32>,
+        process_start_identity: Option<u64>,
+        process_group_id: Option<u32>,
+        exit_code: Option<i32>,
+        cleanup_diagnostic: Option<&str>,
+    ) -> EffectResult<()> {
         let data = serde_json::json!({
             "schema_version": 1,
             "operation_id_sha256": digest(&self.operation_id),
             "outcome": outcome,
-            "process_id": process.map(|result| result.pid),
-            "process_start_identity": process.and_then(|result| result.start_identity),
-            "process_group_id": process.and_then(|result| result.process_group_id),
+            "process_id": process_id,
+            "process_start_identity": process_start_identity,
+            "process_group_id": process_group_id,
             "exit_code": exit_code,
+            "cleanup_diagnostic": cleanup_diagnostic,
         });
         self.append_event("git.process.finished", &data, "managed Git process result")
     }

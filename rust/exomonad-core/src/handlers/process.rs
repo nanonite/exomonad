@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use exomonad_proto::effects::process::*;
 use std::path::{Component, PathBuf};
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 const CHAINLINK_DB_ENV: &str = "CHAINLINK_DB";
 const CHAINLINK_TRACE_ENV: &str = "EXOMONAD_CHAINLINK_TRACE";
@@ -25,6 +26,16 @@ const CHAINLINK_TRACE_ENV: &str = "EXOMONAD_CHAINLINK_TRACE";
 /// trusts WASM author. Working dir is confined to the agent's worktree root.
 pub struct ProcessHandler {
     project_dir: PathBuf,
+}
+
+struct ProcessCancellationSignal(Option<oneshot::Sender<()>>);
+
+impl Drop for ProcessCancellationSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
 }
 
 impl Default for ProcessHandler {
@@ -136,24 +147,62 @@ impl ProcessEffects for ProcessHandler {
             None
         };
         let timeout = (req.timeout_ms > 0).then(|| Duration::from_millis(req.timeout_ms));
-        let audit = git_process
-            .as_ref()
-            .map(GitProcessContext::audit)
-            .transpose()?;
-        let output = match run_supervised(&mut cmd, timeout, &operation_id, audit).await {
-            Ok(output) => {
-                if let Some(context) = &git_process {
-                    context.record_finished("exited", Some(&output), output.status.code())?;
+        let (cancel_sender, mut cancel_receiver) = oneshot::channel();
+        let _cancellation_signal = ProcessCancellationSignal(Some(cancel_sender));
+        let supervisor_operation_id = operation_id.clone();
+        let supervisor = tokio::spawn(async move {
+            let audit = git_process
+                .as_ref()
+                .map(GitProcessContext::audit)
+                .transpose()
+                .map_err(|_| ProcessRunError::Audit)?;
+            let result = run_supervised(
+                &mut cmd,
+                timeout,
+                &supervisor_operation_id,
+                audit,
+                &mut cancel_receiver,
+            )
+            .await;
+            if let Some(context) = git_process {
+                let recorded = match &result {
+                    Ok(output) => {
+                        context.record_finished("exited", Some(output), output.status.code())
+                    }
+                    Err(ProcessRunError::Cancelled {
+                        pid,
+                        start_identity,
+                        process_group_id,
+                        cleanup_diagnostic,
+                    }) => context.record_finished_with_identity(
+                        if cleanup_diagnostic.is_some() {
+                            "cleanup_unresolved"
+                        } else {
+                            "cancelled"
+                        },
+                        Some(*pid),
+                        *start_identity,
+                        *process_group_id,
+                        None,
+                        *cleanup_diagnostic,
+                    ),
+                    Err(error) => context.record_finished(process_outcome(error), None, None),
+                };
+                if recorded.is_err() {
+                    return Err(ProcessRunError::Audit);
                 }
-                output
             }
-            Err(error) => {
-                if let Some(context) = &git_process {
-                    context.record_finished(process_outcome(&error), None, None)?;
-                }
-                return Err(process_run_error(error, req.timeout_ms, &operation_id));
-            }
-        };
+            result
+        });
+        let output = supervisor
+            .await
+            .map_err(|_| {
+                EffectError::custom(
+                    "process_cleanup_unresolved",
+                    format!("managed process supervisor exited unexpectedly; operation_id={operation_id}"),
+                )
+            })?
+            .map_err(|error| process_run_error(error, req.timeout_ms, &operation_id))?;
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -197,6 +246,17 @@ fn process_run_error(error: ProcessRunError, timeout_ms: u64, operation_id: &str
             "process_error",
             format!("managed process result is unavailable ({kind:?}); operation_id={operation_id}"),
         ),
+        ProcessRunError::Cancelled {
+            cleanup_diagnostic: Some(reason),
+            ..
+        } => EffectError::custom(
+            "process_cleanup_unresolved",
+            format!("{reason}; operation_id={operation_id}"),
+        ),
+        ProcessRunError::Cancelled { .. } => EffectError::custom(
+            "process_cancelled",
+            format!("managed process was cancelled; operation_id={operation_id}"),
+        ),
         ProcessRunError::Cleanup(reason) => EffectError::custom(
             "process_cleanup_unresolved",
             format!("{reason}; operation_id={operation_id}"),
@@ -213,6 +273,11 @@ fn process_run_error(error: ProcessRunError, timeout_ms: u64, operation_id: &str
 fn process_outcome(error: &ProcessRunError) -> &'static str {
     match error {
         ProcessRunError::Timeout => "timed_out",
+        ProcessRunError::Cancelled {
+            cleanup_diagnostic: Some(_),
+            ..
+        } => "cleanup_unresolved",
+        ProcessRunError::Cancelled { .. } => "cancelled",
         ProcessRunError::Spawn(_) => "spawn_failed",
         ProcessRunError::Wait(_) | ProcessRunError::Output(_) => "unresolved",
         ProcessRunError::Cleanup(_) | ProcessRunError::Audit => "cleanup_unresolved",
@@ -593,6 +658,214 @@ mod tests {
         runner.abort();
         assert!(runner.await.unwrap_err().is_cancelled());
         assert!(assert_stopped_and_cleanup(pid).await);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn aborting_a_sigterm_ignoring_group_forces_kill_and_reaps_helpers() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_pid_file = temp.path().join("parent.pid");
+        let helper_pid_file = temp.path().join("helper.pid");
+        let handler = ProcessHandler::new();
+        let context = test_ctx_at(temp.path());
+        let request = RunRequest {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "trap '' TERM; echo $$ > {}; (trap '' TERM; exec sleep 60) & echo $! > {}; wait",
+                    parent_pid_file.display(),
+                    helper_pid_file.display()
+                ),
+            ],
+            working_dir: ".".into(),
+            env: std::collections::HashMap::new(),
+            timeout_ms: 0,
+        };
+        let runner = tokio::spawn(async move { handler.run(request, &context).await });
+        let helper_pid = wait_for_pid_file(&helper_pid_file).await;
+        let parent_pid = wait_for_pid_file(&parent_pid_file).await;
+
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        assert!(assert_stopped_and_cleanup(parent_pid).await);
+        assert!(assert_stopped_and_cleanup(helper_pid).await);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn aborting_a_git_process_records_one_finished_event_after_group_cleanup() {
+        use crate::services::EventLog;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (git_shim, _fifo_guard) = init_git_index_lock_fixture(temp.path());
+        let worktree = temp.path().to_path_buf();
+        let command_directory = worktree.join("nested");
+        let saved_index = std::fs::read(worktree.join(".git/index")).unwrap();
+        let handler = ProcessHandler::with_project_dir(temp.path().to_path_buf());
+        let context = test_ctx_at(temp.path());
+        let lock = temp.path().join(".git/index.lock");
+        let event_log = EventLog::open(temp.path().join(".exo/logs")).unwrap();
+        let request = RunRequest {
+            command: git_shim.to_string_lossy().into_owned(),
+            args: vec!["credential-canary-argument".into()],
+            working_dir: "nested".into(),
+            env: std::collections::HashMap::from([(
+                "CREDENTIAL_CANARY_ENV".into(),
+                "credential-canary-value".into(),
+            )]),
+            timeout_ms: 0,
+        };
+        let mut runner = tokio::spawn(async move { handler.run(request, &context).await });
+        let process_id = tokio::select! {
+            pid = wait_for_lock_proof(&event_log, &lock) => pid,
+            result = &mut runner => panic!("Git process returned before lock proof: {result:?}"),
+        };
+        let before_abort = event_log.ledger().read_events().unwrap();
+        let started = before_abort
+            .iter()
+            .find(|record| record.event.event_type == "git.process.started")
+            .unwrap();
+        let operation_hash = started.event.data["operation_id_sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        assert!(assert_stopped_and_cleanup(process_id).await);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let records = loop {
+            let records = event_log.ledger().read_events().unwrap();
+            let finished = records.iter().filter(|record| {
+                record.event.event_type == "git.process.finished"
+                    && record.event.data["operation_id_sha256"] == operation_hash
+            });
+            if finished.count() == 1 {
+                break records;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cancelled Git process did not record one finished event"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let finished: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record.event.event_type == "git.process.finished"
+                    && record.event.data["operation_id_sha256"] == operation_hash
+            })
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].event.data["outcome"], "cancelled");
+        assert_eq!(finished[0].event.data["process_id"], process_id);
+        assert_eq!(
+            std::fs::read(worktree.join(".git/index")).unwrap(),
+            saved_index,
+            "cancellation must not commit a partial index update"
+        );
+        assert!(records.iter().any(|record| {
+            record.event.event_type == "git.native_lock.held"
+                && record.event.data["owner"]["pid"] == process_id
+        }));
+        assert!(
+            !lock.exists(),
+            "the reaped Git process should release its own lock"
+        );
+        assert!(command_directory.is_dir());
+        let audit = records
+            .iter()
+            .map(|record| record.event.data.to_string())
+            .collect::<String>();
+        assert!(!audit.contains("credential-canary-argument"));
+        assert!(!audit.contains("credential-canary-value"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn aborting_as_git_process_exits_records_one_terminal_event() {
+        use crate::services::EventLog;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (git_shim, _fifo_guard) = init_git_index_lock_fixture(temp.path());
+        let marker = temp.path().join("git-exit.marker");
+        std::fs::write(
+            &git_shim,
+            format!(
+                "#!/bin/sh\n: > {}\nexit 0\n",
+                shell_quote(marker.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&git_shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&git_shim, permissions).unwrap();
+
+        let handler = ProcessHandler::with_project_dir(temp.path().to_path_buf());
+        let context = test_ctx_at(temp.path());
+        let request = RunRequest {
+            command: git_shim.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            working_dir: ".".into(),
+            env: std::collections::HashMap::new(),
+            timeout_ms: 0,
+        };
+        let runner = tokio::spawn(async move { handler.run(request, &context).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Git exit marker was not written"
+            );
+            tokio::task::yield_now().await;
+        }
+        runner.abort();
+        match runner.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(result) => assert!(result.is_ok()),
+        }
+
+        let event_log = EventLog::open(temp.path().join(".exo/logs")).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let records = loop {
+            let records = event_log.ledger().read_events().unwrap();
+            let terminal = records
+                .iter()
+                .filter(|record| record.event.event_type == "git.process.finished")
+                .count();
+            if terminal == 1 {
+                break records;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "exiting Git process did not record its terminal event"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let finished: Vec<_> = records
+            .iter()
+            .filter(|record| record.event.event_type == "git.process.finished")
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert!(matches!(
+            finished[0].event.data["outcome"].as_str(),
+            Some("exited" | "cancelled")
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            event_log
+                .ledger()
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|record| record.event.event_type == "git.process.finished")
+                .count(),
+            1,
+            "cancellation/exit race must not duplicate the finish audit"
+        );
     }
 
     #[cfg(target_os = "linux")]
