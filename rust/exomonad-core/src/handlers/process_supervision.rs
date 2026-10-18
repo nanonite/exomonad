@@ -1,6 +1,12 @@
 //! Bounded process execution with process-group cleanup on timeout and cancellation.
 
+#[cfg(target_os = "linux")]
+use crate::services::{try_record_managed_native_lock_proof_for_identity, ManagedProcessIdentity};
+use crate::services::{EventLog, GitMutationLease};
+use sha2::{Digest, Sha256};
 use std::io;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Duration;
 use thiserror::Error;
@@ -23,6 +29,8 @@ pub(crate) enum ProcessRunError {
     Timeout,
     #[error("managed process group cleanup is unresolved: {0}")]
     Cleanup(&'static str),
+    #[error("managed Git process audit could not be persisted")]
+    Audit,
 }
 
 #[derive(Debug)]
@@ -35,10 +43,81 @@ pub(crate) struct ProcessRunOutput {
     pub process_group_id: Option<u32>,
 }
 
+pub(crate) struct GitProcessAudit<'a> {
+    pub lease: &'a GitMutationLease,
+    pub event_log: &'a EventLog,
+    pub operation_id: &'a str,
+    pub agent_id: &'a str,
+    pub birth_branch: &'a str,
+}
+
+impl GitProcessAudit<'_> {
+    fn record_started(
+        &self,
+        pid: u32,
+        start_identity: Option<u64>,
+        process_group_id: Option<u32>,
+    ) -> Result<(), ProcessRunError> {
+        let paths = &self.lease.paths;
+        let data = serde_json::json!({
+            "schema_version": 1,
+            "operation_id_sha256": digest(self.operation_id),
+            "agent_id": self.agent_id,
+            "birth_branch": self.birth_branch,
+            "worktree_root": paths.worktree_root,
+            "git_dir": paths.git_dir,
+            "common_git_dir": paths.common_git_dir,
+            "index_file": paths.index_file,
+            "index_lock_file": paths.index_lock_file,
+            "process_id": pid,
+            "process_start_identity": start_identity,
+            "process_group_id": process_group_id,
+        });
+        self.event_log
+            .append("git.process.started", "git-process", &data)
+            .map_err(|_| ProcessRunError::Audit)?;
+        Ok(())
+    }
+
+    fn observe_lock(&self, pid: u32, start_identity: Option<u64>) -> Result<bool, ProcessRunError> {
+        #[cfg(target_os = "linux")]
+        {
+            let lock_path = &self.lease.paths.index_lock_file;
+            if !path_exists(lock_path)? {
+                return Ok(false);
+            }
+            let Some(start_time_ticks) = start_identity else {
+                return Err(ProcessRunError::Cleanup(
+                    "managed Git process start identity is unavailable while its index lock exists",
+                ));
+            };
+            let owner = ManagedProcessIdentity {
+                pid,
+                start_time_ticks,
+            };
+            try_record_managed_native_lock_proof_for_identity(self.lease, &owner, self.event_log)
+                .map(|proof| proof.is_some())
+                .map_err(|_| {
+                    ProcessRunError::Cleanup(
+                        "managed Git lock ownership could not be proved from process and inode evidence",
+                    )
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Without procfs descriptor identity, keep Git's native lock protocol in control.
+            // Automatic quarantine will refuse a lock for which no durable owner proof exists.
+            let _ = (pid, start_identity);
+            Ok(false)
+        }
+    }
+}
+
 pub(crate) async fn run_supervised(
     command: &mut Command,
     timeout: Option<Duration>,
     operation_id: &str,
+    git_audit: Option<GitProcessAudit<'_>>,
 ) -> Result<ProcessRunOutput, ProcessRunError> {
     configure_command(command);
     let mut child = command
@@ -59,21 +138,34 @@ pub(crate) async fn run_supervised(
     );
     let stdout = spawn_reader(child.stdout.take())?;
     let stderr = spawn_reader(child.stderr.take())?;
+    if let Some(audit) = &git_audit {
+        if audit
+            .record_started(pid, start_identity, group_id_for_record(pid))
+            .is_err()
+        {
+            cancel_process_group(process_group_id, &mut child).await?;
+            group_guard.disarm();
+            let _ = tokio::join!(join_reader(stdout), join_reader(stderr));
+            return Err(ProcessRunError::Audit);
+        }
+    }
 
-    let status = match timeout {
-        Some(budget) => match tokio::time::timeout(budget, child.wait()).await {
-            Ok(result) => result.map_err(|error| ProcessRunError::Wait(error.kind()))?,
-            Err(_) => {
-                cancel_process_group(process_group_id, &mut child).await?;
-                group_guard.disarm();
-                let _ = tokio::join!(join_reader(stdout), join_reader(stderr));
-                return Err(ProcessRunError::Timeout);
-            }
-        },
-        None => child
-            .wait()
-            .await
-            .map_err(|error| ProcessRunError::Wait(error.kind()))?,
+    let status = match wait_for_process(
+        &mut child,
+        timeout,
+        pid,
+        start_identity,
+        git_audit.as_ref(),
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(error) => {
+            cancel_process_group(process_group_id, &mut child).await?;
+            group_guard.disarm();
+            let _ = tokio::join!(join_reader(stdout), join_reader(stderr));
+            return Err(error);
+        }
     };
 
     cleanup_process_group(process_group_id, &mut child).await?;
@@ -86,6 +178,34 @@ pub(crate) async fn run_supervised(
         start_identity,
         process_group_id: group_id_for_record(pid),
     })
+}
+
+async fn wait_for_process(
+    child: &mut Child,
+    timeout: Option<Duration>,
+    pid: u32,
+    start_identity: Option<u64>,
+    git_audit: Option<&GitProcessAudit<'_>>,
+) -> Result<ExitStatus, ProcessRunError> {
+    let started_at = tokio::time::Instant::now();
+    let mut lock_proof_recorded = false;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| ProcessRunError::Wait(error.kind()))?
+        {
+            return Ok(status);
+        }
+        if !lock_proof_recorded {
+            if let Some(audit) = git_audit {
+                lock_proof_recorded = audit.observe_lock(pid, start_identity)?;
+            }
+        }
+        if timeout.is_some_and(|budget| started_at.elapsed() >= budget) {
+            return Err(ProcessRunError::Timeout);
+        }
+        tokio::time::sleep(GROUP_POLL).await;
+    }
 }
 
 fn configure_command(command: &mut Command) {
@@ -313,5 +433,20 @@ fn process_start_identity(pid: u32) -> Option<u64> {
     {
         let _ = pid;
         None
+    }
+}
+
+fn digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+#[cfg(target_os = "linux")]
+fn path_exists(path: &Path) -> Result<bool, ProcessRunError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(ProcessRunError::Cleanup(
+            "managed Git index lock could not be inspected",
+        )),
     }
 }

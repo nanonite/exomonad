@@ -4,6 +4,9 @@
 //! Working dir is validated to stay within the agent's worktree (no absolute paths,
 //! no `..` traversal).
 
+use super::git_process_audit::{
+    is_git_executable, validate_git_target, validate_git_working_directory, GitProcessContext,
+};
 use super::process_supervision::{run_supervised, ProcessRunError};
 use crate::effects::{
     dispatch_process_effect, EffectContext, EffectError, EffectResult, ProcessEffects,
@@ -114,10 +117,41 @@ impl ProcessEffects for ProcessHandler {
             cmd.env(CHAINLINK_DB_ENV, chainlink_db);
         }
 
+        let git_process = if is_git_executable(&req.command) {
+            validate_git_target(&req.args, &req.env)?;
+            validate_git_working_directory(&ctx.working_dir, &resolved_dir)?;
+            Some(
+                GitProcessContext::prepare(
+                    &self.project_dir,
+                    &ctx.working_dir,
+                    &operation_id,
+                    ctx.agent_name.as_ref(),
+                    ctx.birth_branch.as_str(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let timeout = (req.timeout_ms > 0).then(|| Duration::from_millis(req.timeout_ms));
-        let output = run_supervised(&mut cmd, timeout, &operation_id)
-            .await
-            .map_err(|error| process_run_error(error, req.timeout_ms, &operation_id))?;
+        let audit = git_process
+            .as_ref()
+            .map(GitProcessContext::audit)
+            .transpose()?;
+        let output = match run_supervised(&mut cmd, timeout, &operation_id, audit).await {
+            Ok(output) => {
+                if let Some(context) = &git_process {
+                    context.record_finished("exited", Some(&output), output.status.code())?;
+                }
+                output
+            }
+            Err(error) => {
+                if let Some(context) = &git_process {
+                    context.record_finished(process_outcome(&error), None, None)?;
+                }
+                return Err(process_run_error(error, req.timeout_ms, &operation_id));
+            }
+        };
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -165,6 +199,21 @@ fn process_run_error(error: ProcessRunError, timeout_ms: u64, operation_id: &str
             "process_cleanup_unresolved",
             format!("{reason}; operation_id={operation_id}"),
         ),
+        ProcessRunError::Audit => EffectError::custom(
+            "git_audit_unavailable",
+            format!(
+                "managed Git process could not record its lifecycle; operation_id={operation_id}"
+            ),
+        ),
+    }
+}
+
+fn process_outcome(error: &ProcessRunError) -> &'static str {
+    match error {
+        ProcessRunError::Timeout => "timed_out",
+        ProcessRunError::Spawn(_) => "spawn_failed",
+        ProcessRunError::Wait(_) | ProcessRunError::Output(_) => "unresolved",
+        ProcessRunError::Cleanup(_) | ProcessRunError::Audit => "cleanup_unresolved",
     }
 }
 
@@ -173,6 +222,7 @@ mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch};
     use crate::effects::EffectContext;
+    use crate::services::EventLog;
 
     fn test_ctx() -> EffectContext {
         EffectContext {
@@ -505,6 +555,167 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_git_index_write_records_owner_and_recovers_without_changing_index() {
+        use crate::services::{
+            GitLockRecoveryReceipt, GitMutationResource, GitMutationSafety,
+            NativeLockRecoveryVerdict,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let (git_shim, _fifo_guard) = init_git_index_lock_fixture(temp.path());
+        let worktree = temp.path().to_path_buf();
+        let command_directory = worktree.join("nested");
+        let handler = ProcessHandler::with_project_dir(temp.path().to_path_buf());
+        let ctx = test_ctx_at(temp.path());
+        let index = worktree.join(".git/index");
+        let head = run_git_output(&worktree, &["rev-parse", "HEAD"]);
+        let saved_index = std::fs::read(&index).unwrap();
+        let lock = temp.path().join(".git/index.lock");
+        let event_log = EventLog::open(temp.path().join(".exo/logs")).unwrap();
+        let request = RunRequest {
+            command: git_shim.to_string_lossy().into_owned(),
+            args: vec!["credential-canary-argument".into()],
+            working_dir: "nested".into(),
+            env: std::collections::HashMap::from([(
+                "CREDENTIAL_CANARY_ENV".into(),
+                "credential-canary-value".into(),
+            )]),
+            timeout_ms: 1200,
+        };
+        let mut runner = tokio::spawn(async move { handler.run(request, &ctx).await });
+        let started_pid = tokio::select! {
+            pid = wait_for_lock_proof(&event_log, &lock) => pid,
+            result = &mut runner => panic!(
+                "Git process returned before lock proof was observed: {result:?}"
+            ),
+        };
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(started_pid as i32),
+            nix::sys::signal::Signal::SIGSTOP,
+        )
+        .unwrap();
+        let error = runner.await.unwrap().unwrap_err();
+        assert!(matches!(error, EffectError::Timeout { .. }));
+        assert!(
+            lock.exists(),
+            "killed Git write must retain its native lock"
+        );
+
+        let records = event_log.ledger().read_events().unwrap();
+        let started = records
+            .iter()
+            .find(|record| record.event.event_type == "git.process.started")
+            .unwrap();
+        let requested = records
+            .iter()
+            .find(|record| record.event.event_type == "git.process.requested")
+            .unwrap();
+        let finished = records
+            .iter()
+            .find(|record| record.event.event_type == "git.process.finished")
+            .unwrap();
+        let operation_hash = started.event.data["operation_id_sha256"].as_str().unwrap();
+        assert_eq!(
+            requested.event.data["operation_id_sha256"].as_str(),
+            Some(operation_hash)
+        );
+        assert_eq!(
+            finished.event.data["operation_id_sha256"].as_str(),
+            Some(operation_hash)
+        );
+        assert_eq!(
+            started.event.data["process_id"].as_u64(),
+            Some(started_pid as u64)
+        );
+        assert!(started.event.data["process_group_id"].is_number());
+        let owner = records
+            .iter()
+            .find(|record| record.event.event_type == "git.native_lock.held")
+            .unwrap();
+        assert_eq!(
+            owner.event.data["owner"]["start_time_ticks"],
+            started.event.data["process_start_identity"]
+        );
+        assert_eq!(
+            owner.event.data["operation_id_sha256"],
+            started.event.data["operation_id_sha256"]
+        );
+        assert_eq!(
+            started.event.data["index_lock_file"].as_str(),
+            Some(lock.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            started.event.data["worktree_root"].as_str(),
+            Some(worktree.canonicalize().unwrap().to_string_lossy().as_ref())
+        );
+        assert!(started.event.data.get("args").is_none());
+        let audit = records
+            .iter()
+            .map(|record| record.event.data.to_string())
+            .collect::<String>();
+        assert!(!audit.contains("credential-canary-argument"));
+        assert!(!audit.contains("credential-canary-value"));
+        assert!(!audit.contains("CREDENTIAL_CANARY_ENV"));
+        assert_eq!(
+            owner.event.data["owner"]["pid"].as_u64(),
+            Some(started_pid as u64)
+        );
+        assert!(records.iter().any(|record| {
+            record.event.event_type == "git.process.finished"
+                && record.event.data["outcome"] == "timed_out"
+        }));
+
+        let safety = GitMutationSafety::new(temp.path().to_path_buf());
+        let leases = safety
+            .acquire_set(
+                temp.path(),
+                &[GitMutationResource::Index],
+                "test-index-recovery",
+                Duration::ZERO,
+            )
+            .unwrap();
+        let index_lease = leases
+            .leases()
+            .iter()
+            .find(|lease| lease.resource == GitMutationResource::Index)
+            .unwrap();
+        let recovered = safety.reconcile_native_index_lock(index_lease, &event_log, Duration::ZERO);
+        assert!(
+            matches!(
+                &recovered,
+                NativeLockRecoveryVerdict::Recovered(GitLockRecoveryReceipt { .. })
+            ),
+            "unexpected native lock recovery verdict: {recovered:?}"
+        );
+        assert!(!lock.exists());
+        assert_eq!(std::fs::read(&index).unwrap(), saved_index);
+        assert_eq!(run_git_output(&worktree, &["rev-parse", "HEAD"]), head);
+        assert!(command_directory.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_lock_proof(event_log: &EventLog, lock: &std::path::Path) -> u32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if lock.exists() {
+                let records = event_log.ledger().read_events().unwrap();
+                if let Some(owner) = records
+                    .iter()
+                    .find(|record| record.event.event_type == "git.native_lock.held")
+                {
+                    return owner.event.data["owner"]["pid"].as_u64().unwrap() as u32;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Git did not acquire and durably prove its native index lock"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -519,6 +730,93 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_git_fixture(path: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_git_output(path: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn init_git_index_lock_fixture(path: &std::path::Path) -> (PathBuf, std::fs::File) {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        run_git_fixture(path, &["init", "-q", "-b", "main"]);
+        run_git_fixture(path, &["config", "user.name", "process test"]);
+        run_git_fixture(
+            path,
+            &["config", "user.email", "process-test@example.invalid"],
+        );
+        std::fs::write(path.join("tracked.txt"), "committed\n").unwrap();
+        run_git_fixture(path, &["add", "tracked.txt"]);
+        run_git_fixture(path, &["commit", "-q", "-m", "base"]);
+        let worktree_subdir = path.join("nested");
+        std::fs::create_dir(&worktree_subdir).unwrap();
+        let fifo = worktree_subdir.join("index-info.fifo");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let fifo_guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("test environment has Git on PATH");
+        let shim_directory = path.join("shim");
+        std::fs::create_dir(&shim_directory).unwrap();
+        let shim = shim_directory.join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nexec {} update-index --index-info < {}\n",
+                shell_quote(git.to_string_lossy().as_ref()),
+                shell_quote(fifo.to_string_lossy().as_ref()),
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).unwrap();
+        (shim, fifo_guard)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     #[test]
@@ -536,6 +834,16 @@ mod tests {
         assert!(ProcessHandler::validate_working_dir("..").is_err());
         assert!(ProcessHandler::validate_working_dir("../foo").is_err());
         assert!(ProcessHandler::validate_working_dir("foo/../../bar").is_err());
+    }
+
+    #[test]
+    fn direct_git_executable_names_are_recognized() {
+        assert!(is_git_executable("git"));
+        assert!(is_git_executable("/usr/bin/git"));
+        assert!(is_git_executable("/Git/bin/Git.EXE"));
+        assert!(is_git_executable("GIT.EXE"));
+        assert!(!is_git_executable("/bin/sh"));
+        assert!(!is_git_executable("my-git-wrapper"));
     }
 
     fn process_request(command: &str) -> RunRequest {

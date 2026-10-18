@@ -380,6 +380,32 @@ fn production_procfs_permission_gap_is_uncertain() {
     assert!(fixture.event_log.ledger().read_events().unwrap().is_empty());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn zombie_process_with_inaccessible_descriptors_cannot_be_a_lock_holder() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let lock_path = fixture.lock_path();
+    let _held_lock = File::create(&lock_path).expect("native lock");
+    let process_root = fixture._temp.path().join("zombie-proc");
+    let pid = 7218;
+    procfs_fixture(&process_root, pid, 80, &lock_path);
+    let process_dir = process_root.join(pid.to_string());
+    fs::write(process_dir.join("stat"), fake_stat_with_state(pid, 80, "Z"))
+        .expect("zombie process identity");
+    let fd_dir = process_dir.join("fd");
+    fs::set_permissions(&fd_dir, fs::Permissions::from_mode(0o0)).expect("hide zombie descriptors");
+    let metadata = fs::metadata(&lock_path).expect("lock identity");
+    let inspector = ProcFsInspector::under(process_root);
+
+    assert!(inspector
+        .process_holders(metadata.dev(), metadata.ino())
+        .expect("zombies cannot retain open descriptors")
+        .is_empty());
+}
+
 #[test]
 fn a_lock_changed_after_ownership_observation_is_not_audited_as_proven() {
     let fixture = Fixture::new();
@@ -460,6 +486,10 @@ fn parser_refuses_malformed_or_ambiguous_process_records() {
 }
 
 fn fake_stat(pid: u32, start_ticks: u64) -> String {
+    fake_stat_with_state(pid, start_ticks, "S")
+}
+
+fn fake_stat_with_state(pid: u32, start_ticks: u64, state: &str) -> String {
     let suffix = (0..19)
         .map(|index| {
             if index == 18 {
@@ -470,5 +500,5 @@ fn fake_stat(pid: u32, start_ticks: u64) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    format!("{pid} (worker) S {suffix}")
+    format!("{pid} (worker) {state} {suffix}")
 }

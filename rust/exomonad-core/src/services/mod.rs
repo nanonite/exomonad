@@ -96,7 +96,9 @@ pub use self::expected_events::{
 pub use self::filesystem::FileSystemService;
 pub use self::forgejo::ForgejoClient;
 pub use self::git_lock_owner::{
-    capture_managed_process_identity, record_managed_native_lock_proof, ManagedNativeLockProof,
+    capture_managed_process_identity, record_managed_native_lock_proof,
+    record_managed_native_lock_proof_for_identity,
+    try_record_managed_native_lock_proof_for_identity, ManagedNativeLockProof,
     ManagedProcessIdentity, NativeGitLockSnapshot, RecordedManagedNativeLockProof,
 };
 pub use self::git_lock_recovery::{GitLockRecoveryReceipt, NativeLockRecoveryVerdict};

@@ -92,7 +92,27 @@ pub fn record_managed_native_lock_proof(
             "process identity does not belong to the managed child handle",
         ));
     }
+    record_managed_native_lock_proof_for_identity(lease, owner, event_log)
+}
+
+/// Record an exact lock-holding proof from a previously captured process identity.
+pub fn record_managed_native_lock_proof_for_identity(
+    lease: &GitMutationLease,
+    owner: &ManagedProcessIdentity,
+    event_log: &EventLog,
+) -> Result<RecordedManagedNativeLockProof, GitMutationError> {
     record_proof_with(lease, owner, event_log, &ProcFsInspector::default())
+}
+
+/// Record a lock proof for an already captured child identity.
+///
+/// Returns None while the child has not opened the current index-lock inode yet.
+pub fn try_record_managed_native_lock_proof_for_identity(
+    lease: &GitMutationLease,
+    owner: &ManagedProcessIdentity,
+    event_log: &EventLog,
+) -> Result<Option<RecordedManagedNativeLockProof>, GitMutationError> {
+    try_record_proof_with(lease, owner, event_log, &ProcFsInspector::default())
 }
 
 fn capture_managed_process_identity_with(
@@ -120,6 +140,20 @@ fn record_proof_with(
     event_log: &EventLog,
     inspector: &dyn ProcessInspector,
 ) -> Result<RecordedManagedNativeLockProof, GitMutationError> {
+    try_record_proof_with(lease, owner, event_log, inspector)?.ok_or_else(|| {
+        uncertain(
+            &lease.paths.index_lock_file,
+            "managed process does not hold the current native lock inode open",
+        )
+    })
+}
+
+fn try_record_proof_with(
+    lease: &GitMutationLease,
+    owner: &ManagedProcessIdentity,
+    event_log: &EventLog,
+    inspector: &dyn ProcessInspector,
+) -> Result<Option<RecordedManagedNativeLockProof>, GitMutationError> {
     let paths = &lease.paths;
     if lease.resource != GitMutationResource::Index {
         return Err(uncertain(
@@ -129,15 +163,16 @@ fn record_proof_with(
     }
 
     verify_process_identity(inspector, owner, &paths.index_lock_file)?;
-    let lock = snapshot_lock(&paths.index_lock_file)?;
+    let lock = match snapshot_lock(&paths.index_lock_file) {
+        Ok(lock) => lock,
+        Err(_error) if native_lock_is_absent(&paths.index_lock_file) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if !inspector
         .holds_inode(owner.pid, lock.device, lock.inode)
         .map_err(|reason| uncertain(&paths.index_lock_file, &reason))?
     {
-        return Err(uncertain(
-            &paths.index_lock_file,
-            "managed process does not hold the current native lock inode open",
-        ));
+        return Ok(None);
     }
     verify_process_identity(inspector, owner, &paths.index_lock_file)?;
     if snapshot_lock(&paths.index_lock_file)? != lock {
@@ -167,7 +202,14 @@ fn record_proof_with(
     let data = serde_json::to_value(&proof)
         .map_err(|_| uncertain(&paths.index_lock_file, "cannot encode native lock proof"))?;
     let event_id = append_proof_once(event_log, &data)?;
-    Ok(RecordedManagedNativeLockProof { event_id, proof })
+    Ok(Some(RecordedManagedNativeLockProof { event_id, proof }))
+}
+
+fn native_lock_is_absent(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    )
 }
 
 fn verify_process_identity(
@@ -401,6 +443,16 @@ impl ProcFsInspector {
     pub(crate) fn under(root: PathBuf) -> Self {
         Self { root }
     }
+
+    fn process_is_zombie(&self, pid: u32) -> Result<bool, String> {
+        let stat_path = self.root.join(pid.to_string()).join("stat");
+        let stat = fs::read_to_string(stat_path)
+            .map_err(|error| format!("cannot inspect process identity ({})", error.kind()))?;
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            return Err("process identity record is malformed".into());
+        };
+        Ok(matches!(fields.split_whitespace().next(), Some("Z" | "X")))
+    }
 }
 
 impl ProcessInspector for ProcFsInspector {
@@ -423,12 +475,22 @@ impl ProcessInspector for ProcFsInspector {
 
     fn holds_inode(&self, pid: u32, device: u64, inode: u64) -> Result<bool, String> {
         let fd_dir = self.root.join(pid.to_string()).join("fd");
-        let entries = fs::read_dir(&fd_dir).map_err(|error| {
-            format!(
-                "cannot inspect managed process descriptors ({})",
-                error.kind()
-            )
-        })?;
+        let entries = match fs::read_dir(&fd_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && self.process_is_zombie(pid)? =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect managed process descriptors ({})",
+                    error.kind()
+                ));
+            }
+        };
         for entry in entries {
             let entry = entry.map_err(|error| {
                 format!(
@@ -486,11 +548,27 @@ impl ProcessInspector for ProcFsInspector {
             let Some(start_time_ticks) = self.start_time_ticks(pid)? else {
                 continue;
             };
-            if !self.holds_inode(pid, device, inode)? {
+            let holds_inode = match self.holds_inode(pid, device, inode) {
+                Ok(holds_inode) => holds_inode,
+                Err(reason) => match self.start_time_ticks(pid)? {
+                    None => continue,
+                    Some(current) if current == start_time_ticks => {
+                        return Err(format!("{reason} (pid {pid})"));
+                    }
+                    Some(_) => {
+                        return Err("process identity changed during descriptor inspection".into());
+                    }
+                },
+            };
+            let current_start_time = self.start_time_ticks(pid)?;
+            if current_start_time.is_none() {
                 continue;
             }
-            if self.start_time_ticks(pid)? != Some(start_time_ticks) {
+            if current_start_time != Some(start_time_ticks) {
                 return Err("process identity changed during descriptor inspection".to_string());
+            }
+            if !holds_inode {
+                continue;
             }
             holders.push(ManagedProcessIdentity {
                 pid,

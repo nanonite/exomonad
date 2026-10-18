@@ -36,6 +36,16 @@ Handles effects in the `process.*` namespace, providing ad-hoc process execution
   also clean up leftover group members before returning the original result.
 - Process logs use a generated operation ID and PID/start/group identity. They
   do not include command arguments or environment values.
+- Direct `git`/`git.exe` process effects acquire the ordered shared-ref and
+  index leases before spawn and append requested, started, and finished
+  records to the existing `.exo/logs` event ledger. On Linux, an index-lock
+  proof is recorded only after `/proc` confirms that exact child identity holds
+  the exact lock inode. Other platforms keep Git's native locking behavior but
+  cannot authorize automatic quarantine without a durable owner proof.
+- Managed direct Git calls reject repository path overrides such as `-C`,
+  `--git-dir`, `--work-tree`, and `GIT_*` path selectors. A requested
+  subdirectory must resolve inside the declared worktree and cannot cross a
+  nested `.git` boundary; use the owning worktree as the process context.
 - Non-Unix fallback supervises and reaps the direct child only; it reports
   unresolved cleanup when cancellation cannot verify helper-process exit.
 - No command allowlist — trusts WASM author

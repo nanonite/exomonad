@@ -23,6 +23,7 @@ pub mod file_pr;
 pub mod forgejo_as_github;
 pub mod fs;
 pub mod git;
+mod git_process_audit;
 pub mod github;
 pub mod groups;
 pub mod inbox;
