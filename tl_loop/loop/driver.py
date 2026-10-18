@@ -6991,7 +6991,28 @@ def _parent_sync_effect(
                 old_payload = _validated_sync_payload(
                     old_payload, call_arguments, sync_id, attempt, require_correlation=False
                 )
-            return call_arguments, old_payload
+            if old_payload.get("sync_outcome") == "unresolved":
+                return call_arguments, old_payload
+            identity_error = _confirmed_sync_repository_error(
+                call_arguments, config, effects, effects_log
+            )
+            if identity_error is not None:
+                return call_arguments, _unresolved_sync_decision(sync_id, attempt, identity_error)
+            reconciled = _run_parent_sync_observation(
+                current.id,
+                call_arguments,
+                sync_id,
+                next_attempt,
+                effects,
+                effects_log,
+                config,
+            )
+            if reconciled.get("sync_outcome") == "confirmed":
+                return call_arguments, reconciled
+            if reconciled.get("sync_outcome") != "safe_to_retry":
+                return call_arguments, reconciled
+            outcome = "safe_to_retry"
+            next_attempt += 1
         if outcome in {"pre_mutation_refusal", "known_partial_progress", "safe_to_retry"}:
             pass
         elif outcome in {"unknown_interruption", "unresolved"}:
@@ -7026,6 +7047,20 @@ def _parent_sync_effect(
         effects_log,
         config,
     )
+
+
+def _confirmed_sync_repository_error(
+    arguments: Mapping[str, object],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> str | None:
+    identity, failure = _resolve_repository_identity_detail(config, effects, effects_log)
+    if identity is None:
+        return f"current repository identity is {failure or 'unavailable'}"
+    if identity.remote_url != arguments.get("repository"):
+        return "current repository identity differs from the confirmed parent-sync operation"
+    return None
 
 
 def _parent_sync_identity_fields(arguments: Mapping[str, object]) -> dict[str, object]:

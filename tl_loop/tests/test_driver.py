@@ -229,6 +229,27 @@ def _test_git_tree(repository: Path, commit: str) -> str:
     return tree
 
 
+def _parent_sync_git_fixture(repository: Path) -> tuple[str, str, str]:
+    base = _test_git_repository(repository)
+    merged_head = _test_git_commit(repository, "aggregate.txt", "integrated\n", "merge child")
+    remote_url = "https://forge.example.com/org/repo.git"
+    subprocess.run(
+        ("git", "-C", str(repository), "remote", "add", "origin", remote_url), check=True
+    )
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "update-ref",
+            "refs/remotes/origin/main",
+            merged_head,
+        ),
+        check=True,
+    )
+    return base, merged_head, remote_url
+
+
 def test_event_diagnostics_exposes_non_terminal_timing() -> None:
     started_at = time.time() - 2.0
     diagnostics = EventDiagnostics(
@@ -6741,62 +6762,213 @@ def test_parent_sync_reconciles_legacy_unknown_rows_without_rewriting_them(tmp_p
     assert current_journal[:2] == historical
 
 
-def test_parent_sync_adopts_legacy_confirmed_receipt_without_rewriting_it(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "drift", ["none", "head", "branch", "remote_head", "remote_url", "fast_forwardable"]
+)
+def test_parent_sync_revalidates_legacy_confirmed_receipt_against_current_git(
+    tmp_path: Path, drift: str
+) -> None:
     store = _review_store(tmp_path)
     state = store.load()
     current = state.slices["leaf-a"]
+    base_sha, merged_head, remote_url = _parent_sync_git_fixture(tmp_path)
     evidence: dict[str, object] = {
-        "repository": "https://forge.example.com/org/repo.git",
+        "repository": remote_url,
         "parent_branch": "main",
-        "head_sha": "head-a",
+        "head_sha": merged_head,
         "merge_journal_id": "merge-journal-a",
         "lane_epoch": "1",
     }
+    if drift == "head":
+        _test_git_commit(tmp_path, "later.txt", "later local work\n", "later local work")
+    elif drift == "branch":
+        subprocess.run(("git", "-C", str(tmp_path), "checkout", "-b", "other"), check=True)
+    elif drift == "remote_head":
+        subprocess.run(
+            ("git", "-C", str(tmp_path), "update-ref", "refs/remotes/origin/main", base_sha),
+            check=True,
+        )
+    elif drift == "fast_forwardable":
+        subprocess.run(
+            ("git", "-C", str(tmp_path), "update-ref", "refs/heads/main", base_sha),
+            check=True,
+        )
+    elif drift == "remote_url":
+        subprocess.run(
+            (
+                "git",
+                "-C",
+                str(tmp_path),
+                "remote",
+                "set-url",
+                "origin",
+                "https://forge.example.com/other/repo.git",
+            ),
+            check=True,
+        )
+
     journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
     legacy_arguments = {
         "child_id": "leaf-a",
         "pr_number": 42,
-        "repository": evidence["repository"],
+        "repository": remote_url,
         "parent_branch": "main",
-        "merged_head_sha": "head-a",
-        "expected_base_sha": "base-a",
+        "merged_head_sha": merged_head,
+        "expected_base_sha": base_sha,
         "lane_epoch": 1,
         "working_dir": ".",
     }
     receipt = {
         **legacy_arguments,
         "remote_name": "forgejo",
-        "parent_commit_sha": "parent-after-merge",
-        "remote_head_sha": "parent-after-merge",
-        "ancestry_proof": "ancestor:head-a->parent-after-merge",
+        "parent_commit_sha": merged_head,
+        "remote_head_sha": merged_head,
+        "ancestry_proof": f"ancestor:{merged_head}->{merged_head}",
     }
     legacy_intent = EffectIntent("post_merge_parent_sync", "leaf-a", legacy_arguments, True)
     journal.append(legacy_intent)
     journal.mark_result(legacy_intent, ToolResult.from_raw({"success": True, "result": receipt}))
     historical = journal.snapshot()
 
-    class NoDispatchTransport:
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
-            del role, name, tool_name, arguments
-            raise AssertionError(
-                "a proven legacy success must be adopted without another Git effect"
-            )
+    class CurrentGitTransport:
+        calls: ClassVar[list[tuple[str, dict[str, object]]]] = []
 
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+            del role, name
+            self.calls.append((tool_name, dict(arguments)))
+            if tool_name == "repository_identity":
+                observed_remote = _test_git_output(tmp_path, "remote", "get-url", "origin")
+                return {"success": True, "result": {"remote_url": observed_remote}}
+
+            assert tool_name == "post_merge_parent_sync"
+            branch = _test_git_output(tmp_path, "branch", "--show-current")
+            local_head = _test_git_output(tmp_path, "rev-parse", "HEAD")
+            remote_head = _test_git_output(tmp_path, "rev-parse", "refs/remotes/origin/main")
+            current_remote = _test_git_output(tmp_path, "remote", "get-url", "origin")
+            if branch != "main":
+                outcome, phase, diagnostic = (
+                    "pre_mutation_refusal",
+                    "branch_check",
+                    "parent branch changed",
+                )
+            elif current_remote != remote_url:
+                outcome, phase, diagnostic = (
+                    "unresolved",
+                    "remote_selection",
+                    "current remote differs from the historical repository identity",
+                )
+            elif arguments["reconcile_only"] is False:
+                synchronized = subprocess.run(
+                    ("git", "-C", str(tmp_path), "merge", "--ff-only", "refs/remotes/origin/main"),
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+                local_head = _test_git_output(tmp_path, "rev-parse", "HEAD")
+                remote_head = _test_git_output(tmp_path, "rev-parse", "refs/remotes/origin/main")
+                if synchronized.returncode == 0 and local_head == remote_head:
+                    outcome, phase, diagnostic = "confirmed", "complete", ""
+                else:
+                    outcome, phase, diagnostic = (
+                        "unresolved",
+                        "fast_forward",
+                        "test Git fast-forward did not complete",
+                    )
+            elif local_head == remote_head:
+                outcome, phase, diagnostic = "confirmed", "complete", ""
+            elif (
+                local_head is not None
+                and remote_head is not None
+                and subprocess.run(
+                    (
+                        "git",
+                        "-C",
+                        str(tmp_path),
+                        "merge-base",
+                        "--is-ancestor",
+                        local_head,
+                        remote_head,
+                    ),
+                    check=False,
+                ).returncode
+                == 0
+            ):
+                outcome, phase, diagnostic = (
+                    "safe_to_retry",
+                    "reconcile_complete",
+                    "current Git state proves fast-forward retry is safe",
+                )
+            else:
+                outcome, phase, diagnostic = (
+                    "unresolved",
+                    "reconcile_observation",
+                    "current Git coordinates differ from the historical receipt",
+                )
+            result: dict[str, object] = {
+                **arguments,
+                "sync_outcome": outcome,
+                "sync_phase": phase,
+                "completed_steps": ["fetch"],
+                "retry_safe": outcome == "safe_to_retry",
+                "diagnostic": diagnostic,
+            }
+            if outcome == "confirmed":
+                assert local_head is not None and remote_head is not None
+                result.update(
+                    {
+                        "parent_commit_sha": local_head,
+                        "remote_head_sha": remote_head,
+                        "ancestry_proof": f"ancestor:{merged_head}->{local_head}",
+                    }
+                )
+            return {"success": True, "result": result}
+
+    transport = CurrentGitTransport()
     _, adopted = _parent_sync_effect(
         state,
         current,
         42,
         evidence,
         TLLoopConfig(active=True, project_root=tmp_path),
-        EffectClient(NoDispatchTransport()),
+        EffectClient(transport),
         journal,
         operation="post_merge_parent_sync",
-        expected_base_sha="base-a",
+        expected_base_sha=base_sha,
     )
 
-    assert adopted["sync_outcome"] == "confirmed"
-    assert adopted["parent_commit_sha"] == "parent-after-merge"
-    assert journal.snapshot() == historical
+    if drift in {"none", "fast_forwardable"}:
+        assert adopted["sync_outcome"] == "confirmed"
+        assert adopted["parent_commit_sha"] == merged_head
+        if drift == "none":
+            assert [name for name, _ in transport.calls] == [
+                "repository_identity",
+                "post_merge_parent_sync",
+            ]
+            assert transport.calls[1][1]["sync_attempt"] == 2
+            assert transport.calls[1][1]["reconcile_only"] is True
+        else:
+            assert [name for name, _ in transport.calls] == [
+                "repository_identity",
+                "post_merge_parent_sync",
+                "post_merge_parent_sync",
+            ]
+            assert transport.calls[1][1]["sync_attempt"] == 2
+            assert transport.calls[1][1]["reconcile_only"] is True
+            assert transport.calls[2][1]["sync_attempt"] == 3
+            assert transport.calls[2][1]["reconcile_only"] is False
+            assert _test_git_output(tmp_path, "rev-parse", "HEAD") == merged_head
+        assert journal.snapshot()[0] == historical[0]
+        assert len(journal.confirmed_entries("post_merge_parent_sync_reconcile", "leaf-a")) == 1
+    else:
+        assert adopted["sync_outcome"] != "confirmed"
+        assert journal.snapshot()[0] == historical[0]
+        assert all(
+            arguments.get("reconcile_only") is not False
+            for name, arguments in transport.calls
+            if name == "post_merge_parent_sync"
+        )
+        if drift == "remote_url":
+            assert [name for name, _ in transport.calls] == ["repository_identity"]
 
 
 def test_slice_recovery_is_projected_into_the_canonical_scope_before_release(

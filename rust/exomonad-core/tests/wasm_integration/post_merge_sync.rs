@@ -244,6 +244,51 @@ async fn compiled_parent_sync_uses_selected_remote_preserves_unrelated_edits_and
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn compiled_parent_sync_rejects_a_historical_success_after_local_head_changes() {
+    let fixture = sync_fixture(false);
+    let plugin = sync_plugin(&fixture.repository).await;
+
+    let synchronized = call_parent_sync(&plugin, &fixture, 1, false).await;
+    assert_eq!(synchronized["result"]["sync_outcome"], "confirmed");
+    assert_eq!(
+        git_output(&fixture.repository, &["rev-parse", "HEAD"]),
+        fixture.merged_sha
+    );
+
+    git(
+        &fixture.repository,
+        &["update-ref", "refs/heads/main", &fixture.base_sha],
+    );
+    assert_eq!(
+        git_output(&fixture.repository, &["rev-parse", "HEAD"]),
+        fixture.base_sha,
+        "the disposable repository now contradicts its saved synchronization receipt"
+    );
+
+    let replay = call_parent_sync(&plugin, &fixture, 2, true).await;
+    assert_eq!(
+        replay["success"], true,
+        "reconciliation must return an evidence decision: {replay:#}"
+    );
+    assert_eq!(replay["result"]["sync_outcome"], "safe_to_retry");
+    assert_eq!(replay["result"]["sync_attempt"], 2);
+    assert_eq!(
+        git_output(&fixture.repository, &["rev-parse", "HEAD"]),
+        fixture.base_sha,
+        "read-only reconciliation must not silently restore the prior local head"
+    );
+    assert_eq!(
+        git_output(
+            &fixture.repository,
+            &["rev-parse", "refs/remotes/forgejo/main"]
+        ),
+        fixture.merged_sha,
+        "the current selected remote still contains the merged aggregate"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn compiled_parent_sync_reconciles_a_safe_retry_without_mutating_local_head() {
     let fixture = sync_fixture(false);
     let plugin = sync_plugin(&fixture.repository).await;
