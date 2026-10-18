@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Reap managed process groups after task cancellation (#1247)
 - Revalidate parent synchronization receipts before replay completion (#1246)
 - Reject Git execution inside nested bare repositories (#1245)
 - Resume merged aggregates through post-merge recovery instead of publication lookup (#1234)
