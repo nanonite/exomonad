@@ -28,6 +28,7 @@ MUTATING_OPERATIONS = frozenset(
         "merge_pr",
         "merge_bookkeeping",
         "post_merge_parent_sync",
+        "post_merge_parent_sync_reconcile",
         "post_merge_remote_reconcile",
         "post_merge_issue_close",
         "post_merge_changelog",
@@ -137,6 +138,14 @@ class EffectJournal(list[Any]):
                 if isinstance(entry, dict) and entry.get("key") == key
             ),
             None,
+        )
+
+    def entries_for(self, operation: str, target: str) -> tuple[dict[str, object], ...]:
+        """Return all immutable attempts for one effect operation and target."""
+        return tuple(
+            json.loads(dumps_json(entry))
+            for entry in self._read()
+            if entry.get("operation") == operation and entry.get("target") == target
         )
 
     def probe(self, intent: Any) -> EffectProbe:

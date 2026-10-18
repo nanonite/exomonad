@@ -288,6 +288,8 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         merged_head_sha="merged-head",
         expected_base_sha="base",
         lane_epoch=1,
+        sync_operation_id="a" * 64,
+        sync_attempt=1,
     )
     client.post_merge_remote_reconcile(
         child_id="child",

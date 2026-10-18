@@ -51,6 +51,8 @@ import Control.Monad (void)
 import Control.Monad.Freer (Eff, Member)
 import Data.Aeson (FromJSON (..), ToJSON (..), Value, object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
+import Data.Aeson.Types (Pair)
+import Data.Char (isControl)
 import Data.Int (Int32)
 import Data.Map qualified as Map
 import Data.Text (Text)
@@ -58,6 +60,7 @@ import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Data.Word (Word64)
+import Effects.EffectError qualified as EE
 import Effects.Log qualified as Log
 import Effects.Process qualified as Proc
 import ExoMonad.Effects.Log (LogInfo)
@@ -137,7 +140,10 @@ data PostMergeParentSyncArgs = PostMergeParentSyncArgs
     pmpForgejoMergeCommitSha :: Maybe Text,
     pmpForgejoMergeCommitTreeSha :: Maybe Text,
     pmpProspectiveMergeTreeSha :: Maybe Text,
-    pmpReviewedPrHeadTreeSha :: Maybe Text
+    pmpReviewedPrHeadTreeSha :: Maybe Text,
+    pmpSyncOperationId :: Maybe Text,
+    pmpSyncAttempt :: Maybe Int,
+    pmpReconcileOnly :: Maybe Bool
   }
   deriving (Show, Eq, Generic)
 
@@ -159,6 +165,9 @@ instance FromJSON PostMergeParentSyncArgs where
       <*> v .:? "forgejo_merge_commit_tree_sha"
       <*> v .:? "prospective_merge_tree_sha"
       <*> v .:? "reviewed_pr_head_tree_sha"
+      <*> v .:? "sync_operation_id"
+      <*> v .:? "sync_attempt"
+      <*> v .:? "reconcile_only"
 
 data PostMergeChangelog
 
@@ -216,7 +225,7 @@ instance FromJSON PostMergePushArgs where
 
 postMergeParentSyncDescription :: Text
 postMergeParentSyncDescription =
-  "Synchronize a merged child into its parent branch and return Git-verified remote-head and structured merge-integration evidence."
+  "Synchronize a merged child into its parent branch and return a Git-verified receipt or a structured refusal, partial-progress, retry-safety, or unknown-outcome decision. Supply the stable sync_operation_id and a monotonically increasing sync_attempt for each effect attempt; set reconcile_only to observe and classify current Git state without advancing the branch."
 
 postMergeParentSyncSchema :: Aeson.Object
 postMergeParentSyncSchema =
@@ -235,6 +244,9 @@ postMergeParentSyncSchema =
       ("forgejo_merge_commit_tree_sha", "Git tree resolved from the authoritative merge commit."),
       ("prospective_merge_tree_sha", "Git merge-tree result for the reviewed base and PR head."),
       ("reviewed_pr_head_tree_sha", "Tree SHA resolved from the exact reviewed PR head."),
+      ("sync_operation_id", "Stable identity for the logical parent synchronization."),
+      ("sync_attempt", "Durable attempt number for this synchronization operation."),
+      ("reconcile_only", "Observe remote and local Git evidence without fast-forwarding."),
       ("working_dir", "Optional relative repository working directory.")
     ]
 
@@ -328,55 +340,241 @@ instance MCPTool PostMergePush where
 postMergeParentSyncCore :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Eff effs (Either Text Value)
 postMergeParentSyncCore args = do
   case validateParentSync args of
-    Left err -> pure $ Left err
+    Left err -> pure $ Right (syncDecision args "pre_mutation_refusal" "validation" [] True err)
     Right () -> do
       selectedRemote <- resolveSelectedRemoteAt (pmpWorkingDir args)
       case selectedRemote of
-        Left err -> pure $ Left err
+        Left err -> pure $ Right (syncDecision args "pre_mutation_refusal" "remote_selection" [] True err)
         Right remote -> do
           branch <- runGitAt (pmpWorkingDir args) ["branch", "--show-current"]
           case branch of
-            Left err -> pure $ Left err
+            Left err -> pure $ Right (syncDecision args "pre_mutation_refusal" "branch_check" [] True err)
             Right current
               | T.strip current /= pmpParentBranch args ->
-                  pure $ Left "parent synchronization requires the requested branch to be checked out"
-              | otherwise -> do
-                  fetched <- runGitAt (pmpWorkingDir args) (postMergeParentSyncFetchArgs remote (pmpParentBranch args))
-                  case fetched of
-                    Left err -> pure $ Left err
-                    Right _ -> do
-                      merged <- runGitAt (pmpWorkingDir args) (postMergeParentSyncMergeArgs remote (pmpParentBranch args))
-                      case merged of
-                        Left err -> pure $ Left err
-                        Right _ -> do
-                          parentCommit <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
-                          remoteHead <- runGitAt (pmpWorkingDir args) ["rev-parse", remoteRef remote (pmpParentBranch args)]
-                          case (parentCommit, remoteHead) of
-                            (Right parent, Right observedRemote)
-                              | parent /= observedRemote -> pure $ Left "parent synchronization produced divergent local and remote heads"
-                              | otherwise -> do
-                                  integration <- verifyMergeIntegrationAt (pmpWorkingDir args) args parent
-                                  case integration of
-                                    Left err -> pure $ Left err
-                                    Right integrationProof ->
-                                      pure $
-                                        Right
-                                          ( object
-                                              [ "child_id" .= pmpChildId args,
-                                                "pr_number" .= pmpPrNumber args,
-                                                "repository" .= pmpRepository args,
-                                                "parent_branch" .= pmpParentBranch args,
-                                                "remote_name" .= remote,
-                                                "merged_head_sha" .= pmpMergedHeadSha args,
-                                                "expected_base_sha" .= pmpExpectedBaseSha args,
-                                                "lane_epoch" .= pmpLaneEpoch args,
-                                                "parent_commit_sha" .= parent,
-                                                "remote_head_sha" .= observedRemote,
-                                                "ancestry_proof" .= legacyProof integrationProof,
-                                                "merge_integration_proof" .= integrationProof
-                                              ]
-                                          )
-                            _ -> pure $ Left "parent synchronization could not read authoritative heads"
+                  pure $ Right (syncDecision args "pre_mutation_refusal" "branch_check" [] True "parent synchronization requires the requested branch to be checked out")
+              | pmpReconcileOnly args == Just True -> reconcileParentSync args remote
+              | otherwise -> synchronizeParentBranch args remote
+
+data SyncGitResult
+  = SyncGitResponse Int32 Text Text
+  | SyncGitInterrupted Bool Text
+
+synchronizeParentBranch :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Eff effs (Either Text Value)
+synchronizeParentBranch args remote = do
+  fetched <- runGitSyncAt (pmpWorkingDir args) (postMergeParentSyncFetchArgs remote (pmpParentBranch args))
+  case fetched of
+    SyncGitInterrupted True diagnostic ->
+      pure $ Right (syncDecision args "pre_mutation_refusal" "fetch" [] True diagnostic)
+    SyncGitInterrupted False diagnostic ->
+      pure $ Right (syncDecision args "unknown_interruption" "fetch" [] False diagnostic)
+    SyncGitResponse exitCode stdout stderr
+      | exitCode /= 0 ->
+          pure $ Right (syncDecision args "unknown_interruption" "fetch" [] False (exitDiagnostic exitCode stdout stderr))
+      | otherwise -> fastForwardParentBranch args remote
+
+fastForwardParentBranch :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Eff effs (Either Text Value)
+fastForwardParentBranch args remote = do
+  before <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+  case before of
+    Left diagnostic ->
+      pure $ Right (syncDecision args "known_partial_progress" "pre_fast_forward_observation" ["fetch"] True diagnostic)
+    Right beforeHead -> do
+      merged <- runGitSyncAt (pmpWorkingDir args) (postMergeParentSyncMergeArgs remote (pmpParentBranch args))
+      case merged of
+        SyncGitInterrupted True diagnostic ->
+          pure $ Right (syncDecision args "known_partial_progress" "fast_forward" ["fetch"] True diagnostic)
+        SyncGitInterrupted False diagnostic ->
+          pure $ Right (syncDecision args "unknown_interruption" "fast_forward" ["fetch"] False diagnostic)
+        SyncGitResponse 0 _ _ -> verifySynchronizedParent args remote ["fetch", "fast_forward"]
+        SyncGitResponse exitCode stdout stderr ->
+          classifyRejectedFastForward args remote beforeHead exitCode stdout stderr
+
+classifyRejectedFastForward :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Text -> Int32 -> Text -> Text -> Eff effs (Either Text Value)
+classifyRejectedFastForward args remote beforeHead exitCode stdout stderr = do
+  after <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+  mergeHead <- runGitSyncAt (pmpWorkingDir args) ["rev-parse", "--quiet", "--verify", "MERGE_HEAD"]
+  case (after, mergeHead) of
+    (Right afterHead, SyncGitResponse 1 _ _)
+      | afterHead == beforeHead ->
+          pure $ Right (syncDecision args "known_partial_progress" "fast_forward" ["fetch"] True (exitDiagnostic exitCode stdout stderr))
+    (Right afterHead, _)
+      | afterHead /= beforeHead ->
+          verifySynchronizedParent args remote ["fetch", "fast_forward"]
+    _ ->
+      pure $ Right (syncDecision args "unknown_interruption" "fast_forward_verification" ["fetch"] False "Git refused fast-forward and its local result could not be proven")
+
+verifySynchronizedParent :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> [Text] -> Eff effs (Either Text Value)
+verifySynchronizedParent args remote completed = do
+  parentCommit <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+  remoteHead <- runGitAt (pmpWorkingDir args) ["rev-parse", remoteRef remote (pmpParentBranch args)]
+  case (parentCommit, remoteHead) of
+    (Right parent, Right observedRemote)
+      | parent /= observedRemote ->
+          pure $ Right (syncDecision args "unknown_interruption" "receipt_verification" completed False "local parent and selected remote heads differ after fast-forward")
+      | otherwise -> do
+          integration <- verifyMergeIntegrationAt (pmpWorkingDir args) args parent
+          case integration of
+            Left diagnostic ->
+              pure $ Right (syncDecision args "unknown_interruption" "receipt_verification" completed False diagnostic)
+            Right integrationProof ->
+              pure $ Right (syncReceipt args remote parent observedRemote integrationProof completed)
+    _ ->
+      pure $ Right (syncDecision args "unknown_interruption" "receipt_verification" completed False "parent synchronization could not read authoritative local and remote heads")
+
+reconcileParentSync :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Eff effs (Either Text Value)
+reconcileParentSync args remote = do
+  fetched <- runGitSyncAt (pmpWorkingDir args) (postMergeParentSyncFetchArgs remote (pmpParentBranch args))
+  case fetched of
+    SyncGitResponse 0 _ _ -> inspectSynchronizedParent args remote
+    SyncGitResponse exitCode stdout stderr ->
+      pure $ Right (syncDecision args "unknown_interruption" "reconcile_fetch" [] False (exitDiagnostic exitCode stdout stderr))
+    SyncGitInterrupted _ diagnostic ->
+      pure $ Right (syncDecision args "unknown_interruption" "reconcile_fetch" [] False diagnostic)
+
+inspectSynchronizedParent :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Eff effs (Either Text Value)
+inspectSynchronizedParent args remote = do
+  localHead <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+  remoteHead <- runGitAt (pmpWorkingDir args) ["rev-parse", remoteRef remote (pmpParentBranch args)]
+  case (localHead, remoteHead) of
+    (Right local, Right observedRemote) ->
+      if local == observedRemote
+        then
+          confirmedOrUnresolved
+            args
+            remote
+            local
+            observedRemote
+            ["fetch", "current_git_matches"]
+            "current_git"
+        else safeRetryWhenFastForwardable args remote local observedRemote
+    _ -> pure $ Right (syncDecision args "unknown_interruption" "reconcile_observation" ["fetch"] False "current local or selected remote head is unavailable")
+
+safeRetryWhenFastForwardable :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Text -> Text -> Eff effs (Either Text Value)
+safeRetryWhenFastForwardable args remote local observedRemote = do
+  ancestry <- verifyAncestryAt (pmpWorkingDir args) local observedRemote
+  case ancestry of
+    Left _ -> pure $ Right (syncDecision args "unresolved" "reconcile_observation" ["fetch"] False "local and remote history does not prove a safe fast-forward retry")
+    Right _ -> confirmedOrUnresolved args remote local observedRemote ["fetch", "fast_forward_available"] "safe_to_retry"
+
+confirmedOrUnresolved :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Text -> Text -> [Text] -> Text -> Eff effs (Either Text Value)
+confirmedOrUnresolved args remote local observedRemote completed basis = do
+  integration <- verifyMergeIntegrationAt (pmpWorkingDir args) args observedRemote
+  case integration of
+    Left _ -> pure $ Right (syncDecision args "unresolved" "reconcile_integration_proof" completed False "current Git state does not prove the merged child is integrated")
+    Right proof
+      | basis == "safe_to_retry" ->
+          pure $ Right (syncDecision args "safe_to_retry" "reconcile_complete" completed True "remote contains the merged child and local HEAD is an ancestor")
+      | local /= observedRemote ->
+          pure $ Right (syncDecision args "unresolved" "reconcile_complete" completed False "local and selected remote heads differ")
+      | otherwise ->
+          pure $ Right (syncReceipt args remote local observedRemote proof completed)
+
+syncDecision :: PostMergeParentSyncArgs -> Text -> Text -> [Text] -> Bool -> Text -> Value
+syncDecision args outcome phase completed retrySafe diagnostic =
+  object $
+    [ "sync_outcome" .= outcome,
+      "sync_phase" .= phase,
+      "completed_steps" .= completed,
+      "retry_safe" .= retrySafe,
+      "diagnostic" .= redactDiagnostic diagnostic
+    ]
+      <> syncCorrelation args
+
+syncReceipt :: PostMergeParentSyncArgs -> Text -> Text -> Text -> MergeIntegrationProof -> [Text] -> Value
+syncReceipt args remote parent observedRemote integrationProof completed =
+  object $
+    [ "sync_outcome" .= ("confirmed" :: Text),
+      "sync_phase" .= ("complete" :: Text),
+      "completed_steps" .= completed,
+      "retry_safe" .= False,
+      "diagnostic" .= ("" :: Text),
+      "child_id" .= pmpChildId args,
+      "pr_number" .= pmpPrNumber args,
+      "repository" .= pmpRepository args,
+      "parent_branch" .= pmpParentBranch args,
+      "remote_name" .= remote,
+      "merged_head_sha" .= pmpMergedHeadSha args,
+      "expected_base_sha" .= pmpExpectedBaseSha args,
+      "lane_epoch" .= pmpLaneEpoch args,
+      "parent_commit_sha" .= parent,
+      "remote_head_sha" .= observedRemote,
+      "ancestry_proof" .= legacyProof integrationProof,
+      "merge_integration_proof" .= integrationProof
+    ]
+      <> syncCorrelation args
+
+syncCorrelation :: PostMergeParentSyncArgs -> [Pair]
+syncCorrelation args =
+  maybe [] (\value -> ["sync_operation_id" .= value]) (pmpSyncOperationId args)
+    <> maybe [] (\value -> ["sync_attempt" .= value]) (pmpSyncAttempt args)
+
+runGitSyncAt :: (Member SuspendYield effs) => Maybe Text -> [Text] -> Eff effs SyncGitResult
+runGitSyncAt workingDir args = do
+  logInfo ("post-merge git before: " <> T.unwords args)
+  result <-
+    suspendEffect @ProcessRun
+      ( Proc.RunRequest
+          { Proc.runRequestCommand = "git",
+            Proc.runRequestArgs = V.fromList (TL.fromStrict <$> args),
+            Proc.runRequestWorkingDir = maybe "." TL.fromStrict workingDir,
+            Proc.runRequestEnv = Map.empty,
+            Proc.runRequestTimeoutMs = gitTimeoutMs
+          }
+      )
+  case result of
+    Left err -> do
+      logInfo "post-merge git outcome unavailable"
+      pure (SyncGitInterrupted (isPreMutationGitError err) (redactDiagnostic (T.pack (show err))))
+    Right response -> do
+      let stdout = T.strip (TL.toStrict (Proc.runResponseStdout response))
+          stderr = TL.toStrict (Proc.runResponseStderr response)
+          exitCode = Proc.runResponseExitCode response
+      logInfo ("post-merge git after: exit=" <> T.pack (show exitCode))
+      pure (SyncGitResponse exitCode stdout stderr)
+
+isPreMutationGitError :: EE.EffectError -> Bool
+isPreMutationGitError (EE.EffectError (Just (EE.EffectErrorKindCustom custom))) =
+  EE.customCode custom == "git_mutation_unavailable"
+    || EE.customCode custom == "git_audit_unavailable"
+isPreMutationGitError _ = False
+
+exitDiagnostic :: Int32 -> Text -> Text -> Text
+exitDiagnostic exitCode stdout stderr =
+  redactDiagnostic
+    ( "Git exited with code "
+        <> T.pack (show exitCode)
+        <> "; stdout: "
+        <> stdout
+        <> "; stderr: "
+        <> stderr
+    )
+
+redactDiagnostic :: Text -> Text
+redactDiagnostic =
+  T.take 500 . T.unwords . map redactCredentialToken . T.words . T.filter (not . isControl)
+
+redactCredentialToken :: Text -> Text
+redactCredentialToken = redactSensitiveAssignments . redactUrlAuthority
+
+redactSensitiveAssignments :: Text -> Text
+redactSensitiveAssignments value =
+  foldl redactMarker value ["token=", "password=", "authorization="]
+  where
+    redactMarker value marker =
+      let (prefix, remainder) = T.breakOn marker (T.toLower value)
+       in if T.null remainder
+            then value
+            else T.take (T.length prefix) value <> marker <> "[REDACTED]"
+
+redactUrlAuthority :: Text -> Text
+redactUrlAuthority token =
+  let (scheme, remainder) = T.breakOn "://" token
+      authorityStart = T.drop 3 remainder
+      (authority, suffix) = T.breakOn "/" authorityStart
+      (_, host) = T.breakOnEnd "@" authority
+   in if T.null remainder || T.null host
+        then token
+        else scheme <> "://[REDACTED]@" <> host <> suffix
 
 postMergeRemoteReconcileCore :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Eff effs (Either Text Value)
 postMergeRemoteReconcileCore args = do
@@ -823,7 +1021,21 @@ validateParentSync args
   | not (validToken (pmpMergedHeadSha args)) = Left "merged_head_sha is required"
   | not (validToken (pmpExpectedBaseSha args)) = Left "expected_base_sha is required"
   | not (validPositive (pmpLaneEpoch args)) = Left "lane_epoch must be positive"
+  | not (validSyncCorrelation args) = Left "sync operation identity and positive attempt must be supplied together"
+  | pmpReconcileOnly args == Just True && pmpSyncOperationId args == Nothing =
+      Left "reconciliation requires a sync operation identity and attempt"
   | otherwise = Right ()
+
+validSyncCorrelation :: PostMergeParentSyncArgs -> Bool
+validSyncCorrelation args =
+  case (pmpSyncOperationId args, pmpSyncAttempt args) of
+    (Nothing, Nothing) -> True
+    (Just identity, Just attempt) -> validDigest identity && validPositive attempt
+    _ -> False
+
+validDigest :: Text -> Bool
+validDigest value =
+  T.length value == 64 && T.all (\character -> character `elem` ("0123456789abcdef" :: String)) value
 
 validateChangelog :: PostMergeChangelogArgs -> Either Text ()
 validateChangelog args

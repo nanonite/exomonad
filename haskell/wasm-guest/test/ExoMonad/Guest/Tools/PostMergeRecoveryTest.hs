@@ -13,9 +13,11 @@ import Data.ByteString.Lazy.Char8 qualified as L8
 import Data.Int (Int32)
 import Data.List qualified as List
 import Data.Text (Text)
+import Data.Text qualified as T
 import Data.Text.Lazy qualified as TL
 import Data.Vector qualified as V
 import Data.Word (Word8)
+import Effects.EffectError qualified as EffectError
 import Effects.Envelope qualified as Envelope
 import Effects.Process qualified as Proc
 import ExoMonad.Guest.Tool.Suspend.Types (EffectRequest (..))
@@ -41,7 +43,7 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
   )
 import Proto3.Suite.Class (Message, fromByteString, toLazyByteString)
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (assertBool, assertEqual, testCase)
+import Test.Tasty.HUnit (Assertion, assertBool, assertEqual, testCase)
 
 postMergeRecoveryTests :: TestTree
 postMergeRecoveryTests =
@@ -67,6 +69,9 @@ postMergeRecoveryTests =
                 "merge-head"
                 "base-head"
                 7
+                Nothing
+                Nothing
+                Nothing
                 Nothing
                 Nothing
                 Nothing
@@ -179,9 +184,11 @@ postMergeRecoveryTests =
                 processResponse 0 "origin\nforgejo" "",
                 processResponse 0 "main" "",
                 processResponse 0 "" "",
+                processResponse 0 "base-head" "",
                 processResponse 0 "" "",
                 processResponse 0 "merge-commit" "",
                 processResponse 0 "merge-commit" "",
+                processResponse 0 "" "",
                 processResponse 0 "" ""
               ]
             (result, processArgs) = runParentSyncWithRequests squashArgs responses
@@ -208,20 +215,137 @@ postMergeRecoveryTests =
           "push requires all identity fields"
           Nothing
           (decode "{\"child_id\":\"slice-a\"}" :: Maybe PostMergePushArgs),
-      testCase "non-zero Git exit is returned as a durable boundary error" $ do
-        assertEqual
-          "stderr is preserved in the failure"
-          (Left "git command failed (128): rejected by remote")
-          (interpretGitResult 128 "ignored stdout" "rejected by remote\n"),
+      testCase "fast-forward refusal reports known partial synchronization progress" $ do
+        let responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "base-head" "",
+                processResponse 128 "" "fatal: refusing to merge unrelated histories\n",
+                processResponse 0 "base-head" "",
+                processResponse 1 "" ""
+              ]
+        case runParentSyncWithArgs squashArgs responses of
+          Right (Aeson.Object fields) -> do
+            assertEqual
+              "the fetch is recorded as completed partial progress"
+              (Just (Aeson.String "known_partial_progress"))
+              (KeyMap.lookup "sync_outcome" fields)
+            assertEqual
+              "the failing command phase is identified"
+              (Just (Aeson.String "fast_forward"))
+              (KeyMap.lookup "sync_phase" fields)
+          _ -> assertBool "fast-forward refusal has structured recoverable outcome" False,
       testCase "fetch permission refusal cannot produce a sync receipt" $ do
         let responses =
               [ processResponse 0 "main" "",
                 processResponse 128 "" "permission denied"
               ]
-        assertEqual
-          "permission refusal is a failed sync boundary"
-          (Left "git command failed (128): permission denied")
-          (runParentSyncWithArgs squashArgs responses),
+        case runParentSyncWithArgs squashArgs responses of
+          Right (Aeson.Object fields) ->
+            assertEqual
+              "a fetch exit with uncertain partial refs is reported as unknown"
+              (Just (Aeson.String "unknown_interruption"))
+              (KeyMap.lookup "sync_outcome" fields)
+          _ -> assertBool "fetch failure returns structured synchronization status" False,
+      testCase "Git diagnostics redact URL credentials and token values" $ do
+        let stderr = "\ESC[31mfailed https://user:secret@forge.example/org/repo.git?token=abc123\ESC[0m"
+            stdout = "fetch detail https://reader:stdout-secret@source.example/org/repo.git"
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 128 stdout stderr
+              ]
+        case runParentSyncWithArgs squashArgs responses of
+          Right (Aeson.Object fields) ->
+            case KeyMap.lookup "diagnostic" fields of
+              Just (Aeson.String diagnostic) -> do
+                assertBool "credential username is omitted" (not ("user" `T.isInfixOf` diagnostic))
+                assertBool "credential password is omitted" (not ("secret" `T.isInfixOf` diagnostic))
+                assertBool "stdout credential is omitted" (not ("stdout-secret" `T.isInfixOf` diagnostic))
+                assertBool "token is omitted" (not ("abc123" `T.isInfixOf` diagnostic))
+                assertBool "terminal escape codes are omitted" (not ("\ESC" `T.isInfixOf` diagnostic))
+                assertBool "host context is retained" ("forge.example" `T.isInfixOf` diagnostic)
+                assertBool "stdout context is retained" ("source.example" `T.isInfixOf` diagnostic)
+              _ -> assertBool "structured decision includes a diagnostic" False
+          _ -> assertBool "fetch failure returns structured synchronization status" False,
+      testCase "managed lock refusal is a known pre-mutation outcome" $ do
+        let failure =
+              EffectError.EffectError
+                ( Just
+                    ( EffectError.EffectErrorKindCustom
+                        (EffectError.Custom "git_mutation_unavailable" "managed lock is busy" BS.empty)
+                    )
+                )
+            responses =
+              [ processResponse 1 "" "",
+                processResponse 0 "origin" "",
+                processResponse 0 "main" "",
+                effectFailureResponse failure
+              ]
+        case fst (runParentSyncWithRequests squashArgs responses) of
+          Right (Aeson.Object fields) -> do
+            assertEqual
+              "lock refusal is known before mutation"
+              (Just (Aeson.String "pre_mutation_refusal"))
+              (KeyMap.lookup "sync_outcome" fields)
+            assertEqual
+              "failure phase is retained"
+              (Just (Aeson.String "fetch"))
+              (KeyMap.lookup "sync_phase" fields)
+          _ -> assertBool "lock refusal is returned as a structured result" False,
+      testCase "timeout remains an unknown outcome" $ do
+        let failure =
+              EffectError.EffectError
+                (Just (EffectError.EffectErrorKindTimeout (EffectError.Timeout "process timed out")))
+            responses =
+              [ processResponse 1 "" "",
+                processResponse 0 "origin" "",
+                processResponse 0 "main" "",
+                effectFailureResponse failure
+              ]
+        case fst (runParentSyncWithRequests squashArgs responses) of
+          Right (Aeson.Object fields) ->
+            assertEqual
+              "timeout does not imply that fetch made no progress"
+              (Just (Aeson.String "unknown_interruption"))
+              (KeyMap.lookup "sync_outcome" fields)
+          _ -> assertBool "timeout is returned as a structured result" False,
+      testCase "reconciliation adopts matching current Git evidence without a merge" $ do
+        let args =
+              squashArgs
+                { pmpSyncOperationId = Just (T.replicate 64 "a"),
+                  pmpSyncAttempt = Just 1,
+                  pmpReconcileOnly = Just True
+                }
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "" ""
+              ]
+        let result = runParentSyncWithArgs args responses
+        case result of
+          Right (Aeson.Object fields) -> do
+            assertEqual "current evidence is adopted" (Just (Aeson.String "confirmed")) (KeyMap.lookup "sync_outcome" fields)
+            assertEqual "stable identity is echoed" (Just (Aeson.String (T.replicate 64 "a"))) (KeyMap.lookup "sync_operation_id" fields)
+          _ -> assertBool "matching current Git state produces an adoption receipt" False,
+      testCase "reconciliation permits retry only when remote contains child and local is ancestor" $ do
+        let args =
+              squashArgs
+                { pmpSyncOperationId = Just (T.replicate 64 "b"),
+                  pmpSyncAttempt = Just 2,
+                  pmpReconcileOnly = Just True
+                }
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "base-head" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "" "",
+                processResponse 0 "" ""
+              ]
+        let result = runParentSyncWithArgs args responses
+        assertSyncOutcome "safe_to_retry" result,
       testCase "squash merge accepts exact Forgejo and Git tree proof" $ do
         let args =
               PostMergeParentSyncArgs
@@ -240,9 +364,13 @@ postMergeRecoveryTests =
                 (Just "merged-tree-a")
                 (Just "merged-tree-a")
                 (Just "pr-tree-a")
+                Nothing
+                Nothing
+                Nothing
             responses =
               [ processResponse 0 "main" "",
                 processResponse 0 "" "",
+                processResponse 0 "base-head" "",
                 processResponse 0 "" "",
                 processResponse 0 "merge-commit" "",
                 processResponse 0 "merge-commit" "",
@@ -255,6 +383,11 @@ postMergeRecoveryTests =
           ( Right
               ( object
                   [ "child_id" .= ("slice-a" :: Text),
+                    "sync_outcome" .= ("confirmed" :: Text),
+                    "sync_phase" .= ("complete" :: Text),
+                    "completed_steps" .= (["fetch", "fast_forward"] :: [Text]),
+                    "retry_safe" .= False,
+                    "diagnostic" .= ("" :: Text),
                     "pr_number" .= (43 :: Int),
                     "repository" .= ("org/repo" :: Text),
                     "parent_branch" .= ("main" :: Text),
@@ -303,9 +436,13 @@ postMergeRecoveryTests =
                 Nothing
                 Nothing
                 Nothing
+                Nothing
+                Nothing
+                Nothing
             responses =
               [ processResponse 0 "main" "",
                 processResponse 0 "" "",
+                processResponse 0 "base-head" "",
                 processResponse 0 "" "",
                 processResponse 0 "merge-commit" "",
                 processResponse 0 "merge-commit" "",
@@ -320,6 +457,7 @@ postMergeRecoveryTests =
             responses =
               [ processResponse 0 "main" "",
                 processResponse 0 "" "",
+                processResponse 0 "base-head" "",
                 processResponse 0 "" "",
                 processResponse 0 "merge-commit" "",
                 processResponse 0 "merge-commit" "",
@@ -327,10 +465,7 @@ postMergeRecoveryTests =
                 processResponse 0 "pr-tree-a" "",
                 processResponse 0 "wrong-authoritative-tree" ""
               ]
-        assertEqual
-          "divergent tree is rejected"
-          (Left "squash merge proof disagrees with the authoritative merge tree")
-          (runParentSync args responses),
+        assertSyncOutcome "unknown_interruption" (runParentSync args responses),
       testCase "tree equality without authoritative Forgejo binding is rejected" $ do
         let args =
               PostMergeParentSyncArgs
@@ -349,9 +484,13 @@ postMergeRecoveryTests =
                 Nothing
                 Nothing
                 (Just "tree-a")
+                Nothing
+                Nothing
+                Nothing
             responses =
               [ processResponse 0 "main" "",
                 processResponse 0 "" "",
+                processResponse 0 "base-head" "",
                 processResponse 0 "" "",
                 processResponse 0 "merge-commit" "",
                 processResponse 0 "merge-commit" "",
@@ -359,23 +498,18 @@ postMergeRecoveryTests =
                 processResponse 0 "tree-a" "",
                 processResponse 0 "tree-a" ""
               ]
-        assertEqual
-          "missing merged binding is rejected"
-          (Left "squash merge proof requires the authoritative Forgejo PR number")
-          (runParentSync args responses),
+        assertSyncOutcome "unknown_interruption" (runParentSync args responses),
       testCase "parent synchronization requires equal local and fetched remote heads" $ do
         let args = squashArgs
             responses =
               [ processResponse 0 "main" "",
                 processResponse 0 "" "",
+                processResponse 0 "base-head" "",
                 processResponse 0 "" "",
                 processResponse 0 "local-head" "",
                 processResponse 0 "remote-head" ""
               ]
-        assertEqual
-          "divergent local and remote heads are rejected"
-          (Left "parent synchronization produced divergent local and remote heads")
-          (runParentSync args responses),
+        assertSyncOutcome "unknown_interruption" (runParentSync args responses),
       testCase "changelog core propagates a failed commit" $ do
         let args =
               PostMergeChangelogArgs
@@ -401,6 +535,9 @@ postMergeRecoveryTests =
                 "merged-head"
                 "old-base"
                 7
+                Nothing
+                Nothing
+                Nothing
                 Nothing
                 Nothing
                 Nothing
@@ -457,6 +594,9 @@ postMergeRecoveryTests =
                 (Just "merged-tree-a")
                 (Just "merged-tree-a")
                 (Just "pr-tree-a")
+                Nothing
+                Nothing
+                Nothing
             responses =
               [ processResponse 0 "main" "",
                 processResponse 0 "" "",
@@ -556,6 +696,9 @@ squashArgs =
     (Just "merged-tree-a")
     (Just "merged-tree-a")
     (Just "pr-tree-a")
+    Nothing
+    Nothing
+    Nothing
 
 runParentSync :: PostMergeParentSyncArgs -> [Value] -> Either Text Value
 runParentSync args responses =
@@ -666,6 +809,28 @@ processResponse exitCode stdout stderr =
     ( BL.toStrict
         (toLazyByteString (Proc.RunResponse exitCode (TL.fromStrict stdout) (TL.fromStrict stderr)))
     )
+
+effectFailureResponse :: EffectError.EffectError -> Value
+effectFailureResponse failure =
+  toJSON
+    ( BS.unpack
+        ( BL.toStrict
+            ( toLazyByteString
+                (Envelope.EffectResponse (Just (Envelope.EffectResponseResultError failure)))
+            )
+        ) ::
+        [Word8]
+    )
+
+assertSyncOutcome :: Text -> Either Text Value -> Assertion
+assertSyncOutcome expected result =
+  case result of
+    Right (Aeson.Object fields) ->
+      assertEqual
+        "structured parent synchronization outcome"
+        (Just (Aeson.String expected))
+        (KeyMap.lookup "sync_outcome" fields)
+    _ -> assertBool "parent synchronization returns a structured outcome" False
 
 encodedEffectResponse :: BS.ByteString -> Value
 encodedEffectResponse payload =

@@ -2,6 +2,7 @@ use super::{wasm_binary_bytes, MockLogHandler};
 use exomonad_core::handlers::ProcessHandler;
 use exomonad_core::{AgentName, BirthBranch, EffectContext, EffectRegistry, PluginManager};
 use serde_json::{json, Value};
+use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -152,7 +153,12 @@ async fn sync_plugin(repository: &Path) -> PluginManager {
         .expect("load compiled production WASM with the managed Git process handler")
 }
 
-async fn call_parent_sync(plugin: &PluginManager, fixture: &SyncFixture) -> Value {
+async fn call_parent_sync(
+    plugin: &PluginManager,
+    fixture: &SyncFixture,
+    attempt: i64,
+    reconcile_only: bool,
+) -> Value {
     plugin
         .call(
             "handle_mcp_call",
@@ -166,7 +172,10 @@ async fn call_parent_sync(plugin: &PluginManager, fixture: &SyncFixture) -> Valu
                     "parent_branch": "main",
                     "merged_head_sha": fixture.merged_sha,
                     "expected_base_sha": fixture.base_sha,
-                    "lane_epoch": 1
+                    "lane_epoch": 1,
+                    "sync_operation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "sync_attempt": attempt,
+                    "reconcile_only": reconcile_only
                 }
             }),
         )
@@ -175,12 +184,16 @@ async fn call_parent_sync(plugin: &PluginManager, fixture: &SyncFixture) -> Valu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn compiled_parent_sync_uses_selected_remote_preserves_unrelated_edits_and_adopts_replay() {
     let fixture = sync_fixture(false);
     let plugin = sync_plugin(&fixture.repository).await;
 
-    let first = call_parent_sync(&plugin, &fixture).await;
+    let first = call_parent_sync(&plugin, &fixture, 1, false).await;
     assert_eq!(first["success"], true, "first sync must succeed: {first:#}");
+    assert_eq!(first["result"]["sync_outcome"], "confirmed");
+    assert_eq!(first["result"]["sync_operation_id"], "a".repeat(64));
+    assert_eq!(first["result"]["sync_attempt"], 1);
     assert_eq!(first["result"]["remote_name"], "forgejo");
     assert_eq!(first["result"]["remote_head_sha"], fixture.merged_sha);
     assert_eq!(first["result"]["parent_commit_sha"], fixture.merged_sha);
@@ -208,11 +221,13 @@ async fn compiled_parent_sync_uses_selected_remote_preserves_unrelated_edits_and
         "untracked file remains: {status}"
     );
 
-    let replay = call_parent_sync(&plugin, &fixture).await;
+    let replay = call_parent_sync(&plugin, &fixture, 2, true).await;
     assert_eq!(
         replay["success"], true,
-        "replay must adopt the synced head: {replay:#}"
+        "reconciliation must adopt the synced head: {replay:#}"
     );
+    assert_eq!(replay["result"]["sync_outcome"], "confirmed");
+    assert_eq!(replay["result"]["sync_attempt"], 2);
     assert_eq!(replay["result"]["remote_name"], "forgejo");
     assert_eq!(
         git_output(&fixture.repository, &["rev-parse", "HEAD"]),
@@ -228,15 +243,46 @@ async fn compiled_parent_sync_uses_selected_remote_preserves_unrelated_edits_and
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn compiled_parent_sync_reconciles_a_safe_retry_without_mutating_local_head() {
+    let fixture = sync_fixture(false);
+    let plugin = sync_plugin(&fixture.repository).await;
+    let local_before = git_output(&fixture.repository, &["rev-parse", "HEAD"]);
+
+    let observation = call_parent_sync(&plugin, &fixture, 2, true).await;
+    assert_eq!(
+        observation["success"], true,
+        "reconciliation should return a decision: {observation:#}"
+    );
+    assert_eq!(observation["result"]["sync_outcome"], "safe_to_retry");
+    assert_eq!(observation["result"]["sync_operation_id"], "a".repeat(64));
+    assert_eq!(observation["result"]["sync_attempt"], 2);
+    assert_eq!(
+        git_output(&fixture.repository, &["rev-parse", "HEAD"]),
+        local_before,
+        "reconciliation may fetch but must not advance the local branch"
+    );
+
+    let synchronized = call_parent_sync(&plugin, &fixture, 3, false).await;
+    assert_eq!(synchronized["result"]["sync_outcome"], "confirmed");
+    assert_eq!(
+        git_output(&fixture.repository, &["rev-parse", "HEAD"]),
+        fixture.merged_sha
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn compiled_parent_sync_holds_a_conflicting_dirty_edit_without_overwriting_it() {
     let fixture = sync_fixture(true);
     let plugin = sync_plugin(&fixture.repository).await;
 
-    let output = call_parent_sync(&plugin, &fixture).await;
+    let output = call_parent_sync(&plugin, &fixture, 1, false).await;
     assert_eq!(
-        output["success"], false,
+        output["success"], true,
         "conflicting edit must block sync: {output:#}"
     );
+    assert_eq!(output["result"]["sync_outcome"], "known_partial_progress");
     assert_eq!(
         git_output(&fixture.repository, &["rev-parse", "HEAD"]),
         fixture.base_sha,
@@ -250,17 +296,19 @@ async fn compiled_parent_sync_holds_a_conflicting_dirty_edit_without_overwriting
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn compiled_parent_sync_rejects_the_wrong_checked_out_branch_before_fetching() {
     let fixture = sync_fixture(false);
     git(&fixture.repository, &["switch", "-c", "wrong-parent"]);
     let local_head = git_output(&fixture.repository, &["rev-parse", "HEAD"]);
     let plugin = sync_plugin(&fixture.repository).await;
 
-    let output = call_parent_sync(&plugin, &fixture).await;
+    let output = call_parent_sync(&plugin, &fixture, 1, false).await;
     assert_eq!(
-        output["success"], false,
+        output["success"], true,
         "wrong branch must block sync: {output:#}"
     );
+    assert_eq!(output["result"]["sync_outcome"], "pre_mutation_refusal");
     assert_eq!(
         git_output(&fixture.repository, &["rev-parse", "HEAD"]),
         local_head
@@ -276,6 +324,7 @@ async fn compiled_parent_sync_rejects_the_wrong_checked_out_branch_before_fetchi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn compiled_parent_sync_holds_divergent_local_and_remote_histories() {
     let fixture = sync_fixture(false);
     git(
@@ -293,11 +342,12 @@ async fn compiled_parent_sync_holds_divergent_local_and_remote_histories() {
     let local_head = git_output(&fixture.repository, &["rev-parse", "HEAD"]);
     let plugin = sync_plugin(&fixture.repository).await;
 
-    let output = call_parent_sync(&plugin, &fixture).await;
+    let output = call_parent_sync(&plugin, &fixture, 1, false).await;
     assert_eq!(
-        output["success"], false,
+        output["success"], true,
         "divergence must block sync: {output:#}"
     );
+    assert_eq!(output["result"]["sync_outcome"], "known_partial_progress");
     assert_eq!(
         git_output(&fixture.repository, &["rev-parse", "HEAD"]),
         local_head,
@@ -314,6 +364,7 @@ async fn compiled_parent_sync_holds_divergent_local_and_remote_histories() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn compiled_parent_sync_reports_fetch_failure_without_changing_local_head() {
     let fixture = sync_fixture(false);
     let unavailable_remote = fixture._root.path().join("unavailable.git");
@@ -324,11 +375,12 @@ async fn compiled_parent_sync_reports_fetch_failure_without_changing_local_head(
     );
     let plugin = sync_plugin(&fixture.repository).await;
 
-    let output = call_parent_sync(&plugin, &fixture).await;
+    let output = call_parent_sync(&plugin, &fixture, 1, false).await;
     assert_eq!(
-        output["success"], false,
+        output["success"], true,
         "unavailable remote must block sync: {output:#}"
     );
+    assert_eq!(output["result"]["sync_outcome"], "unknown_interruption");
     assert_eq!(
         git_output(&fixture.repository, &["rev-parse", "HEAD"]),
         fixture.base_sha,
@@ -337,6 +389,7 @@ async fn compiled_parent_sync_reports_fetch_failure_without_changing_local_head(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn compiled_parent_sync_preserves_unowned_native_index_lock_evidence() {
     let fixture = sync_fixture(false);
     let lock_output = git_output(
@@ -351,11 +404,26 @@ async fn compiled_parent_sync_preserves_unowned_native_index_lock_evidence() {
     std::fs::write(&index_lock, b"").expect("write unowned empty index lock fixture");
     let plugin = sync_plugin(&fixture.repository).await;
 
-    let output = call_parent_sync(&plugin, &fixture).await;
+    let output = call_parent_sync(&plugin, &fixture, 1, false).await;
     assert_eq!(
-        output["success"], false,
+        output["success"], true,
         "unowned lock must block sync: {output:#}"
     );
+    let outcome = output["result"]["sync_outcome"]
+        .as_str()
+        .expect("structured synchronization outcome");
+    assert!(
+        matches!(
+            outcome,
+            "pre_mutation_refusal" | "known_partial_progress" | "unknown_interruption"
+        ),
+        "an unowned index lock cannot produce a confirmed receipt: {output:#}"
+    );
+    if outcome != "pre_mutation_refusal" {
+        assert!(output["result"]["completed_steps"]
+            .as_array()
+            .is_some_and(|steps| { steps.iter().any(|step| step == "fetch") }));
+    }
     assert!(
         index_lock.exists(),
         "unproven lock evidence must not be deleted"

@@ -530,6 +530,9 @@ class EffectClient:
         merged_head_sha: str,
         expected_base_sha: str,
         lane_epoch: int,
+        sync_operation_id: str,
+        sync_attempt: int,
+        reconcile_only: bool = False,
         working_dir: str | None = None,
         forgejo_pr_number: int | None = None,
         forgejo_merged: bool | None = None,
@@ -548,6 +551,9 @@ class EffectClient:
             "merged_head_sha": merged_head_sha,
             "expected_base_sha": expected_base_sha,
             "lane_epoch": lane_epoch,
+            "sync_operation_id": sync_operation_id,
+            "sync_attempt": sync_attempt,
+            "reconcile_only": reconcile_only,
         }
         _put(arguments, "working_dir", working_dir)
         _put(arguments, "forgejo_pr_number", forgejo_pr_number)

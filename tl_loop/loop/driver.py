@@ -6901,15 +6901,40 @@ def _run_parent_sync(
         operation="post_merge_parent_sync",
         expected_base_sha=_required_current_base(current),
     )
+    outcome = payload.get("sync_outcome")
+    if outcome != "confirmed":
+        diagnostic = payload.get("diagnostic")
+        phase = payload.get("sync_phase")
+        detail = (
+            diagnostic if isinstance(diagnostic, str) and diagnostic else "no diagnostic supplied"
+        )
+        context = f"{outcome or 'unresolved'} during {phase or 'unknown phase'}: {detail}"
+        if outcome in {"pre_mutation_refusal", "known_partial_progress"}:
+            LOGGER.info("[TL loop] parent synchronization attempt held for retry: %s", context)
+            return state
+        return _block_post_merge_recovery(
+            store,
+            state,
+            current.id,
+            f"parent synchronization requires current Git reconciliation: {context}",
+        )
     return _checkpoint_post_merge_event(
         store,
         state,
         current.id,
-        ParentBranchSynced(current.id, arguments["parent_branch"], payload["parent_commit_sha"]),
+        ParentBranchSynced(
+            current.id,
+            cast(str, arguments["parent_branch"]),
+            cast(str, payload["parent_commit_sha"]),
+        ),
         {
-            "remote_head_sha": payload["remote_head_sha"],
-            "ancestry_proof": payload["ancestry_proof"],
-            **({"remote_name": payload["remote_name"]} if "remote_name" in payload else {}),
+            "remote_head_sha": cast(str, payload["remote_head_sha"]),
+            "ancestry_proof": cast(str, payload["ancestry_proof"]),
+            **(
+                {"remote_name": cast(str, payload["remote_name"])}
+                if "remote_name" in payload
+                else {}
+            ),
         },
     )
 
@@ -6925,35 +6950,315 @@ def _parent_sync_effect(
     *,
     operation: str,
     expected_base_sha: str,
-) -> tuple[dict[str, object], Mapping[str, str]]:
-    """Run and validate one authoritative parent-branch observation."""
-    arguments = _parent_sync_arguments(
+) -> tuple[dict[str, object], Mapping[str, object]]:
+    """Run one stable synchronization attempt or reconcile its prior outcome."""
+    call_arguments = _parent_sync_arguments(
         current, pr_number, evidence, expected_base_sha, _relative_process_working_dir(config)
     )
-    result = _post_merge_effect(
+    identity = _parent_sync_identity_fields(call_arguments)
+    sync_id = stable_action_key(
+        state.run_id, "post_merge_parent_sync_operation", current.id, identity
+    )
+    history, history_error = _parent_sync_history(effects_log, current.id, sync_id, identity)
+    if history_error:
+        return call_arguments, _unresolved_sync_decision(sync_id, 0, history_error)
+
+    latest = max(history, key=lambda entry: entry[0], default=None)
+    next_attempt = max((entry[0] for entry in history), default=0) + 1
+    if latest is not None:
+        attempt, entry = latest
+        outcome, old_payload = _journal_sync_outcome(entry)
+        entry_arguments = entry.get("arguments")
+        stable_attempt = (
+            isinstance(entry_arguments, Mapping)
+            and entry_arguments.get("sync_operation_id") == sync_id
+        )
+        if outcome == "confirmed" and old_payload is not None and "sync_outcome" not in old_payload:
+            old_payload = {**old_payload, "sync_outcome": "confirmed"}
+        if stable_attempt and old_payload is not None:
+            old_payload = _validated_sync_payload(
+                old_payload, call_arguments, sync_id, attempt, require_correlation=True
+            )
+            observed_outcome = old_payload.get("sync_outcome")
+            outcome = observed_outcome if isinstance(observed_outcome, str) else "unresolved"
+        if outcome == "confirmed":
+            if old_payload is None:
+                return call_arguments, _unresolved_sync_decision(
+                    sync_id, attempt, "confirmed parent-sync entry has no recoverable result"
+                )
+            if not stable_attempt:
+                old_payload = _validated_sync_payload(
+                    old_payload, call_arguments, sync_id, attempt, require_correlation=False
+                )
+            return call_arguments, old_payload
+        if outcome in {"pre_mutation_refusal", "known_partial_progress", "safe_to_retry"}:
+            pass
+        elif outcome in {"unknown_interruption", "unresolved"}:
+            reconciled = _run_parent_sync_observation(
+                current.id,
+                call_arguments,
+                sync_id,
+                next_attempt,
+                effects,
+                effects_log,
+                config,
+            )
+            if reconciled.get("sync_outcome") == "confirmed":
+                return call_arguments, _validated_sync_payload(
+                    reconciled, call_arguments, sync_id, next_attempt, require_correlation=True
+                )
+            if reconciled.get("sync_outcome") != "safe_to_retry":
+                return call_arguments, reconciled
+            next_attempt += 1
+        else:
+            return call_arguments, _unresolved_sync_decision(
+                sync_id, attempt, "prior parent-sync result lacks a recognized outcome"
+            )
+
+    return _dispatch_parent_sync_attempt(
         operation,
         current.id,
-        arguments,
+        call_arguments,
+        sync_id,
+        next_attempt,
         effects,
         effects_log,
-        "post_merge_parent_sync",
-        active=config.active,
+        config,
     )
-    payload = _required_effect_result(
-        result,
-        (
+
+
+def _parent_sync_identity_fields(arguments: Mapping[str, object]) -> dict[str, object]:
+    """Keep observations out of the immutable parent-sync identity."""
+    return {
+        key: arguments[key]
+        for key in (
             "child_id",
             "pr_number",
             "repository",
             "parent_branch",
             "merged_head_sha",
-            "expected_base_sha",
+            "merge_journal_id",
             "lane_epoch",
-            "parent_commit_sha",
-            "remote_head_sha",
-            "ancestry_proof",
-        ),
+        )
+    }
+
+
+def _parent_sync_history(
+    effects_log: list[EffectIntent],
+    child_id: str,
+    sync_id: str,
+    identity: Mapping[str, object],
+) -> tuple[list[tuple[int, Mapping[str, object]]], str | None]:
+    """Find this operation's attempts while safely recognizing old journal rows."""
+    if not isinstance(effects_log, EffectJournal):
+        return [], None
+    rows = [
+        ("post_merge_parent_sync", entry)
+        for entry in effects_log.entries_for("post_merge_parent_sync", child_id)
+    ] + [
+        ("post_merge_parent_sync_reconcile", entry)
+        for entry in effects_log.entries_for("post_merge_parent_sync_reconcile", child_id)
+    ]
+    matches: list[tuple[int, Mapping[str, object]]] = []
+    legacy_attempt = 0
+    for operation, entry in rows:
+        arguments = entry.get("arguments")
+        if not isinstance(arguments, Mapping):
+            if entry.get("status") in {"intended", "unknown"}:
+                return [], "pending synchronization entry has malformed identity arguments"
+            continue
+        observed_id = arguments.get("sync_operation_id")
+        if isinstance(observed_id, str):
+            if observed_id != sync_id:
+                if entry.get("status") in {"intended", "unknown"}:
+                    return (
+                        [],
+                        "pending synchronization entry conflicts with the current logical operation",
+                    )
+                continue
+        elif operation == "post_merge_parent_sync":
+            legacy_attempt += 1
+            required = set(identity).difference({"merge_journal_id"})
+            if not required.issubset(arguments):
+                if entry.get("status") in {"intended", "unknown"}:
+                    return (
+                        [],
+                        "legacy synchronization entry lacks coordinates needed to prove its owner",
+                    )
+                continue
+            if any(str(arguments[key]) != str(identity[key]) for key in required):
+                if entry.get("status") in {"intended", "unknown"}:
+                    return (
+                        [],
+                        "legacy synchronization entry conflicts with the current PR or branch identity",
+                    )
+                continue
+        else:
+            if entry.get("status") in {"intended", "unknown"}:
+                return [], "pending reconciliation entry lacks its stable synchronization identity"
+            continue
+        raw_attempt = arguments.get("sync_attempt")
+        attempt = raw_attempt if type(raw_attempt) is int and raw_attempt > 0 else legacy_attempt
+        if attempt <= 0:
+            return [], "synchronization attempt number is malformed"
+        matches.append((attempt, entry))
+    return matches, None
+
+
+def _journal_sync_outcome(
+    entry: Mapping[str, object],
+) -> tuple[str, Mapping[str, object] | None]:
+    """Classify a stored attempt without treating a missing result as rejection."""
+    status = entry.get("status")
+    if status in {"intended", "unknown"}:
+        return "unknown_interruption", None
+    raw_result = entry.get("result")
+    if not isinstance(raw_result, Mapping):
+        return "unresolved", None
+    result = raw_result.get("result")
+    if not isinstance(result, Mapping):
+        return "unresolved", None
+    outcome = result.get("sync_outcome")
+    if isinstance(outcome, str):
+        return outcome, result
+    if all(key in result for key in ("parent_commit_sha", "remote_head_sha", "ancestry_proof")):
+        return "confirmed", result
+    return "unresolved", result
+
+
+def _run_parent_sync_observation(
+    child_id: str,
+    arguments: dict[str, object],
+    sync_id: str,
+    attempt: int,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    config: TLLoopConfig,
+) -> Mapping[str, object]:
+    """Re-read current Git state before deciding whether an unknown is retryable."""
+    stable_arguments = {"sync_operation_id": sync_id, "sync_attempt": attempt}
+    result = _post_merge_effect(
+        "post_merge_parent_sync_reconcile",
+        child_id,
+        stable_arguments,
+        effects,
+        effects_log,
+        "post_merge_parent_sync",
+        active=config.active,
+        call_arguments={
+            **_parent_sync_tool_arguments(arguments),
+            "sync_operation_id": sync_id,
+            "sync_attempt": attempt,
+            "reconcile_only": True,
+        },
+        retryable_failure=False,
     )
+    payload = _sync_decision_payload(result, sync_id, attempt)
+    if payload is None:
+        return _unresolved_sync_decision(
+            sync_id, attempt, "Git reconciliation returned malformed evidence"
+        )
+    return _validated_sync_payload(payload, arguments, sync_id, attempt, require_correlation=True)
+
+
+def _dispatch_parent_sync_attempt(
+    operation: str,
+    child_id: str,
+    arguments: dict[str, object],
+    sync_id: str,
+    attempt: int,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    config: TLLoopConfig,
+) -> tuple[dict[str, object], Mapping[str, object]]:
+    stable_arguments = {"sync_operation_id": sync_id, "sync_attempt": attempt}
+    result = _post_merge_effect(
+        operation,
+        child_id,
+        stable_arguments,
+        effects,
+        effects_log,
+        "post_merge_parent_sync",
+        active=config.active,
+        call_arguments={
+            **_parent_sync_tool_arguments(arguments),
+            "sync_operation_id": sync_id,
+            "sync_attempt": attempt,
+            "reconcile_only": False,
+        },
+        retryable_failure=False,
+    )
+    payload = _sync_decision_payload(result, sync_id, attempt)
+    if payload is None:
+        return arguments, _unresolved_sync_decision(
+            sync_id, attempt, "parent synchronization returned malformed evidence"
+        )
+    return arguments, _validated_sync_payload(
+        payload, arguments, sync_id, attempt, require_correlation=True
+    )
+
+
+def _sync_decision_payload(
+    result: ToolResult | None,
+    sync_id: str,
+    attempt: int,
+) -> Mapping[str, object] | None:
+    if result is None or result.success is not True:
+        return _unresolved_sync_decision(
+            sync_id,
+            attempt,
+            result.error if result is not None else "synchronization was not dispatched",
+        )
+    payload = _merge_result_payload(result)
+    if payload is None or payload.get("sync_outcome") not in {
+        "pre_mutation_refusal",
+        "known_partial_progress",
+        "unknown_interruption",
+        "unresolved",
+        "safe_to_retry",
+        "confirmed",
+    }:
+        return None
+    return payload
+
+
+def _parent_sync_tool_arguments(arguments: Mapping[str, object]) -> dict[str, object]:
+    """Drop controller-only lineage while retaining the stable opaque identity."""
+    return {key: value for key, value in arguments.items() if key != "merge_journal_id"}
+
+
+def _validate_sync_correlation(payload: Mapping[str, object], sync_id: str, attempt: int) -> None:
+    if payload.get("sync_operation_id") != sync_id:
+        raise ValueError(
+            "parent synchronization response has a different logical operation identity"
+        )
+    if payload.get("sync_attempt") != attempt:
+        raise ValueError("parent synchronization response has a different attempt number")
+
+
+def _validate_sync_receipt(
+    payload: Mapping[str, object],
+    arguments: Mapping[str, object],
+    sync_id: str,
+    attempt: int | None,
+) -> Mapping[str, object]:
+    for field_name in (
+        "child_id",
+        "repository",
+        "parent_branch",
+        "merged_head_sha",
+        "expected_base_sha",
+        "parent_commit_sha",
+        "remote_head_sha",
+        "ancestry_proof",
+    ):
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"parent synchronization receipt is missing {field_name}")
+    for field_name in ("pr_number", "lane_epoch"):
+        value = payload.get(field_name)
+        if type(value) is not int and not (isinstance(value, str) and value.isdigit()):
+            raise ValueError(f"parent synchronization receipt is missing {field_name}")
     _require_matching_text(
         payload,
         arguments,
@@ -6969,18 +7274,64 @@ def _parent_sync_effect(
         raise ValueError("parent synchronization receipt mismatch for lane_epoch")
     if payload["parent_commit_sha"] != payload["remote_head_sha"]:
         raise ValueError("parent synchronization returned divergent local and remote heads")
-    raw_payload = _merge_result_payload(result)
-    if raw_payload is None:
-        raise ValueError("parent synchronization returned no authoritative receipt")
-    payload = _include_selected_remote(payload, raw_payload)
+    if attempt is not None:
+        _validate_sync_correlation(payload, sync_id, attempt)
     if (
         payload["ancestry_proof"]
         != (f"ancestor:{arguments['merged_head_sha']}->{payload['parent_commit_sha']}")
-        and "merge_integration_proof" not in raw_payload
+        and "merge_integration_proof" not in payload
     ):
         raise ValueError("parent synchronization returned unverifiable ancestry evidence")
-    _validate_parent_sync_proof(raw_payload, arguments, payload)
-    return arguments, payload
+    _validate_parent_sync_proof(payload, arguments, cast(Mapping[str, str], payload))
+    return payload
+
+
+def _validated_sync_payload(
+    payload: Mapping[str, object],
+    arguments: Mapping[str, object],
+    sync_id: str,
+    attempt: int,
+    *,
+    require_correlation: bool,
+) -> Mapping[str, object]:
+    try:
+        if require_correlation:
+            _validate_sync_correlation(payload, sync_id, attempt)
+        if payload.get("sync_outcome") == "confirmed":
+            return _validate_sync_receipt(
+                payload,
+                arguments,
+                sync_id,
+                attempt if require_correlation else None,
+            )
+    except (KeyError, TypeError, ValueError) as error:
+        return _unresolved_sync_decision(sync_id, attempt, str(error))
+    return payload
+
+
+def _unresolved_sync_decision(sync_id: str, attempt: int, diagnostic: str) -> Mapping[str, object]:
+    return {
+        "sync_outcome": "unresolved",
+        "sync_phase": "controller_reconciliation",
+        "sync_operation_id": sync_id,
+        "sync_attempt": attempt,
+        "diagnostic": _redact_sync_diagnostic(diagnostic),
+    }
+
+
+def _redact_sync_diagnostic(value: str) -> str:
+    """Bound returned process diagnostics and remove common credential forms."""
+    safe = re.sub(
+        r"(?i)(https?://)[^/@\s]+@",
+        r"\1[REDACTED]@",
+        re.sub(r"[\x00-\x1f\x7f]+", " ", value),
+    )
+    safe = re.sub(
+        r"(?i)(token|password|authorization)=\S+",
+        r"\1=[REDACTED]",
+        safe,
+    )
+    return " ".join(safe.split())[:500]
 
 
 def _validate_parent_sync_proof(
@@ -7131,6 +7482,9 @@ def _parent_sync_arguments(
         "merged_head_sha": _required_merge_identity(evidence, ("head_sha",), "merged head SHA"),
         "expected_base_sha": expected_base_sha,
         "lane_epoch": _required_int(evidence, "lane_epoch", "lane epoch"),
+        "merge_journal_id": _required_merge_identity(
+            evidence, ("merge_journal_id",), "merge journal"
+        ),
         "working_dir": working_dir,
     }
     forgejo_pr_number = evidence.get("forgejo_pr_number")
@@ -9676,6 +10030,14 @@ def _reconcile_action_journal(
     if not isinstance(effects_log, EffectJournal):
         return state
     for entry in effects_log.pending_entries():
+        if entry.get("operation") in {
+            "post_merge_parent_sync",
+            "post_merge_parent_sync_reconcile",
+        }:
+            # Parent synchronization owns its Git probe and retry policy. A
+            # generic approval gate cannot distinguish a preflight refusal
+            # from a completed fast-forward or an unknown interruption.
+            continue
         if entry.get("operation") == "post_merge_issue_close":
             continue
         if _is_aggregate_file_pr_entry(entry, state):

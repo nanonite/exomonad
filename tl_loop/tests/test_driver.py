@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -75,9 +75,11 @@ from tl_loop.loop.driver import (
     _migrate_audit_marked_quarantine,
     _new_dispatch_attempt,
     _ordered_child_complete,
+    _parent_sync_effect,
     _park_repeated_action,
     _phase_after_slice_merge,
     _publication_from_watcher,
+    _reconcile_action_journal,
     _reconcile_pending_merge_entry,
     _record_review_event,
     _recover_tool_unavailable,
@@ -1076,6 +1078,11 @@ class RecordingTransport:
                 "success": True,
                 "result": {
                     **arguments,
+                    "sync_outcome": "confirmed",
+                    "sync_phase": "complete",
+                    "completed_steps": ["fetch", "fast_forward"],
+                    "retry_safe": False,
+                    "diagnostic": "",
                     "parent_commit_sha": arguments["expected_base_sha"],
                     "remote_head_sha": arguments["expected_base_sha"],
                     "ancestry_proof": (
@@ -6419,6 +6426,377 @@ def test_convergence_executes_journaled_direct_merge_with_compare_evidence(tmp_p
     merge_entries = journal.confirmed_entries("merge_pr", "leaf-a")
     assert len(merge_entries) == 1
     assert len(journal.confirmed_entries("post_merge_parent_sync", "leaf-a")) == 1
+
+
+def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_refusal(
+    tmp_path: Path,
+) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    current = state.slices["leaf-a"]
+    evidence: dict[str, object] = {
+        "repository": "https://forge.example.com/org/repo.git",
+        "parent_branch": "main",
+        "head_sha": "head-a",
+        "merge_journal_id": "merge-journal-a",
+        "lane_epoch": "1",
+    }
+
+    class SyncTransport:
+        calls: ClassVar[list[dict[str, object]]] = []
+
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+            del role, name
+            assert tool_name == "post_merge_parent_sync"
+            self.calls.append(arguments)
+            outcome = "known_partial_progress" if len(self.calls) == 1 else "confirmed"
+            result: dict[str, object] = {
+                **arguments,
+                "sync_outcome": outcome,
+                "sync_phase": "fast_forward" if outcome != "confirmed" else "complete",
+                "completed_steps": ["fetch"],
+                "retry_safe": outcome != "confirmed",
+                "diagnostic": "fast-forward refused" if outcome != "confirmed" else "",
+            }
+            if outcome == "confirmed":
+                result.update(
+                    {
+                        "parent_commit_sha": "parent-after-merge",
+                        "remote_head_sha": "parent-after-merge",
+                        "ancestry_proof": "ancestor:head-a->parent-after-merge",
+                    }
+                )
+            return {"success": True, "result": result}
+
+    transport = SyncTransport()
+    effects = EffectClient(transport)
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    config = TLLoopConfig(active=True, project_root=tmp_path)
+
+    _, refused = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        config,
+        effects,
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+    assert refused["sync_outcome"] == "known_partial_progress"
+    first_id = transport.calls[0]["sync_operation_id"]
+    assert transport.calls[0]["sync_attempt"] == 1
+
+    expanded_evidence = {
+        **evidence,
+        "forgejo_pr_number": "42",
+        "forgejo_merged": "true",
+        "forgejo_head_sha": "head-a",
+        "forgejo_merge_commit_sha": "parent-after-merge",
+        "forgejo_merge_commit_tree_sha": "tree-a",
+        "prospective_merge_tree_sha": "tree-a",
+        "reviewed_pr_head_tree_sha": "tree-a",
+    }
+    _, receipt = _parent_sync_effect(
+        state,
+        current,
+        42,
+        expanded_evidence,
+        config,
+        effects,
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-after-fetch",
+    )
+    assert receipt["sync_outcome"] == "confirmed"
+    assert transport.calls[1]["sync_operation_id"] == first_id
+    assert transport.calls[1]["sync_attempt"] == 2
+    attempts = journal.entries_for("post_merge_parent_sync", "leaf-a")
+    assert [entry["arguments"]["sync_attempt"] for entry in attempts] == [1, 2]
+
+
+def test_parent_sync_rejects_mismatched_result_correlation_as_a_recoverable_hold(
+    tmp_path: Path,
+) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    current = state.slices["leaf-a"]
+    evidence: dict[str, object] = {
+        "repository": "https://forge.example.com/org/repo.git",
+        "parent_branch": "main",
+        "head_sha": "head-a",
+        "merge_journal_id": "merge-journal-a",
+        "lane_epoch": "1",
+    }
+
+    class MismatchedTransport:
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+            del role, name
+            assert tool_name == "post_merge_parent_sync"
+            return {
+                "success": True,
+                "result": {
+                    **arguments,
+                    "sync_operation_id": "b" * 64,
+                    "sync_outcome": "known_partial_progress",
+                    "sync_phase": "fast_forward",
+                    "completed_steps": ["fetch"],
+                    "retry_safe": True,
+                    "diagnostic": "host returned another operation's result",
+                },
+            }
+
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    _, result = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        TLLoopConfig(active=True, project_root=tmp_path),
+        EffectClient(MismatchedTransport()),
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+
+    assert result["sync_outcome"] == "unresolved"
+    assert "different logical operation identity" in result["diagnostic"]
+    assert journal.entries_for("post_merge_parent_sync", "leaf-a")[0]["status"] == "confirmed"
+
+
+def test_parent_sync_diagnostics_strip_control_characters_and_credentials() -> None:
+    diagnostic = driver_module._redact_sync_diagnostic(
+        "\x1b[31mfailed https://user:secret@forge.example/org/repo?token=abc123\x1b[0m"
+    )
+
+    assert "\x1b" not in diagnostic
+    assert "user" not in diagnostic
+    assert "secret" not in diagnostic
+    assert "abc123" not in diagnostic
+    assert "forge.example" in diagnostic
+
+
+def test_parent_sync_timeout_is_reconciled_before_a_new_mutation_attempt(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    current = state.slices["leaf-a"]
+    evidence: dict[str, object] = {
+        "repository": "https://forge.example.com/org/repo.git",
+        "parent_branch": "main",
+        "head_sha": "head-a",
+        "merge_journal_id": "merge-journal-a",
+        "lane_epoch": "1",
+    }
+
+    class SyncTransport:
+        calls: ClassVar[list[dict[str, object]]] = []
+
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+            del role, name
+            assert tool_name == "post_merge_parent_sync"
+            self.calls.append(arguments)
+            if len(self.calls) == 1:
+                raise TimeoutError("response lost after Git may have run")
+            outcome = "safe_to_retry" if arguments["reconcile_only"] else "confirmed"
+            result: dict[str, object] = {
+                **arguments,
+                "sync_outcome": outcome,
+                "sync_phase": "reconcile_complete" if arguments["reconcile_only"] else "complete",
+                "completed_steps": ["fetch"],
+                "retry_safe": outcome == "safe_to_retry",
+                "diagnostic": "verified fast-forward is available"
+                if outcome == "safe_to_retry"
+                else "",
+            }
+            if outcome == "confirmed":
+                result.update(
+                    {
+                        "parent_commit_sha": "parent-after-merge",
+                        "remote_head_sha": "parent-after-merge",
+                        "ancestry_proof": "ancestor:head-a->parent-after-merge",
+                    }
+                )
+            return {"success": True, "result": result}
+
+    transport = SyncTransport()
+    effects = EffectClient(transport)
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    config = TLLoopConfig(active=True, project_root=tmp_path)
+
+    with pytest.raises(TimeoutError):
+        _parent_sync_effect(
+            state,
+            current,
+            42,
+            evidence,
+            config,
+            effects,
+            journal,
+            operation="post_merge_parent_sync",
+            expected_base_sha="base-a",
+        )
+
+    assert journal.pending_entries()[0]["operation"] == "post_merge_parent_sync"
+    reconciled_state = _reconcile_action_journal(state, store, journal)
+    assert reconciled_state.gates == state.gates
+    assert journal.pending_entries()[0]["status"] == "unknown"
+
+    _, receipt = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        config,
+        effects,
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+    assert receipt["sync_outcome"] == "confirmed"
+    assert [call["reconcile_only"] for call in transport.calls] == [False, True, False]
+    assert [call["sync_attempt"] for call in transport.calls] == [1, 2, 3]
+    assert len(journal.confirmed_entries("post_merge_parent_sync_reconcile", "leaf-a")) == 1
+
+
+def test_parent_sync_reconciles_legacy_unknown_rows_without_rewriting_them(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    current = state.slices["leaf-a"]
+    evidence: dict[str, object] = {
+        "repository": "https://forge.example.com/org/repo.git",
+        "parent_branch": "main",
+        "head_sha": "head-a",
+        "merge_journal_id": "merge-journal-a",
+        "lane_epoch": "1",
+    }
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    legacy_coordinates = {
+        "child_id": "leaf-a",
+        "pr_number": 42,
+        "repository": evidence["repository"],
+        "parent_branch": "main",
+        "merged_head_sha": "head-a",
+        "lane_epoch": 1,
+    }
+    for index, observed_base in enumerate(("base-before", "base-after"), start=1):
+        legacy_intent = EffectIntent(
+            "post_merge_parent_sync",
+            "leaf-a",
+            {
+                **legacy_coordinates,
+                "expected_base_sha": observed_base,
+                "working_dir": ".",
+                "forgejo_head_sha": "head-a" if index == 2 else None,
+            },
+            True,
+        )
+        journal.append(legacy_intent)
+        journal.mark_unknown(legacy_intent, RuntimeError("legacy response was incomplete"))
+    historical = journal.snapshot()
+
+    class SyncTransport:
+        calls: ClassVar[list[dict[str, object]]] = []
+
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+            del role, name
+            assert tool_name == "post_merge_parent_sync"
+            self.calls.append(arguments)
+            outcome = "safe_to_retry" if arguments["reconcile_only"] else "confirmed"
+            result: dict[str, object] = {
+                **arguments,
+                "sync_outcome": outcome,
+                "sync_phase": "reconcile_complete" if arguments["reconcile_only"] else "complete",
+                "completed_steps": ["fetch"],
+                "retry_safe": outcome == "safe_to_retry",
+                "diagnostic": "remote integration verified" if outcome == "safe_to_retry" else "",
+            }
+            if outcome == "confirmed":
+                result.update(
+                    {
+                        "parent_commit_sha": "parent-after-merge",
+                        "remote_head_sha": "parent-after-merge",
+                        "ancestry_proof": "ancestor:head-a->parent-after-merge",
+                    }
+                )
+            return {"success": True, "result": result}
+
+    transport = SyncTransport()
+    _, receipt = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        TLLoopConfig(active=True, project_root=tmp_path),
+        EffectClient(transport),
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-current",
+    )
+
+    assert receipt["sync_outcome"] == "confirmed"
+    assert [call["reconcile_only"] for call in transport.calls] == [True, False]
+    assert [call["sync_attempt"] for call in transport.calls] == [3, 4]
+    current_journal = journal.snapshot()
+    assert current_journal[:2] == historical
+
+
+def test_parent_sync_adopts_legacy_confirmed_receipt_without_rewriting_it(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    current = state.slices["leaf-a"]
+    evidence: dict[str, object] = {
+        "repository": "https://forge.example.com/org/repo.git",
+        "parent_branch": "main",
+        "head_sha": "head-a",
+        "merge_journal_id": "merge-journal-a",
+        "lane_epoch": "1",
+    }
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    legacy_arguments = {
+        "child_id": "leaf-a",
+        "pr_number": 42,
+        "repository": evidence["repository"],
+        "parent_branch": "main",
+        "merged_head_sha": "head-a",
+        "expected_base_sha": "base-a",
+        "lane_epoch": 1,
+        "working_dir": ".",
+    }
+    receipt = {
+        **legacy_arguments,
+        "remote_name": "forgejo",
+        "parent_commit_sha": "parent-after-merge",
+        "remote_head_sha": "parent-after-merge",
+        "ancestry_proof": "ancestor:head-a->parent-after-merge",
+    }
+    legacy_intent = EffectIntent("post_merge_parent_sync", "leaf-a", legacy_arguments, True)
+    journal.append(legacy_intent)
+    journal.mark_result(legacy_intent, ToolResult.from_raw({"success": True, "result": receipt}))
+    historical = journal.snapshot()
+
+    class NoDispatchTransport:
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+            del role, name, tool_name, arguments
+            raise AssertionError(
+                "a proven legacy success must be adopted without another Git effect"
+            )
+
+    _, adopted = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        TLLoopConfig(active=True, project_root=tmp_path),
+        EffectClient(NoDispatchTransport()),
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+
+    assert adopted["sync_outcome"] == "confirmed"
+    assert adopted["parent_commit_sha"] == "parent-after-merge"
+    assert journal.snapshot() == historical
 
 
 def test_slice_recovery_is_projected_into_the_canonical_scope_before_release(

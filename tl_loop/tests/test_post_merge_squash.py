@@ -320,6 +320,11 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
                     "success": True,
                     "result": {
                         **arguments,
+                        "sync_outcome": "confirmed",
+                        "sync_phase": "complete",
+                        "completed_steps": ["fetch", "fast_forward"],
+                        "retry_safe": False,
+                        "diagnostic": "",
                         "parent_commit_sha": "merge-commit",
                         "remote_head_sha": "merge-commit",
                         "remote_name": "forgejo",

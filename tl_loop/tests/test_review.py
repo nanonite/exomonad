@@ -814,6 +814,11 @@ def test_unknown_merge_restart_resolves_lane_and_finishes_without_remerge(tmp_pa
                     "success": True,
                     "result": {
                         **arguments,
+                        "sync_outcome": "confirmed",
+                        "sync_phase": "complete",
+                        "completed_steps": ["fetch", "fast_forward"],
+                        "retry_safe": False,
+                        "diagnostic": "",
                         "parent_commit_sha": "parent-a",
                         "remote_head_sha": "parent-a",
                         "ancestry_proof": "ancestor:abc123->parent-a",

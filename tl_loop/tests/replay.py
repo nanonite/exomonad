@@ -91,6 +91,11 @@ class RecordingTransport:
                 "success": True,
                 "result": {
                     **arguments,
+                    "sync_outcome": "confirmed",
+                    "sync_phase": "complete",
+                    "completed_steps": ["fetch", "fast_forward"],
+                    "retry_safe": False,
+                    "diagnostic": "",
                     "repository": "https://forge.example.com/org/repo.git",
                     "parent_commit_sha": parent_commit,
                     "remote_head_sha": parent_commit,

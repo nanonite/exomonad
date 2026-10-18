@@ -1420,6 +1420,13 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
                 {
                     "success": True,
                     "result": {
+                        "sync_outcome": "confirmed",
+                        "sync_phase": "complete",
+                        "completed_steps": ["fetch", "fast_forward"],
+                        "retry_safe": False,
+                        "diagnostic": "",
+                        "sync_operation_id": arguments["sync_operation_id"],
+                        "sync_attempt": arguments["sync_attempt"],
                         "child_id": arguments["child_id"],
                         "pr_number": arguments["pr_number"],
                         "repository": "https://forge.example.com/org/repo.git",
@@ -1557,6 +1564,13 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
                 {
                     "success": True,
                     "result": {
+                        "sync_outcome": "confirmed",
+                        "sync_phase": "complete",
+                        "completed_steps": ["fetch", "fast_forward"],
+                        "retry_safe": False,
+                        "diagnostic": "",
+                        "sync_operation_id": arguments["sync_operation_id"],
+                        "sync_attempt": arguments["sync_attempt"],
                         "child_id": arguments["child_id"],
                         "pr_number": arguments["pr_number"],
                         "repository": arguments["repository"],
@@ -1707,6 +1721,13 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
                 {
                     "success": True,
                     "result": {
+                        "sync_outcome": "confirmed",
+                        "sync_phase": "complete",
+                        "completed_steps": ["fetch", "fast_forward"],
+                        "retry_safe": False,
+                        "diagnostic": "",
+                        "sync_operation_id": arguments["sync_operation_id"],
+                        "sync_attempt": arguments["sync_attempt"],
                         "child_id": arguments["child_id"],
                         "pr_number": arguments["pr_number"],
                         "repository": "https://forge.example.com/org/repo.git",

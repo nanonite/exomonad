@@ -345,6 +345,18 @@
             "description": "Durable integration-lane epoch.",
             "type": "integer"
           },
+          "sync_operation_id": {
+            "description": "Stable identity for the logical parent synchronization.",
+            "type": "string"
+          },
+          "sync_attempt": {
+            "description": "Durable attempt number for this synchronization operation.",
+            "type": "integer"
+          },
+          "reconcile_only": {
+            "description": "Observe remote and local Git evidence without fast-forwarding.",
+            "type": "boolean"
+          },
           "working_dir": {
             "description": "Optional relative repository working directory.",
             "type": "string"
