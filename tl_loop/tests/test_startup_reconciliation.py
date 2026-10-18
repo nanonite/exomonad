@@ -1710,13 +1710,24 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
     crash = {"observed": False, "raised": False}
 
     class CrashRecoveryClient(FakeClient):
+        def repository_identity(self) -> ToolResult:
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        "remote_url": "https://forge.example.com/org/repo.git",
+                    },
+                }
+            )
+
         def _mark_boundary(self, boundary: str) -> None:
             self.post_merge_calls.append(boundary)
             if boundary == crash_boundary and not crash["observed"]:
                 crash["observed"] = True
 
         def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
-            self._mark_boundary("parent_sync")
+            if arguments.get("reconcile_only") is not True:
+                self._mark_boundary("parent_sync")
             return ToolResult.from_raw(
                 {
                     "success": True,

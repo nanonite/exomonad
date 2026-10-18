@@ -783,8 +783,27 @@ def test_tl_run_crash_resume_matches_live_and_probes_each_recovery_effect(
     assert live_state.state_version == resumed_state.state_version
     assert live_state.reducer_version == resumed_state.reducer_version
     effect_tool = RECOVERY_EFFECT_TO_TOOL.get(operation, operation)
-    assert sum(action[0] == effect_tool for action in live_transport.calls) == 1
-    assert sum(action[0] == effect_tool for action in resumed_transport.calls) == 0
+
+    def mutating_effect_calls(transport: _RecoveryTransport) -> list[tuple[str, dict[str, object]]]:
+        return [
+            action
+            for action in transport.calls
+            if action[0] == effect_tool
+            and not (
+                effect_tool == "post_merge_parent_sync" and action[1].get("reconcile_only") is True
+            )
+        ]
+
+    assert len(mutating_effect_calls(live_transport)) == 1
+    assert len(mutating_effect_calls(resumed_transport)) == 0
+    if effect_tool == "post_merge_parent_sync":
+        assert (
+            sum(
+                tool == effect_tool and arguments.get("reconcile_only") is True
+                for tool, arguments in resumed_transport.calls
+            )
+            == 1
+        )
 
 
 def _canonical(value: object) -> bytes:

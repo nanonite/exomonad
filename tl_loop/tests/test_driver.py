@@ -6465,11 +6465,34 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
 
     class SyncTransport:
         calls: ClassVar[list[dict[str, object]]] = []
+        tool_names: ClassVar[list[str]] = []
 
         def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
             del role, name
-            assert tool_name == "post_merge_parent_sync"
             self.calls.append(arguments)
+            is_reconcile = arguments.get("reconcile_only") is True
+            self.tool_names.append(
+                "post_merge_parent_sync_reconcile" if is_reconcile else tool_name
+            )
+            if is_reconcile:
+                result: dict[str, object] = {
+                    **arguments,
+                    "sync_outcome": "safe_to_retry",
+                    "sync_phase": "reconcile_complete",
+                    "completed_steps": ["fetch", "fast_forward_available"],
+                    "retry_safe": True,
+                    "diagnostic": "the refusal preconditions changed",
+                    "refusal_preconditions": {
+                        "parent_branch": "main",
+                        "remote_name": "origin",
+                        "local_head_sha": "local-b",
+                        "remote_head_sha": "remote-a",
+                        "working_tree_status": "",
+                        "local_is_ancestor_remote": True,
+                    },
+                }
+                return {"success": True, "result": result}
+            assert tool_name == "post_merge_parent_sync"
             outcome = "known_partial_progress" if len(self.calls) == 1 else "confirmed"
             result: dict[str, object] = {
                 **arguments,
@@ -6479,6 +6502,15 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
                 "retry_safe": outcome != "confirmed",
                 "diagnostic": "fast-forward refused" if outcome != "confirmed" else "",
             }
+            if outcome == "known_partial_progress":
+                result["refusal_preconditions"] = {
+                    "parent_branch": "main",
+                    "remote_name": "origin",
+                    "local_head_sha": "local-a",
+                    "remote_head_sha": "remote-a",
+                    "working_tree_status": " M tracked.txt",
+                    "local_is_ancestor_remote": True,
+                }
             if outcome == "confirmed":
                 result.update(
                     {
@@ -6533,8 +6565,209 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
     assert receipt["sync_outcome"] == "confirmed"
     assert transport.calls[1]["sync_operation_id"] == first_id
     assert transport.calls[1]["sync_attempt"] == 2
+    assert transport.calls[2]["sync_attempt"] == 3
+    assert transport.tool_names == [
+        "post_merge_parent_sync",
+        "post_merge_parent_sync_reconcile",
+        "post_merge_parent_sync",
+    ]
     attempts = journal.entries_for("post_merge_parent_sync", "leaf-a")
-    assert [entry["arguments"]["sync_attempt"] for entry in attempts] == [1, 2]
+    assert [entry["arguments"]["sync_attempt"] for entry in attempts] == [1, 3]
+
+
+@pytest.mark.parametrize("include_initial_preconditions", [True, False])
+def test_parent_sync_holds_unchanged_known_fast_forward_refusal(
+    tmp_path: Path, include_initial_preconditions: bool
+) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    current = state.slices["leaf-a"]
+    evidence: dict[str, object] = {
+        "repository": "https://forge.example.com/org/repo.git",
+        "parent_branch": "main",
+        "head_sha": "head-a",
+        "merge_journal_id": "merge-journal-a",
+        "lane_epoch": "1",
+    }
+    refusal_preconditions: dict[str, object] = {
+        "parent_branch": "main",
+        "remote_name": "origin",
+        "local_head_sha": "local-a",
+        "remote_head_sha": "remote-a",
+        "working_tree_status": "1 .M N... 100644 100644 100644 abc abc tracked.txt",
+        "local_is_ancestor_remote": True,
+    }
+
+    class RefusalTransport:
+        calls: ClassVar[list[tuple[str, dict[str, object]]]] = []
+
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+            del role, name
+            assert tool_name == "post_merge_parent_sync"
+            self.calls.append((tool_name, arguments))
+            is_reconcile = arguments.get("reconcile_only") is True
+            outcome = "safe_to_retry" if is_reconcile else "known_partial_progress"
+            result: dict[str, object] = {
+                **arguments,
+                "sync_outcome": outcome,
+                "sync_phase": "reconcile_complete" if is_reconcile else "fast_forward",
+                "completed_steps": ["fetch"],
+                "retry_safe": True,
+                "diagnostic": "local changes would be overwritten",
+            }
+            if is_reconcile or include_initial_preconditions:
+                result["refusal_preconditions"] = refusal_preconditions
+            return {"success": True, "result": result}
+
+    transport = RefusalTransport()
+    effects = EffectClient(transport)
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    config = TLLoopConfig(active=True, project_root=tmp_path)
+    _, refusal = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        config,
+        effects,
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+    assert refusal["sync_outcome"] == "known_partial_progress"
+    original_attempt = dict(journal.entries_for("post_merge_parent_sync", "leaf-a")[0])
+
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    _, held = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        config,
+        effects,
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+
+    assert held["sync_outcome"] == "unresolved", (held, transport.calls)
+    expected_diagnostic = (
+        "preconditions are unchanged"
+        if include_initial_preconditions
+        else "lacks exact preconditions"
+    )
+    assert expected_diagnostic in str(held["diagnostic"])
+    assert [tool_name for tool_name, _ in transport.calls] == [
+        "post_merge_parent_sync",
+        "post_merge_parent_sync",
+    ]
+    assert transport.calls[1][1]["reconcile_only"] is True
+    assert [
+        entry["arguments"]["sync_attempt"]
+        for entry in journal.entries_for("post_merge_parent_sync", "leaf-a")
+    ] == [1]
+    assert journal.entries_for("post_merge_parent_sync", "leaf-a")[0] == original_attempt
+
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    _, replayed = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        config,
+        effects,
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+    assert replayed["sync_outcome"] == "unresolved"
+    assert len(transport.calls) == 3
+    assert all(call[1]["reconcile_only"] is True for call in transport.calls[1:])
+    assert [
+        entry["arguments"]["sync_attempt"]
+        for entry in journal.entries_for("post_merge_parent_sync", "leaf-a")
+    ] == [1]
+
+
+def test_parent_sync_holds_unchanged_divergent_history_after_replay(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    state = store.load()
+    current = state.slices["leaf-a"]
+    evidence: dict[str, object] = {
+        "repository": "https://forge.example.com/org/repo.git",
+        "parent_branch": "main",
+        "head_sha": "head-a",
+        "merge_journal_id": "merge-journal-a",
+        "lane_epoch": "1",
+    }
+    refusal_preconditions: dict[str, object] = {
+        "parent_branch": "main",
+        "remote_name": "origin",
+        "local_head_sha": "local-a",
+        "remote_head_sha": "remote-a",
+        "working_tree_status": "",
+        "local_is_ancestor_remote": False,
+    }
+
+    class DivergenceTransport:
+        calls: ClassVar[list[dict[str, object]]] = []
+
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+            del role, name
+            assert tool_name == "post_merge_parent_sync"
+            self.calls.append(arguments)
+            is_reconcile = arguments.get("reconcile_only") is True
+            result: dict[str, object] = {
+                **arguments,
+                "sync_outcome": "unresolved" if is_reconcile else "known_partial_progress",
+                "sync_phase": "reconcile_observation" if is_reconcile else "fast_forward",
+                "sync_blocker": "diverged_history",
+                "completed_steps": ["fetch"],
+                "retry_safe": False,
+                "diagnostic": "local and remote history is divergent",
+                "refusal_preconditions": refusal_preconditions,
+            }
+            return {"success": True, "result": result}
+
+    transport = DivergenceTransport()
+    effects = EffectClient(transport)
+    journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
+    config = TLLoopConfig(active=True, project_root=tmp_path)
+    _, refusal = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        config,
+        effects,
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+    assert refusal["sync_outcome"] == "known_partial_progress"
+    original_attempt = dict(journal.entries_for("post_merge_parent_sync", "leaf-a")[0])
+
+    _, held = _parent_sync_effect(
+        state,
+        current,
+        42,
+        evidence,
+        config,
+        effects,
+        journal,
+        operation="post_merge_parent_sync",
+        expected_base_sha="base-a",
+    )
+
+    assert held["sync_outcome"] == "unresolved"
+    assert "local and remote history is divergent" in str(held["diagnostic"])
+    assert len(transport.calls) == 2
+    assert transport.calls[1]["reconcile_only"] is True
+    assert [
+        entry["arguments"]["sync_attempt"]
+        for entry in journal.entries_for("post_merge_parent_sync", "leaf-a")
+    ] == [1]
+    assert journal.entries_for("post_merge_parent_sync", "leaf-a")[0] == original_attempt
 
 
 def test_parent_sync_rejects_mismatched_result_correlation_as_a_recoverable_hold(

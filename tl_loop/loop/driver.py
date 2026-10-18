@@ -6965,10 +6965,33 @@ def _parent_sync_effect(
         return call_arguments, _unresolved_sync_decision(sync_id, 0, history_error)
 
     latest = max(history, key=lambda entry: entry[0], default=None)
+    latest_mutation = max(
+        (entry for entry in history if entry[1] == "post_merge_parent_sync"),
+        key=lambda entry: entry[0],
+        default=None,
+    )
     next_attempt = max((entry[0] for entry in history), default=0) + 1
     if latest is not None:
-        attempt, entry = latest
+        attempt, _, entry = latest
         outcome, old_payload = _journal_sync_outcome(entry)
+        ready_reconciliation: Mapping[str, object] | None = None
+        refusal_payload: Mapping[str, object] | None = None
+        refusal_lacks_preconditions = False
+        if latest_mutation is not None:
+            mutation_entry = latest_mutation[2]
+            mutation_outcome, mutation_payload = _journal_sync_outcome(mutation_entry)
+            if (
+                mutation_outcome == "known_partial_progress"
+                and mutation_payload is not None
+                and mutation_payload.get("sync_phase") == "fast_forward"
+            ):
+                refusal_payload = mutation_payload
+                refusal_lacks_preconditions = (
+                    _parent_sync_refusal_preconditions(
+                        mutation_payload, call_arguments.get("parent_branch")
+                    )
+                    is None
+                )
         entry_arguments = entry.get("arguments")
         stable_attempt = (
             isinstance(entry_arguments, Mapping)
@@ -7011,27 +7034,63 @@ def _parent_sync_effect(
                 return call_arguments, reconciled
             if reconciled.get("sync_outcome") != "safe_to_retry":
                 return call_arguments, reconciled
+            ready_reconciliation = reconciled
             outcome = "safe_to_retry"
             next_attempt += 1
-        if outcome in {"pre_mutation_refusal", "known_partial_progress", "safe_to_retry"}:
+        if outcome == "pre_mutation_refusal":
             pass
-        elif outcome in {"unknown_interruption", "unresolved"}:
-            reconciled = _run_parent_sync_observation(
-                current.id,
-                call_arguments,
-                sync_id,
-                next_attempt,
-                effects,
-                effects_log,
-                config,
-            )
+        elif outcome in {
+            "known_partial_progress",
+            "safe_to_retry",
+            "unknown_interruption",
+            "unresolved",
+        }:
+            reconciliation_was_freshly_started = ready_reconciliation is None
+            if ready_reconciliation is None:
+                reconciled = _run_parent_sync_observation(
+                    current.id,
+                    call_arguments,
+                    sync_id,
+                    next_attempt,
+                    effects,
+                    effects_log,
+                    config,
+                )
+            else:
+                reconciled = ready_reconciliation
             if reconciled.get("sync_outcome") == "confirmed":
                 return call_arguments, _validated_sync_payload(
                     reconciled, call_arguments, sync_id, next_attempt, require_correlation=True
                 )
             if reconciled.get("sync_outcome") != "safe_to_retry":
                 return call_arguments, reconciled
-            next_attempt += 1
+            if refusal_payload is not None:
+                if refusal_lacks_preconditions:
+                    return call_arguments, _unresolved_sync_decision(
+                        sync_id,
+                        next_attempt,
+                        "prior fast-forward refusal lacks exact preconditions; synchronization remains held",
+                    )
+                previous_preconditions = _parent_sync_refusal_preconditions(
+                    refusal_payload, call_arguments.get("parent_branch")
+                )
+                current_preconditions = _parent_sync_refusal_preconditions(
+                    reconciled, call_arguments.get("parent_branch")
+                )
+                if current_preconditions is None:
+                    return call_arguments, _unresolved_sync_decision(
+                        sync_id,
+                        next_attempt,
+                        "Git reconciliation omitted exact fast-forward refusal preconditions",
+                    )
+                if current_preconditions == previous_preconditions:
+                    return call_arguments, _unresolved_sync_decision(
+                        sync_id,
+                        next_attempt,
+                        "known fast-forward refusal preconditions are unchanged; no mutation was retried",
+                    )
+            if reconciliation_was_freshly_started:
+                next_attempt += 1
         else:
             return call_arguments, _unresolved_sync_decision(
                 sync_id, attempt, "prior parent-sync result lacks a recognized outcome"
@@ -7084,7 +7143,7 @@ def _parent_sync_history(
     child_id: str,
     sync_id: str,
     identity: Mapping[str, object],
-) -> tuple[list[tuple[int, Mapping[str, object]]], str | None]:
+) -> tuple[list[tuple[int, str, Mapping[str, object]]], str | None]:
     """Find this operation's attempts while safely recognizing old journal rows."""
     if not isinstance(effects_log, EffectJournal):
         return [], None
@@ -7095,7 +7154,7 @@ def _parent_sync_history(
         ("post_merge_parent_sync_reconcile", entry)
         for entry in effects_log.entries_for("post_merge_parent_sync_reconcile", child_id)
     ]
-    matches: list[tuple[int, Mapping[str, object]]] = []
+    matches: list[tuple[int, str, Mapping[str, object]]] = []
     legacy_attempt = 0
     for operation, entry in rows:
         arguments = entry.get("arguments")
@@ -7137,8 +7196,40 @@ def _parent_sync_history(
         attempt = raw_attempt if type(raw_attempt) is int and raw_attempt > 0 else legacy_attempt
         if attempt <= 0:
             return [], "synchronization attempt number is malformed"
-        matches.append((attempt, entry))
+        matches.append((attempt, operation, entry))
     return matches, None
+
+
+def _parent_sync_refusal_preconditions(
+    payload: Mapping[str, object],
+    expected_branch: object = None,
+) -> dict[str, object] | None:
+    """Return the exact safe Git-state coordinates recorded for a refusal."""
+    value = payload.get("refusal_preconditions")
+    if not isinstance(value, Mapping):
+        return None
+    required = {
+        "parent_branch",
+        "remote_name",
+        "local_head_sha",
+        "remote_head_sha",
+        "working_tree_status",
+        "local_is_ancestor_remote",
+    }
+    if set(value) != required:
+        return None
+    if any(not isinstance(value[key], str) for key in required - {"local_is_ancestor_remote"}):
+        return None
+    if any(
+        not value[key]
+        for key in ("parent_branch", "remote_name", "local_head_sha", "remote_head_sha")
+    ):
+        return None
+    if expected_branch is not None and value["parent_branch"] != expected_branch:
+        return None
+    if type(value["local_is_ancestor_remote"]) is not bool:
+        return None
+    return {key: value[key] for key in sorted(required)}
 
 
 def _journal_sync_outcome(

@@ -359,6 +359,15 @@ data SyncGitResult
   = SyncGitResponse Int32 Text Text
   | SyncGitInterrupted Bool Text
 
+data SyncPreconditions = SyncPreconditions
+  { syncParentBranch :: Text,
+    syncRemoteName :: Text,
+    syncLocalHead :: Text,
+    syncRemoteHead :: Text,
+    syncWorkingTreeStatus :: Text,
+    syncLocalIsAncestorRemote :: Bool
+  }
+
 synchronizeParentBranch :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Eff effs (Either Text Value)
 synchronizeParentBranch args remote = do
   fetched <- runGitSyncAt (pmpWorkingDir args) (postMergeParentSyncFetchArgs remote (pmpParentBranch args))
@@ -382,7 +391,7 @@ fastForwardParentBranch args remote = do
       merged <- runGitSyncAt (pmpWorkingDir args) (postMergeParentSyncMergeArgs remote (pmpParentBranch args))
       case merged of
         SyncGitInterrupted True diagnostic ->
-          pure $ Right (syncDecision args "known_partial_progress" "fast_forward" ["fetch"] True diagnostic)
+          pure $ Right (syncDecision args "pre_mutation_refusal" "fast_forward" ["fetch"] True diagnostic)
         SyncGitInterrupted False diagnostic ->
           pure $ Right (syncDecision args "unknown_interruption" "fast_forward" ["fetch"] False diagnostic)
         SyncGitResponse 0 _ _ -> verifySynchronizedParent args remote ["fetch", "fast_forward"]
@@ -396,12 +405,45 @@ classifyRejectedFastForward args remote beforeHead exitCode stdout stderr = do
   case (after, mergeHead) of
     (Right afterHead, SyncGitResponse 1 _ _)
       | afterHead == beforeHead ->
-          pure $ Right (syncDecision args "known_partial_progress" "fast_forward" ["fetch"] True (exitDiagnostic exitCode stdout stderr))
+          knownFastForwardRefusal args remote beforeHead exitCode stdout stderr
     (Right afterHead, _)
       | afterHead /= beforeHead ->
           verifySynchronizedParent args remote ["fetch", "fast_forward"]
     _ ->
       pure $ Right (syncDecision args "unknown_interruption" "fast_forward_verification" ["fetch"] False "Git refused fast-forward and its local result could not be proven")
+
+knownFastForwardRefusal :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Text -> Int32 -> Text -> Text -> Eff effs (Either Text Value)
+knownFastForwardRefusal args remote beforeHead exitCode stdout stderr = do
+  preconditions <- readSyncPreconditions args remote
+  pure $
+    Right
+      ( knownFastForwardRefusalDecision
+          args
+          beforeHead
+          exitCode
+          stdout
+          stderr
+          preconditions
+      )
+
+knownFastForwardRefusalDecision :: PostMergeParentSyncArgs -> Text -> Int32 -> Text -> Text -> Either Text SyncPreconditions -> Value
+knownFastForwardRefusalDecision args beforeHead exitCode stdout stderr preconditions =
+  case preconditions of
+    Left diagnostic ->
+      syncDecision args "known_partial_progress" "fast_forward" ["fetch"] True diagnostic
+    Right observed
+      | syncLocalHead observed /= beforeHead ->
+          syncDecision args "unknown_interruption" "fast_forward_verification" ["fetch"] False "Git state changed while capturing the known refusal; current state must be reconciled"
+      | otherwise ->
+          syncDecisionWithPreconditions
+            args
+            "known_partial_progress"
+            "fast_forward"
+            ["fetch"]
+            True
+            (exitDiagnostic exitCode stdout stderr)
+            (syncBlockerFor observed)
+            observed
 
 verifySynchronizedParent :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> [Text] -> Eff effs (Either Text Value)
 verifySynchronizedParent args remote completed = do
@@ -452,9 +494,53 @@ inspectSynchronizedParent args remote = do
 safeRetryWhenFastForwardable :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Text -> Text -> Eff effs (Either Text Value)
 safeRetryWhenFastForwardable args remote local observedRemote = do
   ancestry <- verifyAncestryAt (pmpWorkingDir args) local observedRemote
+  preconditions <- readSyncPreconditions args remote
+  case assessSafeRetry args local observedRemote ancestry preconditions of
+    Left held -> pure $ Right held
+    Right observed -> do
+      decision <- safeRetryDecision args observedRemote observed
+      pure $ Right decision
+
+assessSafeRetry :: PostMergeParentSyncArgs -> Text -> Text -> Either Text Text -> Either Text SyncPreconditions -> Either Value SyncPreconditions
+assessSafeRetry args local observedRemote ancestry preconditions =
+  case preconditions of
+    Left diagnostic ->
+      Left (syncDecision args "unresolved" "reconcile_observation" ["fetch"] False diagnostic)
+    Right observed -> assessAncestry args local observedRemote ancestry observed
+
+assessAncestry :: PostMergeParentSyncArgs -> Text -> Text -> Either Text Text -> SyncPreconditions -> Either Value SyncPreconditions
+assessAncestry args local observedRemote ancestry observed =
   case ancestry of
-    Left _ -> pure $ Right (syncDecision args "unresolved" "reconcile_observation" ["fetch"] False "local and remote history does not prove a safe fast-forward retry")
-    Right _ -> confirmedOrUnresolved args remote local observedRemote ["fetch", "fast_forward_available"] "safe_to_retry"
+    Left _ ->
+      blockedRetry args "local and remote history does not prove a safe fast-forward retry" observed
+    Right _
+      | syncLocalHead observed /= local || syncRemoteHead observed /= observedRemote ->
+          blockedRetry args "Git heads changed while collecting synchronization preconditions" observed
+      | not (syncLocalIsAncestorRemote observed) ->
+          blockedRetry args "ancestry changed while collecting synchronization preconditions" observed
+      | otherwise -> Right observed
+
+blockedRetry :: PostMergeParentSyncArgs -> Text -> SyncPreconditions -> Either Value SyncPreconditions
+blockedRetry args diagnostic observed =
+  Left $
+    syncDecisionWithPreconditions
+      args
+      "unresolved"
+      "reconcile_observation"
+      ["fetch"]
+      False
+      diagnostic
+      (syncBlockerFor observed)
+      observed
+
+safeRetryDecision :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> SyncPreconditions -> Eff effs Value
+safeRetryDecision args observedRemote preconditions = do
+  integration <- verifyMergeIntegrationAt (pmpWorkingDir args) args observedRemote
+  pure $ case integration of
+    Left _ ->
+      syncDecisionWithPreconditions args "unresolved" "reconcile_integration_proof" ["fetch"] False "current Git state does not prove the merged child is integrated" (syncBlockerFor preconditions) preconditions
+    Right _ ->
+      syncDecisionWithPreconditions args "safe_to_retry" "reconcile_complete" ["fetch", "fast_forward_available"] True "remote contains the merged child and local HEAD is an ancestor" (syncBlockerFor preconditions) preconditions
 
 confirmedOrUnresolved :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Text -> Text -> [Text] -> Text -> Eff effs (Either Text Value)
 confirmedOrUnresolved args remote local observedRemote completed basis = do
@@ -468,6 +554,67 @@ confirmedOrUnresolved args remote local observedRemote completed basis = do
           pure $ Right (syncDecision args "unresolved" "reconcile_complete" completed False "local and selected remote heads differ")
       | otherwise ->
           pure $ Right (syncReceipt args remote local observedRemote proof completed)
+
+readSyncPreconditions :: (Member SuspendYield effs) => PostMergeParentSyncArgs -> Text -> Eff effs (Either Text SyncPreconditions)
+readSyncPreconditions args remote = do
+  branch <- runGitAt (pmpWorkingDir args) ["branch", "--show-current"]
+  localHead <- runGitAt (pmpWorkingDir args) ["rev-parse", "HEAD"]
+  remoteHead <- runGitAt (pmpWorkingDir args) ["rev-parse", remoteRef remote (pmpParentBranch args)]
+  status <- runGitAt (pmpWorkingDir args) ["status", "--porcelain=v2", "--untracked-files=all"]
+  case (branch, localHead, remoteHead, status) of
+    (Right currentBranch, Right currentLocal, Right currentRemote, Right currentStatus) -> do
+      if currentBranch /= pmpParentBranch args
+        then pure (Left "checked out branch changed during parent synchronization observation")
+        else do
+          ancestry <- verifyAncestryAt (pmpWorkingDir args) currentLocal currentRemote
+          pure $ do
+            localIsAncestorRemote <- case ancestry of
+              Right _ -> Right True
+              Left "git command failed (1): " -> Right False
+              Left diagnostic -> Left diagnostic
+            Right
+              ( SyncPreconditions
+                  currentBranch
+                  remote
+                  currentLocal
+                  currentRemote
+                  currentStatus
+                  localIsAncestorRemote
+              )
+    (Left diagnostic, _, _, _) -> pure (Left diagnostic)
+    (_, Left diagnostic, _, _) -> pure (Left diagnostic)
+    (_, _, Left diagnostic, _) -> pure (Left diagnostic)
+    (_, _, _, Left diagnostic) -> pure (Left diagnostic)
+
+syncDecisionWithPreconditions :: PostMergeParentSyncArgs -> Text -> Text -> [Text] -> Bool -> Text -> Text -> SyncPreconditions -> Value
+syncDecisionWithPreconditions args outcome phase completed retrySafe diagnostic blocker preconditions =
+  object $
+    [ "sync_outcome" .= outcome,
+      "sync_phase" .= phase,
+      "completed_steps" .= completed,
+      "retry_safe" .= retrySafe,
+      "diagnostic" .= redactDiagnostic diagnostic,
+      "sync_blocker" .= blocker,
+      "refusal_preconditions" .= syncPreconditionsValue preconditions
+    ]
+      <> syncCorrelation args
+
+syncPreconditionsValue :: SyncPreconditions -> Value
+syncPreconditionsValue preconditions =
+  object
+    [ "parent_branch" .= syncParentBranch preconditions,
+      "remote_name" .= syncRemoteName preconditions,
+      "local_head_sha" .= syncLocalHead preconditions,
+      "remote_head_sha" .= syncRemoteHead preconditions,
+      "working_tree_status" .= syncWorkingTreeStatus preconditions,
+      "local_is_ancestor_remote" .= syncLocalIsAncestorRemote preconditions
+    ]
+
+syncBlockerFor :: SyncPreconditions -> Text
+syncBlockerFor preconditions
+  | not (T.null (T.strip (syncWorkingTreeStatus preconditions))) = "dirty_worktree"
+  | not (syncLocalIsAncestorRemote preconditions) = "diverged_history"
+  | otherwise = "fast_forward_refusal"
 
 syncDecision :: PostMergeParentSyncArgs -> Text -> Text -> [Text] -> Bool -> Text -> Value
 syncDecision args outcome phase completed retrySafe diagnostic =

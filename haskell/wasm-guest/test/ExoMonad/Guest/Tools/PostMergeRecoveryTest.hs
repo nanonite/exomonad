@@ -222,7 +222,12 @@ postMergeRecoveryTests =
                 processResponse 0 "base-head" "",
                 processResponse 128 "" "fatal: refusing to merge unrelated histories\n",
                 processResponse 0 "base-head" "",
-                processResponse 1 "" ""
+                processResponse 1 "" "",
+                processResponse 0 "main" "",
+                processResponse 0 "base-head" "",
+                processResponse 0 "base-head" "",
+                processResponse 0 "1 .M N... 100644 100644 100644 abc abc tracked.txt" "",
+                processResponse 0 "" ""
               ]
         case runParentSyncWithArgs squashArgs responses of
           Right (Aeson.Object fields) -> do
@@ -234,7 +239,45 @@ postMergeRecoveryTests =
               "the failing command phase is identified"
               (Just (Aeson.String "fast_forward"))
               (KeyMap.lookup "sync_phase" fields)
+            assertEqual
+              "dirty refusal is typed"
+              (Just (Aeson.String "dirty_worktree"))
+              (KeyMap.lookup "sync_blocker" fields)
+            case KeyMap.lookup "refusal_preconditions" fields of
+              Just (Aeson.Object preconditions) -> do
+                assertEqual
+                  "the selected remote head is retained"
+                  (Just (Aeson.String "base-head"))
+                  (KeyMap.lookup "remote_head_sha" preconditions)
+                assertEqual
+                  "the dirty-worktree status is retained exactly"
+                  (Just (Aeson.String "1 .M N... 100644 100644 100644 abc abc tracked.txt"))
+                  (KeyMap.lookup "working_tree_status" preconditions)
+              _ -> assertBool "refusal includes exact current Git preconditions" False
           _ -> assertBool "fast-forward refusal has structured recoverable outcome" False,
+      testCase "known refusal without captured preconditions remains a known refusal" $ do
+        let responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "base-head" "",
+                processResponse 128 "" "local changes would be overwritten",
+                processResponse 0 "base-head" "",
+                processResponse 1 "" "",
+                processResponse 1 "" "",
+                processResponse 0 "base-head" "",
+                processResponse 0 "base-head" "",
+                processResponse 0 "" ""
+              ]
+        case runParentSyncWithArgs squashArgs responses of
+          Right (Aeson.Object fields) -> do
+            assertEqual
+              "the refusal is not downgraded to an unknown mutation"
+              (Just (Aeson.String "known_partial_progress"))
+              (KeyMap.lookup "sync_outcome" fields)
+            assertBool
+              "missing exact preconditions are not fabricated"
+              (not (KeyMap.member "refusal_preconditions" fields))
+          _ -> assertBool "missing preconditions retain a structured refusal" False,
       testCase "fetch permission refusal cannot produce a sync receipt" $ do
         let responses =
               [ processResponse 0 "main" "",
@@ -292,6 +335,31 @@ postMergeRecoveryTests =
               (Just (Aeson.String "fetch"))
               (KeyMap.lookup "sync_phase" fields)
           _ -> assertBool "lock refusal is returned as a structured result" False,
+      testCase "fast-forward lease refusal stays pre-mutation and retryable" $ do
+        let failure =
+              EffectError.EffectError
+                ( Just
+                    ( EffectError.EffectErrorKindCustom
+                        (EffectError.Custom "git_mutation_unavailable" "managed lock is busy" BS.empty)
+                    )
+                )
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "base-head" "",
+                effectFailureResponse failure
+              ]
+        case runParentSyncWithArgs squashArgs responses of
+          Right (Aeson.Object fields) -> do
+            assertEqual
+              "the blocked Git mutation is not recorded as an unresolved fast-forward result"
+              (Just (Aeson.String "pre_mutation_refusal"))
+              (KeyMap.lookup "sync_outcome" fields)
+            assertEqual
+              "the refusal remains tied to the fast-forward boundary"
+              (Just (Aeson.String "fast_forward"))
+              (KeyMap.lookup "sync_phase" fields)
+          _ -> assertBool "lease refusal returns a typed pre-mutation decision" False,
       testCase "timeout remains an unknown outcome" $ do
         let failure =
               EffectError.EffectError
@@ -342,10 +410,61 @@ postMergeRecoveryTests =
                 processResponse 0 "base-head" "",
                 processResponse 0 "merge-commit" "",
                 processResponse 0 "" "",
+                processResponse 0 "main" "",
+                processResponse 0 "base-head" "",
+                processResponse 0 "merge-commit" "",
+                processResponse 0 "" "",
+                processResponse 0 "" "",
                 processResponse 0 "" ""
               ]
         let result = runParentSyncWithArgs args responses
-        assertSyncOutcome "safe_to_retry" result,
+        case result of
+          Right (Aeson.Object fields) -> do
+            assertEqual
+              "replay requires a safe fast-forward"
+              (Just (Aeson.String "safe_to_retry"))
+              (KeyMap.lookup "sync_outcome" fields)
+            assertBool
+              "safe retry includes exact current refusal preconditions"
+              (KeyMap.member "refusal_preconditions" fields)
+          _ -> assertBool "reconciliation returns a safe retry decision" False,
+      testCase "divergent replay carries its unchanged refusal preconditions" $ do
+        let args =
+              squashArgs
+                { pmpSyncOperationId = Just (T.replicate 64 "c"),
+                  pmpSyncAttempt = Just 2,
+                  pmpReconcileOnly = Just True
+                }
+            responses =
+              [ processResponse 0 "main" "",
+                processResponse 0 "" "",
+                processResponse 0 "local-diverged" "",
+                processResponse 0 "remote-diverged" "",
+                processResponse 1 "" "",
+                processResponse 0 "main" "",
+                processResponse 0 "local-diverged" "",
+                processResponse 0 "remote-diverged" "",
+                processResponse 0 "" "",
+                processResponse 1 "" ""
+              ]
+        case runParentSyncWithArgs args responses of
+          Right (Aeson.Object fields) -> do
+            assertEqual
+              "divergent histories remain unresolved"
+              (Just (Aeson.String "unresolved"))
+              (KeyMap.lookup "sync_outcome" fields)
+            assertEqual
+              "the divergence is identified"
+              (Just (Aeson.String "diverged_history"))
+              (KeyMap.lookup "sync_blocker" fields)
+            case KeyMap.lookup "refusal_preconditions" fields of
+              Just (Aeson.Object preconditions) ->
+                assertEqual
+                  "the failed ancestry proof is part of the exact refusal state"
+                  (Just (Aeson.Bool False))
+                  (KeyMap.lookup "local_is_ancestor_remote" preconditions)
+              _ -> assertBool "divergence includes exact current Git preconditions" False
+          _ -> assertBool "divergent reconciliation returns a structured hold" False,
       testCase "squash merge accepts exact Forgejo and Git tree proof" $ do
         let args =
               PostMergeParentSyncArgs
