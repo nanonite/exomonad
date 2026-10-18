@@ -35,6 +35,51 @@ CONTINUATION_SESSION="e2e-init-recovery-continuation"
 AGGREGATE_SESSION="e2e-init-aggregate-recovery"
 MOCK_PID=""
 
+run_managed_lock_fixture() {
+    local test_name="$1"
+    (
+        cd "$PROJECT_ROOT"
+        nix develop --command env \
+            "EXOMONAD_INIT_LOCK_FIXTURE_PROJECT=$AGG_REPO" \
+            cargo test -p exomonad --test init_git_lock_readiness "$test_name" \
+                -- --ignored --exact --nocapture
+    )
+}
+
+capture_local_edit_state() {
+    python3 - "$AGG_REPO" <<'PY'
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+def git(*args: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True
+    ).stdout
+
+status = git("status", "--porcelain", "--untracked-files=all").decode()
+assert "M  preserved-staged.txt" in status, status
+assert " M preserved-unstaged.txt" in status, status
+assert "?? preserved-untracked.txt" in status, status
+print(json.dumps({
+    "status": status,
+    "staged_diff_sha256": hashlib.sha256(git("diff", "--cached", "--binary")).hexdigest(),
+    "unstaged_diff_sha256": hashlib.sha256(git("diff", "--binary")).hexdigest(),
+    "untracked_sha256": hashlib.sha256((repo / "preserved-untracked.txt").read_bytes()).hexdigest(),
+}, sort_keys=True))
+PY
+}
+
+e2e_require_commands just
+e2e_phase "Build" "Rebuilding production guest WASM from the current source..."
+just wasm-all
+GUEST_WASM="$PROJECT_ROOT/.exo/wasm/wasm-guest-devswarm.wasm"
+[[ -s "$GUEST_WASM" ]] || e2e_fail "fresh devswarm guest WASM was not installed"
+GUEST_WASM_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$GUEST_WASM")"
+e2e_log "Fresh production guest WASM sha256=$GUEST_WASM_SHA256"
 e2e_preflight tmux git curl python3
 
 cleanup() {
@@ -51,6 +96,9 @@ cleanup() {
     if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
         kill "$MOCK_PID" 2>/dev/null
         wait "$MOCK_PID" 2>/dev/null
+    fi
+    if (( code != 0 )); then
+        KEEP_E2E_WORKDIR=1
     fi
     trap - EXIT
     (exit "$code")
@@ -366,6 +414,10 @@ git -C "$AGG_REPO" remote add origin "file://$AGG_REMOTE"
 git -C "$AGG_REPO" config user.name "Exomonad aggregate recovery E2E"
 git -C "$AGG_REPO" config user.email "aggregate-recovery-e2e@example.invalid"
 git -C "$AGG_REPO" commit --allow-empty -q -m "aggregate recovery base"
+printf 'tracked staged baseline\n' > "$AGG_REPO/preserved-staged.txt"
+printf 'tracked unstaged baseline\n' > "$AGG_REPO/preserved-unstaged.txt"
+git -C "$AGG_REPO" add preserved-staged.txt preserved-unstaged.txt
+git -C "$AGG_REPO" commit -q -m "add local edit preservation baselines"
 git -C "$AGG_REPO" push -u origin main -q
 
 AGG_MOCK_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
@@ -417,10 +469,27 @@ PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_aggregate_checkpoint.py" \
     > "$AGG_DIR/seed.log" \
     || { cat "$AGG_DIR/seed.log"; cat "$AGG_DIR/mock.stderr"; e2e_fail "failed to seed failed-root aggregate recovery state"; }
 AGGREGATE_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_pr"])' "$AGG_DIR/seed.json")"
+AGGREGATE_BASE_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_sha"])' "$AGG_DIR/seed.json")"
+AGGREGATE_REMOTE_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_remote_head"])' "$AGG_DIR/seed.json")"
 LEAF_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf_pr"])' "$AGG_DIR/seed.json")"
 LEAF_RECEIPT_SHA256="$(python3 -c 'import hashlib,json,sys; d=json.load(open(sys.argv[1])); r=json.load(open(d["child"])); e=r["slices"]["issue-811"]["post_merge"]["evidence"]; print(hashlib.sha256(json.dumps(e,sort_keys=True,separators=(",", ":")).encode()).hexdigest())' "$AGG_DIR/seed.json")"
 ARCHITECTURE_INVOCATION_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
     "$AGG_REPO/.exo/agents/architecture/invocation.json")"
+[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_BASE_SHA" ]] \
+    || e2e_fail "fixture did not leave the local parent branch behind the merged aggregate"
+[[ "$(git -C "$AGG_REPO" rev-parse origin/main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
+    || e2e_fail "fixture remote parent branch does not point at the confirmed aggregate merge"
+AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)"
+[[ "$AGGREGATE_MERGE_REQUESTS_BEFORE" == "1" ]] \
+    || e2e_fail "fixture did not record exactly one authoritative remote aggregate merge"
+e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR at remote head $AGGREGATE_REMOTE_HEAD with local parent HEAD still at $AGGREGATE_BASE_SHA"
+LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
+printf '%s\n' "$LOCAL_EDIT_STATE_BEFORE" > "$AGG_DIR/local-edits-before.json"
+e2e_log "Seeded unrelated staged, unstaged, and untracked edits"
+run_managed_lock_fixture create_managed_orphan_lock_fixture_for_e2e
+[[ -e "$AGG_REPO/.git/index.lock" && ! -s "$AGG_REPO/.git/index.lock" ]] \
+    || e2e_fail "ProcessHandler did not leave the proven zero-byte native index lock"
+e2e_log "Created a managed orphan lock through the production ProcessHandler timeout path"
 AGGREGATE_SERVER_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 cat > .exo/config.toml <<EOF
 shell_command = "bash"
@@ -450,6 +519,40 @@ HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     > "$AGG_DIR/init.log" 2>&1 || true
 rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init.log" \
     || { cat "$AGG_DIR/init.log"; e2e_fail "aggregate continuation binary/archive fingerprints did not match"; }
+if rg -Fq 'cannot inspect managed process descriptors (permission denied)' "$AGG_DIR/init.log"; then
+    [[ -e "$AGG_REPO/.git/index.lock" && ! -s "$AGG_REPO/.git/index.lock" ]] \
+        || e2e_fail "limited-inspection refusal changed or removed the zero-byte native lock"
+    [[ "$(capture_local_edit_state)" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
+        || e2e_fail "limited-inspection refusal changed unrelated local edits"
+    [[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_BASE_SHA" ]] \
+        || e2e_fail "limited-inspection refusal changed the local parent branch"
+    CURRENT_TL_ID="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{window_id} #{pane_dead}' | awk '$1 == "TL" { print $2, $3; exit }')"
+    [[ "$CURRENT_TL_ID" == "$DEAD_TL_WINDOW 1" ]] \
+        || e2e_fail "limited-inspection refusal restarted or replaced the exited TL pane"
+    [[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc Server || true)" == "0" ]] \
+        || e2e_fail "limited-inspection refusal started a Server before Git readiness"
+    [[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc Watcher || true)" == "0" ]] \
+        || e2e_fail "limited-inspection refusal started a Watcher before Git readiness"
+    python3 - "$AGG_REPO" <<'PY' || e2e_fail "limited-inspection refusal recorded a false quarantine"
+import json
+import sys
+from pathlib import Path
+
+segments = Path(sys.argv[1]) / ".exo/ledger/segments"
+events = [
+    json.loads(line)
+    for path in segments.glob("segment-*.jsonl")
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+assert not any(
+    event.get("type") == "git.native_lock.quarantined" for event in events
+)
+PY
+    e2e_fail "positive init recovery is unavailable: this runtime cannot inspect /proc descriptors (permission denied); fail-closed refusal preserved the lock and local edits, and the complete fixture is retained at $WORK_DIR"
+fi
+[[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || true)" == "1" ]] \
+    || { cat "$AGG_DIR/init.log"; e2e_fail "init did not report exactly one proven lock recovery"; }
 
 AGGREGATE_RESULT=""
 for _ in $(seq 1 240); do
@@ -532,6 +635,37 @@ aggregate_merges = [
 ]
 assert sum(entry.get("status") == "rejected" for entry in aggregate_merges) == 1
 assert sum(entry.get("status") == "confirmed" for entry in aggregate_merges) == 1
+approved_merge = next(
+    entry
+    for entry in aggregate_merges
+    if entry.get("status") == "confirmed"
+)
+assert (
+    approved_merge["result"]["result"].get("aggregate_approval_receipt_id")
+    == candidate["active_aggregate_approval_id"]
+), "the durable merge result is not bound to the retained parent approval"
+sync_entries = [
+    entry
+    for entry in journal
+    if entry.get("operation") == "post_merge_parent_sync" and entry.get("target") == "architecture"
+]
+prior_refusals = [
+    entry
+    for entry in sync_entries
+    if isinstance(entry.get("result"), dict)
+    and isinstance(entry["result"].get("result"), dict)
+    and entry["result"]["result"].get("sync_outcome") == "pre_mutation_refusal"
+]
+confirmed_syncs = [
+    entry
+    for entry in sync_entries
+    if isinstance(entry.get("result"), dict)
+    and isinstance(entry["result"].get("result"), dict)
+    and entry["result"]["result"].get("sync_outcome") == "confirmed"
+]
+assert len(prior_refusals) == 1, "the immutable prior sync refusal was not retained"
+assert len(confirmed_syncs) == 1, "parent synchronization was not confirmed exactly once"
+assert confirmed_syncs[0]["arguments"].get("sync_attempt") == 2
 kani_dispatches = [
     entry
     for entry in journal
@@ -549,8 +683,15 @@ assert not any(
 ), "aggregate recovery started a root reviewer"
 PY
 
-[[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
-    || e2e_fail "production merge tool did not integrate the aggregate exactly once"
+LOCAL_EDIT_STATE_AFTER="$(capture_local_edit_state)"
+[[ "$LOCAL_EDIT_STATE_AFTER" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
+    || e2e_fail "parent synchronization or bookkeeping changed unrelated local edits"
+[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
+    || e2e_fail "confirmed local synchronization did not advance main to the verified merge commit"
+run_managed_lock_fixture assert_managed_lock_quarantined_once_for_e2e
+
+[[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
+    || e2e_fail "continuation repeated the aggregate merge instead of resuming local synchronization"
 [[ "$(rg -c "pulls/$LEAF_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
     || e2e_fail "completed leaf PR was merged again during aggregate recovery"
 [[ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
@@ -568,9 +709,15 @@ read -r RECOVERED_TL_WINDOW RECOVERED_TL_DEAD < <(
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
     > "$AGG_DIR/init-repeat.log" 2>&1 || true
-[[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
+[[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "repeated continuation duplicated the aggregate merge"
-e2e_log "PASS: actual init --continue replayed the failed root, adopted PR #$AGGREGATE_PR, preserved merged leaf PR #$LEAF_PR, and dispatched Kani once (archive=$AGGREGATE_ARCHIVE_SHA256, build=$AGGREGATE_BUILD_ID)"
+[[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init-repeat.log" || true)" == "0" ]] \
+    || e2e_fail "repeated init reported an already-completed lock recovery again"
+LOCAL_EDIT_STATE_AFTER_REPEAT="$(capture_local_edit_state)"
+[[ "$LOCAL_EDIT_STATE_AFTER_REPEAT" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
+    || e2e_fail "repeated continuation changed unrelated local edits"
+run_managed_lock_fixture assert_managed_lock_quarantined_once_for_e2e
+e2e_log "PASS: actual init --continue resumed a previously merged aggregate without repeating merge/publication/leaf work, recovered one proven lock, preserved local edits, completed bookkeeping, and dispatched Kani once (archive=$AGGREGATE_ARCHIVE_SHA256, guest=$GUEST_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
 
 echo ""
 echo "============================================"

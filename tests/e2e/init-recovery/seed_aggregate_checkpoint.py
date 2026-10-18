@@ -47,11 +47,14 @@ def create_pr(mock_url: str, head: str, base: str, title: str) -> int:
     return int(result["number"])
 
 
-def merge_pr(mock_url: str, pr_number: int) -> None:
-    api(mock_url, f"/api/v1/repos/owner/repo/pulls/{pr_number}/merge", {})
+def merge_pr(mock_url: str, pr_number: int) -> str:
+    result = api(mock_url, f"/api/v1/repos/owner/repo/pulls/{pr_number}/merge", {})
+    return str(result["sha"])
 
 
-def seed_git_history(repository: Path, mock_url: str) -> tuple[int, int, str, str, str]:
+def seed_git_history(
+    repository: Path, mock_url: str
+) -> tuple[int, int, str, str, str, str]:
     git(repository, "checkout", "-b", "main.architecture")
     git(repository, "push", "-u", "origin", "main.architecture")
     git(repository, "checkout", "-b", "main.issue-811", "main")
@@ -78,7 +81,24 @@ def seed_git_history(repository: Path, mock_url: str) -> tuple[int, int, str, st
         "Aggregate architecture into main",
     )
     base_sha = git(repository, "rev-parse", "main")
-    return leaf_pr, aggregate_pr, leaf_head, aggregate_head, base_sha
+    merged_remote_head = merge_pr(mock_url, aggregate_pr)
+    git(repository, "fetch", "origin")
+    aggregate_record = api(mock_url, f"/api/v1/repos/owner/repo/pulls/{aggregate_pr}")
+    if (
+        not aggregate_record.get("merged")
+        or aggregate_record.get("merge_commit_sha") != merged_remote_head
+    ):
+        raise ValueError(
+            "aggregate fixture merge is not authoritatively recorded by Forgejo"
+        )
+    return (
+        leaf_pr,
+        aggregate_pr,
+        leaf_head,
+        aggregate_head,
+        base_sha,
+        merged_remote_head,
+    )
 
 
 def install_publication_owner(
@@ -344,23 +364,27 @@ def seed_root(
     leaf_head: str,
     aggregate_head: str,
     base_sha: str,
+    merged_remote_head: str,
 ) -> dict[str, object]:
     from tl_loop.client.effects import ToolResult
+    from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
     from tl_loop.fsm.scope import TLFailed
     from tl_loop.loop.driver import (
+        AGGREGATE_PUBLICATION_GATE_PREFIX,
         EffectIntent,
         TLLoopConfig,
         WorkPlan,
         _initial_slices,
         _manifest_for_plan,
+        _parent_aggregate_approval,
+        _parent_sync_arguments,
+        _parent_sync_identity_fields,
+        _verified_child_completion_evidence,
     )
     from tl_loop.loop.journal import EffectJournal
-    from tl_loop.ordered import IntegrationLifecycle
+    from tl_loop.ordered import AggregateCandidate, IntegrationLifecycle
     from tl_loop.state.repository_identity import canonical_repository_url
     from tl_loop.state.schema import (
-        ActionKind,
-        ActionPhase,
-        ActionState,
         GateStatus,
         HandoffEvidence,
         IntegrationCandidateState,
@@ -475,6 +499,7 @@ def seed_root(
             }
         ),
     )
+    root_state = root_store.set_controller_epoch("e2e-parent-controller-epoch")
     architecture_worktree = repository / ".exo" / "worktrees" / "architecture"
     git(repository, "worktree", "add", str(architecture_worktree), "main.architecture")
     invocation_id = install_publication_owner(
@@ -524,6 +549,67 @@ def seed_root(
         capture_output=True,
         text=True,
     ).stdout.splitlines()[0]
+    aggregate_head_tree = git(repository, "rev-parse", f"{aggregate_head}^{{tree}}")
+    merge_commit_tree = git(repository, "rev-parse", f"{merged_remote_head}^{{tree}}")
+    aggregate_record = api(mock_url, f"/api/v1/repos/owner/repo/pulls/{aggregate_pr}")
+    if (
+        aggregate_record.get("merged") is not True
+        or aggregate_record.get("head", {}).get("sha") != aggregate_head
+        or aggregate_record.get("merge_commit_sha") != merged_remote_head
+        or merge_commit_tree != merge_tree
+    ):
+        raise ValueError(
+            "merged aggregate record does not match its Git compare evidence"
+        )
+    watcher = {
+        "found": True,
+        "pr_number": aggregate_pr,
+        "merged": True,
+        "head_sha": aggregate_head,
+        "base_sha": base_sha,
+        "patch_digest": patch_digest,
+        "merge_tree_sha": merge_tree,
+        "pr_head_tree_sha": aggregate_head_tree,
+        "ci_status": "success",
+        "head_branch": "main.architecture",
+        "base_branch": "main",
+        "head_reachable": True,
+        "publication_ownership_verified": True,
+        "publication_ownership_error": "",
+        "publication": {
+            "invocation_id": invocation_id,
+            "slice_id": "architecture",
+            "author_agent": "architecture",
+            "succession_invocation_ids": [],
+        },
+    }
+    readiness = _verified_child_completion_evidence(
+        work_plan.sub_tls[0],
+        child_store.load(),
+        AggregateCandidate(
+            "architecture", aggregate_pr, aggregate_head, patch_digest, base_sha
+        ),
+        watcher=watcher,
+        repository=architecture_worktree,
+    )
+    if readiness is None:
+        raise ValueError(
+            "production child-completion verifier rejected the merged fixture"
+        )
+    approval_history, approval_receipt = _parent_aggregate_approval(
+        work_plan.sub_tls[0],
+        root_state,
+        readiness,
+        root_store,
+        root_config,
+        pr_number=aggregate_pr,
+        head_sha=aggregate_head,
+        head_tree_sha=aggregate_head_tree,
+        base_sha=base_sha,
+        patch_digest=patch_digest,
+        merge_tree_sha=merge_tree,
+        ci_status="success",
+    )
     architecture = root_state.slices["architecture"]
     publication = PublicationBinding(
         pr_number=aggregate_pr,
@@ -533,10 +619,10 @@ def seed_root(
         attempt=1,
         invocation_id=invocation_id,
     )
+    journal = EffectJournal("root", root_store.run_dir / "action-journal.json")
     rejected_intent = EffectIntent(
         "merge_pr", "architecture", {"pr_number": aggregate_pr, "attempt": 1}, True
     )
-    journal = EffectJournal("root", root_store.run_dir / "action-journal.json")
     journal.append(rejected_intent)
     rejected = ToolResult(
         raw={
@@ -551,7 +637,45 @@ def seed_root(
         error=f"No Forgejo reviewer response yet on PR #{aggregate_pr}.",
     )
     journal.mark_result(rejected_intent, rejected)
-    action_key = journal.key_for(rejected_intent)
+    merge_arguments = {
+        "pr_number": aggregate_pr,
+        "base_sha": base_sha,
+        "head_sha": aggregate_head,
+        "aggregate_approval_receipt_id": approval_receipt.receipt_id,
+        "attempt": 2,
+    }
+    merged_intent = EffectIntent("merge_pr", "architecture", merge_arguments, True)
+    journal.append(merged_intent)
+    journal.mark_result(
+        merged_intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    **merge_arguments,
+                    "merged": True,
+                    "merge_commit_sha": merged_remote_head,
+                },
+            }
+        ),
+    )
+    merge_journal_id = journal.key_for(merged_intent)
+    post_merge_evidence = {
+        "child_id": "architecture",
+        "repository": identity.remote_url,
+        "parent_branch": "main",
+        "pr_number": str(aggregate_pr),
+        "head_sha": aggregate_head,
+        "merge_journal_id": merge_journal_id,
+        "lane_epoch": "1",
+        "forgejo_pr_number": str(aggregate_pr),
+        "forgejo_merged": "true",
+        "forgejo_head_sha": aggregate_head,
+        "forgejo_merge_commit_sha": merged_remote_head,
+        "forgejo_merge_commit_tree_sha": merge_commit_tree,
+        "prospective_merge_tree_sha": merge_tree,
+        "reviewed_pr_head_tree_sha": aggregate_head_tree,
+    }
     parked_architecture = replace(
         architecture,
         status=SliceStatus.PARKED,
@@ -567,7 +691,7 @@ def seed_root(
         dispatch_invocation_id=invocation_id,
         dispatch_generation=1,
         dispatch_authoritative_event_seq=1,
-        dispatch_last_boundary="aggregate_pr_open",
+        dispatch_last_boundary="aggregate_merged",
         publication=publication,
         handoff=HandoffEvidence(
             pr_number=aggregate_pr,
@@ -577,20 +701,73 @@ def seed_root(
             agent_id="architecture",
             observed_at="2026-10-16T00:00:00Z",
         ),
-        park_cause=ParkCause.TASK_BUDGET_EXCEEDED,
+        park_cause=ParkCause.PUBLICATION_BLOCKED,
         park_audit={
-            "reason": "obsolete worker timeout while parent integration was pending"
+            "error_kind": "post_merge_sync_refused",
+            "reason": "a prior local parent synchronization was refused before mutation",
+            "retryable": True,
         },
-        action=ActionState(
-            ActionKind.MERGE,
-            ActionPhase.IN_FLIGHT,
-            intent_id=action_key,
-            head_sha=aggregate_head,
-            attempt=1,
+        action=None,
+        post_merge=PostMergeState(
+            PostMergePhase.REMOTE_MERGE_ADOPTED,
+            post_merge_evidence,
+        ),
+        reconciliation={
+            "confirmed_stage": "aggregate_merged",
+            "next_action": "post_merge_recovery",
+            "authoritative_evidence": ["merge_pr_journal", "forgejo_merge_record"],
+            "missing_evidence": [],
+            "conflicts": [],
+            "merge_base_sha": base_sha,
+            "merge_head_sha": aggregate_head,
+            "merge_journal_id": merge_journal_id,
+        },
+    )
+    # Keep a prior legacy-format synchronization refusal in the journal. It
+    # represents a managed Git lease refusal before any sync mutation; the
+    # next invocation must preserve it and continue with a new attempt.
+    sync_arguments = _parent_sync_arguments(
+        parked_architecture,
+        aggregate_pr,
+        {
+            "repository": identity.remote_url,
+            "parent_branch": "main",
+            "head_sha": aggregate_head,
+            "merge_journal_id": merge_journal_id,
+            "lane_epoch": 1,
+        },
+        base_sha,
+        ".",
+    )
+    legacy_sync_arguments = {
+        key: value
+        for key, value in _parent_sync_identity_fields(sync_arguments).items()
+        if key != "merge_journal_id"
+    }
+    legacy_sync_arguments.update({"expected_base_sha": base_sha, "sync_attempt": 1})
+    sync_intent = EffectIntent(
+        "post_merge_parent_sync", "architecture", legacy_sync_arguments, True
+    )
+    journal.append(sync_intent)
+    journal.mark_result(
+        sync_intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    **sync_arguments,
+                    "sync_attempt": 1,
+                    "sync_outcome": "pre_mutation_refusal",
+                    "sync_phase": "preflight",
+                    "completed_steps": [],
+                    "retry_safe": True,
+                    "diagnostic": "prior managed Git lock prevented local synchronization",
+                },
+            }
         ),
     )
     candidate = IntegrationCandidateState(
-        lifecycle=IntegrationLifecycle.MERGING,
+        lifecycle=IntegrationLifecycle.MERGED,
         aggregate_pr_number=aggregate_pr,
         aggregate_head_sha=aggregate_head,
         aggregate_patch_digest=patch_digest,
@@ -605,8 +782,10 @@ def seed_root(
         merge_tree_sha=merge_tree,
         integration_evidence_at="2026-10-16T00:00:00Z",
         ci_status="success",
-        merge_attempts=0,
+        merge_attempts=2,
         stage_verification="passed",
+        aggregate_approval_receipts=approval_history,
+        active_aggregate_approval_id=approval_receipt.receipt_id,
     )
     root_store.checkpoint(
         TLFailed("recursive child is not recoverable"),
@@ -617,11 +796,14 @@ def seed_root(
         ordered_stages=root_state.ordered_stages,
         integration=IntegrationRuntimeState(
             sub_tl_states={
-                "architecture": IntegrationLifecycle.MERGING,
+                "architecture": IntegrationLifecycle.MERGED,
                 "kani": IntegrationLifecycle.RUNNING,
             },
             candidates={"architecture": candidate},
         ),
+    )
+    root_store.set_gate(
+        f"{AGGREGATE_PUBLICATION_GATE_PREFIX}architecture", GateStatus.PENDING
     )
     root_store.set_gate("tl-ordered-child-recovery-ambiguous", GateStatus.PENDING)
     return {
@@ -631,9 +813,29 @@ def seed_root(
         "aggregate_pr": aggregate_pr,
         "leaf_head": leaf_head,
         "aggregate_head": aggregate_head,
+        "aggregate_remote_head": merged_remote_head,
         "base_sha": base_sha,
         "patch_digest": patch_digest,
         "merge_tree": merge_tree,
+    }
+
+
+def seed_local_edits(repository: Path) -> dict[str, str]:
+    """Leave independent staged, unstaged, and untracked edits for recovery."""
+    (repository / "preserved-staged.txt").write_text(
+        "staged local change\n", encoding="utf-8"
+    )
+    git(repository, "add", "preserved-staged.txt")
+    (repository / "preserved-unstaged.txt").write_text(
+        "unstaged local change\n", encoding="utf-8"
+    )
+    (repository / "preserved-untracked.txt").write_text(
+        "untracked local change\n", encoding="utf-8"
+    )
+    return {
+        "staged": "preserved-staged.txt",
+        "unstaged": "preserved-unstaged.txt",
+        "untracked": "preserved-untracked.txt",
     }
 
 
@@ -643,9 +845,14 @@ def main() -> None:
     parser.add_argument("--mock-url", required=True)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
-    leaf_pr, aggregate_pr, leaf_head, aggregate_head, base_sha = seed_git_history(
-        args.repo, args.mock_url
-    )
+    (
+        leaf_pr,
+        aggregate_pr,
+        leaf_head,
+        aggregate_head,
+        base_sha,
+        merged_remote_head,
+    ) = seed_git_history(args.repo, args.mock_url)
     result = seed_root(
         args.repo,
         args.mock_url,
@@ -654,7 +861,9 @@ def main() -> None:
         leaf_head=leaf_head,
         aggregate_head=aggregate_head,
         base_sha=base_sha,
+        merged_remote_head=merged_remote_head,
     )
+    result["preserved_local_edits"] = seed_local_edits(args.repo)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, sort_keys=True))
 

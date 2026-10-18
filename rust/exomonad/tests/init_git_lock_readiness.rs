@@ -6,7 +6,7 @@ mod fixture;
 use fixture::*;
 use std::fs;
 use std::path::Path;
-use std::process::Output;
+use std::process::{ExitStatus, Output};
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -60,11 +60,35 @@ async fn init_continue_recovers_managed_orphan_and_attaches_once() {
 
     let live_tl = window_id(&socket_dir, &session, "TL");
     let repeat = run_init(&project, &home, &socket_dir, &session);
-    assert_init_recovered(&repeat, "repeated init --continue");
+    assert_init_repeat_is_idempotent(&repeat);
     assert_exactly_one_live_role_window(&socket_dir, &session, "TL");
     assert_eq!(window_id(&socket_dir, &session, "TL"), live_tl);
     assert_eq!(quarantine_count(&project), 1);
     drop(tmux_session);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "invoked only by the disposable init-recovery harness"]
+async fn create_managed_orphan_lock_fixture_for_e2e() {
+    let project = std::env::var_os("EXOMONAD_INIT_LOCK_FIXTURE_PROJECT")
+        .map(std::path::PathBuf::from)
+        .expect("EXOMONAD_INIT_LOCK_FIXTURE_PROJECT must name the disposable repository");
+    let lock = record_managed_orphan_lock(&project).await;
+    assert_eq!(fs::read(&lock).unwrap(), b"");
+    assert!(has_lock_owner_proof(&project));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "invoked only by the disposable init-recovery harness"]
+async fn assert_managed_lock_quarantined_once_for_e2e() {
+    let project = std::env::var_os("EXOMONAD_INIT_LOCK_FIXTURE_PROJECT")
+        .map(std::path::PathBuf::from)
+        .expect("EXOMONAD_INIT_LOCK_FIXTURE_PROJECT must name the disposable repository");
+    assert!(!project.join(".git/index.lock").exists());
+    assert_eq!(quarantine_count(&project), 1);
+    assert_eq!(fs::read(quarantined_lock(&project)).unwrap(), b"");
 }
 
 fn process_inspection_was_denied(output: &Output) -> bool {
@@ -118,7 +142,35 @@ fn assert_init_recovered(output: &Output, action: &str) {
         "{action}: {text}"
     );
     assert!(
-        text.contains("Recovered a proven orphan native Git lock"),
-        "{action} omitted recovery evidence: {text}"
+        text.matches("Recovered a proven orphan native Git lock")
+            .count()
+            == 1,
+        "{action} should report the one completed lock recovery: {text}"
     );
+}
+
+fn assert_init_repeat_is_idempotent(output: &Output) {
+    let text = combined_output(output);
+    let detached_attach = text.contains("open terminal failed: not a terminal");
+    assert!(
+        output.status.success() || detached_attach,
+        "repeated init --continue: {text}"
+    );
+    assert!(
+        !text.contains("Recovered a proven orphan native Git lock"),
+        "repeated init claimed a recovery that had already completed: {text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repeated_init_accepts_no_second_lock_recovery_message() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let output = Output {
+        status: ExitStatus::from_raw(0),
+        stdout: b"Git mutation readiness is clear; reusing the active controller.\n".to_vec(),
+        stderr: Vec::new(),
+    };
+    assert_init_repeat_is_idempotent(&output);
 }
