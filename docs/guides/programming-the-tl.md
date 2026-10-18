@@ -1681,6 +1681,7 @@ repair prose, or plan documents:
 | `tl.plan_proposed` | A `/control` plan proposal is accepted or rejected |
 | `tl.stage_started` / `tl.stage_completed` | An ordered numeric stage starts or finishes |
 | `tl.aggregate_pr_opened` | An aggregate PR is created for a child sub-TL |
+| `tl.aggregate_publication_gate_superseded` | An exact, verified aggregate merge resolves its obsolete publication gate |
 | `tl.integration_validated` / `tl.integration_revalidated` | Base-bound integration evidence is accepted or refreshed |
 | `tl.integration_base_invalidated` | The integration base changed and evidence must be refreshed |
 | `tl.unlinked_changelog_resolved` | An unlinked merged slice completed with its CHANGELOG decision and outcome |

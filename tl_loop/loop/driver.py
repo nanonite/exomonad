@@ -274,6 +274,7 @@ from tl_loop.state.schema import (
     ActionPhase,
     ActionState,
     BudgetLedger,
+    GateState,
     GateStatus,
     GoalState,
     HandoffEvidence,
@@ -13499,9 +13500,35 @@ def _run_sub_tls(
     """Run recursive children in deterministic, bounded order batches."""
     if not plan.sub_tls:
         return state
+    post_merge_verified: dict[str, bool] = {}
     state = _reconcile_aggregate_publication_gates(
-        plan.sub_tls, state, config, effects, store, effects_log
+        plan.sub_tls, state, config, effects, store, effects_log, post_merge_verified
     )
+    for task in plan.sub_tls:
+        current = state.slices.get(task.name)
+        if (
+            task.integration.aggregate_pr_required
+            and current is not None
+            and _post_merge_recovery_started(current)
+            and not post_merge_verified.get(task.name, False)
+        ):
+            return state
+        gate = next(
+            (
+                item
+                for item in state.gates
+                if item.name == _aggregate_publication_gate_name(task.name)
+            ),
+            None,
+        )
+        if (
+            task.integration.aggregate_pr_required
+            and current is not None
+            and _post_merge_recovery_started(current)
+            and gate is not None
+            and gate.status is not GateStatus.APPROVED
+        ):
+            return state
     tasks_by_name = {task.name: task for task in plan.sub_tls}
     current_order = state.current_order or 1
     for stage in plan.ordered_stages:
@@ -13536,6 +13563,14 @@ def _run_sub_tls(
                 )
         state = store.load()
         stage_states = [state.slices.get(task.name) for task in stage_tasks]
+        if any(
+            task.integration.aggregate_pr_required
+            and current is not None
+            and current.status is SliceStatus.MERGED
+            and _post_merge_recovery_pending(current)
+            for task, current in zip(stage_tasks, stage_states)
+        ):
+            return state
         if any(
             current.status is SliceStatus.FAILED
             or (
@@ -14644,13 +14679,292 @@ def _reconcile_aggregate_publication_gates(
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
     effects_log: list[EffectIntent],
+    post_merge_verified: dict[str, bool],
 ) -> RunState:
     """Repair missing gates and resume only operator-approved publications."""
     state = store.load()
     for task in tasks:
-        state = _reconcile_aggregate_publication_gate(
+        state, verified = _reconcile_aggregate_publication_gate(
             task, state, config, effects, store, effects_log
         )
+        if _post_merge_recovery_started(state.slices.get(task.name)):
+            post_merge_verified[task.name] = verified
+    return state
+
+
+def _post_merge_recovery_started(current: SliceState | None) -> bool:
+    """Whether this slice already crossed the durable remote-merge boundary."""
+    return (
+        current is not None
+        and current.post_merge is not None
+        and current.post_merge.phase
+        not in {PostMergePhase.NOT_STARTED, PostMergePhase.NOT_REQUIRED}
+    )
+
+
+def _post_merge_recovery_pending(current: SliceState) -> bool:
+    """Whether a merged slice still has required local post-merge work."""
+    return (
+        _post_merge_recovery_started(current)
+        and current.post_merge is not None
+        and (current.post_merge.phase is not PostMergePhase.COMPLETE)
+    )
+
+
+def _verified_aggregate_post_merge(
+    task: SubTLTask,
+    state: RunState,
+    current: SliceState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> tuple[bool, str]:
+    """Verify the saved aggregate merge against its exact durable or live identity."""
+    receipt = current.post_merge
+    if receipt is None or not _post_merge_recovery_started(current):
+        return False, "post_merge_receipt_missing"
+    candidate = state.integration.candidates.get(task.name)
+    publication = current.publication
+    reconciliation = current.reconciliation
+    if (
+        current.status not in {SliceStatus.MERGED, SliceStatus.PARKED}
+        or (
+            current.status is SliceStatus.PARKED
+            and current.park_cause is not ParkCause.PUBLICATION_BLOCKED
+        )
+        or candidate is None
+        or candidate.lifecycle is not IntegrationLifecycle.MERGED
+        or publication is None
+        or state.repository_identity is None
+        or not isinstance(reconciliation, Mapping)
+    ):
+        return False, "aggregate_merge_checkpoint_incomplete"
+    evidence = receipt.evidence
+    pr_number = current.pr_number
+    head_sha = candidate.aggregate_head_sha
+    base_sha = reconciliation.get("merge_base_sha")
+    merge_journal_id = evidence.get("merge_journal_id")
+    parent_branch = publication.base_branch or current.base_ref
+    if (
+        evidence.get("child_id") != task.name
+        or type(pr_number) is not int
+        or pr_number <= 0
+        or evidence.get("pr_number") != str(pr_number)
+        or candidate.aggregate_pr_number != pr_number
+        or not isinstance(head_sha, str)
+        or not head_sha
+        or evidence.get("head_sha") != head_sha
+        or publication.pr_number != pr_number
+        or publication.head_sha != head_sha
+        or not current.branch
+        or publication.head_branch != current.branch
+        or not isinstance(parent_branch, str)
+        or not parent_branch
+        or evidence.get("parent_branch") != parent_branch
+        or current.base_ref != parent_branch
+        or evidence.get("repository") != state.repository_identity.remote_url
+        or not isinstance(base_sha, str)
+        or not base_sha
+        or not isinstance(merge_journal_id, str)
+        or not merge_journal_id
+        or reconciliation.get("merge_head_sha") != head_sha
+        or reconciliation.get("merge_journal_id") != merge_journal_id
+    ):
+        return False, "aggregate_merge_coordinates_conflict"
+    journal_result = _verified_aggregate_merge_journal(
+        state,
+        current,
+        candidate,
+        pr_number,
+        head_sha,
+        base_sha,
+        merge_journal_id,
+        effects_log,
+    )
+    if journal_result == "verified":
+        return True, "confirmed_merge_journal"
+    if journal_result == "conflict":
+        return False, "aggregate_merge_journal_conflict"
+    if not config.active:
+        return False, "aggregate_merge_journal_unavailable_for_shadow_resume"
+    try:
+        watcher = _watcher_snapshot(pr_number, config, effects, effects_log)
+    except (ConnectionError, OSError, RuntimeError, TimeoutError, ToolUnavailableError):
+        return False, "bound_pr_merge_observation_unavailable"
+    if watcher is None:
+        return False, "bound_pr_merge_observation_missing"
+    if _aggregate_watcher_confirms_merged_pr(task, current, candidate, watcher):
+        return True, "closed_merged_pr_observation"
+    return False, "bound_pr_merge_observation_mismatched"
+
+
+def _verified_aggregate_merge_journal(
+    state: RunState,
+    current: SliceState,
+    candidate: IntegrationCandidateState,
+    pr_number: int,
+    head_sha: str,
+    base_sha: str,
+    merge_journal_id: str,
+    effects_log: list[EffectIntent],
+) -> str:
+    """Classify the retained merge action without rewriting its outcome."""
+    if not isinstance(effects_log, EffectJournal):
+        return "unavailable"
+    entry = effects_log.entry_by_key(merge_journal_id)
+    if entry is None:
+        return "unavailable"
+    if entry.get("status") != "confirmed":
+        return "unavailable" if entry.get("status") in {"intended", "unknown"} else "conflict"
+    arguments = entry.get("arguments")
+    result = entry.get("result")
+    payload = result.get("result") if isinstance(result, Mapping) else None
+    if (
+        entry.get("key") != merge_journal_id
+        or entry.get("run_id") != state.run_id
+        or entry.get("operation") != "merge_pr"
+        or entry.get("target") != current.id
+        or not isinstance(arguments, Mapping)
+        or not isinstance(payload, Mapping)
+        or not _merge_journal_reports_success(entry)
+    ):
+        return "conflict"
+    journal_pr = arguments.get("pr_number")
+    journal_base = arguments.get("base_sha", arguments.get("expected_base_sha"))
+    if journal_pr != pr_number or journal_base != base_sha:
+        return "conflict"
+    for field_name, expected in (
+        ("expected_head_sha", head_sha),
+        ("expected_patch_digest", candidate.aggregate_patch_digest),
+        ("expected_merge_tree_sha", candidate.merge_tree_sha),
+    ):
+        observed = arguments.get(field_name)
+        if observed is not None and observed != expected:
+            return "conflict"
+    for field_name, expected in (
+        ("pr_number", pr_number),
+        ("head_sha", head_sha),
+        ("base_sha", base_sha),
+        ("repository", state.repository_identity.remote_url if state.repository_identity else None),
+        ("parent_branch", current.publication.base_branch if current.publication else None),
+    ):
+        observed = payload.get(field_name)
+        if observed is not None and observed != expected:
+            return "conflict"
+    return "verified"
+
+
+def _aggregate_watcher_confirms_merged_pr(
+    task: SubTLTask,
+    current: SliceState,
+    candidate: IntegrationCandidateState,
+    watcher: WatcherObservation | None,
+) -> bool:
+    """Require the bound PR-by-number read to prove closed merge and provenance."""
+    publication = current.publication
+    record = watcher.publication if watcher is not None else None
+    expected_author = task.agent_id or task.name
+    return (
+        watcher is not None
+        and publication is not None
+        and record is not None
+        and watcher.found is True
+        and watcher.pr_number == current.pr_number
+        and watcher.merged is True
+        and isinstance(watcher.pr_state, str)
+        and watcher.pr_state.lower() == "closed"
+        and watcher.head_sha == candidate.aggregate_head_sha
+        and watcher.head_branch == current.branch
+        and watcher.base_branch == publication.base_branch
+        and watcher.publication_ownership_verified is True
+        and watcher.evidence_error is None
+        and watcher.head_reachable is True
+        and record.slice_id == task.name
+        and record.author_agent == expected_author
+        and publication.invocation_id is not None
+        and record.invocation_id == publication.invocation_id
+        and (
+            watcher.patch_digest is None or watcher.patch_digest == candidate.aggregate_patch_digest
+        )
+        and (watcher.merge_tree_sha is None or watcher.merge_tree_sha == candidate.merge_tree_sha)
+    )
+
+
+def _record_aggregate_post_merge_hold(
+    state: RunState,
+    slice_id: str,
+    reason: str,
+    store: RunStore,
+) -> RunState:
+    """Persist a bounded diagnosis while retaining the original publication park."""
+    current = state.slices[slice_id]
+    reconciliation = dict(current.reconciliation or {})
+    hold = {"reason_code": reason, "pr_number": current.pr_number}
+    if reconciliation.get("aggregate_post_merge_hold") == hold:
+        return state
+    reconciliation["aggregate_post_merge_hold"] = hold
+    return _checkpoint_slice_action(
+        store,
+        state,
+        slice_id,
+        current.action,
+        slice_state=replace(current, reconciliation=reconciliation),
+    )
+
+
+def _adopt_aggregate_post_merge_recovery(
+    task: SubTLTask,
+    state: RunState,
+    current: SliceState,
+    gate: GateState | None,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+    store: RunStore,
+) -> RunState:
+    """Retire the matching publication park while retaining its audit evidence."""
+    assert current.post_merge is not None
+    reconciliation = dict(current.reconciliation or {})
+    reconciliation.pop("aggregate_post_merge_hold", None)
+    reconciliation["aggregate_publication_resolution"] = {
+        "resolution": "superseded_by_verified_merge",
+        "pr_number": current.pr_number,
+        "head_sha": current.post_merge.evidence["head_sha"],
+        "merge_journal_id": current.post_merge.evidence["merge_journal_id"],
+    }
+    updated = current
+    if current.status is SliceStatus.PARKED:
+        updated = slice_transition(current, MergeCompleted(current.pr_number or 0))
+    if current.park_cause is ParkCause.PUBLICATION_BLOCKED:
+        updated = replace(
+            updated,
+            park_cause=None,
+            dispatch_error=None,
+            reconciliation=reconciliation,
+        )
+    elif updated.reconciliation != reconciliation:
+        updated = replace(updated, reconciliation=reconciliation)
+    if updated != current:
+        state = _checkpoint_slice_action(
+            store, state, task.name, updated.action, slice_state=updated
+        )
+    if gate is not None and gate.status is GateStatus.PENDING:
+        _record_controller_event(
+            task.name,
+            "tl.aggregate_publication_gate_superseded",
+            {
+                "slice_id": task.name,
+                "gate_name": gate.name,
+                "pr_number": current.pr_number,
+                "head_sha": current.post_merge.evidence["head_sha"],
+                "merge_journal_id": current.post_merge.evidence["merge_journal_id"],
+                "reason": "the exact aggregate PR is already durably merged",
+            },
+            config,
+            effects,
+            effects_log,
+        )
+        state = store.clear_gate(gate.name)
     return state
 
 
@@ -14661,15 +14975,30 @@ def _reconcile_aggregate_publication_gate(
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
     effects_log: list[EffectIntent],
-) -> RunState:
+) -> tuple[RunState, bool]:
     """Reconcile one sub-TL's publication park and approval gate."""
     current = state.slices.get(task.name)
     if current is None:
-        return state
+        return state, False
     gate_name = _aggregate_publication_gate_name(task.name)
     gate = next((item for item in state.gates if item.name == gate_name), None)
+    if task.integration.aggregate_pr_required and _post_merge_recovery_started(current):
+        verified, reason = _verified_aggregate_post_merge(
+            task, state, current, config, effects, effects_log
+        )
+        if not verified:
+            LOGGER.warning(
+                "[TL loop] holding aggregate post-merge recovery for %s: %s",
+                task.name,
+                reason,
+            )
+            return _record_aggregate_post_merge_hold(state, task.name, reason, store), False
+        state = _adopt_aggregate_post_merge_recovery(
+            task, state, current, gate, config, effects, effects_log, store
+        )
+        return state, True
     if current.park_cause is not ParkCause.PUBLICATION_BLOCKED:
-        return store.clear_gate(gate_name) if gate is not None else state
+        return (store.clear_gate(gate_name) if gate is not None else state), False
     if config.active:
         recovered_state = _recover_parked_aggregate_candidate(
             task, state, config, effects, store, effects_log
@@ -14678,15 +15007,15 @@ def _reconcile_aggregate_publication_gate(
             state = recovered_state
             current = state.slices.get(task.name)
             if current is not None and current.park_cause is not ParkCause.PUBLICATION_BLOCKED:
-                return store.clear_gate(gate_name)
+                return store.clear_gate(gate_name), False
     if gate is None:
         state = _restore_aggregate_publication_gate(
             task.name, current, state, config, effects, store, effects_log
         )
         gate = next((item for item in state.gates if item.name == gate_name), None)
     if config.active and gate is not None and gate.status is GateStatus.APPROVED:
-        return _retry_aggregate_publication(task, state, config, effects, store, effects_log)
-    return state
+        return _retry_aggregate_publication(task, state, config, effects, store, effects_log), False
+    return state, False
 
 
 def _recover_parked_aggregate_candidate(

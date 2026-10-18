@@ -671,7 +671,13 @@ RECONCILIATION_KEYS = frozenset(
         "remote_head_sha",
         "remote_name",
         "ancestry_proof",
+        "aggregate_post_merge_hold",
+        "aggregate_publication_resolution",
     }
+)
+AGGREGATE_POST_MERGE_HOLD_KEYS = frozenset({"reason_code", "pr_number"})
+AGGREGATE_PUBLICATION_RESOLUTION_KEYS = frozenset(
+    {"resolution", "pr_number", "head_sha", "merge_journal_id"}
 )
 LEGACY_MANIFEST_MIGRATION_KEYS = frozenset(
     {
@@ -1848,6 +1854,56 @@ def _reconciliation(value: object, path: str, errors: list[tuple[str, str]]) -> 
         "ancestry_proof",
     ):
         _nullable_string(reconciliation, key, f"{path}.reconciliation", errors)
+    hold = reconciliation.get("aggregate_post_merge_hold")
+    if hold is not None:
+        hold_value = _object(
+            hold,
+            f"{path}.reconciliation.aggregate_post_merge_hold",
+            AGGREGATE_POST_MERGE_HOLD_KEYS,
+            errors,
+        )
+        if hold_value is not None:
+            _non_empty_string(
+                hold_value,
+                "reason_code",
+                f"{path}.reconciliation.aggregate_post_merge_hold",
+                errors,
+            )
+            _nullable_positive_int(
+                hold_value,
+                "pr_number",
+                f"{path}.reconciliation.aggregate_post_merge_hold",
+                errors,
+            )
+    resolution = reconciliation.get("aggregate_publication_resolution")
+    if resolution is not None:
+        resolution_value = _object(
+            resolution,
+            f"{path}.reconciliation.aggregate_publication_resolution",
+            AGGREGATE_PUBLICATION_RESOLUTION_KEYS,
+            errors,
+        )
+        if resolution_value is not None:
+            if resolution_value.get("resolution") != "superseded_by_verified_merge":
+                errors.append(
+                    (
+                        f"{path}.reconciliation.aggregate_publication_resolution.resolution",
+                        "must be 'superseded_by_verified_merge'",
+                    )
+                )
+            _positive_int(
+                resolution_value,
+                "pr_number",
+                f"{path}.reconciliation.aggregate_publication_resolution",
+                errors,
+            )
+            for key in ("head_sha", "merge_journal_id"):
+                _non_empty_string(
+                    resolution_value,
+                    key,
+                    f"{path}.reconciliation.aggregate_publication_resolution",
+                    errors,
+                )
 
 
 def _legacy_manifest_migration(

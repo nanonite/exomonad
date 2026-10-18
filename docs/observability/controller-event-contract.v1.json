@@ -234,6 +234,16 @@
         "integration_owner_id"
       ]
     },
+    "tl.aggregate_publication_gate_superseded": {
+      "fields": [
+        "slice_id",
+        "gate_name",
+        "pr_number",
+        "head_sha",
+        "merge_journal_id",
+        "reason"
+      ]
+    },
     "tl.aggregate_dispatch_identity_reconciled": {
       "fields": [
         "run_id",

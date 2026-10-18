@@ -132,6 +132,7 @@
     {"type": "tl.stage_started", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.stage_completed", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.aggregate_pr_opened", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
+    {"type": "tl.aggregate_publication_gate_superseded", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.aggregate_dispatch_identity_reconciled", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.aggregate_completion_verified", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},
     {"type": "tl.ordered_recovery_superseded", "payload_class": "aggregate_dimensions", "producers": ["tl_loop"]},

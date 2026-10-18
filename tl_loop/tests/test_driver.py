@@ -13041,6 +13041,548 @@ def test_driver_keeps_aggregate_parked_when_git_lineage_is_unavailable(tmp_path:
     assert not any(name == "merge_pr" for name, _ in transport.calls)
 
 
+def _seed_merged_aggregate_post_merge_recovery(
+    root_dir: Path, run_id: str, *, merge_confirmed: bool = True
+) -> tuple[WorkPlan, RunStore, RunStore, str, str]:
+    """Seed an adopted aggregate merge behind its obsolete publication park."""
+    plan, root_store, child_store = _nested_blocked_owner_stores(root_dir, run_id)
+    assert child_store is not None
+    _complete_nested_leaf(child_store)
+    _seed_nested_aggregate_in_review(root_store)
+    state = root_store.load()
+    current = state.slices["architecture"]
+    assert current.publication is not None
+    candidate = state.integration.candidates["architecture"]
+    pr_number = current.publication.pr_number
+    head_sha = current.publication.head_sha
+    base_sha = "aggregate-base-sha"
+    merge_arguments = {
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "aggregate_approval_receipt_id": "parent-approval-receipt",
+        "attempt": 1,
+    }
+    journal = EffectJournal(run_id, root_store.run_dir / "action-journal.json")
+    merge_intent = EffectIntent("merge_pr", "architecture", merge_arguments, True)
+    merge_journal_id = journal.key_for(merge_intent)
+    journal.append(merge_intent)
+    if merge_confirmed:
+        journal.mark_result(
+            merge_intent,
+            ToolResult.from_raw({"success": True, "result": {"merged": True}}),
+        )
+    else:
+        journal.mark_unknown(merge_intent, RuntimeError("merge response was interrupted"))
+    post_merge = PostMergeState(
+        PostMergePhase.REMOTE_MERGE_ADOPTED,
+        {
+            "child_id": "architecture",
+            "repository": "https://forge.example.test/test/repository.git",
+            "parent_branch": "main",
+            "pr_number": str(pr_number),
+            "head_sha": head_sha,
+            "merge_journal_id": merge_journal_id,
+            "lane_epoch": "1",
+        },
+    )
+    parked = replace(
+        current,
+        status=SliceStatus.PARKED,
+        park_cause=ParkCause.PUBLICATION_BLOCKED,
+        park_audit={
+            "error_kind": "publication_lookup_unavailable",
+            "reason": "aggregate publication lookup was unavailable after merge",
+            "retryable": True,
+        },
+        post_merge=post_merge,
+        action=None,
+        reconciliation={
+            "confirmed_stage": "aggregate_merged",
+            "next_action": "post_merge_recovery",
+            "authoritative_evidence": ["merge_pr_journal"],
+            "missing_evidence": [],
+            "conflicts": [],
+            "merge_base_sha": base_sha,
+            "merge_head_sha": head_sha,
+            "merge_journal_id": merge_journal_id,
+        },
+    )
+    merged_candidate = replace(
+        candidate,
+        lifecycle=IntegrationLifecycle.MERGED,
+        aggregate_pr_number=pr_number,
+        aggregate_head_sha=head_sha,
+        aggregate_original_base_sha=base_sha,
+        validated_base_sha=base_sha,
+        merge_tree_sha="aggregate-merge-tree-sha",
+        integration_evidence_at="2026-10-17T00:00:00Z",
+        ci_status="success",
+        merge_attempts=1,
+        stage_verification="passed",
+    )
+    integration = driver_module._persist_candidate_runtime(
+        state.integration,
+        "architecture",
+        merged_candidate,
+    )
+    root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "architecture": parked},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+    root_store.set_gate(f"{AGGREGATE_PUBLICATION_GATE_PREFIX}architecture", GateStatus.PENDING)
+    sync_arguments = driver_module._parent_sync_arguments(
+        parked,
+        pr_number,
+        post_merge.evidence,
+        base_sha,
+        ".",
+    )
+    sync_identity = driver_module._parent_sync_identity_fields(sync_arguments)
+    sync_operation_id = driver_module.stable_action_key(
+        run_id,
+        "post_merge_parent_sync_operation",
+        "architecture",
+        sync_identity,
+    )
+    sync_intent = EffectIntent(
+        "post_merge_parent_sync",
+        "architecture",
+        {"sync_operation_id": sync_operation_id, "sync_attempt": 1},
+        True,
+    )
+    journal = EffectJournal(run_id, root_store.run_dir / "action-journal.json")
+    journal.append(sync_intent)
+    journal.mark_result(
+        sync_intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    "sync_outcome": "pre_mutation_refusal",
+                    "sync_phase": "preflight",
+                    "sync_operation_id": sync_operation_id,
+                    "sync_attempt": 1,
+                    "completed_steps": [],
+                    "retry_safe": True,
+                    "diagnostic": "retained local lock evidence requires a fresh inspection",
+                },
+            }
+        ),
+    )
+    return plan, root_store, child_store, merge_journal_id, base_sha
+
+
+def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, child_store, merge_journal_id, base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(tmp_path, "merged-aggregate-resume")
+    )
+    merge_journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
+    original_merge_entry = merge_journal.entry_by_key(merge_journal_id)
+    assert original_merge_entry is not None
+    original_leaf_receipt = child_store.load().slices["leaf-a"].post_merge
+
+    class PostMergeResumeTransport(RecordingTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sync_outcomes = ["confirmed"]
+
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            if tool_name == "resolve_live_pr_for_slice":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {
+                        "resolution": "never_published",
+                        "slice_id": arguments["slice_id"],
+                    },
+                }
+            if tool_name == "post_merge_parent_sync":
+                self.calls.append((tool_name, arguments))
+                outcome = self.sync_outcomes.pop(0)
+                payload = {
+                    **arguments,
+                    "sync_outcome": outcome,
+                    "sync_phase": "preflight" if outcome == "pre_mutation_refusal" else "complete",
+                    "completed_steps": []
+                    if outcome == "pre_mutation_refusal"
+                    else ["fetch", "fast_forward"],
+                    "retry_safe": outcome == "pre_mutation_refusal",
+                    "diagnostic": "preserved local Git evidence" if outcome != "confirmed" else "",
+                }
+                if outcome == "confirmed":
+                    payload.update(
+                        {
+                            "parent_commit_sha": base_sha,
+                            "remote_head_sha": base_sha,
+                            "ancestry_proof": f"ancestor:{arguments['merged_head_sha']}->{base_sha}",
+                        }
+                    )
+                return {"success": True, "result": payload}
+            if tool_name == "post_merge_changelog_context":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"changelog_present": False},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = PostMergeResumeTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=tmp_path,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        agent_id="root-controller",
+        policy=validate_policy(_selector_policy()),
+        tl_model_choice=_tl_choice(ReviewBackend([])),
+    )
+
+    resumed = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    completed = resumed.final_state
+    architecture = completed.slices["architecture"]
+    assert architecture.status is SliceStatus.MERGED
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.COMPLETE, [
+        name
+        for name, _ in transport.calls
+        if name.startswith("post_merge") or name == "resolve_live_pr_for_slice"
+    ]
+    assert completed.current_order == 2
+    assert completed.slices["kani"].status is SliceStatus.MERGED
+    assert (
+        sum(
+            name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.dispatch_confirmed"
+            and arguments.get("payload", {}).get("slice_id") == "kani"
+            for name, arguments in transport.calls
+        )
+        == 1
+    )
+    assert sum(name == "post_merge_parent_sync" for name, _ in transport.calls) == 1
+    sync_call_index = next(
+        index for index, (name, _) in enumerate(transport.calls) if name == "post_merge_parent_sync"
+    )
+    dispatch_event_index = next(
+        index
+        for index, (name, arguments) in enumerate(transport.calls)
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+        and arguments.get("payload", {}).get("slice_id") == "kani"
+    )
+    assert sync_call_index < dispatch_event_index
+    assert not any(
+        gate.name == f"{AGGREGATE_PUBLICATION_GATE_PREFIX}architecture" for gate in completed.gates
+    )
+    assert any(
+        name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.aggregate_publication_gate_superseded"
+        for name, arguments in transport.calls
+    )
+    parent_sync_entries = merge_journal.entries_for("post_merge_parent_sync", "architecture")
+    assert [entry["result"]["result"]["sync_outcome"] for entry in parent_sync_entries] == [
+        "pre_mutation_refusal",
+        "confirmed",
+    ]
+    assert not any(
+        name in {"resolve_live_pr_for_slice", "file_pr", "merge_pr"} for name, _ in transport.calls
+    )
+    assert child_store.load().slices["leaf-a"].post_merge is not None
+    assert child_store.load().slices["leaf-a"].post_merge.phase is PostMergePhase.COMPLETE
+    assert child_store.load().slices["leaf-a"].post_merge == original_leaf_receipt
+    assert merge_journal.entry_by_key(merge_journal_id) == original_merge_entry
+
+    repeated = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert repeated.final_state.current_order == 2
+    assert (
+        sum(
+            name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.dispatch_confirmed"
+            and arguments.get("payload", {}).get("slice_id") == "kani"
+            for name, arguments in transport.calls
+        )
+        == 1
+    )
+    assert sum(name == "post_merge_parent_sync" for name, _ in transport.calls) == 1
+
+
+def test_merged_aggregate_with_conflicting_merge_coordinates_stays_parked(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(tmp_path, "merged-aggregate-conflict")
+    )
+    state = root_store.load()
+    current = state.slices["architecture"]
+    assert current.post_merge is not None
+    bad_receipt = replace(
+        current.post_merge,
+        evidence={**current.post_merge.evidence, "head_sha": "unrelated-head"},
+    )
+    root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "architecture": replace(current, post_merge=bad_receipt)},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    class IdentityTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = IdentityTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=tmp_path,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
+
+    result = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    architecture = result.final_state.slices["architecture"]
+    assert architecture.status is SliceStatus.PARKED
+    assert architecture.park_cause is ParkCause.PUBLICATION_BLOCKED
+    assert architecture.reconciliation is not None
+    assert architecture.reconciliation["aggregate_post_merge_hold"] == {
+        "reason_code": "aggregate_merge_coordinates_conflict",
+        "pr_number": 273,
+    }
+    assert result.final_state.current_order == 1
+    assert not any(
+        name
+        in {
+            "resolve_live_pr_for_slice",
+            "watcher_pr_state",
+            "post_merge_parent_sync",
+            "merge_pr",
+            "file_pr",
+        }
+        for name, _ in transport.calls
+    )
+
+
+def test_verified_aggregate_merge_preserves_rejected_manual_gate(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(tmp_path, "merged-aggregate-manual-gate")
+    )
+    gate_name = f"{AGGREGATE_PUBLICATION_GATE_PREFIX}architecture"
+    root_store.set_gate(gate_name, GateStatus.REJECTED)
+    root_store.set_gate("unrelated-human-gate", GateStatus.PENDING)
+
+    class IdentityTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = IdentityTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=tmp_path,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
+    result = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    architecture = result.final_state.slices["architecture"]
+    assert architecture.status is SliceStatus.MERGED
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED
+    assert result.final_state.current_order == 1
+    assert any(
+        gate.name == gate_name and gate.status is GateStatus.REJECTED
+        for gate in result.final_state.gates
+    )
+    assert any(
+        gate.name == "unrelated-human-gate" and gate.status is GateStatus.PENDING
+        for gate in result.final_state.gates
+    )
+    assert not any(
+        name in {"resolve_live_pr_for_slice", "merge_pr", "file_pr"} for name, _ in transport.calls
+    )
+    assert not any(
+        name == "emit_controller_event" and arguments.get("event_type") == "tl.dispatch_confirmed"
+        for name, arguments in transport.calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("watcher_result", "expected_reason"),
+    [
+        (None, "bound_pr_merge_observation_unavailable"),
+        (
+            {
+                "found": True,
+                "pr_number": 273,
+                "pr_state": "closed",
+                "merged": False,
+                "head_sha": "e" * 40,
+                "head_branch": "main.architecture",
+                "base_branch": "main",
+                "head_reachable": True,
+                "publication_ownership_verified": True,
+                "publication": {
+                    "slice_id": "architecture",
+                    "author_agent": "architecture",
+                    "invocation_id": "aggregate-invocation",
+                    "succession_invocation_ids": [],
+                },
+            },
+            "bound_pr_merge_observation_mismatched",
+        ),
+    ],
+)
+def test_unconfirmed_aggregate_merge_observation_stays_parked(
+    tmp_path: Path,
+    watcher_result: JsonObject | None,
+    expected_reason: str,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(
+            tmp_path, "merged-aggregate-unconfirmed", merge_confirmed=False
+        )
+    )
+    state = root_store.load()
+    current = state.slices["architecture"]
+    candidate = state.integration.candidates["architecture"]
+    if watcher_result is not None:
+        watcher_result = {
+            **watcher_result,
+            "pr_number": current.pr_number,
+            "head_sha": candidate.aggregate_head_sha,
+            "head_branch": current.branch,
+            "base_branch": current.publication.base_branch,
+        }
+
+    class UnconfirmedMergeTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            if tool_name == "watcher_pr_state":
+                self.calls.append((tool_name, arguments))
+                return (
+                    {"success": False, "error": "watcher unavailable"}
+                    if watcher_result is None
+                    else {"success": True, "result": watcher_result}
+                )
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = UnconfirmedMergeTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=tmp_path,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
+
+    result = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    architecture = result.final_state.slices["architecture"]
+    assert architecture.status is SliceStatus.PARKED
+    assert architecture.park_cause is ParkCause.PUBLICATION_BLOCKED
+    assert architecture.reconciliation is not None
+    assert architecture.reconciliation["aggregate_post_merge_hold"]["reason_code"] == (
+        expected_reason
+    )
+    assert result.final_state.current_order == 1
+    assert any(name == "watcher_pr_state" for name, _ in transport.calls)
+    assert any(
+        gate.name == f"{AGGREGATE_PUBLICATION_GATE_PREFIX}architecture"
+        and gate.status is GateStatus.PENDING
+        for gate in result.final_state.gates
+    )
+    assert not any(
+        name
+        in {
+            "resolve_live_pr_for_slice",
+            "post_merge_parent_sync",
+            "merge_pr",
+            "file_pr",
+        }
+        for name, _ in transport.calls
+    )
+    assert not any(
+        name == "emit_controller_event" and arguments.get("event_type") == "tl.dispatch_confirmed"
+        for name, arguments in transport.calls
+    )
+
+
 def test_driver_does_not_merge_unrelated_head_that_matches_candidate_and_watcher(
     tmp_path: Path,
 ) -> None:
