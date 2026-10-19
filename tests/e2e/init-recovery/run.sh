@@ -113,11 +113,11 @@ assert_init_status() {
 
 assert_one_live_window() {
     local role="$1"
-    local count state
+    local count pane_dead
     count="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc "$role" || true)"
     [[ "$count" == "1" ]] || e2e_fail "repeat init did not retain exactly one $role window"
-    state="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{pane_dead}' | awk -v role="$role" '$1 == role { print $2, $3; exit }')"
-    [[ "${state##* }" == "0" ]] || e2e_fail "repeat init returned without a live $role window"
+    pane_dead="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{pane_dead}' | awk -v role="$role" '$1 == role { print $2; exit }')"
+    [[ "$pane_dead" == "0" ]] || e2e_fail "repeat init returned without a live $role window"
 }
 
 run_managed_lock_fixture() {
@@ -390,10 +390,7 @@ cd "$CONT_REPO"
 git remote set-url origin "git@forgejo-e2e:owner/repo.git"
 git remote set-url --push origin "git@forgejo-e2e:owner/repo.git"
 git config core.sshCommand "$CONT_DIR/git-ssh"
-mkdir -p .exo/wasm
-for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
-    ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
-done
+install_verified_wasm_and_roles
 cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
 cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
 cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
