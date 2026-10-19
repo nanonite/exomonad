@@ -73,6 +73,7 @@ fn shared_read_lock_times_out_without_waiting_for_an_active_ledger_writer() {
     let lock_path = log.ledger().segments_dir().join(".append.lock");
     let lock_file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path)
