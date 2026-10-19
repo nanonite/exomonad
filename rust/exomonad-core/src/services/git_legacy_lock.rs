@@ -9,7 +9,7 @@ use crate::services::git_lock_recovery::{
     append_audit_once, atomic_move_lock, check_quarantine_capacity, proof_matches_paths,
 };
 use crate::services::git_mutation::{
-    ensure_safe_lease_directory, GitMutationResource, GitMutationSafety,
+    ensure_safe_lease_directory, GitMutationError, GitMutationResource, GitMutationSafety,
 };
 use crate::services::git_recovery_ledger::{
     read_git_recovery_events, read_git_recovery_events_at, GitRecoveryEvent,
@@ -107,6 +107,16 @@ struct LegacyRecoveryData {
     index: GitFileFingerprint,
     original_lock: NativeGitLockSnapshot,
     quarantine_file: PathBuf,
+}
+
+#[derive(Debug)]
+enum InterruptedLegacyRecovery {
+    None,
+    Pending {
+        intent_event_id: String,
+        data: LegacyRecoveryData,
+    },
+    Quarantined(LegacyGitLockRecoveryReceipt),
 }
 
 #[derive(Debug, Serialize)]
@@ -224,11 +234,18 @@ pub fn apply_legacy_git_lock(
     let lease = safety
         .acquire(worktree, GitMutationResource::Index, &operation_id, wait)
         .map_err(|error| error.to_string())?;
-    if let Some(receipt) =
-        complete_interrupted_recovery(safety, worktree, event_log, expected_fingerprint, &paths)?
-    {
-        return verify_applied_receipt(receipt, true);
-    }
+    let interrupted = match complete_interrupted_recovery(
+        safety,
+        worktree,
+        event_log,
+        expected_fingerprint,
+        &paths,
+    )? {
+        InterruptedLegacyRecovery::Quarantined(receipt) => {
+            return verify_applied_receipt(receipt, true);
+        }
+        pending => pending,
+    };
     let before = inspect_legacy_git_lock(safety, worktree, event_log.ledger().segments_dir())?;
     ensure_eligible(&before, expected_fingerprint)?;
     let lock = before.lock.clone().ok_or("native index lock disappeared")?;
@@ -239,27 +256,29 @@ pub fn apply_legacy_git_lock(
     let target_dir = target.parent().ok_or("quarantine target has no parent")?;
     ensure_safe_lease_directory(target_dir).map_err(|error| error.to_string())?;
     check_quarantine_capacity(target_dir, &target)?;
-    let actor = current_actor()?;
-    let data = LegacyRecoveryData {
-        schema_version: LEGACY_SCHEMA_VERSION,
-        recovery_fingerprint: expected_fingerprint.to_string(),
-        writer_stopped_authorization: writers_stopped,
-        actor,
-        worktree_root: before.worktree_root.clone(),
-        git_dir: before.git_dir.clone(),
-        common_git_dir: before.common_git_dir.clone(),
-        index_file: before.index_file.clone(),
-        index_lock_file: before.index_lock_file.clone(),
-        index: before.index.clone(),
-        original_lock: lock.clone(),
-        quarantine_file: target.clone(),
+    let (data, intent_event_id) = match interrupted {
+        InterruptedLegacyRecovery::Pending {
+            intent_event_id,
+            data,
+        } => {
+            validate_pending_intent(&before, expected_fingerprint, &data)?;
+            (data, intent_event_id)
+        }
+        InterruptedLegacyRecovery::None => {
+            let data =
+                new_recovery_data(&before, expected_fingerprint, writers_stopped, lock.clone())?;
+            let intent_event_id = append_audit_once(
+                event_log,
+                LEGACY_INTENT_EVENT,
+                &data,
+                &before.index_lock_file,
+            )?;
+            (data, intent_event_id)
+        }
+        InterruptedLegacyRecovery::Quarantined(_) => {
+            return Err("interrupted legacy recovery state changed unexpectedly".into());
+        }
     };
-    let intent_event_id = append_audit_once(
-        event_log,
-        LEGACY_INTENT_EVENT,
-        &data,
-        &before.index_lock_file,
-    )?;
     let current_paths = safety
         .resolve_paths_with_index_override(worktree, None)
         .map_err(|error| format!("Git path revalidation failed: {error}"))?;
@@ -304,6 +323,53 @@ fn ensure_eligible(inspection: &LegacyGitLockInspection, expected: &str) -> Resu
             Err(format!("managed process activity is uncertain: {reason}"))
         }
     }
+}
+
+fn new_recovery_data(
+    inspection: &LegacyGitLockInspection,
+    fingerprint: &str,
+    writers_stopped: bool,
+    original_lock: NativeGitLockSnapshot,
+) -> Result<LegacyRecoveryData, String> {
+    Ok(LegacyRecoveryData {
+        schema_version: LEGACY_SCHEMA_VERSION,
+        recovery_fingerprint: fingerprint.to_string(),
+        writer_stopped_authorization: writers_stopped,
+        actor: current_actor()?,
+        worktree_root: inspection.worktree_root.clone(),
+        git_dir: inspection.git_dir.clone(),
+        common_git_dir: inspection.common_git_dir.clone(),
+        index_file: inspection.index_file.clone(),
+        index_lock_file: inspection.index_lock_file.clone(),
+        index: inspection.index.clone(),
+        original_lock,
+        quarantine_file: inspection
+            .quarantine_file
+            .clone()
+            .ok_or("recovery quarantine target is unavailable")?,
+    })
+}
+
+fn validate_pending_intent(
+    inspection: &LegacyGitLockInspection,
+    fingerprint: &str,
+    data: &LegacyRecoveryData,
+) -> Result<(), String> {
+    let lock = inspection
+        .lock
+        .as_ref()
+        .ok_or("authorized legacy lock is missing; inspect the repository again")?;
+    if data.recovery_fingerprint != fingerprint
+        || !data.writer_stopped_authorization
+        || data.index != inspection.index
+        || data.original_lock != *lock
+        || Some(&data.quarantine_file) != inspection.quarantine_file.as_ref()
+    {
+        return Err(
+            "pending legacy recovery intent does not match current fingerprinted evidence".into(),
+        );
+    }
+    Ok(())
 }
 
 fn inspect_managed_activity(
@@ -710,24 +776,25 @@ fn complete_interrupted_recovery(
     event_log: &EventLog,
     fingerprint: &str,
     paths: &crate::services::GitMutationPaths,
-) -> Result<Option<LegacyGitLockRecoveryReceipt>, String> {
+) -> Result<InterruptedLegacyRecovery, String> {
     let records =
         read_git_recovery_events(event_log, &[LEGACY_INTENT_EVENT], Duration::from_secs(2))?;
     let mut matching = Vec::new();
     for record in &records {
         let data: LegacyRecoveryData = serde_json::from_value(record.data.clone())
             .map_err(|_| "legacy recovery intent is malformed".to_string())?;
-        if data.recovery_fingerprint == fingerprint && data.worktree_root == paths.worktree_root {
+        if data.recovery_fingerprint == fingerprint
+            && data.worktree_root == paths.worktree_root
+            && data.git_dir == paths.git_dir
+            && data.common_git_dir == paths.common_git_dir
+        {
             matching.push((record.event_id.clone(), data));
         }
     }
-    if matching.len() > 1 {
-        return Err("multiple legacy recovery intents claim the same fingerprint".into());
-    }
-    let Some((intent_id, data)) = matching.pop() else {
-        return Ok(None);
+    let Some((intent_id, data)) = matching.first().cloned() else {
+        return Ok(InterruptedLegacyRecovery::None);
     };
-    verify_authorized_intent(&records, &data, &intent_id)?;
+    validate_matching_intents(&records, &matching, &data)?;
     validate_intent_paths(&data, paths)?;
     if safety
         .resolve_paths_with_index_override(worktree, None)
@@ -737,11 +804,47 @@ fn complete_interrupted_recovery(
         return Err("Git paths changed since legacy recovery was authorized".into());
     }
     match snapshot_lock(&data.quarantine_file) {
-        Ok(quarantined) if same_lock_inode(&data.original_lock, &quarantined) => {}
-        Ok(_) => return Err("interrupted legacy quarantine differs from its intent".into()),
-        Err(_) => return Ok(None),
+        Ok(quarantined) if same_lock_inode(&data.original_lock, &quarantined) => {
+            append_recovery_receipt(event_log, &data, &intent_id, &data.index_lock_file)
+                .map(InterruptedLegacyRecovery::Quarantined)
+        }
+        Ok(_) => Err("interrupted legacy quarantine differs from its intent".into()),
+        Err(error) if snapshot_is_missing(&error) => Ok(InterruptedLegacyRecovery::Pending {
+            intent_event_id: intent_id,
+            data,
+        }),
+        Err(error) => Err(format!(
+            "cannot inspect interrupted legacy quarantine target: {error}"
+        )),
     }
-    append_recovery_receipt(event_log, &data, &intent_id, &data.index_lock_file).map(Some)
+}
+
+fn snapshot_is_missing(error: &GitMutationError) -> bool {
+    matches!(
+        error,
+        GitMutationError::Uncertain { reason, .. }
+            if reason.contains("No such file") || reason.contains("not found")
+    )
+}
+
+fn validate_matching_intents(
+    records: &[GitRecoveryEvent],
+    matching: &[(String, LegacyRecoveryData)],
+    selected: &LegacyRecoveryData,
+) -> Result<(), String> {
+    for (event_id, data) in matching {
+        verify_authorized_intent(records, data, event_id)?;
+        if !same_recovery_operation(selected, data) {
+            return Err("conflicting legacy recovery intents claim the same fingerprint".into());
+        }
+    }
+    Ok(())
+}
+
+fn same_recovery_operation(left: &LegacyRecoveryData, right: &LegacyRecoveryData) -> bool {
+    let mut normalized_right = right.clone();
+    normalized_right.actor = left.actor.clone();
+    *left == normalized_right
 }
 
 fn verify_authorized_intent(

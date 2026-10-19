@@ -3,7 +3,7 @@ use super::{
     LegacyManagedActivity, LegacyRecoveryData, LEGACY_INTENT_EVENT, LEGACY_RECOVERED_EVENT,
 };
 use crate::services::event_log::EventLog;
-use crate::services::git_lock_owner::{ManagedProcessIdentity, ProcessInspector};
+use crate::services::git_lock_owner::{ManagedProcessIdentity, ProcFsInspector, ProcessInspector};
 use crate::services::git_lock_recovery::atomic_move_lock;
 use crate::services::git_mutation::{GitMutationResource, GitMutationSafety};
 use std::fs;
@@ -294,6 +294,137 @@ fn authorized_apply_quarantines_once_preserves_edits_and_never_removes_replaceme
             .count(),
         1
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retry_reuses_pre_quarantine_authorization_from_a_prior_process() {
+    let fixture = Fixture::new();
+    fs::write(fixture.lock_path(), b"interrupted before quarantine").unwrap();
+    let report = fixture.inspect();
+    let fingerprint = report.recovery_fingerprint.clone().unwrap();
+    let prior_actor = prior_operator_process();
+    let intent_id = append_pending_intent(&fixture, &report, prior_actor);
+
+    let replay = apply_legacy_git_lock(
+        &fixture.safety,
+        &fixture.root,
+        &fixture.event_log,
+        &fingerprint,
+        true,
+        Duration::ZERO,
+    )
+    .expect("restart reuses the pending authorization");
+
+    assert!(!replay.already_applied);
+    assert_eq!(replay.receipt.intent_event_id, intent_id);
+    assert_eq!(
+        fs::read(&replay.receipt.quarantine_file).unwrap(),
+        b"interrupted before quarantine"
+    );
+    let events = fixture.event_log.ledger().read_events().unwrap();
+    assert_eq!(event_count(&events, LEGACY_INTENT_EVENT), 1);
+    assert_eq!(event_count(&events, LEGACY_RECOVERED_EVENT), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn equivalent_duplicate_authorizations_from_old_retries_are_adopted_safely() {
+    let fixture = Fixture::new();
+    fs::write(fixture.lock_path(), b"repeated old authorization").unwrap();
+    let report = fixture.inspect();
+    let fingerprint = report.recovery_fingerprint.clone().unwrap();
+    let first_actor = prior_operator_process();
+    let second_actor = prior_operator_process();
+    let first_intent = append_pending_intent(&fixture, &report, first_actor);
+    append_pending_intent(&fixture, &report, second_actor);
+
+    let replay = apply_legacy_git_lock(
+        &fixture.safety,
+        &fixture.root,
+        &fixture.event_log,
+        &fingerprint,
+        true,
+        Duration::ZERO,
+    )
+    .expect("equivalent old retry intents share one recovery operation");
+
+    assert_eq!(replay.receipt.intent_event_id, first_intent);
+    let events = fixture.event_log.ledger().read_events().unwrap();
+    assert_eq!(event_count(&events, LEGACY_INTENT_EVENT), 2);
+    assert_eq!(event_count(&events, LEGACY_RECOVERED_EVENT), 1);
+    let repeated = apply_legacy_git_lock(
+        &fixture.safety,
+        &fixture.root,
+        &fixture.event_log,
+        &fingerprint,
+        true,
+        Duration::ZERO,
+    )
+    .expect("completed duplicate-intent recovery is idempotent");
+    assert!(repeated.already_applied);
+    assert_eq!(repeated.receipt.intent_event_id, first_intent);
+    let events = fixture.event_log.ledger().read_events().unwrap();
+    assert_eq!(event_count(&events, LEGACY_INTENT_EVENT), 2);
+    assert_eq!(event_count(&events, LEGACY_RECOVERED_EVENT), 1);
+}
+
+fn append_pending_intent(
+    fixture: &Fixture,
+    report: &super::LegacyGitLockInspection,
+    actor: ManagedProcessIdentity,
+) -> String {
+    let data = LegacyRecoveryData {
+        schema_version: super::LEGACY_SCHEMA_VERSION,
+        recovery_fingerprint: report.recovery_fingerprint.clone().unwrap(),
+        writer_stopped_authorization: true,
+        actor,
+        worktree_root: report.worktree_root.clone(),
+        git_dir: report.git_dir.clone(),
+        common_git_dir: report.common_git_dir.clone(),
+        index_file: report.index_file.clone(),
+        index_lock_file: report.index_lock_file.clone(),
+        index: report.index.clone(),
+        original_lock: report.lock.clone().unwrap(),
+        quarantine_file: report.quarantine_file.clone().unwrap(),
+    };
+    fixture
+        .event_log
+        .append(
+            LEGACY_INTENT_EVENT,
+            "git-mutation",
+            &serde_json::to_value(data).unwrap(),
+        )
+        .unwrap()
+}
+
+fn event_count(
+    events: &[crate::services::immutable_ledger::LedgerRecord],
+    event_type: &str,
+) -> usize {
+    events
+        .iter()
+        .filter(|record| record.event.event_type == event_type)
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+fn prior_operator_process() -> ManagedProcessIdentity {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("start previous operator process");
+    let pid = child.id();
+    let start_time_ticks = ProcFsInspector::default()
+        .start_time_ticks(pid)
+        .unwrap()
+        .expect("read prior operator process identity");
+    child.kill().expect("stop previous operator process");
+    child.wait().expect("reap previous operator process");
+    ManagedProcessIdentity {
+        pid,
+        start_time_ticks,
+    }
 }
 
 #[test]

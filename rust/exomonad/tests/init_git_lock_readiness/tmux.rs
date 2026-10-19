@@ -26,6 +26,14 @@ pub fn create_exited_tl_session(socket_dir: &Path, session: &str) -> TmuxSession
         .output()
         .expect("create isolated existing tmux session");
     assert_success(&output, "create initial exited TL pane");
+    let environment = tmux(
+        socket_dir,
+        &["set-environment", "-g", "EXOMONAD_TL_PREFLIGHT_ACK", "1"],
+    );
+    assert_success(
+        &environment,
+        "configure dirty-worktree preflight acknowledgement",
+    );
     wait_for_exited_tl(socket_dir, session);
     TmuxSession {
         socket_dir: socket_dir.to_path_buf(),
@@ -33,7 +41,7 @@ pub fn create_exited_tl_session(socket_dir: &Path, session: &str) -> TmuxSession
     }
 }
 
-fn wait_for_exited_tl(socket_dir: &Path, session: &str) {
+pub fn wait_for_exited_tl(socket_dir: &Path, session: &str) {
     let started = Instant::now();
     while !pane_is_dead(socket_dir, session, "TL") {
         assert!(
