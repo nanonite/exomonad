@@ -97,14 +97,6 @@ impl ProcessInspector for FakeInspector {
             Ok(false)
         }
     }
-
-    fn process_holders(
-        &self,
-        _device: u64,
-        _inode: u64,
-    ) -> Result<Vec<ManagedProcessIdentity>, String> {
-        Ok(Vec::new())
-    }
 }
 
 fn procfs_fixture(root: &Path, pid: u32, start_ticks: u64, lock_path: &Path) {
@@ -400,10 +392,9 @@ fn zombie_process_with_inaccessible_descriptors_cannot_be_a_lock_holder() {
     let metadata = fs::metadata(&lock_path).expect("lock identity");
     let inspector = ProcFsInspector::under(process_root);
 
-    assert!(inspector
-        .process_holders(metadata.dev(), metadata.ino())
-        .expect("zombies cannot retain open descriptors")
-        .is_empty());
+    assert!(!inspector
+        .holds_inode(pid, metadata.dev(), metadata.ino())
+        .expect("a zombie cannot retain open descriptors"));
 }
 
 #[test]
@@ -462,14 +453,6 @@ impl ProcessInspector for MutatingInspector {
         file.write_all(b"changed during ownership check")
             .map_err(|error| error.to_string())?;
         Ok(true)
-    }
-
-    fn process_holders(
-        &self,
-        _device: u64,
-        _inode: u64,
-    ) -> Result<Vec<ManagedProcessIdentity>, String> {
-        Ok(Vec::new())
     }
 }
 

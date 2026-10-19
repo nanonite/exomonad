@@ -147,18 +147,6 @@ fn reconcile_once(
         Ok(snapshot) => snapshot,
         Err(error) => return uncertain(&paths.index_lock_file, &error.to_string()),
     };
-    let holders = match inspector.process_holders(snapshot.device, snapshot.inode) {
-        Ok(holders) => holders,
-        Err(reason) => return uncertain(&paths.index_lock_file, &reason),
-    };
-    if !holders.is_empty() {
-        return NativeLockRecoveryVerdict::Busy {
-            path: paths.index_lock_file.clone(),
-            owners: holders,
-            reason: "a process currently holds the native index lock inode".to_string(),
-        };
-    }
-
     let proof = match matching_proof(event_log, paths, &snapshot) {
         Ok(Some(proof)) => proof,
         Ok(None) => {
@@ -169,15 +157,16 @@ fn reconcile_once(
         }
         Err(reason) => return uncertain(&paths.index_lock_file, &reason),
     };
-    match inspector.start_time_ticks(proof.proof.owner.pid) {
-        Ok(Some(current)) if current == proof.proof.owner.start_time_ticks => {
+    match managed_scope_active(inspector, &proof.scope) {
+        Ok(true) => {
             return NativeLockRecoveryVerdict::Busy {
                 path: paths.index_lock_file.clone(),
                 owners: vec![proof.proof.owner],
-                reason: "the recorded managed Git process is still alive".to_string(),
+                reason: "the recorded managed Git process or a supervised helper is still active"
+                    .to_string(),
             };
         }
-        Ok(_) => {}
+        Ok(false) => {}
         Err(reason) => return uncertain(&paths.index_lock_file, &reason),
     }
     if snapshot.size != 0 {
@@ -215,30 +204,32 @@ fn matching_proof(
     let records = read_git_recovery_events(event_log, &[LOCK_HELD_EVENT], Duration::from_secs(2))?;
     let mut matches = Vec::new();
     for record in records {
+        if record
+            .data
+            .get("index_lock_file")
+            .and_then(serde_json::Value::as_str)
+            != Some(paths.index_lock_file.to_string_lossy().as_ref())
+        {
+            continue;
+        }
         let proof_version = record
             .data
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| "native lock ownership event has no supported schema".to_string())?;
         if proof_version != u64::from(PROOF_SCHEMA_VERSION) {
-            if record
-                .data
-                .get("index_lock_file")
-                .and_then(serde_json::Value::as_str)
-                == Some(paths.index_lock_file.to_string_lossy().as_ref())
-            {
-                return Err(
-                    "native lock ownership event uses an unsupported proof version".to_string(),
-                );
-            }
-            continue;
+            return Err(
+                "native lock ownership event uses an unsupported proof version".to_string(),
+            );
         }
         let proof: ManagedNativeLockProof = serde_json::from_value(record.data)
             .map_err(|_| "native lock ownership event is malformed".to_string())?;
         if proof_matches_paths(&proof, paths) && proof.lock == *snapshot {
+            let scope = matching_process_scope(event_log, paths, &proof)?;
             matches.push(LocatedProof {
                 event_id: record.event_id,
                 proof,
+                scope,
             });
         }
     }
@@ -248,7 +239,7 @@ fn matching_proof(
     Ok(matches.pop())
 }
 
-fn proof_matches_paths(
+pub(crate) fn proof_matches_paths(
     proof: &ManagedNativeLockProof,
     paths: &super::git_mutation::GitMutationPaths,
 ) -> bool {
@@ -269,6 +260,102 @@ fn proof_matches_paths(
 struct LocatedProof {
     event_id: String,
     proof: ManagedNativeLockProof,
+    scope: ManagedProcessScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedProcessScope {
+    owner: ManagedProcessIdentity,
+    process_group_id: u32,
+}
+
+fn matching_process_scope(
+    event_log: &EventLog,
+    paths: &super::git_mutation::GitMutationPaths,
+    proof: &ManagedNativeLockProof,
+) -> Result<ManagedProcessScope, String> {
+    const STARTED: &str = "git.process.started";
+    let records = read_git_recovery_events(event_log, &[STARTED], Duration::from_secs(2))?;
+    let mut matches = Vec::new();
+    for record in records {
+        if record
+            .data
+            .get("index_lock_file")
+            .and_then(serde_json::Value::as_str)
+            != Some(paths.index_lock_file.to_string_lossy().as_ref())
+            || record
+                .data
+                .get("operation_id_sha256")
+                .and_then(serde_json::Value::as_str)
+                != Some(proof.operation_id_sha256.as_str())
+        {
+            continue;
+        }
+        let process_id = record
+            .data
+            .get("process_id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "matching managed process record has no valid PID".to_string())?;
+        let start_time_ticks = record
+            .data
+            .get("process_start_identity")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "matching managed process record has no start identity".to_string())?;
+        let process_group_id = record
+            .data
+            .get("process_group_id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                "matching managed process record has no process-group identity".to_string()
+            })?;
+        if process_id != proof.owner.pid
+            || start_time_ticks != proof.owner.start_time_ticks
+            || process_group_id != process_id
+            || record
+                .data
+                .get("worktree_root")
+                .and_then(serde_json::Value::as_str)
+                != Some(paths.worktree_root.to_string_lossy().as_ref())
+            || record
+                .data
+                .get("git_dir")
+                .and_then(serde_json::Value::as_str)
+                != Some(paths.git_dir.to_string_lossy().as_ref())
+            || record
+                .data
+                .get("common_git_dir")
+                .and_then(serde_json::Value::as_str)
+                != Some(paths.common_git_dir.to_string_lossy().as_ref())
+            || record
+                .data
+                .get("index_file")
+                .and_then(serde_json::Value::as_str)
+                != Some(paths.index_file.to_string_lossy().as_ref())
+        {
+            return Err("matching managed process scope conflicts with native lock proof".into());
+        }
+        matches.push(ManagedProcessScope {
+            owner: proof.owner.clone(),
+            process_group_id,
+        });
+    }
+    if matches.len() != 1 {
+        return Err("native lock proof has no unique durable supervised process scope".into());
+    }
+    Ok(matches.remove(0))
+}
+
+fn managed_scope_active(
+    inspector: &dyn ProcessInspector,
+    scope: &ManagedProcessScope,
+) -> Result<bool, String> {
+    match inspector.start_time_ticks(scope.owner.pid)? {
+        Some(current) if current == scope.owner.start_time_ticks => return Ok(true),
+        Some(_) | None => {}
+    }
+    inspector.process_group_exists(scope.process_group_id)
 }
 
 fn reconcile_absent_lock(
@@ -390,9 +477,11 @@ fn verify_quarantine_receipt(
             if snapshot == audit.quarantined_lock
                 && same_quarantined_inode(&audit.proof.lock, &snapshot) =>
         {
-            if let Err(verdict) =
-                verify_quarantined_owner(inspector, &audit.proof, &snapshot, &expected)
-            {
+            let scope = match matching_process_scope(event_log, paths, &audit.proof) {
+                Ok(scope) => scope,
+                Err(reason) => return uncertain(&expected, &reason),
+            };
+            if let Err(verdict) = verify_quarantined_owner(inspector, &scope, &expected) {
                 return *verdict;
             }
             NativeLockRecoveryVerdict::Recovered(recovery_result(event_id, audit))
@@ -437,9 +526,11 @@ fn complete_interrupted_quarantine(
         }
         Err(error) => return uncertain(&expected, &error.to_string()),
     };
-    if let Err(verdict) =
-        verify_quarantined_owner(inspector, &audit.proof, &quarantined_lock, &expected)
-    {
+    let scope = match matching_process_scope(event_log, paths, &audit.proof) {
+        Ok(scope) => scope,
+        Err(reason) => return uncertain(&expected, &reason),
+    };
+    if let Err(verdict) = verify_quarantined_owner(inspector, &scope, &expected) {
         return *verdict;
     }
     let receipt = QuarantineReceiptData {
@@ -547,9 +638,7 @@ fn quarantine_proven_lock(
         }
         Err(error) => return uncertain(&quarantine_file, &error.to_string()),
     };
-    if let Err(verdict) =
-        verify_quarantined_owner(inspector, &audit.proof, &quarantined_lock, &quarantine_file)
-    {
+    if let Err(verdict) = verify_quarantined_owner(inspector, &located.scope, &quarantine_file) {
         return *verdict;
     }
     let receipt = QuarantineReceiptData {
@@ -613,38 +702,18 @@ fn verify_proof_event(
 
 fn verify_quarantined_owner(
     inspector: &dyn ProcessInspector,
-    proof: &ManagedNativeLockProof,
-    quarantined: &NativeGitLockSnapshot,
+    scope: &ManagedProcessScope,
     path: &Path,
 ) -> Result<(), Box<NativeLockRecoveryVerdict>> {
-    let holders = inspector
-        .process_holders(quarantined.device, quarantined.inode)
-        .map_err(|_| {
-            Box::new(uncertain(
-                path,
-                "cannot verify holders of the quarantined lock inode",
-            ))
-        })?;
-    if !holders.is_empty() {
-        return Err(Box::new(NativeLockRecoveryVerdict::Busy {
+    match managed_scope_active(inspector, scope) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(Box::new(NativeLockRecoveryVerdict::Busy {
             path: path.to_path_buf(),
-            owners: holders,
-            reason: "a process still holds the quarantined native index lock inode".to_string(),
-        }));
-    }
-    match inspector.start_time_ticks(proof.owner.pid) {
-        Ok(Some(current)) if current == proof.owner.start_time_ticks => {
-            Err(Box::new(NativeLockRecoveryVerdict::Busy {
-                path: path.to_path_buf(),
-                owners: vec![proof.owner.clone()],
-                reason: "the recorded managed Git process is still alive".to_string(),
-            }))
-        }
-        Ok(_) => Ok(()),
-        Err(_) => Err(Box::new(uncertain(
-            path,
-            "cannot revalidate the recorded managed Git process identity",
-        ))),
+            owners: vec![scope.owner.clone()],
+            reason: "the recorded managed Git process or a supervised helper is still active"
+                .to_string(),
+        })),
+        Err(reason) => Err(Box::new(uncertain(path, &reason))),
     }
 }
 
@@ -663,31 +732,23 @@ fn revalidate_before_quarantine(
     if current != proof.lock || current.size != 0 {
         return Err("native lock no longer matches the empty proven inode".to_string());
     }
-    let holders = inspector
-        .process_holders(current.device, current.inode)
-        .map_err(|_| "process visibility became incomplete before quarantine".to_string())?;
-    if !holders.is_empty() {
-        return Err("a process began holding the native lock before quarantine".to_string());
-    }
-    match inspector.start_time_ticks(proof.owner.pid) {
-        Ok(Some(start)) if start == proof.owner.start_time_ticks => {
-            return Err("the original managed Git process is still active".to_string());
-        }
-        Ok(_) => {}
-        Err(_) => return Err("the original process identity cannot be revalidated".to_string()),
-    }
     let matches = matching_proof(event_log, paths, &current)
         .map_err(|reason| format!("cannot revalidate ownership evidence ({reason})"))?;
-    if matches
-        .as_ref()
-        .is_none_or(|candidate| candidate.proof != *proof)
-    {
+    let Some(matching) = matches else {
         return Err("durable lock ownership evidence changed before quarantine".to_string());
+    };
+    if matching.proof != *proof {
+        return Err("durable lock ownership evidence changed before quarantine".to_string());
+    }
+    if managed_scope_active(inspector, &matching.scope)
+        .map_err(|_| "managed process scope cannot be revalidated before quarantine".to_string())?
+    {
+        return Err("the managed process or a supervised helper is still active".to_string());
     }
     Ok(())
 }
 
-fn check_quarantine_capacity(directory: &Path, target: &Path) -> Result<(), String> {
+pub(crate) fn check_quarantine_capacity(directory: &Path, target: &Path) -> Result<(), String> {
     if target.exists() {
         return Err("quarantine target already exists".to_string());
     }
@@ -709,7 +770,7 @@ fn quarantine_path(paths: &super::git_mutation::GitMutationPaths, proof_event_id
         .join(format!("{proof_digest}.lock"))
 }
 
-fn atomic_move_lock(
+pub(crate) fn atomic_move_lock(
     source: &Path,
     target: &Path,
     expected: &NativeGitLockSnapshot,
@@ -791,7 +852,7 @@ fn open_directory_nofollow(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn append_audit_once<T: Serialize>(
+pub(crate) fn append_audit_once<T: Serialize>(
     event_log: &EventLog,
     event_type: &str,
     data: &T,

@@ -25,6 +25,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/harness.sh
 source "$SCRIPT_DIR/../lib/harness.sh"
+# shellcheck source=tl-window-state.sh
+source "$SCRIPT_DIR/tl-window-state.sh"
 
 # This recovery fixture never invokes a model. Keep project scaffolding
 # deterministic when the isolated Codex home has no host model configuration.
@@ -120,35 +122,6 @@ assert_one_live_window() {
     [[ "$pane_dead" == "0" ]] || e2e_fail "repeat init returned without a live $role window"
 }
 
-assert_no_aggregate_tl_window() {
-    local context="$1"
-    local count
-    count="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc TL || true)"
-    [[ "$count" == "0" ]] || e2e_fail "$context left an unexpected TL window ($count found)"
-}
-
-wait_for_aggregate_tl_exit() {
-    local context="$1"
-    local count
-    for _ in $(seq 1 40); do
-        count="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc TL || true)"
-        [[ "$count" == "0" ]] && return
-        sleep 0.25
-    done
-    e2e_fail "$context did not exit its completed TL window ($count found)"
-}
-
-run_managed_lock_fixture() {
-    local test_name="$1"
-    (
-        cd "$PROJECT_ROOT"
-        nix develop --command env \
-            "EXOMONAD_INIT_LOCK_FIXTURE_PROJECT=$AGG_REPO" \
-            cargo test -p exomonad --test init_git_lock_readiness "$test_name" \
-                -- --ignored --exact --nocapture
-    )
-}
-
 capture_local_edit_state() {
     python3 - "$AGG_REPO" <<'PY'
 import hashlib
@@ -173,6 +146,95 @@ print(json.dumps({
     "unstaged_diff_sha256": hashlib.sha256(git("diff", "--binary")).hexdigest(),
     "untracked_sha256": hashlib.sha256((repo / "preserved-untracked.txt").read_bytes()).hexdigest(),
 }, sort_keys=True))
+PY
+}
+
+capture_index_and_worktree_bytes() {
+    python3 - "$AGG_REPO" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+paths = [
+    repo / ".git/index",
+    repo / "preserved-staged.txt",
+    repo / "preserved-unstaged.txt",
+    repo / "preserved-untracked.txt",
+]
+print(json.dumps({
+    str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in paths
+}, sort_keys=True))
+PY
+}
+
+capture_ledger_segments_fingerprint() {
+    python3 - "$1/.exo/ledger/segments" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+segments = Path(sys.argv[1])
+hasher = hashlib.sha256()
+for path in sorted(segments.glob("segment-*.jsonl")):
+    hasher.update(path.name.encode())
+    hasher.update(path.read_bytes())
+print(hasher.hexdigest())
+PY
+}
+
+assert_legacy_recovery_receipt() {
+    local project="$1"
+    local expected_lock_contents="$2"
+    local expected_fingerprint="$3"
+    python3 - "$project" "$expected_lock_contents" "$expected_fingerprint" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+expected = sys.argv[2].encode()
+expected_fingerprint = sys.argv[3]
+segments = repo / ".exo/ledger/segments"
+events = [
+    json.loads(line)
+    for path in sorted(segments.glob("segment-*.jsonl"))
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+intents = [event for event in events if event.get("type", event.get("event_type")) == "git.native_lock.legacy_recovery_intent"]
+receipts = [event for event in events if event.get("type", event.get("event_type")) == "git.native_lock.legacy_recovered"]
+assert len(intents) == 1, f"expected one legacy recovery intent, found {len(intents)}"
+assert len(receipts) == 1, f"expected one legacy recovery receipt, found {len(receipts)}"
+intent_id = intents[0].get("event_id", intents[0].get("id"))
+intent_data = intents[0].get("data")
+assert isinstance(intent_data, dict), "legacy recovery intent has no structured data"
+assert intent_data.get("recovery_fingerprint") == expected_fingerprint
+assert intent_data.get("writer_stopped_authorization") is True
+receipt = receipts[0]
+data = receipt.get("data")
+assert isinstance(data, dict), "legacy recovery receipt has no structured data"
+assert data.get("intent_event_id") == intent_id, "legacy receipt is not linked to its authorization intent"
+assert data.get("writer_stopped_authorization") is True, "receipt omitted explicit writer-stopped authorization"
+assert data.get("recovery_fingerprint") == expected_fingerprint, "receipt changed the approved fingerprint"
+assert data.get("index_lock_file") == str((repo / ".git/index.lock").resolve()), "receipt is for a different lock path"
+quarantine = Path(data["quarantine_file"])
+assert quarantine.read_bytes() == expected, "quarantined lock bytes differ from the approved legacy lock"
+assert not (repo / ".git/index.lock").exists(), "recovered native lock still exists"
+assert not any(
+    event.get("type", event.get("event_type")) == "git.native_lock.held"
+    and isinstance(event.get("data"), dict)
+    and event["data"].get("index_lock_file") == str((repo / ".git/index.lock").resolve())
+    for event in events
+), "legacy recovery fabricated a managed lock ownership proof"
+assert not any(
+    event.get("type", event.get("event_type")) == "git.native_lock.quarantined"
+    and isinstance(event.get("data"), dict)
+    and event["data"].get("index_lock_file") == str((repo / ".git/index.lock").resolve())
+    for event in events
+), "legacy recovery fabricated a managed quarantine receipt"
 PY
 }
 
@@ -592,10 +654,12 @@ e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR at remote head $AGGREGATE_REM
 LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
 printf '%s\n' "$LOCAL_EDIT_STATE_BEFORE" > "$AGG_DIR/local-edits-before.json"
 e2e_log "Seeded unrelated staged, unstaged, and untracked edits"
-run_managed_lock_fixture create_managed_orphan_lock_fixture_for_e2e
-[[ -e "$AGG_REPO/.git/index.lock" && ! -s "$AGG_REPO/.git/index.lock" ]] \
-    || e2e_fail "ProcessHandler did not leave the proven zero-byte native index lock"
-e2e_log "Created a managed orphan lock through the production ProcessHandler timeout path"
+LOCAL_INDEX_AND_FILES_BEFORE="$(capture_index_and_worktree_bytes)"
+LEGACY_LOCK_CONTENTS="legacy index lock evidence requiring explicit operator authorization"
+printf '%s' "$LEGACY_LOCK_CONTENTS" > "$AGG_REPO/.git/index.lock"
+[[ -s "$AGG_REPO/.git/index.lock" ]] \
+    || e2e_fail "failed to create the nonempty legacy native index lock"
+e2e_log "Created an unowned legacy lock without synthesizing a managed ownership proof"
 AGGREGATE_SERVER_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 cat > .exo/config.toml <<EOF
 shell_command = "bash"
@@ -622,49 +686,88 @@ read -r DEAD_TL_WINDOW _ <<< "$DEAD_TL_ID"
 
 CONTROLLER_EPOCH_PATH="$AGG_REPO/.exo/tl-loop/root.controller-epoch"
 PRE_RECOVERY_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
+PRE_REFUSAL_RUN_SHA256="$(sha256sum "$AGG_REPO/.exo/tl-loop/root/run.json" | cut -d ' ' -f 1)"
+PRE_REFUSAL_JOURNAL_SHA256="$(sha256sum "$AGG_REPO/.exo/tl-loop/root/action-journal.json" | cut -d ' ' -f 1)"
+PRE_REFUSAL_LEDGER_SHA256="$(capture_ledger_segments_fingerprint "$AGG_REPO")"
 AGG_INIT_STATUS=0
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
     > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
 rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init.log" \
     || { cat "$AGG_DIR/init.log"; e2e_fail "aggregate continuation binary/archive fingerprints did not match"; }
-if rg -Fq 'cannot inspect managed process descriptors (permission denied)' "$AGG_DIR/init.log"; then
-    [[ "$AGG_INIT_STATUS" -ne 0 ]] \
-        || e2e_fail "limited-inspection refusal returned success instead of a nonzero init status"
-    [[ -e "$AGG_REPO/.git/index.lock" && ! -s "$AGG_REPO/.git/index.lock" ]] \
-        || e2e_fail "limited-inspection refusal changed or removed the zero-byte native lock"
-    [[ "$(capture_local_edit_state)" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
-        || e2e_fail "limited-inspection refusal changed unrelated local edits"
-    [[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_BASE_SHA" ]] \
-        || e2e_fail "limited-inspection refusal changed the local parent branch"
-    CURRENT_TL_ID="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{window_id} #{pane_dead}' | awk '$1 == "TL" { print $2, $3; exit }')"
-    [[ "$CURRENT_TL_ID" == "$DEAD_TL_WINDOW 1" ]] \
-        || e2e_fail "limited-inspection refusal restarted or replaced the exited TL pane"
-    [[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc Server || true)" == "0" ]] \
-        || e2e_fail "limited-inspection refusal started a Server before Git readiness"
-    [[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc Watcher || true)" == "0" ]] \
-        || e2e_fail "limited-inspection refusal started a Watcher before Git readiness"
-    python3 - "$AGG_REPO" <<'PY' || e2e_fail "limited-inspection refusal recorded a false quarantine"
+[[ "$AGG_INIT_STATUS" -ne 0 ]] \
+    || e2e_fail "init succeeded despite an unattributed legacy lock"
+rg -Fq 'exomonad git-lock inspect --project-root' "$AGG_DIR/init.log" \
+    || { cat "$AGG_DIR/init.log"; e2e_fail "init omitted the supported legacy inspect command"; }
+rg -Fq 'exomonad git-lock apply --project-root' "$AGG_DIR/init.log" \
+    || { cat "$AGG_DIR/init.log"; e2e_fail "init omitted the supported legacy apply command"; }
+rg -Fq -- '--writers-stopped' "$AGG_DIR/init.log" \
+    || { cat "$AGG_DIR/init.log"; e2e_fail "init omitted explicit stopped-writer authorization"; }
+[[ "$(cat "$AGG_REPO/.git/index.lock")" == "$LEGACY_LOCK_CONTENTS" ]] \
+    || e2e_fail "initial init refusal changed the legacy lock bytes"
+[[ "$(capture_index_and_worktree_bytes)" == "$LOCAL_INDEX_AND_FILES_BEFORE" ]] \
+    || e2e_fail "initial init refusal changed the index or unrelated local files"
+[[ "$(sha256sum "$AGG_REPO/.exo/tl-loop/root/run.json" | cut -d ' ' -f 1)" == "$PRE_REFUSAL_RUN_SHA256" ]] \
+    || e2e_fail "initial init refusal changed the accepted root checkpoint"
+[[ "$(sha256sum "$AGG_REPO/.exo/tl-loop/root/action-journal.json" | cut -d ' ' -f 1)" == "$PRE_REFUSAL_JOURNAL_SHA256" ]] \
+    || e2e_fail "initial init refusal changed the durable action journal"
+[[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" == "$PRE_RECOVERY_CONTROLLER_EPOCH" ]] \
+    || e2e_fail "initial init refusal advanced the controller epoch"
+[[ "$(capture_ledger_segments_fingerprint "$AGG_REPO")" == "$PRE_REFUSAL_LEDGER_SHA256" ]] \
+    || e2e_fail "initial init refusal changed immutable ledger history"
+CURRENT_TL_ID="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{window_id} #{pane_dead}' | awk '$1 == "TL" { print $2, $3; exit }')"
+[[ "$CURRENT_TL_ID" == "$DEAD_TL_WINDOW 1" ]] \
+    || e2e_fail "legacy-lock refusal restarted or replaced the exited TL pane"
+[[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc Server || true)" == "0" ]] \
+    || e2e_fail "legacy-lock refusal started a Server before Git readiness"
+[[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc Watcher || true)" == "0" ]] \
+    || e2e_fail "legacy-lock refusal started a Watcher before Git readiness"
+HOME="$AGG_HOME" "$EXOMONAD_BIN" git-lock inspect --project-root "$AGG_REPO" \
+    > "$AGG_DIR/legacy-inspect.log" 2>&1 \
+    || { cat "$AGG_DIR/legacy-inspect.log"; e2e_fail "actual binary legacy inspection failed"; }
+LEGACY_FINGERPRINT="$(python3 -c 'import pathlib,re,sys; m=re.search(r"\"recovery_fingerprint\"\s*:\s*\"([0-9a-f]{64})\"", pathlib.Path(sys.argv[1]).read_text()); print(m.group(1) if m else "")' "$AGG_DIR/legacy-inspect.log")"
+[[ "$LEGACY_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] \
+    || { cat "$AGG_DIR/legacy-inspect.log"; e2e_fail "legacy inspection did not return a valid fingerprint"; }
+python3 - "$AGG_DIR/legacy-inspect.log" <<'PY' \
+    || e2e_fail "legacy inspection did not report a clear, unowned managed scope"
 import json
 import sys
 from pathlib import Path
 
-segments = Path(sys.argv[1]) / ".exo/ledger/segments"
-events = [
-    json.loads(line)
-    for path in segments.glob("segment-*.jsonl")
-    for line in path.read_text(encoding="utf-8").splitlines()
-    if line.strip()
-]
-assert not any(
-    event.get("type") == "git.native_lock.quarantined" for event in events
-)
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+report, _ = json.JSONDecoder().raw_decode(text)
+assert report["matching_managed_proof"] is False
+assert report["managed_activity"]["status"] == "clear"
+assert report["lock"]["size"] > 0
 PY
-    e2e_fail "positive init recovery is unavailable: this runtime cannot inspect /proc descriptors (permission denied); fail-closed refusal preserved the lock and local edits, and the complete fixture is retained at $WORK_DIR"
-fi
-assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "first aggregate init --continue"
-[[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || true)" == "1" ]] \
-    || { cat "$AGG_DIR/init.log"; e2e_fail "init did not report exactly one proven lock recovery"; }
+[[ "$(cat "$AGG_REPO/.git/index.lock")" == "$LEGACY_LOCK_CONTENTS" ]] \
+    || e2e_fail "read-only legacy inspection changed lock bytes"
+[[ "$(capture_index_and_worktree_bytes)" == "$LOCAL_INDEX_AND_FILES_BEFORE" ]] \
+    || e2e_fail "read-only legacy inspection changed the index or local files"
+[[ "$(capture_ledger_segments_fingerprint "$AGG_REPO")" == "$PRE_REFUSAL_LEDGER_SHA256" ]] \
+    || e2e_fail "read-only legacy inspection wrote recovery history"
+HOME="$AGG_HOME" "$EXOMONAD_BIN" git-lock apply --project-root "$AGG_REPO" \
+    --expected-fingerprint "$LEGACY_FINGERPRINT" --writers-stopped \
+    > "$AGG_DIR/legacy-apply.log" 2>&1 \
+    || { cat "$AGG_DIR/legacy-apply.log"; e2e_fail "authorized actual-binary legacy recovery failed"; }
+rg -Fq 'Legacy Git lock recovered:' "$AGG_DIR/legacy-apply.log" \
+    || { cat "$AGG_DIR/legacy-apply.log"; e2e_fail "legacy apply omitted its durable receipt"; }
+assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
+[[ "$(capture_local_edit_state)" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
+    || e2e_fail "legacy recovery changed staged, unstaged, or untracked edits"
+[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_BASE_SHA" ]] \
+    || e2e_fail "init refusal or legacy inspection moved the local parent branch"
+[[ "$(git -C "$AGG_REPO" rev-parse origin/main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
+    || e2e_fail "legacy recovery changed the remote merge observation"
+e2e_log "Actual init refused the legacy lock; compiled inspect/apply recovered approved fingerprint $LEGACY_FINGERPRINT"
+
+AGG_INIT_STATUS=0
+HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
+    "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+    > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
+assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --continue after legacy recovery"
+[[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || printf '0')" == "0" ]] \
+    || { cat "$AGG_DIR/init.log"; e2e_fail "legacy lock was misreported as a managed orphan"; }
 [[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
     || e2e_fail "first continuation published a new PR instead of adopting the existing aggregate"
 
@@ -802,7 +905,7 @@ LOCAL_EDIT_STATE_AFTER="$(capture_local_edit_state)"
     || e2e_fail "parent synchronization or bookkeeping changed unrelated local edits"
 [[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
     || e2e_fail "confirmed local synchronization did not advance main to the verified merge commit"
-run_managed_lock_fixture assert_managed_lock_quarantined_once_for_e2e
+assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
 
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "continuation repeated the aggregate merge instead of resuming local synchronization"
@@ -813,7 +916,7 @@ run_managed_lock_fixture assert_managed_lock_quarantined_once_for_e2e
 [[ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
     "$AGG_REPO/.exo/agents/architecture/invocation.json")" == "$ARCHITECTURE_INVOCATION_SHA256" ]] \
     || e2e_fail "completed architecture producer invocation changed during aggregate recovery"
-wait_for_aggregate_tl_exit "completed aggregate continuation"
+wait_for_aggregate_tl_terminal "completed aggregate continuation"
 RECOVERED_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
 [[ -n "$RECOVERED_CONTROLLER_EPOCH" ]] \
     || e2e_fail "completed aggregate continuation did not retain its controller epoch"
@@ -829,7 +932,7 @@ rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD
     || { cat "$AGG_DIR/init-repeat.log"; e2e_fail "repeat init did not attach using the verified binary/archive"; }
 assert_one_live_window Server
 assert_one_live_window Watcher
-assert_no_aggregate_tl_window "repeated init --continue"
+assert_aggregate_tl_terminal_unchanged "repeated init --continue" "$AGGREGATE_TERMINAL_TL_STATE"
 REPEAT_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
 [[ "$REPEAT_CONTROLLER_EPOCH" == "$RECOVERED_CONTROLLER_EPOCH" ]] \
     || e2e_fail "repeat init restarted the completed TL controller"
@@ -837,13 +940,13 @@ REPEAT_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
     || e2e_fail "repeated continuation duplicated the aggregate merge"
 [[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
     || e2e_fail "repeat init published a replacement aggregate PR"
-[[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init-repeat.log" || true)" == "0" ]] \
+[[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init-repeat.log" || printf '0')" == "0" ]] \
     || e2e_fail "repeated init reported an already-completed lock recovery again"
 LOCAL_EDIT_STATE_AFTER_REPEAT="$(capture_local_edit_state)"
 [[ "$LOCAL_EDIT_STATE_AFTER_REPEAT" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
     || e2e_fail "repeated continuation changed unrelated local edits"
-run_managed_lock_fixture assert_managed_lock_quarantined_once_for_e2e
-e2e_log "PASS: actual init --continue resumed a previously merged aggregate without repeating merge/publication/leaf work, recovered one proven lock, preserved local edits, completed bookkeeping, and dispatched Kani once (archive=$AGGREGATE_ARCHIVE_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
+assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
+e2e_log "PASS: actual init --continue resumed a previously merged aggregate without repeating merge/publication/leaf work, explicitly recovered one legacy lock, preserved local edits, completed bookkeeping, and dispatched Kani once (archive=$AGGREGATE_ARCHIVE_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
 
 echo ""
 echo "============================================"

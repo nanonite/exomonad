@@ -65,11 +65,11 @@ pub struct RecordedManagedNativeLockProof {
 pub(crate) trait ProcessInspector {
     fn start_time_ticks(&self, pid: u32) -> Result<Option<u64>, String>;
     fn holds_inode(&self, pid: u32, device: u64, inode: u64) -> Result<bool, String>;
-    fn process_holders(
-        &self,
-        device: u64,
-        inode: u64,
-    ) -> Result<Vec<ManagedProcessIdentity>, String>;
+    /// Check one recorded managed process group without enumerating unrelated host PIDs.
+    fn process_group_exists(&self, process_group_id: u32) -> Result<bool, String> {
+        let _ = process_group_id;
+        Ok(false)
+    }
 }
 
 /// Capture the process start identity immediately after spawning a managed Git child.
@@ -526,56 +526,27 @@ impl ProcessInspector for ProcFsInspector {
         Ok(false)
     }
 
-    fn process_holders(
-        &self,
-        device: u64,
-        inode: u64,
-    ) -> Result<Vec<ManagedProcessIdentity>, String> {
-        let processes = fs::read_dir(&self.root)
-            .map_err(|error| format!("cannot enumerate process identities ({})", error.kind()))?;
-        let mut holders = Vec::new();
-        for entry in processes {
-            let entry = entry.map_err(|error| {
-                format!("cannot enumerate process identities ({})", error.kind())
-            })?;
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse().ok())
-            else {
-                continue;
-            };
-            let Some(start_time_ticks) = self.start_time_ticks(pid)? else {
-                continue;
-            };
-            let holds_inode = match self.holds_inode(pid, device, inode) {
-                Ok(holds_inode) => holds_inode,
-                Err(reason) => match self.start_time_ticks(pid)? {
-                    None => continue,
-                    Some(current) if current == start_time_ticks => {
-                        return Err(format!("{reason} (pid {pid})"));
-                    }
-                    Some(_) => {
-                        return Err("process identity changed during descriptor inspection".into());
-                    }
-                },
-            };
-            let current_start_time = self.start_time_ticks(pid)?;
-            if current_start_time.is_none() {
-                continue;
+    fn process_group_exists(&self, process_group_id: u32) -> Result<bool, String> {
+        #[cfg(unix)]
+        {
+            use nix::errno::Errno;
+            use nix::sys::signal::killpg;
+            use nix::unistd::Pid;
+            let group = Pid::from_raw(
+                i32::try_from(process_group_id)
+                    .map_err(|_| "managed process group ID is out of range".to_string())?,
+            );
+            match killpg(group, None::<nix::sys::signal::Signal>) {
+                Ok(()) | Err(Errno::EPERM) => Ok(true),
+                Err(Errno::ESRCH) => Ok(false),
+                Err(error) => Err(format!("cannot inspect managed process group ({error})")),
             }
-            if current_start_time != Some(start_time_ticks) {
-                return Err("process identity changed during descriptor inspection".to_string());
-            }
-            if !holds_inode {
-                continue;
-            }
-            holders.push(ManagedProcessIdentity {
-                pid,
-                start_time_ticks,
-            });
         }
-        Ok(holders)
+        #[cfg(not(unix))]
+        {
+            let _ = process_group_id;
+            Err("managed process groups are unsupported on this platform".to_string())
+        }
     }
 }
 

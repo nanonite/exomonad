@@ -22,6 +22,7 @@ pub mod filesystem;
 pub mod forgejo;
 pub mod forgejo_ci;
 pub mod git;
+pub mod git_legacy_lock;
 pub mod git_lock_owner;
 pub mod git_lock_recovery;
 pub mod git_mutation;
@@ -95,6 +96,10 @@ pub use self::expected_events::{
 };
 pub use self::filesystem::FileSystemService;
 pub use self::forgejo::ForgejoClient;
+pub use self::git_legacy_lock::{
+    apply_legacy_git_lock, inspect_legacy_git_lock, GitFileFingerprint, LegacyGitLockApplyResult,
+    LegacyGitLockInspection, LegacyGitLockRecoveryReceipt, LegacyManagedActivity,
+};
 pub use self::git_lock_owner::{
     capture_managed_process_identity, record_managed_native_lock_proof,
     record_managed_native_lock_proof_for_identity,

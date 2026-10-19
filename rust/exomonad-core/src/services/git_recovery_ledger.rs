@@ -30,26 +30,107 @@ pub(crate) fn read_git_recovery_events(
     selected_types: &[&str],
     wait: Duration,
 ) -> Result<Vec<GitRecoveryEvent>, String> {
-    let segments_dir = event_log.ledger().segments_dir().to_path_buf();
-    let _ledger_read_lock = acquire_shared_ledger_lock(&segments_dir, wait)?;
-    let segments = event_log
-        .ledger()
-        .segments()
-        .map_err(|error| format!("cannot enumerate Git recovery ledger segments: {error:?}"))?;
+    read_git_recovery_events_at(event_log.ledger().segments_dir(), selected_types, wait)
+}
+
+/// Read an existing ledger without creating its directory or append lock.
+pub(crate) fn read_git_recovery_events_at(
+    segments_dir: &Path,
+    selected_types: &[&str],
+    wait: Duration,
+) -> Result<Vec<GitRecoveryEvent>, String> {
+    let metadata = match fs::symlink_metadata(segments_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("TL ledger segments path is not a regular directory".to_string());
+        }
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect TL ledger directory: {}",
+                error.kind()
+            ))
+        }
+    };
+    let _ledger_read_lock = acquire_existing_shared_ledger_lock(segments_dir, wait)?;
+    let segments = read_segment_paths(segments_dir)?;
     let mut selected = Vec::new();
     for segment in segments {
         read_segment(&segment, selected_types, &mut selected)?;
     }
+    let current = fs::symlink_metadata(segments_dir).map_err(|error| {
+        format!(
+            "TL ledger directory changed while reading: {}",
+            error.kind()
+        )
+    })?;
+    if !same_file(&metadata, &current) {
+        return Err("TL ledger directory changed while reading recovery evidence".to_string());
+    }
     Ok(selected)
 }
 
-fn acquire_shared_ledger_lock(segments_dir: &Path, wait: Duration) -> Result<Flock<File>, String> {
-    let lock_path = segments_dir.join(".append.lock");
-    let mut file = open_append_lock(&lock_path)?;
+fn read_segment_paths(segments_dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut paths = fs::read_dir(segments_dir)
+        .map_err(|error| format!("cannot enumerate TL ledger segments: {}", error.kind()))?
+        .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("jsonl"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn acquire_existing_shared_ledger_lock(
+    segments_dir: &Path,
+    wait: Duration,
+) -> Result<Option<Flock<File>>, String> {
+    let path = segments_dir.join(".append.lock");
+    let before = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("TL ledger append lock is not a regular file".to_string());
+        }
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if read_segment_paths(segments_dir)?.is_empty() {
+                return Ok(None);
+            }
+            return Err(
+                "TL ledger append lock is missing; process history is uncertain".to_string(),
+            );
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect TL ledger append lock: {}",
+                error.kind()
+            ))
+        }
+    };
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("cannot open TL ledger append lock: {}", error.kind()))?;
+    let opened = file.metadata().map_err(|error| {
+        format!(
+            "cannot inspect opened TL ledger append lock: {}",
+            error.kind()
+        )
+    })?;
+    let current = fs::symlink_metadata(&path)
+        .map_err(|error| format!("TL ledger append lock changed: {}", error.kind()))?;
+    if !same_file(&before, &opened) || !same_file(&before, &current) {
+        return Err("TL ledger append lock changed while opening".to_string());
+    }
     let deadline = Instant::now() + wait;
+    let mut file = file;
     loop {
         match Flock::lock(file, FlockArg::LockSharedNonblock) {
-            Ok(lock) => return Ok(lock),
+            Ok(lock) => return Ok(Some(lock)),
             Err((returned, error)) => {
                 file = returned;
                 if error == Errno::EWOULDBLOCK || error == Errno::EAGAIN {
@@ -67,41 +148,6 @@ fn acquire_shared_ledger_lock(segments_dir: &Path, wait: Duration) -> Result<Flo
             }
         }
     }
-}
-
-fn open_append_lock(path: &Path) -> Result<File, String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "TL ledger append lock has no parent".to_string())?;
-    let directory = fs::symlink_metadata(parent)
-        .map_err(|error| format!("cannot inspect TL ledger directory: {}", error.kind()))?;
-    if directory.file_type().is_symlink() || !directory.is_dir() {
-        return Err("TL ledger directory is not a regular directory".to_string());
-    }
-    let mut options = OpenOptions::new();
-    options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| format!("cannot open TL ledger append lock: {}", error.kind()))?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot recheck TL ledger append lock: {}", error.kind()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("TL ledger append lock is not a regular file".to_string());
-    }
-    let opened = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect TL ledger append lock: {}", error.kind()))?;
-    if !same_file(&metadata, &opened) {
-        return Err("TL ledger append lock changed while opening".to_string());
-    }
-    Ok(file)
 }
 
 fn read_segment(

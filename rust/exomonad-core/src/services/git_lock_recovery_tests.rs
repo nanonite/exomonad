@@ -10,8 +10,11 @@ use crate::services::git_lock_owner::{
 use crate::services::git_mutation::{
     GitMutationError, GitMutationLease, GitMutationResource, GitMutationSafety,
 };
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::fs::{self, File};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
@@ -69,9 +72,9 @@ impl Fixture {
             .expect("index mutation lease");
         let mut child = managed_lock_holder(&lock_path);
         let owner = capture_managed_process_identity(&child).expect("child process identity");
+        record_process_scope(&lease, &owner, &self.event_log);
         let recorded = record_until_proven(&lease, &mut child, &owner, &self.event_log);
-        let _ = child.kill();
-        child.wait().expect("reap managed lock holder");
+        kill_managed_group(&mut child);
         let recorded = recorded.expect("proof the managed child held the exact lock inode");
         (lease, recorded.proof, recorded.event_id)
     }
@@ -101,14 +104,53 @@ fn git(directory: &Path, args: &[&str]) -> Output {
 }
 
 fn managed_lock_holder(lock_path: &Path) -> Child {
-    Command::new("sh")
-        .args(["-c", "exec 9<\"$1\"; sleep 30", "git-lock-holder"])
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "exec 9<\"$1\"; sleep 30 & wait", "git-lock-holder"])
         .arg(lock_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn managed lock holder")
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    command.spawn().expect("spawn managed lock holder")
+}
+
+fn kill_managed_group(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let group = nix::unistd::Pid::from_raw(child.id() as i32);
+        let _ = nix::sys::signal::killpg(group, Some(nix::sys::signal::Signal::SIGKILL));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn record_process_scope(
+    lease: &GitMutationLease,
+    owner: &ManagedProcessIdentity,
+    event_log: &EventLog,
+) {
+    let paths = &lease.paths;
+    let operation_id_sha256 = format!("{:x}", Sha256::digest(lease.operation_id.as_bytes()));
+    event_log
+        .append(
+            "git.process.started",
+            "git-process",
+            &serde_json::json!({
+                "schema_version": 1,
+                "operation_id_sha256": operation_id_sha256,
+                "worktree_root": paths.worktree_root,
+                "git_dir": paths.git_dir,
+                "common_git_dir": paths.common_git_dir,
+                "index_file": paths.index_file,
+                "index_lock_file": paths.index_lock_file,
+                "process_id": owner.pid,
+                "process_start_identity": owner.start_time_ticks,
+                "process_group_id": owner.pid,
+            }),
+        )
+        .expect("persist managed process scope");
 }
 
 fn record_until_proven(
@@ -136,16 +178,17 @@ enum OwnerState {
     Gone,
     Alive,
     Reused,
+    Inaccessible,
 }
 
 struct TableInspector {
     owner: ManagedProcessIdentity,
     owner_state: OwnerState,
-    holders: Vec<ManagedProcessIdentity>,
-    inaccessible: bool,
-    holder_calls: Cell<usize>,
-    report_holders_for_calls: usize,
-    mutation_on_call: Option<(usize, PathBuf, Vec<u8>)>,
+    group_active: bool,
+    group_inaccessible: bool,
+    group_calls: Cell<usize>,
+    active_group_for_calls: usize,
+    mutation_on_group_call: Option<(usize, PathBuf, Vec<u8>)>,
 }
 
 impl TableInspector {
@@ -153,17 +196,17 @@ impl TableInspector {
         Self {
             owner: owner.clone(),
             owner_state: OwnerState::Gone,
-            holders: Vec::new(),
-            inaccessible: false,
-            holder_calls: Cell::new(0),
-            report_holders_for_calls: usize::MAX,
-            mutation_on_call: None,
+            group_active: false,
+            group_inaccessible: false,
+            group_calls: Cell::new(0),
+            active_group_for_calls: 0,
+            mutation_on_group_call: None,
         }
     }
 
-    fn holders(owner: &ManagedProcessIdentity, holders: Vec<ManagedProcessIdentity>) -> Self {
+    fn active_helper(owner: &ManagedProcessIdentity) -> Self {
         Self {
-            holders,
+            group_active: true,
             ..Self::gone(owner)
         }
     }
@@ -178,6 +221,7 @@ impl ProcessInspector for TableInspector {
             OwnerState::Gone => Ok(None),
             OwnerState::Alive => Ok(Some(self.owner.start_time_ticks)),
             OwnerState::Reused => Ok(Some(self.owner.start_time_ticks + 1)),
+            OwnerState::Inaccessible => Err("managed process identity is permission denied".into()),
         }
     }
 
@@ -185,28 +229,19 @@ impl ProcessInspector for TableInspector {
         Ok(false)
     }
 
-    fn process_holders(
-        &self,
-        _device: u64,
-        _inode: u64,
-    ) -> Result<Vec<ManagedProcessIdentity>, String> {
-        if self.inaccessible {
-            return Err(
-                "cannot inspect one or more process descriptor directories (permission denied)"
-                    .to_string(),
-            );
+    fn process_group_exists(&self, process_group_id: u32) -> Result<bool, String> {
+        assert_eq!(process_group_id, self.owner.pid);
+        if self.group_inaccessible {
+            return Err("cannot inspect relevant managed process group (permission denied)".into());
         }
-        let call = self.holder_calls.get() + 1;
-        self.holder_calls.set(call);
-        if let Some((mutation_call, path, contents)) = &self.mutation_on_call {
+        let call = self.group_calls.get() + 1;
+        self.group_calls.set(call);
+        if let Some((mutation_call, path, contents)) = &self.mutation_on_group_call {
             if call == *mutation_call {
                 fs::write(path, contents).map_err(|error| error.kind().to_string())?;
             }
         }
-        if call <= self.report_holders_for_calls {
-            return Ok(self.holders.clone());
-        }
-        Ok(Vec::new())
+        Ok(self.group_active || call <= self.active_group_for_calls)
     }
 }
 
@@ -285,7 +320,10 @@ fn proven_empty_managed_orphan_is_quarantined_and_replay_adopts_one_receipt() {
         status_before
     );
     let event_count = fixture.event_log.ledger().read_events().unwrap().len();
-    assert_eq!(event_count, 3, "proof, intent, and completion are durable");
+    assert_eq!(
+        event_count, 4,
+        "process start, proof, intent, and completion are durable"
+    );
 
     let replay = reconcile(&fixture, &lease, &inspector, Duration::ZERO);
     assert_eq!(replay, NativeLockRecoveryVerdict::Recovered(receipt));
@@ -296,7 +334,7 @@ fn proven_empty_managed_orphan_is_quarantined_and_replay_adopts_one_receipt() {
 }
 
 #[test]
-fn active_managed_owner_and_external_holder_are_busy_without_mutation() {
+fn active_managed_owner_and_surviving_supervised_helper_are_busy() {
     let fixture = Fixture::new();
     let (lease, proof, _) = fixture.proven_lock(b"");
     let lock_path = fixture.lock_path();
@@ -311,66 +349,58 @@ fn active_managed_owner_and_external_holder_are_busy_without_mutation() {
     ));
     assert_eq!(fs::read(&lock_path).unwrap(), before);
 
-    let external_owner = ManagedProcessIdentity {
-        pid: proof.owner.pid + 100,
-        start_time_ticks: 123,
-    };
-    let external = TableInspector::holders(&proof.owner, vec![external_owner]);
+    let helper = TableInspector::active_helper(&proof.owner);
     assert!(matches!(
-        reconcile(&fixture, &lease, &external, Duration::ZERO),
+        reconcile(&fixture, &lease, &helper, Duration::ZERO),
         NativeLockRecoveryVerdict::Busy { .. }
     ));
     assert_eq!(fs::read(&lock_path).unwrap(), before);
 }
 
 #[test]
-fn production_process_scanner_detects_an_external_open_lock_descriptor() {
+fn production_scoped_inspection_ignores_unrelated_protected_host_processes() {
     let fixture = Fixture::new();
+    let (lease, _, _) = fixture.proven_lock(b"");
+    let inspector = ProcFsInspector::default();
+    let verdict = reconcile(&fixture, &lease, &inspector, Duration::ZERO);
+    assert!(matches!(verdict, NativeLockRecoveryVerdict::Recovered(_)));
+    assert!(!fixture.lock_path().exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn production_scoped_inspection_holds_recovery_for_a_surviving_supervised_helper() {
+    let fixture = Fixture::new();
+    let lock_path = fixture.lock_path();
     fixture.empty_lock();
     let lease = fixture.lease();
-    let lock_path = fixture.lock_path();
-    let proc_root = fixture._temp.path().join("synthetic-proc");
-    let pid = 4819;
-    let process_dir = proc_root.join(pid.to_string());
-    fs::create_dir_all(process_dir.join("fd")).unwrap();
-    let stat_fields = (0..19)
-        .map(|index| {
-            if index == 18 {
-                "551".to_string()
-            } else if index == 1 {
-                "1".to_string()
-            } else {
-                "0".to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    fs::write(
-        process_dir.join("stat"),
-        format!("{pid} (external writer) S {stat_fields}\n"),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&lock_path, process_dir.join("fd/4")).unwrap();
-    let inspector = ProcFsInspector::under(proc_root);
+    let mut child = managed_lock_holder(&lock_path);
+    let owner = capture_managed_process_identity(&child).expect("managed owner identity");
+    record_process_scope(&lease, &owner, &fixture.event_log);
+    let proof = record_until_proven(&lease, &mut child, &owner, &fixture.event_log)
+        .expect("managed lock proof")
+        .proof;
 
-    let verdict = reconcile(&fixture, &lease, &inspector, Duration::ZERO);
-    let NativeLockRecoveryVerdict::Busy { owners, .. } = verdict else {
-        panic!("expected production process scanner to report Busy, got {verdict:?}");
-    };
-    assert_eq!(
-        owners,
-        vec![ManagedProcessIdentity {
-            pid,
-            start_time_ticks: 551
-        }]
+    child.kill().expect("stop process-group leader");
+    child.wait().expect("reap process-group leader");
+    let verdict = reconcile(
+        &fixture,
+        &lease,
+        &ProcFsInspector::default(),
+        Duration::ZERO,
+    );
+    assert!(
+        matches!(verdict, NativeLockRecoveryVerdict::Busy { .. }),
+        "the recorded process group still has a helper: {verdict:?}"
     );
     assert!(fixture.lock_path().exists());
-    assert!(fixture.event_log.ledger().read_events().unwrap().is_empty());
+
+    let group = nix::unistd::Pid::from_raw(proof.owner.pid as i32);
+    let _ = nix::sys::signal::killpg(group, Some(nix::sys::signal::Signal::SIGKILL));
 }
 
 #[test]
-fn legacy_unknown_owner_and_partial_process_visibility_are_unchanged_uncertainty() {
+fn legacy_unknown_owner_and_relevant_scope_permission_denial_remain_uncertain() {
     let fixture = Fixture::new();
     fixture.empty_lock();
     let lease = fixture.lease();
@@ -388,20 +418,38 @@ fn legacy_unknown_owner_and_partial_process_visibility_are_unchanged_uncertainty
 
     let second = Fixture::new();
     let (_, proof, _) = second.proven_lock(b"");
-    let partial = TableInspector {
-        inaccessible: true,
+    let inaccessible_owner = TableInspector {
+        owner_state: OwnerState::Inaccessible,
         ..TableInspector::gone(&proof.owner)
     };
     let lock_before = fs::read(second.lock_path()).unwrap();
     assert!(matches!(
-        reconcile(&second, &second.lease(), &partial, Duration::ZERO),
+        reconcile(
+            &second,
+            &second.lease(),
+            &inaccessible_owner,
+            Duration::ZERO
+        ),
+        NativeLockRecoveryVerdict::Uncertain { .. }
+    ));
+    let inaccessible_group = TableInspector {
+        group_inaccessible: true,
+        ..TableInspector::gone(&proof.owner)
+    };
+    assert!(matches!(
+        reconcile(
+            &second,
+            &second.lease(),
+            &inaccessible_group,
+            Duration::ZERO
+        ),
         NativeLockRecoveryVerdict::Uncertain { .. }
     ));
     assert_eq!(fs::read(second.lock_path()).unwrap(), lock_before);
 }
 
 #[test]
-fn pid_reuse_is_gone_only_when_no_process_holds_the_proven_inode() {
+fn pid_reuse_is_gone_only_when_recorded_process_group_is_inactive() {
     let fixture = Fixture::new();
     let (lease, proof, _) = fixture.proven_lock(b"");
     let reused = TableInspector {
@@ -415,13 +463,11 @@ fn pid_reuse_is_gone_only_when_no_process_holds_the_proven_inode() {
 
     let second = Fixture::new();
     let (lease, proof, _) = second.proven_lock(b"");
-    let replacement_holds_inode = TableInspector::holders(
-        &proof.owner,
-        vec![ManagedProcessIdentity {
-            pid: proof.owner.pid,
-            start_time_ticks: proof.owner.start_time_ticks + 1,
-        }],
-    );
+    let replacement_holds_inode = TableInspector {
+        owner_state: OwnerState::Reused,
+        group_active: true,
+        ..TableInspector::gone(&proof.owner)
+    };
     assert!(matches!(
         reconcile(&second, &lease, &replacement_holds_inode, Duration::ZERO),
         NativeLockRecoveryVerdict::Busy { .. }
@@ -520,7 +566,7 @@ fn path_swap_and_external_writer_race_are_rechecked_before_quarantine() {
     let (lease, proof, _) = second.proven_lock(b"");
     let changed_lock = second.lock_path();
     let race = TableInspector {
-        mutation_on_call: Some((2, changed_lock.clone(), b"external writer raced".to_vec())),
+        mutation_on_group_call: Some((2, changed_lock.clone(), b"external writer raced".to_vec())),
         ..TableInspector::gone(&proof.owner)
     };
     assert!(matches!(
@@ -535,15 +581,15 @@ fn bounded_wait_retries_after_busy_owner_then_recovers_once() {
     let fixture = Fixture::new();
     let (lease, proof, _) = fixture.proven_lock(b"");
     let inspector = TableInspector {
-        holders: vec![proof.owner.clone()],
-        report_holders_for_calls: 1,
+        group_active: false,
+        active_group_for_calls: 1,
         ..TableInspector::gone(&proof.owner)
     };
     let started = std::time::Instant::now();
     let result = reconcile(&fixture, &lease, &inspector, Duration::from_millis(120));
     assert!(matches!(result, NativeLockRecoveryVerdict::Recovered(_)));
     assert!(started.elapsed() >= Duration::from_millis(20));
-    assert!(inspector.holder_calls.get() >= 3);
+    assert!(inspector.group_calls.get() >= 3);
 }
 
 #[test]
@@ -552,7 +598,10 @@ fn bounded_wait_exhaustion_returns_busy_without_removing_lock() {
     let (lease, proof, _) = fixture.proven_lock(b"");
     let lock_path = fixture.lock_path();
     let before = fs::read(&lock_path).unwrap();
-    let inspector = TableInspector::holders(&proof.owner, vec![proof.owner.clone()]);
+    let inspector = TableInspector {
+        group_active: true,
+        ..TableInspector::gone(&proof.owner)
+    };
     let started = std::time::Instant::now();
 
     let result = reconcile(&fixture, &lease, &inspector, Duration::from_millis(80));
@@ -618,6 +667,7 @@ fn interrupted_rename_waits_until_the_original_writer_is_gone() {
     let lease = fixture.lease();
     let mut child = managed_lock_holder(&lock_path);
     let owner = capture_managed_process_identity(&child).expect("child process identity");
+    record_process_scope(&lease, &owner, &fixture.event_log);
     let recorded = record_until_proven(&lease, &mut child, &owner, &fixture.event_log)
         .expect("record live lock owner");
     let proof = recorded.proof;
@@ -641,7 +691,7 @@ fn interrupted_rename_waits_until_the_original_writer_is_gone() {
 
     let busy = TableInspector {
         owner_state: OwnerState::Alive,
-        holders: vec![proof.owner.clone()],
+        group_active: true,
         ..TableInspector::gone(&proof.owner)
     };
     assert!(matches!(
@@ -660,8 +710,7 @@ fn interrupted_rename_waits_until_the_original_writer_is_gone() {
         0
     );
 
-    child.kill().expect("stop original writer");
-    child.wait().expect("reap original writer");
+    kill_managed_group(&mut child);
     assert!(matches!(
         reconcile(
             &fixture,

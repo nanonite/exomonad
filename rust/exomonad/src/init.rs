@@ -2947,15 +2947,33 @@ fn classify_init_git_readiness(
             );
         }
         NativeLockRecoveryVerdict::Uncertain { path, reason } => {
+            let legacy_route = if reason.contains("no durable managed-process proof") {
+                format!(
+                    " This is a legacy lock without retained ExoMonad ownership proof. Inspect it locally with `exomonad git-lock inspect --project-root {}`. If inspection says the evidence is eligible, stop all repository Git writers, copy its fingerprint, and run `exomonad git-lock apply --project-root {} --expected-fingerprint <fingerprint> --writers-stopped`; then retry `exomonad init --continue`.",
+                    shell_quote_path(project_dir),
+                    shell_quote_path(project_dir),
+                )
+            } else if reason.contains("permission denied")
+                || reason.contains("cannot inspect managed")
+            {
+                " Relevant recorded managed-process evidence is inaccessible; recovery remains blocked until that exact process scope can be inspected. Then retry `exomonad init --continue`.".to_string()
+            } else {
+                " Recovery evidence changed or is incomplete; resolve the identified discrepancy, inspect again after the relevant writer state is settled, then retry `exomonad init --continue`.".to_string()
+            };
             anyhow::bail!(
-                "Git mutation readiness is uncertain at {:?} (native index lock {:?}): {}. The lock and all evidence are retained; audit records are under {:?}. Do not remove or overwrite the lock. No existing command authorizes recovery without a matching managed-process proof; preserve these files and escalate for a supported recovery procedure. Retry `exomonad init --continue` only after that procedure resolves the lock.",
+                "Git mutation readiness is uncertain at {:?} (native index lock {:?}): {}. The lock and all evidence are retained; audit records are under {:?}. Do not remove or overwrite the lock.{}",
                 path,
                 native_index_lock,
                 reason,
-                project_dir.join(".exo/ledger/segments")
+                project_dir.join(".exo/ledger/segments"),
+                legacy_route
             );
         }
     }
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 fn init_git_lease_error(
@@ -12045,6 +12063,9 @@ mod tests {
         assert!(diagnostic.contains(&format!("{:?}", lock)));
         assert!(diagnostic.contains("ledger"));
         assert!(diagnostic.contains("Do not remove or overwrite the lock"));
+        assert!(diagnostic.contains("exomonad git-lock inspect --project-root"));
+        assert!(diagnostic.contains("exomonad git-lock apply --project-root"));
+        assert!(diagnostic.contains("--writers-stopped"));
         assert!(diagnostic.contains("exomonad init --continue"));
         assert!(lock.exists());
         assert_eq!(std::fs::read(&lock).unwrap(), b"");

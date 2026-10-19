@@ -22,6 +22,7 @@ mod dashboard;
 mod experiment_analysis;
 #[cfg(debug_assertions)]
 mod experiment_harness;
+mod git_lock;
 mod init;
 mod logging;
 mod logs;
@@ -70,6 +71,9 @@ enum Commands {
 
     /// Inspect or safely clean stale managed-agent resources through the server.
     Clean(clean::CleanArgs),
+
+    /// Inspect or explicitly recover a native Git index lock without a server.
+    GitLock(git_lock::GitLockArgs),
 
     /// Inspect and reclaim historical ExoMonad Codex hook trust residue.
     ///
@@ -565,6 +569,10 @@ async fn main() -> Result<()> {
 
         Commands::Clean(args) => {
             return clean::run(args).await;
+        }
+
+        Commands::GitLock(args) => {
+            return git_lock::run(args);
         }
 
         Commands::Plan(args) => {
