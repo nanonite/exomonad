@@ -228,7 +228,7 @@ pub fn apply_legacy_git_lock(
         .resolve_paths_with_index_override(worktree, None)
         .map_err(|error| error.to_string())?;
     if let Some(receipt) = find_completed_receipt(event_log, expected_fingerprint, &paths)? {
-        return verify_applied_receipt(receipt, true);
+        return verify_applied_receipt(receipt, &paths.index_file, &paths.index_lock_file, true);
     }
     let operation_id = format!("legacy-lock-{}", &expected_fingerprint[..32]);
     let lease = safety
@@ -242,7 +242,12 @@ pub fn apply_legacy_git_lock(
         &paths,
     )? {
         InterruptedLegacyRecovery::Quarantined(receipt) => {
-            return verify_applied_receipt(receipt, true);
+            return verify_applied_receipt(
+                receipt,
+                &paths.index_file,
+                &paths.index_lock_file,
+                true,
+            );
         }
         pending => pending,
     };
@@ -298,7 +303,7 @@ pub fn apply_legacy_git_lock(
     }
     let receipt =
         append_recovery_receipt(event_log, &data, &intent_event_id, &before.index_lock_file)?;
-    verify_applied_receipt(receipt, false)
+    verify_applied_receipt(receipt, &before.index_file, &before.index_lock_file, false)
 }
 
 fn ensure_eligible(inspection: &LegacyGitLockInspection, expected: &str) -> Result<(), String> {
@@ -805,6 +810,7 @@ fn complete_interrupted_recovery(
     }
     match snapshot_lock(&data.quarantine_file) {
         Ok(quarantined) if same_lock_inode(&data.original_lock, &quarantined) => {
+            validate_interrupted_quarantine(paths, &data)?;
             append_recovery_receipt(event_log, &data, &intent_id, &data.index_lock_file)
                 .map(InterruptedLegacyRecovery::Quarantined)
         }
@@ -817,6 +823,32 @@ fn complete_interrupted_recovery(
             "cannot inspect interrupted legacy quarantine target: {error}"
         )),
     }
+}
+
+fn validate_interrupted_quarantine(
+    paths: &crate::services::GitMutationPaths,
+    data: &LegacyRecoveryData,
+) -> Result<(), String> {
+    match fs::symlink_metadata(&paths.index_lock_file) {
+        Ok(_) => {
+            return Err(
+                "native index lock remains after interrupted quarantine; recovery receipt withheld"
+                    .into(),
+            )
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot verify native index lock was quarantined: {}",
+                error.kind()
+            ))
+        }
+    }
+    let current_index = fingerprint_file(&paths.index_file)?;
+    if current_index != data.index {
+        return Err("active Git index changed since legacy recovery was authorized".into());
+    }
+    Ok(())
 }
 
 fn snapshot_is_missing(error: &GitMutationError) -> bool {
@@ -917,12 +949,36 @@ fn recovery_receipt(
 
 fn verify_applied_receipt(
     receipt: LegacyGitLockRecoveryReceipt,
+    index_file: &Path,
+    index_lock_file: &Path,
     already_applied: bool,
 ) -> Result<LegacyGitLockApplyResult, String> {
     let quarantined = snapshot_lock(&receipt.quarantine_file)
         .map_err(|error| format!("retained legacy lock receipt cannot be verified: {error}"))?;
     if !same_lock_inode(&receipt.original_lock, &quarantined) {
         return Err("retained legacy lock differs from its durable recovery receipt".into());
+    }
+    match fs::symlink_metadata(index_lock_file) {
+        Ok(_) => {
+            let current = snapshot_lock(index_lock_file)
+                .map_err(|error| format!("cannot verify retained legacy recovery lock: {error}"))?;
+            if same_lock_inode(&receipt.original_lock, &current) {
+                return Err(
+                    "retained legacy recovery receipt is unsafe while its original native index lock remains"
+                        .into(),
+                );
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot verify retained legacy recovery removed the native lock: {}",
+                error.kind()
+            ))
+        }
+    }
+    if fingerprint_file(index_file)? != receipt.index {
+        return Err("retained legacy recovery receipt has stale Git index evidence".into());
     }
     Ok(LegacyGitLockApplyResult {
         receipt,

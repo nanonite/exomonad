@@ -7,6 +7,7 @@ use crate::services::git_lock_owner::{ManagedProcessIdentity, ProcFsInspector, P
 use crate::services::git_lock_recovery::atomic_move_lock;
 use crate::services::git_mutation::{GitMutationResource, GitMutationSafety};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -95,15 +96,15 @@ fn dry_run_is_read_only_and_fingerprints_paths_index_and_nonempty_lock() {
     assert!(report
         .operator_scope
         .contains("host-wide external-process census is not performed"));
-    assert_eq!(fs::read(index).unwrap(), index_before);
+    assert_eq!(fs::read(&index).unwrap(), index_before);
     assert_eq!(fs::read(fixture.lock_path()).unwrap(), lock_before);
-    assert_eq!(
-        git_output(&fixture.root, &["status", "--porcelain"]),
-        status_before
-    );
     assert_eq!(
         fixture.event_log.ledger().read_events().unwrap().len(),
         events_before
+    );
+    assert_eq!(
+        git_output(&fixture.root, &["status", "--porcelain"]),
+        status_before
     );
 }
 
@@ -236,11 +237,7 @@ fn authorized_apply_quarantines_once_preserves_edits_and_never_removes_replaceme
     assert!(!result.already_applied);
     assert!(!fixture.lock_path().exists());
     assert_eq!(fs::read(&result.receipt.quarantine_file).unwrap(), old_lock);
-    assert_eq!(fs::read(index).unwrap(), index_before);
-    assert_eq!(
-        git_output(&fixture.root, &["status", "--porcelain"]),
-        status_before
-    );
+    assert_eq!(fs::read(&index).unwrap(), index_before);
     let history = fixture.event_log.ledger().read_events().unwrap();
     assert_eq!(
         history
@@ -278,6 +275,10 @@ fn authorized_apply_quarantines_once_preserves_edits_and_never_removes_replaceme
     assert_eq!(
         replay.receipt.receipt_event_id,
         result.receipt.receipt_event_id
+    );
+    assert_eq!(
+        git_output(&fixture.root, &["status", "--porcelain"]),
+        status_before
     );
     let history = fixture.event_log.ledger().read_events().unwrap();
     assert_eq!(
@@ -484,6 +485,75 @@ fn apply_recovers_crash_after_quarantine_before_receipt_under_the_same_lease() {
             .count(),
         1
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_quarantine_with_source_lock_still_present_withholds_receipt() {
+    let fixture = Fixture::new();
+    fs::write(fixture.lock_path(), b"source lock remains").unwrap();
+    let report = fixture.inspect();
+    let fingerprint = report.recovery_fingerprint.clone().unwrap();
+    let target = report.quarantine_file.clone().unwrap();
+    let actor = super::current_actor().unwrap();
+    let intent_id = append_pending_intent(&fixture, &report, actor);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::hard_link(fixture.lock_path(), &target).unwrap();
+
+    let error = apply_legacy_git_lock(
+        &fixture.safety,
+        &fixture.root,
+        &fixture.event_log,
+        &fingerprint,
+        true,
+        Duration::ZERO,
+    )
+    .unwrap_err();
+
+    assert!(error.contains("native index lock remains"));
+    assert!(fixture.lock_path().exists());
+    assert!(target.exists());
+    let events = fixture.event_log.ledger().read_events().unwrap();
+    assert_eq!(event_count(&events, LEGACY_INTENT_EVENT), 1);
+    assert_eq!(event_count(&events, LEGACY_RECOVERED_EVENT), 0);
+    assert_eq!(intent_id, events[0].event.event_id);
+}
+
+#[test]
+fn interrupted_quarantine_with_changed_index_withholds_receipt() {
+    let fixture = Fixture::new();
+    fs::write(fixture.lock_path(), b"index changed after move").unwrap();
+    let report = fixture.inspect();
+    let fingerprint = report.recovery_fingerprint.clone().unwrap();
+    let target = report.quarantine_file.clone().unwrap();
+    let lock = report.lock.clone().unwrap();
+    let actor = super::current_actor().unwrap();
+    append_pending_intent(&fixture, &report, actor);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    atomic_move_lock(&report.index_lock_file, &target, &lock).unwrap();
+    let mut index = fs::OpenOptions::new()
+        .append(true)
+        .open(&report.index_file)
+        .unwrap();
+    index.write_all(b"changed after quarantine").unwrap();
+    index.sync_all().unwrap();
+
+    let error = apply_legacy_git_lock(
+        &fixture.safety,
+        &fixture.root,
+        &fixture.event_log,
+        &fingerprint,
+        true,
+        Duration::ZERO,
+    )
+    .unwrap_err();
+
+    assert!(error.contains("active Git index changed"));
+    assert!(!fixture.lock_path().exists());
+    assert!(target.exists());
+    let events = fixture.event_log.ledger().read_events().unwrap();
+    assert_eq!(event_count(&events, LEGACY_INTENT_EVENT), 1);
+    assert_eq!(event_count(&events, LEGACY_RECOVERED_EVENT), 0);
 }
 
 struct ActivityInspector {
