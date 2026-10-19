@@ -8,6 +8,8 @@ use crate::services::git_lock_recovery::atomic_move_lock;
 use crate::services::git_mutation::{GitMutationResource, GitMutationSafety};
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -567,14 +569,8 @@ fn interrupted_quarantine_rechecks_surviving_managed_activity() {
     let lock = report.lock.clone().unwrap();
     let actor = super::current_actor().unwrap();
     append_pending_intent(&fixture, &report, actor);
-    let mut helper = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let helper_start = ProcFsInspector::default()
-        .start_time_ticks(helper.id())
-        .unwrap()
-        .unwrap();
+    let (leader_pid, leader_start, helper_pid, helper_start) =
+        spawn_exited_group_with_live_helper();
     fixture
         .event_log
         .append(
@@ -588,9 +584,9 @@ fn interrupted_quarantine_rechecks_surviving_managed_activity() {
                 "common_git_dir": report.common_git_dir,
                 "index_file": report.index_file,
                 "index_lock_file": report.index_lock_file,
-                "process_id": helper.id(),
-                "process_start_identity": helper_start,
-                "process_group_id": helper.id(),
+                "process_id": leader_pid,
+                "process_start_identity": leader_start,
+                "process_group_id": leader_pid,
             }),
         )
         .unwrap();
@@ -605,14 +601,110 @@ fn interrupted_quarantine_rechecks_surviving_managed_activity() {
         true,
         Duration::ZERO,
     );
-    helper.kill().unwrap();
-    helper.wait().unwrap();
+    cleanup_process_group(leader_pid, helper_pid);
     let error = result.unwrap_err();
 
     assert!(error.contains("active recorded ExoMonad Git process or helper"));
+    wait_for_process_exit(helper_pid);
+    assert_ne!(helper_start, leader_start);
     assert!(target.exists());
     let events = fixture.event_log.ledger().read_events().unwrap();
     assert_eq!(event_count(&events, LEGACY_RECOVERED_EVENT), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interrupted_apply_uses_canonical_index_in_an_isolated_alternate_index_process() {
+    const CHILD_MARKER: &str = "EXOMONAD_LEGACY_ALTERNATE_INDEX_TEST";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let fixture = Fixture::new();
+        fs::write(fixture.lock_path(), b"default index lock").unwrap();
+        let report = fixture.inspect();
+        let fingerprint = report.recovery_fingerprint.clone().unwrap();
+        let alternate = fixture.root.join(".git/alternate-index");
+        std::env::set_var("GIT_INDEX_FILE", &alternate);
+        let result = apply_legacy_git_lock(
+            &fixture.safety,
+            &fixture.root,
+            &fixture.event_log,
+            &fingerprint,
+            true,
+            Duration::ZERO,
+        )
+        .expect("interrupted apply uses the canonical default index lease");
+        assert!(!result.already_applied);
+        assert!(!fixture.lock_path().exists());
+        assert!(result.receipt.quarantine_file.exists());
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "interrupted_apply_uses_canonical_index_in_an_isolated_alternate_index_process",
+            "--nocapture",
+        ])
+        .env(CHILD_MARKER, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated alternate-index child failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_exited_group_with_live_helper() -> (u32, u64, u32, u64) {
+    let mut command = std::process::Command::new("python3");
+    command
+        .args([
+            "-c",
+            "import os, time\npid = os.fork()\nif pid == 0:\n    os.close(1)\n    os.close(2)\n    time.sleep(30)\nelse:\n    print(pid, flush=True)\n    os._exit(0)\n",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    let leader = command.spawn().expect("spawn process-group leader");
+    let leader_pid = leader.id();
+    let leader_start = ProcFsInspector::default()
+        .start_time_ticks(leader_pid)
+        .unwrap()
+        .unwrap();
+    let output = leader
+        .wait_with_output()
+        .expect("reap process-group leader");
+    assert!(output.status.success());
+    let helper_pid = String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let helper_start = ProcFsInspector::default()
+        .start_time_ticks(helper_pid)
+        .unwrap()
+        .unwrap();
+    assert_ne!(leader_pid, helper_pid);
+    (leader_pid, leader_start, helper_pid, helper_start)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_process_group(leader_pid: u32, helper_pid: u32) {
+    let group = nix::unistd::Pid::from_raw(leader_pid as i32);
+    let _ = nix::sys::signal::killpg(group, Some(nix::sys::signal::Signal::SIGKILL));
+    let helper = nix::unistd::Pid::from_raw(helper_pid as i32);
+    let _ = nix::sys::signal::kill(helper, Some(nix::sys::signal::Signal::SIGKILL));
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_process_exit(pid: u32) {
+    for _ in 0..100 {
+        if matches!(ProcFsInspector::default().start_time_ticks(pid), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("helper process {pid} did not exit after process-group cleanup");
 }
 
 struct ActivityInspector {
