@@ -556,6 +556,65 @@ fn interrupted_quarantine_with_changed_index_withholds_receipt() {
     assert_eq!(event_count(&events, LEGACY_RECOVERED_EVENT), 0);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn interrupted_quarantine_rechecks_surviving_managed_activity() {
+    let fixture = Fixture::new();
+    fs::write(fixture.lock_path(), b"managed helper remains").unwrap();
+    let report = fixture.inspect();
+    let fingerprint = report.recovery_fingerprint.clone().unwrap();
+    let target = report.quarantine_file.clone().unwrap();
+    let lock = report.lock.clone().unwrap();
+    let actor = super::current_actor().unwrap();
+    append_pending_intent(&fixture, &report, actor);
+    let mut helper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let helper_start = ProcFsInspector::default()
+        .start_time_ticks(helper.id())
+        .unwrap()
+        .unwrap();
+    fixture
+        .event_log
+        .append(
+            "git.process.started",
+            "git-process",
+            &serde_json::json!({
+                "schema_version": 1,
+                "operation_id_sha256": "c".repeat(64),
+                "worktree_root": report.worktree_root,
+                "git_dir": report.git_dir,
+                "common_git_dir": report.common_git_dir,
+                "index_file": report.index_file,
+                "index_lock_file": report.index_lock_file,
+                "process_id": helper.id(),
+                "process_start_identity": helper_start,
+                "process_group_id": helper.id(),
+            }),
+        )
+        .unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    atomic_move_lock(&report.index_lock_file, &target, &lock).unwrap();
+
+    let result = apply_legacy_git_lock(
+        &fixture.safety,
+        &fixture.root,
+        &fixture.event_log,
+        &fingerprint,
+        true,
+        Duration::ZERO,
+    );
+    helper.kill().unwrap();
+    helper.wait().unwrap();
+    let error = result.unwrap_err();
+
+    assert!(error.contains("active recorded ExoMonad Git process or helper"));
+    assert!(target.exists());
+    let events = fixture.event_log.ledger().read_events().unwrap();
+    assert_eq!(event_count(&events, LEGACY_RECOVERED_EVENT), 0);
+}
+
 struct ActivityInspector {
     owner: ManagedProcessIdentity,
     inaccessible: bool,

@@ -232,8 +232,17 @@ pub fn apply_legacy_git_lock(
     }
     let operation_id = format!("legacy-lock-{}", &expected_fingerprint[..32]);
     let lease = safety
-        .acquire(worktree, GitMutationResource::Index, &operation_id, wait)
+        .acquire_with_index_override(
+            worktree,
+            GitMutationResource::Index,
+            &operation_id,
+            wait,
+            None,
+        )
         .map_err(|error| error.to_string())?;
+    if lease.paths != paths {
+        return Err("Git index path changed before acquiring the legacy recovery lease".into());
+    }
     let interrupted = match complete_interrupted_recovery(
         safety,
         worktree,
@@ -808,6 +817,7 @@ fn complete_interrupted_recovery(
     {
         return Err("Git paths changed since legacy recovery was authorized".into());
     }
+    ensure_no_managed_activity(event_log, paths)?;
     match snapshot_lock(&data.quarantine_file) {
         Ok(quarantined) if same_lock_inode(&data.original_lock, &quarantined) => {
             validate_interrupted_quarantine(paths, &data)?;
@@ -821,6 +831,26 @@ fn complete_interrupted_recovery(
         }),
         Err(error) => Err(format!(
             "cannot inspect interrupted legacy quarantine target: {error}"
+        )),
+    }
+}
+
+fn ensure_no_managed_activity(
+    event_log: &EventLog,
+    paths: &crate::services::GitMutationPaths,
+) -> Result<(), String> {
+    match inspect_managed_activity(
+        event_log.ledger().segments_dir(),
+        paths,
+        &ProcFsInspector::default(),
+    )? {
+        LegacyManagedActivity::Clear { .. } => Ok(()),
+        LegacyManagedActivity::Active { .. } => Err(
+            "an active recorded ExoMonad Git process or helper prevents interrupted recovery"
+                .into(),
+        ),
+        LegacyManagedActivity::Uncertain { reason } => Err(format!(
+            "managed process activity is uncertain during interrupted recovery: {reason}"
         )),
     }
 }
