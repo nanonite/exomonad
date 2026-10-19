@@ -120,6 +120,24 @@ assert_one_live_window() {
     [[ "$pane_dead" == "0" ]] || e2e_fail "repeat init returned without a live $role window"
 }
 
+assert_no_aggregate_tl_window() {
+    local context="$1"
+    local count
+    count="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc TL || true)"
+    [[ "$count" == "0" ]] || e2e_fail "$context left an unexpected TL window ($count found)"
+}
+
+wait_for_aggregate_tl_exit() {
+    local context="$1"
+    local count
+    for _ in $(seq 1 40); do
+        count="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc TL || true)"
+        [[ "$count" == "0" ]] && return
+        sleep 0.25
+    done
+    e2e_fail "$context did not exit its completed TL window ($count found)"
+}
+
 run_managed_lock_fixture() {
     local test_name="$1"
     (
@@ -602,6 +620,8 @@ DEAD_TL_ID="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{win
 [[ "${DEAD_TL_ID##* }" == "1" ]] || e2e_fail "aggregate fixture did not start with an exited TL pane"
 read -r DEAD_TL_WINDOW _ <<< "$DEAD_TL_ID"
 
+CONTROLLER_EPOCH_PATH="$AGG_REPO/.exo/tl-loop/root.controller-epoch"
+PRE_RECOVERY_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
 AGG_INIT_STATUS=0
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
@@ -793,14 +813,12 @@ run_managed_lock_fixture assert_managed_lock_quarantined_once_for_e2e
 [[ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
     "$AGG_REPO/.exo/agents/architecture/invocation.json")" == "$ARCHITECTURE_INVOCATION_SHA256" ]] \
     || e2e_fail "completed architecture producer invocation changed during aggregate recovery"
-read -r RECOVERED_TL_WINDOW RECOVERED_TL_DEAD < <(
-    tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{window_id} #{pane_dead}' \
-        | awk '$1 == "TL" { print $2, $3; exit }'
-)
-[[ "$RECOVERED_TL_WINDOW" != "$DEAD_TL_WINDOW" ]] \
-    || e2e_fail "init --continue did not replace the existing exited TL pane"
-[[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name}' | grep -Fxc TL || true)" == "1" ]] \
-    || e2e_fail "aggregate recovery created duplicate TL windows"
+wait_for_aggregate_tl_exit "completed aggregate continuation"
+RECOVERED_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
+[[ -n "$RECOVERED_CONTROLLER_EPOCH" ]] \
+    || e2e_fail "completed aggregate continuation did not retain its controller epoch"
+[[ "$RECOVERED_CONTROLLER_EPOCH" != "$PRE_RECOVERY_CONTROLLER_EPOCH" ]] \
+    || e2e_fail "init --continue did not launch a fresh controller for the exited TL pane"
 
 REPEAT_INIT_STATUS=0
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
@@ -811,7 +829,10 @@ rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD
     || { cat "$AGG_DIR/init-repeat.log"; e2e_fail "repeat init did not attach using the verified binary/archive"; }
 assert_one_live_window Server
 assert_one_live_window Watcher
-assert_one_live_window TL
+assert_no_aggregate_tl_window "repeated init --continue"
+REPEAT_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
+[[ "$REPEAT_CONTROLLER_EPOCH" == "$RECOVERED_CONTROLLER_EPOCH" ]] \
+    || e2e_fail "repeat init restarted the completed TL controller"
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "repeated continuation duplicated the aggregate merge"
 [[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
