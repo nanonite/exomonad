@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Fix recovered aggregate bookkeeping completion when its integration lane is idle (#1264)
 - Fix plan-scoped aggregate merge replay after interrupted parent synchronization (#1259)
 - Hold known synchronization refusals until their preconditions change (#1248)
 - Reap managed process groups after task cancellation (#1247)
