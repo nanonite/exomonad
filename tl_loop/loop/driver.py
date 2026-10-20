@@ -14455,6 +14455,22 @@ def _child_handoff_ready(state: RunState | None, parent_run_id: str) -> bool:
     return state.fsm.phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
 
 
+def _aggregate_child_completion_proven(state: RunState | None) -> bool:
+    """Require a completed child scope before repairing its aggregate label."""
+    if state is None:
+        return False
+    recursive_fsm = getattr(state, "recursive_fsm", None)
+    if recursive_fsm is None:
+        if state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLAllMerged}:
+            return False
+    elif not isinstance(
+        recursive_fsm,
+        (RecursiveTLAllMerged, RecursiveTLFinalizing, RecursiveTLPRFiled, RecursiveTLDone),
+    ):
+        return False
+    return _scope_post_merge_complete(state)
+
+
 def _exit_marker_matches_checkpoint(
     diagnostic: Mapping[str, object] | None,
     child_store: RunStore,
@@ -14844,6 +14860,7 @@ def _verified_aggregate_post_merge(
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
+    store: RunStore,
 ) -> tuple[bool, str]:
     """Verify the saved aggregate merge against its exact durable or live identity."""
     receipt = current.post_merge
@@ -14859,12 +14876,20 @@ def _verified_aggregate_post_merge(
             and current.park_cause is not ParkCause.PUBLICATION_BLOCKED
         )
         or candidate is None
-        or candidate.lifecycle is not IntegrationLifecycle.MERGED
+        or candidate.lifecycle
+        not in {IntegrationLifecycle.CHILDREN_MERGED, IntegrationLifecycle.MERGED}
         or publication is None
         or state.repository_identity is None
         or not isinstance(reconciliation, Mapping)
     ):
         return False, "aggregate_merge_checkpoint_incomplete"
+    if candidate.lifecycle is IntegrationLifecycle.CHILDREN_MERGED:
+        try:
+            child_state = RunStore(task.name, store.run_dir).load()
+        except (OSError, ValueError):
+            return False, "aggregate_child_completion_unavailable"
+        if not _aggregate_child_completion_proven(child_state):
+            return False, "aggregate_child_completion_incomplete"
     evidence = receipt.evidence
     pr_number = current.pr_number
     head_sha = candidate.aggregate_head_sha
@@ -14922,6 +14947,34 @@ def _verified_aggregate_post_merge(
     if _aggregate_watcher_confirms_merged_pr(task, current, candidate, watcher):
         return True, "closed_merged_pr_observation"
     return False, "bound_pr_merge_observation_mismatched"
+
+
+def _promote_candidate_after_verified_merge(
+    integration: IntegrationRuntimeState,
+    candidate_id: str,
+) -> IntegrationRuntimeState:
+    """Record a proof-backed merge repair without widening normal FSM edges.
+
+    A publication failure can leave the candidate at CHILDREN_MERGED after the
+    remote merge receipt was durably recorded.  This repair is only callable
+    after `_verified_aggregate_post_merge` has authenticated that receipt (or
+    equivalent authoritative watcher evidence); ordinary integration still
+    uses the centralized transition table.
+    """
+    candidate = _candidate_runtime(integration, candidate_id)
+    if candidate.lifecycle is IntegrationLifecycle.MERGED:
+        return integration
+    if candidate.lifecycle is not IntegrationLifecycle.CHILDREN_MERGED:
+        raise IntegrationTransitionError(
+            "verified aggregate merge repair requires a CHILDREN_MERGED candidate"
+        )
+    sub_tl_states = dict(integration.sub_tl_states)
+    sub_tl_states[candidate_id] = IntegrationLifecycle.MERGED
+    return _persist_candidate_runtime(
+        replace(integration, sub_tl_states=sub_tl_states),
+        candidate_id,
+        replace(candidate, lifecycle=IntegrationLifecycle.MERGED),
+    )
 
 
 def _verified_aggregate_merge_journal(
@@ -15070,9 +15123,15 @@ def _adopt_aggregate_post_merge_recovery(
         )
     elif updated.reconciliation != reconciliation:
         updated = replace(updated, reconciliation=reconciliation)
-    if updated != current:
+    promoted_integration = _promote_candidate_after_verified_merge(state.integration, task.name)
+    if updated != current or promoted_integration != state.integration:
         state = _checkpoint_slice_action(
-            store, state, task.name, updated.action, slice_state=updated
+            store,
+            state,
+            task.name,
+            updated.action,
+            slice_state=updated,
+            integration=promoted_integration,
         )
     if gate is not None and gate.status is GateStatus.PENDING:
         _record_controller_event(
@@ -15110,7 +15169,7 @@ def _reconcile_aggregate_publication_gate(
     gate = next((item for item in state.gates if item.name == gate_name), None)
     if task.integration.aggregate_pr_required and _post_merge_recovery_started(current):
         verified, reason = _verified_aggregate_post_merge(
-            task, state, current, config, effects, effects_log
+            task, state, current, config, effects, effects_log, store
         )
         if not verified:
             LOGGER.warning(

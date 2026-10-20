@@ -13447,7 +13447,11 @@ def test_driver_keeps_aggregate_parked_when_git_lineage_is_unavailable(tmp_path:
 
 
 def _seed_merged_aggregate_post_merge_recovery(
-    root_dir: Path, run_id: str, *, merge_confirmed: bool = True
+    root_dir: Path,
+    run_id: str,
+    *,
+    merge_confirmed: bool = True,
+    candidate_lifecycle: IntegrationLifecycle = IntegrationLifecycle.MERGED,
 ) -> tuple[WorkPlan, RunStore, RunStore, str, str]:
     """Seed an adopted aggregate merge behind its obsolete publication park."""
     plan, root_store, child_store = _nested_blocked_owner_stores(root_dir, run_id)
@@ -13514,7 +13518,7 @@ def _seed_merged_aggregate_post_merge_recovery(
     )
     merged_candidate = replace(
         candidate,
-        lifecycle=IntegrationLifecycle.MERGED,
+        lifecycle=candidate_lifecycle,
         aggregate_pr_number=pr_number,
         aggregate_head_sha=head_sha,
         aggregate_original_base_sha=base_sha,
@@ -13530,6 +13534,8 @@ def _seed_merged_aggregate_post_merge_recovery(
         "architecture",
         merged_candidate,
     )
+    if candidate_lifecycle is IntegrationLifecycle.CHILDREN_MERGED:
+        integration = replace(integration, lifecycle=IntegrationLifecycle.MERGED)
     root_store.checkpoint(
         state.recursive_fsm or state.fsm,
         {**state.slices, "architecture": parked},
@@ -13582,11 +13588,20 @@ def _seed_merged_aggregate_post_merge_recovery(
     return plan, root_store, child_store, merge_journal_id, base_sha
 
 
+@pytest.mark.parametrize(
+    "candidate_lifecycle",
+    [IntegrationLifecycle.MERGED, IntegrationLifecycle.CHILDREN_MERGED],
+)
 def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
     tmp_path: Path,
+    candidate_lifecycle: IntegrationLifecycle,
 ) -> None:
     plan, root_store, child_store, merge_journal_id, base_sha = (
-        _seed_merged_aggregate_post_merge_recovery(tmp_path, "merged-aggregate-resume")
+        _seed_merged_aggregate_post_merge_recovery(
+            tmp_path,
+            f"merged-aggregate-resume-{candidate_lifecycle.value.lower()}",
+            candidate_lifecycle=candidate_lifecycle,
+        )
     )
     merge_journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
     original_merge_entry = merge_journal.entry_by_key(merge_journal_id)
@@ -13669,6 +13684,9 @@ def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
     completed = resumed.final_state
     architecture = completed.slices["architecture"]
     assert architecture.status is SliceStatus.MERGED
+    assert completed.integration.candidates["architecture"].lifecycle is (
+        IntegrationLifecycle.MERGED
+    )
     assert architecture.post_merge is not None
     assert architecture.post_merge.phase is PostMergePhase.COMPLETE, [
         name
