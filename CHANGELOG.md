@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Add commit-all tidying before TL handoff to the next scope (#1267)
 - Document and verify commit-all handoffs through disposable init recovery (#1270)
 - Wire audited commit-all into ordered TL handoff recovery (#1269)
 - Persist parent approval receipts for accepted aggregate integrations (#1218)
