@@ -705,7 +705,11 @@ untracked files remain ignored. A clean worktree is a no-op and creates no
 empty commit.
 
 The runtime records the parent scope, child declaration, source branch, HEAD,
-and worktree fingerprint in the durable handoff action. The commit uses the
+and worktree fingerprint in the durable handoff action. Its receipt reports
+`committed_paths` as hexadecimal encoded relative paths included in this
+handoff commit, and `remaining_dirty_paths` as paths still dirty afterward.
+The deprecated `changed_paths` field aliases `remaining_dirty_paths`; it never
+identifies which files the commit captured. The commit uses the
 repository's configured Git identity and hooks. A conflict, unsafe in-progress
 Git operation, ownership mismatch, hook refusal, active mutation, or changed
 worktree blocks the child handoff without discarding the edits. Continuation

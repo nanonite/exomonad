@@ -10858,13 +10858,35 @@ def _reconcile_pending_scope_handoff(
     """Replay one ambiguous handoff with the exact durable snapshot arguments."""
     key = entry.get("key")
     arguments = entry.get("arguments")
-    if not isinstance(key, str) or not isinstance(arguments, Mapping):
+    if (
+        not isinstance(key, str)
+        or not isinstance(arguments, Mapping)
+        or arguments.get("apply") is not True
+        or not isinstance(arguments.get("expected_head_sha"), str)
+        or not isinstance(arguments.get("expected_source_fingerprint"), str)
+    ):
         return False
     try:
         result = _scope_handoff_call(effects, arguments)
     except Exception:  # noqa: BLE001 - retain unknown until a later safe replay
         return False
-    if result.success is not True:
+    expected = {
+        key: arguments.get(key)
+        for key in (
+            "handoff_id",
+            "controller_id",
+            "parent_run_id",
+            "parent_scope_id",
+            "child_scope_id",
+            "expected_branch",
+        )
+    }
+    if _scope_handoff_response_error(
+        result,
+        expected,
+        expected_head=cast(str, arguments.get("expected_head_sha")),
+        expected_fingerprint=cast(str, arguments.get("expected_source_fingerprint")),
+    ) is not None:
         return False
     effects_log.resolve_by_key(key, status="confirmed", result=result.raw, error=None)
     return True
@@ -14354,6 +14376,12 @@ def _scope_handoff_response_error(
         return "scope handoff receipt is missing a valid source HEAD"
     if not _is_sha256_text(payload.get("source_fingerprint")):
         return "scope handoff receipt is missing its source fingerprint"
+    committed_paths = _scope_handoff_paths(payload.get("committed_paths"))
+    remaining_paths = _scope_handoff_paths(payload.get("remaining_dirty_paths"))
+    if committed_paths is None or remaining_paths is None:
+        return "scope handoff receipt has missing or malformed path evidence"
+    if payload.get("changed_paths") != remaining_paths:
+        return "scope handoff changed_paths alias conflicts with remaining_dirty_paths"
     if expected_head is not None and payload.get("head_before") != expected_head:
         return "scope handoff source HEAD changed between inspection and apply"
     if (
@@ -14365,9 +14393,44 @@ def _scope_handoff_response_error(
         return "read-only scope handoff inspection reported a changed HEAD"
     if expected_head is not None and not _is_git_object_id(payload.get("head_after")):
         return "scope handoff apply receipt is missing its resulting HEAD"
+    outcome = payload.get("outcome")
+    if expected_head is None:
+        if committed_paths:
+            return "read-only scope handoff inspection reported committed paths"
+        if outcome == "no_changes" and remaining_paths:
+            return "clean scope handoff inspection reported remaining dirty paths"
+        if outcome not in {"ready", "no_changes"}:
+            return "scope handoff inspection has an unsupported outcome"
+    elif outcome == "no_changes":
+        if committed_paths or remaining_paths:
+            return "no-op scope handoff receipt contains path changes"
+    elif outcome in {"committed", "recovered_commit"}:
+        if not committed_paths or remaining_paths:
+            return "successful scope handoff receipt has incomplete committed or remaining paths"
+        if payload.get("commit_sha") != payload.get("head_after"):
+            return "successful scope handoff receipt has conflicting commit and resulting HEAD"
+    else:
+        return "scope handoff apply receipt has an unsupported success outcome"
     if not isinstance(payload.get("source_worktree"), str) or not payload["source_worktree"]:
         return "scope handoff receipt is missing its authenticated source worktree"
     return None
+
+
+def _scope_handoff_paths(value: object) -> list[str] | None:
+    """Validate the canonical sorted hexadecimal path-list wire format."""
+    if not isinstance(value, list) or any(not isinstance(path, str) for path in value):
+        return None
+    paths = cast(list[str], value)
+    if any(
+        not path
+        or len(path) % 2 != 0
+        or any(character not in "0123456789abcdef" for character in path)
+        for path in paths
+    ):
+        return None
+    if paths != sorted(set(paths)):
+        return None
+    return paths
 
 
 def _safe_scope_handoff_error(error: object, outcome: object) -> str:
@@ -14423,10 +14486,39 @@ def _scope_handoff_action_target(
 
 
 def _scope_handoff_entry_ready(entry: Mapping[str, object]) -> bool:
-    """Read the nested ready bit from one previously confirmed tool response."""
+    """Reuse only a confirmed apply receipt with valid path and identity evidence."""
+    arguments = entry.get("arguments")
     result = entry.get("result")
     payload = result.get("result") if isinstance(result, Mapping) else None
-    return isinstance(payload, Mapping) and payload.get("ready") is True
+    if (
+        not isinstance(arguments, Mapping)
+        or arguments.get("apply") is not True
+        or entry.get("status") != "confirmed"
+        or not isinstance(result, dict)
+        or not isinstance(payload, Mapping)
+    ):
+        return False
+    try:
+        decoded = ToolResult.from_raw(cast(JsonObject, result))
+    except (DecodeError, TypeError, ValueError):
+        return False
+    expected = {
+        key: arguments.get(key)
+        for key in (
+            "handoff_id",
+            "controller_id",
+            "parent_run_id",
+            "parent_scope_id",
+            "child_scope_id",
+            "expected_branch",
+        )
+    }
+    return _scope_handoff_response_error(
+        decoded,
+        expected,
+        expected_head=cast(str, arguments.get("expected_head_sha")),
+        expected_fingerprint=cast(str, arguments.get("expected_source_fingerprint")),
+    ) is None
 
 
 def _invoke_scope_handoff_apply(

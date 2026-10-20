@@ -1307,6 +1307,7 @@ class ScopeHandoffTransport(RecordingTransport):
                 outcome="committed",
                 ready=True,
                 commit_sha=self.head,
+            committed_paths=["747261636b65642e747874"],
             )
         if not self.dirty and expected_head == self.head:
             return _scope_handoff_tool_response(
@@ -1330,6 +1331,7 @@ class ScopeHandoffTransport(RecordingTransport):
                 outcome="recovered_commit",
                 ready=True,
                 commit_sha=self.head,
+                committed_paths=["747261636b65642e747874"],
             )
         return _scope_handoff_tool_response(
             arguments,
@@ -1357,8 +1359,11 @@ def _scope_handoff_tool_response(
     error: str = "",
     commit_sha: str = "",
     changed_paths: list[str] | None = None,
+    committed_paths: list[str] | None = None,
+    remaining_dirty_paths: list[str] | None = None,
 ) -> JsonObject:
     """Shape a typed host response behind the MCP success envelope."""
+    remaining = remaining_dirty_paths if remaining_dirty_paths is not None else changed_paths or []
     return {
         "success": True,
         "result": {
@@ -1381,10 +1386,86 @@ def _scope_handoff_tool_response(
             "head_after": head_after,
             "commit_sha": commit_sha,
             "source_fingerprint": fingerprint,
-            "changed_paths": changed_paths or [],
+            "changed_paths": remaining,
+            "committed_paths": committed_paths or [],
+            "remaining_dirty_paths": remaining,
             "ready": ready,
         },
     }
+
+
+def test_scope_handoff_receipt_distinguishes_committed_and_remaining_paths() -> None:
+    arguments: JsonObject = {
+        "handoff_id": "handoff",
+        "controller_id": "root-controller",
+        "parent_run_id": "root-run",
+        "parent_scope_id": "root",
+        "child_scope_id": "node:architecture",
+        "expected_branch": "main",
+    }
+    expected = {
+        "handoff_id": "handoff",
+        "controller_id": "root-controller",
+        "parent_run_id": "root-run",
+        "parent_scope_id": "root",
+        "child_scope_id": "node:architecture",
+        "expected_branch": "main",
+    }
+
+    def response(outcome: str, committed: list[str], remaining: list[str]) -> ToolResult:
+        return ToolResult.from_raw(
+            _scope_handoff_tool_response(
+                arguments,
+                source_worktree="/tmp/source",
+                branch="main",
+                head_before="1" * 40,
+                head_after="1" * 40 if outcome in {"ready", "no_changes"} else "2" * 40,
+                fingerprint="3" * 64,
+                outcome=outcome,
+                ready=True,
+                commit_sha="" if outcome in {"ready", "no_changes"} else "2" * 40,
+                committed_paths=committed,
+                remaining_dirty_paths=remaining,
+            )
+        )
+
+    assert (
+        driver_module._scope_handoff_response_error(
+            response("ready", [], ["612e747874"]), expected
+        )
+        is None
+    )
+    assert (
+        driver_module._scope_handoff_response_error(
+            response("no_changes", [], []),
+            expected,
+            expected_head="1" * 40,
+            expected_fingerprint="3" * 64,
+        )
+        is None
+    )
+    assert (
+        driver_module._scope_handoff_response_error(
+            response("committed", ["612e747874"], []),
+            expected,
+            expected_head="1" * 40,
+            expected_fingerprint="3" * 64,
+        )
+        is None
+    )
+
+    mismatched_alias = response("committed", ["612e747874"], [])
+    assert isinstance(mismatched_alias.raw["result"], dict)
+    mismatched_alias.raw["result"]["changed_paths"] = ["622e747874"]
+    assert "alias conflicts" in cast(
+        str,
+        driver_module._scope_handoff_response_error(
+            mismatched_alias,
+            expected,
+            expected_head="1" * 40,
+            expected_fingerprint="3" * 64,
+        ),
+    )
 
 
 def test_required_aggregate_completion_needs_publication_and_post_merge(

@@ -9764,7 +9764,9 @@ data PrepareScopeHandoffResponse
     prepareScopeHandoffResponseCommitSha :: Hs.Text,
     prepareScopeHandoffResponseSourceFingerprint :: Hs.Text,
     prepareScopeHandoffResponseChangedPaths :: (Hs.Vector Hs.Text),
-    prepareScopeHandoffResponseReady :: Hs.Bool
+    prepareScopeHandoffResponseReady :: Hs.Bool,
+    prepareScopeHandoffResponseCommittedPaths :: (Hs.Vector Hs.Text),
+    prepareScopeHandoffResponseRemainingDirtyPaths :: (Hs.Vector Hs.Text)
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -9794,7 +9796,9 @@ instance (HsProtobuf.Message PrepareScopeHandoffResponse) where
         prepareScopeHandoffResponseCommitSha,
         prepareScopeHandoffResponseSourceFingerprint,
         prepareScopeHandoffResponseChangedPaths,
-        prepareScopeHandoffResponseReady
+        prepareScopeHandoffResponseReady,
+        prepareScopeHandoffResponseCommittedPaths,
+        prepareScopeHandoffResponseRemainingDirtyPaths
       } =
       Hs.mappend
         ( Hs.mappend
@@ -9811,117 +9815,145 @@ instance (HsProtobuf.Message PrepareScopeHandoffResponse) where
                                                     ( Hs.mappend
                                                         ( Hs.mappend
                                                             ( Hs.mappend
-                                                                ( HsProtobuf.encodeMessageField
-                                                                    (HsProtobuf.FieldNumber 1)
-                                                                    prepareScopeHandoffResponseSuccess
+                                                                ( Hs.mappend
+                                                                    ( Hs.mappend
+                                                                        ( HsProtobuf.encodeMessageField
+                                                                            (HsProtobuf.FieldNumber 1)
+                                                                            prepareScopeHandoffResponseSuccess
+                                                                        )
+                                                                        ( HsProtobuf.encodeMessageField
+                                                                            (HsProtobuf.FieldNumber 2)
+                                                                            ( ( Hs.coerce
+                                                                                  @Hs.Text
+                                                                                  @(HsProtobuf.String Hs.Text)
+                                                                              )
+                                                                                prepareScopeHandoffResponseError
+                                                                            )
+                                                                        )
+                                                                    )
+                                                                    ( HsProtobuf.encodeMessageField
+                                                                        (HsProtobuf.FieldNumber 3)
+                                                                        ( ( Hs.coerce
+                                                                              @Hs.Text
+                                                                              @(HsProtobuf.String Hs.Text)
+                                                                          )
+                                                                            prepareScopeHandoffResponseOutcome
+                                                                        )
+                                                                    )
                                                                 )
                                                                 ( HsProtobuf.encodeMessageField
-                                                                    (HsProtobuf.FieldNumber 2)
+                                                                    (HsProtobuf.FieldNumber 4)
                                                                     ( ( Hs.coerce
                                                                           @Hs.Text
                                                                           @(HsProtobuf.String Hs.Text)
                                                                       )
-                                                                        prepareScopeHandoffResponseError
+                                                                        prepareScopeHandoffResponseHandoffId
                                                                     )
                                                                 )
                                                             )
                                                             ( HsProtobuf.encodeMessageField
-                                                                (HsProtobuf.FieldNumber 3)
+                                                                (HsProtobuf.FieldNumber 5)
                                                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                                    prepareScopeHandoffResponseOutcome
+                                                                    prepareScopeHandoffResponseControllerId
                                                                 )
                                                             )
                                                         )
                                                         ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 4)
+                                                            (HsProtobuf.FieldNumber 6)
                                                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                                prepareScopeHandoffResponseHandoffId
+                                                                prepareScopeHandoffResponseParentRunId
                                                             )
                                                         )
                                                     )
                                                     ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 5)
+                                                        (HsProtobuf.FieldNumber 7)
                                                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                            prepareScopeHandoffResponseControllerId
+                                                            prepareScopeHandoffResponseParentScopeId
                                                         )
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 6)
+                                                    (HsProtobuf.FieldNumber 8)
                                                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                        prepareScopeHandoffResponseParentRunId
+                                                        prepareScopeHandoffResponseChildScopeId
                                                     )
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 7)
+                                                (HsProtobuf.FieldNumber 9)
                                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                    prepareScopeHandoffResponseParentScopeId
+                                                    prepareScopeHandoffResponseSourceWorktree
                                                 )
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 8)
+                                            (HsProtobuf.FieldNumber 10)
                                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                prepareScopeHandoffResponseChildScopeId
+                                                prepareScopeHandoffResponseBranch
                                             )
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 9)
+                                        (HsProtobuf.FieldNumber 11)
                                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                            prepareScopeHandoffResponseSourceWorktree
+                                            prepareScopeHandoffResponseHeadBefore
                                         )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 10)
+                                    (HsProtobuf.FieldNumber 12)
                                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        prepareScopeHandoffResponseBranch
+                                        prepareScopeHandoffResponseHeadAfter
                                     )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 11)
+                                (HsProtobuf.FieldNumber 13)
                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    prepareScopeHandoffResponseHeadBefore
+                                    prepareScopeHandoffResponseCommitSha
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 12)
+                            (HsProtobuf.FieldNumber 14)
                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                prepareScopeHandoffResponseHeadAfter
+                                prepareScopeHandoffResponseSourceFingerprint
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 13)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            prepareScopeHandoffResponseCommitSha
+                        (HsProtobuf.FieldNumber 15)
+                        ( ( Hs.coerce
+                              @(Hs.Vector Hs.Text)
+                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                          )
+                            prepareScopeHandoffResponseChangedPaths
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 14)
-                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        prepareScopeHandoffResponseSourceFingerprint
-                    )
+                    (HsProtobuf.FieldNumber 16)
+                    prepareScopeHandoffResponseReady
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 15)
+                (HsProtobuf.FieldNumber 17)
                 ( ( Hs.coerce
                       @(Hs.Vector Hs.Text)
                       @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                   )
-                    prepareScopeHandoffResponseChangedPaths
+                    prepareScopeHandoffResponseCommittedPaths
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 16)
-            prepareScopeHandoffResponseReady
+            (HsProtobuf.FieldNumber 18)
+            ( ( Hs.coerce
+                  @(Hs.Vector Hs.Text)
+                  @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+              )
+                prepareScopeHandoffResponseRemainingDirtyPaths
+            )
         )
   decodeMessage _ =
     Hs.pure PrepareScopeHandoffResponse
@@ -10018,6 +10050,24 @@ instance (HsProtobuf.Message PrepareScopeHandoffResponse) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 16)
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 17)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 18)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -10107,12 +10157,27 @@ instance (HsProtobuf.Message PrepareScopeHandoffResponse) where
         (HsProtobuf.FieldNumber 15)
         (HsProtobufAST.Repeated HsProtobufAST.String)
         (HsProtobufAST.Single "changed_paths")
-        []
+        [ HsProtobufAST.DotProtoOption
+            (HsProtobufAST.Single "deprecated")
+            (HsProtobufAST.BoolLit Hs.True)
+        ]
         "",
       HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 16)
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "ready")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 17)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "committed_paths")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 18)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "remaining_dirty_paths")
         []
         ""
     ]
@@ -10136,6 +10201,8 @@ instance (HsJSONPB.ToJSONPB PrepareScopeHandoffResponse) where
         f14
         f15
         f16
+        f17
+        f18
       ) =
       HsJSONPB.object
         [ "success" .= f1,
@@ -10171,7 +10238,21 @@ instance (HsJSONPB.ToJSONPB PrepareScopeHandoffResponse) where
                  )
                    f15
                ),
-          "ready" .= f16
+          "ready" .= f16,
+          "committed_paths"
+            .= ( ( Hs.coerce
+                     @(Hs.Vector Hs.Text)
+                     @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                 )
+                   f17
+               ),
+          "remaining_dirty_paths"
+            .= ( ( Hs.coerce
+                     @(Hs.Vector Hs.Text)
+                     @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                 )
+                   f18
+               )
         ]
   toEncodingPB
     ( PrepareScopeHandoffResponse
@@ -10191,6 +10272,8 @@ instance (HsJSONPB.ToJSONPB PrepareScopeHandoffResponse) where
         f14
         f15
         f16
+        f17
+        f18
       ) =
       HsJSONPB.pairs
         [ "success" .= f1,
@@ -10226,7 +10309,21 @@ instance (HsJSONPB.ToJSONPB PrepareScopeHandoffResponse) where
                  )
                    f15
                ),
-          "ready" .= f16
+          "ready" .= f16,
+          "committed_paths"
+            .= ( ( Hs.coerce
+                     @(Hs.Vector Hs.Text)
+                     @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                 )
+                   f17
+               ),
+          "remaining_dirty_paths"
+            .= ( ( Hs.coerce
+                     @(Hs.Vector Hs.Text)
+                     @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                 )
+                   f18
+               )
         ]
 
 instance (HsJSONPB.FromJSONPB PrepareScopeHandoffResponse) where
@@ -10282,6 +10379,18 @@ instance (HsJSONPB.FromJSONPB PrepareScopeHandoffResponse) where
                     (obj .: "changed_paths")
                 )
             <*> obj .: "ready"
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "committed_paths")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "remaining_dirty_paths")
+                )
       )
 
 instance (HsJSONPB.ToJSON PrepareScopeHandoffResponse) where

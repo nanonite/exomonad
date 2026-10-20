@@ -55,6 +55,17 @@ prepareScopeHandoffTests =
         let blocked = response {PA.prepareScopeHandoffResponseSuccess = False, PA.prepareScopeHandoffResponseReady = False, PA.prepareScopeHandoffResponseOutcome = "blocked", PA.prepareScopeHandoffResponseError = "hook refused"}
         assertEqual "blocked response is retained as data" (Just (toJSON ("blocked" :: Text))) (field "outcome" (prepareScopeHandoffResponseValue blocked))
         assertEqual "blocked readiness is false" (Just (toJSON False)) (field "ready" (prepareScopeHandoffResponseValue blocked)),
+      testCase "committed and still-dirty path lists remain distinct in JSON" $ do
+        let response =
+              successfulResponse
+                { PA.prepareScopeHandoffResponseCommittedPaths = V.fromList ["747261636b65642e747874"],
+                  PA.prepareScopeHandoffResponseRemainingDirtyPaths = V.fromList ["6c6174652e747874"],
+                  PA.prepareScopeHandoffResponseChangedPaths = V.fromList ["6c6174652e747874"]
+                }
+            projected = prepareScopeHandoffResponseValue response
+        assertEqual "committed paths" (Just (toJSON (["747261636b65642e747874"] :: [Text]))) (field "committed_paths" projected)
+        assertEqual "remaining dirty paths" (Just (toJSON (["6c6174652e747874"] :: [Text]))) (field "remaining_dirty_paths" projected)
+        assertEqual "compatibility alias" (Just (toJSON (["6c6174652e747874"] :: [Text]))) (field "changed_paths" projected),
       testCase "core sends the typed agent effect and returns its authoritative response" $ do
         let result = runCoreWith successEnvelope
         assertEqual "host response" (Right responseValue) result
@@ -68,7 +79,7 @@ successfulResponse =
   PA.PrepareScopeHandoffResponse
     { PA.prepareScopeHandoffResponseSuccess = True,
       PA.prepareScopeHandoffResponseError = "",
-      PA.prepareScopeHandoffResponseOutcome = "ready",
+      PA.prepareScopeHandoffResponseOutcome = "committed",
       PA.prepareScopeHandoffResponseHandoffId = "handoff-1",
       PA.prepareScopeHandoffResponseControllerId = "root-controller",
       PA.prepareScopeHandoffResponseParentRunId = "root-run",
@@ -77,10 +88,12 @@ successfulResponse =
       PA.prepareScopeHandoffResponseSourceWorktree = "/tmp/repo",
       PA.prepareScopeHandoffResponseBranch = "main",
       PA.prepareScopeHandoffResponseHeadBefore = "before-sha",
-      PA.prepareScopeHandoffResponseHeadAfter = "before-sha",
-      PA.prepareScopeHandoffResponseCommitSha = "",
+      PA.prepareScopeHandoffResponseHeadAfter = "after-sha",
+      PA.prepareScopeHandoffResponseCommitSha = "after-sha",
       PA.prepareScopeHandoffResponseSourceFingerprint = "source-fingerprint",
-      PA.prepareScopeHandoffResponseChangedPaths = V.fromList ["4348414e47454c4f472e6d64", "646f63732f6e6f74652e6d64"],
+      PA.prepareScopeHandoffResponseChangedPaths = V.empty,
+      PA.prepareScopeHandoffResponseCommittedPaths = V.fromList ["4348414e47454c4f472e6d64", "646f63732f6e6f74652e6d64"],
+      PA.prepareScopeHandoffResponseRemainingDirtyPaths = V.empty,
       PA.prepareScopeHandoffResponseReady = True
     }
 
@@ -89,7 +102,7 @@ responseValue =
   object
     [ "success" .= True,
       "error" .= ("" :: Text),
-      "outcome" .= ("ready" :: Text),
+      "outcome" .= ("committed" :: Text),
       "handoff_id" .= ("handoff-1" :: Text),
       "controller_id" .= ("root-controller" :: Text),
       "parent_run_id" .= ("root-run" :: Text),
@@ -98,10 +111,12 @@ responseValue =
       "source_worktree" .= ("/tmp/repo" :: Text),
       "branch" .= ("main" :: Text),
       "head_before" .= ("before-sha" :: Text),
-      "head_after" .= ("before-sha" :: Text),
-      "commit_sha" .= ("" :: Text),
+      "head_after" .= ("after-sha" :: Text),
+      "commit_sha" .= ("after-sha" :: Text),
       "source_fingerprint" .= ("source-fingerprint" :: Text),
-      "changed_paths" .= (["4348414e47454c4f472e6d64", "646f63732f6e6f74652e6d64"] :: [Text]),
+      "changed_paths" .= ([] :: [Text]),
+      "committed_paths" .= (["4348414e47454c4f472e6d64", "646f63732f6e6f74652e6d64"] :: [Text]),
+      "remaining_dirty_paths" .= ([] :: [Text]),
       "ready" .= True
     ]
 

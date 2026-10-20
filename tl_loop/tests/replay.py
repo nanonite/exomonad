@@ -77,6 +77,8 @@ class RecordingTransport:
                     "commit_sha": "",
                     "source_fingerprint": resolved_fingerprint,
                     "changed_paths": [],
+                    "committed_paths": [],
+                    "remaining_dirty_paths": [],
                 },
             }
         if tool_name == "repository_identity":

@@ -332,7 +332,7 @@ async fn execute_handoff(
                 "blocked",
                 "",
                 &snapshot,
-                changed_paths,
+                HandoffPathReceipt::new(Vec::new(), changed_paths),
                 false,
             );
             response.error = error;
@@ -399,7 +399,8 @@ async fn execute_handoff_body(
     );
     if request.apply {
         if let Some(commit) = find_handoff_commit(context, &handoff_identity, cancellation).await? {
-            return adopt_existing_commit(context, request, changed_paths, commit);
+            return adopt_existing_commit(context, request, changed_paths, commit, cancellation)
+                .await;
         }
         if request.expected_head_sha != context.head {
             return Err("scope handoff source HEAD changed and no matching committed handoff can be recovered".to_string());
@@ -420,7 +421,7 @@ async fn execute_handoff_body(
                 request,
                 &handoff_identity,
                 &snapshot,
-                serde_json::json!({"changed_paths": changed_paths}),
+                path_receipt_details(&[], &changed_paths),
             )?;
         }
         return Ok(response(
@@ -429,7 +430,7 @@ async fn execute_handoff_body(
             if clean { "no_changes" } else { "ready" },
             "",
             &snapshot,
-            changed_paths,
+            HandoffPathReceipt::new(Vec::new(), changed_paths),
             true,
         ));
     }
@@ -442,7 +443,11 @@ async fn execute_handoff_body(
         request,
         &handoff_identity,
         &snapshot,
-        serde_json::json!({"outcome": "intent", "changed_paths": changed_paths}),
+        with_path_receipt_details(
+            serde_json::json!({"outcome": "intent"}),
+            &[],
+            &changed_paths,
+        ),
     )?;
     run_required_git(
         context,
@@ -460,7 +465,11 @@ async fn execute_handoff_body(
             request,
             &handoff_identity,
             &snapshot,
-            serde_json::json!({"outcome": "staging_snapshot_changed", "observed_fingerprint": after_staging}),
+            with_path_receipt_details(
+                serde_json::json!({"outcome": "staging_snapshot_changed", "observed_fingerprint": after_staging}),
+                &[],
+                &changed_paths,
+            ),
         )?;
         return Err(format!(
             "worktree content changed while staging (expected {snapshot}, observed {after_staging}); inspect and retry with a new handoff snapshot"
@@ -485,7 +494,11 @@ async fn execute_handoff_body(
             request,
             &handoff_identity,
             &snapshot,
-            serde_json::json!({"outcome": "no_changes_after_staging"}),
+            with_path_receipt_details(
+                serde_json::json!({"outcome": "no_changes_after_staging"}),
+                &[],
+                &[],
+            ),
         )?;
         return Ok(response(
             request,
@@ -493,7 +506,7 @@ async fn execute_handoff_body(
             "no_changes",
             "",
             &snapshot,
-            Vec::new(),
+            HandoffPathReceipt::new(Vec::new(), Vec::new()),
             true,
         ));
     }
@@ -534,18 +547,6 @@ async fn execute_handoff_body(
                 GitFailureOutcome::Refused => "commit_refused",
                 GitFailureOutcome::Unknown => "unknown",
             };
-            append_handoff_event(
-                context,
-                if outcome == "unknown" {
-                    "tl.scope_handoff.unknown"
-                } else {
-                    "tl.scope_handoff.commit_refused"
-                },
-                request,
-                &handoff_identity,
-                &snapshot,
-                serde_json::json!({"outcome": outcome}),
-            )?;
             if outcome == "unknown" {
                 if let Ok(branch) = context
                     .git_text(&["branch", "--show-current"], cancellation)
@@ -560,13 +561,32 @@ async fn execute_handoff_body(
                     context.head = head;
                 }
             }
+            let remaining_dirty_paths = changed_path_hex(context, cancellation)
+                .await
+                .unwrap_or_else(|_| changed_paths.clone());
+            append_handoff_event(
+                context,
+                if outcome == "unknown" {
+                    "tl.scope_handoff.unknown"
+                } else {
+                    "tl.scope_handoff.commit_refused"
+                },
+                request,
+                &handoff_identity,
+                &snapshot,
+                with_path_receipt_details(
+                    serde_json::json!({"outcome": outcome}),
+                    &[],
+                    &remaining_dirty_paths,
+                ),
+            )?;
             let mut response = response(
                 request,
                 context,
                 outcome,
                 "",
                 &snapshot,
-                changed_paths,
+                HandoffPathReceipt::new(Vec::new(), remaining_dirty_paths),
                 false,
             );
             response.error = failure.message;
@@ -574,13 +594,20 @@ async fn execute_handoff_body(
         }
     };
     if !commit_result.status.success() {
+        let remaining_dirty_paths = changed_path_hex(context, cancellation)
+            .await
+            .unwrap_or_else(|_| changed_paths.clone());
         append_handoff_event(
             context,
             "tl.scope_handoff.commit_refused",
             request,
             &handoff_identity,
             &snapshot,
-            serde_json::json!({"outcome": "commit_refused"}),
+            with_path_receipt_details(
+                serde_json::json!({"outcome": "commit_refused"}),
+                &[],
+                &remaining_dirty_paths,
+            ),
         )?;
         let mut response = response(
             request,
@@ -588,7 +615,7 @@ async fn execute_handoff_body(
             "commit_refused",
             "",
             &snapshot,
-            changed_paths,
+            HandoffPathReceipt::new(Vec::new(), remaining_dirty_paths),
             false,
         );
         response.error = git_refusal(
@@ -617,13 +644,20 @@ async fn execute_handoff_body(
         )
         .await?
     {
+        let remaining_dirty_paths = changed_path_hex(context, cancellation)
+            .await
+            .unwrap_or_default();
         append_handoff_event(
             context,
             "tl.scope_handoff.unknown",
             request,
             &handoff_identity,
             &snapshot,
-            serde_json::json!({"outcome": "commit_evidence_unverified", "head_observed": head_after, "tree_expected": expected_tree}),
+            with_path_receipt_details(
+                serde_json::json!({"outcome": "commit_evidence_unverified", "head_observed": head_after, "tree_expected": expected_tree}),
+                &[],
+                &remaining_dirty_paths,
+            ),
         )?;
         let mut response = response(
             request,
@@ -631,14 +665,14 @@ async fn execute_handoff_body(
             "unknown",
             "",
             &snapshot,
-            changed_path_hex(context, cancellation)
-                .await
-                .unwrap_or_default(),
+            HandoffPathReceipt::new(Vec::new(), remaining_dirty_paths),
             false,
         );
         response.error = "Git commit may have completed, but its handoff evidence could not be verified; retry the same handoff snapshot".to_string();
         return Ok(response);
     }
+    let committed_paths =
+        committed_path_hex(context, &head_before_commit, &head_after, cancellation).await?;
     let changed_after_commit = changed_path_hex(context, cancellation).await?;
     if !changed_after_commit.is_empty() {
         append_handoff_event(
@@ -647,7 +681,11 @@ async fn execute_handoff_body(
             request,
             &handoff_identity,
             &snapshot,
-            serde_json::json!({"outcome": "committed_with_new_changes", "commit_sha": head_after, "head_after": head_after, "tree_sha": expected_tree, "changed_paths": changed_after_commit}),
+            with_path_receipt_details(
+                serde_json::json!({"outcome": "committed_with_new_changes", "commit_sha": head_after, "head_after": head_after, "tree_sha": expected_tree}),
+                &committed_paths,
+                &changed_after_commit,
+            ),
         )?;
         return Ok(response(
             request,
@@ -655,7 +693,7 @@ async fn execute_handoff_body(
             "committed_with_new_changes",
             &head_after,
             &snapshot,
-            changed_after_commit,
+            HandoffPathReceipt::new(committed_paths, changed_after_commit),
             false,
         ));
     }
@@ -665,7 +703,11 @@ async fn execute_handoff_body(
         request,
         &handoff_identity,
         &snapshot,
-        serde_json::json!({"outcome": "committed", "commit_sha": head_after, "head_after": head_after, "tree_sha": expected_tree, "changed_paths": changed_paths}),
+        with_path_receipt_details(
+            serde_json::json!({"outcome": "committed", "commit_sha": head_after, "head_after": head_after, "tree_sha": expected_tree}),
+            &committed_paths,
+            &[],
+        ),
     )?;
     Ok(response(
         request,
@@ -673,16 +715,17 @@ async fn execute_handoff_body(
         "committed",
         &head_after,
         &snapshot,
-        Vec::new(),
+        HandoffPathReceipt::new(committed_paths, Vec::new()),
         true,
     ))
 }
 
-fn adopt_existing_commit(
+async fn adopt_existing_commit(
     context: &mut HandoffContext,
     request: &PrepareScopeHandoffRequest,
     changed_paths: Vec<String>,
     commit: ExistingHandoffCommit,
+    cancellation: &mut oneshot::Receiver<()>,
 ) -> Result<PrepareScopeHandoffResponse, String> {
     if commit.parent != request.expected_head_sha
         || commit.fingerprint != request.expected_source_fingerprint
@@ -698,13 +741,19 @@ fn adopt_existing_commit(
                 .to_string(),
         );
     }
+    let committed_paths =
+        committed_path_hex(context, &commit.parent, &commit.sha, cancellation).await?;
     append_handoff_event(
         context,
         "tl.scope_handoff.adopted",
         request,
         &commit.identity,
         &commit.fingerprint,
-        serde_json::json!({"outcome": "adopted", "commit_sha": commit.sha, "head_after": commit.sha, "changed_paths": changed_paths}),
+        with_path_receipt_details(
+            serde_json::json!({"outcome": "recovered_commit", "commit_sha": commit.sha, "head_after": commit.sha}),
+            &committed_paths,
+            &changed_paths,
+        ),
     )?;
     context.head = commit.sha.clone();
     Ok(response(
@@ -713,7 +762,7 @@ fn adopt_existing_commit(
         "recovered_commit",
         &commit.sha,
         &commit.fingerprint,
-        Vec::new(),
+        HandoffPathReceipt::new(committed_paths, Vec::new()),
         true,
     ))
 }
@@ -939,6 +988,66 @@ async fn changed_path_hex(
     Ok(paths.into_iter().map(|path| hex(&path)).collect())
 }
 
+async fn committed_path_hex(
+    context: &HandoffContext,
+    parent: &str,
+    commit: &str,
+    cancellation: &mut oneshot::Receiver<()>,
+) -> Result<Vec<String>, String> {
+    let changed = context
+        .git_bytes(
+            vec![
+                "diff-tree".into(),
+                "--no-commit-id".into(),
+                "--name-only".into(),
+                "--no-renames".into(),
+                "-z".into(),
+                "-r".into(),
+                parent.into(),
+                commit.into(),
+            ],
+            cancellation,
+        )
+        .await?;
+    Ok(path_set(&changed)?
+        .into_iter()
+        .map(|path| hex(&path))
+        .collect())
+}
+
+fn with_path_receipt_details(
+    mut details: serde_json::Value,
+    committed_paths: &[String],
+    remaining_dirty_paths: &[String],
+) -> serde_json::Value {
+    if let Some(object) = details.as_object_mut() {
+        object.insert(
+            "committed_paths".to_string(),
+            serde_json::json!(committed_paths),
+        );
+        object.insert(
+            "remaining_dirty_paths".to_string(),
+            serde_json::json!(remaining_dirty_paths),
+        );
+        object.insert(
+            "changed_paths".to_string(),
+            serde_json::json!(remaining_dirty_paths),
+        );
+    }
+    details
+}
+
+fn path_receipt_details(
+    committed_paths: &[String],
+    remaining_dirty_paths: &[String],
+) -> serde_json::Value {
+    with_path_receipt_details(
+        serde_json::json!({}),
+        committed_paths,
+        remaining_dirty_paths,
+    )
+}
+
 fn path_set(bytes: &[u8]) -> Result<BTreeSet<Vec<u8>>, String> {
     if bytes.last().is_some_and(|last| *last != 0) {
         return Err("Git returned malformed path evidence".to_string());
@@ -1117,13 +1226,28 @@ fn append_audit(
         .map_err(|_| "scope handoff audit could not be persisted".to_string())
 }
 
+struct HandoffPathReceipt {
+    committed_paths: Vec<String>,
+    remaining_dirty_paths: Vec<String>,
+}
+
+impl HandoffPathReceipt {
+    fn new(committed_paths: Vec<String>, remaining_dirty_paths: Vec<String>) -> Self {
+        Self {
+            committed_paths,
+            remaining_dirty_paths,
+        }
+    }
+}
+
+#[allow(deprecated)]
 fn response(
     request: &PrepareScopeHandoffRequest,
     context: &HandoffContext,
     outcome: &str,
     commit_sha: &str,
     fingerprint: &str,
-    changed_paths: Vec<String>,
+    paths: HandoffPathReceipt,
     ready: bool,
 ) -> PrepareScopeHandoffResponse {
     PrepareScopeHandoffResponse {
@@ -1149,11 +1273,14 @@ fn response(
         },
         commit_sha: commit_sha.to_string(),
         source_fingerprint: fingerprint.to_string(),
-        changed_paths,
+        changed_paths: paths.remaining_dirty_paths.clone(),
+        committed_paths: paths.committed_paths,
+        remaining_dirty_paths: paths.remaining_dirty_paths,
         ready,
     }
 }
 
+#[allow(deprecated)]
 fn blocked_response(
     request: &PrepareScopeHandoffRequest,
     error: String,
@@ -1174,6 +1301,8 @@ fn blocked_response(
         commit_sha: String::new(),
         source_fingerprint: String::new(),
         changed_paths: Vec::new(),
+        committed_paths: Vec::new(),
+        remaining_dirty_paths: Vec::new(),
         ready: false,
     }
 }
@@ -1413,6 +1542,8 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
@@ -1433,10 +1564,25 @@ mod tests {
         let inspected = run(&repository, request(false, "", "")).await;
         assert!(inspected.ready, "{}", inspected.error);
         assert!(!inspected.changed_paths.is_empty());
+        assert!(inspected.committed_paths.is_empty());
+        assert_eq!(inspected.changed_paths, inspected.remaining_dirty_paths);
         let handoff = request(true, &inspected.head_after, &inspected.source_fingerprint);
         let committed = run(&repository, handoff.clone()).await;
         assert!(committed.ready, "{}", committed.error);
         assert_eq!(committed.outcome, "committed");
+        assert_eq!(
+            committed.committed_paths,
+            vec![
+                hex(b".gitignore"),
+                hex(b"delete.txt"),
+                hex(b"kept.secret"),
+                hex(b"new.txt"),
+                hex(b"tracked.txt")
+            ]
+        );
+        assert!(committed.remaining_dirty_paths.is_empty());
+        assert!(committed.changed_paths.is_empty());
+        assert_handoff_event_paths(&repository, "tl.scope_handoff.committed", &committed);
         assert_ne!(committed.commit_sha, base);
         assert_eq!(repository.head(), committed.commit_sha);
         let paths = repository.git(&["show", "--pretty=", "--name-only", "HEAD"]);
@@ -1454,6 +1600,9 @@ mod tests {
         assert!(replayed.ready, "{}", replayed.error);
         assert_eq!(replayed.outcome, "recovered_commit");
         assert_eq!(replayed.commit_sha, committed.commit_sha);
+        assert_eq!(replayed.committed_paths, committed.committed_paths);
+        assert!(replayed.remaining_dirty_paths.is_empty());
+        assert_handoff_event_paths(&repository, "tl.scope_handoff.adopted", &replayed);
         assert_eq!(repository.commit_count(), 2);
     }
 
@@ -1473,6 +1622,18 @@ mod tests {
         let clean = run(&repository, request(false, "", "")).await;
         assert!(clean.ready, "{}", clean.error);
         assert_eq!(clean.outcome, "no_changes");
+        assert!(clean.committed_paths.is_empty());
+        assert!(clean.remaining_dirty_paths.is_empty());
+        let clean_apply = run(
+            &repository,
+            request(true, &clean.head_after, &clean.source_fingerprint),
+        )
+        .await;
+        assert!(clean_apply.ready, "{}", clean_apply.error);
+        assert_eq!(clean_apply.outcome, "no_changes");
+        assert!(clean_apply.committed_paths.is_empty());
+        assert!(clean_apply.remaining_dirty_paths.is_empty());
+        assert_handoff_event_paths(&repository, "tl.scope_handoff.no_changes", &clean_apply);
         assert_eq!(repository.commit_count(), 1);
 
         repository.write("root.txt", "root work\n");
@@ -1491,6 +1652,63 @@ mod tests {
             "?? sibling.txt"
         );
         assert_eq!(repository.commit_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_paths_are_separate_from_changes_written_after_the_handoff_commit() {
+        let repository = TestRepository::new();
+        repository.write("tracked.txt", "snapshot content\n");
+        let inspected = run(&repository, request(false, "", "")).await;
+        let hook = repository.path().join(".git/hooks/pre-commit");
+        fs::write(&hook, "#!/bin/sh\nprintf 'late change\\n' > late.txt\n").unwrap();
+        set_executable(&hook);
+
+        let applied = run(
+            &repository,
+            request(true, &inspected.head_after, &inspected.source_fingerprint),
+        )
+        .await;
+
+        assert!(!applied.ready);
+        assert_eq!(applied.outcome, "committed_with_new_changes");
+        assert_eq!(applied.committed_paths, vec![hex(b"tracked.txt")]);
+        assert_eq!(applied.remaining_dirty_paths, vec![hex(b"late.txt")]);
+        assert_eq!(applied.changed_paths, applied.remaining_dirty_paths);
+        assert_handoff_event_paths(
+            &repository,
+            "tl.scope_handoff.committed_with_new_changes",
+            &applied,
+        );
+        assert_eq!(repository.commit_count(), 2);
+    }
+
+    fn assert_handoff_event_paths(
+        repository: &TestRepository,
+        event_type: &str,
+        response: &PrepareScopeHandoffResponse,
+    ) {
+        let log = fs::read_to_string(repository.path().join(".exo/logs/controller.jsonl"))
+            .expect("controller audit events are retained");
+        let event = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["type"] == event_type)
+            .last()
+            .expect("matching handoff event exists");
+        let data = &event["data"];
+        assert_eq!(
+            data["committed_paths"],
+            serde_json::json!(response.committed_paths)
+        );
+        assert_eq!(
+            data["remaining_dirty_paths"],
+            serde_json::json!(response.remaining_dirty_paths)
+        );
+        assert_eq!(
+            data["changed_paths"],
+            serde_json::json!(response.remaining_dirty_paths)
+        );
     }
 
     #[tokio::test]
