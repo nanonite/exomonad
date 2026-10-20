@@ -381,12 +381,15 @@ def seed_root(
         TLLoopConfig,
         WorkPlan,
         _checkpoint_post_merge_event,
+        _child_controller_name,
         _initial_slices,
         _manifest_for_plan,
         _parent_aggregate_approval,
         _parent_sync_arguments,
         _parent_sync_identity_fields,
+        _sub_tl_worktree,
         _verified_child_completion_evidence,
+        derive_child_branch,
         stable_action_key,
     )
     from tl_loop.loop.journal import EffectJournal
@@ -550,6 +553,64 @@ def seed_root(
         patch_digest=patch_digest,
         architecture_worktree=architecture_worktree,
     )
+    kani_task = next(task for task in work_plan.sub_tls if task.name == "kani")
+    kani_branch = derive_child_branch("main", _child_controller_name(kani_task))
+    kani_worktree = str(_sub_tl_worktree(root_config, state_root, "root", kani_task))
+    kani_manifest = manifest.child_manifests[
+        next(node.node_id for node in manifest.nodes if node.name == "kani")
+    ]
+    kani_config = replace(
+        root_config,
+        root_dir=root_store.run_dir,
+        run_id="kani",
+        branch=kani_branch,
+        worktree=kani_worktree,
+        parent_branch="main",
+        parent_run_id="root",
+        parent_agent_id="root",
+        agent_id=_child_controller_name(kani_task),
+        depth=1,
+        declared_manifest=kani_manifest,
+    )
+    kani_slices = _initial_slices(kani_task.plan, kani_config, state_root, "kani")
+    create(
+        "kani",
+        {
+            "slices": kani_slices,
+            "repository_identity": identity.to_document(),
+            "owner_branch": kani_branch,
+            "owner_worktree": kani_worktree,
+            "parent_branch": "main",
+            "parent_run_id": "root",
+            "parent_agent_id": "root",
+            "depth": 1,
+        },
+        root_dir=root_store.run_dir,
+    )
+    kani_store = RunStore("kani", root_store.run_dir)
+    kani_store.set_plan_manifest(kani_manifest, slices=kani_slices)
+    kani_state = kani_store.load()
+    kani_failure = "server socket timed out during child startup"
+    kani_store.checkpoint(
+        RecursiveTLFailed(kani_failure),
+        kani_state.slices,
+        kani_state.budgets,
+        kani_state.events.last_consumed_offset,
+    )
+    kani_store.record_exit_reason(kani_failure)
+    failed_kani = replace(
+        root_state.slices["kani"],
+        status=SliceStatus.FAILED,
+        attempts=1,
+        branch=kani_branch,
+        worktree=kani_worktree,
+        dispatch_intent_id="seed-kani-dispatch-intent",
+        dispatch_agent_id=_child_controller_name(kani_task),
+        dispatch_invocation_id="seed-kani-failed-startup-invocation",
+        dispatch_generation=1,
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary="sub_tl_started",
+    )
     merge_tree = subprocess.run(
         (
             "git",
@@ -635,6 +696,31 @@ def seed_root(
         invocation_id=invocation_id,
     )
     journal = EffectJournal("root", root_store.run_dir / "action-journal.json")
+    kani_dispatch_arguments = {
+        "event_type": "tl.dispatch_confirmed",
+        "payload": {
+            "slice_id": "kani",
+            "intent_id": "seed-kani-dispatch-intent",
+            "boundary": "sub_tl_started",
+            "started_at": 1700000001.0,
+            "attempt": 1,
+            "controller_epoch": "e2e-parent-controller-epoch",
+            "dispatch_generation": 1,
+        },
+    }
+    kani_dispatch_intent = EffectIntent(
+        "emit_controller_event", "kani", kani_dispatch_arguments, True
+    )
+    journal.append(kani_dispatch_intent)
+    journal.mark_result(
+        kani_dispatch_intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {"event_type": "tl.dispatch_confirmed", "run_seq": 1},
+            }
+        ),
+    )
     rejected_intent = EffectIntent(
         "merge_pr", "architecture", {"pr_number": aggregate_pr, "attempt": 1}, True
     )
@@ -921,18 +1007,24 @@ def seed_root(
         last_lane_epoch=2,
     )
     root_store.checkpoint(
-        RecursiveTLFailed(
-            "Prior invocation ended while aggregate integration was pending"
-        ),
+        RecursiveTLFailed("Kani controller exited during startup"),
         {
             **synced.slices,
             "architecture": synced_architecture,
+            "kani": failed_kani,
         },
         synced.budgets,
         synced.events.last_consumed_offset,
         current_order=2,
         ordered_stages=synced.ordered_stages,
-        integration=replace(synced.integration, lanes={lane_key: idle_lane}),
+        integration=replace(
+            synced.integration,
+            lanes={lane_key: idle_lane},
+            sub_tl_states={
+                **synced.integration.sub_tl_states,
+                "kani": IntegrationLifecycle.FAILED,
+            },
+        ),
     )
     git(repository, "merge", "--ff-only", merged_remote_head)
     return {
@@ -946,6 +1038,9 @@ def seed_root(
         "base_sha": base_sha,
         "patch_digest": patch_digest,
         "merge_tree": merge_tree,
+        "failed_child": "kani",
+        "failed_child_run": str(kani_store.path),
+        "failed_child_worktree": kani_worktree,
     }
 
 

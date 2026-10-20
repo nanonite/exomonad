@@ -792,23 +792,42 @@ PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_aggregate_checkpoint.py" \
     > "$AGG_DIR/seed.log" \
     || { cat "$AGG_DIR/seed.log"; cat "$AGG_DIR/mock.stderr"; e2e_fail "failed to seed completed-aggregate/later-child recovery state"; }
 python3 - "$AGG_REPO" <<'PY' \
-    || e2e_fail "Phase 8 did not seed the failed-root/completed-aggregate/pending-child shape"
+    || e2e_fail "Phase 8 did not seed the failed-root/completed-aggregate/failed-child shape"
 import json
 import sys
 from pathlib import Path
 
-root_dir = Path(sys.argv[1]) / ".exo/tl-loop/root"
+repo = Path(sys.argv[1])
+root_dir = repo / ".exo/tl-loop/root"
 root = json.loads((root_dir / "run.json").read_text(encoding="utf-8"))
 architecture = root["slices"]["architecture"]
 kani = root["slices"]["kani"]
 candidate = root["integration"]["candidates"]["architecture"]
+kani_child_path = root_dir / "kani/run.json"
+assert kani_child_path.is_file(), "failed Kani startup checkpoint is missing"
+kani_child = json.loads(kani_child_path.read_text(encoding="utf-8"))
+exit_path = kani_child_path.parent / "controller-exit.json"
+exit_record = json.loads(exit_path.read_text(encoding="utf-8"))
 assert root["fsm"]["phase"] == "tl_failed"
 assert root["current_order"] == 2
 assert architecture["status"] == "merged"
 assert architecture["post_merge"]["phase"] == "complete"
 assert candidate["lifecycle"] == "MERGED"
-assert kani["status"] == "pending"
-assert not (root_dir / "kani/run.json").exists(), "pending Kani stage already has a child checkpoint"
+assert kani["status"] == "failed"
+assert kani["dispatch_last_boundary"] == "sub_tl_started"
+assert kani["dispatch_intent_id"] and kani["dispatch_authoritative_event_seq"] == 1
+assert kani_child["run_id"] == "kani"
+assert kani_child["parent_run_id"] == "root"
+assert kani_child["fsm"]["phase"] == "tl_failed"
+assert exit_record["reason"] == kani_child["fsm"]["payload"]["reason"]
+assert exit_record["checkpoint_revision"] == kani_child["revision"]
+assert not Path(kani["worktree"]).exists(), "failed startup unexpectedly provisioned a child worktree"
+assert not (repo / ".exo/agents/kani/identity.json").exists(), (
+    "failed startup already has a durable agent identity and must not be resumed as a PR owner"
+)
+assert not (repo / ".exo/agents/kani/invocation.json").exists(), (
+    "failed startup has an invocation record that would turn recovery into resume_pr"
+)
 PY
 AGGREGATE_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_pr"])' "$AGG_DIR/seed.json")"
 AGGREGATE_BASE_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_sha"])' "$AGG_DIR/seed.json")"
@@ -827,7 +846,7 @@ AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/m
 PULL_PUBLICATIONS_BEFORE="$(count_pull_publications "$AGG_DIR/mock.log")"
 [[ "$PULL_PUBLICATIONS_BEFORE" == "2" ]] \
     || e2e_fail "fixture expected only its leaf and aggregate PR publications, found $PULL_PUBLICATIONS_BEFORE"
-e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR with a full completed architecture receipt and pending Kani stage at order 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
+e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR, full architecture completion evidence, and a revision-bound Kani startup failure at order 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
 LEGACY_LOCK_CONTENTS="legacy index lock evidence requiring explicit operator authorization"
 printf '%s' "$LEGACY_LOCK_CONTENTS" > "$AGG_REPO/.git/index.lock"
 [[ -s "$AGG_REPO/.git/index.lock" ]] \
