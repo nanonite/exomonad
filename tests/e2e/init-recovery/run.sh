@@ -140,14 +140,26 @@ def git(*args: str) -> bytes:
     ).stdout
 
 status = git("status", "--porcelain", "--untracked-files=all").decode()
-assert "M  preserved-staged.txt" in status, status
-assert " M preserved-unstaged.txt" in status, status
-assert "?? preserved-untracked.txt" in status, status
+expected_status = (
+    "M  .exo/harness_policy.toml",
+    "M  .exo/tracked-runtime-policy.toml",
+    "M  preserved-staged.txt",
+    " M CHANGELOG.md",
+    " M preserved-unstaged.txt",
+    " D preserved-deleted.txt",
+    "?? preserved-untracked.txt",
+    "?? .exo/config.toml",
+)
+for row in expected_status:
+    assert row in status, f"expected dirty path {row!r} in:\n{status}"
 print(json.dumps({
     "status": status,
     "staged_diff_sha256": hashlib.sha256(git("diff", "--cached", "--binary")).hexdigest(),
     "unstaged_diff_sha256": hashlib.sha256(git("diff", "--binary")).hexdigest(),
     "untracked_sha256": hashlib.sha256((repo / "preserved-untracked.txt").read_bytes()).hexdigest(),
+    "ignored_untracked_sha256": hashlib.sha256(
+        (repo / ".exo/e2e-runtime-ignored-untracked/runtime-state.txt").read_bytes()
+    ).hexdigest(),
 }, sort_keys=True))
 PY
 }
@@ -165,11 +177,79 @@ paths = [
     repo / "preserved-staged.txt",
     repo / "preserved-unstaged.txt",
     repo / "preserved-untracked.txt",
+    repo / "preserved-deleted.txt",
+    repo / "CHANGELOG.md",
+    repo / ".exo/harness_policy.toml",
+    repo / ".exo/tracked-runtime-policy.toml",
+    repo / ".exo/config.toml",
+    repo / ".exo/e2e-runtime-ignored-untracked/runtime-state.txt",
 ]
 print(json.dumps({
-    str(path.relative_to(repo)): hashlib.sha256(path.read_bytes()).hexdigest()
+    str(path.relative_to(repo)): (
+        hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else "absent"
+    )
     for path in paths
 }, sort_keys=True))
+PY
+}
+
+assert_scope_handoff_commit() {
+    python3 - "$AGG_REPO" "$AGGREGATE_REMOTE_HEAD" "$AGGREGATE_DIRTY_BEFORE" <<'PY'
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+aggregate_head = sys.argv[2]
+dirty_before = json.loads(sys.argv[3])
+
+def git(*args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+head = git("rev-parse", "HEAD")
+assert head != aggregate_head, "dirty handoff did not create a commit"
+assert git("rev-parse", "HEAD^") == aggregate_head, "handoff commit has an unexpected parent"
+assert git("show", "-s", "--format=%s", head) == (
+    "Prepare parent worktree for ordered subTL handoff"
+)
+body = git("show", "-s", "--format=%B", head)
+for trailer in (
+    "Exomonad-Handoff-Identity:",
+    "Exomonad-Handoff-Fingerprint:",
+    "Exomonad-Handoff-Parent:",
+    "Exomonad-Handoff-Branch-SHA256:",
+    "Exomonad-Handoff-Tree:",
+):
+    assert trailer in body, f"handoff commit omitted {trailer}"
+expected_paths = {
+    ".exo/config.toml",
+    ".exo/harness_policy.toml",
+    ".exo/tracked-runtime-policy.toml",
+    "CHANGELOG.md",
+    "preserved-deleted.txt",
+    "preserved-staged.txt",
+    "preserved-unstaged.txt",
+    "preserved-untracked.txt",
+}
+committed_paths = set(
+    git("diff-tree", "--no-commit-id", "--name-only", "-r", head).splitlines()
+)
+assert committed_paths == expected_paths, (committed_paths, expected_paths)
+assert ".exo/e2e-runtime-ignored-untracked/runtime-state.txt" not in committed_paths
+ignored_file = repo / ".exo/e2e-runtime-ignored-untracked/runtime-state.txt"
+assert ignored_file.is_file()
+assert hashlib.sha256(ignored_file.read_bytes()).hexdigest() == dirty_before[
+    "ignored_untracked_sha256"
+]
+assert git("status", "--porcelain", "--untracked-files=all") == ""
+print(json.dumps({"handoff_commit": head, "changed_paths": sorted(committed_paths)}, sort_keys=True))
 PY
 }
 
@@ -214,6 +294,8 @@ assert len(receipts) == 1, f"expected one legacy recovery receipt, found {len(re
 intent_id = intents[0].get("event_id", intents[0].get("id"))
 intent_data = intents[0].get("data")
 assert isinstance(intent_data, dict), "legacy recovery intent has no structured data"
+legacy_lock = intent_data.get("original_lock")
+assert isinstance(legacy_lock, dict), "legacy recovery intent has no original lock identity"
 assert intent_data.get("recovery_fingerprint") == expected_fingerprint
 assert intent_data.get("writer_stopped_authorization") is True
 receipt = receipts[0]
@@ -226,16 +308,26 @@ assert data.get("index_lock_file") == str((repo / ".git/index.lock").resolve()),
 quarantine = Path(data["quarantine_file"])
 assert quarantine.read_bytes() == expected, "quarantined lock bytes differ from the approved legacy lock"
 assert not (repo / ".git/index.lock").exists(), "recovered native lock still exists"
+def matches_legacy_inode(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    observed = data.get("original_lock", data.get("lock"))
+    return (
+        isinstance(observed, dict)
+        and observed.get("device") == legacy_lock.get("device")
+        and observed.get("inode") == legacy_lock.get("inode")
+    )
+
 assert not any(
     event.get("type", event.get("event_type")) == "git.native_lock.held"
     and isinstance(event.get("data"), dict)
-    and event["data"].get("index_lock_file") == str((repo / ".git/index.lock").resolve())
+    and matches_legacy_inode(event["data"])
     for event in events
 ), "legacy recovery fabricated a managed lock ownership proof"
 assert not any(
     event.get("type", event.get("event_type")) == "git.native_lock.quarantined"
     and isinstance(event.get("data"), dict)
-    and event["data"].get("index_lock_file") == str((repo / ".git/index.lock").resolve())
+    and matches_legacy_inode(event["data"])
     for event in events
 ), "legacy recovery fabricated a managed quarantine receipt"
 PY
@@ -285,7 +377,14 @@ trap cleanup EXIT INT TERM
 
 e2e_phase "Runtime build" "Building the current ExoMonad binary before the disposable run..."
 nix develop --command cargo build -p exomonad
-e2e_find_exomonad
+HOST_ARTIFACT_DIR="$WORK_DIR/host-artifacts"
+mkdir -p "$HOST_ARTIFACT_DIR"
+cp "$PROJECT_ROOT/target/debug/exomonad" "$HOST_ARTIFACT_DIR/exomonad"
+chmod 0755 "$HOST_ARTIFACT_DIR/exomonad"
+EXOMONAD_BIN="$HOST_ARTIFACT_DIR/exomonad"
+EXOMONAD_BIN_SHA256="$(sha256sum "$EXOMONAD_BIN" | cut -d ' ' -f 1)"
+export EXOMONAD_BIN
+e2e_log "Disposable ExoMonad binary=$EXOMONAD_BIN sha256=$EXOMONAD_BIN_SHA256"
 
 WASM_ARTIFACT_DIR="$WORK_DIR/wasm-artifacts"
 e2e_phase "WASM build" "Building production guest WASM into isolated scratch output..."
@@ -618,10 +717,32 @@ git -C "$AGG_REPO" init -q -b main
 git -C "$AGG_REPO" remote add origin "file://$AGG_REMOTE"
 git -C "$AGG_REPO" config user.name "Exomonad aggregate recovery E2E"
 git -C "$AGG_REPO" config user.email "aggregate-recovery-e2e@example.invalid"
+mkdir -p "$AGG_REPO/.exo"
+mkdir -p "$AGG_REPO/.forgejo/workflows"
+cp "$PROJECT_ROOT/CHANGELOG.md" "$AGG_REPO/CHANGELOG.md"
+cp "$PROJECT_ROOT/.forgejo/workflows/ci.yml" "$AGG_REPO/.forgejo/workflows/ci.yml"
+cp "$PROJECT_ROOT/.exo/harness_policy.toml" "$AGG_REPO/.exo/harness_policy.toml"
+printf 'tracked runtime baseline\n' > "$AGG_REPO/.exo/tracked-runtime-policy.toml"
+printf 'deleted before handoff baseline\n' > "$AGG_REPO/preserved-deleted.txt"
+cat > "$AGG_REPO/.gitignore" <<'EOF'
+.exo/*
+!.exo/config.toml
+!.exo/roles/
+!.exo/lib/
+!.exo/rules/
+.exo/roles/
+.codex/
+.claude/settings.local.json
+.opencode/
+opencode.json
+.chainlink/issues.db
+.exo/e2e-runtime-ignored-untracked/
+EOF
 git -C "$AGG_REPO" commit --allow-empty -q -m "aggregate recovery base"
 printf 'tracked staged baseline\n' > "$AGG_REPO/preserved-staged.txt"
 printf 'tracked unstaged baseline\n' > "$AGG_REPO/preserved-unstaged.txt"
-git -C "$AGG_REPO" add preserved-staged.txt preserved-unstaged.txt
+git -C "$AGG_REPO" add .gitignore .forgejo/workflows/ci.yml CHANGELOG.md preserved-deleted.txt preserved-staged.txt preserved-unstaged.txt
+git -C "$AGG_REPO" add -f .exo/harness_policy.toml .exo/tracked-runtime-policy.toml
 git -C "$AGG_REPO" commit -q -m "add local edit preservation baselines"
 git -C "$AGG_REPO" push -u origin main -q
 
@@ -671,7 +792,7 @@ PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_aggregate_checkpoint.py" \
     > "$AGG_DIR/seed.log" \
     || { cat "$AGG_DIR/seed.log"; cat "$AGG_DIR/mock.stderr"; e2e_fail "failed to seed completed-aggregate/later-child recovery state"; }
 python3 - "$AGG_REPO" <<'PY' \
-    || e2e_fail "Phase 8 did not seed the completed-architecture/later-child-failure shape"
+    || e2e_fail "Phase 8 did not seed the failed-root/completed-aggregate/pending-child shape"
 import json
 import sys
 from pathlib import Path
@@ -681,15 +802,13 @@ root = json.loads((root_dir / "run.json").read_text(encoding="utf-8"))
 architecture = root["slices"]["architecture"]
 kani = root["slices"]["kani"]
 candidate = root["integration"]["candidates"]["architecture"]
-child = json.loads((root_dir / "kani/run.json").read_text(encoding="utf-8"))
 assert root["fsm"]["phase"] == "tl_failed"
 assert root["current_order"] == 2
 assert architecture["status"] == "merged"
 assert architecture["post_merge"]["phase"] == "complete"
 assert candidate["lifecycle"] == "MERGED"
-assert kani["status"] == "failed"
-assert child["fsm"]["phase"] == "tl_failed"
-assert child["run_id"] == "kani"
+assert kani["status"] == "pending"
+assert not (root_dir / "kani/run.json").exists(), "pending Kani stage already has a child checkpoint"
 PY
 AGGREGATE_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_pr"])' "$AGG_DIR/seed.json")"
 AGGREGATE_BASE_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_sha"])' "$AGG_DIR/seed.json")"
@@ -708,11 +827,7 @@ AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/m
 PULL_PUBLICATIONS_BEFORE="$(count_pull_publications "$AGG_DIR/mock.log")"
 [[ "$PULL_PUBLICATIONS_BEFORE" == "2" ]] \
     || e2e_fail "fixture expected only its leaf and aggregate PR publications, found $PULL_PUBLICATIONS_BEFORE"
-e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR with a full completed architecture receipt and retryable Kani startup failure at order 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
-LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
-printf '%s\n' "$LOCAL_EDIT_STATE_BEFORE" > "$AGG_DIR/local-edits-before.json"
-e2e_log "Seeded unrelated staged, unstaged, and untracked edits"
-LOCAL_INDEX_AND_FILES_BEFORE="$(capture_index_and_worktree_bytes)"
+e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR with a full completed architecture receipt and pending Kani stage at order 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
 LEGACY_LOCK_CONTENTS="legacy index lock evidence requiring explicit operator authorization"
 printf '%s' "$LEGACY_LOCK_CONTENTS" > "$AGG_REPO/.git/index.lock"
 [[ -s "$AGG_REPO/.git/index.lock" ]] \
@@ -727,9 +842,13 @@ poll_interval = 1
 port = $AGGREGATE_SERVER_PORT
 spawn_agent_type = "codex"
 forgejo_url = "$AGG_MOCK_URL"
-forgejo_token = "test-token-e2e"
-forgejo_reviewer_token = "reviewer-token-e2e"
 EOF
+
+LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
+printf '%s\n' "$LOCAL_EDIT_STATE_BEFORE" > "$AGG_DIR/local-edits-before.json"
+AGGREGATE_DIRTY_BEFORE="$LOCAL_EDIT_STATE_BEFORE"
+e2e_log "Seeded staged, unstaged, deleted, tracked-ignored, nonignored-untracked, and ignored-untracked content for commit-all"
+LOCAL_INDEX_AND_FILES_BEFORE="$(capture_index_and_worktree_bytes)"
 
 tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null || true
 # Keep the test transport scoped to the session after the isolated server is
@@ -856,6 +975,7 @@ fsm = state.get("fsm", {})
 slices = state.get("slices", {})
 architecture = slices.get("architecture", {})
 kani = slices.get("kani", {})
+handoff = slices.get("handoff-proof", {})
 post = architecture.get("post_merge") or {}
 phase = post.get("phase") if isinstance(post, dict) else None
 print(
@@ -865,19 +985,22 @@ print(
     phase or "none",
     kani.get("status", "missing"),
     kani.get("dispatch_intent_id") or "none",
+    handoff.get("status", "missing"),
+    handoff.get("dispatch_intent_id") or "none",
 )
 PY
     2>/dev/null)" || AGGREGATE_RESULT=""
-    [[ "$AGGREGATE_RESULT" == "tl_done 2 merged complete merged "* ]] && break
+    [[ "$AGGREGATE_RESULT" == "tl_done 3 merged complete merged "*" merged "* ]] && break
     sleep 0.25
 done
-read -r final_phase final_order architecture_status architecture_post kani_status kani_intent <<< "$AGGREGATE_RESULT"
-if [[ "$final_phase" != "tl_done" || "$final_order" != "2" \
+read -r final_phase final_order architecture_status architecture_post kani_status kani_intent handoff_status handoff_intent <<< "$AGGREGATE_RESULT"
+if [[ "$final_phase" != "tl_done" || "$final_order" != "3" \
     || "$architecture_status" != "merged" || "$architecture_post" != "complete" \
-    || "$kani_status" != "merged" || "$kani_intent" == "none" ]]; then
+    || "$kani_status" != "merged" || "$kani_intent" == "none" \
+    || "$handoff_status" != "merged" || "$handoff_intent" == "none" ]]; then
     cat "$AGG_DIR/init.log"
     cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true
-    e2e_fail "failed later child did not recover while retaining completed aggregate integration: '$AGGREGATE_RESULT'"
+    e2e_fail "continuation did not recover the aggregate and dispatch the post-handoff child: '$AGGREGATE_RESULT'"
 fi
 
 python3 - "$AGG_REPO" "$AGGREGATE_PR" "$LEAF_PR" "$LEAF_RECEIPT_SHA256" "$AGGREGATE_REMOTE_HEAD" <<'PY'
@@ -923,6 +1046,10 @@ lane = root["integration"]["lanes"][f'{root["repository_identity"]["remote_url"]
 assert lane["phase"] == "idle" and lane["child_id"] is None
 assert lane["last_lane_epoch"] == 2
 journal = json.loads((root_dir / "action-journal.json").read_text())
+handoff_node = next(
+    node for node in root["plan_manifest"]["nodes"]
+    if node.get("kind") == "sub_tl" and node.get("name") == "handoff-proof"
+)
 aggregate_merges = [
     entry
     for entry in journal
@@ -973,19 +1100,86 @@ kani_dispatches = [
     and entry["arguments"]["payload"].get("boundary") == "sub_tl_started"
 ]
 assert len(kani_dispatches) == 1, f"expected one Kani stage dispatch, found {len(kani_dispatches)}"
+handoffs = [
+    entry for entry in journal
+    if entry.get("operation") == "prepare_scope_handoff"
+    and isinstance(entry.get("arguments"), dict)
+    and entry["arguments"].get("child_scope_id") == handoff_node["node_id"]
+]
+assert len(handoffs) == 1, f"expected one audited commit-all handoff, found {len(handoffs)}"
+assert handoffs[0].get("status") == "confirmed"
+handoff_result = handoffs[0].get("result", {}).get("result", {})
+assert handoff_result.get("ready") is True
+assert handoff_result.get("head_after") != sys.argv[5]
+handoff_dispatches = [
+    entry for entry in journal
+    if entry.get("operation") == "emit_controller_event"
+    and entry.get("target") == "handoff-proof"
+    and isinstance(entry.get("arguments"), dict)
+    and entry["arguments"].get("event_type") == "tl.dispatch_confirmed"
+    and isinstance(entry["arguments"].get("payload"), dict)
+    and entry["arguments"]["payload"].get("boundary") == "sub_tl_started"
+]
+assert len(handoff_dispatches) == 1, (
+    f"expected one post-handoff subTL dispatch, found {len(handoff_dispatches)}"
+)
+assert journal.index(handoffs[0]) < journal.index(handoff_dispatches[0]), (
+    "subTL dispatch was journaled before its commit-all handoff"
+)
 assert not any(
     entry.get("operation") == "spawn_reviewer" and entry.get("target") == "architecture"
     for entry in journal
 ), "aggregate recovery started a root reviewer"
 PY
 
-LOCAL_EDIT_STATE_AFTER="$(capture_local_edit_state)"
-[[ "$LOCAL_EDIT_STATE_AFTER" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
-    || e2e_fail "parent synchronization or bookkeeping changed unrelated local edits"
-[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
-    || e2e_fail "confirmed local synchronization did not advance main to the verified merge commit"
+HANDOFF_COMMIT_REPORT="$(assert_scope_handoff_commit)"
+printf '%s\n' "$HANDOFF_COMMIT_REPORT" > "$AGG_DIR/scope-handoff-commit.json"
+HANDOFF_COMMIT_SHA="$(git -C "$AGG_REPO" rev-parse HEAD)"
+[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$HANDOFF_COMMIT_SHA" ]] \
+    || e2e_fail "parent branch does not point at its audited handoff commit"
 [[ "$(git -C "$AGG_REPO" rev-parse refs/remotes/origin/main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
-    || e2e_fail "aggregate startup fetch changed origin/main away from its authoritative merge head"
+    || e2e_fail "handoff commit unexpectedly pushed or changed the authoritative remote merge head"
+HANDOFF_WORKTREE="$AGG_REPO/.exo/worktrees/handoff-proof"
+[[ -d "$HANDOFF_WORKTREE" ]] \
+    || e2e_fail "post-handoff child worktree was not provisioned"
+[[ "$(git -C "$HANDOFF_WORKTREE" rev-parse HEAD)" == "$HANDOFF_COMMIT_SHA" ]] \
+    || e2e_fail "post-handoff child did not start from the committed parent revision"
+[[ "$(git -C "$HANDOFF_WORKTREE" branch --show-current)" == "main.handoff-proof" ]] \
+    || e2e_fail "post-handoff child was provisioned on an unexpected branch"
+python3 - "$AGG_REPO" "$HANDOFF_COMMIT_SHA" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+identity = json.loads((repo / ".exo/agents/handoff-proof/identity.json").read_text())
+invocation = json.loads((repo / ".exo/agents/handoff-proof/invocation.json").read_text())
+assert identity["slice_id"] == "handoff-proof"
+assert identity["parent_branch"] == "main"
+assert identity["birth_branch"] == "main.handoff-proof"
+assert identity["working_dir"] == str(repo / ".exo/worktrees/handoff-proof")
+assert invocation["slice_id"] == "handoff-proof"
+assert invocation["branch"] == "main.handoff-proof"
+assert invocation["worktree"] == identity["working_dir"]
+child = json.loads((repo / ".exo/tl-loop/root/handoff-proof/run.json").read_text())
+assert child["run_id"] == "handoff-proof"
+assert child["parent_run_id"] == "root"
+root = json.loads((repo / ".exo/tl-loop/root/run.json").read_text())
+journal = json.loads((repo / ".exo/tl-loop/root/action-journal.json").read_text())
+handoff_node = next(
+    node for node in root["plan_manifest"]["nodes"]
+    if node.get("kind") == "sub_tl" and node.get("name") == "handoff-proof"
+)
+handoff_entries = [
+    entry for entry in journal
+    if entry.get("operation") == "prepare_scope_handoff"
+    and isinstance(entry.get("arguments"), dict)
+    and entry["arguments"].get("child_scope_id") == handoff_node["node_id"]
+]
+assert len(handoff_entries) == 1
+assert handoff_entries[0]["result"]["result"]["head_after"] == sys.argv[2]
+print(json.dumps({"child_run": child["run_id"], "handoff_commit": sys.argv[2]}))
+PY
 assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
 
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
@@ -1023,11 +1217,46 @@ REPEAT_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
     || e2e_fail "repeat init published a replacement aggregate PR"
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init-repeat.log" || printf '0')" == "0" ]] \
     || e2e_fail "repeated init reported an already-completed lock recovery again"
-LOCAL_EDIT_STATE_AFTER_REPEAT="$(capture_local_edit_state)"
-[[ "$LOCAL_EDIT_STATE_AFTER_REPEAT" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
-    || e2e_fail "repeated continuation changed unrelated local edits"
+[[ "$(git -C "$AGG_REPO" rev-parse HEAD)" == "$HANDOFF_COMMIT_SHA" ]] \
+    || e2e_fail "repeat continuation created or selected another handoff commit"
+[[ "$(git -C "$AGG_REPO" log --format=%H --grep='^Prepare parent worktree for ordered subTL handoff$' | wc -l | tr -d ' ')" == "1" ]] \
+    || e2e_fail "repeat continuation duplicated the audited handoff commit"
+[[ "$(git -C "$AGG_REPO" status --porcelain --untracked-files=all)" == "" ]] \
+    || e2e_fail "repeat continuation changed committed parent worktree content"
+[[ "$(assert_scope_handoff_commit)" == "$HANDOFF_COMMIT_REPORT" ]] \
+    || e2e_fail "repeat continuation changed the handoff commit or excluded ignored runtime content"
+python3 - "$AGG_REPO" "$handoff_intent" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+root_dir = repo / ".exo/tl-loop/root"
+root = json.loads((root_dir / "run.json").read_text())
+journal = json.loads((root_dir / "action-journal.json").read_text())
+proof = root["slices"]["handoff-proof"]
+assert proof["dispatch_intent_id"] == sys.argv[2]
+assert sum(
+    entry.get("operation") == "prepare_scope_handoff"
+    and entry.get("arguments", {}).get("child_scope_id")
+    == next(
+        node["node_id"] for node in root["plan_manifest"]["nodes"]
+        if node.get("kind") == "sub_tl" and node.get("name") == "handoff-proof"
+    )
+    for entry in journal
+) == 1
+assert sum(
+    entry.get("operation") == "emit_controller_event"
+    and entry.get("target") == "handoff-proof"
+    and isinstance(entry.get("arguments"), dict)
+    and entry["arguments"].get("event_type") == "tl.dispatch_confirmed"
+    and isinstance(entry["arguments"].get("payload"), dict)
+    and entry["arguments"]["payload"].get("boundary") == "sub_tl_started"
+    for entry in journal
+) == 1
+PY
 assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
-e2e_log "PASS: actual init --continue resumed a previously merged aggregate without repeating merge/publication/leaf work, explicitly recovered one legacy lock, preserved local edits, completed bookkeeping, and dispatched Kani once (archive=$AGGREGATE_ARCHIVE_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
+e2e_log "PASS: actual init --continue recovered the merged aggregate, commit-all tidied the parent before dispatch, preserved ignored runtime data and completed receipts, and repeat init added no duplicate effects (handoff=$HANDOFF_COMMIT_SHA, archive=$AGGREGATE_ARCHIVE_SHA256, host=$EXOMONAD_BIN_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
 
 echo ""
 echo "============================================"

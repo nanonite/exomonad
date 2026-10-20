@@ -693,6 +693,32 @@ one parent's direct sub-TL siblings:
   the owning run, complete child path, blocked slice, recovery round, and next
   probe time; only the nearest child TL may resume that checkpoint.
 
+### Parent worktree handoff
+
+Before a pending ordered sub-TL is provisioned or dispatched, its parent
+controller prepares the authenticated source worktree that the spawn path
+uses. The current policy is explicit commit-all: `git add -A` semantics stage
+tracked additions, modifications, deletions, and nonignored untracked files
+in that one parent worktree. This includes staged and unstaged changes and
+changes to tracked files even when their paths match ignore rules. Ignored
+untracked files remain ignored. A clean worktree is a no-op and creates no
+empty commit.
+
+The runtime records the parent scope, child declaration, source branch, HEAD,
+and worktree fingerprint in the durable handoff action. The commit uses the
+repository's configured Git identity and hooks. A conflict, unsafe in-progress
+Git operation, ownership mismatch, hook refusal, active mutation, or changed
+worktree blocks the child handoff without discarding the edits. Continuation
+reconciles an interrupted commit against the same handoff identity before it
+can dispatch. Local handoff commits do not imply that a remote push occurred;
+publication and push receipts remain separate requirements of the existing
+integration flow.
+
+This first version commits all eligible changes. It does not ask a model to
+select files or infer which edits belong to the next child. A narrower,
+smarter scope policy can replace commit-all in a later change without
+changing the ownership and replay checks.
+
 The parent's top-level execution is therefore: dispatch any top-level
 workers/leaves, run order 1, integrate it, then advance through the remaining
 ordered stages. A sub-TL has its own checkpoint and branch coordinates, so a

@@ -374,23 +374,19 @@ def seed_root(
         PostMergeNotApplicable,
         UnlinkedChangelogJudged,
     )
-    from tl_loop.fsm.scope import RecursiveTLFailed
+    from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
     from tl_loop.loop.driver import (
         AGGREGATE_PUBLICATION_GATE_PREFIX,
-        SUB_TL_DISPATCH_STARTED_BOUNDARY,
         EffectIntent,
         TLLoopConfig,
         WorkPlan,
         _checkpoint_post_merge_event,
-        _child_controller_name,
         _initial_slices,
         _manifest_for_plan,
         _parent_aggregate_approval,
         _parent_sync_arguments,
         _parent_sync_identity_fields,
-        _sub_tl_worktree,
         _verified_child_completion_evidence,
-        derive_child_branch,
         stable_action_key,
     )
     from tl_loop.loop.journal import EffectJournal
@@ -435,6 +431,12 @@ def seed_root(
             {
                 "name": "kani",
                 "order": 2,
+                "integration": {"aggregate_pr_required": False},
+                "plan": {"leaves": []},
+            },
+            {
+                "name": "handoff-proof",
+                "order": 3,
                 "integration": {"aggregate_pr_required": False},
                 "plan": {"leaves": []},
             },
@@ -503,6 +505,7 @@ def seed_root(
         (
             OrderedStageState(1, ("architecture",)),
             OrderedStageState(2, ("kani",)),
+            OrderedStageState(3, ("handoff-proof",)),
         ),
         IntegrationRuntimeState(
             sub_tl_states={
@@ -902,10 +905,6 @@ def seed_root(
             "captured",
             "an existing unreleased entry already covers the merged work",
         ),
-        {
-            "changelog_outcome": "captured",
-            "changelog_detail": "an existing unreleased entry already covers the merged work",
-        },
     )
     synced_architecture = replace(
         synced.slices["architecture"],
@@ -914,78 +913,6 @@ def seed_root(
         dispatch_error=None,
     )
 
-    kani_task = next(task for task in work_plan.sub_tls if task.name == "kani")
-    kani_branch = derive_child_branch(
-        root_config.branch, _child_controller_name(kani_task)
-    )
-    kani_worktree = _sub_tl_worktree(root_config, state_root, "root", kani_task)
-    kani_worktree.parent.mkdir(parents=True, exist_ok=True)
-    git(
-        repository,
-        "worktree",
-        "add",
-        "-b",
-        kani_branch,
-        str(kani_worktree),
-        merged_remote_head,
-    )
-    kani_node = next(node for node in manifest.nodes if node.name == kani_task.name)
-    kani_manifest = manifest.child_manifests[kani_node.node_id]
-    kani_config = TLLoopConfig(
-        root_dir=state_root,
-        run_id=kani_task.name,
-        branch=kani_branch,
-        worktree=str(kani_worktree),
-        project_root=repository,
-        parent_branch=root_config.branch,
-        parent_run_id="root",
-        parent_agent_id="root",
-        depth=1,
-        repository_identity=identity,
-        agent_id=_child_controller_name(kani_task),
-        declared_manifest=kani_manifest,
-    )
-    kani_slices = _initial_slices(
-        kani_task.plan, kani_config, state_root, kani_task.name
-    )
-    create(
-        kani_task.name,
-        {
-            "slices": kani_slices,
-            "repository_identity": identity.to_document(),
-            "owner_branch": kani_branch,
-            "owner_worktree": str(kani_worktree),
-            "parent_branch": root_config.branch,
-            "parent_run_id": "root",
-            "parent_agent_id": "root",
-            "depth": 1,
-        },
-        root_dir=state_root,
-    )
-    kani_store = RunStore(kani_task.name, state_root)
-    kani_store.set_plan_manifest(kani_manifest, slices=kani_slices)
-    kani_failure = "server socket timed out during child startup"
-    kani_store.checkpoint(
-        RecursiveTLFailed(kani_failure, scope_path=(kani_manifest.scope_id,)),
-        kani_slices,
-        kani_store.load().budgets,
-        kani_store.load().events.last_consumed_offset,
-    )
-    kani_store.record_exit_reason(kani_failure)
-    kani_dispatch_intent = "seed-kani-startup-dispatch"
-    failed_kani = replace(
-        synced.slices["kani"],
-        status=SliceStatus.FAILED,
-        attempts=1,
-        branch=kani_branch,
-        worktree=str(kani_worktree),
-        dispatch_intent_id=kani_dispatch_intent,
-        dispatch_agent_id=_child_controller_name(kani_task),
-        dispatch_invocation_id="seed-kani-startup-invocation",
-        dispatch_generation=1,
-        dispatch_authoritative_event_seq=1,
-        dispatch_last_boundary=SUB_TL_DISPATCH_STARTED_BOUNDARY,
-    )
     lane_key = f"{identity.remote_url}:main"
     idle_lane = LaneState(
         identity.remote_url,
@@ -994,11 +921,12 @@ def seed_root(
         last_lane_epoch=2,
     )
     root_store.checkpoint(
-        RecursiveTLFailed("Kani controller exited during startup"),
+        RecursiveTLFailed(
+            "Prior invocation ended while aggregate integration was pending"
+        ),
         {
             **synced.slices,
             "architecture": synced_architecture,
-            "kani": failed_kani,
         },
         synced.budgets,
         synced.events.last_consumed_offset,
@@ -1022,7 +950,7 @@ def seed_root(
 
 
 def seed_local_edits(repository: Path) -> dict[str, str]:
-    """Leave independent staged, unstaged, and untracked edits for recovery."""
+    """Leave representative all-changes edits for the next scope handoff."""
     (repository / "preserved-staged.txt").write_text(
         "staged local change\n", encoding="utf-8"
     )
@@ -1033,10 +961,41 @@ def seed_local_edits(repository: Path) -> dict[str, str]:
     (repository / "preserved-untracked.txt").write_text(
         "untracked local change\n", encoding="utf-8"
     )
+    (repository / "preserved-deleted.txt").unlink()
+    changelog = repository / "CHANGELOG.md"
+    changelog.write_text(
+        changelog.read_text(encoding="utf-8")
+        + "\n- Record disposable ordered handoff test change.\n",
+        encoding="utf-8",
+    )
+    policy = repository / ".exo/harness_policy.toml"
+    policy.write_text(
+        policy.read_text(encoding="utf-8") + "\n# disposable handoff policy change\n",
+        encoding="utf-8",
+    )
+    (repository / ".exo/tracked-runtime-policy.toml").write_text(
+        "tracked runtime policy change\n", encoding="utf-8"
+    )
+    git(
+        repository,
+        "add",
+        ".exo/harness_policy.toml",
+        ".exo/tracked-runtime-policy.toml",
+    )
+    ignored_untracked = (
+        repository / ".exo/e2e-runtime-ignored-untracked/runtime-state.txt"
+    )
+    ignored_untracked.parent.mkdir(parents=True, exist_ok=True)
+    ignored_untracked.write_text("ignored disposable runtime state\n", encoding="utf-8")
     return {
         "staged": "preserved-staged.txt",
         "unstaged": "preserved-unstaged.txt",
         "untracked": "preserved-untracked.txt",
+        "deleted": "preserved-deleted.txt",
+        "changelog": "CHANGELOG.md",
+        "policy": ".exo/harness_policy.toml",
+        "tracked_ignored": ".exo/tracked-runtime-policy.toml",
+        "ignored_untracked": ".exo/e2e-runtime-ignored-untracked/runtime-state.txt",
     }
 
 
