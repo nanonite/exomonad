@@ -640,6 +640,60 @@
       "name": "root_branch_finalize"
     },
     {
+      "description": "Inspect or commit all normal Git changes in this TL's authenticated source worktree before handing control to one declared child. Standard git add -A ignore behavior, hooks, and configured identity apply. First call with apply=false; pass its branch, HEAD, and source fingerprint unchanged to apply=true. Changed paths are hexadecimal encoded. A false ready field blocks handoff.",
+      "inputSchema": {
+        "properties": {
+          "apply": {
+            "description": "False inspects; true stages and commits the inspected snapshot.",
+            "type": "boolean"
+          },
+          "child_scope_id": {
+            "description": "The intended accepted child declaration.",
+            "type": "string"
+          },
+          "controller_id": {
+            "description": "Authenticated TL controller identity.",
+            "type": "string"
+          },
+          "expected_branch": {
+            "description": "Exact source branch selected for this handoff.",
+            "type": "string"
+          },
+          "expected_head_sha": {
+            "description": "HEAD returned by the preceding inspection; required for apply.",
+            "type": "string"
+          },
+          "expected_source_fingerprint": {
+            "description": "Fingerprint returned by the preceding inspection; required for apply.",
+            "type": "string"
+          },
+          "handoff_id": {
+            "description": "Stable logical identity for this parent-run/scope/child handoff.",
+            "type": "string"
+          },
+          "parent_run_id": {
+            "description": "Accepted parent RunStore identity.",
+            "type": "string"
+          },
+          "parent_scope_id": {
+            "description": "Accepted parent manifest scope identity.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "apply",
+          "handoff_id",
+          "controller_id",
+          "parent_run_id",
+          "parent_scope_id",
+          "child_scope_id",
+          "expected_branch"
+        ],
+        "type": "object"
+      },
+      "name": "prepare_scope_handoff"
+    },
+    {
       "description": "Close an ephemeral worker tmux pane by pane_id. Use the pane_id returned by spawn_worker after you have received the worker's final result or no longer need the worker pane.",
       "inputSchema": {
         "properties": {

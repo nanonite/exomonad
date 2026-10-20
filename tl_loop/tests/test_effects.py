@@ -375,6 +375,17 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         strategy="squash",
         working_dir=".",
     )
+    client.prepare_scope_handoff(
+        apply=True,
+        handoff_id="handoff-id",
+        controller_id="root-controller",
+        parent_run_id="root-run",
+        parent_scope_id="root",
+        child_scope_id="node:architecture",
+        expected_branch="main",
+        expected_head_sha="a" * 40,
+        expected_source_fingerprint="b" * 64,
+    )
     client.notify_parent(
         status="success",
         message="message",

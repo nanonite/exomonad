@@ -13,7 +13,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
-from tl_loop.client.effects import ToolResult
+from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.loop.driver import (
     TLLoopConfig,
     _action_journal_gate_name,
@@ -177,6 +177,72 @@ def test_controller_event_journal_records_confirmed_and_unknown_outcomes(tmp_pat
     )
     unknown = journal._read()[-1]
     assert unknown["status"] == "unknown"
+
+
+def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_path) -> None:
+    store, state = _store_and_state(tmp_path)
+    journal = EffectJournal("reconcile-journal", store.run_dir / "action-journal.json")
+    arguments = {
+        "apply": True,
+        "handoff_id": "handoff-id",
+        "controller_id": "root-controller",
+        "parent_run_id": "reconcile-journal",
+        "parent_scope_id": "root",
+        "child_scope_id": "node:architecture",
+        "expected_branch": "main",
+        "expected_head_sha": "a" * 40,
+        "expected_source_fingerprint": "b" * 64,
+    }
+    intent = _Intent(
+        operation="prepare_scope_handoff",
+        target="handoff-action",
+        arguments=arguments,
+    )
+    journal.append(intent)
+    journal.mark_unknown(intent, RuntimeError("response lost after commit"))
+
+    class Transport:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def call_tool(self, role, name, tool_name, received):
+            self.calls.append((role, name, tool_name, received))
+            assert tool_name == "prepare_scope_handoff"
+            assert received == arguments
+            return {
+                "success": True,
+                "result": {
+                    "success": True,
+                    "ready": True,
+                    "outcome": "recovered_commit",
+                    "handoff_id": "handoff-id",
+                    "controller_id": "root-controller",
+                    "parent_run_id": "reconcile-journal",
+                    "parent_scope_id": "root",
+                    "child_scope_id": "node:architecture",
+                    "source_worktree": str(tmp_path),
+                    "branch": "main",
+                    "head_before": "a" * 40,
+                    "head_after": "c" * 40,
+                    "commit_sha": "c" * 40,
+                    "source_fingerprint": "b" * 64,
+                    "changed_paths": [],
+                    "error": "",
+                },
+            }
+
+    transport = Transport()
+    reconciled = _reconcile_action_journal(
+        state,
+        store,
+        journal,
+        effects=EffectClient(transport),
+    )
+
+    assert transport.calls == [("tl", "root", "prepare_scope_handoff", arguments)]
+    assert journal.pending_entries() == []
+    assert journal.existing(intent)["status"] == "confirmed"
+    assert reconciled.gates == state.gates
 
 
 def test_a_second_unknown_outcome_for_the_same_key_does_not_reuse_the_earlier_approval(

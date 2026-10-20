@@ -23,6 +23,7 @@ MUTATING_OPERATIONS = frozenset(
         "spawn_worker",
         "spawn_leaf",
         "spawn_reviewer",
+        "prepare_scope_handoff",
         "file_pr",
         "update_pr",
         "merge_pr",

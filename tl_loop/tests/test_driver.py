@@ -992,6 +992,23 @@ class RecordingTransport:
     ) -> JsonObject:
         del role
         self.calls.append((tool_name, arguments))
+        if tool_name == "prepare_scope_handoff":
+            expected_head = arguments.get("expected_head_sha")
+            expected_fingerprint = arguments.get("expected_source_fingerprint")
+            head = expected_head if isinstance(expected_head, str) else "1" * 40
+            fingerprint = (
+                expected_fingerprint if isinstance(expected_fingerprint, str) else "2" * 64
+            )
+            return _scope_handoff_tool_response(
+                arguments,
+                source_worktree="/tmp/recording-transport-worktree",
+                branch=cast(str, arguments["expected_branch"]),
+                head_before=head,
+                head_after=head,
+                fingerprint=fingerprint,
+                outcome="no_changes",
+                ready=True,
+            )
         if self.fail_observability and tool_name == "emit_controller_event":
             return {"success": False, "error": "ledger unavailable"}
         if self.reject_spawns and tool_name in {"spawn_worker", "spawn_leaf"}:
@@ -1229,6 +1246,145 @@ class NamedRecordingTransport(RecordingTransport):
     ) -> JsonObject:
         self.identities.append((role, name, tool_name))
         return super().call_tool(role, name, tool_name, arguments)
+
+
+@dataclass
+class ScopeHandoffTransport(RecordingTransport):
+    """Deterministic host boundary for ordered scope handoff regressions."""
+
+    source_worktree: str = "/tmp/accepted-source"
+    head: str = "1" * 40
+    committed_head: str = "3" * 40
+    fingerprint: str = "2" * 64
+    dirty: bool = True
+    inspection_error: str | None = None
+    change_before_apply: bool = False
+    commit_count: int = 0
+    owners: list[str] = field(default_factory=list)
+
+    def call_tool(self, role, name, tool_name, arguments):
+        if tool_name != "prepare_scope_handoff":
+            return super().call_tool(role, name, tool_name, arguments)
+        self.calls.append((tool_name, arguments))
+        self.owners.append(name)
+        if arguments.get("apply") is not True:
+            return self._inspection(arguments)
+        if self.change_before_apply:
+            self.change_before_apply = False
+            self.head = "4" * 40
+            self.fingerprint = "5" * 64
+        return self._apply(arguments)
+
+    def _inspection(self, arguments: JsonObject) -> JsonObject:
+        ready = self.inspection_error is None
+        return _scope_handoff_tool_response(
+            arguments,
+            source_worktree=self.source_worktree,
+            branch=cast(str, arguments["expected_branch"]),
+            head_before=self.head,
+            head_after=self.head,
+            fingerprint=self.fingerprint,
+            outcome="ready" if self.dirty else "no_changes",
+            ready=ready,
+            error=self.inspection_error or "",
+            changed_paths=["747261636b65642e747874"] if self.dirty else [],
+        )
+
+    def _apply(self, arguments: JsonObject) -> JsonObject:
+        expected_head = arguments.get("expected_head_sha")
+        if self.dirty and expected_head == self.head:
+            self.commit_count += 1
+            before = self.head
+            self.head = self.committed_head
+            self.dirty = False
+            return _scope_handoff_tool_response(
+                arguments,
+                source_worktree=self.source_worktree,
+                branch=cast(str, arguments["expected_branch"]),
+                head_before=before,
+                head_after=self.head,
+                fingerprint=self.fingerprint,
+                outcome="committed",
+                ready=True,
+                commit_sha=self.head,
+            )
+        if not self.dirty and expected_head == self.head:
+            return _scope_handoff_tool_response(
+                arguments,
+                source_worktree=self.source_worktree,
+                branch=cast(str, arguments["expected_branch"]),
+                head_before=self.head,
+                head_after=self.head,
+                fingerprint=self.fingerprint,
+                outcome="no_changes",
+                ready=True,
+            )
+        if not self.dirty and expected_head != self.head:
+            return _scope_handoff_tool_response(
+                arguments,
+                source_worktree=self.source_worktree,
+                branch=cast(str, arguments["expected_branch"]),
+                head_before=cast(str, expected_head),
+                head_after=self.head,
+                fingerprint=self.fingerprint,
+                outcome="recovered_commit",
+                ready=True,
+                commit_sha=self.head,
+            )
+        return _scope_handoff_tool_response(
+            arguments,
+            source_worktree=self.source_worktree,
+            branch=cast(str, arguments["expected_branch"]),
+            head_before=self.head,
+            head_after=self.head,
+            fingerprint=self.fingerprint,
+            outcome="blocked",
+            ready=False,
+            error="source snapshot changed",
+        )
+
+
+def _scope_handoff_tool_response(
+    arguments: JsonObject,
+    *,
+    source_worktree: str,
+    branch: str,
+    head_before: str,
+    head_after: str,
+    fingerprint: str,
+    outcome: str,
+    ready: bool,
+    error: str = "",
+    commit_sha: str = "",
+    changed_paths: list[str] | None = None,
+) -> JsonObject:
+    """Shape a typed host response behind the MCP success envelope."""
+    return {
+        "success": True,
+        "result": {
+            "success": ready,
+            "error": error,
+            "outcome": outcome,
+            **{
+                key: arguments[key]
+                for key in (
+                    "handoff_id",
+                    "controller_id",
+                    "parent_run_id",
+                    "parent_scope_id",
+                    "child_scope_id",
+                )
+            },
+            "source_worktree": source_worktree,
+            "branch": branch,
+            "head_before": head_before,
+            "head_after": head_after,
+            "commit_sha": commit_sha,
+            "source_fingerprint": fingerprint,
+            "changed_paths": changed_paths or [],
+            "ready": ready,
+        },
+    }
 
 
 def test_required_aggregate_completion_needs_publication_and_post_merge(
@@ -9405,7 +9561,8 @@ def test_recursive_sub_tls_isolate_state_and_branch_coordinates(tmp_path: Path) 
     assert grandchild.repository_identity == result.final_state.repository_identity
     assert not any(name == "repository_identity" for name, _ in transport.calls)
     assert all(
-        name in {"emit_controller_event", "repository_identity"} for name, _ in transport.calls
+        name in {"emit_controller_event", "repository_identity", "prepare_scope_handoff"}
+        for name, _ in transport.calls
     )
 
 
@@ -10313,6 +10470,296 @@ def test_nested_ordered_stages_round_trip_the_recursive_checkpoint(tmp_path: Pat
     )
     assert child.slices["inner-one"].status is SliceStatus.MERGED
     assert child.slices["inner-two"].status is SliceStatus.MERGED
+
+
+def test_scope_handoff_commits_before_child_dispatch_and_replays_without_duplicate_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = SubTLTask(
+        "architecture",
+        WorkPlan(),
+        order=1,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    plan = WorkPlan(sub_tls=(task,))
+    transport = ScopeHandoffTransport(source_worktree=str(tmp_path))
+    effects = EffectClient(transport, name="root-controller")
+    config = replace(
+        _config(),
+        max_workers=0,
+        max_leaves=0,
+        max_parallel_slices=1,
+        ledger_run_id="scope-handoff-ledger",
+        project_root=tmp_path,
+        worktree=tmp_path,
+        working_dir=str(tmp_path),
+        agent_id="root-controller",
+        keep_alive_on_waiting=False,
+    )
+    original_prepare = driver_module._prepare_sub_tl_stage
+
+    def crash_before_dispatch(*args, **kwargs):
+        del args, kwargs
+        raise SystemExit("simulated crash after handoff result")
+
+    monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", crash_before_dispatch)
+    with pytest.raises(SystemExit, match="simulated crash"):
+        run_tl_loop(
+            "scope-handoff-run",
+            plan,
+            SyntheticQueue([]),
+            effects,
+            config=config,
+            root_dir=tmp_path,
+        )
+    assert transport.commit_count == 1
+    assert not any(
+        name == "emit_controller_event" and arguments.get("event_type") == "tl.dispatch_confirmed"
+        for name, arguments in transport.calls
+    )
+
+    monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", original_prepare)
+    resumed = run_tl_loop(
+        "scope-handoff-run",
+        plan,
+        SyntheticQueue([]),
+        effects,
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert resumed.final_state.slices["architecture"].status is SliceStatus.MERGED
+    assert transport.commit_count == 1
+    handoff_indices = [
+        index for index, (name, _) in enumerate(transport.calls) if name == "prepare_scope_handoff"
+    ]
+    dispatch_index = next(
+        index
+        for index, (name, arguments) in enumerate(transport.calls)
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+    )
+    assert max(handoff_indices) < dispatch_index
+    dispatches = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+    ]
+    assert len(dispatches) == 1
+
+    call_count = len(transport.calls)
+    repeated = run_tl_loop(
+        "scope-handoff-run",
+        plan,
+        SyntheticQueue([]),
+        effects,
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert repeated.final_state.slices["architecture"].status is SliceStatus.MERGED
+    assert len(transport.calls) == call_count
+    assert transport.commit_count == 1
+
+
+def test_scope_handoff_covers_root_and_descendant_boundaries(tmp_path: Path) -> None:
+    nested = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "inner",
+                WorkPlan(),
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+        )
+    )
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "outer",
+                nested,
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+        )
+    )
+    transport = ScopeHandoffTransport(source_worktree=str(tmp_path), dirty=False)
+    config = replace(
+        _config(),
+        max_workers=0,
+        max_leaves=0,
+        max_parallel_slices=2,
+        project_root=tmp_path,
+        worktree=tmp_path,
+        working_dir=str(tmp_path),
+        agent_id="root-controller",
+        keep_alive_on_waiting=False,
+    )
+
+    result = run_tl_loop(
+        "scope-handoff-nested",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport, name="root-controller"),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.slices["outer"].status is SliceStatus.MERGED
+    assert transport.owners.count("root-controller") == 2
+    assert transport.owners.count("outer") == 2
+    inspections = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "prepare_scope_handoff" and arguments["apply"] is False
+    ]
+    assert len(inspections) == 2
+    outer_inspection = next(
+        item for item in inspections if item["parent_run_id"] == "scope-handoff-nested"
+    )
+    inner_inspection = next(item for item in inspections if item["parent_run_id"] == "outer")
+    assert outer_inspection["child_scope_id"] != inner_inspection["child_scope_id"]
+    assert outer_inspection["parent_scope_id"] != inner_inspection["parent_scope_id"]
+    assert transport.commit_count == 0
+
+
+def test_scope_handoff_refusal_keeps_child_and_later_stage_pending(tmp_path: Path) -> None:
+    first = SubTLTask(
+        "architecture",
+        WorkPlan(),
+        order=1,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    later = SubTLTask(
+        "kani",
+        WorkPlan(),
+        order=2,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    plan = WorkPlan(sub_tls=(first, later))
+    transport = ScopeHandoffTransport(
+        source_worktree=str(tmp_path), inspection_error="Git conflict remains"
+    )
+    config = replace(
+        _config(),
+        max_workers=0,
+        max_leaves=0,
+        max_parallel_slices=1,
+        ledger_run_id="scope-handoff-ledger",
+        project_root=tmp_path,
+        worktree=tmp_path,
+        working_dir=str(tmp_path),
+        agent_id="root-controller",
+    )
+
+    result = run_tl_loop(
+        "scope-handoff-blocked",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport, name="root-controller"),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLFailed
+    assert "Git conflict remains" in str(result.final_state.recursive_fsm)
+    assert result.final_state.slices["architecture"].status is SliceStatus.PENDING
+    assert result.final_state.slices["kani"].status is SliceStatus.PENDING
+    assert transport.commit_count == 0
+    assert sum(name == "prepare_scope_handoff" for name, _ in transport.calls) == 1
+    assert not any(
+        name == "emit_controller_event" and arguments.get("event_type") == "tl.dispatch_confirmed"
+        for name, arguments in transport.calls
+    )
+
+
+def test_scope_handoff_clean_source_is_noop_before_child_dispatch(tmp_path: Path) -> None:
+    task = SubTLTask(
+        "architecture",
+        WorkPlan(),
+        order=1,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    plan = WorkPlan(sub_tls=(task,))
+    transport = ScopeHandoffTransport(source_worktree=str(tmp_path), dirty=False)
+    config = replace(
+        _config(),
+        max_workers=0,
+        max_leaves=0,
+        max_parallel_slices=1,
+        ledger_run_id="scope-handoff-ledger",
+        project_root=tmp_path,
+        worktree=tmp_path,
+        working_dir=str(tmp_path),
+        agent_id="root-controller",
+    )
+
+    result = run_tl_loop(
+        "scope-handoff-clean",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport, name="root-controller"),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.slices["architecture"].status is SliceStatus.MERGED
+    assert transport.commit_count == 0
+    handoffs = [arguments for name, arguments in transport.calls if name == "prepare_scope_handoff"]
+    assert len(handoffs) == 2
+    assert [arguments["apply"] for arguments in handoffs] == [False, True]
+    dispatch_indices = [
+        index
+        for index, (name, arguments) in enumerate(transport.calls)
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+    ]
+    handoff_indices = [
+        index for index, (name, _) in enumerate(transport.calls) if name == "prepare_scope_handoff"
+    ]
+    assert len(dispatch_indices) == 1
+    assert max(handoff_indices) < dispatch_indices[0]
+
+
+def test_scope_handoff_concurrent_source_edit_blocks_child_dispatch(tmp_path: Path) -> None:
+    task = SubTLTask(
+        "architecture",
+        WorkPlan(),
+        order=1,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    plan = WorkPlan(sub_tls=(task,))
+    transport = ScopeHandoffTransport(source_worktree=str(tmp_path), change_before_apply=True)
+    config = replace(
+        _config(),
+        max_workers=0,
+        max_leaves=0,
+        max_parallel_slices=1,
+        ledger_run_id="scope-handoff-ledger",
+        project_root=tmp_path,
+        worktree=tmp_path,
+        working_dir=str(tmp_path),
+        agent_id="root-controller",
+    )
+
+    result = run_tl_loop(
+        "scope-handoff-concurrent-edit",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport, name="root-controller"),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.fsm.phase is TLPhase.TLFailed
+    assert "source snapshot changed" in str(result.final_state.recursive_fsm)
+    assert result.final_state.slices["architecture"].status is SliceStatus.PENDING
+    assert transport.commit_count == 0
+    assert sum(name == "prepare_scope_handoff" for name, _ in transport.calls) == 2
+    assert not any(
+        name == "emit_controller_event" and arguments.get("event_type") == "tl.dispatch_confirmed"
+        for name, arguments in transport.calls
+    )
 
 
 def test_ordered_sub_tl_restart_does_not_rerun_merged_children(

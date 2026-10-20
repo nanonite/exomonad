@@ -799,6 +799,25 @@ async fn filter_gitignored_paths(worktree: &Path, files: Vec<String>) -> Result<
     Ok(visible_files)
 }
 
+async fn resolve_spawn_source_worktree(
+    project_dir: &Path,
+    caller_worktree: &Path,
+) -> Result<PathBuf> {
+    let requested = if caller_worktree.is_absolute() {
+        caller_worktree.to_path_buf()
+    } else {
+        project_dir.join(caller_worktree)
+    };
+    fs::canonicalize(&requested)
+        .await
+        .with_context(|| format!("failed to resolve caller worktree {}", requested.display()))
+}
+
+async fn ensure_clean_spawn_source(project_dir: &Path, caller_worktree: &Path) -> Result<()> {
+    let source_worktree = resolve_spawn_source_worktree(project_dir, caller_worktree).await?;
+    ensure_clean_spawn_worktree(&source_worktree).await
+}
+
 async fn ensure_clean_spawn_worktree(worktree: &Path) -> Result<()> {
     let output = Command::new("git")
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
@@ -2590,6 +2609,22 @@ impl<
         caller_bb: &BirthBranch,
         intent_id: Option<&str>,
     ) -> Result<SpawnResult> {
+        self.spawn_leaf_subtree_with_intent_from_worktree(
+            options,
+            caller_bb,
+            intent_id,
+            self.project_dir(),
+        )
+        .await
+    }
+
+    pub async fn spawn_leaf_subtree_with_intent_from_worktree(
+        &self,
+        options: &SpawnLeafOptions,
+        caller_bb: &BirthBranch,
+        intent_id: Option<&str>,
+        caller_worktree: &Path,
+    ) -> Result<SpawnResult> {
         info!(branch_name = %options.branch_name, timeout_sec = SPAWN_TIMEOUT.as_secs(), "Starting spawn_leaf_subtree");
         let _resume_spawn_guard = if options.expected_agent_name.is_some() {
             Some(resume_spawn_lock().lock().await)
@@ -2604,7 +2639,7 @@ impl<
 
             let effective_birth = self.effective_birth_branch(Some(caller_bb));
             let effective_project_dir = self.project_dir();
-            ensure_clean_spawn_worktree(effective_project_dir).await?;
+            ensure_clean_spawn_source(effective_project_dir, caller_worktree).await?;
 
             // Replacement leaves may start from an old PR head while their branch
             // hierarchy still targets the original PR base branch.
@@ -5651,6 +5686,72 @@ mod tests {
             .to_string();
         assert!(message.contains("src/lib.rs"));
         assert!(message.contains("dirty TL worktree"));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_guard_checks_authenticated_caller_worktree() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_root = temp_dir.path().join("project-root");
+        let caller_temp = tempfile::tempdir().unwrap();
+        let caller_worktree = caller_temp.path().join("nested-tl-worktree");
+        fs::create_dir_all(&project_root).await.unwrap();
+        fs::create_dir_all(&caller_worktree).await.unwrap();
+        init_test_repo(&project_root).await;
+        init_test_repo(&caller_worktree).await;
+
+        fs::write(project_root.join("root.txt"), "clean root\n")
+            .await
+            .unwrap();
+        run_git_test_command(&project_root, &["add", "root.txt"]).await;
+        run_git_test_command(&project_root, &["commit", "-q", "-m", "root baseline"]).await;
+
+        fs::write(caller_worktree.join("child.txt"), "baseline\n")
+            .await
+            .unwrap();
+        run_git_test_command(&caller_worktree, &["add", "child.txt"]).await;
+        run_git_test_command(&caller_worktree, &["commit", "-q", "-m", "child baseline"]).await;
+        fs::write(
+            caller_worktree.join("child.txt"),
+            "uncommitted child change\n",
+        )
+        .await
+        .unwrap();
+
+        ensure_clean_spawn_worktree(&project_root).await.unwrap();
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_root.clone();
+        services.git_wt = Arc::new(GitWorktreeService::new(project_root.clone()));
+        let service = AgentControlService::new(Arc::new(services))
+            .with_tmux_session("exo-spawn-guard-test".to_string())
+            .with_birth_branch(BirthBranch::try_from_str("main").unwrap());
+        let options = SpawnLeafOptions {
+            task: "inspect the dirty caller source".to_string(),
+            branch_name: "nested-leaf".to_string(),
+            role: None,
+            agent_type: AgentType::Codex,
+            model: None,
+            claude_flags: ClaudeSpawnFlags::default(),
+            standalone_repo: false,
+            allowed_dirs: Vec::new(),
+            start_point: None,
+            base_branch: None,
+            expected_agent_name: None,
+            invocation_pr_number: None,
+            recovery_lineage: None,
+        };
+        let birth_branch = BirthBranch::try_from_str("main").unwrap();
+        let error = service
+            .spawn_leaf_subtree_with_intent_from_worktree(
+                &options,
+                &birth_branch,
+                None,
+                &caller_worktree,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("child.txt"));
+        assert!(error.contains("dirty TL worktree"));
     }
 
     #[tokio::test]

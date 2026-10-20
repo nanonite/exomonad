@@ -10776,6 +10776,13 @@ def _reconcile_action_journal(
     if not isinstance(effects_log, EffectJournal):
         return state
     for entry in effects_log.pending_entries():
+        if entry.get("operation") == "prepare_scope_handoff":
+            if isinstance(effects, EffectClient):
+                _reconcile_pending_scope_handoff(entry, effects_log, effects)
+            # The operation is bound to a stable Git snapshot and its host
+            # handler adopts a matching commit by trailer before retrying.
+            # A generic approval gate would prevent that safe reconciliation.
+            continue
         if entry.get("operation") in {
             "post_merge_parent_sync",
             "post_merge_parent_sync_reconcile",
@@ -10841,6 +10848,64 @@ def _reconcile_action_journal(
                 },
             )
     return state
+
+
+def _reconcile_pending_scope_handoff(
+    entry: Mapping[str, object],
+    effects_log: EffectJournal,
+    effects: EffectClient,
+) -> bool:
+    """Replay one ambiguous handoff with the exact durable snapshot arguments."""
+    key = entry.get("key")
+    arguments = entry.get("arguments")
+    if not isinstance(key, str) or not isinstance(arguments, Mapping):
+        return False
+    try:
+        result = _scope_handoff_call(effects, arguments)
+    except Exception:  # noqa: BLE001 - retain unknown until a later safe replay
+        return False
+    if result.success is not True:
+        return False
+    effects_log.resolve_by_key(key, status="confirmed", result=result.raw, error=None)
+    return True
+
+
+def _scope_handoff_call(
+    effects: EffectClient,
+    arguments: Mapping[str, object],
+) -> ToolResult:
+    """Decode journaled arguments before replaying the idempotent host operation."""
+    required = (
+        "apply",
+        "handoff_id",
+        "controller_id",
+        "parent_run_id",
+        "parent_scope_id",
+        "child_scope_id",
+        "expected_branch",
+    )
+    if any(key not in arguments for key in required) or type(arguments.get("apply")) is not bool:
+        raise ActionJournalError("scope handoff journal arguments are incomplete")
+    text = {key: arguments.get(key) for key in required if key != "apply"}
+    if any(not isinstance(value, str) or not value for value in text.values()):
+        raise ActionJournalError("scope handoff journal identity is malformed")
+    head = arguments.get("expected_head_sha")
+    fingerprint = arguments.get("expected_source_fingerprint")
+    if head is not None and not isinstance(head, str):
+        raise ActionJournalError("scope handoff expected HEAD is malformed")
+    if fingerprint is not None and not isinstance(fingerprint, str):
+        raise ActionJournalError("scope handoff source fingerprint is malformed")
+    return effects.prepare_scope_handoff(
+        apply=cast(bool, arguments["apply"]),
+        handoff_id=cast(str, text["handoff_id"]),
+        controller_id=cast(str, text["controller_id"]),
+        parent_run_id=cast(str, text["parent_run_id"]),
+        parent_scope_id=cast(str, text["parent_scope_id"]),
+        child_scope_id=cast(str, text["child_scope_id"]),
+        expected_branch=cast(str, text["expected_branch"]),
+        expected_head_sha=head,
+        expected_source_fingerprint=fingerprint,
+    )
 
 
 def _is_aggregate_file_pr_entry(entry: Mapping[str, object], state: RunState) -> bool:
@@ -14233,6 +14298,237 @@ def _child_recovery_projection(
     return None
 
 
+def _scope_handoff_identity(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+    effects: EffectClient,
+) -> tuple[dict[str, object], str] | str:
+    """Resolve one parent and child only through the accepted manifest."""
+    manifest = state.plan_manifest
+    if manifest is None or not manifest.scope_id:
+        return "accepted parent manifest is unavailable for the child handoff"
+    declarations = [
+        node for node in manifest.nodes if node.kind == "sub_tl" and node.name == task.name
+    ]
+    if len(declarations) != 1:
+        return f"accepted parent manifest does not uniquely declare subTL {task.name!r}"
+    if state.owner_branch is not None and state.owner_branch != config.branch:
+        return "controller branch differs from its persisted owner branch"
+    node = declarations[0]
+    coordinates = {
+        "controller_id": effects.name,
+        "parent_run_id": store.run_id,
+        "parent_scope_id": manifest.scope_id,
+        "child_scope_id": node.node_id,
+        "expected_branch": config.branch,
+    }
+    stable = json.dumps(
+        {**coordinates, "manifest_digest": manifest.digest or ""},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    handoff_id = hashlib.sha256(stable.encode("utf-8")).hexdigest()
+    return coordinates, handoff_id
+
+
+def _scope_handoff_response_error(
+    result: ToolResult | None,
+    expected: Mapping[str, object],
+    *,
+    expected_head: str | None = None,
+    expected_fingerprint: str | None = None,
+) -> str | None:
+    """Reject incomplete or inconsistent inspect/apply receipts before dispatch."""
+    if result is None or result.success is not True or not isinstance(result.result, Mapping):
+        return "scope handoff tool returned no structured result"
+    payload = result.result
+    if payload.get("success") is not True or payload.get("ready") is not True:
+        return _safe_scope_handoff_error(payload.get("error"), payload.get("outcome"))
+    for key, value in expected.items():
+        response_key = "branch" if key == "expected_branch" else key
+        if payload.get(response_key) != value:
+            return f"scope handoff receipt has conflicting {key}"
+    if not _is_git_object_id(payload.get("head_before")):
+        return "scope handoff receipt is missing a valid source HEAD"
+    if not _is_sha256_text(payload.get("source_fingerprint")):
+        return "scope handoff receipt is missing its source fingerprint"
+    if expected_head is not None and payload.get("head_before") != expected_head:
+        return "scope handoff source HEAD changed between inspection and apply"
+    if (
+        expected_fingerprint is not None
+        and payload.get("source_fingerprint") != expected_fingerprint
+    ):
+        return "scope handoff source fingerprint changed between inspection and apply"
+    if expected_head is None and payload.get("head_after") != payload.get("head_before"):
+        return "read-only scope handoff inspection reported a changed HEAD"
+    if expected_head is not None and not _is_git_object_id(payload.get("head_after")):
+        return "scope handoff apply receipt is missing its resulting HEAD"
+    if not isinstance(payload.get("source_worktree"), str) or not payload["source_worktree"]:
+        return "scope handoff receipt is missing its authenticated source worktree"
+    return None
+
+
+def _safe_scope_handoff_error(error: object, outcome: object) -> str:
+    """Return a bounded operator diagnostic without raw tool output."""
+    code = outcome if isinstance(outcome, str) and outcome else "unknown"
+    detail = error if isinstance(error, str) and error else "operation did not become ready"
+    safe = "".join(max(character, " ") for character in detail)[:320]
+    return f"scope handoff outcome {code}: {safe}"
+
+
+def _is_git_object_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) in {40, 64}
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
+
+
+def _is_sha256_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
+
+
+def _scope_handoff_action_target(
+    effects_log: list[EffectIntent],
+    handoff_id: str,
+    head: str,
+    fingerprint: str,
+) -> str:
+    """Reuse readiness evidence and retain each known failed apply attempt."""
+    matching = []
+    if isinstance(effects_log, EffectJournal):
+        for entry in effects_log.snapshot():
+            arguments = entry.get("arguments")
+            if (
+                entry.get("operation") == "prepare_scope_handoff"
+                and isinstance(arguments, Mapping)
+                and arguments.get("handoff_id") == handoff_id
+                and arguments.get("expected_head_sha") == head
+                and arguments.get("expected_source_fingerprint") == fingerprint
+            ):
+                matching.append(entry)
+    snapshot_key = hashlib.sha256(f"{head}\0{fingerprint}".encode("ascii")).hexdigest()[:16]
+    prefix = f"{handoff_id}:{snapshot_key}"
+    if matching and _scope_handoff_entry_ready(matching[-1]):
+        target = matching[-1].get("target")
+        if isinstance(target, str) and target:
+            return target
+    return f"{prefix}:attempt:{len(matching)}"
+
+
+def _scope_handoff_entry_ready(entry: Mapping[str, object]) -> bool:
+    """Read the nested ready bit from one previously confirmed tool response."""
+    result = entry.get("result")
+    payload = result.get("result") if isinstance(result, Mapping) else None
+    return isinstance(payload, Mapping) and payload.get("ready") is True
+
+
+def _invoke_scope_handoff_apply(
+    effects: EffectClient,
+    effects_log: list[EffectIntent],
+    target: str,
+    arguments: Mapping[str, object],
+) -> ToolResult:
+    """Record and safely replay one idempotent source-snapshot commit attempt."""
+    intent = EffectIntent("prepare_scope_handoff", target, arguments, True)
+    journal = effects_log if isinstance(effects_log, EffectJournal) else None
+    probe = journal.probe(intent) if journal is not None else None
+    if probe is not None and probe.status in {"confirmed", "rejected"}:
+        if probe.result is None:
+            raise ActionJournalError("scope handoff journal response is missing")
+        if probe.status == "confirmed" and _scope_handoff_entry_ready(
+            cast(Mapping[str, object], probe.entry)
+        ):
+            return probe.result
+    elif probe is None or probe.entry is None:
+        effects_log.append(intent)
+    try:
+        result = _scope_handoff_call(effects, arguments)
+    except BaseException as error:
+        if journal is not None:
+            journal.mark_unknown(intent, error)
+        raise
+    if journal is not None:
+        journal.mark_result(intent, result)
+    return result
+
+
+def _prepare_scope_handoff(
+    task: SubTLTask,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> str | None:
+    """Commit the accepted parent worktree snapshot before a new subTL starts."""
+    if not config.active:
+        return None
+    if not isinstance(effects, EffectClient):
+        return "scope handoff is blocked because the active effect client is unavailable"
+    identity = _scope_handoff_identity(task, state, config, store, effects)
+    if isinstance(identity, str):
+        return identity
+    coordinates, handoff_id = identity
+    if _scope_handoff_is_unresolved(effects_log, handoff_id):
+        return "a prior scope handoff outcome is unresolved; continuation must reconcile it first"
+    inspection_args = {"apply": False, "handoff_id": handoff_id, **coordinates}
+    inspection = _invoke(
+        "inspect_scope_handoff",
+        handoff_id,
+        inspection_args,
+        True,
+        effects,
+        lambda client: _scope_handoff_call(client, inspection_args),
+        effects_log,
+        raise_on_failure=False,
+    )
+    error = _scope_handoff_response_error(inspection, coordinates)
+    if error is not None:
+        return error
+    assert inspection is not None and isinstance(inspection.result, Mapping)
+    inspected = inspection.result
+    head = cast(str, inspected["head_after"])
+    fingerprint = cast(str, inspected["source_fingerprint"])
+    apply_args = {
+        "apply": True,
+        "handoff_id": handoff_id,
+        **coordinates,
+        "expected_head_sha": head,
+        "expected_source_fingerprint": fingerprint,
+    }
+    target = _scope_handoff_action_target(effects_log, handoff_id, head, fingerprint)
+    try:
+        applied = _invoke_scope_handoff_apply(effects, effects_log, target, apply_args)
+    except Exception as error:  # noqa: BLE001 - retain state and do not transfer control
+        return f"scope handoff result is unresolved ({type(error).__name__}); retry continuation to reconcile"
+    return _scope_handoff_response_error(
+        applied,
+        coordinates,
+        expected_head=head,
+        expected_fingerprint=fingerprint,
+    )
+
+
+def _scope_handoff_is_unresolved(effects_log: list[EffectIntent], handoff_id: str) -> bool:
+    """Prevent a changed snapshot from bypassing a prior ambiguous commit."""
+    if not isinstance(effects_log, EffectJournal):
+        return False
+    return any(
+        entry.get("operation") == "prepare_scope_handoff"
+        and entry.get("status") in {"intended", "unknown"}
+        and isinstance(entry.get("arguments"), Mapping)
+        and entry["arguments"].get("handoff_id") == handoff_id
+        for entry in effects_log.snapshot()
+    )
+
+
 def _run_sub_tls(
     plan: WorkPlan,
     state: RunState,
@@ -14340,6 +14636,20 @@ def _run_sub_tls(
             )
             and not _ordered_child_complete(task, current)
         )
+        for task in pending:
+            current = state.slices.get(task.name)
+            if current is None or current.status not in {SliceStatus.PENDING, SliceStatus.READY}:
+                continue
+            handoff_error = _prepare_scope_handoff(task, state, config, effects, store, effects_log)
+            if handoff_error is not None:
+                return _fail_recursive_parent(
+                    state,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    f"scope handoff for {task.name!r} is blocked: {handoff_error}",
+                )
         if not pending:
             state = _integrate_stage_candidates(
                 stage_tasks, state, config, effects, store, effects_log

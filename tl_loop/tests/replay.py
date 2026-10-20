@@ -53,6 +53,32 @@ class RecordingTransport:
     ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, copy.deepcopy(arguments)))
+        if tool_name == "prepare_scope_handoff":
+            head = arguments.get("expected_head_sha")
+            fingerprint = arguments.get("expected_source_fingerprint")
+            resolved_head = head if isinstance(head, str) else "1" * 40
+            resolved_fingerprint = fingerprint if isinstance(fingerprint, str) else "2" * 64
+            return {
+                "success": True,
+                "result": {
+                    "success": True,
+                    "ready": True,
+                    "outcome": "no_changes",
+                    "error": "",
+                    "handoff_id": arguments.get("handoff_id"),
+                    "controller_id": arguments.get("controller_id"),
+                    "parent_run_id": arguments.get("parent_run_id"),
+                    "parent_scope_id": arguments.get("parent_scope_id"),
+                    "child_scope_id": arguments.get("child_scope_id"),
+                    "source_worktree": "/tmp/replay-source-worktree",
+                    "branch": arguments.get("expected_branch"),
+                    "head_before": resolved_head,
+                    "head_after": resolved_head,
+                    "commit_sha": "",
+                    "source_fingerprint": resolved_fingerprint,
+                    "changed_paths": [],
+                },
+            }
         if tool_name == "repository_identity":
             return {
                 "success": True,

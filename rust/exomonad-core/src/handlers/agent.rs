@@ -2396,10 +2396,11 @@ impl<
 
         let result = match self
             .service
-            .spawn_leaf_subtree_with_intent(
+            .spawn_leaf_subtree_with_intent_from_worktree(
                 &options,
                 &ctx.birth_branch,
                 Some(req.intent_id.as_str()),
+                &ctx.working_dir,
             )
             .await
             .effect_err_preserve("agent")

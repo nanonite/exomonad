@@ -124,6 +124,7 @@ TOOL_METHODS: tuple[str, ...] = (
     "post_merge_changelog_entry",
     "post_merge_push",
     "root_branch_finalize",
+    "prepare_scope_handoff",
     "close_worker_pane",
     "spawn_codex",
     "session_status",
@@ -420,6 +421,33 @@ class EffectClient:
         _put(arguments, "expected_merge_tree_sha", expected_merge_tree_sha)
         _put(arguments, "aggregate_approval", aggregate_approval)
         return self._call("merge_pr", arguments)
+
+    def prepare_scope_handoff(
+        self,
+        *,
+        apply: bool,
+        handoff_id: str,
+        controller_id: str,
+        parent_run_id: str,
+        parent_scope_id: str,
+        child_scope_id: str,
+        expected_branch: str,
+        expected_head_sha: str | None = None,
+        expected_source_fingerprint: str | None = None,
+    ) -> ToolResult:
+        """Inspect or commit the authenticated caller worktree for one TL handoff."""
+        arguments: JsonObject = {
+            "apply": apply,
+            "handoff_id": handoff_id,
+            "controller_id": controller_id,
+            "parent_run_id": parent_run_id,
+            "parent_scope_id": parent_scope_id,
+            "child_scope_id": child_scope_id,
+            "expected_branch": expected_branch,
+        }
+        _put(arguments, "expected_head_sha", expected_head_sha)
+        _put(arguments, "expected_source_fingerprint", expected_source_fingerprint)
+        return self._call("prepare_scope_handoff", arguments)
 
     def notify_parent(
         self,
