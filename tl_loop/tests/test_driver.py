@@ -13758,6 +13758,85 @@ def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
     assert sum(name == "post_merge_parent_sync" for name, _ in transport.calls) == 1
 
 
+def _assert_aggregate_recovery_stays_parked(
+    plan: WorkPlan,
+    root_store: RunStore,
+    root_dir: Path,
+) -> None:
+    """Run the production reconciliation boundary and require a proof hold."""
+    transport = RecordingTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=root_dir,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
+    before = root_store.load()
+    expected_pr = before.slices["architecture"].pr_number
+    state, adopted = driver_module._reconcile_aggregate_publication_gate(
+        plan.sub_tls[0],
+        before,
+        config,
+        EffectClient(transport),
+        root_store,
+        EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json"),
+    )
+    assert adopted is False
+    assert state.slices["architecture"].status is SliceStatus.PARKED
+    assert state.integration.candidates["architecture"].lifecycle is (
+        IntegrationLifecycle.CHILDREN_MERGED
+    )
+    assert state.slices["architecture"].reconciliation is not None
+    assert state.slices["architecture"].reconciliation["aggregate_post_merge_hold"] == {
+        "reason_code": "aggregate_child_completion_incomplete",
+        "pr_number": expected_pr,
+    }
+    assert not any(name in {"post_merge_parent_sync", "merge_pr"} for name, _ in transport.calls)
+
+
+def test_merged_aggregate_rejects_child_from_wrong_parent_scope(tmp_path: Path) -> None:
+    plan, root_store, child_store, _merge_journal_id, _base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(
+            tmp_path,
+            "merged-aggregate-wrong-parent",
+            candidate_lifecycle=IntegrationLifecycle.CHILDREN_MERGED,
+        )
+    )
+    document = json.loads(child_store.path.read_text(encoding="utf-8"))
+    document["parent_run_id"] = "unrelated-parent"
+    child_store.path.write_text(json.dumps(document), encoding="utf-8")
+
+    _assert_aggregate_recovery_stays_parked(plan, root_store, tmp_path)
+
+
+def test_merged_aggregate_rejects_incomplete_declared_child_leaf(tmp_path: Path) -> None:
+    plan, root_store, child_store, _merge_journal_id, _base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(
+            tmp_path,
+            "merged-aggregate-incomplete-leaf",
+            candidate_lifecycle=IntegrationLifecycle.CHILDREN_MERGED,
+        )
+    )
+    child_state = child_store.load()
+    leaf = child_state.slices["leaf-a"]
+    child_store.checkpoint(
+        child_state.recursive_fsm or child_state.fsm,
+        {
+            **child_state.slices,
+            "leaf-a": replace(leaf, status=SliceStatus.SPAWNED, post_merge=None),
+        },
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+        current_order=child_state.current_order,
+        ordered_stages=child_state.ordered_stages,
+        integration=child_state.integration,
+    )
+
+    _assert_aggregate_recovery_stays_parked(plan, root_store, tmp_path)
+
+
 def test_merged_aggregate_with_conflicting_merge_coordinates_stays_parked(
     tmp_path: Path,
 ) -> None:

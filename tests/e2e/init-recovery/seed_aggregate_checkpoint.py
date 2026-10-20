@@ -767,7 +767,7 @@ def seed_root(
         ),
     )
     candidate = IntegrationCandidateState(
-        lifecycle=IntegrationLifecycle.MERGED,
+        lifecycle=IntegrationLifecycle.CHILDREN_MERGED,
         aggregate_pr_number=aggregate_pr,
         aggregate_head_sha=aggregate_head,
         aggregate_patch_digest=patch_digest,
@@ -795,8 +795,9 @@ def seed_root(
         current_order=1,
         ordered_stages=root_state.ordered_stages,
         integration=IntegrationRuntimeState(
+            lifecycle=IntegrationLifecycle.MERGED,
             sub_tl_states={
-                "architecture": IntegrationLifecycle.MERGED,
+                "architecture": IntegrationLifecycle.CHILDREN_MERGED,
                 "kani": IntegrationLifecycle.RUNNING,
             },
             candidates={"architecture": candidate},

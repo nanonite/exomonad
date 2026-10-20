@@ -14455,20 +14455,95 @@ def _child_handoff_ready(state: RunState | None, parent_run_id: str) -> bool:
     return state.fsm.phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
 
 
-def _aggregate_child_completion_proven(state: RunState | None) -> bool:
-    """Require a completed child scope before repairing its aggregate label."""
-    if state is None:
-        return False
+def _aggregate_scope_phase_complete(state: RunState) -> bool:
+    """Require a terminal child phase before repairing its aggregate label."""
     recursive_fsm = getattr(state, "recursive_fsm", None)
     if recursive_fsm is None:
-        if state.fsm.phase not in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLAllMerged}:
-            return False
-    elif not isinstance(
+        return state.fsm.phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLAllMerged}
+    return isinstance(
         recursive_fsm,
         (RecursiveTLAllMerged, RecursiveTLFinalizing, RecursiveTLPRFiled, RecursiveTLDone),
-    ):
+    )
+
+
+def _aggregate_declared_node_complete(
+    scope_state: RunState,
+    scope_store: RunStore,
+    declared_manifest: PlanManifest,
+    node: ManifestNode,
+) -> bool:
+    """Prove one direct leaf or nested sub-TL declaration completed."""
+    current = scope_state.slices.get(node.name)
+    if current is None:
         return False
-    return _scope_post_merge_complete(state)
+    if node.kind in {"leaf", "worker"}:
+        return _ordered_slice_complete(current)
+    if node.kind != "sub_tl" or not _ordered_slice_complete(current):
+        return False
+    child_manifest = declared_manifest.child_manifests.get(node.node_id)
+    if child_manifest is None:
+        return False
+    child_store = RunStore(node.name, scope_store.run_dir)
+    try:
+        child_state = child_store.load()
+    except (OSError, ValueError):
+        return False
+    return _aggregate_scope_completion_proven(
+        scope_state,
+        child_state,
+        child_store,
+        child_manifest,
+    )
+
+
+def _aggregate_scope_completion_proven(
+    parent_state: RunState,
+    scope_state: RunState,
+    scope_store: RunStore,
+    declared_manifest: PlanManifest,
+) -> bool:
+    """Prove one declared scope and every direct descendant completed."""
+    if not _child_owner_checkpoint_matches(
+        parent_state,
+        scope_state.run_id,
+        scope_state,
+        declared_manifest,
+    ) or not _aggregate_scope_phase_complete(scope_state):
+        return False
+    return all(
+        _aggregate_declared_node_complete(scope_state, scope_store, declared_manifest, node)
+        for node in declared_manifest.nodes
+    ) and _scope_post_merge_complete(scope_state)
+
+
+def _aggregate_child_completion_proven(
+    parent_state: RunState,
+    child_state: RunState | None,
+    child_store: RunStore,
+    child_name: str,
+) -> bool:
+    """Bind aggregate repair to the accepted parent declaration and leaves."""
+    if child_state is None or parent_state.plan_manifest is None:
+        return False
+    declaration = next(
+        (
+            node
+            for node in parent_state.plan_manifest.nodes
+            if node.kind == "sub_tl" and node.name == child_name
+        ),
+        None,
+    )
+    if declaration is None:
+        return False
+    child_manifest = parent_state.plan_manifest.child_manifests.get(declaration.node_id)
+    if child_manifest is None:
+        return False
+    return _aggregate_scope_completion_proven(
+        parent_state,
+        child_state,
+        child_store,
+        child_manifest,
+    )
 
 
 def _exit_marker_matches_checkpoint(
@@ -14884,11 +14959,12 @@ def _verified_aggregate_post_merge(
     ):
         return False, "aggregate_merge_checkpoint_incomplete"
     if candidate.lifecycle is IntegrationLifecycle.CHILDREN_MERGED:
+        child_store = RunStore(task.name, store.run_dir)
         try:
-            child_state = RunStore(task.name, store.run_dir).load()
+            child_state = child_store.load()
         except (OSError, ValueError):
             return False, "aggregate_child_completion_unavailable"
-        if not _aggregate_child_completion_proven(child_state):
+        if not _aggregate_child_completion_proven(state, child_state, child_store, task.name):
             return False, "aggregate_child_completion_incomplete"
     evidence = receipt.evidence
     pr_number = current.pr_number
