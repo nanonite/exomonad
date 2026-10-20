@@ -800,6 +800,27 @@ def seed_root(
                 "architecture": IntegrationLifecycle.CHILDREN_MERGED,
                 "kani": IntegrationLifecycle.RUNNING,
             },
+            # Preserve the historical root compatibility projection as a
+            # structurally complete MERGED record while the per-candidate
+            # lifecycle remains CHILDREN_MERGED. The recovery under test must
+            # repair the candidate from its child proof, not reject this
+            # checkpoint before startup reaches reconciliation.
+            aggregate_pr_number=aggregate_pr,
+            aggregate_head_sha=aggregate_head,
+            aggregate_patch_digest=patch_digest,
+            aggregate_original_base_sha=base_sha,
+            integration_owner_id="root:architecture:integration",
+            integration_owner_run_id="architecture",
+            integration_owner_branch="main.architecture",
+            integration_owner_worktree=str(architecture_worktree),
+            head_sha=aggregate_head,
+            patch_digest=patch_digest,
+            validated_base_sha=base_sha,
+            merge_tree_sha=merge_tree,
+            integration_evidence_at="2026-10-16T00:00:00Z",
+            ci_status="success",
+            merge_attempts=2,
+            stage_verification="passed",
             candidates={"architecture": candidate},
         ),
     )

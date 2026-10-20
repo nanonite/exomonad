@@ -124,7 +124,7 @@ from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
-from tl_loop.state.plan_manifest import PlanManifest, build_plan_manifest
+from tl_loop.state.plan_manifest import ManifestNode, PlanManifest, build_plan_manifest
 from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
 from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.plan_revision_apply import apply_plan_revision
@@ -3480,16 +3480,19 @@ def _nested_blocked_owner_stores(
     direct_leaf: bool = False,
     create_child: bool = True,
     leaf_issue_id: int | None = None,
+    child_leaf_names: tuple[str, ...] = ("leaf-a",),
+    child_plan: WorkPlan | None = None,
 ) -> tuple[WorkPlan, RunStore, RunStore | None]:
     """Persist a root stage and its declared child scope for routing tests."""
-    child_plan = WorkPlan.from_mapping(
+    child_plan = child_plan or WorkPlan.from_mapping(
         {
             "leaves": [
                 {
-                    "name": "leaf-a",
+                    "name": leaf_name,
                     "task": "blocked leaf",
-                    "chainlink_issue_id": leaf_issue_id,
+                    "chainlink_issue_id": leaf_issue_id if leaf_name == "leaf-a" else None,
                 }
+                for leaf_name in child_leaf_names
             ]
         }
     )
@@ -3574,20 +3577,27 @@ def _nested_blocked_owner_stores(
     )
     child_store.set_plan_manifest(child_manifest, slices=child_slices)
     child_state = child_store.load()
+    first_child_name = next(iter(child_state.slices))
     dispatched_leaf = replace(
-        child_state.slices["leaf-a"],
+        child_state.slices[first_child_name],
         status=SliceStatus.SPAWNED,
         attempts=1,
-        dispatch_intent_id="leaf-a-intent",
-        dispatch_agent_id="leaf-a",
+        dispatch_intent_id=f"{first_child_name}-intent",
+        dispatch_agent_id=first_child_name,
         dispatch_invocation_id="inv-1",
         dispatch_authoritative_event_seq=0,
         dispatch_generation=1,
         dispatch_last_boundary="agent.spawned",
     )
     child_store.checkpoint(
-        TLWaiting({"leaf-a": ChildHandle("leaf-a", dispatched_leaf.branch or "", "worker")}),
-        {**child_state.slices, "leaf-a": dispatched_leaf},
+        TLWaiting(
+            {
+                first_child_name: ChildHandle(
+                    first_child_name, dispatched_leaf.branch or "", "worker"
+                )
+            }
+        ),
+        {**child_state.slices, first_child_name: dispatched_leaf},
         child_state.budgets,
         child_state.events.last_consumed_offset,
     )
@@ -3710,10 +3720,13 @@ def _complete_nested_leaf(
     *,
     attempt: int = 6,
     repository: Path | None = None,
+    leaf_name: str = "leaf-a",
+    pr_number: int = 145,
 ) -> RunState:
     """Persist complete receipt-backed leaf history for blocker replay tests."""
     state = child_store.load()
-    current = state.slices["leaf-a"]
+    current = state.slices[leaf_name]
+    receipt_prefix = "leaf" if leaf_name == "leaf-a" else leaf_name
     head_sha = "a" * 40
     parent_commit_sha = "b" * 40
     changelog_commit_sha = "c" * 40
@@ -3721,7 +3734,9 @@ def _complete_nested_leaf(
     pushed_commit = "d" * 40
     if repository is not None:
         expected_base_sha = _test_git_repository(repository)
-        head_sha = _test_git_commit(repository, "leaf-a.txt", "reviewed leaf\n", "leaf merge")
+        head_sha = _test_git_commit(
+            repository, f"{leaf_name}.txt", f"reviewed {leaf_name}\n", f"{leaf_name} merge"
+        )
         parent_commit_sha = head_sha
         changelog_commit_sha = _test_git_commit(
             repository, "CHANGELOG.md", "leaf entry\n", "changelog bookkeeping"
@@ -3731,12 +3746,12 @@ def _complete_nested_leaf(
         )
         _test_git_commit(repository, "aggregate.txt", "aggregate publication\n", "aggregate head")
     publication = PublicationBinding(
-        pr_number=145,
+        pr_number=pr_number,
         head_sha=head_sha,
         head_branch=current.branch or "main.leaf-a",
         base_branch=current.base_ref or "main",
         attempt=attempt,
-        invocation_id="leaf-publication-invocation",
+        invocation_id=f"{receipt_prefix}-publication-invocation",
     )
     handoff = HandoffEvidence(
         pr_number=publication.pr_number,
@@ -3749,8 +3764,8 @@ def _complete_nested_leaf(
     closure = (
         {
             "issue_id": str(current.chainlink_issue_id),
-            "issue_close_intent_id": "leaf-issue-close-intent",
-            "issue_close_journal_id": "leaf-issue-close-journal",
+            "issue_close_intent_id": f"{receipt_prefix}-issue-close-intent",
+            "issue_close_journal_id": f"{receipt_prefix}-issue-close-journal",
             "issue_close_outcome": "closed",
         }
         if current.chainlink_issue_id is not None
@@ -3765,17 +3780,17 @@ def _complete_nested_leaf(
         "parent_branch": publication.base_branch,
         "pr_number": str(publication.pr_number),
         "head_sha": publication.head_sha,
-        "merge_journal_id": "leaf-merge-journal",
+        "merge_journal_id": f"{receipt_prefix}-merge-journal",
         "lane_epoch": "1",
         "parent_commit_sha": parent_commit_sha,
         **closure,
-        "changelog_intent_id": "leaf-changelog-intent",
+        "changelog_intent_id": f"{receipt_prefix}-changelog-intent",
         "changelog_generation": "1",
         "changelog_commit_sha": changelog_commit_sha,
-        "parent_push_intent_id": "leaf-parent-push-intent",
-        "push_journal_id": "leaf-push-journal",
+        "parent_push_intent_id": f"{receipt_prefix}-parent-push-intent",
+        "push_journal_id": f"{receipt_prefix}-push-journal",
         "expected_base_sha": expected_base_sha,
-        "push_receipt_id": "leaf-push-receipt",
+        "push_receipt_id": f"{receipt_prefix}-push-receipt",
         "pushed_commit": pushed_commit,
         "bookkeeping_commit": pushed_commit,
         "observed_remote_head": pushed_commit,
@@ -13452,11 +13467,17 @@ def _seed_merged_aggregate_post_merge_recovery(
     *,
     merge_confirmed: bool = True,
     candidate_lifecycle: IntegrationLifecycle = IntegrationLifecycle.MERGED,
+    leaf_names: tuple[str, ...] = ("leaf-a",),
+    completed_leaf_names: tuple[str, ...] | None = None,
 ) -> tuple[WorkPlan, RunStore, RunStore, str, str]:
     """Seed an adopted aggregate merge behind its obsolete publication park."""
-    plan, root_store, child_store = _nested_blocked_owner_stores(root_dir, run_id)
+    plan, root_store, child_store = _nested_blocked_owner_stores(
+        root_dir, run_id, child_leaf_names=leaf_names
+    )
     assert child_store is not None
-    _complete_nested_leaf(child_store)
+    completed = completed_leaf_names if completed_leaf_names is not None else leaf_names
+    for index, leaf_name in enumerate(completed, start=1):
+        _complete_nested_leaf(child_store, leaf_name=leaf_name, pr_number=144 + index)
     _seed_nested_aggregate_in_review(root_store)
     state = root_store.load()
     current = state.slices["architecture"]
@@ -13589,18 +13610,24 @@ def _seed_merged_aggregate_post_merge_recovery(
 
 
 @pytest.mark.parametrize(
-    "candidate_lifecycle",
-    [IntegrationLifecycle.MERGED, IntegrationLifecycle.CHILDREN_MERGED],
+    ("candidate_lifecycle", "leaf_names"),
+    [
+        (IntegrationLifecycle.MERGED, ("leaf-a",)),
+        (IntegrationLifecycle.CHILDREN_MERGED, ("leaf-a",)),
+        (IntegrationLifecycle.CHILDREN_MERGED, ("leaf-a", "leaf-b")),
+    ],
 )
 def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
     tmp_path: Path,
     candidate_lifecycle: IntegrationLifecycle,
+    leaf_names: tuple[str, ...],
 ) -> None:
     plan, root_store, child_store, merge_journal_id, base_sha = (
         _seed_merged_aggregate_post_merge_recovery(
             tmp_path,
             f"merged-aggregate-resume-{candidate_lifecycle.value.lower()}",
             candidate_lifecycle=candidate_lifecycle,
+            leaf_names=leaf_names,
         )
     )
     merge_journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
@@ -13735,6 +13762,10 @@ def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
     assert child_store.load().slices["leaf-a"].post_merge is not None
     assert child_store.load().slices["leaf-a"].post_merge.phase is PostMergePhase.COMPLETE
     assert child_store.load().slices["leaf-a"].post_merge == original_leaf_receipt
+    for leaf_name in leaf_names[1:]:
+        assert child_store.load().slices[leaf_name].status is SliceStatus.MERGED
+        assert child_store.load().slices[leaf_name].post_merge is not None
+        assert child_store.load().slices[leaf_name].post_merge.phase is PostMergePhase.COMPLETE
     assert merge_journal.entry_by_key(merge_journal_id) == original_merge_entry
 
     repeated = run_tl_loop(
@@ -13762,9 +13793,21 @@ def _assert_aggregate_recovery_stays_parked(
     plan: WorkPlan,
     root_store: RunStore,
     root_dir: Path,
+    expected_reason: str = "aggregate_child_completion_incomplete",
 ) -> None:
-    """Run the production reconciliation boundary and require a proof hold."""
-    transport = RecordingTransport()
+    """Run the production driver and require a scoped proof hold."""
+
+    class AggregateProofTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = AggregateProofTransport()
     config = replace(
         _config(),
         run_id=root_store.run_id,
@@ -13772,28 +13815,35 @@ def _assert_aggregate_recovery_stays_parked(
         session_mode="continue",
         keep_alive_on_waiting=False,
         repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        policy=validate_policy(_selector_policy()),
+        tl_model_choice=_tl_choice(ReviewBackend([])),
     )
-    before = root_store.load()
-    expected_pr = before.slices["architecture"].pr_number
-    state, adopted = driver_module._reconcile_aggregate_publication_gate(
-        plan.sub_tls[0],
-        before,
-        config,
+    expected_pr = root_store.load().slices["architecture"].pr_number
+    result = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
         EffectClient(transport),
-        root_store,
-        EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json"),
+        config=config,
+        root_dir=root_dir,
     )
-    assert adopted is False
+    state = result.final_state
     assert state.slices["architecture"].status is SliceStatus.PARKED
     assert state.integration.candidates["architecture"].lifecycle is (
         IntegrationLifecycle.CHILDREN_MERGED
     )
     assert state.slices["architecture"].reconciliation is not None
     assert state.slices["architecture"].reconciliation["aggregate_post_merge_hold"] == {
-        "reason_code": "aggregate_child_completion_incomplete",
+        "reason_code": expected_reason,
         "pr_number": expected_pr,
     }
     assert not any(name in {"post_merge_parent_sync", "merge_pr"} for name, _ in transport.calls)
+    assert not any(
+        name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+        and arguments.get("payload", {}).get("slice_id") == "kani"
+        for name, arguments in transport.calls
+    )
 
 
 def test_merged_aggregate_rejects_child_from_wrong_parent_scope(tmp_path: Path) -> None:
@@ -13808,7 +13858,28 @@ def test_merged_aggregate_rejects_child_from_wrong_parent_scope(tmp_path: Path) 
     document["parent_run_id"] = "unrelated-parent"
     child_store.path.write_text(json.dumps(document), encoding="utf-8")
 
-    _assert_aggregate_recovery_stays_parked(plan, root_store, tmp_path)
+    _assert_aggregate_recovery_stays_parked(
+        plan, root_store, tmp_path, expected_reason="aggregate_child_parent_mismatch"
+    )
+
+
+def test_merged_aggregate_rejects_child_checkpoint_with_unrelated_run_id(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, child_store, _merge_journal_id, _base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(
+            tmp_path,
+            "merged-aggregate-wrong-child-run-id",
+            candidate_lifecycle=IntegrationLifecycle.CHILDREN_MERGED,
+        )
+    )
+    document = json.loads(child_store.path.read_text(encoding="utf-8"))
+    document["run_id"] = "unrelated-child"
+    child_store.path.write_text(json.dumps(document), encoding="utf-8")
+
+    _assert_aggregate_recovery_stays_parked(
+        plan, root_store, tmp_path, expected_reason="aggregate_child_run_id_mismatch"
+    )
 
 
 def test_merged_aggregate_rejects_incomplete_declared_child_leaf(tmp_path: Path) -> None:
@@ -13817,16 +13888,14 @@ def test_merged_aggregate_rejects_incomplete_declared_child_leaf(tmp_path: Path)
             tmp_path,
             "merged-aggregate-incomplete-leaf",
             candidate_lifecycle=IntegrationLifecycle.CHILDREN_MERGED,
+            leaf_names=("leaf-a", "leaf-b"),
+            completed_leaf_names=("leaf-a",),
         )
     )
     child_state = child_store.load()
-    leaf = child_state.slices["leaf-a"]
     child_store.checkpoint(
-        child_state.recursive_fsm or child_state.fsm,
-        {
-            **child_state.slices,
-            "leaf-a": replace(leaf, status=SliceStatus.SPAWNED, post_merge=None),
-        },
+        TLPhase.TLPRFiled,
+        child_state.slices,
         child_state.budgets,
         child_state.events.last_consumed_offset,
         current_order=child_state.current_order,
@@ -13835,6 +13904,157 @@ def test_merged_aggregate_rejects_incomplete_declared_child_leaf(tmp_path: Path)
     )
 
     _assert_aggregate_recovery_stays_parked(plan, root_store, tmp_path)
+
+
+def test_nested_sibling_scope_cannot_supply_missing_child_completion(tmp_path: Path) -> None:
+    nested_plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "inner-one",
+                WorkPlan.from_mapping(
+                    {
+                        "leaves": [
+                            {
+                                "name": "leaf-a",
+                                "task": "complete first sibling",
+                                "chainlink_issue_id": None,
+                            }
+                        ]
+                    }
+                ),
+                order=1,
+            ),
+            SubTLTask(
+                "inner-two",
+                WorkPlan.from_mapping(
+                    {
+                        "leaves": [
+                            {
+                                "name": "leaf-b",
+                                "task": "complete second sibling",
+                                "chainlink_issue_id": None,
+                            }
+                        ]
+                    }
+                ),
+                order=2,
+            ),
+        )
+    )
+    _plan, root_store, architecture_store = _nested_blocked_owner_stores(
+        tmp_path,
+        "nested-sibling-completion-proof",
+        child_plan=nested_plan,
+    )
+    assert architecture_store is not None
+    architecture_state = architecture_store.load()
+    architecture_manifest = architecture_state.plan_manifest
+    assert architecture_manifest is not None
+    architecture_slices = dict(architecture_state.slices)
+    sibling_receipt: PostMergeState | None = None
+
+    for index, declaration in enumerate(architecture_manifest.nodes):
+        nested_manifest = architecture_manifest.child_manifests[declaration.node_id]
+        nested_plan = driver_module._work_plan_from_manifest(nested_manifest)
+        nested_store = _seed_nested_scope_store(
+            architecture_store,
+            architecture_state,
+            declaration,
+            nested_manifest,
+            nested_plan,
+        )
+        leaf_name = nested_manifest.nodes[0].name
+        if index == 0:
+            nested_state = _complete_nested_leaf(nested_store, leaf_name=leaf_name, pr_number=150)
+        else:
+            nested_state = nested_store.load()
+            leaf = nested_state.slices[leaf_name]
+            nested_store.checkpoint(
+                TLPhase.TLPRFiled,
+                {
+                    **nested_state.slices,
+                    leaf_name: replace(
+                        leaf,
+                        status=SliceStatus.SPAWNED,
+                        attempts=1,
+                        dispatch_intent_id=f"{leaf_name}-dispatch-intent",
+                        dispatch_agent_id=leaf_name,
+                        dispatch_authoritative_event_seq=0,
+                        dispatch_last_boundary="agent.spawned",
+                    ),
+                },
+                nested_state.budgets,
+                nested_state.events.last_consumed_offset,
+            )
+            nested_state = nested_store.load()
+        receipt = nested_state.slices[leaf_name].post_merge or sibling_receipt
+        assert receipt is not None
+        aggregate_receipt = PostMergeState(
+            PostMergePhase.COMPLETE,
+            {
+                **receipt.evidence,
+                "child_id": declaration.name,
+                "pr_number": str(500 + index),
+            },
+        )
+        sibling_receipt = sibling_receipt or aggregate_receipt
+        architecture_slices[declaration.name] = replace(
+            architecture_slices[declaration.name],
+            status=SliceStatus.MERGED,
+            pr_number=500 + index,
+            post_merge=aggregate_receipt,
+        )
+
+    architecture_store.checkpoint(
+        TLPhase.TLPRFiled,
+        architecture_slices,
+        architecture_state.budgets,
+        architecture_state.events.last_consumed_offset,
+        current_order=architecture_state.current_order,
+        ordered_stages=architecture_state.ordered_stages,
+        integration=architecture_state.integration,
+    )
+
+    proven, _reason = driver_module._aggregate_child_completion_proven(
+        root_store.load(), architecture_store.load(), architecture_store, "architecture"
+    )
+    assert not proven
+
+
+def _seed_nested_scope_store(
+    parent_store: RunStore,
+    parent_state: RunState,
+    declaration: ManifestNode,
+    manifest: PlanManifest,
+    plan: WorkPlan,
+) -> RunStore:
+    """Create one nested child checkpoint bound to its accepted declaration."""
+    store = RunStore(declaration.name, parent_store.run_dir)
+    config = replace(
+        _config(),
+        root_dir=parent_store.run_dir,
+        run_id=declaration.name,
+        branch=declaration.owned_branch,
+        parent_branch=parent_state.owner_branch,
+        parent_run_id=parent_state.run_id,
+        depth=parent_state.depth + 1,
+        repository_identity=parent_state.repository_identity,
+        declared_manifest=manifest,
+    )
+    slices = _initial_slices(plan, config, parent_store.run_dir, declaration.name)
+    create(
+        declaration.name,
+        {
+            "slices": slices,
+            "parent_run_id": parent_state.run_id,
+            "parent_branch": parent_state.owner_branch,
+            "owner_branch": declaration.owned_branch,
+            "depth": config.depth,
+        },
+        root_dir=parent_store.run_dir,
+    )
+    store.set_plan_manifest(manifest, slices=slices)
+    return store
 
 
 def test_merged_aggregate_with_conflicting_merge_coordinates_stays_parked(

@@ -14490,6 +14490,7 @@ def _aggregate_declared_node_complete(
         return False
     return _aggregate_scope_completion_proven(
         scope_state,
+        node.name,
         child_state,
         child_store,
         child_manifest,
@@ -14498,6 +14499,7 @@ def _aggregate_declared_node_complete(
 
 def _aggregate_scope_completion_proven(
     parent_state: RunState,
+    expected_scope_run_id: str,
     scope_state: RunState,
     scope_store: RunStore,
     declared_manifest: PlanManifest,
@@ -14505,7 +14507,7 @@ def _aggregate_scope_completion_proven(
     """Prove one declared scope and every direct descendant completed."""
     if not _child_owner_checkpoint_matches(
         parent_state,
-        scope_state.run_id,
+        expected_scope_run_id,
         scope_state,
         declared_manifest,
     ) or not _aggregate_scope_phase_complete(scope_state):
@@ -14521,10 +14523,10 @@ def _aggregate_child_completion_proven(
     child_state: RunState | None,
     child_store: RunStore,
     child_name: str,
-) -> bool:
+) -> tuple[bool, str]:
     """Bind aggregate repair to the accepted parent declaration and leaves."""
     if child_state is None or parent_state.plan_manifest is None:
-        return False
+        return False, "aggregate_child_declaration_unavailable"
     declaration = next(
         (
             node
@@ -14534,16 +14536,24 @@ def _aggregate_child_completion_proven(
         None,
     )
     if declaration is None:
-        return False
+        return False, "aggregate_child_declaration_missing"
     child_manifest = parent_state.plan_manifest.child_manifests.get(declaration.node_id)
     if child_manifest is None:
-        return False
-    return _aggregate_scope_completion_proven(
-        parent_state,
-        child_state,
-        child_store,
-        child_manifest,
-    )
+        return False, "aggregate_child_manifest_missing"
+    if child_state.run_id != declaration.name:
+        return False, "aggregate_child_run_id_mismatch"
+    if child_state.parent_run_id != parent_state.run_id:
+        return False, "aggregate_child_parent_mismatch"
+    if (
+        child_state.plan_manifest is None
+        or child_state.plan_manifest.digest != child_manifest.digest
+    ):
+        return False, "aggregate_child_manifest_mismatch"
+    if not _aggregate_scope_completion_proven(
+        parent_state, declaration.name, child_state, child_store, child_manifest
+    ):
+        return False, "aggregate_child_completion_incomplete"
+    return True, "accepted_child_declaration_and_completion"
 
 
 def _exit_marker_matches_checkpoint(
@@ -14964,8 +14974,11 @@ def _verified_aggregate_post_merge(
             child_state = child_store.load()
         except (OSError, ValueError):
             return False, "aggregate_child_completion_unavailable"
-        if not _aggregate_child_completion_proven(state, child_state, child_store, task.name):
-            return False, "aggregate_child_completion_incomplete"
+        child_complete, child_reason = _aggregate_child_completion_proven(
+            state, child_state, child_store, task.name
+        )
+        if not child_complete:
+            return False, child_reason
     evidence = receipt.evidence
     pr_number = current.pr_number
     head_sha = candidate.aggregate_head_sha
