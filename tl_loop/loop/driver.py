@@ -391,6 +391,7 @@ INTEGRATION_FAILURE_GATE_NAME = "tl-integration-failure"
 AGGREGATE_PUBLICATION_GATE_PREFIX = "tl-aggregate-publication-blocked-"
 INTEGRITY_RECONCILIATION_GATE_NAME = "tl-integrity-reconciliation"
 CHAINLINK_BINDING_RECONCILIATION_GATE_NAME = "chainlink-issue-binding-reconciliation"
+IDLE_LANE_BOOKKEEPING_ERROR = "no lane transition for idle and LaneBookkeepingNotRequired"
 MERGE_RECOVERY_GATE_PREFIX = "tl-merge-recovery-"
 MERGE_RETIREMENT_GATE_PREFIX = "tl-merge-retirement-"
 RECOVERY_CONSISTENCY_GATE_NAME = "tl-recovery-consistency"
@@ -6350,6 +6351,10 @@ def _checkpoint_post_merge_event(
     event: object,
     reconciliation_additions: Mapping[str, object] | None = None,
     lane_event: object | tuple[object, ...] | None = None,
+    *,
+    expected_revision: int | None = None,
+    clear_gates: tuple[str, ...] = (),
+    clear_dispatch_error: bool = False,
 ) -> RunState:
     current = state.slices[slice_id]
     updated = slice_transition(current, PostMergeEventObserved(event))
@@ -6357,6 +6362,12 @@ def _checkpoint_post_merge_event(
         reconciliation = dict(updated.reconciliation or {})
         reconciliation.update(reconciliation_additions)
         updated = replace(updated, reconciliation=reconciliation)
+    if (
+        clear_dispatch_error
+        and current.dispatch_error == IDLE_LANE_BOOKKEEPING_ERROR
+        and current.dispatch_error_code is None
+    ):
+        updated = replace(updated, dispatch_error=None, dispatch_error_code=None)
     integration = state.integration
     if lane_event is not None:
         repository, parent_branch = _candidate_lane_key(state, current)
@@ -6377,6 +6388,8 @@ def _checkpoint_post_merge_event(
         None,
         slice_state=updated,
         integration=integration,
+        expected_revision=expected_revision,
+        clear_gates=clear_gates,
     )
     return result
 
@@ -6516,6 +6529,8 @@ def _advance_post_merge_boundary(
         return _record_issue_close_failure(
             store, state, slice_id, error, config, effects, effects_log
         )
+    except CheckpointConflict:
+        return store.load()
     except (EffectFailed, TLLoopError, ToolUnavailableError, TypeError, ValueError) as error:
         return _block_post_merge_recovery(store, state, slice_id, str(error))
     return state
@@ -6804,18 +6819,385 @@ def _complete_unlinked_changelog(
     commit_sha: str = "",
     remote_head: str = "",
 ) -> RunState:
-    """Release the lane and complete the slice with its typed changelog outcome."""
-    lane_event: object | None = None
-    repository, parent_branch = _candidate_lane_key(state, current)
-    if f"{repository}:{parent_branch}" in state.integration.lanes:
-        lane_event = LaneBookkeepingNotRequired(current.id)
-    completed = _checkpoint_post_merge_event(
+    """Checkpoint typed completion without releasing a lane the child no longer owns."""
+    for _ in range(3):
+        state = store.load()
+        current = state.slices[current.id]
+        if _same_unlinked_completion_is_already_saved(current, outcome, commit_sha, remote_head):
+            return state
+        proof_error = _unlinked_completion_proof_error(
+            state, current, pr_number, effects_log, outcome, commit_sha, remote_head
+        )
+        if proof_error:
+            try:
+                return _hold_unlinked_completion(store, state, current.id, proof_error)
+            except CheckpointConflict:
+                continue
+        lane_event, _lane_action, lane_error = _unlinked_completion_lane_decision(state, current)
+        if lane_error:
+            try:
+                return _hold_unlinked_completion(store, state, current.id, lane_error)
+            except CheckpointConflict:
+                continue
+        evidence = current.post_merge.evidence if current.post_merge is not None else evidence
+        try:
+            completed = _checkpoint_post_merge_event(
+                store,
+                state,
+                current.id,
+                PostMergeNotApplicable(current.id, outcome, detail, commit_sha, remote_head),
+                lane_event=lane_event,
+                expected_revision=state.revision,
+                clear_gates=(f"tl-post-merge-{current.id}",),
+                clear_dispatch_error=True,
+            )
+        except CheckpointConflict:
+            continue
+        except ValueError as error:
+            try:
+                return _hold_unlinked_completion(
+                    store, state, current.id, f"post-merge completion evidence refused: {error}"
+                )
+            except CheckpointConflict:
+                continue
+        _record_unlinked_completion_event(
+            current,
+            pr_number,
+            evidence,
+            outcome,
+            config,
+            effects,
+            effects_log,
+        )
+        return completed
+    return store.load()
+
+
+def _same_unlinked_completion_is_already_saved(
+    current: SliceState,
+    outcome: str,
+    commit_sha: str,
+    remote_head: str,
+) -> bool:
+    """Recognize the exact durable terminal result without replaying its effects."""
+    post_merge = current.post_merge
+    return (
+        post_merge is not None
+        and post_merge.phase is PostMergePhase.COMPLETE
+        and post_merge.evidence.get("issue_close_outcome") == "not_applicable"
+        and post_merge.evidence.get("changelog_outcome") == outcome
+        and post_merge.evidence.get("changelog_commit_sha", "") == commit_sha
+        and post_merge.evidence.get("observed_remote_head", "") == remote_head
+    )
+
+
+def _hold_unlinked_completion(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    reason: str,
+) -> RunState:
+    """Retain lane ownership and the post-merge gate when completion proof fails."""
+    return _block_post_merge_recovery(
         store,
         state,
-        current.id,
-        PostMergeNotApplicable(current.id, outcome, detail, commit_sha, remote_head),
-        lane_event=lane_event,
+        slice_id,
+        f"unlinked post-merge completion held: {reason}",
+        preserve_lane=True,
+        expected_revision=state.revision,
     )
+
+
+def _unlinked_completion_lane_decision(
+    state: RunState,
+    current: SliceState,
+) -> tuple[object | None, str, str | None]:
+    """Release only the exact active owner; preserve absent and idle lane records."""
+    try:
+        repository, parent_branch = _candidate_lane_key(state, current)
+    except ValueError as error:
+        return None, "held", str(error)
+    lane = state.integration.lanes.get(f"{repository}:{parent_branch}")
+    if lane is None:
+        return None, "lane_absent", None
+    if lane.phase is LanePhase.IDLE:
+        return None, "lane_idle_preserved", _idle_lane_conflict(lane)
+    return _active_unlinked_lane_decision(state, current, lane)
+
+
+def _idle_lane_conflict(lane: LaneState) -> str | None:
+    """Reject an idle phase that still claims active ownership coordinates."""
+    active_fields = (
+        lane.child_id,
+        lane.lane_epoch,
+        lane.expected_base_sha,
+        lane.head_sha,
+        lane.merge_journal_id,
+        lane.push_intent_id,
+        lane.push_journal_id,
+        lane.changelog_commit,
+    )
+    return "idle lane retains active owner coordinates" if any(active_fields) else None
+
+
+def _active_unlinked_lane_decision(
+    state: RunState,
+    current: SliceState,
+    lane: LaneState,
+) -> tuple[object | None, str, str | None]:
+    """Require exact child, epoch and merge coordinates before a guarded release."""
+    if lane.phase not in {LanePhase.INTEGRATING, LanePhase.BOOKKEEPING}:
+        return None, "held", f"lane is unresolved in phase {lane.phase.value}"
+    if lane.child_id != current.id:
+        return None, "held", f"lane is owned by another child ({lane.child_id or 'unknown'})"
+    mismatch = _owned_unlinked_lane_mismatch(state, current, lane)
+    if mismatch:
+        return None, "held", mismatch
+    return LaneBookkeepingNotRequired(current.id), "owned_lane_released", None
+
+
+def _owned_unlinked_lane_mismatch(
+    state: RunState,
+    current: SliceState,
+    lane: LaneState,
+) -> str | None:
+    """Validate active lane identity and ensure no pending push remains."""
+    evidence = current.post_merge.evidence if current.post_merge is not None else {}
+    expected_epoch = _evidence_int(evidence, "lane_epoch", "post-merge lane epoch")
+    if lane.lane_epoch != expected_epoch:
+        return "active lane epoch conflicts with the retained merge evidence"
+    if lane.head_sha != evidence.get("head_sha"):
+        return "active lane head conflicts with the retained merge evidence"
+    expected_base = current.reconciliation.get("merge_base_sha") if current.reconciliation else None
+    if lane.expected_base_sha not in {None, expected_base}:
+        return "active lane base conflicts with the retained merge evidence"
+    if lane.repository != _repository_identity(state) or lane.parent_branch != evidence.get(
+        "parent_branch"
+    ):
+        return "active lane repository or parent branch conflicts with the merge evidence"
+    merge_id = evidence.get("merge_journal_id")
+    if lane.merge_journal_id not in {None, merge_id}:
+        return "active lane merge journal conflicts with the retained merge evidence"
+    if lane.phase is LanePhase.BOOKKEEPING and any(
+        (lane.push_intent_id, lane.push_journal_id, lane.changelog_commit)
+    ):
+        return "active bookkeeping lane retains an unresolved push obligation"
+    return None
+
+
+def _unlinked_completion_proof_error(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    effects_log: list[EffectIntent],
+    outcome: str,
+    commit_sha: str,
+    remote_head: str,
+) -> str | None:
+    """Check the saved parent sync and candidate identity before terminal completion."""
+    post_merge = current.post_merge
+    if post_merge is None or post_merge.phase is not PostMergePhase.PARENT_BRANCH_SYNCED:
+        return "a parent-branch-synced checkpoint is required"
+    error = _unlinked_completion_coordinates(state, current, pr_number, post_merge.evidence)
+    if error:
+        return error
+    error = _unlinked_changelog_outcome_error(outcome, commit_sha, remote_head)
+    if error:
+        return error
+    candidate = state.integration.candidates.get(current.id)
+    if candidate is None:
+        return None
+    return _aggregate_completion_sync_error(state, current, pr_number, candidate, effects_log)
+
+
+def _unlinked_completion_coordinates(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+) -> str | None:
+    """Bind the terminal receipt to this slice's accepted repository and PR."""
+    if (
+        state.repository_identity is None
+        or evidence.get("repository") != state.repository_identity.remote_url
+    ):
+        return "repository identity is missing or conflicts with the saved merge receipt"
+    if evidence.get("child_id") != current.id:
+        return "merge receipt child does not match the completing slice"
+    if evidence.get("parent_branch") != _publication_parent_branch_from_slice(current):
+        return "merge receipt parent branch conflicts with the accepted slice"
+    if current.pr_number != pr_number or str(evidence.get("pr_number")) != str(pr_number):
+        return "merge receipt PR number conflicts with the completing slice"
+    if not evidence.get("head_sha") or not evidence.get("merge_journal_id"):
+        return "merge receipt is missing its exact head or journal identity"
+    try:
+        _required_int(evidence, "lane_epoch", "post-merge lane epoch")
+    except ValueError:
+        return "merge receipt is missing its lane epoch"
+    publication = current.publication
+    if publication is not None:
+        if publication.pr_number != pr_number:
+            return "publication PR number conflicts with the saved merge receipt"
+        if publication.head_sha != evidence.get("head_sha"):
+            return "publication head conflicts with the saved merge receipt"
+        if publication.base_branch != evidence.get("parent_branch"):
+            return "publication parent branch conflicts with the saved merge receipt"
+    return None
+
+
+def _unlinked_changelog_outcome_error(
+    outcome: str,
+    commit_sha: str,
+    remote_head: str,
+) -> str | None:
+    """Reject unsupported or contradictory typed changelog completion evidence."""
+    valid = {
+        "captured",
+        "no_changelog",
+        "judgment_failed",
+        "entry_added",
+        "entry_write_failed",
+        "entry_push_failed",
+    }
+    if outcome not in valid:
+        return f"unknown changelog outcome {outcome!r}"
+    if outcome == "entry_added" and (
+        not commit_sha or not remote_head or commit_sha != remote_head
+    ):
+        return "entry_added requires matching changelog commit and observed remote head"
+    if outcome != "entry_added" and (commit_sha or remote_head):
+        return f"{outcome} must not carry changelog commit evidence"
+    return None
+
+
+def _aggregate_completion_sync_error(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    candidate: IntegrationCandidateState,
+    effects_log: list[EffectIntent],
+) -> str | None:
+    """Validate aggregate merge and parent-sync receipts for the no-write path."""
+    post_merge = current.post_merge
+    assert post_merge is not None
+    base_sha = candidate.aggregate_original_base_sha
+    evidence = post_merge.evidence
+    merge_id = evidence.get("merge_journal_id", "")
+    if candidate.lifecycle is not IntegrationLifecycle.MERGED:
+        return "aggregate candidate is not authoritatively merged"
+    if candidate.aggregate_pr_number != pr_number or candidate.aggregate_head_sha != evidence.get(
+        "head_sha"
+    ):
+        return "aggregate candidate PR or head conflicts with the merge receipt"
+    if not base_sha or not merge_id:
+        return "aggregate merge base or journal identity is missing"
+    reconciliation = current.reconciliation
+    if not isinstance(reconciliation, Mapping) or reconciliation.get("merge_base_sha") != base_sha:
+        return "aggregate accepted base conflicts with its retained merge evidence"
+    merge_proof = _verified_aggregate_merge_journal(
+        state,
+        current,
+        candidate,
+        pr_number,
+        str(evidence.get("head_sha", "")),
+        base_sha,
+        merge_id,
+        effects_log,
+    )
+    if merge_proof != "verified":
+        return f"aggregate merge journal is {merge_proof}"
+    return _verified_aggregate_parent_sync(state, current, pr_number, candidate, effects_log)
+
+
+def _verified_aggregate_parent_sync(
+    state: RunState,
+    current: SliceState,
+    pr_number: int,
+    candidate: IntegrationCandidateState,
+    effects_log: list[EffectIntent],
+) -> str | None:
+    """Match the retained sync result to current checkpoint and candidate coordinates."""
+    post_merge = current.post_merge
+    assert post_merge is not None
+    evidence = post_merge.evidence
+    reconciliation = current.reconciliation
+    if not isinstance(reconciliation, Mapping):
+        return "parent synchronization reconciliation evidence is missing"
+    expected_base = candidate.aggregate_original_base_sha
+    if not expected_base:
+        return "aggregate original base is missing from the accepted candidate"
+    arguments = _parent_sync_arguments(current, pr_number, evidence, expected_base, None)
+    identity = _parent_sync_identity_fields(arguments)
+    sync_id = stable_action_key(
+        state.run_id, "post_merge_parent_sync_operation", current.id, identity
+    )
+    history, history_error = _parent_sync_history(effects_log, current.id, sync_id, identity)
+    if history_error or not history:
+        return history_error or "confirmed parent synchronization journal is missing"
+    attempt, operation, entry = max(history, key=lambda record: record[0])
+    return _aggregate_parent_sync_entry_error(
+        state, current, arguments, sync_id, attempt, operation, entry, reconciliation
+    )
+
+
+def _aggregate_parent_sync_entry_error(
+    state: RunState,
+    current: SliceState,
+    arguments: Mapping[str, object],
+    sync_id: str,
+    attempt: int,
+    operation: str,
+    entry: Mapping[str, object],
+    reconciliation: Mapping[str, object],
+) -> str | None:
+    """Validate journal ownership, exact sync receipt and checkpoint projection."""
+    entry_arguments = entry.get("arguments")
+    if (
+        entry.get("run_id") != state.run_id
+        or entry.get("target") != current.id
+        or operation not in {"post_merge_parent_sync", "post_merge_parent_sync_reconcile"}
+        or not isinstance(entry_arguments, Mapping)
+    ):
+        return "parent synchronization journal has conflicting ownership"
+    result = entry.get("result")
+    raw = result.get("result") if isinstance(result, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return "parent synchronization journal has no receipt"
+    stable = entry_arguments.get("sync_operation_id") == sync_id
+    payload = _validated_sync_payload(raw, arguments, sync_id, attempt, require_correlation=stable)
+    if payload.get("sync_outcome") != "confirmed":
+        return "parent synchronization journal is not confirmed: " + str(
+            payload.get("diagnostic", "unresolved")
+        )
+    post_merge = current.post_merge
+    assert post_merge is not None
+    evidence = post_merge.evidence
+    recorded_sync_id = evidence.get("sync_operation_id")
+    if recorded_sync_id is not None and recorded_sync_id != sync_id:
+        return "parent synchronization identity conflicts with the saved receipt"
+    recorded_attempt = evidence.get("sync_attempt")
+    if recorded_attempt is not None and str(recorded_attempt) != str(attempt):
+        return "parent synchronization attempt conflicts with the saved receipt"
+    for name, observed in (
+        ("parent_commit_sha", evidence.get("parent_commit_sha")),
+        ("remote_head_sha", reconciliation.get("remote_head_sha")),
+        ("ancestry_proof", reconciliation.get("ancestry_proof")),
+    ):
+        if payload.get(name) != observed:
+            return f"parent synchronization {name} conflicts with its checkpoint projection"
+    return None
+
+
+def _record_unlinked_completion_event(
+    current: SliceState,
+    pr_number: int,
+    evidence: Mapping[str, object],
+    outcome: str,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
+    """Record the committed terminal disposition after its atomic checkpoint."""
     _record_controller_event(
         current.id,
         "tl.unlinked_changelog_resolved",
@@ -6831,7 +7213,6 @@ def _complete_unlinked_changelog(
         effects,
         effects_log,
     )
-    return completed
 
 
 def _drain_post_merge_recovery(
@@ -8667,6 +9048,9 @@ def _block_post_merge_recovery(
     state: RunState,
     slice_id: str,
     reason: str,
+    *,
+    preserve_lane: bool = False,
+    expected_revision: int | None = None,
 ) -> RunState:
     bounded = reason[:500]
     blocked = replace(
@@ -8679,9 +9063,14 @@ def _block_post_merge_recovery(
         slice_id,
         None,
         slice_state=blocked,
-        integration=_abandon_owned_lane_integration(
-            state, blocked, state.integration, "post_merge_gate", bounded
+        integration=(
+            state.integration
+            if preserve_lane
+            else _abandon_owned_lane_integration(
+                state, blocked, state.integration, "post_merge_gate", bounded
+            )
         ),
+        expected_revision=expected_revision,
     )
     gate_name = f"tl-post-merge-{slice_id}"
     gate = next(
@@ -9344,6 +9733,7 @@ def _checkpoint_slice_action(
     slice_state: SliceState | None = None,
     integration: IntegrationRuntimeState | None = None,
     clear_gates: tuple[str, ...] = (),
+    expected_revision: int | None = None,
 ) -> RunState:
     """Persist one direct action phase without changing unrelated run state."""
     current = slice_state or state.slices[slice_id]
@@ -9367,6 +9757,7 @@ def _checkpoint_slice_action(
         ordered_stages=state.ordered_stages,
         integration=integration or state.integration,
         clear_gates=clear_gates,
+        expected_revision=expected_revision,
     )
 
 

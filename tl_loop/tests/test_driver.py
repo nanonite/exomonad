@@ -26,6 +26,7 @@ from tl_loop.events.queue import LedgerQueue, QueueError
 from tl_loop.events.reader import LedgerReader, LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
+from tl_loop.fsm.lane import LanePhase, LaneReserved, LaneState
 from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
@@ -3235,7 +3236,11 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
             current = root_store.load()
             if event.run_seq == 78:
                 assert current.slices["architecture"].status is SliceStatus.MERGED, transport.calls
-                assert current.current_order == 2
+                assert current.current_order == 2, (
+                    current.slices["architecture"].post_merge,
+                    current.slices["architecture"].dispatch_error,
+                    [(gate.name, gate.status.value) for gate in current.gates],
+                )
                 assert current.slices["kani"].status is not SliceStatus.PENDING
             return super().acknowledge(event)
 
@@ -3252,13 +3257,14 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
         tl_model_choice=_tl_choice(ReviewBackend([])),
         agent_id=run_id,
     )
+    effects_log = EffectJournal(run_id, root_store.run_dir / "action-journal.json")
     reconciled_start = driver_module._reconcile_nonterminal_slices(
         plan,
         root_store.load(),
         config,
         EffectClient(transport),
         root_store,
-        [],
+        effects_log,
     )
     assert reconciled_start.slices["architecture"].dispatch_agent_id == "architecture"
     assert reconciled_start.slices["architecture"].recovery == recovery
@@ -3274,7 +3280,7 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
         config,
         root_store,
         root_store.load(),
-        [],
+        effects_log,
         TLEventDecoder(),
     )
 
@@ -13609,6 +13615,133 @@ def _seed_merged_aggregate_post_merge_recovery(
     return plan, root_store, child_store, merge_journal_id, base_sha
 
 
+def _seed_synced_captured_aggregate_with_idle_lane(
+    root_dir: Path,
+    run_id: str,
+    *,
+    lane_owner: str | None = None,
+    lane_phase: LanePhase = LanePhase.IDLE,
+    lane_absent: bool = False,
+) -> tuple[WorkPlan, RunStore, RunStore, str, str]:
+    """Seed the retained merged/synced/captured state before its final checkpoint."""
+    from tl_loop.fsm.post_merge_events import ParentBranchSynced, UnlinkedChangelogJudged
+
+    plan, root_store, child_store, merge_journal_id, base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(root_dir, run_id)
+    )
+    state = root_store.load()
+    current = state.slices["architecture"]
+    assert current.post_merge is not None
+    evidence = dict(current.post_merge.evidence)
+    sync_arguments = driver_module._parent_sync_arguments(
+        current, current.pr_number or 0, evidence, base_sha, "."
+    )
+    sync_identity = driver_module._parent_sync_identity_fields(sync_arguments)
+    sync_id = driver_module.stable_action_key(
+        run_id, "post_merge_parent_sync_operation", current.id, sync_identity
+    )
+    remote_head = base_sha
+    sync_payload = {
+        **sync_arguments,
+        "sync_operation_id": sync_id,
+        "sync_attempt": 2,
+        "sync_outcome": "confirmed",
+        "sync_phase": "complete",
+        "completed_steps": ["fetch", "fast_forward"],
+        "retry_safe": False,
+        "parent_commit_sha": remote_head,
+        "remote_head_sha": remote_head,
+        "ancestry_proof": f"ancestor:{evidence['head_sha']}->{remote_head}",
+        "remote_name": "origin",
+    }
+    sync_intent = EffectIntent(
+        "post_merge_parent_sync",
+        current.id,
+        {"sync_operation_id": sync_id, "sync_attempt": 2},
+        True,
+    )
+    journal = EffectJournal(run_id, root_store.run_dir / "action-journal.json")
+    journal.append(sync_intent)
+    journal.mark_result(sync_intent, ToolResult.from_raw({"success": True, "result": sync_payload}))
+    synced = driver_module._checkpoint_post_merge_event(
+        root_store,
+        state,
+        current.id,
+        ParentBranchSynced(current.id, "main", remote_head),
+    )
+    synced_current = synced.slices[current.id]
+    synced_post_merge = synced_current.post_merge
+    assert synced_post_merge is not None
+    synced_post_merge = replace(
+        synced_post_merge,
+        evidence={
+            **synced_post_merge.evidence,
+            "sync_operation_id": sync_id,
+            "sync_attempt": "2",
+        },
+    )
+    judged_post_merge = driver_module.slice_transition(
+        replace(synced_current, post_merge=synced_post_merge),
+        driver_module.PostMergeEventObserved(
+            UnlinkedChangelogJudged(
+                current.id,
+                "retained-changelog-judgment",
+                "captured",
+                "the existing unreleased entry already covers this change",
+                model="retained-tl-model",
+                tokens=17,
+            )
+        ),
+    ).post_merge
+    assert judged_post_merge is not None
+    final_slice = replace(
+        synced_current,
+        status=SliceStatus.PARKED,
+        dispatch_error="no lane transition for idle and LaneBookkeepingNotRequired",
+        post_merge=judged_post_merge,
+        reconciliation={
+            **dict(synced_current.reconciliation or {}),
+            "remote_head_sha": remote_head,
+            "ancestry_proof": sync_payload["ancestry_proof"],
+            "remote_name": "origin",
+        },
+    )
+    repository = "https://forge.example.test/test/repository.git"
+    lane_key = f"{repository}:main"
+    lane = LaneState(
+        repository,
+        "main",
+        phase=lane_phase,
+        child_id=lane_owner,
+        lane_epoch=1 if lane_owner else None,
+        last_lane_epoch=2,
+        expected_base_sha=base_sha if lane_owner else None,
+        head_sha=evidence["head_sha"] if lane_owner else None,
+        merge_journal_id=(
+            evidence["merge_journal_id"]
+            if lane_owner and lane_phase is LanePhase.BOOKKEEPING
+            else None
+        ),
+        push_intent_id="pending-push" if lane_phase is LanePhase.BOOKKEEPING else None,
+        push_journal_id="pending-push-journal" if lane_phase is LanePhase.BOOKKEEPING else None,
+        changelog_commit="pending-changelog" if lane_phase is LanePhase.BOOKKEEPING else None,
+    )
+    lanes = {} if lane_absent else {lane_key: lane}
+    integration = replace(synced.integration, lanes=lanes)
+    root_store.checkpoint(
+        synced.recursive_fsm or synced.fsm,
+        {**synced.slices, current.id: final_slice},
+        synced.budgets,
+        synced.events.last_consumed_offset,
+        current_order=synced.current_order,
+        ordered_stages=synced.ordered_stages,
+        integration=integration,
+    )
+    root_store.set_gate(f"tl-post-merge-{current.id}", GateStatus.PENDING)
+    root_store.set_gate("manual-approval-preserved", GateStatus.APPROVED)
+    return plan, root_store, child_store, merge_journal_id, base_sha
+
+
 @pytest.mark.parametrize(
     ("candidate_lifecycle", "leaf_names"),
     [
@@ -13787,6 +13920,597 @@ def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
         == 1
     )
     assert sum(name == "post_merge_parent_sync" for name, _ in transport.calls) == 1
+
+
+def test_captured_aggregate_completion_preserves_an_idle_integration_lane(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, child_store, merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "merged-aggregate-captured-idle-lane"
+        )
+    )
+    before = root_store.load()
+    lane_key = "https://forge.example.test/test/repository.git:main"
+    original_lane = before.integration.lanes[lane_key]
+    original_leaf_receipt = child_store.load().slices["leaf-a"].post_merge
+    original_park_audit = before.slices["architecture"].park_audit
+    journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
+    original_merge_entry = journal.entry_by_key(merge_journal_id)
+    original_sync_entries = journal.entries_for("post_merge_parent_sync", "architecture")
+
+    class CapturedCompletionTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = CapturedCompletionTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=tmp_path,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        agent_id="root-controller",
+        policy=validate_policy(_selector_policy()),
+        tl_model_choice=_tl_choice(ReviewBackend([])),
+    )
+    result = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    completed = result.final_state
+    architecture = completed.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.COMPLETE
+    assert architecture.post_merge.evidence["changelog_decision"] == "captured"
+    assert architecture.post_merge.evidence["changelog_outcome"] == "captured"
+    assert architecture.dispatch_error is None
+    assert architecture.park_audit == original_park_audit
+    assert completed.integration.lanes[lane_key] == original_lane
+    assert completed.current_order == 2
+    assert completed.slices["kani"].status is SliceStatus.MERGED
+    assert not any(gate.name == "tl-post-merge-architecture" for gate in completed.gates)
+    assert any(
+        gate.name == "manual-approval-preserved" and gate.status is GateStatus.APPROVED
+        for gate in completed.gates
+    )
+    assert sum(name == "post_merge_parent_sync" for name, _ in transport.calls) == 0
+    assert (
+        sum(
+            name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.unlinked_changelog_resolved"
+            for name, arguments in transport.calls
+        )
+        == 1
+    )
+    assert not any(
+        name
+        in {"post_merge_changelog_context", "post_merge_changelog_entry", "merge_pr", "file_pr"}
+        for name, _ in transport.calls
+    )
+    assert child_store.load().slices["leaf-a"].post_merge == original_leaf_receipt
+    assert journal.entry_by_key(merge_journal_id) == original_merge_entry
+    assert journal.entries_for("post_merge_parent_sync", "architecture") == original_sync_entries
+
+    repeated = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert repeated.final_state.current_order == 2
+    assert sum(name == "post_merge_parent_sync" for name, _ in transport.calls) == 0
+    assert (
+        sum(
+            name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.unlinked_changelog_resolved"
+            for name, arguments in transport.calls
+        )
+        == 1
+    )
+    assert (
+        sum(
+            name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.dispatch_confirmed"
+            and arguments.get("payload", {}).get("slice_id") == "kani"
+            for name, arguments in transport.calls
+        )
+        == 1
+    )
+
+
+def test_captured_aggregate_completion_preserves_unrelated_dispatch_error(
+    tmp_path: Path,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "merged-aggregate-preserve-unrelated-dispatch-error"
+        )
+    )
+    state = root_store.load()
+    architecture = state.slices["architecture"]
+    root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {
+            **state.slices,
+            "architecture": replace(
+                architecture,
+                dispatch_error="unrelated historical worker failure",
+                dispatch_error_code="worker_failure",
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    completed, _transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
+
+    architecture = completed.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.COMPLETE
+    assert architecture.dispatch_error == "unrelated historical worker failure"
+    assert architecture.dispatch_error_code == "worker_failure"
+
+
+def _continue_captured_aggregate(
+    plan: WorkPlan,
+    root_store: RunStore,
+    root_dir: Path,
+) -> tuple[RunState, RecordingTransport]:
+    """Continue one saved captured aggregate through the production driver."""
+
+    class CapturedCompletionTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = CapturedCompletionTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=root_dir,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        agent_id="root-controller",
+        policy=validate_policy(_selector_policy()),
+        tl_model_choice=_tl_choice(ReviewBackend([])),
+    )
+    result = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=root_dir,
+    )
+    return result.final_state, transport
+
+
+def _complete_captured_aggregate_boundary(
+    root_store: RunStore,
+    root_dir: Path,
+) -> tuple[RunState, RecordingTransport]:
+    """Invoke the production completion boundary against its retained evidence."""
+    state = root_store.load()
+    current = state.slices["architecture"]
+    assert current.post_merge is not None
+    transport = RecordingTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=root_dir,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        agent_id="root-controller",
+    )
+    journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
+    completed = driver_module._complete_unlinked_changelog(
+        root_store,
+        state,
+        current,
+        current.pr_number or 0,
+        current.post_merge.evidence,
+        "captured",
+        "retained judgment already covers the change",
+        config,
+        EffectClient(transport),
+        journal,
+    )
+    return completed, transport
+
+
+@pytest.mark.parametrize("lane_absent", [False, True])
+def test_captured_aggregate_completion_accepts_an_absent_or_idle_lane(
+    tmp_path: Path,
+    lane_absent: bool,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path,
+            f"merged-aggregate-captured-lane-absent-{lane_absent}",
+            lane_absent=lane_absent,
+        )
+    )
+
+    completed, transport = _continue_captured_aggregate(plan, root_store, tmp_path)
+
+    assert completed.slices["architecture"].post_merge is not None
+    assert completed.slices["architecture"].post_merge.phase is PostMergePhase.COMPLETE
+    if not lane_absent:
+        lane = completed.integration.lanes["https://forge.example.test/test/repository.git:main"]
+        assert lane.phase is LanePhase.IDLE
+        assert lane.child_id is None
+        assert lane.last_lane_epoch == 2
+    assert completed.current_order == 2
+    assert sum(name == "post_merge_parent_sync" for name, _ in transport.calls) == 0
+
+
+def test_captured_aggregate_completion_releases_only_its_matching_active_lane(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path,
+            "merged-aggregate-captured-owned-lane",
+            lane_owner="architecture",
+            lane_phase=LanePhase.INTEGRATING,
+        )
+    )
+
+    completed, _transport = _continue_captured_aggregate(plan, root_store, tmp_path)
+
+    lane = completed.integration.lanes["https://forge.example.test/test/repository.git:main"]
+    assert completed.slices["architecture"].post_merge is not None
+    assert completed.slices["architecture"].post_merge.phase is PostMergePhase.COMPLETE
+    assert lane.phase is LanePhase.IDLE
+    assert lane.child_id is None
+    assert lane.last_lane_epoch == 2
+
+
+@pytest.mark.parametrize(
+    ("owner", "phase"),
+    [
+        ("kani", LanePhase.INTEGRATING),
+        ("architecture", LanePhase.RECOVERY),
+        ("architecture", LanePhase.PARKED),
+        ("architecture", LanePhase.BOOKKEEPING),
+    ],
+)
+def test_captured_aggregate_completion_preserves_conflicting_or_unresolved_lane(
+    tmp_path: Path,
+    owner: str,
+    phase: LanePhase,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path,
+            f"merged-aggregate-captured-held-{owner}-{phase.value}",
+            lane_owner=owner,
+            lane_phase=phase,
+        )
+    )
+    before = root_store.load()
+    lane_key = "https://forge.example.test/test/repository.git:main"
+    original_lane = before.integration.lanes[lane_key]
+
+    held, transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
+
+    architecture = held.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED
+    assert "unlinked post-merge completion held" in (architecture.dispatch_error or "")
+    assert held.integration.lanes[lane_key] == original_lane
+    assert any(gate.name == "tl-post-merge-architecture" for gate in held.gates)
+    assert held.current_order == 1
+    assert held.slices["kani"].status is SliceStatus.PENDING
+    assert not any(name == "post_merge_parent_sync" for name, _ in transport.calls)
+    assert not any(
+        name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+        and arguments.get("payload", {}).get("slice_id") == "kani"
+        for name, arguments in transport.calls
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("remote_head_sha", "different-parent-head", "remote_head_sha conflicts"),
+        ("ancestry_proof", "unrelated-ancestry", "ancestry_proof conflicts"),
+    ],
+)
+def test_captured_aggregate_requires_sync_projection_to_match_its_receipt(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    reason: str,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, f"merged-aggregate-sync-projection-{field}"
+        )
+    )
+    state = root_store.load()
+    current = state.slices["architecture"]
+    reconciliation = {**dict(current.reconciliation or {}), field: value}
+    root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, current.id: replace(current, reconciliation=reconciliation)},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    held, transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
+
+    architecture = held.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED
+    assert reason in (architecture.dispatch_error or "")
+    assert held.current_order == 1
+    assert held.slices["kani"].status is SliceStatus.PENDING
+    assert not any(name == "post_merge_parent_sync" for name, _ in transport.calls)
+
+
+def test_captured_aggregate_missing_confirmed_sync_journal_stays_held(
+    tmp_path: Path,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "merged-aggregate-sync-journal-missing"
+        )
+    )
+    journal_path = root_store.run_dir / "action-journal.json"
+    entries = json.loads(journal_path.read_text(encoding="utf-8"))
+    retained = [
+        entry
+        for entry in entries
+        if not (
+            entry.get("operation") == "post_merge_parent_sync"
+            and entry.get("target") == "architecture"
+            and entry.get("arguments", {}).get("sync_attempt") == 2
+        )
+    ]
+    journal_path.write_text(json.dumps(retained), encoding="utf-8")
+
+    held, _transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
+
+    architecture = held.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED
+    assert "journal" in (architecture.dispatch_error or "")
+    assert held.current_order == 1
+    assert held.slices["kani"].status is SliceStatus.PENDING
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("repository", "https://other.invalid/repo.git", "repository identity"),
+        ("parent_branch", "other-parent", "parent branch"),
+        ("child_id", "other-child", "child"),
+        ("pr_number", "999", "PR number"),
+        ("head_sha", "other-head", "head"),
+        ("merge_journal_id", "other-journal", "merge journal"),
+    ],
+)
+def test_captured_aggregate_rejects_conflicting_merge_coordinates(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    reason: str,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, f"merged-aggregate-coordinate-{field}"
+        )
+    )
+    state = root_store.load()
+    current = state.slices["architecture"]
+    assert current.post_merge is not None
+    changed_post = replace(
+        current.post_merge,
+        evidence={**current.post_merge.evidence, field: value},
+    )
+    root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, current.id: replace(current, post_merge=changed_post)},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    held, _transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
+
+    architecture = held.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED
+    assert reason in (architecture.dispatch_error or "")
+    assert held.current_order == 1
+    assert held.slices["kani"].status is SliceStatus.PENDING
+
+
+def test_captured_aggregate_refuses_contradictory_entry_added_result(tmp_path: Path) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "merged-aggregate-entry-added-contradiction"
+        )
+    )
+    state = root_store.load()
+    current = state.slices["architecture"]
+    assert current.post_merge is not None
+    transport = RecordingTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=tmp_path,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
+    journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
+
+    held = driver_module._complete_unlinked_changelog(
+        root_store,
+        state,
+        current,
+        current.pr_number or 0,
+        current.post_merge.evidence,
+        "entry_added",
+        "contradictory synthetic receipt",
+        config,
+        EffectClient(transport),
+        journal,
+        commit_sha="new-commit",
+        remote_head="different-remote-head",
+    )
+
+    architecture = held.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED
+    assert "matching changelog commit" in (architecture.dispatch_error or "")
+    assert held.integration.lanes["https://forge.example.test/test/repository.git:main"].phase is (
+        LanePhase.IDLE
+    )
+
+
+class _SimulatedPostMergeCrash(RuntimeError):
+    """Represent abrupt controller termination at a durable boundary."""
+
+
+def test_completion_checkpoint_crash_replays_without_rejudging_or_duplicate_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "merged-aggregate-completion-crash-after-checkpoint"
+        )
+    )
+    original_record = driver_module._record_controller_event
+
+    def crash_after_checkpoint(slice_id, event_type, *args, **kwargs):
+        if event_type == "tl.unlinked_changelog_resolved":
+            raise _SimulatedPostMergeCrash("after completion checkpoint")
+        return original_record(slice_id, event_type, *args, **kwargs)
+
+    monkeypatch.setattr(driver_module, "_record_controller_event", crash_after_checkpoint)
+    with pytest.raises(_SimulatedPostMergeCrash, match="after completion checkpoint"):
+        _complete_captured_aggregate_boundary(root_store, tmp_path)
+    monkeypatch.setattr(driver_module, "_record_controller_event", original_record)
+
+    saved = root_store.load()
+    assert saved.slices["architecture"].post_merge is not None
+    assert saved.slices["architecture"].post_merge.phase is PostMergePhase.COMPLETE
+    replayed, transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
+    assert replayed.slices["architecture"].post_merge == saved.slices["architecture"].post_merge
+    assert transport.calls == []
+
+
+def test_completion_crash_before_checkpoint_reuses_captured_judgment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "merged-aggregate-completion-crash-before-checkpoint"
+        )
+    )
+    original_checkpoint = driver_module._checkpoint_post_merge_event
+
+    def crash_before_checkpoint(*args, **kwargs):
+        event = args[3] if len(args) > 3 else kwargs.get("event")
+        if isinstance(event, driver_module.PostMergeNotApplicable):
+            raise _SimulatedPostMergeCrash("before completion checkpoint")
+        return original_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(driver_module, "_checkpoint_post_merge_event", crash_before_checkpoint)
+    with pytest.raises(_SimulatedPostMergeCrash, match="before completion checkpoint"):
+        _complete_captured_aggregate_boundary(root_store, tmp_path)
+    monkeypatch.setattr(driver_module, "_checkpoint_post_merge_event", original_checkpoint)
+    assert root_store.load().slices["architecture"].post_merge.phase is (
+        PostMergePhase.PARENT_BRANCH_SYNCED
+    )
+
+    resumed, transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
+
+    architecture = resumed.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.COMPLETE
+    assert architecture.post_merge.evidence["changelog_decision"] == "captured"
+    assert not any(
+        name in {"post_merge_changelog_context", "post_merge_parent_sync"}
+        for name, _ in transport.calls
+    )
+
+
+def test_concurrent_lane_reservation_survives_completion_checkpoint_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "merged-aggregate-concurrent-reservation"
+        )
+    )
+    original_checkpoint = driver_module._checkpoint_post_merge_event
+    injected = False
+
+    def reserve_before_completion(*args, **kwargs):
+        nonlocal injected
+        event = args[3] if len(args) > 3 else kwargs.get("event")
+        if not injected and isinstance(event, driver_module.PostMergeNotApplicable):
+            injected = True
+            root_store.transition_lane(
+                "https://forge.example.test/test/repository.git",
+                "main",
+                LaneReserved("kani", 3, base_sha),
+            )
+        return original_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(driver_module, "_checkpoint_post_merge_event", reserve_before_completion)
+
+    held, transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
+
+    lane = held.integration.lanes["https://forge.example.test/test/repository.git:main"]
+    assert injected
+    assert lane.phase is LanePhase.RESERVED
+    assert lane.child_id == "kani"
+    assert lane.lane_epoch == 3
+    architecture = held.slices["architecture"]
+    assert architecture.post_merge is not None
+    assert architecture.post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED
+    assert held.current_order == 1
+    assert not any(
+        name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+        and arguments.get("payload", {}).get("slice_id") == "kani"
+        for name, arguments in transport.calls
+    )
 
 
 def _assert_aggregate_recovery_stays_parked(

@@ -367,19 +367,26 @@ def seed_root(
     merged_remote_head: str,
 ) -> dict[str, object]:
     from tl_loop.client.effects import ToolResult
+    from tl_loop.fsm.lane import LanePhase, LaneState
     from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
+    from tl_loop.fsm.post_merge_events import (
+        ParentBranchSynced,
+        UnlinkedChangelogJudged,
+    )
     from tl_loop.fsm.scope import TLFailed
     from tl_loop.loop.driver import (
         AGGREGATE_PUBLICATION_GATE_PREFIX,
         EffectIntent,
         TLLoopConfig,
         WorkPlan,
+        _checkpoint_post_merge_event,
         _initial_slices,
         _manifest_for_plan,
         _parent_aggregate_approval,
         _parent_sync_arguments,
         _parent_sync_identity_fields,
         _verified_child_completion_evidence,
+        stable_action_key,
     )
     from tl_loop.loop.journal import EffectJournal
     from tl_loop.ordered import AggregateCandidate, IntegrationLifecycle
@@ -766,6 +773,34 @@ def seed_root(
             }
         ),
     )
+    sync_identity = _parent_sync_identity_fields(sync_arguments)
+    sync_operation_id = stable_action_key(
+        "root", "post_merge_parent_sync_operation", "architecture", sync_identity
+    )
+    confirmed_sync_arguments = {
+        "sync_operation_id": sync_operation_id,
+        "sync_attempt": 2,
+    }
+    confirmed_sync_intent = EffectIntent(
+        "post_merge_parent_sync", "architecture", confirmed_sync_arguments, True
+    )
+    confirmed_sync_payload = {
+        **sync_arguments,
+        **confirmed_sync_arguments,
+        "sync_outcome": "confirmed",
+        "sync_phase": "complete",
+        "completed_steps": ["fetch", "fast_forward"],
+        "retry_safe": False,
+        "parent_commit_sha": merged_remote_head,
+        "remote_head_sha": merged_remote_head,
+        "ancestry_proof": f"ancestor:{aggregate_head}->{merged_remote_head}",
+        "remote_name": "origin",
+    }
+    journal.append(confirmed_sync_intent)
+    journal.mark_result(
+        confirmed_sync_intent,
+        ToolResult.from_raw({"success": True, "result": confirmed_sync_payload}),
+    )
     candidate = IntegrationCandidateState(
         lifecycle=IntegrationLifecycle.CHILDREN_MERGED,
         aggregate_pr_number=aggregate_pr,
@@ -828,6 +863,53 @@ def seed_root(
         f"{AGGREGATE_PUBLICATION_GATE_PREFIX}architecture", GateStatus.PENDING
     )
     root_store.set_gate("tl-ordered-child-recovery-ambiguous", GateStatus.PENDING)
+    state = root_store.load()
+    synced = _checkpoint_post_merge_event(
+        root_store,
+        state,
+        "architecture",
+        ParentBranchSynced("architecture", "main", merged_remote_head),
+        {
+            "remote_head_sha": merged_remote_head,
+            "ancestry_proof": confirmed_sync_payload["ancestry_proof"],
+            "remote_name": "origin",
+        },
+    )
+    synced = _checkpoint_post_merge_event(
+        root_store,
+        synced,
+        "architecture",
+        UnlinkedChangelogJudged(
+            "architecture",
+            "retained-architecture-changelog-judgment",
+            "captured",
+            "an existing unreleased entry already covers the merged work",
+            model="retained-tl-model",
+            tokens=17,
+        ),
+    )
+    synced_architecture = replace(
+        synced.slices["architecture"],
+        dispatch_error="no lane transition for idle and LaneBookkeepingNotRequired",
+    )
+    lane_key = f"{identity.remote_url}:main"
+    idle_lane = LaneState(
+        identity.remote_url,
+        "main",
+        phase=LanePhase.IDLE,
+        last_lane_epoch=2,
+    )
+    root_store.checkpoint(
+        synced.recursive_fsm or synced.fsm,
+        {**synced.slices, "architecture": synced_architecture},
+        synced.budgets,
+        synced.events.last_consumed_offset,
+        current_order=synced.current_order,
+        ordered_stages=synced.ordered_stages,
+        integration=replace(synced.integration, lanes={lane_key: idle_lane}),
+    )
+    root_store.set_gate("tl-post-merge-architecture", GateStatus.PENDING)
+    git(repository, "merge", "--ff-only", merged_remote_head)
     return {
         "root": str(root_store.path),
         "child": str(child_store.path),

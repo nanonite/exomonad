@@ -576,6 +576,15 @@ fi
 
 e2e_phase "Phase 8" "Recovering a failed root with a parked aggregate through actual init --continue..."
 
+# Earlier phases use their own Git transport and may leave GIT_* selectors or
+# config overrides in this shell. Phase 8 must start from its repository-local
+# remotes and the transport created below.
+while IFS= read -r variable; do
+    case "$variable" in
+        GIT_*) unset "$variable" ;;
+    esac
+done < <(compgen -e)
+
 if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
     kill "$MOCK_PID" 2>/dev/null || true
     wait "$MOCK_PID" 2>/dev/null || true
@@ -652,6 +661,10 @@ git remote set-url --push origin "git@forgejo-e2e:owner/repo.git"
 git config core.sshCommand "$AGG_DIR/git-ssh"
 export GIT_SSH_COMMAND="$AGG_DIR/git-ssh"
 export E2E_GIT_REMOTE_DIR="$AGG_REMOTE"
+[[ "$(git -C "$AGG_REPO" remote get-url origin)" == "git@forgejo-e2e:owner/repo.git" ]] \
+    || e2e_fail "Phase 8 origin URL does not resolve to its isolated aggregate repository"
+[[ "$(git -C "$AGG_REPO" config --get core.sshCommand)" == "$AGG_DIR/git-ssh" ]] \
+    || e2e_fail "Phase 8 Git transport does not target its isolated remote"
 
 PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_aggregate_checkpoint.py" \
     --repo "$AGG_REPO" --mock-url "$AGG_MOCK_URL" --output "$AGG_DIR/seed.json" \
@@ -664,8 +677,8 @@ LEAF_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf
 LEAF_RECEIPT_SHA256="$(python3 -c 'import hashlib,json,sys; d=json.load(open(sys.argv[1])); r=json.load(open(d["child"])); e=r["slices"]["issue-811"]["post_merge"]["evidence"]; print(hashlib.sha256(json.dumps(e,sort_keys=True,separators=(",", ":")).encode()).hexdigest())' "$AGG_DIR/seed.json")"
 ARCHITECTURE_INVOCATION_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
     "$AGG_REPO/.exo/agents/architecture/invocation.json")"
-[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_BASE_SHA" ]] \
-    || e2e_fail "fixture did not leave the local parent branch behind the merged aggregate"
+[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
+    || e2e_fail "fixture did not retain the already-confirmed local parent synchronization"
 [[ "$(git -C "$AGG_REPO" rev-parse origin/main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
     || e2e_fail "fixture remote parent branch does not point at the confirmed aggregate merge"
 AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)"
@@ -674,7 +687,7 @@ AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/m
 PULL_PUBLICATIONS_BEFORE="$(count_pull_publications "$AGG_DIR/mock.log")"
 [[ "$PULL_PUBLICATIONS_BEFORE" == "2" ]] \
     || e2e_fail "fixture expected only its leaf and aggregate PR publications, found $PULL_PUBLICATIONS_BEFORE"
-e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR at remote head $AGGREGATE_REMOTE_HEAD with local parent HEAD still at $AGGREGATE_BASE_SHA"
+e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR with captured judgment, confirmed sync, and an idle lane at epoch 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
 LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
 printf '%s\n' "$LOCAL_EDIT_STATE_BEFORE" > "$AGG_DIR/local-edits-before.json"
 e2e_log "Seeded unrelated staged, unstaged, and untracked edits"
@@ -698,7 +711,13 @@ forgejo_reviewer_token = "reviewer-token-e2e"
 EOF
 
 tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null || true
+# Keep the test transport scoped to the session after the isolated server is
+# created. This prevents Git selectors from being copied into its global env.
+unset GIT_SSH_COMMAND E2E_GIT_REMOTE_DIR
 tmux new-session -d -s "$AGGREGATE_SESSION" -n TL "sleep 0.2; exit 0"
+if tmux show-environment -g | cut -d= -f1 | grep -q '^GIT_'; then
+    e2e_fail "isolated Phase 8 tmux server inherited a Git environment override"
+fi
 tmux set-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND "$AGG_DIR/git-ssh"
 tmux set-environment -t "$AGGREGATE_SESSION" E2E_GIT_REMOTE_DIR "$AGG_REMOTE"
 tmux set-window-option -t "$AGGREGATE_SESSION:TL" remain-on-exit on
@@ -784,8 +803,8 @@ rg -Fq 'Legacy Git lock recovered:' "$AGG_DIR/legacy-apply.log" \
 assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
 [[ "$(capture_local_edit_state)" == "$LOCAL_EDIT_STATE_BEFORE" ]] \
     || e2e_fail "legacy recovery changed staged, unstaged, or untracked edits"
-[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_BASE_SHA" ]] \
-    || e2e_fail "init refusal or legacy inspection moved the local parent branch"
+[[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
+    || e2e_fail "init refusal or legacy inspection changed the already-synchronized parent branch"
 [[ "$(git -C "$AGG_REPO" rev-parse origin/main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
     || e2e_fail "legacy recovery changed the remote merge observation"
 e2e_log "Actual init refused the legacy lock; compiled inspect/apply recovered approved fingerprint $LEGACY_FINGERPRINT"
@@ -840,7 +859,7 @@ if [[ "$final_phase" != "tl_done" || "$final_order" != "2" \
     e2e_fail "failed-root aggregate did not recover through integration and the next stage: '$AGGREGATE_RESULT'"
 fi
 
-python3 - "$AGG_REPO" "$AGGREGATE_PR" "$LEAF_PR" "$LEAF_RECEIPT_SHA256" <<'PY'
+python3 - "$AGG_REPO" "$AGGREGATE_PR" "$LEAF_PR" "$LEAF_RECEIPT_SHA256" "$AGGREGATE_REMOTE_HEAD" <<'PY'
 import hashlib
 import json
 import sys
@@ -873,6 +892,15 @@ assert candidate["lifecycle"] == "MERGED"
 assert candidate["aggregate_pr_number"] == aggregate_pr
 assert candidate["active_aggregate_approval_id"]
 assert len(candidate["aggregate_approval_receipts"]) == 1
+architecture = root["slices"]["architecture"]
+post_merge = architecture["post_merge"]
+assert post_merge["phase"] == "complete"
+assert post_merge["evidence"]["changelog_decision"] == "captured"
+assert post_merge["evidence"]["changelog_outcome"] == "captured"
+assert post_merge["evidence"]["parent_commit_sha"] == sys.argv[5]
+lane = root["integration"]["lanes"][f'{root["repository_identity"]["remote_url"]}:main']
+assert lane["phase"] == "idle" and lane["child_id"] is None
+assert lane["last_lane_epoch"] == 2
 journal = json.loads((root_dir / "action-journal.json").read_text())
 aggregate_merges = [
     entry
@@ -912,6 +940,7 @@ confirmed_syncs = [
 assert len(prior_refusals) == 1, "the immutable prior sync refusal was not retained"
 assert len(confirmed_syncs) == 1, "parent synchronization was not confirmed exactly once"
 assert confirmed_syncs[0]["arguments"].get("sync_attempt") == 2
+assert confirmed_syncs[0]["result"]["result"].get("remote_head_sha") == sys.argv[5]
 kani_dispatches = [
     entry
     for entry in journal
