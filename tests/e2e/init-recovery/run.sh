@@ -37,6 +37,9 @@ CONTINUATION_SESSION="e2e-init-recovery-continuation"
 AGGREGATE_SESSION="e2e-init-aggregate-recovery"
 MOCK_PID=""
 WASM_ARTIFACT_DIR=""
+INITIAL_TMUX="${TMUX:-}"
+INITIAL_TMUX_TMPDIR="${TMUX_TMPDIR:-}"
+AGGREGATE_TMUX_TMPDIR=""
 
 build_guest_wasm() {
     local role="$1"
@@ -249,9 +252,23 @@ cleanup() {
     # leaking the tmux session and scratch work dir. Disable errexit for
     # the remainder of the trap so every step below always executes.
     set +e
-    tmux kill-session -t "$SESSION" 2>/dev/null
-    tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
-    tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null
+    if [[ -n "$AGGREGATE_TMUX_TMPDIR" ]]; then
+        env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR" \
+            tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null
+    fi
+    if [[ -n "$INITIAL_TMUX" ]]; then
+        env TMUX="$INITIAL_TMUX" tmux kill-session -t "$SESSION" 2>/dev/null
+        env TMUX="$INITIAL_TMUX" tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+    elif [[ -n "$INITIAL_TMUX_TMPDIR" ]]; then
+        env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$INITIAL_TMUX_TMPDIR" \
+            tmux kill-session -t "$SESSION" 2>/dev/null
+        env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$INITIAL_TMUX_TMPDIR" \
+            tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+    else
+        env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR tmux kill-session -t "$SESSION" 2>/dev/null
+        env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR \
+            tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+    fi
     if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
         kill "$MOCK_PID" 2>/dev/null
         wait "$MOCK_PID" 2>/dev/null
@@ -570,6 +587,13 @@ AGG_REPO="$AGG_DIR/repo"
 AGG_REMOTE="$AGG_DIR/remote/owner/repo.git"
 AGG_HOME="$AGG_DIR/home"
 mkdir -p "$AGG_DIR" "$AGG_HOME/.exo" "$(dirname "$AGG_REMOTE")" "$AGG_REPO"
+# The earlier phases use another repository's Git transport. A separate tmux
+# server keeps its inherited GIT_* environment out of the aggregate controller.
+AGGREGATE_TMUX_TMPDIR="$AGG_DIR/tmux"
+mkdir -p "$AGGREGATE_TMUX_TMPDIR"
+unset TMUX TMUX_PANE
+export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
+e2e_log "Phase 8 tmux server isolated to $TMUX_TMPDIR"
 python3 "$PROJECT_ROOT/scripts/build_tl_loop_archive.py" \
     --source "$PROJECT_ROOT/tl_loop" --output "$AGG_HOME/.exo/tl_loop.pyz"
 python3 "$PROJECT_ROOT/scripts/check_tl_loop_archive.py" \
@@ -675,7 +699,12 @@ EOF
 
 tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null || true
 tmux new-session -d -s "$AGGREGATE_SESSION" -n TL "sleep 0.2; exit 0"
+tmux set-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND "$AGG_DIR/git-ssh"
+tmux set-environment -t "$AGGREGATE_SESSION" E2E_GIT_REMOTE_DIR "$AGG_REMOTE"
 tmux set-window-option -t "$AGGREGATE_SESSION:TL" remain-on-exit on
+[[ "$(tmux show-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND)" == \
+    "GIT_SSH_COMMAND=$AGG_DIR/git-ssh" ]] \
+    || e2e_fail "aggregate tmux session did not retain its isolated Git transport"
 for _ in $(seq 1 30); do
     [[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{pane_dead}' | awk '$1 == "TL" { print $2; exit }')" == "1" ]] && break
     sleep 0.1
@@ -905,6 +934,8 @@ LOCAL_EDIT_STATE_AFTER="$(capture_local_edit_state)"
     || e2e_fail "parent synchronization or bookkeeping changed unrelated local edits"
 [[ "$(git -C "$AGG_REPO" rev-parse main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
     || e2e_fail "confirmed local synchronization did not advance main to the verified merge commit"
+[[ "$(git -C "$AGG_REPO" rev-parse refs/remotes/origin/main)" == "$AGGREGATE_REMOTE_HEAD" ]] \
+    || e2e_fail "aggregate startup fetch changed origin/main away from its authoritative merge head"
 assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
 
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \

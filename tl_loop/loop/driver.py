@@ -14505,6 +14505,13 @@ def _aggregate_scope_completion_proven(
     declared_manifest: PlanManifest,
 ) -> bool:
     """Prove one declared scope and every direct descendant completed."""
+    if (
+        _aggregate_scope_branch_binding_error(
+            parent_state, expected_scope_run_id, scope_state, declared_manifest
+        )
+        is not None
+    ):
+        return False
     if not _child_owner_checkpoint_matches(
         parent_state,
         expected_scope_run_id,
@@ -14549,11 +14556,72 @@ def _aggregate_child_completion_proven(
         or child_state.plan_manifest.digest != child_manifest.digest
     ):
         return False, "aggregate_child_manifest_mismatch"
+    branch_error = _aggregate_scope_branch_binding_error(
+        parent_state, declaration.name, child_state, child_manifest
+    )
+    if branch_error is not None:
+        return False, branch_error
     if not _aggregate_scope_completion_proven(
         parent_state, declaration.name, child_state, child_store, child_manifest
     ):
         return False, "aggregate_child_completion_incomplete"
     return True, "accepted_child_declaration_and_completion"
+
+
+def _aggregate_scope_branch_binding_error(
+    parent_state: RunState,
+    expected_scope_run_id: str,
+    scope_state: RunState,
+    declared_manifest: PlanManifest,
+) -> str | None:
+    """Bind checkpoint branches to the accepted parent declaration."""
+    parent_manifest = parent_state.plan_manifest
+    if parent_manifest is None:
+        return "aggregate_child_declaration_unavailable"
+    declaration = next(
+        (
+            node
+            for node in parent_manifest.nodes
+            if node.kind == "sub_tl" and node.name == expected_scope_run_id
+        ),
+        None,
+    )
+    if declaration is None:
+        return "aggregate_child_declaration_missing"
+    accepted_child = parent_manifest.child_manifests.get(declaration.node_id)
+    if accepted_child is None or accepted_child.digest != declared_manifest.digest:
+        return "aggregate_child_manifest_mismatch"
+    return _aggregate_declared_scope_branch_error(
+        parent_state, scope_state, parent_manifest, declaration, declared_manifest
+    )
+
+
+def _aggregate_declared_scope_branch_error(
+    parent_state: RunState,
+    scope_state: RunState,
+    parent_manifest: PlanManifest,
+    declaration: ManifestNode,
+    declared_manifest: PlanManifest,
+) -> str | None:
+    """Check the checkpoint against the declaration's immutable branch pair."""
+    if (
+        declaration.owned_branch != declared_manifest.owned_branch
+        or declaration.parent_integration_target != declared_manifest.parent_integration_target
+    ):
+        return "aggregate_child_branch_declaration_mismatch"
+    expected_parent_branch = parent_manifest.owned_branch
+    if (
+        declaration.parent_integration_target != expected_parent_branch
+        or declared_manifest.parent_integration_target != expected_parent_branch
+    ):
+        return "aggregate_child_parent_branch_declaration_mismatch"
+    if parent_state.owner_branch and parent_state.owner_branch != expected_parent_branch:
+        return "aggregate_parent_branch_mismatch"
+    if scope_state.parent_branch != expected_parent_branch:
+        return "aggregate_child_parent_branch_mismatch"
+    if scope_state.owner_branch != declaration.owned_branch:
+        return "aggregate_child_owner_branch_mismatch"
+    return None
 
 
 def _exit_marker_matches_checkpoint(

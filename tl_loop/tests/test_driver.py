@@ -13882,6 +13882,41 @@ def test_merged_aggregate_rejects_child_checkpoint_with_unrelated_run_id(
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        (
+            "parent_branch",
+            "unrelated-parent-branch",
+            "aggregate_child_parent_branch_mismatch",
+        ),
+        (
+            "owner_branch",
+            "unrelated-owner-branch",
+            "aggregate_child_owner_branch_mismatch",
+        ),
+    ],
+)
+def test_merged_aggregate_rejects_child_checkpoint_with_unrelated_branch(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    reason: str,
+) -> None:
+    plan, root_store, child_store, _merge_journal_id, _base_sha = (
+        _seed_merged_aggregate_post_merge_recovery(
+            tmp_path,
+            f"merged-aggregate-wrong-{field}",
+            candidate_lifecycle=IntegrationLifecycle.CHILDREN_MERGED,
+        )
+    )
+    document = json.loads(child_store.path.read_text(encoding="utf-8"))
+    document[field] = value
+    child_store.path.write_text(json.dumps(document), encoding="utf-8")
+
+    _assert_aggregate_recovery_stays_parked(plan, root_store, tmp_path, expected_reason=reason)
+
+
 def test_merged_aggregate_rejects_incomplete_declared_child_leaf(tmp_path: Path) -> None:
     plan, root_store, child_store, _merge_journal_id, _base_sha = (
         _seed_merged_aggregate_post_merge_recovery(
@@ -13906,7 +13941,11 @@ def test_merged_aggregate_rejects_incomplete_declared_child_leaf(tmp_path: Path)
     _assert_aggregate_recovery_stays_parked(plan, root_store, tmp_path)
 
 
-def test_nested_sibling_scope_cannot_supply_missing_child_completion(tmp_path: Path) -> None:
+@pytest.mark.parametrize("second_leaf_complete", [False, True])
+def test_nested_sibling_scope_cannot_supply_missing_child_completion(
+    tmp_path: Path,
+    second_leaf_complete: bool,
+) -> None:
     nested_plan = WorkPlan(
         sub_tls=(
             SubTLTask(
@@ -13951,6 +13990,8 @@ def test_nested_sibling_scope_cannot_supply_missing_child_completion(tmp_path: P
     architecture_manifest = architecture_state.plan_manifest
     assert architecture_manifest is not None
     architecture_slices = dict(architecture_state.slices)
+    nested_stores: dict[str, RunStore] = {}
+    nested_states: dict[str, RunState] = {}
     sibling_receipt: PostMergeState | None = None
 
     for index, declaration in enumerate(architecture_manifest.nodes):
@@ -13963,9 +14004,20 @@ def test_nested_sibling_scope_cannot_supply_missing_child_completion(tmp_path: P
             nested_manifest,
             nested_plan,
         )
+        nested_stores[declaration.name] = nested_store
         leaf_name = nested_manifest.nodes[0].name
-        if index == 0:
+        if index == 0 or second_leaf_complete:
             nested_state = _complete_nested_leaf(nested_store, leaf_name=leaf_name, pr_number=150)
+            nested_store.checkpoint(
+                TLPhase.TLPRFiled,
+                nested_state.slices,
+                nested_state.budgets,
+                nested_state.events.last_consumed_offset,
+                current_order=nested_state.current_order,
+                ordered_stages=nested_state.ordered_stages,
+                integration=nested_state.integration,
+            )
+            nested_state = nested_store.load()
         else:
             nested_state = nested_store.load()
             leaf = nested_state.slices[leaf_name]
@@ -13987,7 +14039,12 @@ def test_nested_sibling_scope_cannot_supply_missing_child_completion(tmp_path: P
                 nested_state.events.last_consumed_offset,
             )
             nested_state = nested_store.load()
-        receipt = nested_state.slices[leaf_name].post_merge or sibling_receipt
+        nested_states[declaration.name] = nested_state
+        own_receipt = nested_state.slices[leaf_name].post_merge
+        if index == 0:
+            assert own_receipt is not None
+            sibling_receipt = own_receipt
+        receipt = own_receipt or sibling_receipt
         assert receipt is not None
         aggregate_receipt = PostMergeState(
             PostMergePhase.COMPLETE,
@@ -13997,7 +14054,6 @@ def test_nested_sibling_scope_cannot_supply_missing_child_completion(tmp_path: P
                 "pr_number": str(500 + index),
             },
         )
-        sibling_receipt = sibling_receipt or aggregate_receipt
         architecture_slices[declaration.name] = replace(
             architecture_slices[declaration.name],
             status=SliceStatus.MERGED,
@@ -14015,10 +14071,44 @@ def test_nested_sibling_scope_cannot_supply_missing_child_completion(tmp_path: P
         integration=architecture_state.integration,
     )
 
-    proven, _reason = driver_module._aggregate_child_completion_proven(
-        root_store.load(), architecture_store.load(), architecture_store, "architecture"
+    architecture_state = architecture_store.load()
+    first_manifest = architecture_manifest.child_manifests[
+        next(node.node_id for node in architecture_manifest.nodes if node.name == "inner-one")
+    ]
+    second_manifest = architecture_manifest.child_manifests[
+        next(node.node_id for node in architecture_manifest.nodes if node.name == "inner-two")
+    ]
+    first_proven = driver_module._aggregate_scope_completion_proven(
+        architecture_state,
+        "inner-one",
+        nested_states["inner-one"],
+        nested_stores["inner-one"],
+        first_manifest,
     )
-    assert not proven
+    second_proven = driver_module._aggregate_scope_completion_proven(
+        architecture_state,
+        "inner-two",
+        nested_states["inner-two"],
+        nested_stores["inner-two"],
+        second_manifest,
+    )
+    assert first_proven
+    assert second_proven is second_leaf_complete
+    if not second_leaf_complete:
+        second_leaf = nested_states["inner-two"].slices["leaf-b"]
+        assert second_leaf.status is SliceStatus.SPAWNED
+        assert second_leaf.post_merge is None
+        assert driver_module._aggregate_scope_phase_complete(nested_states["inner-two"])
+        assert driver_module._scope_post_merge_complete(nested_states["inner-two"])
+        proven, _reason = driver_module._aggregate_child_completion_proven(
+            root_store.load(), architecture_state, architecture_store, "architecture"
+        )
+        assert not proven
+    else:
+        proven, _reason = driver_module._aggregate_child_completion_proven(
+            root_store.load(), architecture_state, architecture_store, "architecture"
+        )
+        assert proven
 
 
 def _seed_nested_scope_store(
