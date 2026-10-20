@@ -27,6 +27,7 @@ module ExoMonad.Effects.Agent
     AgentCloseReviewerWindow,
     AgentCloseIssueAndCleanup,
     AgentReplaceClosedPr,
+    AgentPrepareScopeHandoff,
 
     -- * Re-exported proto types
     module Effects.Agent,
@@ -180,3 +181,10 @@ instance Effect AgentReplaceClosedPr where
   type Input AgentReplaceClosedPr = ReplaceClosedPrRequest
   type Output AgentReplaceClosedPr = ReplaceClosedPrResponse
   effectId = "agent.replace_closed_pr"
+
+data AgentPrepareScopeHandoff
+
+instance Effect AgentPrepareScopeHandoff where
+  type Input AgentPrepareScopeHandoff = PrepareScopeHandoffRequest
+  type Output AgentPrepareScopeHandoff = PrepareScopeHandoffResponse
+  effectId = "agent.prepare_scope_handoff"

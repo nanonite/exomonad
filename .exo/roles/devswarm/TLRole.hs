@@ -65,6 +65,7 @@ import ExoMonad.Guest.Tools.PostMergeRecovery
     PostMergePush,
     PostMergeRemoteReconcile,
   )
+import ExoMonad.Guest.Tools.PrepareScopeHandoff (PrepareScopeHandoff)
 import ExoMonad.Guest.Tools.ReplaceClosedPr (ReplaceClosedPr (..))
 import ExoMonad.Guest.Tools.ResolveLivePrForSlice (ResolveLivePrForSlice (..))
 import ExoMonad.Guest.Tools.RestartReview (RestartReview (..))
@@ -292,6 +293,7 @@ data Tools mode = Tools
     postMergeChangelogContext :: mode :- UnlinkedChangelogContext,
     postMergeChangelogEntry :: mode :- UnlinkedChangelogEntry,
     postMergePush :: mode :- PostMergePush,
+    prepareScopeHandoff :: mode :- PrepareScopeHandoff,
     rootBranchFinalize :: mode :- RootBranchFinalize,
     discardWorkerOutput :: mode :- DiscardWorkerOutput,
     disposeLeaf :: mode :- DisposeLeaf,
@@ -359,6 +361,7 @@ config =
             postMergeChangelogContext = mkHandler @UnlinkedChangelogContext,
             postMergeChangelogEntry = mkHandler @UnlinkedChangelogEntry,
             postMergePush = mkHandler @PostMergePush,
+            prepareScopeHandoff = mkHandler @PrepareScopeHandoff,
             rootBranchFinalize = mkHandler @RootBranchFinalize,
             discardWorkerOutput = mkHandler @DiscardWorkerOutput,
             disposeLeaf = mkHandler @DisposeLeaf,

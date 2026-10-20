@@ -34,6 +34,7 @@ pub mod memory;
 pub mod merge_pr;
 pub mod process;
 mod process_supervision;
+mod scope_handoff;
 pub mod session;
 pub mod tasks;
 pub mod tl;

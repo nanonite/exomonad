@@ -9451,3 +9451,842 @@ instance (HsJSONPB.ToJSON ReplaceClosedPrResponse) where
 
 instance (HsJSONPB.FromJSON ReplaceClosedPrResponse) where
   parseJSON = HsJSONPB.parseJSONPB
+
+data PrepareScopeHandoffRequest
+  = PrepareScopeHandoffRequest
+  { prepareScopeHandoffRequestApply :: Hs.Bool,
+    prepareScopeHandoffRequestHandoffId :: Hs.Text,
+    prepareScopeHandoffRequestControllerId :: Hs.Text,
+    prepareScopeHandoffRequestParentRunId :: Hs.Text,
+    prepareScopeHandoffRequestParentScopeId :: Hs.Text,
+    prepareScopeHandoffRequestChildScopeId :: Hs.Text,
+    prepareScopeHandoffRequestExpectedBranch :: Hs.Text,
+    prepareScopeHandoffRequestExpectedHeadSha :: Hs.Text,
+    prepareScopeHandoffRequestExpectedSourceFingerprint :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData PrepareScopeHandoffRequest)
+
+instance (HsProtobuf.Named PrepareScopeHandoffRequest) where
+  nameOf _ = Hs.fromString "PrepareScopeHandoffRequest"
+
+instance (HsProtobuf.HasDefault PrepareScopeHandoffRequest)
+
+instance (HsProtobuf.Message PrepareScopeHandoffRequest) where
+  encodeMessage
+    _
+    PrepareScopeHandoffRequest
+      { prepareScopeHandoffRequestApply,
+        prepareScopeHandoffRequestHandoffId,
+        prepareScopeHandoffRequestControllerId,
+        prepareScopeHandoffRequestParentRunId,
+        prepareScopeHandoffRequestParentScopeId,
+        prepareScopeHandoffRequestChildScopeId,
+        prepareScopeHandoffRequestExpectedBranch,
+        prepareScopeHandoffRequestExpectedHeadSha,
+        prepareScopeHandoffRequestExpectedSourceFingerprint
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( Hs.mappend
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 1)
+                                        prepareScopeHandoffRequestApply
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 2)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            prepareScopeHandoffRequestHandoffId
+                                        )
+                                    )
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 3)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        prepareScopeHandoffRequestControllerId
+                                    )
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 4)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    prepareScopeHandoffRequestParentRunId
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 5)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                prepareScopeHandoffRequestParentScopeId
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 6)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            prepareScopeHandoffRequestChildScopeId
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 7)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        prepareScopeHandoffRequestExpectedBranch
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 8)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    prepareScopeHandoffRequestExpectedHeadSha
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 9)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                prepareScopeHandoffRequestExpectedSourceFingerprint
+            )
+        )
+  decodeMessage _ =
+    Hs.pure PrepareScopeHandoffRequest
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 6)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 9)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "apply")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "handoff_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "controller_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "parent_run_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "parent_scope_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "child_scope_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_head_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "expected_source_fingerprint")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB PrepareScopeHandoffRequest) where
+  toJSONPB (PrepareScopeHandoffRequest f1 f2 f3 f4 f5 f6 f7 f8 f9) =
+    HsJSONPB.object
+      [ "apply" .= f1,
+        "handoff_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "controller_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+        "parent_run_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "parent_scope_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "child_scope_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "expected_branch"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "expected_head_sha"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "expected_source_fingerprint"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9)
+      ]
+  toEncodingPB
+    (PrepareScopeHandoffRequest f1 f2 f3 f4 f5 f6 f7 f8 f9) =
+      HsJSONPB.pairs
+        [ "apply" .= f1,
+          "handoff_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+          "controller_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+          "parent_run_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+          "parent_scope_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+          "child_scope_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+          "expected_branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+          "expected_head_sha"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+          "expected_source_fingerprint"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9)
+        ]
+
+instance (HsJSONPB.FromJSONPB PrepareScopeHandoffRequest) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "PrepareScopeHandoffRequest"
+      ( \obj ->
+          Hs.pure PrepareScopeHandoffRequest
+            <*> obj .: "apply"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "handoff_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "controller_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "parent_run_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "parent_scope_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "child_scope_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_head_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "expected_source_fingerprint")
+                )
+      )
+
+instance (HsJSONPB.ToJSON PrepareScopeHandoffRequest) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON PrepareScopeHandoffRequest) where
+  parseJSON = HsJSONPB.parseJSONPB
+
+data PrepareScopeHandoffResponse
+  = PrepareScopeHandoffResponse
+  { prepareScopeHandoffResponseSuccess :: Hs.Bool,
+    prepareScopeHandoffResponseError :: Hs.Text,
+    prepareScopeHandoffResponseOutcome :: Hs.Text,
+    prepareScopeHandoffResponseHandoffId :: Hs.Text,
+    prepareScopeHandoffResponseControllerId :: Hs.Text,
+    prepareScopeHandoffResponseParentRunId :: Hs.Text,
+    prepareScopeHandoffResponseParentScopeId :: Hs.Text,
+    prepareScopeHandoffResponseChildScopeId :: Hs.Text,
+    prepareScopeHandoffResponseSourceWorktree :: Hs.Text,
+    prepareScopeHandoffResponseBranch :: Hs.Text,
+    prepareScopeHandoffResponseHeadBefore :: Hs.Text,
+    prepareScopeHandoffResponseHeadAfter :: Hs.Text,
+    prepareScopeHandoffResponseCommitSha :: Hs.Text,
+    prepareScopeHandoffResponseSourceFingerprint :: Hs.Text,
+    prepareScopeHandoffResponseChangedPaths :: (Hs.Vector Hs.Text),
+    prepareScopeHandoffResponseReady :: Hs.Bool
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData PrepareScopeHandoffResponse)
+
+instance (HsProtobuf.Named PrepareScopeHandoffResponse) where
+  nameOf _ = Hs.fromString "PrepareScopeHandoffResponse"
+
+instance (HsProtobuf.HasDefault PrepareScopeHandoffResponse)
+
+instance (HsProtobuf.Message PrepareScopeHandoffResponse) where
+  encodeMessage
+    _
+    PrepareScopeHandoffResponse
+      { prepareScopeHandoffResponseSuccess,
+        prepareScopeHandoffResponseError,
+        prepareScopeHandoffResponseOutcome,
+        prepareScopeHandoffResponseHandoffId,
+        prepareScopeHandoffResponseControllerId,
+        prepareScopeHandoffResponseParentRunId,
+        prepareScopeHandoffResponseParentScopeId,
+        prepareScopeHandoffResponseChildScopeId,
+        prepareScopeHandoffResponseSourceWorktree,
+        prepareScopeHandoffResponseBranch,
+        prepareScopeHandoffResponseHeadBefore,
+        prepareScopeHandoffResponseHeadAfter,
+        prepareScopeHandoffResponseCommitSha,
+        prepareScopeHandoffResponseSourceFingerprint,
+        prepareScopeHandoffResponseChangedPaths,
+        prepareScopeHandoffResponseReady
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( Hs.mappend
+                                    ( Hs.mappend
+                                        ( Hs.mappend
+                                            ( Hs.mappend
+                                                ( Hs.mappend
+                                                    ( Hs.mappend
+                                                        ( Hs.mappend
+                                                            ( Hs.mappend
+                                                                ( HsProtobuf.encodeMessageField
+                                                                    (HsProtobuf.FieldNumber 1)
+                                                                    prepareScopeHandoffResponseSuccess
+                                                                )
+                                                                ( HsProtobuf.encodeMessageField
+                                                                    (HsProtobuf.FieldNumber 2)
+                                                                    ( ( Hs.coerce
+                                                                          @Hs.Text
+                                                                          @(HsProtobuf.String Hs.Text)
+                                                                      )
+                                                                        prepareScopeHandoffResponseError
+                                                                    )
+                                                                )
+                                                            )
+                                                            ( HsProtobuf.encodeMessageField
+                                                                (HsProtobuf.FieldNumber 3)
+                                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                                    prepareScopeHandoffResponseOutcome
+                                                                )
+                                                            )
+                                                        )
+                                                        ( HsProtobuf.encodeMessageField
+                                                            (HsProtobuf.FieldNumber 4)
+                                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                                prepareScopeHandoffResponseHandoffId
+                                                            )
+                                                        )
+                                                    )
+                                                    ( HsProtobuf.encodeMessageField
+                                                        (HsProtobuf.FieldNumber 5)
+                                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                            prepareScopeHandoffResponseControllerId
+                                                        )
+                                                    )
+                                                )
+                                                ( HsProtobuf.encodeMessageField
+                                                    (HsProtobuf.FieldNumber 6)
+                                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                        prepareScopeHandoffResponseParentRunId
+                                                    )
+                                                )
+                                            )
+                                            ( HsProtobuf.encodeMessageField
+                                                (HsProtobuf.FieldNumber 7)
+                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                    prepareScopeHandoffResponseParentScopeId
+                                                )
+                                            )
+                                        )
+                                        ( HsProtobuf.encodeMessageField
+                                            (HsProtobuf.FieldNumber 8)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                prepareScopeHandoffResponseChildScopeId
+                                            )
+                                        )
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 9)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            prepareScopeHandoffResponseSourceWorktree
+                                        )
+                                    )
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 10)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        prepareScopeHandoffResponseBranch
+                                    )
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 11)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    prepareScopeHandoffResponseHeadBefore
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 12)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                prepareScopeHandoffResponseHeadAfter
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 13)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            prepareScopeHandoffResponseCommitSha
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 14)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        prepareScopeHandoffResponseSourceFingerprint
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 15)
+                ( ( Hs.coerce
+                      @(Hs.Vector Hs.Text)
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                  )
+                    prepareScopeHandoffResponseChangedPaths
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 16)
+            prepareScopeHandoffResponseReady
+        )
+  decodeMessage _ =
+    Hs.pure PrepareScopeHandoffResponse
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 1)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 6)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 9)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 10)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 11)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 12)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 13)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 14)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                @(Hs.Vector Hs.Text)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 15)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 16)
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "success")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "error")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "outcome")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "handoff_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "controller_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "parent_run_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "parent_scope_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "child_scope_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "source_worktree")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 10)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "branch")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 11)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "head_before")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 12)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "head_after")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 13)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "commit_sha")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 14)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "source_fingerprint")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 15)
+        (HsProtobufAST.Repeated HsProtobufAST.String)
+        (HsProtobufAST.Single "changed_paths")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 16)
+        (HsProtobufAST.Prim HsProtobufAST.Bool)
+        (HsProtobufAST.Single "ready")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB PrepareScopeHandoffResponse) where
+  toJSONPB
+    ( PrepareScopeHandoffResponse
+        f1
+        f2
+        f3
+        f4
+        f5
+        f6
+        f7
+        f8
+        f9
+        f10
+        f11
+        f12
+        f13
+        f14
+        f15
+        f16
+      ) =
+      HsJSONPB.object
+        [ "success" .= f1,
+          "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+          "outcome"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+          "handoff_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+          "controller_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+          "parent_run_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+          "parent_scope_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+          "child_scope_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+          "source_worktree"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+          "branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f10),
+          "head_before"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11),
+          "head_after"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f12),
+          "commit_sha"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
+          "source_fingerprint"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
+          "changed_paths"
+            .= ( ( Hs.coerce
+                     @(Hs.Vector Hs.Text)
+                     @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                 )
+                   f15
+               ),
+          "ready" .= f16
+        ]
+  toEncodingPB
+    ( PrepareScopeHandoffResponse
+        f1
+        f2
+        f3
+        f4
+        f5
+        f6
+        f7
+        f8
+        f9
+        f10
+        f11
+        f12
+        f13
+        f14
+        f15
+        f16
+      ) =
+      HsJSONPB.pairs
+        [ "success" .= f1,
+          "error" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+          "outcome"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f3),
+          "handoff_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+          "controller_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+          "parent_run_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+          "parent_scope_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+          "child_scope_id"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+          "source_worktree"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+          "branch"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f10),
+          "head_before"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11),
+          "head_after"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f12),
+          "commit_sha"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f13),
+          "source_fingerprint"
+            .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f14),
+          "changed_paths"
+            .= ( ( Hs.coerce
+                     @(Hs.Vector Hs.Text)
+                     @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                 )
+                   f15
+               ),
+          "ready" .= f16
+        ]
+
+instance (HsJSONPB.FromJSONPB PrepareScopeHandoffResponse) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "PrepareScopeHandoffResponse"
+      ( \obj ->
+          Hs.pure PrepareScopeHandoffResponse
+            <*> obj .: "success"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "error")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "outcome")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "handoff_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "controller_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "parent_run_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "parent_scope_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "child_scope_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "source_worktree")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "branch")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "head_before")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "head_after")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "commit_sha")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "source_fingerprint")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                      @(Hs.Vector Hs.Text)
+                  )
+                    (obj .: "changed_paths")
+                )
+            <*> obj .: "ready"
+      )
+
+instance (HsJSONPB.ToJSON PrepareScopeHandoffResponse) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON PrepareScopeHandoffResponse) where
+  parseJSON = HsJSONPB.parseJSONPB

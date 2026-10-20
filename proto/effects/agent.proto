@@ -661,6 +661,41 @@ message ReplaceClosedPrResponse {
   bool replacement_already_exists = 17;
 }
 
+// Inspect or atomically prepare the authenticated TL worktree for an ordered
+// child handoff. The host resolves the source worktree from EffectContext.
+message PrepareScopeHandoffRequest {
+  // False is read-only inspection; true stages and commits all normal changes.
+  bool apply = 1;
+  // Stable logical identity for the parent-run/scope/child handoff.
+  string handoff_id = 2;
+  string controller_id = 3;
+  string parent_run_id = 4;
+  string parent_scope_id = 5;
+  string child_scope_id = 6;
+  string expected_branch = 7;
+  string expected_head_sha = 8;
+  string expected_source_fingerprint = 9;
+}
+
+message PrepareScopeHandoffResponse {
+  bool success = 1;
+  string error = 2;
+  string outcome = 3;
+  string handoff_id = 4;
+  string controller_id = 5;
+  string parent_run_id = 6;
+  string parent_scope_id = 7;
+  string child_scope_id = 8;
+  string source_worktree = 9;
+  string branch = 10;
+  string head_before = 11;
+  string head_after = 12;
+  string commit_sha = 13;
+  string source_fingerprint = 14;
+  repeated string changed_paths = 15;
+  bool ready = 16;
+}
+
 // ============================================================================
 // Service definition
 // ============================================================================
@@ -686,4 +721,5 @@ service AgentEffects {
   rpc CloseReviewerWindow(CloseReviewerWindowRequest) returns (CloseReviewerWindowResponse);
   rpc CloseIssueAndCleanup(CloseIssueAndCleanupRequest) returns (CloseIssueAndCleanupResponse);
   rpc ReplaceClosedPr(ReplaceClosedPrRequest) returns (ReplaceClosedPrResponse);
+  rpc PrepareScopeHandoff(PrepareScopeHandoffRequest) returns (PrepareScopeHandoffResponse);
 }

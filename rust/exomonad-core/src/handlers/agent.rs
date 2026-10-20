@@ -2311,6 +2311,21 @@ impl<
         })
     }
 
+    async fn prepare_scope_handoff(
+        &self,
+        req: PrepareScopeHandoffRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<PrepareScopeHandoffResponse> {
+        super::scope_handoff::prepare_scope_handoff(
+            self.ctx.project_dir(),
+            &ctx.working_dir,
+            ctx.agent_name.as_ref(),
+            ctx.birth_branch.as_ref(),
+            req,
+        )
+        .await
+    }
+
     async fn spawn_leaf_subtree(
         &self,
         req: SpawnLeafSubtreeRequest,
@@ -4786,6 +4801,76 @@ mod tests {
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn authenticated_agent_effect_runs_scope_handoff_in_its_current_worktree() {
+        let temp = tempfile::tempdir().expect("temporary worktree");
+        let project_dir = temp.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(project_dir)
+                .output()
+                .expect("run Git setup");
+            assert!(output.status.success(), "Git setup failed: {:?}", args);
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Handler Test"]);
+        git(&["config", "user.email", "handler@example.invalid"]);
+        std::fs::write(project_dir.join(".gitignore"), ".exo/\n").expect("write ignore file");
+        std::fs::write(project_dir.join("tracked.txt"), "before\n").expect("write tracked file");
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "initial"]);
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        let services = Arc::new(services);
+        let service = Arc::new(AgentControlService::new(services.clone()));
+        let handler = AgentHandler::new(service, services);
+        let context = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root-controller").expect("controller name"),
+            birth_branch: BirthBranch::try_from_str("main").expect("branch"),
+            working_dir: project_dir.to_path_buf(),
+        };
+        std::fs::write(project_dir.join("tracked.txt"), "after\n").expect("modify source file");
+        let request = PrepareScopeHandoffRequest {
+            apply: false,
+            handoff_id: "handoff-handler-test".into(),
+            controller_id: "root-controller".into(),
+            parent_run_id: "root-run".into(),
+            parent_scope_id: "root".into(),
+            child_scope_id: "architecture".into(),
+            expected_branch: "main".into(),
+            expected_head_sha: String::new(),
+            expected_source_fingerprint: String::new(),
+        };
+        let inspection = handler
+            .prepare_scope_handoff(request.clone(), &context)
+            .await
+            .expect("authenticated handoff inspection");
+        assert!(inspection.ready, "{}", inspection.error);
+        assert_eq!(
+            inspection.source_worktree,
+            std::fs::canonicalize(project_dir)
+                .expect("canonical worktree")
+                .to_string_lossy()
+        );
+        let apply = PrepareScopeHandoffRequest {
+            apply: true,
+            expected_head_sha: inspection.head_after.clone(),
+            expected_source_fingerprint: inspection.source_fingerprint,
+            ..request
+        };
+        let committed = handler
+            .prepare_scope_handoff(apply, &context)
+            .await
+            .expect("authenticated handoff commit");
+        assert!(committed.ready, "{}", committed.error);
+        assert_eq!(committed.outcome, "committed");
+        assert!(!committed.commit_sha.is_empty());
+        assert_eq!(committed.head_before, inspection.head_after);
+        assert_eq!(committed.head_after, committed.commit_sha);
+    }
 
     #[test]
     fn watcher_publication_evidence_includes_resumed_invocation_lineage() {
