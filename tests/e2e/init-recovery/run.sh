@@ -574,7 +574,7 @@ fi
 e2e_log "PASS: bundled controller resumed the reviewed checkpoint, used the production merge tool once, and completed post-merge bookkeeping (offset 0 -> $after_offset, head=$after_reviewed_head)"
 fi
 
-e2e_phase "Phase 8" "Recovering a failed root with a parked aggregate through actual init --continue..."
+e2e_phase "Phase 8" "Recovering a failed later subTL while retaining completed aggregate receipts through actual init --continue..."
 
 # Earlier phases use their own Git transport and may leave GIT_* selectors or
 # config overrides in this shell. Phase 8 must start from its repository-local
@@ -669,7 +669,28 @@ export E2E_GIT_REMOTE_DIR="$AGG_REMOTE"
 PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_aggregate_checkpoint.py" \
     --repo "$AGG_REPO" --mock-url "$AGG_MOCK_URL" --output "$AGG_DIR/seed.json" \
     > "$AGG_DIR/seed.log" \
-    || { cat "$AGG_DIR/seed.log"; cat "$AGG_DIR/mock.stderr"; e2e_fail "failed to seed failed-root aggregate recovery state"; }
+    || { cat "$AGG_DIR/seed.log"; cat "$AGG_DIR/mock.stderr"; e2e_fail "failed to seed completed-aggregate/later-child recovery state"; }
+python3 - "$AGG_REPO" <<'PY' \
+    || e2e_fail "Phase 8 did not seed the completed-architecture/later-child-failure shape"
+import json
+import sys
+from pathlib import Path
+
+root_dir = Path(sys.argv[1]) / ".exo/tl-loop/root"
+root = json.loads((root_dir / "run.json").read_text(encoding="utf-8"))
+architecture = root["slices"]["architecture"]
+kani = root["slices"]["kani"]
+candidate = root["integration"]["candidates"]["architecture"]
+child = json.loads((root_dir / "kani/run.json").read_text(encoding="utf-8"))
+assert root["fsm"]["phase"] == "tl_failed"
+assert root["current_order"] == 2
+assert architecture["status"] == "merged"
+assert architecture["post_merge"]["phase"] == "complete"
+assert candidate["lifecycle"] == "MERGED"
+assert kani["status"] == "failed"
+assert child["fsm"]["phase"] == "tl_failed"
+assert child["run_id"] == "kani"
+PY
 AGGREGATE_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_pr"])' "$AGG_DIR/seed.json")"
 AGGREGATE_BASE_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_sha"])' "$AGG_DIR/seed.json")"
 AGGREGATE_REMOTE_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_remote_head"])' "$AGG_DIR/seed.json")"
@@ -687,7 +708,7 @@ AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/m
 PULL_PUBLICATIONS_BEFORE="$(count_pull_publications "$AGG_DIR/mock.log")"
 [[ "$PULL_PUBLICATIONS_BEFORE" == "2" ]] \
     || e2e_fail "fixture expected only its leaf and aggregate PR publications, found $PULL_PUBLICATIONS_BEFORE"
-e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR with captured judgment, confirmed sync, and an idle lane at epoch 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
+e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR with a full completed architecture receipt and retryable Kani startup failure at order 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
 LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
 printf '%s\n' "$LOCAL_EDIT_STATE_BEFORE" > "$AGG_DIR/local-edits-before.json"
 e2e_log "Seeded unrelated staged, unstaged, and untracked edits"
@@ -856,7 +877,7 @@ if [[ "$final_phase" != "tl_done" || "$final_order" != "2" \
     || "$kani_status" != "merged" || "$kani_intent" == "none" ]]; then
     cat "$AGG_DIR/init.log"
     cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true
-    e2e_fail "failed-root aggregate did not recover through integration and the next stage: '$AGGREGATE_RESULT'"
+    e2e_fail "failed later child did not recover while retaining completed aggregate integration: '$AGGREGATE_RESULT'"
 fi
 
 python3 - "$AGG_REPO" "$AGGREGATE_PR" "$LEAF_PR" "$LEAF_RECEIPT_SHA256" "$AGGREGATE_REMOTE_HEAD" <<'PY'

@@ -13766,7 +13766,9 @@ def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
     merge_journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
     original_merge_entry = merge_journal.entry_by_key(merge_journal_id)
     assert original_merge_entry is not None
-    original_leaf_receipt = child_store.load().slices["leaf-a"].post_merge
+    original_leaf_receipt = (
+        RunStore("architecture", root_store.run_dir).load().slices["leaf-a"].post_merge
+    )
 
     class PostMergeResumeTransport(RecordingTransport):
         def __init__(self) -> None:
@@ -13894,7 +13896,10 @@ def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
     )
     assert child_store.load().slices["leaf-a"].post_merge is not None
     assert child_store.load().slices["leaf-a"].post_merge.phase is PostMergePhase.COMPLETE
-    assert child_store.load().slices["leaf-a"].post_merge == original_leaf_receipt
+    assert (
+        RunStore("architecture", root_store.run_dir).load().slices["leaf-a"].post_merge
+        == original_leaf_receipt
+    )
     for leaf_name in leaf_names[1:]:
         assert child_store.load().slices[leaf_name].status is SliceStatus.MERGED
         assert child_store.load().slices[leaf_name].post_merge is not None
@@ -13925,7 +13930,7 @@ def test_merged_aggregate_resumes_bookkeeping_before_ordered_child_dispatch(
 def test_captured_aggregate_completion_preserves_an_idle_integration_lane(
     tmp_path: Path,
 ) -> None:
-    plan, root_store, child_store, merge_journal_id, _base_sha = (
+    plan, root_store, _child_store, merge_journal_id, _base_sha = (
         _seed_synced_captured_aggregate_with_idle_lane(
             tmp_path, "merged-aggregate-captured-idle-lane"
         )
@@ -13933,7 +13938,9 @@ def test_captured_aggregate_completion_preserves_an_idle_integration_lane(
     before = root_store.load()
     lane_key = "https://forge.example.test/test/repository.git:main"
     original_lane = before.integration.lanes[lane_key]
-    original_leaf_receipt = child_store.load().slices["leaf-a"].post_merge
+    original_leaf_receipt = (
+        RunStore("architecture", root_store.run_dir).load().slices["leaf-a"].post_merge
+    )
     original_park_audit = before.slices["architecture"].park_audit
     journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
     original_merge_entry = journal.entry_by_key(merge_journal_id)
@@ -14000,7 +14007,10 @@ def test_captured_aggregate_completion_preserves_an_idle_integration_lane(
         in {"post_merge_changelog_context", "post_merge_changelog_entry", "merge_pr", "file_pr"}
         for name, _ in transport.calls
     )
-    assert child_store.load().slices["leaf-a"].post_merge == original_leaf_receipt
+    assert (
+        RunStore("architecture", root_store.run_dir).load().slices["leaf-a"].post_merge
+        == original_leaf_receipt
+    )
     assert journal.entry_by_key(merge_journal_id) == original_merge_entry
     assert journal.entries_for("post_merge_parent_sync", "architecture") == original_sync_entries
 
@@ -14107,6 +14117,428 @@ def _continue_captured_aggregate(
         root_dir=root_dir,
     )
     return result.final_state, transport
+
+
+def test_continue_reopens_failed_later_scope_without_replacing_completed_sub_tl_receipt(
+    tmp_path: Path,
+) -> None:
+    """A fresh continuation retains completed architecture proof while retrying Kani."""
+    plan, root_store, child_store, merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "failed-later-scope-preserves-completed-receipt"
+        )
+    )
+    _complete_captured_aggregate_boundary(root_store, tmp_path)
+    completed_state = root_store.load()
+    completed_architecture = replace(
+        completed_state.slices["architecture"],
+        status=SliceStatus.MERGED,
+        park_cause=None,
+    )
+    completed_state = root_store.checkpoint(
+        completed_state.recursive_fsm or completed_state.fsm,
+        {**completed_state.slices, "architecture": completed_architecture},
+        completed_state.budgets,
+        completed_state.events.last_consumed_offset,
+        current_order=completed_state.current_order,
+        ordered_stages=completed_state.ordered_stages,
+        integration=completed_state.integration,
+    )
+    architecture_receipt = completed_state.slices["architecture"].post_merge
+    assert architecture_receipt is not None
+    assert architecture_receipt.phase is PostMergePhase.COMPLETE
+    original_leaf_receipt = (
+        RunStore("architecture", root_store.run_dir).load().slices["leaf-a"].post_merge
+    )
+    root_journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
+    original_journal_entries = tuple(root_journal.snapshot())
+    original_merge_entry = root_journal.entry_by_key(merge_journal_id)
+
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=tmp_path,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        agent_id="root-controller",
+    )
+    root_state = root_store.load()
+    kani_task = next(task for task in plan.sub_tls if task.name == "kani")
+    kani = root_state.slices["kani"]
+    branch = driver_module.derive_child_branch(
+        config.branch, driver_module._child_controller_name(kani_task)
+    )
+    worktree = str(
+        driver_module._sub_tl_worktree(config, root_store.root_dir, root_store.run_id, kani_task)
+    )
+    dispatch_intent = "prior-kani-dispatch-intent"
+    failed_kani = replace(
+        kani,
+        status=SliceStatus.FAILED,
+        attempts=1,
+        branch=branch,
+        worktree=worktree,
+        dispatch_intent_id=dispatch_intent,
+        dispatch_agent_id=driver_module._child_controller_name(kani_task),
+        dispatch_invocation_id="prior-kani-invocation",
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    root_store.checkpoint(
+        RecursiveTLFailed("Kani controller exited during startup"),
+        {**root_state.slices, "kani": failed_kani},
+        root_state.budgets,
+        root_state.events.last_consumed_offset,
+        current_order=2,
+        ordered_stages=root_state.ordered_stages,
+        integration=root_state.integration,
+    )
+    assert root_store.load().plan_manifest.role == "root"
+    assert driver_module._continued_failed_root_reason(root_store.load(), config) is not None
+
+    child_store = RunStore("kani", root_store.run_dir)
+    child_manifest = root_state.plan_manifest.child_manifests[
+        next(node.node_id for node in root_state.plan_manifest.nodes if node.name == "kani")
+    ]
+    if not child_store.path.exists():
+        child_config = driver_module._child_config(
+            config,
+            kani_task,
+            SyntheticQueue([]),
+            EffectClient(RecordingTransport()),
+            root_store,
+            branch,
+            worktree,
+            keep_alive_on_waiting=True,
+        )
+        child_slices = _initial_slices(kani_task.plan, child_config, root_store.run_dir, "kani")
+        create(
+            "kani",
+            {
+                "slices": child_slices,
+                "owner_branch": branch,
+                "owner_worktree": worktree,
+                "parent_branch": config.branch,
+                "parent_run_id": root_store.run_id,
+                "parent_agent_id": config.agent_id,
+                "depth": 1,
+            },
+            root_dir=root_store.run_dir,
+        )
+        child_store.set_plan_manifest(child_manifest, slices=child_slices)
+    child_state = child_store.load()
+    child_store.checkpoint(
+        RecursiveTLFailed("server socket timed out during child startup"),
+        child_state.slices,
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    child_store.record_exit_reason("server socket timed out during child startup")
+
+    class KaniRecoveryTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = KaniRecoveryTransport(
+        spawned_agent_id="kani",
+        spawned_invocation_id="recovered-kani-invocation",
+    )
+    failed_root = root_store.load()
+    assert isinstance(failed_root.recursive_fsm, RecursiveTLFailed)
+    assert failed_root.current_order == 2
+    assert failed_root.slices["architecture"].post_merge == architecture_receipt
+    continued = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    reconciled = continued.final_state
+    assert reconciled.fsm.phase is TLPhase.TLDone
+    assert reconciled.slices["architecture"].post_merge == architecture_receipt
+    assert reconciled.slices["kani"].status is SliceStatus.MERGED
+    assert reconciled.current_order == 2
+    assert reconciled.slices["kani"].dispatch_intent_id == dispatch_intent
+    assert reconciled.slices["kani"].attempts == 1
+
+    saved = root_store.load()
+    assert saved.slices["architecture"].post_merge == architecture_receipt
+    assert saved.slices["architecture"].post_merge.evidence["changelog_outcome"] == "captured"
+    assert (
+        RunStore("architecture", root_store.run_dir).load().slices["leaf-a"].post_merge
+        == original_leaf_receipt
+    )
+    journal = EffectJournal(root_store.run_id, root_store.run_dir / "action-journal.json")
+    assert journal.entry_by_key(merge_journal_id) == original_merge_entry
+    assert saved.current_order == 2
+    assert saved.slices["kani"].status is SliceStatus.MERGED
+    assert not any(name in {"merge_pr", "file_pr"} for name, _ in transport.calls)
+    reconciled_journal_entries = tuple(journal.snapshot())
+    reconciled_by_key = {entry["key"]: entry for entry in reconciled_journal_entries}
+    assert all(reconciled_by_key.get(entry["key"]) == entry for entry in original_journal_entries)
+    assert journal.entry_by_key(merge_journal_id) == original_merge_entry
+    repeated = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+    assert repeated.final_state.revision == root_store.load().revision
+    assert repeated.final_state.slices["architecture"].post_merge == architecture_receipt
+    assert repeated.final_state.slices["kani"].status is SliceStatus.MERGED
+    assert repeated.final_state.slices["kani"].dispatch_intent_id == dispatch_intent
+    assert repeated.final_state.slices["kani"].attempts == 1
+    assert tuple(journal.snapshot()) == reconciled_journal_entries
+    assert not any(name in {"merge_pr", "file_pr"} for name, _ in transport.calls)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("missing", None),
+        ("child_id", "unrelated-child"),
+        ("repository", "other/repository"),
+        ("parent_branch", "wrong-parent"),
+        ("pr_number", "999"),
+        ("head_sha", "unrelated-head"),
+        ("merge_journal_id", "unrelated-journal"),
+        ("publication_pr_number", "999"),
+        ("publication_head_branch", "unrelated-branch"),
+        ("candidate_owner_run_id", "unrelated-owner"),
+    ],
+)
+def test_ordered_recovery_holds_for_missing_or_conflicting_completed_receipts(
+    tmp_path: Path,
+    field: str,
+    value: str | None,
+) -> None:
+    _plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, f"ordered-completion-proof-{field}"
+        )
+    )
+    _complete_captured_aggregate_boundary(root_store, tmp_path)
+    state = root_store.load()
+    architecture = state.slices["architecture"]
+    receipt = architecture.post_merge
+    assert receipt is not None
+    changed_receipt = (
+        None
+        if field == "missing"
+        else replace(receipt, evidence={**receipt.evidence, field: value or ""})
+    )
+    changed_publication = architecture.publication
+    if field == "publication_pr_number":
+        assert changed_publication is not None
+        changed_publication = replace(changed_publication, pr_number=int(value or "0"))
+    elif field == "publication_head_branch":
+        assert changed_publication is not None
+        changed_publication = replace(changed_publication, head_branch=value or "")
+    integration = state.integration
+    if field == "candidate_owner_run_id":
+        candidate = replace(
+            integration.candidates["architecture"],
+            integration_owner_run_id=value,
+        )
+        integration = replace(
+            integration,
+            candidates={**integration.candidates, "architecture": candidate},
+        )
+    changed_architecture = replace(
+        architecture,
+        status=SliceStatus.MERGED,
+        park_cause=None,
+        post_merge=changed_receipt,
+        publication=changed_publication,
+    )
+    root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "architecture": changed_architecture},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=2,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+    before = root_store.path.read_bytes()
+
+    with pytest.raises(driver_module.OrderedCompletionEvidenceError, match="architecture"):
+        driver_module._reopen_ordered_scope(root_store.load(), _plan, root_store, None)
+
+    assert root_store.path.read_bytes() == before
+
+
+def test_continue_records_scoped_hold_for_invalid_completed_sub_tl_receipt(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "ordered-completion-proof-production-hold"
+        )
+    )
+    _complete_captured_aggregate_boundary(root_store, tmp_path)
+    state = root_store.load()
+    architecture = state.slices["architecture"]
+    assert architecture.post_merge is not None
+    invalid_receipt = replace(
+        architecture.post_merge,
+        evidence={**architecture.post_merge.evidence, "head_sha": "unrelated-head"},
+    )
+    root_store.checkpoint(
+        RecursiveTLFailed("Kani controller exited during startup"),
+        {
+            **state.slices,
+            "architecture": replace(
+                architecture,
+                status=SliceStatus.MERGED,
+                park_cause=None,
+                post_merge=invalid_receipt,
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=2,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    class SameRepositoryTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": "https://forge.example.test/test/repository.git"},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = SameRepositoryTransport()
+    config = replace(
+        _config(),
+        run_id=root_store.run_id,
+        root_dir=tmp_path,
+        session_mode="continue",
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        agent_id="root-controller",
+    )
+
+    result = run_tl_loop(
+        root_store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    held = root_store.load()
+    assert result.diagnostics["ordered_completion_recovery"].startswith(
+        "ordered recovery child 'architecture': completion proof is unresolved: "
+    )
+    assert isinstance(held.recursive_fsm, RecursiveTLFailed)
+    assert "architecture" in held.recursive_fsm.reason
+    assert any(
+        gate.name == "tl-ordered-completion-evidence-architecture"
+        and gate.status is GateStatus.PENDING
+        for gate in held.gates
+    )
+    assert held.slices["architecture"].post_merge == invalid_receipt
+    assert held.slices["kani"].status is SliceStatus.PENDING
+    assert not any(
+        name in {"post_merge_parent_sync", "merge_pr", "file_pr", "spawn_worker", "spawn_leaf"}
+        for name, _ in transport.calls
+    )
+
+
+def test_ordered_recovery_keeps_declared_aggregate_not_required_outcome(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(tmp_path, "ordered-completion-not-required")
+    )
+    _complete_captured_aggregate_boundary(root_store, tmp_path)
+    state = root_store.load()
+    architecture = replace(state.slices["architecture"], status=SliceStatus.MERGED, park_cause=None)
+    kani = replace(
+        state.slices["kani"],
+        status=SliceStatus.MERGED,
+        pr_number=None,
+        post_merge=PostMergeState(PostMergePhase.NOT_REQUIRED, {}),
+    )
+    root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "architecture": architecture, "kani": kani},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=2,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    reopened = driver_module._reopen_ordered_scope(root_store.load(), plan, root_store, None)
+
+    assert isinstance(reopened.recursive_fsm, RecursiveTLAllMerged)
+    assert reopened.recursive_fsm.completed_children["architecture"] == architecture.post_merge
+    optional = reopened.recursive_fsm.completed_children["kani"]
+    assert optional.phase is PostMergePhase.NOT_REQUIRED
+    assert optional.evidence["aggregate_pr_required"] == "false"
+    assert reopened.slices["architecture"].post_merge == architecture.post_merge
+
+
+def test_ordered_recovery_retains_valid_entry_added_completion_evidence(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(tmp_path, "ordered-completion-entry-added")
+    )
+    _complete_captured_aggregate_boundary(root_store, tmp_path)
+    state = root_store.load()
+    architecture = state.slices["architecture"]
+    assert architecture.post_merge is not None
+    commit_sha = "recorded-changelog-commit"
+    complete_receipt = replace(
+        architecture.post_merge,
+        evidence={
+            **architecture.post_merge.evidence,
+            "changelog_outcome": "entry_added",
+            "changelog_commit_sha": commit_sha,
+            "observed_remote_head": commit_sha,
+        },
+    )
+    root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {
+            **state.slices,
+            "architecture": replace(
+                architecture,
+                status=SliceStatus.MERGED,
+                park_cause=None,
+                post_merge=complete_receipt,
+            ),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=2,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    reopened = driver_module._reopen_ordered_scope(root_store.load(), plan, root_store, None)
+
+    assert reopened.recursive_fsm is not None
+    assert reopened.recursive_fsm.completed_children["architecture"].child_id == "architecture"
+    assert reopened.recursive_fsm.post_merge["architecture"] == complete_receipt
 
 
 def _complete_captured_aggregate_boundary(

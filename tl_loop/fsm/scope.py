@@ -137,8 +137,15 @@ class TLRunning:
                     "leaf_result"
                 ):
                     raise ValueError("completed leaves require result evidence")
-            elif state.phase is not PostMergePhase.COMPLETE:
-                raise ValueError("completed PR children require COMPLETE post-merge state")
+            elif state.phase is PostMergePhase.COMPLETE:
+                continue
+            elif not (
+                state.phase is PostMergePhase.NOT_REQUIRED
+                and record.evidence.get("aggregate_pr_required") == "false"
+            ):
+                raise ValueError(
+                    "completed sub-TLs require COMPLETE or declared NOT_REQUIRED state"
+                )
         object.__setattr__(self, "pending_by_order", MappingProxyType(dict(groups)))
         object.__setattr__(self, "parallel_pending", parallel)
         object.__setattr__(self, "completed_children", MappingProxyType(completed))
@@ -165,7 +172,9 @@ class TLAllMerged:
             if state.phase is PostMergePhase.COMPLETE:
                 continue
             if state.phase is PostMergePhase.NOT_REQUIRED and (
-                state.evidence.get("worker_result") or state.evidence.get("leaf_result")
+                state.evidence.get("worker_result")
+                or state.evidence.get("leaf_result")
+                or state.evidence.get("aggregate_pr_required") == "false"
             ):
                 continue
             raise ValueError("all-merged confirmations must carry completion evidence")

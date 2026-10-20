@@ -651,6 +651,15 @@ class TLLoopError(RuntimeError):
     """The TL loop cannot continue without operator intervention."""
 
 
+class OrderedCompletionEvidenceError(TLLoopError):
+    """Ordered recovery cannot safely reconstruct a completed child scope."""
+
+    def __init__(self, child_id: str, reason: str) -> None:
+        super().__init__(f"ordered recovery child {child_id!r}: {reason}")
+        self.child_id = child_id
+        self.reason = reason
+
+
 class LoopLimitExceeded(TLLoopError):
     """The loop reached its event ceiling before reaching a terminal state."""
 
@@ -1852,7 +1861,21 @@ def run_tl_loop(
     state = _initialize_ordered_runtime(work_plan, state, store)
     if continued_failed_root_reason is not None:
         previous_phase = _phase_from_state(state)
-        state = _reopen_ordered_scope(state, work_plan, store, None)
+        try:
+            state = _reopen_ordered_scope(state, work_plan, store, None)
+        except OrderedCompletionEvidenceError as error:
+            state = _hold_ordered_completion_evidence(
+                state, error, selected, effects, store, effects_log
+            )
+            return TLRunResult(
+                state,
+                tuple(effects_log),
+                (),
+                (),
+                (),
+                {"ordered_completion_recovery": str(error)},
+                _journal_entries(effects_log),
+            )
         _emit_phase_change(
             run_id,
             previous_phase,
@@ -2083,15 +2106,24 @@ def _canonical_child_record(
     action = _runtime_field(slice_value, "action")
     intent_id = _runtime_field(action, "intent_id")
     invocation_id = _runtime_field(slice_value, "dispatch_invocation_id")
+    evidence = {
+        "manifest_node_id": node.node_id,
+        "manifest_revision": str(manifest_revision),
+    }
+    integration = getattr(node, "integration_contract", {})
+    aggregate_required = integration.get("aggregate_pr_required", True)
+    if (
+        kind is ChildKind.SUB_TL
+        and aggregate_required is False
+        and _runtime_field(slice_value, "status") is SliceStatus.MERGED
+    ):
+        evidence["aggregate_pr_required"] = "false"
     return ChildRecord(
         child_id=node.name,
         kind=kind,
         dispatch_intent_id=intent_id if isinstance(intent_id, str) else None,
         invocation_id=invocation_id if isinstance(invocation_id, str) else None,
-        evidence={
-            "manifest_node_id": node.node_id,
-            "manifest_revision": str(manifest_revision),
-        },
+        evidence=evidence,
         manifest_node_id=node.node_id,
         manifest_revision=manifest_revision,
     )
@@ -2783,20 +2815,23 @@ def _reopen_ordered_scope(
         if complete:
             completed[record.child_id] = record
             if record.kind is ChildKind.SUB_TL:
-                post_merge[record.child_id] = PostMergeState(
-                    PostMergePhase.COMPLETE,
-                    {"recovery": "durable-completion"},
+                post_merge[record.child_id] = _ordered_sub_tl_completion_state(
+                    state,
+                    record,
+                    task,
+                    current,
+                    store,
                 )
             elif record.kind is ChildKind.WORKER:
-                post_merge[record.child_id] = PostMergeState(
-                    PostMergePhase.NOT_REQUIRED,
-                    {"worker_result": f"recovered:{record.child_id}"},
-                )
+                post_merge[record.child_id] = _ordered_worker_completion_state(record, current)
             else:
-                post_merge[record.child_id] = PostMergeState(
-                    PostMergePhase.NOT_REQUIRED,
-                    {"leaf_result": f"recovered:{record.child_id}"},
-                )
+                post_merge[record.child_id] = _ordered_leaf_completion_state(record, current)
+        elif record.kind is ChildKind.SUB_TL and current.status is SliceStatus.MERGED:
+            raise OrderedCompletionEvidenceError(
+                record.child_id,
+                "merged declaration lacks its required completion proof; "
+                "recovery will not reopen the completed producer",
+            )
         elif record.kind is ChildKind.SUB_TL:
             for order, group in planning.ordered_children:
                 if record in group:
@@ -2901,6 +2936,174 @@ def _reopen_ordered_scope(
         integration=integration,
         expected_revision=expected_revision,
     )
+
+
+def _ordered_sub_tl_completion_state(
+    state: RunState,
+    record: ChildRecord,
+    task: SubTLTask | None,
+    current: SliceState,
+    store: RunStore,
+) -> PostMergeState:
+    """Retain verified completion evidence for one declared ordered subTL."""
+    if task is None or task.name != record.child_id:
+        raise OrderedCompletionEvidenceError(record.child_id, "no matching accepted declaration")
+    node = next((node for node in state.plan_manifest.nodes if node.name == task.name), None)
+    if node is None or record.manifest_node_id != node.node_id:
+        raise OrderedCompletionEvidenceError(
+            task.name, "manifest binding is missing or conflicting"
+        )
+    declared_required = node.integration_contract.get("aggregate_pr_required", True)
+    if declared_required is not task.integration.aggregate_pr_required:
+        raise OrderedCompletionEvidenceError(
+            task.name, "aggregate requirement conflicts with its manifest"
+        )
+    receipt = current.post_merge
+    if receipt is None and not declared_required and current.pr_number is None:
+        return PostMergeState(
+            PostMergePhase.NOT_REQUIRED,
+            {"child_id": task.name, "aggregate_pr_required": "false"},
+        )
+    if receipt is None:
+        raise OrderedCompletionEvidenceError(task.name, "complete without its post-merge receipt")
+    try:
+        validated = PostMergeState(receipt.phase, dict(receipt.evidence))
+    except (TypeError, ValueError) as error:
+        raise OrderedCompletionEvidenceError(
+            task.name, f"invalid post-merge evidence: {error}"
+        ) from error
+    if validated.phase is PostMergePhase.NOT_REQUIRED and not declared_required:
+        if current.pr_number is not None:
+            raise OrderedCompletionEvidenceError(
+                task.name, "has a PR but no required post-merge proof"
+            )
+        return PostMergeState(
+            PostMergePhase.NOT_REQUIRED,
+            {**receipt.evidence, "child_id": task.name, "aggregate_pr_required": "false"},
+        )
+    if validated.phase is not PostMergePhase.COMPLETE:
+        raise OrderedCompletionEvidenceError(
+            task.name,
+            f"requires COMPLETE post-merge evidence; found {validated.phase.value}",
+        )
+    reason = _ordered_sub_tl_complete_receipt_error(state, task, current, store)
+    if reason is not None:
+        raise OrderedCompletionEvidenceError(task.name, f"completion proof is unresolved: {reason}")
+    return receipt
+
+
+def _ordered_worker_completion_state(
+    record: ChildRecord,
+    current: SliceState,
+) -> PostMergeState:
+    """Retain worker result evidence or project its already-completed result."""
+    receipt = current.post_merge
+    if (
+        receipt is not None
+        and receipt.phase is PostMergePhase.NOT_REQUIRED
+        and receipt.evidence.get("worker_result")
+    ):
+        return receipt
+    return PostMergeState(
+        PostMergePhase.NOT_REQUIRED,
+        {"worker_result": f"recovered:{record.child_id}"},
+    )
+
+
+def _ordered_leaf_completion_state(
+    record: ChildRecord,
+    current: SliceState,
+) -> PostMergeState:
+    """Keep an actual leaf receipt when present; otherwise retain leaf completion."""
+    receipt = current.post_merge
+    if receipt is not None and receipt.phase in {
+        PostMergePhase.COMPLETE,
+        PostMergePhase.NOT_REQUIRED,
+    }:
+        return receipt
+    return PostMergeState(
+        PostMergePhase.NOT_REQUIRED,
+        {"leaf_result": f"recovered:{record.child_id}"},
+    )
+
+
+def _ordered_sub_tl_complete_receipt_error(
+    state: RunState,
+    task: SubTLTask,
+    current: SliceState,
+    store: RunStore,
+) -> str | None:
+    """Match a retained COMPLETE receipt to its accepted aggregate and journal."""
+    receipt = current.post_merge
+    publication = current.publication
+    candidate = state.integration.candidates.get(task.name)
+    reconciliation = current.reconciliation
+    if receipt is None or publication is None or candidate is None:
+        return "aggregate publication or candidate identity is missing"
+    if state.repository_identity is None or not isinstance(reconciliation, Mapping):
+        return "repository identity or merge reconciliation is missing"
+    evidence = receipt.evidence
+    base_sha = candidate.aggregate_original_base_sha
+    repository_match = _completed_repository_evidence_match_kind(evidence.get("repository"), state)
+    conflicts = _ordered_sub_tl_completion_coordinate_conflicts(
+        task, current, evidence, publication, candidate, reconciliation, base_sha, repository_match
+    )
+    if conflicts:
+        return "receipt coordinates conflict with the accepted declaration: " + ", ".join(conflicts)
+    if candidate.lifecycle is not IntegrationLifecycle.MERGED:
+        return "aggregate candidate is not authoritatively merged"
+    missing: list[str] = []
+    _validate_completed_issue_closure(current, evidence, missing, store)
+    if evidence.get("issue_close_outcome") == "not_applicable":
+        changelog_error = _unlinked_changelog_outcome_error(
+            evidence.get("changelog_outcome", ""),
+            evidence.get("changelog_commit_sha", ""),
+            evidence.get("observed_remote_head", ""),
+        )
+        if changelog_error is not None:
+            missing.append(changelog_error)
+    else:
+        _validate_completed_push_receipt(current, evidence, missing)
+    if missing:
+        return "post-merge completion evidence conflicts: " + ", ".join(sorted(set(missing)))
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    return _aggregate_completion_sync_error(state, current, current.pr_number, candidate, journal)
+
+
+def _ordered_sub_tl_completion_coordinate_conflicts(
+    task: SubTLTask,
+    current: SliceState,
+    evidence: Mapping[str, str],
+    publication: PublicationBinding,
+    candidate: IntegrationCandidateState,
+    reconciliation: Mapping[str, object],
+    base_sha: str | None,
+    repository_match: str | None,
+) -> tuple[str, ...]:
+    """Name each accepted aggregate coordinate that conflicts with its receipt."""
+    checks = (
+        ("child_id", evidence.get("child_id") == task.name),
+        ("repository", repository_match is not None),
+        ("parent_branch", evidence.get("parent_branch") == current.base_ref),
+        ("publication_base_branch", publication.base_branch == current.base_ref),
+        ("publication_head_branch", publication.head_branch == current.branch),
+        ("publication_pr_number", publication.pr_number == current.pr_number),
+        ("slice_pr_number", type(current.pr_number) is int),
+        ("receipt_pr_number", evidence.get("pr_number") == str(current.pr_number)),
+        ("candidate_pr_number", candidate.aggregate_pr_number == current.pr_number),
+        ("publication_head_sha", evidence.get("head_sha") == publication.head_sha),
+        ("candidate_head_sha", candidate.aggregate_head_sha == publication.head_sha),
+        ("candidate_owner_run_id", candidate.integration_owner_run_id == task.name),
+        ("candidate_owner_branch", candidate.integration_owner_branch == current.branch),
+        ("aggregate_base_sha", bool(base_sha)),
+        ("merge_base_sha", reconciliation.get("merge_base_sha") == base_sha),
+        ("merge_head_sha", reconciliation.get("merge_head_sha") == publication.head_sha),
+        (
+            "merge_journal_id",
+            reconciliation.get("merge_journal_id") == evidence.get("merge_journal_id"),
+        ),
+    )
+    return tuple(name for name, matches in checks if not matches)
 
 
 def _checkpoint_scope_phase(
@@ -3391,12 +3594,37 @@ def _reconcile_continued_root_failure(
             store,
             effects_log,
         )
-    return _reopen_ordered_scope(
+    try:
+        return _reopen_ordered_scope(
+            state,
+            plan,
+            store,
+            decision.task_name,
+            authorized=decision.authorized,
+        )
+    except OrderedCompletionEvidenceError as error:
+        return _hold_ordered_completion_evidence(state, error, config, effects, store, effects_log)
+
+
+def _hold_ordered_completion_evidence(
+    state: RunState,
+    error: OrderedCompletionEvidenceError,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Persist one scoped hold when a completed declaration lacks valid proof."""
+    gate_name = f"tl-ordered-completion-evidence-{error.child_id}"
+    if not any(gate.name == gate_name for gate in state.gates):
+        state = store.set_gate(gate_name, GateStatus.PENDING)
+    return _persist_rederived_root_failure(
         state,
-        plan,
+        str(error),
+        config,
+        effects,
         store,
-        decision.task_name,
-        authorized=decision.authorized,
+        effects_log,
     )
 
 
@@ -14442,7 +14670,10 @@ def _run_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
-            if _child_handoff_ready(child_state, store.run_id):
+            retrying_failed_child = (
+                config.ordered_recovery_child == task.name and child_phase is TLPhase.TLFailed
+            )
+            if _child_handoff_ready(child_state, store.run_id) and not retrying_failed_child:
                 return task, child_phase, child_state
             if child_phase is TLPhase.TLFailed and config.ordered_recovery_child != task.name:
                 return task, child_phase, child_state
@@ -14505,10 +14736,12 @@ def _run_live_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
+            retrying_failed_child = (
+                config.ordered_recovery_child == task.name and child_phase is TLPhase.TLFailed
+            )
             if (
-                _child_handoff_ready(child_state, store.run_id)
-                or _child_recovery_projection(child_state, store.run_id) is not None
-            ):
+                _child_handoff_ready(child_state, store.run_id) and not retrying_failed_child
+            ) or _child_recovery_projection(child_state, store.run_id) is not None:
                 existing[task.name] = (task, child_phase, child_state)
                 continue
             if child_phase is TLPhase.TLFailed and config.ordered_recovery_child != task.name:

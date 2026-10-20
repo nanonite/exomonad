@@ -1,4 +1,4 @@
-"""Seed a failed root awaiting integration of a completed sub-TL aggregate."""
+"""Seed a failed later child with an already completed sub-TL aggregate."""
 
 from __future__ import annotations
 
@@ -371,21 +371,26 @@ def seed_root(
     from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
     from tl_loop.fsm.post_merge_events import (
         ParentBranchSynced,
+        PostMergeNotApplicable,
         UnlinkedChangelogJudged,
     )
-    from tl_loop.fsm.scope import TLFailed
+    from tl_loop.fsm.scope import RecursiveTLFailed
     from tl_loop.loop.driver import (
         AGGREGATE_PUBLICATION_GATE_PREFIX,
+        SUB_TL_DISPATCH_STARTED_BOUNDARY,
         EffectIntent,
         TLLoopConfig,
         WorkPlan,
         _checkpoint_post_merge_event,
+        _child_controller_name,
         _initial_slices,
         _manifest_for_plan,
         _parent_aggregate_approval,
         _parent_sync_arguments,
         _parent_sync_identity_fields,
+        _sub_tl_worktree,
         _verified_child_completion_evidence,
+        derive_child_branch,
         stable_action_key,
     )
     from tl_loop.loop.journal import EffectJournal
@@ -823,23 +828,20 @@ def seed_root(
         active_aggregate_approval_id=approval_receipt.receipt_id,
     )
     root_store.checkpoint(
-        TLFailed("recursive child is not recoverable"),
+        RecursiveTLFailed("Kani controller exited during startup"),
         {**root_state.slices, "architecture": parked_architecture},
         root_state.budgets,
         root_state.events.last_consumed_offset,
-        current_order=1,
+        current_order=2,
         ordered_stages=root_state.ordered_stages,
         integration=IntegrationRuntimeState(
             lifecycle=IntegrationLifecycle.MERGED,
             sub_tl_states={
-                "architecture": IntegrationLifecycle.CHILDREN_MERGED,
-                "kani": IntegrationLifecycle.RUNNING,
+                "architecture": IntegrationLifecycle.MERGED,
+                "kani": IntegrationLifecycle.FAILED,
             },
-            # Preserve the historical root compatibility projection as a
-            # structurally complete MERGED record while the per-candidate
-            # lifecycle remains CHILDREN_MERGED. The recovery under test must
-            # repair the candidate from its child proof, not reject this
-            # checkpoint before startup reaches reconciliation.
+            # The aggregate is already merged. The later Kani startup failure
+            # is the root's current outcome and must not change this candidate.
             aggregate_pr_number=aggregate_pr,
             aggregate_head_sha=aggregate_head,
             aggregate_patch_digest=patch_digest,
@@ -856,13 +858,16 @@ def seed_root(
             ci_status="success",
             merge_attempts=2,
             stage_verification="passed",
-            candidates={"architecture": candidate},
+            candidates={
+                "architecture": replace(
+                    candidate, lifecycle=IntegrationLifecycle.MERGED
+                )
+            },
         ),
     )
     root_store.set_gate(
         f"{AGGREGATE_PUBLICATION_GATE_PREFIX}architecture", GateStatus.PENDING
     )
-    root_store.set_gate("tl-ordered-child-recovery-ambiguous", GateStatus.PENDING)
     state = root_store.load()
     synced = _checkpoint_post_merge_event(
         root_store,
@@ -888,9 +893,98 @@ def seed_root(
             tokens=17,
         ),
     )
+    synced = _checkpoint_post_merge_event(
+        root_store,
+        synced,
+        "architecture",
+        PostMergeNotApplicable(
+            "architecture",
+            "captured",
+            "an existing unreleased entry already covers the merged work",
+        ),
+        {
+            "changelog_outcome": "captured",
+            "changelog_detail": "an existing unreleased entry already covers the merged work",
+        },
+    )
     synced_architecture = replace(
         synced.slices["architecture"],
-        dispatch_error="no lane transition for idle and LaneBookkeepingNotRequired",
+        status=SliceStatus.MERGED,
+        park_cause=None,
+        dispatch_error=None,
+    )
+
+    kani_task = next(task for task in work_plan.sub_tls if task.name == "kani")
+    kani_branch = derive_child_branch(
+        root_config.branch, _child_controller_name(kani_task)
+    )
+    kani_worktree = _sub_tl_worktree(root_config, state_root, "root", kani_task)
+    kani_worktree.parent.mkdir(parents=True, exist_ok=True)
+    git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        kani_branch,
+        str(kani_worktree),
+        merged_remote_head,
+    )
+    kani_node = next(node for node in manifest.nodes if node.name == kani_task.name)
+    kani_manifest = manifest.child_manifests[kani_node.node_id]
+    kani_config = TLLoopConfig(
+        root_dir=state_root,
+        run_id=kani_task.name,
+        branch=kani_branch,
+        worktree=str(kani_worktree),
+        project_root=repository,
+        parent_branch=root_config.branch,
+        parent_run_id="root",
+        parent_agent_id="root",
+        depth=1,
+        repository_identity=identity,
+        agent_id=_child_controller_name(kani_task),
+        declared_manifest=kani_manifest,
+    )
+    kani_slices = _initial_slices(
+        kani_task.plan, kani_config, state_root, kani_task.name
+    )
+    create(
+        kani_task.name,
+        {
+            "slices": kani_slices,
+            "repository_identity": identity.to_document(),
+            "owner_branch": kani_branch,
+            "owner_worktree": str(kani_worktree),
+            "parent_branch": root_config.branch,
+            "parent_run_id": "root",
+            "parent_agent_id": "root",
+            "depth": 1,
+        },
+        root_dir=state_root,
+    )
+    kani_store = RunStore(kani_task.name, state_root)
+    kani_store.set_plan_manifest(kani_manifest, slices=kani_slices)
+    kani_failure = "server socket timed out during child startup"
+    kani_store.checkpoint(
+        RecursiveTLFailed(kani_failure, scope_path=(kani_manifest.scope_id,)),
+        kani_slices,
+        kani_store.load().budgets,
+        kani_store.load().events.last_consumed_offset,
+    )
+    kani_store.record_exit_reason(kani_failure)
+    kani_dispatch_intent = "seed-kani-startup-dispatch"
+    failed_kani = replace(
+        synced.slices["kani"],
+        status=SliceStatus.FAILED,
+        attempts=1,
+        branch=kani_branch,
+        worktree=str(kani_worktree),
+        dispatch_intent_id=kani_dispatch_intent,
+        dispatch_agent_id=_child_controller_name(kani_task),
+        dispatch_invocation_id="seed-kani-startup-invocation",
+        dispatch_generation=1,
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary=SUB_TL_DISPATCH_STARTED_BOUNDARY,
     )
     lane_key = f"{identity.remote_url}:main"
     idle_lane = LaneState(
@@ -900,15 +994,18 @@ def seed_root(
         last_lane_epoch=2,
     )
     root_store.checkpoint(
-        synced.recursive_fsm or synced.fsm,
-        {**synced.slices, "architecture": synced_architecture},
+        RecursiveTLFailed("Kani controller exited during startup"),
+        {
+            **synced.slices,
+            "architecture": synced_architecture,
+            "kani": failed_kani,
+        },
         synced.budgets,
         synced.events.last_consumed_offset,
-        current_order=synced.current_order,
+        current_order=2,
         ordered_stages=synced.ordered_stages,
         integration=replace(synced.integration, lanes={lane_key: idle_lane}),
     )
-    root_store.set_gate("tl-post-merge-architecture", GateStatus.PENDING)
     git(repository, "merge", "--ff-only", merged_remote_head)
     return {
         "root": str(root_store.path),
