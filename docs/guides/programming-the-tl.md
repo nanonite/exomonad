@@ -704,6 +704,11 @@ changes to tracked files even when their paths match ignore rules. Ignored
 untracked files remain ignored. A clean worktree is a no-op and creates no
 empty commit.
 
+When a child later dispatches a leaf, the spawn cleanliness guard checks that
+child controller's authenticated source worktree. A clean destination leaf
+worktree does not stand in for a dirty source, and unrelated edits in another
+worktree do not make the child's source appear dirty.
+
 The runtime records the parent scope, child declaration, source branch, HEAD,
 and worktree fingerprint in the durable handoff action. Its receipt reports
 `committed_paths` as hexadecimal encoded relative paths included in this

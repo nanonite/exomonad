@@ -791,6 +791,7 @@ e2e-init-recovery:
 # Check the init-recovery E2E harness without launching tmux
 check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/run.sh
+    bash -n tests/e2e/init-recovery/fake-codex.sh
     bash -n tests/e2e/init-recovery/tl-window-state.sh
     bash -n tests/e2e/init-recovery/test-tl-window-state.sh
     tests/e2e/init-recovery/test-tl-window-state.sh
