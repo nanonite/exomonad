@@ -10881,12 +10881,15 @@ def _reconcile_pending_scope_handoff(
             "expected_branch",
         )
     }
-    if _scope_handoff_response_error(
-        result,
-        expected,
-        expected_head=cast(str, arguments.get("expected_head_sha")),
-        expected_fingerprint=cast(str, arguments.get("expected_source_fingerprint")),
-    ) is not None:
+    if (
+        _scope_handoff_response_error(
+            result,
+            expected,
+            expected_head=cast(str, arguments.get("expected_head_sha")),
+            expected_fingerprint=cast(str, arguments.get("expected_source_fingerprint")),
+        )
+        is not None
+    ):
         return False
     effects_log.resolve_by_key(key, status="confirmed", result=result.raw, error=None)
     return True
@@ -14382,6 +14385,14 @@ def _scope_handoff_response_error(
         return "scope handoff receipt has missing or malformed path evidence"
     if payload.get("changed_paths") != remaining_paths:
         return "scope handoff changed_paths alias conflicts with remaining_dirty_paths"
+    outcome = payload.get("outcome")
+    if outcome == "no_changes":
+        if payload.get("head_after") != payload.get("head_before"):
+            return "no-op scope handoff receipt changed source HEAD"
+        if payload.get("commit_sha") != "":
+            return "no-op scope handoff receipt reports a commit"
+        if committed_paths or remaining_paths:
+            return "no-op scope handoff receipt contains path changes"
     if expected_head is not None and payload.get("head_before") != expected_head:
         return "scope handoff source HEAD changed between inspection and apply"
     if (
@@ -14393,23 +14404,17 @@ def _scope_handoff_response_error(
         return "read-only scope handoff inspection reported a changed HEAD"
     if expected_head is not None and not _is_git_object_id(payload.get("head_after")):
         return "scope handoff apply receipt is missing its resulting HEAD"
-    outcome = payload.get("outcome")
     if expected_head is None:
         if committed_paths:
             return "read-only scope handoff inspection reported committed paths"
-        if outcome == "no_changes" and remaining_paths:
-            return "clean scope handoff inspection reported remaining dirty paths"
         if outcome not in {"ready", "no_changes"}:
             return "scope handoff inspection has an unsupported outcome"
-    elif outcome == "no_changes":
-        if committed_paths or remaining_paths:
-            return "no-op scope handoff receipt contains path changes"
     elif outcome in {"committed", "recovered_commit"}:
         if not committed_paths or remaining_paths:
             return "successful scope handoff receipt has incomplete committed or remaining paths"
         if payload.get("commit_sha") != payload.get("head_after"):
             return "successful scope handoff receipt has conflicting commit and resulting HEAD"
-    else:
+    elif outcome != "no_changes":
         return "scope handoff apply receipt has an unsupported success outcome"
     if not isinstance(payload.get("source_worktree"), str) or not payload["source_worktree"]:
         return "scope handoff receipt is missing its authenticated source worktree"
@@ -14513,12 +14518,15 @@ def _scope_handoff_entry_ready(entry: Mapping[str, object]) -> bool:
             "expected_branch",
         )
     }
-    return _scope_handoff_response_error(
-        decoded,
-        expected,
-        expected_head=cast(str, arguments.get("expected_head_sha")),
-        expected_fingerprint=cast(str, arguments.get("expected_source_fingerprint")),
-    ) is None
+    return (
+        _scope_handoff_response_error(
+            decoded,
+            expected,
+            expected_head=cast(str, arguments.get("expected_head_sha")),
+            expected_fingerprint=cast(str, arguments.get("expected_source_fingerprint")),
+        )
+        is None
+    )
 
 
 def _invoke_scope_handoff_apply(
