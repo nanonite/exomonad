@@ -10,6 +10,8 @@ module ExoMonad.Guest.Tools.ResumeBlockedLeaf
     resumeBlockedLeafDescription,
     resumeBlockedLeafSchema,
     resumeBlockedLeafCore,
+    resumeBlockedLeafFailure,
+    resumeBlockedLeafErrorOutput,
   )
 where
 
@@ -18,10 +20,16 @@ import Data.Aeson (FromJSON (..), object, withObject, (.:), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import Data.Text qualified as T
+import Effects.EffectError (EffectError)
 import ExoMonad.Guest.Effects.AgentControl qualified as AC
-import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
+import ExoMonad.Guest.Tool.Class (MCPCallOutput, MCPTool (..), successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
-import ExoMonad.Guest.Tools.Spawn (spawnErrorMessage)
+import ExoMonad.Guest.Tools.Spawn
+  ( SpawnToolFailure,
+    spawnErrorOutput,
+    spawnFailureFromEffectError,
+    spawnFailureFromText,
+  )
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
 
@@ -62,14 +70,14 @@ resumeBlockedLeafSchema =
       ("human_approved", "Explicit operator approval for this same-owner resume")
     ]
 
-resumeBlockedLeafCore :: ResumeBlockedLeafArgs -> Eff Effects (Either Text Aeson.Value)
+resumeBlockedLeafCore :: ResumeBlockedLeafArgs -> Eff Effects (Either SpawnToolFailure Aeson.Value)
 resumeBlockedLeafCore args
-  | rblChainlinkIssueId args <= 0 = pure $ Left "chainlink_issue_id must be positive"
-  | T.null (T.strip (rblExpectedInvocationId args)) = pure $ Left "expected_invocation_id is required"
-  | T.null (T.strip (rblExpectedBranch args)) = pure $ Left "expected_branch is required"
-  | T.null (T.strip (rblExpectedWorktreeFingerprint args)) = pure $ Left "expected_worktree_fingerprint is required"
-  | T.null (T.strip (rblTask args)) = pure $ Left "task is required"
-  | not (rblHumanApproved args) = pure $ Left "human_approved must be true"
+  | rblChainlinkIssueId args <= 0 = invalid "chainlink_issue_id must be positive"
+  | T.null (T.strip (rblExpectedInvocationId args)) = invalid "expected_invocation_id is required"
+  | T.null (T.strip (rblExpectedBranch args)) = invalid "expected_branch is required"
+  | T.null (T.strip (rblExpectedWorktreeFingerprint args)) = invalid "expected_worktree_fingerprint is required"
+  | T.null (T.strip (rblTask args)) = invalid "task is required"
+  | not (rblHumanApproved args) = invalid "human_approved must be true"
   | otherwise = do
       result <-
         AC.spawnLeafSubtree
@@ -92,7 +100,7 @@ resumeBlockedLeafCore args
               AC.slcHumanApproved = True
             }
       pure $ case result of
-        Left err -> Left (spawnErrorMessage err)
+        Left err -> Left (resumeBlockedLeafFailure err)
         Right agent ->
           Right $
             object
@@ -111,6 +119,14 @@ resumeBlockedLeafCore args
                       "outcome" .= AC.invocationOutcome agent
                     ]
               ]
+  where
+    invalid = pure . Left . spawnFailureFromText
+
+resumeBlockedLeafFailure :: EffectError -> SpawnToolFailure
+resumeBlockedLeafFailure = spawnFailureFromEffectError
+
+resumeBlockedLeafErrorOutput :: SpawnToolFailure -> MCPCallOutput
+resumeBlockedLeafErrorOutput = spawnErrorOutput
 
 instance MCPTool ResumeBlockedLeaf where
   type ToolArgs ResumeBlockedLeaf = ResumeBlockedLeafArgs
@@ -120,5 +136,5 @@ instance MCPTool ResumeBlockedLeaf where
   toolHandlerEff args = do
     result <- resumeBlockedLeafCore args
     pure $ case result of
-      Left err -> errorResult err
+      Left err -> resumeBlockedLeafErrorOutput err
       Right value -> successResult value

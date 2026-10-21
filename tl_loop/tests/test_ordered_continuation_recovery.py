@@ -1052,6 +1052,8 @@ def _legacy_dirty_preflight_failure(
     active_sibling: bool = False,
     raw_legacy_response: bool = False,
     structured_response: bool = False,
+    journal_child_name: str = "leaf",
+    wrapped_trailer: str = "",
 ) -> tuple[RunStore, WorkPlan, TLLoopConfig, RunStore]:
     """Build the retained dirty-preflight failure with its exact rejected intent."""
     child_plan = WorkPlan(
@@ -1107,7 +1109,9 @@ def _legacy_dirty_preflight_failure(
                 "acknowledges with EXOMONAD_TL_PREFLIGHT_ACK=1.\n"
                 "worktree check failed: uncommitted or untracked files are present\n"
                 "  - .exo/harness_policy.toml\n  - CHANGELOG.md\n"
-                "TL preflight runtime exclusions (built-in plus configured): .chainlink/, .exo/"
+                "TL preflight runtime exclusions (built-in plus configured): .chainlink/, .exo/, "
+                ".claude/settings.local.json/, .codex/, .opencode/, opencode.json/"
+                f"{wrapped_trailer}"
             )
         )
     )
@@ -1115,7 +1119,11 @@ def _legacy_dirty_preflight_failure(
     leaf_intent = EffectIntent(
         "spawn_leaf",
         "leaf",
-        {"name": "leaf", "task": "implement the child change", "intent_id": attempt.intent_id},
+        {
+            "name": journal_child_name,
+            "task": "implement the child change",
+            "intent_id": attempt.intent_id,
+        },
         True,
     )
     journal.append(leaf_intent)
@@ -1385,6 +1393,49 @@ def test_unrelated_legacy_agent_error_text_cannot_authorize_dispatch_retry(
         state.events.last_consumed_offset,
     )
 
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None
+    assert decision.recoverable is False
+
+
+def test_wrapped_legacy_refusal_rejects_claimed_worker_launch_trailer(
+    tmp_path: Path,
+) -> None:
+    malformed = (
+        "TL preflight failed; spawning is blocked until the worktree is clean or the user "
+        "acknowledges with EXOMONAD_TL_PREFLIGHT_ACK=1.\n"
+        "worktree check failed: uncommitted or untracked files are present\n"
+        "  - CHANGELOG.md\n"
+        "worker was launched and has an active invocation"
+    )
+    assert not driver._wrapped_legacy_dirty_preflight(malformed)
+
+    parent_store, plan, config, _child_store = _legacy_dirty_preflight_failure(
+        tmp_path,
+        wrapped_trailer="\nworker was launched and has an active invocation",
+    )
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None
+    assert decision.recoverable is False
+
+
+def test_rejected_spawn_journal_must_name_the_failed_child(tmp_path: Path) -> None:
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(
+        tmp_path,
+        raw_legacy_response=True,
+        journal_child_name="different-child",
+    )
+    failed_leaf = child_store.load().slices["leaf"]
+
+    assert (
+        driver._rejected_spawn_journal_entry(
+            child_store, "leaf", failed_leaf.dispatch_intent_id
+        )
+        is None
+    )
     decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
     assert decision is not None

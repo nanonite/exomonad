@@ -2808,6 +2808,7 @@ def _rejected_spawn_journal_entry(
         for entry in entries
         if entry.get("status") == "rejected"
         and isinstance(entry.get("arguments"), Mapping)
+        and entry["arguments"].get("name") == slice_id
         and entry["arguments"].get("intent_id") == intent_id
     ]
     return matching[0] if len(matching) == 1 else None
@@ -2891,10 +2892,46 @@ def _wrapped_legacy_dirty_preflight(error: str) -> bool:
         return _raw_legacy_dirty_preflight(body)
     lines = body.splitlines()
     return (
-        bool(lines)
+        len(lines) >= 3
         and lines[0] == "worktree check failed: uncommitted or untracked files are present"
-        and any(line.startswith("  - ") and line[4:].strip() for line in lines[1:])
+        and _wrapped_dirty_path_rows(lines[1:-1])
+        and _wrapped_runtime_exclusions_footer(lines[-1])
     )
+
+
+def _wrapped_dirty_path_rows(rows: list[str]) -> bool:
+    overflow = [index for index, row in enumerate(rows) if row.startswith("  - ... and ")]
+    if overflow and (overflow != [10] or len(rows) != 11):
+        return False
+    if not overflow and not 1 <= len(rows) <= 10:
+        return False
+    for row in rows[:10]:
+        if not row.startswith("  - ") or not row[4:].strip():
+            return False
+    return not overflow or _wrapped_overflow_row_is_valid(rows[10])
+
+
+def _wrapped_overflow_row_is_valid(row: str) -> bool:
+    prefix = "  - ... and "
+    suffix = " more"
+    if not row.startswith(prefix) or not row.endswith(suffix):
+        return False
+    count = row[len(prefix) : -len(suffix)]
+    return bool(count) and count.isascii() and count.isdigit() and count[0] != "0"
+
+
+def _wrapped_runtime_exclusions_footer(line: str) -> bool:
+    prefix = "TL preflight runtime exclusions (built-in plus configured): "
+    if not line.startswith(prefix):
+        return False
+    paths = line[len(prefix) :].split(", ")
+    return bool(paths) and all(_wrapped_runtime_path_is_valid(path) for path in paths)
+
+
+def _wrapped_runtime_path_is_valid(path: str) -> bool:
+    if not path or not path.endswith("/") or path.startswith("/"):
+        return False
+    return all(part not in {"", ".."} for part in path[:-1].split("/"))
 
 
 def _hard_failure(reason: str) -> _ChildRecoveryProof:
