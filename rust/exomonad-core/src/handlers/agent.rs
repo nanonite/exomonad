@@ -388,6 +388,25 @@ impl<
             Err(EffectError::invalid_input(message))
         }
     }
+
+    async fn ensure_tl_spawn_preflight_for_child(
+        &self,
+        ctx: &crate::effects::EffectContext,
+        child_agent: &str,
+        intent_id: &str,
+    ) -> EffectResult<()> {
+        if let Err(error) = self.ensure_tl_spawn_preflight(ctx).await {
+            append_spawn_failed(
+                &self.ctx,
+                ctx.agent_name.as_ref(),
+                child_agent,
+                intent_id,
+                &error,
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 const DIRTY_TL_SPAWN_PREFLIGHT_CODE: &str = "agent.spawn_precondition.dirty_worktree";
@@ -1206,16 +1225,8 @@ impl<
         req: SpawnWorkerRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnWorkerResponse> {
-        if let Err(error) = self.ensure_tl_spawn_preflight(ctx).await {
-            append_spawn_failed(
-                &self.ctx,
-                ctx.agent_name.as_ref(),
-                &req.name,
-                &req.intent_id,
-                &error,
-            );
-            return Err(error);
-        }
+        self.ensure_tl_spawn_preflight_for_child(ctx, &req.name, &req.intent_id)
+            .await?;
         let default_type = self.service.default_spawn_agent_type();
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
@@ -2353,16 +2364,6 @@ impl<
         req: SpawnLeafSubtreeRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
-        if let Err(error) = self.ensure_tl_spawn_preflight(ctx).await {
-            append_spawn_failed(
-                &self.ctx,
-                ctx.agent_name.as_ref(),
-                &req.branch_name,
-                &req.intent_id,
-                &error,
-            );
-            return Err(error);
-        }
         if req.blocked_issue_id != 0
             || !req.expected_invocation_id.trim().is_empty()
             || !req.expected_branch.trim().is_empty()
@@ -2379,6 +2380,8 @@ impl<
                 "branch_name is required for an ordinary spawn",
             ));
         }
+        self.ensure_tl_spawn_preflight_for_child(ctx, &req.branch_name, &req.intent_id)
+            .await?;
         let default_type = self.service.default_spawn_agent_type();
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
@@ -3212,6 +3215,8 @@ impl<
             .join(".exo/agents")
             .join(owner.agent_name.as_str());
         let previous_invocation = read_invocation(&owner_dir).await.effect_err("agent")?;
+        self.ensure_tl_spawn_preflight_for_child(ctx, owner.agent_name.as_str(), &req.intent_id)
+            .await?;
         let result = self
             .service
             .spawn_leaf_subtree(&options, &ctx.birth_branch)
@@ -3489,6 +3494,8 @@ impl<
             }),
             model: owner.model.clone(),
         };
+        self.ensure_tl_spawn_preflight_for_child(ctx, owner.agent_name.as_str(), &req.intent_id)
+            .await?;
         let result = self
             .service
             .spawn_leaf_subtree(&options, &ctx.birth_branch)
@@ -5225,6 +5232,130 @@ mod tests {
         }
         assert!(!project_dir.join(".exo/agents/worker-a").exists());
         assert!(!project_dir.join(".exo/agents/main.leaf-a").exists());
+    }
+
+    #[tokio::test]
+    async fn dirty_resume_preflight_records_the_resolved_owner_when_branch_name_is_empty() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OWNER: &str = "leaf-codex";
+        const PR_NUMBER: u64 = 46;
+        const HEAD_SHA: &str = "resume-head-46";
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(project_dir)
+                .output()
+                .expect("run Git setup");
+            assert!(output.status.success(), "Git setup failed: {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Resume Preflight Test"]);
+        git(&["config", "user.email", "resume-preflight@example.invalid"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://forgejo.invalid/owner/repo.git",
+        ]);
+        std::fs::write(project_dir.join(".gitignore"), ".exo/\n").expect("write ignore file");
+        std::fs::write(project_dir.join("tracked.txt"), "clean\n").expect("write tracked file");
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "resume preflight baseline"]);
+        std::fs::write(project_dir.join("tracked.txt"), "dirty\n").expect("dirty source worktree");
+
+        let forgejo = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/owner/repo/pulls/46"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": PR_NUMBER,
+                "html_url": "https://forgejo.invalid/owner/repo/pulls/46",
+                "title": "Resume existing owner",
+                "body": "",
+                "state": "open",
+                "head": { "ref": "main.leaf-codex", "sha": HEAD_SHA },
+                "base": { "ref": "main", "sha": "base-46" }
+            })))
+            .mount(&forgejo)
+            .await;
+
+        let event_log = Arc::new(
+            crate::services::EventLog::open(project_dir.join(".exo/logs")).expect("open event log"),
+        );
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        services.event_log = Some(event_log);
+        services.forgejo_client = Some(
+            crate::services::forgejo::ForgejoClient::new(&forgejo.uri(), "test-token")
+                .expect("construct fake Forgejo client"),
+        );
+        services
+            .agent_resolver
+            .register(AgentIdentityRecord {
+                agent_name: AgentName::try_from_str(OWNER).expect("owner name"),
+                slug: Slug::try_from_str("leaf").expect("owner slug"),
+                agent_type: ServiceAgentType::Codex,
+                birth_branch: BirthBranch::try_from_str("main.leaf-codex").expect("owner branch"),
+                parent_branch: BirthBranch::try_from_str("main").expect("parent branch"),
+                working_dir: PathBuf::from(format!(".exo/agents/{OWNER}")),
+                display_name: OWNER.to_string(),
+                topology: Topology::WorktreePerAgent,
+                model: None,
+                effort: None,
+                ledger_owned: true,
+                slice_id: Some("issue-814".to_string()),
+            })
+            .await
+            .expect("register authoritative resume owner");
+        let services = Arc::new(services);
+        let handler = AgentHandler::new(
+            Arc::new(AgentControlService::new(services.clone())),
+            services,
+        );
+        let context = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root-controller").expect("controller name"),
+            birth_branch: BirthBranch::try_from_str("main").expect("main branch"),
+            working_dir: project_dir.to_path_buf(),
+        };
+
+        let result = handler
+            .spawn_leaf_subtree(
+                SpawnLeafSubtreeRequest {
+                    task: "Resume the existing owner".to_string(),
+                    resume_pr_number: PR_NUMBER,
+                    expected_head_sha: HEAD_SHA.to_string(),
+                    intent_id: "resume-preflight-intent".to_string(),
+                    ..Default::default()
+                },
+                &context,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(EffectError::Custom { ref code, .. }) if code == DIRTY_TL_SPAWN_PREFLIGHT_CODE
+        ));
+
+        let records = crate::services::immutable_ledger::LedgerWriter::open_project(project_dir)
+            .expect("ledger opens")
+            .read_resolved_events()
+            .expect("ledger reads");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event.event_type, "agent.spawn_failed");
+        assert_eq!(records[0].event.data["code"], DIRTY_TL_SPAWN_PREFLIGHT_CODE);
+        assert_eq!(records[0].event.data["child_agent"], OWNER);
+        assert_eq!(
+            records[0].event.data["intent_id"],
+            "resume-preflight-intent"
+        );
+        assert!(!project_dir
+            .join(".exo/agents")
+            .join(OWNER)
+            .join("invocation.json")
+            .exists());
     }
 
     #[test]
