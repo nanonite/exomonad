@@ -130,6 +130,7 @@ raw ledger payloads. `NEEDS_BASE_REVALIDATION` refreshes base-bound evidence;
 | `spawn_reviewer` | x | x | | | |
 | `resume_pr` | x | x | | | |
 | `resume_blocked_leaf` | x | x | | | |
+| `prepare_scope_handoff` | | x | | | |
 | `close_worker_pane` | x | x | | | |
 | `close_issue_and_cleanup` | x | x | | | |
 | `cleanup_reviewer_leaf` | x | x | | | |
