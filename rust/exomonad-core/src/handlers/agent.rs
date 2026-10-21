@@ -1206,7 +1206,16 @@ impl<
         req: SpawnWorkerRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnWorkerResponse> {
-        self.ensure_tl_spawn_preflight(ctx).await?;
+        if let Err(error) = self.ensure_tl_spawn_preflight(ctx).await {
+            append_spawn_failed(
+                &self.ctx,
+                ctx.agent_name.as_ref(),
+                &req.name,
+                &req.intent_id,
+                &error,
+            );
+            return Err(error);
+        }
         let default_type = self.service.default_spawn_agent_type();
         let requested_agent_type = req.agent_type();
         let effective_agent_type =
@@ -2344,7 +2353,16 @@ impl<
         req: SpawnLeafSubtreeRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
-        self.ensure_tl_spawn_preflight(ctx).await?;
+        if let Err(error) = self.ensure_tl_spawn_preflight(ctx).await {
+            append_spawn_failed(
+                &self.ctx,
+                ctx.agent_name.as_ref(),
+                &req.branch_name,
+                &req.intent_id,
+                &error,
+            );
+            return Err(error);
+        }
         if req.blocked_issue_id != 0
             || !req.expected_invocation_id.trim().is_empty()
             || !req.expected_branch.trim().is_empty()
@@ -5122,6 +5140,91 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].event.data["code"], DIRTY_TL_SPAWN_PREFLIGHT_CODE);
         assert_eq!(records[0].event.data["intent_id"], "intent-2");
+    }
+
+    #[tokio::test]
+    async fn dirty_tl_spawn_preflight_records_the_real_leaf_and_worker_refusals() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(project_dir)
+                .output()
+                .expect("run Git setup");
+            assert!(output.status.success(), "Git setup failed: {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Preflight Test"]);
+        git(&["config", "user.email", "preflight@example.invalid"]);
+        std::fs::write(project_dir.join(".gitignore"), ".exo/\n").expect("write ignore file");
+        std::fs::write(project_dir.join("tracked.txt"), "clean\n").expect("write tracked file");
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "preflight test baseline"]);
+        std::fs::write(project_dir.join("tracked.txt"), "dirty\n").expect("dirty source worktree");
+
+        let event_log = Arc::new(
+            crate::services::EventLog::open(project_dir.join(".exo/logs")).expect("open event log"),
+        );
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        services.event_log = Some(event_log);
+        let services = Arc::new(services);
+        let handler = AgentHandler::new(
+            Arc::new(AgentControlService::new(services.clone())),
+            services,
+        );
+        let context = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root").expect("root identity"),
+            birth_branch: BirthBranch::try_from_str("main").expect("main branch"),
+            working_dir: project_dir.to_path_buf(),
+        };
+
+        let leaf_result = handler
+            .spawn_leaf_subtree(
+                SpawnLeafSubtreeRequest {
+                    branch_name: "main.leaf-a".to_string(),
+                    intent_id: "leaf-preflight-intent".to_string(),
+                    ..Default::default()
+                },
+                &context,
+            )
+            .await;
+        let worker_result = handler
+            .spawn_worker(
+                SpawnWorkerRequest {
+                    name: "worker-a".to_string(),
+                    intent_id: "worker-preflight-intent".to_string(),
+                    ..Default::default()
+                },
+                &context,
+            )
+            .await;
+        assert!(matches!(
+            leaf_result,
+            Err(EffectError::Custom { ref code, .. }) if code == DIRTY_TL_SPAWN_PREFLIGHT_CODE
+        ));
+        assert!(matches!(
+            worker_result,
+            Err(EffectError::Custom { ref code, .. }) if code == DIRTY_TL_SPAWN_PREFLIGHT_CODE
+        ));
+
+        let records = crate::services::immutable_ledger::LedgerWriter::open_project(project_dir)
+            .expect("ledger opens")
+            .read_resolved_events()
+            .expect("ledger reads");
+        assert_eq!(records.len(), 2);
+        for (record, (child, intent)) in records.iter().zip([
+            ("main.leaf-a", "leaf-preflight-intent"),
+            ("worker-a", "worker-preflight-intent"),
+        ]) {
+            assert_eq!(record.event.event_type, "agent.spawn_failed");
+            assert_eq!(record.event.data["code"], DIRTY_TL_SPAWN_PREFLIGHT_CODE);
+            assert_eq!(record.event.data["child_agent"], child);
+            assert_eq!(record.event.data["intent_id"], intent);
+        }
+        assert!(!project_dir.join(".exo/agents/worker-a").exists());
+        assert!(!project_dir.join(".exo/agents/main.leaf-a").exists());
     }
 
     #[test]
