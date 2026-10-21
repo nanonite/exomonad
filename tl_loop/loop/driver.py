@@ -1584,13 +1584,23 @@ def run_tl_loop(
                             },
                             (),
                         )
-                    existing_state = _reopen_ordered_scope(
-                        existing_state,
-                        recovery_plan,
-                        store,
-                        decision.task_name,
-                        authorized=decision.authorized,
-                    )
+                    try:
+                        existing_state = _reopen_ordered_scope(
+                            existing_state,
+                            recovery_plan,
+                            store,
+                            decision.task_name,
+                            authorized=decision.authorized,
+                        )
+                    except OrderedCompletionEvidenceError as error:
+                        return _terminal_ordered_completion_hold_result(
+                            existing_state,
+                            error,
+                            selected,
+                            effects,
+                            store,
+                            identity_effects,
+                        )
                     selected = replace(
                         selected,
                         ordered_recovery_child=decision.task_name,
@@ -1608,12 +1618,22 @@ def run_tl_loop(
                     if plan is not None
                     else _work_plan_from_manifest(existing_state.plan_manifest)
                 )
-                existing_state = _reopen_ordered_scope(
-                    existing_state,
-                    recovery_plan,
-                    store,
-                    None,
-                )
+                try:
+                    existing_state = _reopen_ordered_scope(
+                        existing_state,
+                        recovery_plan,
+                        store,
+                        None,
+                    )
+                except OrderedCompletionEvidenceError as error:
+                    return _terminal_ordered_completion_hold_result(
+                        existing_state,
+                        error,
+                        selected,
+                        effects,
+                        store,
+                        identity_effects,
+                    )
                 terminal_recovery_reopened = True
             # Fall through to the live loop when a recovery reopened this terminal
             # checkpoint so the recovered child is actually relaunched in this
@@ -3014,17 +3034,32 @@ def _ordered_leaf_completion_state(
     record: ChildRecord,
     current: SliceState,
 ) -> PostMergeState:
-    """Keep an actual leaf receipt when present; otherwise retain leaf completion."""
+    """Validate and retain a durable completion receipt for one accepted leaf."""
     receipt = current.post_merge
-    if receipt is not None and receipt.phase in {
-        PostMergePhase.COMPLETE,
-        PostMergePhase.NOT_REQUIRED,
-    }:
-        return receipt
-    return PostMergeState(
-        PostMergePhase.NOT_REQUIRED,
-        {"leaf_result": f"recovered:{record.child_id}"},
-    )
+    if receipt is None:
+        raise OrderedCompletionEvidenceError(record.child_id, "completed leaf receipt is missing")
+    try:
+        PostMergeState(receipt.phase, dict(receipt.evidence))
+    except (TypeError, ValueError) as error:
+        raise OrderedCompletionEvidenceError(
+            record.child_id, f"completed leaf receipt is invalid: {error}"
+        ) from error
+    if receipt.phase is PostMergePhase.NOT_REQUIRED:
+        leaf_result = receipt.evidence.get("leaf_result")
+        if not isinstance(leaf_result, str) or not leaf_result.strip():
+            raise OrderedCompletionEvidenceError(
+                record.child_id, "NOT_REQUIRED completed leaf receipt is missing leaf_result"
+            )
+    if receipt.evidence.get("child_id") not in (None, record.child_id):
+        raise OrderedCompletionEvidenceError(
+            record.child_id, "completed leaf receipt child_id conflicts with its declaration"
+        )
+    if receipt.phase not in {PostMergePhase.COMPLETE, PostMergePhase.NOT_REQUIRED}:
+        raise OrderedCompletionEvidenceError(
+            record.child_id,
+            f"completed leaf receipt has unsupported phase {receipt.phase.value}",
+        )
+    return receipt
 
 
 def _ordered_sub_tl_complete_receipt_error(
@@ -3625,6 +3660,38 @@ def _hold_ordered_completion_evidence(
         effects,
         store,
         effects_log,
+    )
+
+
+def _terminal_ordered_completion_hold_result(
+    state: RunState,
+    error: OrderedCompletionEvidenceError,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    identity_effects: Sequence[EffectIntent],
+) -> TLRunResult:
+    """Turn terminal-reopen proof failures into a durable scoped hold result."""
+    journal_path = store.run_dir / "action-journal.json"
+    effects_log: list[EffectIntent] = (
+        EffectJournal(store.run_id, journal_path)
+        if config.ledger_run_id is not None or journal_path.exists()
+        else []
+    )
+    effects_log.extend(identity_effects)
+    held = _hold_ordered_completion_evidence(state, error, config, effects, store, effects_log)
+    return TLRunResult(
+        held,
+        tuple(effects_log),
+        (),
+        (),
+        (),
+        {
+            "reducer_version": held.reducer_version,
+            "cursor": held.events.last_consumed_offset,
+            "ordered_completion_recovery": str(error),
+        },
+        _journal_entries(effects_log),
     )
 
 

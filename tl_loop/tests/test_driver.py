@@ -14189,6 +14189,275 @@ def _seed_synced_captured_aggregate_with_idle_lane(
     return plan, root_store, child_store, merge_journal_id, base_sha
 
 
+def _seed_nonroot_failed_scope(
+    root_dir: Path,
+    run_id: str,
+    plan: WorkPlan,
+    *,
+    current_order: int = 1,
+) -> tuple[TLLoopConfig, RunStore]:
+    """Persist a terminal non-root scope for ordered recovery boundary tests."""
+    config = replace(
+        _config(),
+        run_id=run_id,
+        root_dir=root_dir,
+        branch="main.outer",
+        parent_branch="main",
+        parent_run_id="outer-controller",
+        parent_agent_id="outer-controller",
+        depth=1,
+        session_mode="continue",
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
+    manifest = driver_module._manifest_for_plan(plan, run_id, config)
+    slices = _initial_slices(plan, config, root_dir, run_id)
+    root_state = {
+        "slices": slices,
+        "owner_branch": config.branch,
+        "owner_worktree": str(driver_module._effective_worktree(config, root_dir, run_id)),
+        "parent_branch": config.parent_branch,
+        "parent_run_id": config.parent_run_id,
+        "parent_agent_id": config.parent_agent_id,
+        "depth": config.depth,
+    }
+    create(run_id, root_state, root_dir=root_dir)
+    store = RunStore(run_id, root_dir)
+    store.set_plan_manifest(manifest, slices=slices)
+    ordered_stages = tuple(
+        driver_module.OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+    )
+    state = (
+        store.set_ordered_state(current_order, ordered_stages, store.load().integration)
+        if ordered_stages
+        else store.load()
+    )
+    store.checkpoint(
+        RecursiveTLFailed("ordered child failed during startup"),
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    return config, store
+
+
+def test_nonroot_terminal_recovery_records_scoped_hold_for_conflicting_sibling(
+    tmp_path: Path,
+) -> None:
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("completed-sibling", _plan(), order=1),
+            SubTLTask("failed-child", WorkPlan(), order=2),
+        )
+    )
+    config, store = _seed_nonroot_failed_scope(
+        tmp_path, "nonroot-conflicting-completion", plan, current_order=2
+    )
+    state = store.load()
+    sibling = state.slices["completed-sibling"]
+    failed = state.slices["failed-child"]
+    conflicting_receipt = PostMergeState(
+        PostMergePhase.COMPLETE,
+        {
+            "repository": config.repository_identity.remote_url,
+            "parent_branch": config.branch,
+            "pr_number": "273",
+            "head_sha": "reviewed-head",
+            "merge_journal_id": "retained-merge-journal",
+            "lane_epoch": "1",
+            "parent_commit_sha": "parent-commit",
+            "issue_close_outcome": "not_applicable",
+            "changelog_outcome": "captured",
+            "child_id": "another-scope",
+        },
+    )
+    failed_task = next(task for task in plan.sub_tls if task.name == "failed-child")
+    failed_branch = driver_module.derive_child_branch(config.branch, "failed-child")
+    failed_worktree = str(
+        driver_module._sub_tl_worktree(config, store.root_dir, store.run_id, failed_task)
+    )
+    failed_slice = replace(
+        failed,
+        status=SliceStatus.FAILED,
+        attempts=1,
+        branch=failed_branch,
+        worktree=failed_worktree,
+        dispatch_intent_id="failed-child-dispatch-intent",
+        dispatch_agent_id="failed-child",
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    completed_slice = replace(
+        sibling,
+        status=SliceStatus.MERGED,
+        pr_number=273,
+        post_merge=conflicting_receipt,
+    )
+    store.checkpoint(
+        RecursiveTLFailed("failed child has a retryable startup exit"),
+        {
+            **state.slices,
+            "completed-sibling": completed_slice,
+            "failed-child": failed_slice,
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=2,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    assert store.load().plan_manifest.role == "non_root"
+
+    manifest = store.load().plan_manifest
+    assert manifest is not None
+    failed_node = next(node for node in manifest.nodes if node.name == "failed-child")
+    child_manifest = manifest.child_manifests[failed_node.node_id]
+    child_config = replace(
+        config,
+        run_id="failed-child",
+        root_dir=store.run_dir,
+        branch=failed_branch,
+        worktree=failed_worktree,
+        parent_run_id=store.run_id,
+        parent_branch=config.branch,
+        parent_agent_id=config.agent_id,
+        depth=config.depth + 1,
+        declared_manifest=child_manifest,
+    )
+    child_slices = _initial_slices(failed_task.plan, child_config, store.run_dir, "failed-child")
+    create(
+        "failed-child",
+        {
+            "slices": child_slices,
+            "owner_branch": failed_branch,
+            "owner_worktree": failed_worktree,
+            "parent_branch": config.branch,
+            "parent_run_id": store.run_id,
+            "parent_agent_id": config.agent_id,
+            "depth": config.depth + 1,
+        },
+        root_dir=store.run_dir,
+    )
+    child_store = RunStore("failed-child", store.run_dir)
+    child_store.set_plan_manifest(child_manifest, slices=child_slices)
+    child_state = child_store.load()
+    child_failure = "server socket timed out during child startup"
+    child_state = child_store.checkpoint(
+        RecursiveTLFailed(child_failure),
+        child_state.slices,
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    child_store.record_exit_reason(child_failure)
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    held = store.load()
+    assert result.diagnostics["ordered_completion_recovery"].startswith(
+        "ordered recovery child 'completed-sibling':"
+    )
+    assert any(
+        gate.name == "tl-ordered-completion-evidence-completed-sibling"
+        and gate.status is GateStatus.PENDING
+        for gate in held.gates
+    )
+    assert held.slices["completed-sibling"].post_merge == conflicting_receipt
+    assert held.slices["failed-child"].status is SliceStatus.FAILED
+    assert isinstance(held.recursive_fsm, RecursiveTLFailed)
+    assert "completed-sibling" in held.recursive_fsm.reason
+    assert not any(
+        name in {"spawn_leaf", "spawn_worker", "resume_pr", "merge_pr", "file_pr"}
+        for name, _ in transport.calls
+    )
+
+
+def test_ordered_recovery_records_scoped_hold_for_empty_completed_leaf_receipt(
+    tmp_path: Path,
+) -> None:
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "completed leaf", "chainlink_issue_id": None}]}
+    )
+    config, store = _seed_nonroot_failed_scope(tmp_path, "empty-completed-leaf-receipt", plan)
+    state = store.load()
+    completed = replace(
+        state.slices["leaf-a"],
+        status=SliceStatus.MERGED,
+        post_merge=PostMergeState(PostMergePhase.NOT_REQUIRED, {}),
+    )
+    store.checkpoint(
+        RecursiveTLFailed("previous invocation failed"),
+        {"leaf-a": completed},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    config = replace(config, ordered_recovery=True)
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        store.run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    held = store.load()
+    assert result.diagnostics["ordered_completion_recovery"].startswith(
+        "ordered recovery child 'leaf-a':"
+    )
+    assert any(
+        gate.name == "tl-ordered-completion-evidence-leaf-a" and gate.status is GateStatus.PENDING
+        for gate in held.gates
+    )
+    assert isinstance(held.recursive_fsm, RecursiveTLFailed)
+    assert "leaf_result" in held.recursive_fsm.reason
+    assert held.slices["leaf-a"].post_merge == PostMergeState(PostMergePhase.NOT_REQUIRED, {})
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
+
+
+def test_ordered_recovery_preserves_valid_completed_leaf_receipt(tmp_path: Path) -> None:
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "completed leaf", "chainlink_issue_id": None}]}
+    )
+    _config_value, store = _seed_nonroot_failed_scope(
+        tmp_path, "valid-completed-leaf-receipt", plan
+    )
+    state = store.load()
+    receipt = PostMergeState(
+        PostMergePhase.NOT_REQUIRED,
+        {"leaf_result": "reviewed PR and post-merge receipts retained", "child_id": "leaf-a"},
+    )
+    completed = replace(state.slices["leaf-a"], status=SliceStatus.MERGED, post_merge=receipt)
+    state = store.checkpoint(
+        RecursiveTLFailed("previous invocation failed"),
+        {"leaf-a": completed},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+    reopened = driver_module._reopen_ordered_scope(state, plan, store, None)
+
+    assert isinstance(reopened.recursive_fsm, driver_module.RecursiveTLAllMerged)
+    assert reopened.recursive_fsm.completed_children["leaf-a"] == receipt
+
+
 @pytest.mark.parametrize(
     ("candidate_lifecycle", "leaf_names"),
     [
