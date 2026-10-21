@@ -673,7 +673,7 @@ fi
 e2e_log "PASS: bundled controller resumed the reviewed checkpoint, used the production merge tool once, and completed post-merge bookkeeping (offset 0 -> $after_offset, head=$after_reviewed_head)"
 fi
 
-e2e_phase "Phase 8" "Recovering a failed later subTL while retaining completed aggregate receipts through actual init --continue..."
+e2e_phase "Phase 8" "Recovering the aggregate, committing the scope handoff, and proving one post-tidy leaf spawn through actual init --continue..."
 
 # Earlier phases use their own Git transport and may leave GIT_* selectors or
 # config overrides in this shell. Phase 8 must start from its repository-local
@@ -847,6 +847,50 @@ PULL_PUBLICATIONS_BEFORE="$(count_pull_publications "$AGG_DIR/mock.log")"
 [[ "$PULL_PUBLICATIONS_BEFORE" == "2" ]] \
     || e2e_fail "fixture expected only its leaf and aggregate PR publications, found $PULL_PUBLICATIONS_BEFORE"
 e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR, full architecture completion evidence, and a revision-bound Kani startup failure at order 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
+
+# The post-checkout hook runs only when the new handoff-proof source worktree
+# is provisioned. It creates a dirty file in the outer root after the tidy
+# commit has completed, while leaving the nested subTL source clean. A real
+# leaf spawn can therefore succeed only if the production guard inspects the
+# authenticated caller worktree rather than the global project root.
+HANDOFF_WORKTREE="$AGG_REPO/.exo/worktrees/handoff-proof"
+ROOT_ONLY_DIRTY_FILE="$AGG_REPO/post-tidy-root-only-dirty.txt"
+ROOT_DIRTY_MARKER="$AGG_DIR/root-dirty-injected"
+HANDOFF_HEAD_FILE="$AGG_DIR/handoff-source-head"
+AGENT_EVENT_LOG="$AGG_DIR/agent-events.jsonl"
+FAKE_CODEX_BIN="$AGG_DIR/fake-bin"
+mkdir -p "$FAKE_CODEX_BIN"
+install -m 0755 "$SCRIPT_DIR/fake-codex.sh" "$FAKE_CODEX_BIN/codex"
+export PATH="$FAKE_CODEX_BIN:$PATH"
+export E2E_AGENT_LOG="$AGENT_EVENT_LOG"
+export E2E_SOURCE_WORKTREE="$HANDOFF_WORKTREE"
+export E2E_ROOT_ONLY_DIRTY_FILE="$ROOT_ONLY_DIRTY_FILE"
+export E2E_HANDOFF_HEAD_FILE="$HANDOFF_HEAD_FILE"
+export E2E_MOCK_URL="$AGG_MOCK_URL"
+export E2E_MCP_SOCKET="$AGG_REPO/.exo/server.sock"
+python3 - "$AGG_REPO/.git/hooks/post-checkout" "$HANDOFF_WORKTREE" "$ROOT_ONLY_DIRTY_FILE" \
+    "$ROOT_DIRTY_MARKER" "$HANDOFF_HEAD_FILE" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+hook_path, source_worktree, root_dirty_file, marker, head_file = sys.argv[1:]
+hook = Path(hook_path)
+hook.parent.mkdir(parents=True, exist_ok=True)
+hook.write_text(
+    "#!/bin/sh\n"
+    "set -eu\n"
+    "source=$(git rev-parse --show-toplevel)\n"
+    f"if [ \"$source\" = {shlex.quote(source_worktree)} ] && [ ! -e {shlex.quote(marker)} ]; then\n"
+    f"  printf '%s\\n' post-handoff-root-only > {shlex.quote(root_dirty_file)}\n"
+    f"  git rev-parse HEAD > {shlex.quote(head_file)}\n"
+    f"  : > {shlex.quote(marker)}\n"
+    "fi\n",
+    encoding="utf-8",
+)
+hook.chmod(0o755)
+PY
+
 LEGACY_LOCK_CONTENTS="legacy index lock evidence requiring explicit operator authorization"
 printf '%s' "$LEGACY_LOCK_CONTENTS" > "$AGG_REPO/.git/index.lock"
 [[ -s "$AGG_REPO/.git/index.lock" ]] \
@@ -861,6 +905,12 @@ poll_interval = 1
 port = $AGGREGATE_SERVER_PORT
 spawn_agent_type = "codex"
 forgejo_url = "$AGG_MOCK_URL"
+forgejo_token = "test-token-e2e"
+forgejo_reviewer_token = "reviewer-token-e2e"
+
+[reviewer]
+agent_type = "codex"
+model = "gpt-5.6-luna"
 EOF
 
 LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
@@ -879,6 +929,14 @@ if tmux show-environment -g | cut -d= -f1 | grep -q '^GIT_'; then
 fi
 tmux set-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND "$AGG_DIR/git-ssh"
 tmux set-environment -t "$AGGREGATE_SESSION" E2E_GIT_REMOTE_DIR "$AGG_REMOTE"
+tmux set-environment -t "$AGGREGATE_SESSION" PATH "$PATH"
+tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGENT_LOG "$AGENT_EVENT_LOG"
+tmux set-environment -t "$AGGREGATE_SESSION" E2E_SOURCE_WORKTREE "$HANDOFF_WORKTREE"
+tmux set-environment -t "$AGGREGATE_SESSION" E2E_ROOT_ONLY_DIRTY_FILE "$ROOT_ONLY_DIRTY_FILE"
+tmux set-environment -t "$AGGREGATE_SESSION" E2E_HANDOFF_HEAD_FILE "$HANDOFF_HEAD_FILE"
+tmux set-environment -t "$AGGREGATE_SESSION" E2E_MOCK_URL "$AGG_MOCK_URL"
+tmux set-environment -t "$AGGREGATE_SESSION" E2E_MCP_SOCKET "$AGG_REPO/.exo/server.sock"
+tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGG_REPO "$AGG_REPO"
 tmux set-window-option -t "$AGGREGATE_SESSION:TL" remain-on-exit on
 [[ "$(tmux show-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND)" == \
     "GIT_SSH_COMMAND=$AGG_DIR/git-ssh" ]] \
@@ -897,7 +955,7 @@ PRE_REFUSAL_RUN_SHA256="$(sha256sum "$AGG_REPO/.exo/tl-loop/root/run.json" | cut
 PRE_REFUSAL_JOURNAL_SHA256="$(sha256sum "$AGG_REPO/.exo/tl-loop/root/action-journal.json" | cut -d ' ' -f 1)"
 PRE_REFUSAL_LEDGER_SHA256="$(capture_ledger_segments_fingerprint "$AGG_REPO")"
 AGG_INIT_STATUS=0
-HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
+HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
     > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
 rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init.log" \
@@ -969,58 +1027,234 @@ assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FING
 e2e_log "Actual init refused the legacy lock; compiled inspect/apply recovered approved fingerprint $LEGACY_FINGERPRINT"
 
 AGG_INIT_STATUS=0
-HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
+HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
     > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
 assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --continue after legacy recovery"
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || printf '0')" == "0" ]] \
     || { cat "$AGG_DIR/init.log"; e2e_fail "legacy lock was misreported as a managed orphan"; }
-[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
-    || e2e_fail "first continuation published a new PR instead of adopting the existing aggregate"
+PULL_PUBLICATIONS_AFTER_START="$(count_pull_publications "$AGG_DIR/mock.log")"
+(( PULL_PUBLICATIONS_AFTER_START <= PULL_PUBLICATIONS_BEFORE + 1 )) \
+    || e2e_fail "first continuation published more than the single planned leaf PR"
 
-AGGREGATE_RESULT=""
+POST_TIDY_STATE=""
 for _ in $(seq 1 240); do
-    AGGREGATE_RESULT="$(python3 - "$AGG_REPO/.exo/tl-loop/root/run.json" <<'PY'
+    POST_TIDY_STATE="$(python3 - "$AGG_REPO" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-path = Path(sys.argv[1])
-if not path.is_file():
-    print("missing")
+repo = Path(sys.argv[1])
+root_dir = repo / ".exo/tl-loop/root"
+try:
+    root = json.loads((root_dir / "run.json").read_text())
+    child = json.loads((root_dir / "handoff-proof/run.json").read_text())
+except (OSError, json.JSONDecodeError):
     raise SystemExit(0)
-state = json.loads(path.read_text())
-fsm = state.get("fsm", {})
-slices = state.get("slices", {})
-architecture = slices.get("architecture", {})
-kani = slices.get("kani", {})
-handoff = slices.get("handoff-proof", {})
+architecture = root["slices"].get("architecture", {})
+kani = root["slices"].get("kani", {})
+handoff = root["slices"].get("handoff-proof", {})
 post = architecture.get("post_merge") or {}
-phase = post.get("phase") if isinstance(post, dict) else None
+leaf = child["slices"].get("post-tidy-leaf", {})
+phase = root.get("phase") or root.get("fsm", {}).get("phase", "unknown")
+ready = (
+    phase in {"tl_running", "tl_waiting", "tl_done"}
+    and root.get("current_order") == 3
+    and architecture.get("status") == "merged"
+    and post.get("phase") == "complete"
+    and kani.get("status") == "merged"
+    and handoff.get("status") in {"spawned", "in_review", "merged"}
+    and bool(handoff.get("dispatch_intent_id"))
+    and leaf.get("status") in {"in_review", "merged"}
+    and bool(leaf.get("pr_number"))
+    and leaf.get("agent_type") == "codex"
+    and leaf.get("model") == "gpt-5.6-luna"
+    and bool(leaf.get("reviewed_head"))
+)
 print(
-    state.get("phase", fsm.get("phase", "unknown")),
-    state.get("current_order", -1),
+    "ready" if ready else "waiting",
+    phase,
+    root.get("current_order", -1),
     architecture.get("status", "missing"),
-    phase or "none",
+    post.get("phase", "none"),
     kani.get("status", "missing"),
-    kani.get("dispatch_intent_id") or "none",
     handoff.get("status", "missing"),
     handoff.get("dispatch_intent_id") or "none",
+    leaf.get("status", "missing"),
+    leaf.get("pr_number") or "none",
+    leaf.get("agent_type") or "none",
+    leaf.get("model") or "none",
+    leaf.get("reviewed_head") or "none",
 )
 PY
-    2>/dev/null)" || AGGREGATE_RESULT=""
-    [[ "$AGGREGATE_RESULT" == "tl_done 3 merged complete merged "*" merged "* ]] && break
+    2>/dev/null)" || POST_TIDY_STATE=""
+    [[ "$POST_TIDY_STATE" == ready\ * ]] && break
     sleep 0.25
 done
-read -r final_phase final_order architecture_status architecture_post kani_status kani_intent handoff_status handoff_intent <<< "$AGGREGATE_RESULT"
-if [[ "$final_phase" != "tl_done" || "$final_order" != "3" \
+read -r post_tidy_marker final_phase final_order architecture_status architecture_post kani_status handoff_status handoff_intent \
+    leaf_status leaf_pr leaf_agent_type leaf_model leaf_head <<< "$POST_TIDY_STATE"
+if [[ "$post_tidy_marker" != "ready" || ( "$final_phase" != "tl_running" && "$final_phase" != "tl_waiting" && "$final_phase" != "tl_done" ) \
+    || "$final_order" != "3" \
     || "$architecture_status" != "merged" || "$architecture_post" != "complete" \
-    || "$kani_status" != "merged" || "$kani_intent" == "none" \
-    || "$handoff_status" != "merged" || "$handoff_intent" == "none" ]]; then
+    || "$kani_status" != "merged" \
+    || ( "$handoff_status" != "spawned" && "$handoff_status" != "in_review" && "$handoff_status" != "merged" ) \
+    || "$handoff_intent" == "none" || ( "$leaf_status" != "in_review" && "$leaf_status" != "merged" ) \
+    || "$leaf_pr" == "none" || "$leaf_agent_type" != "codex" \
+    || "$leaf_model" != "gpt-5.6-luna" || "$leaf_head" == "none" ]]; then
     cat "$AGG_DIR/init.log"
     cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true
-    e2e_fail "continuation did not recover the aggregate and dispatch the post-handoff child: '$AGGREGATE_RESULT'"
+    e2e_fail "continuation did not reach the post-tidy leaf review handoff: '$POST_TIDY_STATE'"
 fi
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 1))" ]] \
+    || e2e_fail "expected exactly one new PR publication for the post-tidy leaf"
+POST_TIDY_LEAF_PR="$leaf_pr"
+
+curl -fsS "$AGG_MOCK_URL/api/v1/repos/owner/repo/pulls/$POST_TIDY_LEAF_PR" \
+    > "$AGG_DIR/post-tidy-leaf-pr.json"
+for _ in $(seq 1 120); do
+    curl -fsS "$AGG_MOCK_URL/api/v1/repos/owner/repo/pulls/$POST_TIDY_LEAF_PR/reviews" \
+        > "$AGG_DIR/post-tidy-leaf-reviews.json" 2>/dev/null || true
+    REVIEW_COUNT="$(python3 - "$AGG_DIR/post-tidy-leaf-reviews.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    reviews = json.loads(Path(sys.argv[1]).read_text())
+except (OSError, json.JSONDecodeError):
+    reviews = []
+print(len(reviews) if isinstance(reviews, list) else 0)
+PY
+)"
+    if [[ "$REVIEW_COUNT" == "1" ]] && python3 - "$AGENT_EVENT_LOG" "$POST_TIDY_LEAF_PR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+events = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+pr_number = int(sys.argv[2])
+raise SystemExit(not any(
+    event.get("event") == "reviewer_approved"
+    and event.get("pr_number") == pr_number
+    for event in events
+))
+PY
+    then
+        break
+    fi
+    sleep 0.25
+done
+curl -fsS "$AGG_MOCK_URL/api/v1/repos/owner/repo/pulls/$POST_TIDY_LEAF_PR/reviews" \
+    > "$AGG_DIR/post-tidy-leaf-reviews.json"
+python3 - "$AGG_DIR/post-tidy-leaf-pr.json" "$leaf_head" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+pr = json.loads(Path(sys.argv[1]).read_text())
+assert pr["base"]["ref"] == "main.handoff-proof", "leaf PR targeted the wrong parent branch"
+assert pr["head"]["ref"].startswith("main.handoff-proof."), "leaf PR branch is outside its subTL"
+assert isinstance(pr["merged"], bool), "mock PR omitted its merge state"
+assert pr["head"]["sha"] == sys.argv[2], "published PR head differs from the worker commit"
+PY
+LEAF_MERGE_REQUEST_COUNT="$(rg -c "pulls/$POST_TIDY_LEAF_PR/merge" "$AGG_DIR/mock.log" || true)"
+[[ "$LEAF_MERGE_REQUEST_COUNT" -le 1 ]] || e2e_fail "leaf PR was merged more than once"
+python3 - "$AGG_DIR/post-tidy-leaf-reviews.json" "$leaf_head" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+reviews = json.loads(Path(sys.argv[1]).read_text())
+assert len(reviews) == 1, f"expected exactly one authenticated reviewer result, found {len(reviews)}"
+assert reviews[0]["state"] == "APPROVED"
+assert reviews[0]["commit_id"] in {None, sys.argv[2]}, "review record contradicts the exact worker head"
+PY
+
+[[ -f "$ROOT_DIRTY_MARKER" && -f "$ROOT_ONLY_DIRTY_FILE" ]] \
+    || e2e_fail "post-checkout guard fixture did not dirty only the outer root after tidy"
+python3 - "$AGG_REPO" "$HANDOFF_WORKTREE" "$HANDOFF_HEAD_FILE" "$AGENT_EVENT_LOG" "$POST_TIDY_LEAF_PR" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+source_worktree = Path(sys.argv[2])
+handoff_head = Path(sys.argv[3]).read_text().strip()
+events = [json.loads(line) for line in Path(sys.argv[4]).read_text().splitlines()]
+leaf_pr_number = int(sys.argv[5])
+worker_starts = [entry for entry in events if entry["event"] == "worker_started"]
+worker_prs = [entry for entry in events if entry["event"] == "worker_filed_pr"]
+reviews = [entry for entry in events if entry["event"] == "reviewer_approved"]
+assert len(worker_starts) == 1, f"expected one real worker process, found {len(worker_starts)}"
+assert len(worker_prs) == 1, f"expected one worker file_pr call, found {len(worker_prs)}"
+assert len(reviews) == 1, f"expected one routed reviewer approval, found {len(reviews)}"
+worker = worker_starts[0]
+review = reviews[0]
+assert worker["role"] == "dev" and worker["model"] == "gpt-5.6-luna"
+assert worker["source_worktree"] == str(source_worktree)
+assert worker["source_branch"] == "main.handoff-proof"
+assert worker["source_head"] == handoff_head
+assert worker["source_clean"] is True and worker["outer_root_dirty"] is True
+assert review["role"] == "reviewer" and review["model"] == "gpt-5.6-luna"
+assert review["pr_number"] == leaf_pr_number
+pr = json.loads((Path(sys.argv[4]).parent / "post-tidy-leaf-pr.json").read_text())
+assert review["head_sha"] == pr["head"]["sha"], "review was not bound to the actual PR head"
+
+child = json.loads((repo / ".exo/tl-loop/root/handoff-proof/run.json").read_text())
+leaf = child["slices"]["post-tidy-leaf"]
+assert leaf["status"] in {"in_review", "merged"}
+assert leaf["agent_type"] == "codex" and leaf["model"] == "gpt-5.6-luna"
+leaf_agent = leaf["dispatch_agent_id"]
+leaf_identity = json.loads((repo / ".exo/agents" / leaf_agent / "identity.json").read_text())
+assert leaf_identity["agent_type"] == "codex"
+leaf_worktree = Path(leaf_identity["working_dir"])
+leaf_head = subprocess.run(
+    ["git", "-C", str(leaf_worktree), "rev-parse", "HEAD"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
+leaf_parent = subprocess.run(
+    ["git", "-C", str(leaf_worktree), "rev-parse", "HEAD^"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.strip()
+assert leaf_parent == handoff_head, "worker commit was not based on the committed handoff revision"
+assert subprocess.run(
+    ["git", "-C", str(source_worktree), "merge-base", "--is-ancestor", handoff_head, "HEAD"],
+    check=False,
+).returncode == 0, "subTL source no longer contains the committed parent handoff"
+journal = json.loads((repo / ".exo/tl-loop/root/handoff-proof/action-journal.json").read_text())
+for operation in ("spawn_leaf", "spawn_reviewer"):
+    matching = [
+        entry for entry in journal
+        if entry.get("operation") == operation and entry.get("target") == "post-tidy-leaf"
+    ]
+    assert len(matching) == 1, f"expected one {operation} action, found {len(matching)}"
+assert not any(
+    entry.get("operation") == "merge_pr" and entry.get("target") == "post-tidy-leaf"
+    for entry in journal
+), "spawn acceptance must not bypass ordinary leaf integration"
+assert sum(
+    entry.get("operation") == "merge_pr" and entry.get("target") == "post-tidy-leaf"
+    for entry in journal
+) <= 1
+assert review["agent_id"] == f"review-pr-{leaf_pr_number}-codex"
+print(json.dumps({
+    "leaf_agent": leaf_agent,
+    "reviewer_agent": review["agent_id"],
+    "leaf_pr": leaf_pr_number,
+    "source_head": handoff_head,
+    "worker_commit": leaf_head,
+}))
+PY
+
+# The dirty root file is a test-only adversarial probe. It proved the nested
+# spawn succeeded while the global root was dirty; remove only this known file
+# before repeat continuation checks that the original commit-all handoff remains stable.
+rm -- "$ROOT_ONLY_DIRTY_FILE"
 
 python3 - "$AGG_REPO" "$AGGREGATE_PR" "$LEAF_PR" "$LEAF_RECEIPT_SHA256" "$AGGREGATE_REMOTE_HEAD" <<'PY'
 import hashlib
@@ -1161,8 +1395,8 @@ HANDOFF_COMMIT_SHA="$(git -C "$AGG_REPO" rev-parse HEAD)"
 HANDOFF_WORKTREE="$AGG_REPO/.exo/worktrees/handoff-proof"
 [[ -d "$HANDOFF_WORKTREE" ]] \
     || e2e_fail "post-handoff child worktree was not provisioned"
-[[ "$(git -C "$HANDOFF_WORKTREE" rev-parse HEAD)" == "$HANDOFF_COMMIT_SHA" ]] \
-    || e2e_fail "post-handoff child did not start from the committed parent revision"
+git -C "$HANDOFF_WORKTREE" merge-base --is-ancestor "$HANDOFF_COMMIT_SHA" HEAD \
+    || e2e_fail "post-handoff child no longer contains the committed parent revision"
 [[ "$(git -C "$HANDOFF_WORKTREE" branch --show-current)" == "main.handoff-proof" ]] \
     || e2e_fail "post-handoff child was provisioned on an unexpected branch"
 python3 - "$AGG_REPO" "$HANDOFF_COMMIT_SHA" <<'PY'
@@ -1203,19 +1437,38 @@ assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FING
 
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "continuation repeated the aggregate merge instead of resuming local synchronization"
-[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
-    || e2e_fail "continuation published a replacement aggregate PR"
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 1))" ]] \
+    || e2e_fail "continuation published a replacement aggregate PR or duplicated the leaf publication"
 [[ "$(rg -c "pulls/$LEAF_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
     || e2e_fail "completed leaf PR was merged again during aggregate recovery"
 [[ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
     "$AGG_REPO/.exo/agents/architecture/invocation.json")" == "$ARCHITECTURE_INVOCATION_SHA256" ]] \
     || e2e_fail "completed architecture producer invocation changed during aggregate recovery"
-wait_for_aggregate_tl_terminal "completed aggregate continuation"
 RECOVERED_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
 [[ -n "$RECOVERED_CONTROLLER_EPOCH" ]] \
     || e2e_fail "completed aggregate continuation did not retain its controller epoch"
 [[ "$RECOVERED_CONTROLLER_EPOCH" != "$PRE_RECOVERY_CONTROLLER_EPOCH" ]] \
-    || e2e_fail "init --continue did not launch a fresh controller for the exited TL pane"
+    || e2e_fail "init --continue did not launch a fresh controller for the recovered root run"
+AGENT_EVENT_SHA256_BEFORE_REPEAT="$(sha256sum "$AGENT_EVENT_LOG" | cut -d ' ' -f 1)"
+POST_TIDY_DISPATCH_STATE="$(python3 - "$AGG_REPO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+root = json.loads((repo / ".exo/tl-loop/root/run.json").read_text())
+child = json.loads((repo / ".exo/tl-loop/root/handoff-proof/run.json").read_text())
+leaf = child["slices"]["post-tidy-leaf"]
+print(" ".join(str(value or "none") for value in (
+    root["slices"]["handoff-proof"]["dispatch_intent_id"],
+    leaf["attempts"],
+    leaf["dispatch_intent_id"],
+    leaf["dispatch_invocation_id"],
+    leaf["pr_number"],
+    leaf["reviewed_head"],
+)))
+PY
+)"
 
 REPEAT_INIT_STATUS=0
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
@@ -1226,14 +1479,33 @@ rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD
     || { cat "$AGG_DIR/init-repeat.log"; e2e_fail "repeat init did not attach using the verified binary/archive"; }
 assert_one_live_window Server
 assert_one_live_window Watcher
-assert_aggregate_tl_terminal_unchanged "repeated init --continue" "$AGGREGATE_TERMINAL_TL_STATE"
-REPEAT_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
-[[ "$REPEAT_CONTROLLER_EPOCH" == "$RECOVERED_CONTROLLER_EPOCH" ]] \
-    || e2e_fail "repeat init restarted the completed TL controller"
+TL_PANE_COUNT="$(aggregate_tl_panes | awk 'NF { count += 1 } END { print count + 0 }')"
+[[ "$TL_PANE_COUNT" -le 1 ]] || e2e_fail "repeat init created duplicate TL panes ($TL_PANE_COUNT found)"
+REPEAT_POST_TIDY_DISPATCH_STATE="$(python3 - "$AGG_REPO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+root = json.loads((repo / ".exo/tl-loop/root/run.json").read_text())
+child = json.loads((repo / ".exo/tl-loop/root/handoff-proof/run.json").read_text())
+leaf = child["slices"]["post-tidy-leaf"]
+print(" ".join(str(value or "none") for value in (
+    root["slices"]["handoff-proof"]["dispatch_intent_id"],
+    leaf["attempts"],
+    leaf["dispatch_intent_id"],
+    leaf["dispatch_invocation_id"],
+    leaf["pr_number"],
+    leaf["reviewed_head"],
+)))
+PY
+)"
+[[ "$REPEAT_POST_TIDY_DISPATCH_STATE" == "$POST_TIDY_DISPATCH_STATE" ]] \
+    || e2e_fail "repeat init changed the post-tidy leaf's dispatch or PR identity"
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "repeated continuation duplicated the aggregate merge"
-[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$PULL_PUBLICATIONS_BEFORE" ]] \
-    || e2e_fail "repeat init published a replacement aggregate PR"
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 1))" ]] \
+    || e2e_fail "repeat init published a replacement aggregate PR or duplicated the leaf publication"
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init-repeat.log" || printf '0')" == "0" ]] \
     || e2e_fail "repeated init reported an already-completed lock recovery again"
 [[ "$(git -C "$AGG_REPO" rev-parse HEAD)" == "$HANDOFF_COMMIT_SHA" ]] \
@@ -1244,6 +1516,10 @@ REPEAT_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
     || e2e_fail "repeat continuation changed committed parent worktree content"
 [[ "$(assert_scope_handoff_commit)" == "$HANDOFF_COMMIT_REPORT" ]] \
     || e2e_fail "repeat continuation changed the handoff commit or excluded ignored runtime content"
+[[ "$(sha256sum "$AGENT_EVENT_LOG" | cut -d ' ' -f 1)" == "$AGENT_EVENT_SHA256_BEFORE_REPEAT" ]] \
+    || e2e_fail "repeat continuation started another worker or reviewer process"
+[[ "$(git -C "$AGG_REPO" log --format=%s --all --grep='^feat: add post-tidy leaf fixture$' | wc -l | tr -d ' ')" == "1" ]] \
+    || e2e_fail "repeat continuation duplicated the post-tidy leaf commit"
 python3 - "$AGG_REPO" "$handoff_intent" <<'PY'
 import json
 import sys
@@ -1254,6 +1530,8 @@ root_dir = repo / ".exo/tl-loop/root"
 root = json.loads((root_dir / "run.json").read_text())
 journal = json.loads((root_dir / "action-journal.json").read_text())
 proof = root["slices"]["handoff-proof"]
+child = json.loads((root_dir / "handoff-proof/run.json").read_text())
+leaf = child["slices"]["post-tidy-leaf"]
 assert proof["dispatch_intent_id"] == sys.argv[2]
 assert sum(
     entry.get("operation") == "prepare_scope_handoff"
@@ -1273,9 +1551,16 @@ assert sum(
     and entry["arguments"]["payload"].get("boundary") == "sub_tl_started"
     for entry in journal
 ) == 1
+child_journal = json.loads((root_dir / "handoff-proof/action-journal.json").read_text())
+for operation in ("spawn_leaf", "spawn_reviewer"):
+    assert sum(
+        entry.get("operation") == operation and entry.get("target") == "post-tidy-leaf"
+        for entry in child_journal
+    ) == 1, f"repeat init duplicated {operation}"
+assert leaf["status"] in {"in_review", "merged"} and leaf["pr_number"] is not None
 PY
 assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
-e2e_log "PASS: actual init --continue recovered the merged aggregate, commit-all tidied the parent before dispatch, preserved ignored runtime data and completed receipts, and repeat init added no duplicate effects (handoff=$HANDOFF_COMMIT_SHA, archive=$AGGREGATE_ARCHIVE_SHA256, host=$EXOMONAD_BIN_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
+e2e_log "PASS: actual init --continue recovered the merged aggregate, commit-all tidied the parent before a real worker/reviewer route, preserved ignored runtime data and completed receipts, and repeat init added no duplicate commit or dispatch (handoff=$HANDOFF_COMMIT_SHA, leaf_pr=$POST_TIDY_LEAF_PR, archive=$AGGREGATE_ARCHIVE_SHA256, host=$EXOMONAD_BIN_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
 
 echo ""
 echo "============================================"

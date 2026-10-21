@@ -441,7 +441,24 @@ def seed_root(
                 "name": "handoff-proof",
                 "order": 3,
                 "integration": {"aggregate_pr_required": False},
-                "plan": {"leaves": []},
+                "plan": {
+                    "leaves": [
+                        {
+                            "name": "post-tidy-leaf",
+                            "task": "Create and publish the post-tidy handoff fixture change",
+                            "chainlink_issue_id": None,
+                            "boundary": ["post-tidy-leaf.txt"],
+                            "read_first": ["README.md"],
+                            "steps": [
+                                "Write post-tidy-leaf.txt and publish its branch"
+                            ],
+                            "verify": ["test -s post-tidy-leaf.txt"],
+                            "done_criteria": [
+                                "The fixture leaf is merged into its declared subTL branch"
+                            ],
+                        }
+                    ]
+                },
             },
         ]
     }
