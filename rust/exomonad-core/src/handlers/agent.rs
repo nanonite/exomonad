@@ -17,7 +17,7 @@ use crate::services::agent_control::{
     AgentIdentityRecord, AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags,
     InvocationFinishResult, InvocationRecord, InvocationStatus, InvocationTrigger,
     RecoveryAuthorization, RecoveryInvocationLineage, SpawnLeafOptions, SpawnOptions,
-    SpawnSubtreeOptions, SpawnWorkerOptions, Topology,
+    SpawnSubtreeOptions, SpawnWorkerOptions, Topology, DIRTY_TL_SPAWN_PREFLIGHT_CODE,
 };
 use crate::services::configured_tl_preflight_runtime_paths;
 use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
@@ -408,8 +408,6 @@ impl<
         Ok(())
     }
 }
-
-const DIRTY_TL_SPAWN_PREFLIGHT_CODE: &str = "agent.spawn_precondition.dirty_worktree";
 
 #[async_trait]
 impl<

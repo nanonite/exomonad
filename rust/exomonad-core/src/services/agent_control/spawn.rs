@@ -761,7 +761,7 @@ fn dirty_spawn_error(files: &[String]) -> anyhow::Error {
         message.push_str(file);
     }
     message.push_str("\nCommit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` if throwaway, then retry. Workers spawn in-place and would inherit this state; dev-leaves fork from your branch HEAD and would not see your uncommitted work.");
-    anyhow!(message)
+    anyhow!(EffectError::custom(DIRTY_TL_SPAWN_PREFLIGHT_CODE, message))
 }
 
 async fn is_gitignored_path(worktree: &Path, file: &str) -> Result<bool> {
@@ -5784,7 +5784,12 @@ mod tests {
     #[test]
     fn test_dirty_spawn_error_includes_count_files_and_recovery() {
         let files = vec!["src/lib.rs".to_string(), "docs/new.md".to_string()];
-        let message = dirty_spawn_error(&files).to_string();
+        let error = dirty_spawn_error(&files);
+        assert!(matches!(
+            error.downcast_ref::<EffectError>(),
+            Some(EffectError::Custom { code, .. }) if code == DIRTY_TL_SPAWN_PREFLIGHT_CODE
+        ));
+        let message = error.to_string();
         assert!(message.contains(
             "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:"
         ));

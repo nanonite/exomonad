@@ -75,3 +75,19 @@ def test_production_agent_handler_artifact_is_accepted_by_aggregate_lookup_consu
         _decode_aggregate_publication_lookup("slice-abandoned", abandoned_result, 1)
     assert rejected.value.error_kind == "publication_lookup_unresolved"
     assert abandoned_result.result["publication"] is None  # type: ignore[index]
+
+
+def test_compiled_spawn_preflight_artifact_preserves_structured_refusal_for_python() -> None:
+    artifact_path = os.environ.get("EXOMONAD_DIRTY_SPAWN_ARTIFACT")
+    if artifact_path is None:
+        pytest.skip("run the production dirty-spawn WASM integration test to generate its artifact")
+
+    raw = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    result = ToolResult.from_raw(cast(JsonObject, raw))
+
+    assert result.success is False
+    assert result.result is None
+    assert result.error_kind == "agent.spawn_precondition.dirty_worktree"
+    assert result.error is not None
+    assert result.error.startswith("TL preflight failed; spawning is blocked")

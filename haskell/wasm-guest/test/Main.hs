@@ -11,9 +11,10 @@ import ExoMonad.Guest.Tools.ResolveLivePrForSliceTest (resolveLivePrForSliceTest
 import ExoMonad.Guest.Tools.ResumeBlockedLeafTest (resumeBlockedLeafTests)
 import ExoMonad.Guest.Tools.ResumePrTest (resumePrTests)
 import ExoMonad.Guest.Tools.RootBranchFinalizeTest (rootBranchFinalizeTests)
+import ExoMonad.Guest.Tools.SpawnTest (spawnTests)
 import ExoMonad.Guest.Tools.UnlinkedChangelogTest (unlinkedChangelogTests)
 import ExoMonad.Guest.Tools.WatcherPrStateTest (watcherPrStateTests)
 import Test.Tasty (defaultMain, testGroup)
 
 main :: IO ()
-main = defaultMain $ testGroup "WASM guest" [pureTests, eventsTests, mergePrTests, resumePrTests, resumeBlockedLeafTests, pollWorkersTests, watcherPrStateTests, resolveLivePrForSliceTests, repositoryIdentityTests, postMergeRecoveryTests, unlinkedChangelogTests, rootBranchFinalizeTests, prepareScopeHandoffTests]
+main = defaultMain $ testGroup "WASM guest" [pureTests, eventsTests, mergePrTests, resumePrTests, resumeBlockedLeafTests, spawnTests, pollWorkersTests, watcherPrStateTests, resolveLivePrForSliceTests, repositoryIdentityTests, postMergeRecoveryTests, unlinkedChangelogTests, rootBranchFinalizeTests, prepareScopeHandoffTests]

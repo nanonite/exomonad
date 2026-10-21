@@ -627,8 +627,12 @@ def seed_root(
     failed_leaf_task = kani_task_plan.leaves[0]
     failed_intent_id = "seed-issue-814-rejected-spawn-intent"
     dirty_preflight_error = (
-        "TL preflight failed; spawning is blocked until the worktree is clean. "
-        "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes"
+        "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:\n"
+        "  .exo/harness_policy.toml\n"
+        "  CHANGELOG.md\n"
+        "Commit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` "
+        "if throwaway, then retry. Workers spawn in-place and would inherit this state; "
+        "dev-leaves fork from your branch HEAD and would not see your uncommitted work."
     )
     failed_leaf = replace(
         kani_state.slices[failed_leaf_name],
@@ -673,8 +677,10 @@ def seed_root(
         ToolResult.from_raw(
             {
                 "success": False,
+                "result": None,
                 "error": dirty_preflight_error,
-                "error_kind": "agent_error",
+                "error_kind": None,
+                "error_context": None,
             }
         ),
     )

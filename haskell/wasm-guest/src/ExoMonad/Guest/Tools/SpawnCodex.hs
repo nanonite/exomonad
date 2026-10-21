@@ -13,6 +13,7 @@ import Data.Text (Text)
 import ExoMonad.Guest.Effects.AgentControl qualified as AC
 import ExoMonad.Guest.Tools.Spawn
   ( SpawnLeafSubtreeArgs (..),
+    SpawnToolFailure,
     spawnLeafSubtreeCore,
     spawnLeafSubtreeSchema,
   )
@@ -27,6 +28,6 @@ spawnCodexDescription =
 spawnCodexSchema :: Aeson.Object
 spawnCodexSchema = spawnLeafSubtreeSchema
 
-handleSpawnCodex :: SpawnLeafSubtreeArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
+handleSpawnCodex :: SpawnLeafSubtreeArgs -> Eff Effects (Either SpawnToolFailure (Text, AC.SpawnResult))
 handleSpawnCodex args =
   spawnLeafSubtreeCore args {slsAgentType = Just AC.Codex}

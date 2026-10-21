@@ -23,10 +23,15 @@ import Data.Text.Lazy qualified as TL
 import Effects.Agent qualified as PA
 import ExoMonad.Effects.Agent qualified as Agent
 import ExoMonad.Guest.Effects.AgentControl qualified as AC
-import ExoMonad.Guest.Tool.Class (MCPTool (..), errorResult, successResult)
+import ExoMonad.Guest.Tool.Class (MCPTool (..), successResult)
 import ExoMonad.Guest.Tool.Schema (genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect)
-import ExoMonad.Guest.Tools.Spawn (spawnErrorMessage)
+import ExoMonad.Guest.Tools.Spawn
+  ( SpawnToolFailure,
+    spawnErrorOutput,
+    spawnFailureFromEffectError,
+    spawnFailureFromText,
+  )
 import ExoMonad.Guest.Types (Effects)
 import GHC.Generics (Generic)
 
@@ -58,11 +63,11 @@ resumePrSchema =
       ("task", "Complete repair handoff for the owning agent on the existing PR")
     ]
 
-resumePrCore :: ResumePrArgs -> Eff Effects (Either Text Aeson.Value)
+resumePrCore :: ResumePrArgs -> Eff Effects (Either SpawnToolFailure Aeson.Value)
 resumePrCore args
-  | rpaPrNumber args <= 0 = pure $ Left "pr_number must be positive"
-  | T.null (T.strip (rpaExpectedHeadSha args)) = pure $ Left "expected_head_sha is required"
-  | T.null (T.strip (rpaTask args)) = pure $ Left "task must be complete and non-empty"
+  | rpaPrNumber args <= 0 = pure $ Left (spawnFailureFromText "pr_number must be positive")
+  | T.null (T.strip (rpaExpectedHeadSha args)) = pure $ Left (spawnFailureFromText "expected_head_sha is required")
+  | T.null (T.strip (rpaTask args)) = pure $ Left (spawnFailureFromText "task must be complete and non-empty")
   | otherwise = do
       let renderedTask = renderResumePrTask args
       stateResult <-
@@ -71,22 +76,22 @@ resumePrCore args
             { PA.watcherPrStateRequestPrNumber = fromIntegral (rpaPrNumber args)
             }
       case stateResult of
-        Left err -> pure $ Left (spawnErrorMessage err)
+        Left err -> pure $ Left (spawnFailureFromEffectError err)
         Right state
           | not (PA.watcherPrStateResponseSuccess state) ->
-              pure $ Left (lazyText (PA.watcherPrStateResponseError state))
+              pure $ Left (spawnFailureFromText (lazyText (PA.watcherPrStateResponseError state)))
           | not (PA.watcherPrStateResponseFound state) ->
-              pure $ Left "PR was not found; refusing to create a replacement branch"
+              pure $ Left (spawnFailureFromText "PR was not found; refusing to create a replacement branch")
           | PA.watcherPrStateResponseMerged state ->
-              pure $ Left "PR is merged; use a separate follow-up task"
+              pure $ Left (spawnFailureFromText "PR is merged; use a separate follow-up task")
           | T.toLower (lazyText (PA.watcherPrStateResponsePrState state)) /= "open" ->
-              pure $ Left "PR is not open and unmerged; use replace_close_pr only with human approval"
+              pure $ Left (spawnFailureFromText "PR is not open and unmerged; use replace_close_pr only with human approval")
           | T.null (T.strip (lazyText (PA.watcherPrStateResponseHeadBranch state))) ->
-              pure $ Left "PR has no head branch; refusing to resume it"
+              pure $ Left (spawnFailureFromText "PR has no head branch; refusing to resume it")
           | T.null (T.strip (lazyText (PA.watcherPrStateResponseHeadSha state))) ->
-              pure $ Left "PR has no head SHA; refusing to resume it"
+              pure $ Left (spawnFailureFromText "PR has no head SHA; refusing to resume it")
           | T.strip (lazyText (PA.watcherPrStateResponseHeadSha state)) /= T.strip (rpaExpectedHeadSha args) ->
-              pure $ Left "PR head changed since the caller's observation; refusing to resume stale work"
+              pure $ Left (spawnFailureFromText "PR head changed since the caller's observation; refusing to resume stale work")
           | otherwise -> do
               spawnResult <-
                 AC.resumePr
@@ -97,7 +102,7 @@ resumePrCore args
                       AC.rpcModel = Nothing
                     }
               pure $ case spawnResult of
-                Left err -> Left (spawnErrorMessage err)
+                Left err -> Left (spawnFailureFromEffectError err)
                 Right agent ->
                   Right $
                     object
@@ -117,7 +122,7 @@ instance MCPTool ResumePr where
   toolHandlerEff args = do
     result <- resumePrCore args
     pure $ case result of
-      Left err -> errorResult err
+      Left err -> spawnErrorOutput err
       Right value -> successResult value
 
 renderResumePrTask :: ResumePrArgs -> Text

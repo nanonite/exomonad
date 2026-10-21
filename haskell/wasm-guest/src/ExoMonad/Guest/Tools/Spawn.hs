@@ -45,6 +45,10 @@ module ExoMonad.Guest.Tools.Spawn
 
     -- * Helpers (re-exported for role code)
     spawnErrorMessage,
+    SpawnToolFailure (..),
+    spawnFailureFromEffectError,
+    spawnFailureFromText,
+    spawnErrorOutput,
     hasCustomCode,
   )
 where
@@ -65,7 +69,13 @@ import Effects.Git qualified as Git
 import Effects.Log qualified as Log
 import ExoMonad.Effects.Log (LogEmitEvent)
 import ExoMonad.Guest.Effects.AgentControl qualified as AC
-import ExoMonad.Guest.Tool.Class (MCPCallOutput (..), errorResult, successResult)
+import ExoMonad.Guest.Tool.Class
+  ( MCPCallOutput (..),
+    ToMCPErrorOutput (..),
+    errorResult,
+    errorResultWithKind,
+    successResult,
+  )
 import ExoMonad.Guest.Tool.Schema (JsonSchema (..), genericToolSchemaWith)
 import ExoMonad.Guest.Tool.SuspendEffect (suspendEffect_)
 import ExoMonad.Guest.Tools.Chainlink.Pure (chainlinkWorkerProtocolText)
@@ -97,6 +107,29 @@ spawnErrorMessage (EffectError kind) = case kind of
 hasCustomCode :: Text -> EffectError -> Bool
 hasCustomCode code (EffectError (Just (EffectErrorKindCustom c))) = customCode c == TL.fromStrict code
 hasCustomCode _ _ = False
+
+data SpawnToolFailure = SpawnToolFailure
+  { spawnFailureKind :: Maybe Text,
+    spawnFailureMessage :: Text
+  }
+  deriving (Show, Eq)
+
+spawnFailureFromText :: Text -> SpawnToolFailure
+spawnFailureFromText = SpawnToolFailure Nothing
+
+spawnFailureFromEffectError :: EffectError -> SpawnToolFailure
+spawnFailureFromEffectError err@(EffectError kind) =
+  SpawnToolFailure (customKind kind) (spawnErrorMessage err)
+  where
+    customKind (Just (EffectErrorKindCustom custom)) = Just (TL.toStrict (customCode custom))
+    customKind _ = Nothing
+
+spawnErrorOutput :: SpawnToolFailure -> MCPCallOutput
+spawnErrorOutput (SpawnToolFailure Nothing message) = errorResult message
+spawnErrorOutput (SpawnToolFailure (Just kind) message) = errorResultWithKind kind message
+
+instance ToMCPErrorOutput SpawnToolFailure where
+  toMCPErrorOutput = spawnErrorOutput
 
 -- ============================================================================
 -- SpawnLeafSubtree
@@ -169,15 +202,15 @@ spawnLeafSubtreeSchema =
 
 -- | Core spawn_leaf_subtree I/O.
 -- Returns (actualSlug, spawnResult) on success.
-spawnLeafSubtreeCore :: SpawnLeafSubtreeArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
+spawnLeafSubtreeCore :: SpawnLeafSubtreeArgs -> Eff Effects (Either SpawnToolFailure (Text, AC.SpawnResult))
 spawnLeafSubtreeCore args = do
   let blockedIssueId = case slsBlockedIssueId args of
         Nothing -> Right Nothing
         Just issueId
           | issueId >= 0 -> Right (Just (fromIntegral issueId :: Word64))
-          | otherwise -> Left "blocked_issue_id must be non-negative"
+          | otherwise -> Left (spawnFailureFromText "blocked_issue_id must be non-negative")
   case blockedIssueId of
-    Left err -> pure (Left err)
+    Left failure -> pure (Left failure)
     Right blockedIssueId' -> do
       let renderedTask = slsTask args <> "\n\n" <> leafProfileText <> "\n\n" <> leafAcceptanceCriteriaText
           standaloneRepo = fromMaybe False (slsStandaloneRepo args)
@@ -206,14 +239,14 @@ spawnLeafSubtreeCore args = do
               }
       result <- AC.spawnLeafSubtree cfg
       case result of
-        Left err -> pure $ Left (spawnErrorMessage err)
+        Left err -> pure $ Left (spawnFailureFromEffectError err)
         Right spawnResult -> do
           emitSpawnEvent (slsIntentId args) (slsBranchName args) "auto" (slsTask args)
           pure $ Right (slsBranchName args, spawnResult)
 
 -- | Render a spawn leaf result to MCPCallOutput.
-spawnLeafRender :: Either Text (Text, AC.SpawnResult) -> MCPCallOutput
-spawnLeafRender (Left err) = errorResult err
+spawnLeafRender :: Either SpawnToolFailure (Text, AC.SpawnResult) -> MCPCallOutput
+spawnLeafRender (Left err) = spawnErrorOutput err
 spawnLeafRender (Right (_, sr)) = successResult $ Aeson.toJSON sr
 
 -- ============================================================================
@@ -329,28 +362,7 @@ spawnWorkersSchema =
 spawnWorkersCore :: SpawnWorkersArgs -> Eff Effects MCPCallOutput
 spawnWorkersCore args = do
   results <- forM (swsSpecs args) $ \spec -> do
-    let protocol = case wsType spec of
-          Just Research -> researchProfileText
-          _ -> workerProfileText
-        prompt = case wsPrompt spec of
-          Just p -> p
-          Nothing -> renderSpec spec <> "\n\n" <> protocol
-        perms =
-          AC.PermissionFlags
-            { AC.permMode = wsPermissionMode spec,
-              AC.allowedTools = fromMaybe [] (wsAllowedTools spec),
-              AC.disallowedTools = fromMaybe [] (wsDisallowedTools spec)
-            }
-        cfg =
-          AC.SpawnWorkerConfig
-            { AC.swcName = wsName spec,
-              AC.swcPrompt = prompt,
-              AC.swcIntentId = wsIntentId spec,
-              AC.swcAgentType = wsAgentType spec,
-              AC.swcModel = wsModel spec,
-              AC.swcPerms = perms
-            }
-    r <- AC.spawnWorker cfg
+    r <- spawnWorkerSpecCore spec
     case r of
       Right _ -> emitSpawnEvent (wsIntentId spec) (wsName spec) "worker" (wsTask spec)
       Left _ -> pure ()
@@ -360,7 +372,41 @@ spawnWorkersCore args = do
     successResult $
       object
         [ "spawned" .= map Aeson.toJSON successes,
-          "errors" .= map (Aeson.String . spawnErrorMessage) errs
+          "errors" .= map (Aeson.String . spawnErrorMessage) errs,
+          "error_details" .= map spawnFailureValue errs
+        ]
+
+spawnWorkerSpecCore :: WorkerSpec -> Eff Effects (Either EffectError AC.SpawnResult)
+spawnWorkerSpecCore spec = do
+  let protocol = case wsType spec of
+        Just Research -> researchProfileText
+        _ -> workerProfileText
+      prompt = case wsPrompt spec of
+        Just p -> p
+        Nothing -> renderSpec spec <> "\n\n" <> protocol
+      perms =
+        AC.PermissionFlags
+          { AC.permMode = wsPermissionMode spec,
+            AC.allowedTools = fromMaybe [] (wsAllowedTools spec),
+            AC.disallowedTools = fromMaybe [] (wsDisallowedTools spec)
+          }
+      cfg =
+        AC.SpawnWorkerConfig
+          { AC.swcName = wsName spec,
+            AC.swcPrompt = prompt,
+            AC.swcIntentId = wsIntentId spec,
+            AC.swcAgentType = wsAgentType spec,
+            AC.swcModel = wsModel spec,
+            AC.swcPerms = perms
+          }
+  AC.spawnWorker cfg
+
+spawnFailureValue :: EffectError -> Aeson.Value
+spawnFailureValue err =
+  let failure = spawnFailureFromEffectError err
+   in object
+        [ "error" .= spawnFailureMessage failure,
+          "error_kind" .= spawnFailureKind failure
         ]
 
 -- ============================================================================
@@ -414,7 +460,7 @@ spawnLeafSchema =
       ("read_first", "File paths to read before starting (CLAUDE.md, source patterns)")
     ]
 
-spawnLeafCore :: SpawnLeafArgs -> Eff Effects (Either Text (Text, AC.SpawnResult))
+spawnLeafCore :: SpawnLeafArgs -> Eff Effects (Either SpawnToolFailure (Text, AC.SpawnResult))
 spawnLeafCore args = do
   let leafArgs =
         SpawnLeafSubtreeArgs
@@ -523,7 +569,12 @@ spawnWorkerToolCore args = do
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing
           }
-  spawnWorkersCore (SpawnWorkersArgs [spec])
+  result <- spawnWorkerSpecCore spec
+  case result of
+    Left err -> pure (spawnErrorOutput (spawnFailureFromEffectError err))
+    Right worker -> do
+      emitSpawnEvent (wsIntentId spec) (wsName spec) "worker" (wsTask spec)
+      pure $ successResult $ object ["spawned" .= [Aeson.toJSON worker], "errors" .= ([] :: [Text])]
 
 data CloseWorkerPaneTool
 

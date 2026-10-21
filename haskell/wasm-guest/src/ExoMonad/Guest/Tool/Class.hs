@@ -16,6 +16,7 @@ module ExoMonad.Guest.Tool.Class
     MCPCallOutput (..),
     WasmResult (..),
     EffectRequest (..),
+    ToMCPErrorOutput (..),
     successResult,
     errorResult,
     errorResultWithKind,
@@ -97,9 +98,15 @@ instance ToJSON MCPCallOutput where
 successResult :: Value -> MCPCallOutput
 successResult v = MCPCallOutput True (Just v) Nothing Nothing
 
--- | Create an error result.
-errorResult :: Text -> MCPCallOutput
-errorResult msg = MCPCallOutput False Nothing (Just msg) Nothing
+-- | Project an error value into the stable MCP failure envelope.
+class ToMCPErrorOutput err where
+  toMCPErrorOutput :: err -> MCPCallOutput
+
+instance ToMCPErrorOutput Text where
+  toMCPErrorOutput msg = MCPCallOutput False Nothing (Just msg) Nothing
+
+errorResult :: (ToMCPErrorOutput err) => err -> MCPCallOutput
+errorResult = toMCPErrorOutput
 
 -- | Create a typed error result while preserving the operator-facing message.
 errorResultWithKind :: Text -> Text -> MCPCallOutput

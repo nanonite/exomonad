@@ -1050,6 +1050,8 @@ def _legacy_dirty_preflight_failure(
     tmp_path: Path,
     *,
     active_sibling: bool = False,
+    raw_legacy_response: bool = False,
+    structured_response: bool = False,
 ) -> tuple[RunStore, WorkPlan, TLLoopConfig, RunStore]:
     """Build the retained dirty-preflight failure with its exact rejected intent."""
     child_plan = WorkPlan(
@@ -1090,8 +1092,24 @@ def _legacy_dirty_preflight_failure(
         ledger_floor=0,
     )
     rejected = (
-        "TL preflight failed; spawning is blocked until the worktree is clean. "
-        "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes"
+        "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:\n"
+        "  .exo/harness_policy.toml\n"
+        "  CHANGELOG.md\n"
+        "Commit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` "
+        "if throwaway, then retry. Workers spawn in-place and would inherit this state; "
+        "dev-leaves fork from your branch HEAD and would not see your uncommitted work."
+        if raw_legacy_response
+        else (
+            "host refusal wording changed; stable preflight classification remains authoritative"
+            if structured_response
+            else (
+                "TL preflight failed; spawning is blocked until the worktree is clean or the user "
+                "acknowledges with EXOMONAD_TL_PREFLIGHT_ACK=1.\n"
+                "worktree check failed: uncommitted or untracked files are present\n"
+                "  - .exo/harness_policy.toml\n  - CHANGELOG.md\n"
+                "TL preflight runtime exclusions (built-in plus configured): .chainlink/, .exo/"
+            )
+        )
     )
     journal = EffectJournal("child", child_store.run_dir / "action-journal.json")
     leaf_intent = EffectIntent(
@@ -1101,16 +1119,38 @@ def _legacy_dirty_preflight_failure(
         True,
     )
     journal.append(leaf_intent)
-    journal.mark_result(
-        leaf_intent,
-        ToolResult(
-            {"success": False, "error": rejected, "error_kind": "agent_error"},
+    journal_result = (
+        ToolResult.from_raw(
+            {
+                "success": False,
+                "result": None,
+                "error": rejected,
+                "error_kind": None,
+                "error_context": None,
+            }
+        )
+        if raw_legacy_response
+        else ToolResult(
+            {
+                "success": False,
+                "error": rejected,
+                "error_kind": (
+                    "agent.spawn_precondition.dirty_worktree"
+                    if structured_response
+                    else "agent_error"
+                ),
+            },
             False,
             None,
             rejected,
-            "agent_error",
-        ),
+            (
+                "agent.spawn_precondition.dirty_worktree"
+                if structured_response
+                else "agent_error"
+            ),
+        )
     )
+    journal.mark_result(leaf_intent, journal_result)
     effects = EffectClient(_RecoveryTestTransport())
     driver._record_terminal_dispatch_failure(
         child_store,
@@ -1118,7 +1158,11 @@ def _legacy_dirty_preflight_failure(
         "leaf",
         attempt,
         rejected,
-        "agent_error",
+        (
+            "agent.spawn_precondition.dirty_worktree"
+            if structured_response
+            else "agent_error"
+        ),
         replace(config, active=False, run_id="child", root_dir=parent_store.run_dir),
         effects,
         journal,
@@ -1241,6 +1285,135 @@ def test_legacy_rejected_leaf_without_exit_marker_recovers_from_checkpoint_and_j
     assert decision.recoverable is True
 
 
+def test_exact_historical_raw_spawn_refusal_with_null_error_kind_recovers(
+    tmp_path: Path,
+) -> None:
+    """The retained raw service error remains recoverable without a diagnostic sidecar."""
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(
+        tmp_path,
+        raw_legacy_response=True,
+    )
+
+    failed_leaf = child_store.load().slices["leaf"]
+    rejected_entry = driver._rejected_spawn_journal_entry(
+        child_store, "leaf", failed_leaf.dispatch_intent_id
+    )
+
+    assert failed_leaf.dispatch_error_code == "agent_error"
+    assert failed_leaf.dispatch_invocation_id is None
+    assert failed_leaf.dispatch_error == rejected_entry["result"]["error"]
+    assert rejected_entry["result"] == {
+        "success": False,
+        "result": None,
+        "error": failed_leaf.dispatch_error,
+        "error_kind": None,
+        "error_context": None,
+    }
+    assert failed_leaf.dispatch_error.startswith(
+        "BLOCKED: cannot spawn agent into a dirty TL worktree."
+    )
+    assert child_store.exit_diagnostics() is None
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None
+    assert decision.recoverable is True
+    child_plan = plan.sub_tls[0].plan
+    assert isinstance(child_plan, WorkPlan)
+    journal_before = EffectJournal(
+        "child", child_store.run_dir / "action-journal.json"
+    ).snapshot()
+    reopened = driver._reopen_ordered_scope(
+        child_store.load(),
+        child_plan,
+        child_store,
+        None,
+        retry_dispatch_slice="leaf",
+    )
+    assert reopened.recursive_fsm is not None
+    assert reopened.recursive_fsm.evidence["preexecution_dispatch_refusal_format"] == (
+        "raw_legacy_null_error_kind"
+    )
+    assert (
+        EffectJournal("child", child_store.run_dir / "action-journal.json").snapshot()
+        == journal_before
+    )
+
+
+def test_current_structured_spawn_refusal_recovers_without_message_matching(
+    tmp_path: Path,
+) -> None:
+    """Current stable codes, rather than human wording, classify the refusal."""
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(
+        tmp_path,
+        structured_response=True,
+    )
+    child_store.exit_reason_path.unlink(missing_ok=True)
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None
+    assert decision.recoverable is True
+
+
+def test_unrelated_legacy_agent_error_text_cannot_authorize_dispatch_retry(
+    tmp_path: Path,
+) -> None:
+    """Matching arbitrary error prose does not become a preflight proof."""
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    state = child_store.load()
+    failed_leaf = replace(
+        state.slices["leaf"],
+        dispatch_error="TL preflight failed; unrelated failure while inspecting repository",
+    )
+    entry = driver._rejected_spawn_journal_entry(
+        child_store, "leaf", failed_leaf.dispatch_intent_id
+    )
+    assert entry is not None
+    unrelated_result = dict(entry["result"])
+    unrelated_result["error"] = failed_leaf.dispatch_error
+    assert (
+        driver._journal_result_dirty_preflight_format(
+            {**entry, "result": unrelated_result}, failed_leaf
+        )
+        is None
+    )
+    child_store.checkpoint(
+        state.recursive_fsm,
+        {**state.slices, "leaf": failed_leaf},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None
+    assert decision.recoverable is False
+
+
+def test_raw_legacy_refusal_requires_its_explicit_null_kind_envelope(
+    tmp_path: Path,
+) -> None:
+    _parent_store, _plan, _config, child_store = _legacy_dirty_preflight_failure(
+        tmp_path,
+        raw_legacy_response=True,
+    )
+    slice_state = child_store.load().slices["leaf"]
+    entry = driver._rejected_spawn_journal_entry(
+        child_store, "leaf", slice_state.dispatch_intent_id
+    )
+    assert entry is not None
+    raw_result = dict(entry["result"])
+    raw_result.pop("error_kind")
+
+    assert (
+        driver._journal_result_dirty_preflight_format(
+            {**entry, "result": raw_result}, slice_state
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -1337,7 +1510,10 @@ def test_proven_rejected_leaf_reopens_only_its_failed_dispatch_and_gate(
 def test_recovered_dirty_refusal_dispatches_once_and_replay_does_not_duplicate(
     tmp_path: Path,
 ) -> None:
-    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(
+        tmp_path,
+        raw_legacy_response=True,
+    )
     decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
     assert decision is not None and decision.recoverable
     transport = _RetryDispatchTransport()
@@ -1366,6 +1542,10 @@ def test_recovered_dirty_refusal_dispatches_once_and_replay_does_not_duplicate(
         child_store,
         None,
         retry_dispatch_slice="leaf",
+    )
+    assert reopened.recursive_fsm is not None
+    assert reopened.recursive_fsm.evidence["preexecution_dispatch_refusal_format"] == (
+        "raw_legacy_null_error_kind"
     )
     effects_log = EffectJournal("child", child_store.run_dir / "action-journal.json")
 

@@ -64,6 +64,7 @@ pub(crate) const TMUX_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const INVOCATION_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const INVOCATION_MONITOR_INTERVAL: Duration = Duration::from_millis(200);
 pub(crate) const LAST_ACTIVITY_FILE: &str = "last_activity_at";
+pub(crate) const DIRTY_TL_SPAWN_PREFLIGHT_CODE: &str = "agent.spawn_precondition.dirty_worktree";
 const MAX_INVOCATION_STDERR_TAIL_BYTES: usize = 4096;
 
 async fn read_invocation_stderr_tail(agent_dir: &Path) -> Option<String> {

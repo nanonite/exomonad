@@ -271,9 +271,15 @@ test-wasm-integration: wasm-all
     #!/usr/bin/env bash
     set -euo pipefail
     artifact="$(mktemp)"
-    trap 'rm -f "$artifact"' EXIT
-    nix develop --command env EXOMONAD_PUBLICATION_LOOKUP_ARTIFACT="$artifact" cargo nextest run -p exomonad-core --test wasm_integration
-    EXOMONAD_PUBLICATION_LOOKUP_ARTIFACT="$artifact" {{py}} -m pytest -q tl_loop/tests/test_haskell_guest_contract.py
+    dirty_spawn_artifact="$(mktemp)"
+    trap 'rm -f "$artifact" "$dirty_spawn_artifact"' EXIT
+    nix develop --command env \
+        EXOMONAD_PUBLICATION_LOOKUP_ARTIFACT="$artifact" \
+        EXOMONAD_DIRTY_SPAWN_ARTIFACT="$dirty_spawn_artifact" \
+        cargo nextest run -p exomonad-core --test wasm_integration
+    EXOMONAD_PUBLICATION_LOOKUP_ARTIFACT="$artifact" \
+        EXOMONAD_DIRTY_SPAWN_ARTIFACT="$dirty_spawn_artifact" \
+        {{py}} -m pytest -q tl_loop/tests/test_haskell_guest_contract.py
 
 # Build and run the devswarm role-hook-tests WASM test suite
 role-hook-tests:

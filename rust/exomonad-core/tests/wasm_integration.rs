@@ -1400,6 +1400,89 @@ async fn resolve_live_pr_tool_uses_production_publication_history() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn production_dirty_spawn_preflight_keeps_stable_error_kind_in_wasm_json() {
+    let project = tempfile::tempdir().expect("temporary dirty spawn project");
+    initialize_test_repository(project.path());
+    run_git(project.path(), &["config", "user.name", "test"]);
+    run_git(
+        project.path(),
+        &["config", "user.email", "test@example.invalid"],
+    );
+    std::fs::write(project.path().join("README.md"), "clean baseline\n")
+        .expect("write clean baseline");
+    run_git(project.path(), &["add", "README.md"]);
+    run_git(project.path(), &["commit", "--quiet", "-m", "baseline"]);
+    std::fs::write(project.path().join("DIRTY.txt"), "uncommitted change\n")
+        .expect("introduce real dirty worktree state");
+
+    let forgejo = MockServer::start().await;
+    let forgejo_client = ForgejoClient::new(&forgejo.uri(), "test-only-token")
+        .expect("construct isolated Forgejo client");
+    let runtime = build_production_agent_runtime(project.path(), forgejo_client).await;
+    let output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_leaf",
+        json!({
+            "name": "dirty-preflight-leaf",
+            "task": "This request must stop at the dirty-worktree preflight",
+            "intent_id": "dirty-preflight-integration-intent"
+        }),
+    )
+    .await;
+
+    assert_tool_error(&output, "spawn_leaf");
+    assert_eq!(
+        output["error_kind"], "agent.spawn_precondition.dirty_worktree",
+        "the compiled Haskell projection must preserve the host's stable refusal code: {output:#}"
+    );
+    assert!(
+        output["error"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("TL preflight failed; spawning is blocked")),
+        "the host refusal text remains available to the operator: {output:#}"
+    );
+    assert!(
+        !project
+            .path()
+            .join(".exo/agents/dirty-preflight-leaf")
+            .exists(),
+        "preflight refusal must not create a leaf owner"
+    );
+    let worker_output = call_tool(
+        &runtime,
+        "tl",
+        "spawn_worker",
+        json!({
+            "name": "dirty-preflight-worker",
+            "task": "This worker request must stop at the dirty-worktree preflight",
+            "intent_id": "dirty-preflight-worker-intent"
+        }),
+    )
+    .await;
+    assert_tool_error(&worker_output, "spawn_worker");
+    assert_eq!(
+        worker_output["error_kind"], "agent.spawn_precondition.dirty_worktree",
+        "worker refusals must keep the typed preflight classification: {worker_output:#}"
+    );
+    assert!(
+        !project
+            .path()
+            .join(".exo/agents/dirty-preflight-worker")
+            .exists(),
+        "worker preflight refusal must not create a worker owner"
+    );
+    if let Some(path) = std::env::var_os("EXOMONAD_DIRTY_SPAWN_ARTIFACT") {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&output).expect("encode actual compiled tool response"),
+        )
+        .expect("write actual compiled tool response for Python consumer");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn wasm_replace_closed_pr_roundtrip_preserves_replacement_context() {
     let runtime = build_test_runtime().await;
 

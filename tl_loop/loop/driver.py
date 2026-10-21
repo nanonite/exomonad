@@ -2717,6 +2717,7 @@ class _PreExecutionDispatchRejection(NamedTuple):
     slice_id: str
     intent_id: str
     gate_name: str
+    response_format: str
 
 
 def _proven_preexecution_dispatch_rejection(
@@ -2740,14 +2741,20 @@ def _proven_preexecution_dispatch_rejection(
     entry = _rejected_spawn_journal_entry(
         child_store, slice_state.id, slice_state.dispatch_intent_id
     )
-    if entry is None or not _journal_result_proves_dirty_preflight(entry, slice_state):
+    response_format = (
+        _journal_result_dirty_preflight_format(entry, slice_state) if entry is not None else None
+    )
+    if response_format is None:
         return None
     gate_name = _dispatch_failure_gate_name(slice_state.id, slice_state.dispatch_error_code)
     gate = next((item for item in child_state.gates if item.name == gate_name), None)
     if gate is not None and gate.status is GateStatus.REJECTED:
         return None
     return _PreExecutionDispatchRejection(
-        slice_state.id, cast(str, slice_state.dispatch_intent_id), gate_name
+        slice_state.id,
+        cast(str, slice_state.dispatch_intent_id),
+        gate_name,
+        response_format,
     )
 
 
@@ -2806,23 +2813,87 @@ def _rejected_spawn_journal_entry(
     return matching[0] if len(matching) == 1 else None
 
 
-def _journal_result_proves_dirty_preflight(
+def _journal_result_dirty_preflight_format(
     entry: Mapping[str, object],
     slice_state: SliceState,
-) -> bool:
+) -> str | None:
     result = entry.get("result")
     if not isinstance(result, Mapping) or result.get("success") is not False:
-        return False
+        return None
     error = result.get("error")
     if not isinstance(error, str) or error != slice_state.dispatch_error:
+        return None
+    code = slice_state.dispatch_error_code
+    kind = result.get("error_kind")
+    if code == "agent.spawn_precondition.dirty_worktree":
+        return "structured_dirty_precondition" if kind == code else None
+    if code != "agent_error":
+        return None
+    if kind == "agent_error" and _wrapped_legacy_dirty_preflight(error):
+        return "wrapped_legacy_agent_error"
+    if (
+        kind is None
+        and {"success", "result", "error", "error_kind", "error_context"}.issubset(result)
+        and result.get("result") is None
+        and result.get("error_context") is None
+        and _raw_legacy_dirty_preflight(error)
+    ):
+        return "raw_legacy_null_error_kind"
+    return None
+
+
+def _raw_legacy_dirty_preflight(error: str) -> bool:
+    """Match the historical service envelope without accepting arbitrary prose."""
+    prefix = "BLOCKED: cannot spawn agent into a dirty TL worktree. "
+    if not error.startswith(prefix):
         return False
-    legacy_agent_error = slice_state.dispatch_error_code == "agent_error"
-    stable_preflight_error = (
-        slice_state.dispatch_error_code == "agent.spawn_precondition.dirty_worktree"
+    lines = error[len(prefix) :].splitlines()
+    if not lines:
+        return False
+    count_prefix = "file(s) have uncommitted changes:"
+    count_text, separator, first_path = lines[0].partition(count_prefix)
+    if not separator or not count_text.endswith(" "):
+        return False
+    try:
+        expected_paths = int(count_text.strip())
+    except ValueError:
+        return False
+    if expected_paths <= 0 or first_path.strip():
+        return False
+    recovery = (
+        "Commit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` "
+        "if throwaway, then retry. Workers spawn in-place and would inherit this state; "
+        "dev-leaves fork from your branch HEAD and would not see your uncommitted work."
     )
-    exact_legacy = "TL preflight failed" in error and "dirty TL worktree" in error
-    return (legacy_agent_error and result.get("error_kind") == "agent_error" and exact_legacy) or (
-        stable_preflight_error and exact_legacy
+    try:
+        recovery_index = lines.index(recovery)
+    except ValueError:
+        return False
+    paths = lines[1:recovery_index]
+    return len(paths) == expected_paths and all(
+        path.startswith("  ") and path[2:].strip() for path in paths
+    ) and lines[recovery_index + 1 :] == []
+
+
+def _wrapped_legacy_dirty_preflight(error: str) -> bool:
+    """Match the historical TL preflight wrapper and its structured file report."""
+    headers = (
+        "TL preflight failed; spawning is blocked until the worktree is clean. ",
+        (
+            "TL preflight failed; spawning is blocked until the worktree is clean or the user "
+            "acknowledges with EXOMONAD_TL_PREFLIGHT_ACK=1.\n"
+        ),
+    )
+    body = next((error[len(header) :] for header in headers if error.startswith(header)), None)
+    if body is None:
+        return False
+    if body.startswith("BLOCKED: cannot spawn agent into a dirty TL worktree. "):
+        return _raw_legacy_dirty_preflight(body)
+    lines = body.splitlines()
+    return (
+        bool(lines)
+        and lines[0] == "worktree check failed: uncommitted or untracked files are present"
+        and any(line.startswith("  - ") and line[4:].strip() for line in lines[1:])
     )
 
 
@@ -3156,6 +3227,7 @@ def _reopen_ordered_scope(
         )
     slices = dict(state.slices)
     clear_gates: set[str] = set()
+    rejection_format: str | None = None
     if target_name is not None:
         target = slices[target_name]
         reopened = replace(
@@ -3212,6 +3284,7 @@ def _reopen_ordered_scope(
                 f"ordered retry slice {retry_dispatch_slice!r} no longer has proven "
                 "pre-execution refusal evidence"
             )
+        rejection_format = rejection.response_format
         slices[retry_dispatch_slice] = replace(
             slice_transition(rejected, SliceStatusChanged(SliceStatus.PENDING)),
             park_cause=None,
@@ -3235,7 +3308,14 @@ def _reopen_ordered_scope(
         lane_bindings={
             record.child_id: record.lane_id for record in records if record.lane_id is not None
         },
-        evidence={"ordered_recovery_child": target_name or "scope"},
+        evidence={
+            "ordered_recovery_child": target_name or "scope",
+            **(
+                {"preexecution_dispatch_refusal_format": rejection_format}
+                if rejection_format is not None
+                else {}
+            ),
+        },
     )
     sub_tl_states = dict(state.integration.sub_tl_states)
     if target_name is not None:
