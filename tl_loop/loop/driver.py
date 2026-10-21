@@ -616,6 +616,87 @@ def _scope_post_merge_complete(state: RunState) -> bool:
     )
 
 
+def _scope_declared_completion_matches(state: RunState) -> bool:
+    """Require every accepted direct declaration to be complete in this checkpoint."""
+    manifest = state.plan_manifest
+    if manifest is None:
+        return False
+    recursive_fsm = state.recursive_fsm
+    if recursive_fsm is not None and getattr(recursive_fsm, "plan_digest", None) != manifest.digest:
+        return False
+    nodes = {node.name: node for node in manifest.nodes}
+    if len(nodes) != len(manifest.nodes):
+        return False
+    if isinstance(recursive_fsm, RecursiveTLAllMerged) and not set(
+        recursive_fsm.completed_children
+    ).issubset(nodes):
+        return False
+    for name, node in nodes.items():
+        current = state.slices.get(name)
+        if current is None or not _scope_node_completion_matches(node, current):
+            return False
+        if isinstance(recursive_fsm, RecursiveTLAllMerged):
+            recorded = recursive_fsm.completed_children.get(name)
+            if (
+                recorded is not None
+                and current.post_merge != recorded
+                and not (_legacy_scope_completion_marker(node, recorded))
+            ):
+                return False
+    return True
+
+
+def _scope_node_completion_matches(node: ManifestNode, current: SliceState) -> bool:
+    """Check a declaration's completion contract against its current slice receipt."""
+    if not _ordered_slice_complete(current):
+        return False
+    receipt = current.post_merge
+    if node.kind == "worker":
+        return receipt is not None and (
+            receipt.phase is PostMergePhase.COMPLETE
+            or (
+                receipt.phase is PostMergePhase.NOT_REQUIRED
+                and bool(receipt.evidence.get("worker_result"))
+            )
+        )
+    if node.kind == "leaf":
+        return receipt is not None and (
+            receipt.phase is PostMergePhase.COMPLETE
+            or (
+                receipt.phase is PostMergePhase.NOT_REQUIRED
+                and bool(receipt.evidence.get("leaf_result"))
+            )
+        )
+    if node.kind != "sub_tl":
+        return False
+    aggregate_required = node.integration_contract.get("aggregate_pr_required", True)
+    if type(aggregate_required) is not bool:
+        return False
+    if aggregate_required:
+        return (
+            current.status is SliceStatus.MERGED
+            and current.pr_number is not None
+            and receipt is not None
+            and receipt.phase is PostMergePhase.COMPLETE
+        )
+    return receipt is not None and (
+        receipt.phase is PostMergePhase.NOT_REQUIRED
+        and receipt.evidence.get("aggregate_pr_required") == "false"
+    )
+
+
+def _legacy_scope_completion_marker(node: ManifestNode, value: object) -> bool:
+    """Recognize the old FSM marker only when current slice evidence proves completion."""
+    if node.kind not in {"worker", "leaf"}:
+        return False
+    result_key = "worker_result" if node.kind == "worker" else "leaf_result"
+    return (
+        isinstance(value, PostMergeState)
+        and value.phase is PostMergePhase.NOT_REQUIRED
+        and dict(value.evidence) == {result_key: "legacy-completion"}
+    )
+
+
 def _scope_has_pending_post_merge(state: RunState) -> bool:
     """Find merged PR slices whose durable recovery still needs a boundary."""
     return any(
@@ -4394,8 +4475,10 @@ def _run_loop(
                 effects_log,
             )
         phase = _phase_from_state(state)
-        if isinstance(state.recursive_fsm, RecursiveTLAllMerged) and not _source_has_pending(
-            source
+        if (
+            isinstance(state.recursive_fsm, RecursiveTLAllMerged)
+            and not _source_has_pending(source)
+            and _child_handoff_ready(state, state.parent_run_id or "")
         ):
             return TLRunResult(
                 state,
@@ -4447,6 +4530,20 @@ def _run_loop(
                     effects_log,
                 )
         phase = _phase_from_state(state)
+        if (
+            not recovery_pending
+            and not _source_has_pending(source)
+            and _child_handoff_ready(state, state.parent_run_id or "")
+        ):
+            return TLRunResult(
+                state,
+                tuple(effects_log),
+                tuple(transitions),
+                tuple(consumed),
+                tuple(heartbeat_events),
+                diagnostics.snapshot(),
+                _journal_entries(effects_log),
+            )
         if _is_terminal_phase(phase) and not recovery_pending:
             break
         if (
@@ -15789,11 +15886,11 @@ def _child_handoff_ready(state: RunState | None, parent_run_id: str) -> bool:
         recursive_fsm,
         (RecursiveTLAllMerged, RecursiveTLFinalizing, RecursiveTLPRFiled, RecursiveTLDone),
     ):
-        return _scope_post_merge_complete(state)
+        return _scope_post_merge_complete(state) and _scope_declared_completion_matches(state)
     if recursive_fsm is not None:
         return False
     if state.fsm.phase is TLPhase.TLAllMerged:
-        return _scope_post_merge_complete(state)
+        return _scope_post_merge_complete(state) and _scope_declared_completion_matches(state)
     return state.fsm.phase in {TLPhase.TLDone, TLPhase.TLPRFiled, TLPhase.TLFailed}
 
 

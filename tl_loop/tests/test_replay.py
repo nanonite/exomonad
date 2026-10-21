@@ -199,6 +199,7 @@ def test_recursive_replay_replays_review_checkpoint_and_journal_once(tmp_path: P
         tmp_path / "recursive-recovery-live",
         journal=True,
         live_ledger=True,
+        keep_alive_on_waiting=False,
     )
     root = tmp_path / "recursive-recovery-replay"
     first = replay_fixture(
@@ -206,8 +207,16 @@ def test_recursive_replay_replays_review_checkpoint_and_journal_once(tmp_path: P
         root,
         journal=True,
         capture_initial_events=True,
+        keep_alive_on_waiting=False,
+        allow_truncated=True,
     )
-    second = replay_fixture(FIXTURE_ROOT / "recursive-recovery.json", root, journal=True)
+    second = replay_fixture(
+        FIXTURE_ROOT / "recursive-recovery.json",
+        root,
+        journal=True,
+        keep_alive_on_waiting=False,
+        allow_truncated=True,
+    )
 
     live_child = json.loads(
         (

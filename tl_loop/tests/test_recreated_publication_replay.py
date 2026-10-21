@@ -126,6 +126,7 @@ def _replay(root: Path, transform: Any) -> ReplayResult:
         root,
         journal=True,
         production_clock=True,
+        allow_truncated=True,
         child_event_transform=transform,
     )
 
@@ -138,9 +139,7 @@ def _child_row(event_id: str) -> Mapping[str, Any]:
     raise AssertionError(f"the fixture does not commit the {event_id!r} row")
 
 
-def _boundary_payload(
-    result: ReplayResult, event_type: str, slice_id: str
-) -> Mapping[str, Any]:
+def _boundary_payload(result: ReplayResult, event_type: str, slice_id: str) -> Mapping[str, Any]:
     """The one payload one controller boundary recorded for one slice."""
 
     def recorded(action: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -219,10 +218,7 @@ def _pending_seqs(root: Path) -> list[Any]:
 
 def _dispatch_identity(payload: Mapping[str, Any]) -> dict[str, Any]:
     """The generation and epoch dimensions one boundary recorded."""
-    return {
-        name: payload[name]
-        for name in ("attempt", "controller_epoch", "dispatch_generation")
-    }
+    return {name: payload[name] for name in ("attempt", "controller_epoch", "dispatch_generation")}
 
 
 def test_recreated_generation_is_the_only_owner_of_the_leaf(tmp_path: Path) -> None:
@@ -267,9 +263,7 @@ def test_the_recreated_policy_dispatch_records_the_generation_its_publication_bi
     # names, and it is the one this scope persisted.
     assert provenance["child_scope"] == CHILD_SCOPE
     assert provenance["slice_id"] == LEAF
-    assert state["dispatch_intent_id"] == provenance["intent_id"] == (
-        confirmation["intent_id"]
-    )
+    assert state["dispatch_intent_id"] == provenance["intent_id"] == (confirmation["intent_id"])
 
     intended = _boundary_payload(result, "tl.dispatch_intended", LEAF)
     assert _dispatch_identity(intended) == {

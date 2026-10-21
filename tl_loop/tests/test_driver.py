@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -9481,12 +9482,55 @@ def _complete_ordered_child_receipts(
             post_merge=PostMergeState(PostMergePhase.COMPLETE, receipt),
             recovery=None,
         )
+    completed_slices = {**state.slices, **completed}
+    recursive_fsm = state.recursive_fsm
+    if isinstance(recursive_fsm, RecursiveTLAllMerged):
+        completion_fsm: object = replace(
+            recursive_fsm,
+            completed_children={
+                name: current.post_merge
+                for name, current in completed_slices.items()
+                if current.post_merge is not None
+            },
+        )
+    else:
+        completion_fsm = FSMState(TLPhase.TLAllMerged, ())
     return child_store.checkpoint(
-        FSMState(TLPhase.TLAllMerged, ()),
-        {**state.slices, **completed},
+        completion_fsm,
+        completed_slices,
         state.budgets,
         state.events.last_consumed_offset,
     )
+
+
+def _install_completed_scope_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    scope_ids: set[str],
+) -> None:
+    """Give legacy lifecycle fixtures the durable child receipts they stand for."""
+    original_checkpoint = RunStore.checkpoint
+    completing: set[str] = set()
+    completed: set[str] = set()
+
+    def checkpoint(store: RunStore, *args: object, **kwargs: object) -> RunState:
+        fsm = args[0] if args else kwargs.get("fsm")
+        result = original_checkpoint(store, *args, **kwargs)
+        if (
+            store.run_id in scope_ids
+            and isinstance(fsm, RecursiveTLAllMerged)
+            and store.run_id not in completing
+            and store.run_id not in completed
+        ):
+            completing.add(store.run_id)
+            try:
+                _complete_ordered_child_receipts(store, f"fixture-{store.run_id}")
+                completed.add(store.run_id)
+            finally:
+                completing.remove(store.run_id)
+            return store.load()
+        return result
+
+    monkeypatch.setattr(RunStore, "checkpoint", checkpoint)
 
 
 def _canonical_lifecycle(run_id: str) -> list[EventEnvelope]:
@@ -11063,6 +11107,7 @@ def test_ordered_sub_tl_restart_adopts_terminal_child_checkpoint(
 def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     transport = NamedRecordingTransport()
     child_plan = _plan()
@@ -11218,6 +11263,7 @@ def test_aggregate_file_pr_journal_replays_after_checkpoint_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
     run_id = "aggregate-crash-run"
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     parent_dir = tmp_path / run_id
@@ -11301,6 +11347,8 @@ def test_aggregate_watcher_observation_replays_after_checkpoint_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
+
     class PartialResponseTransport(RecordingTransport):
         def call_tool(
             self,
@@ -11438,6 +11486,8 @@ def test_partial_aggregate_file_pr_response_adopts_watcher_evidence(
     monkeypatch: pytest.MonkeyPatch,
     response_failed: bool,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
+
     class PartialResponseTransport(RecordingTransport):
         def call_tool(
             self,
@@ -11509,6 +11559,7 @@ def test_aggregate_publication_rehydrates_durable_invocation_before_file_pr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
     original = driver_module._prepare_sub_tl_stage
 
     def prepare(tasks, state, config, source, effects, store, effects_log, order):
@@ -11573,7 +11624,10 @@ def test_aggregate_publication_rehydrates_durable_invocation_before_file_pr(
 
 def test_unrecoverable_aggregate_evidence_parks_with_missing_fields(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
+
     class PartialResponseTransport(RecordingTransport):
         def call_tool(
             self,
@@ -11629,7 +11683,9 @@ def test_unrecoverable_aggregate_evidence_parks_with_missing_fields(
 
 def test_missing_durable_invocation_parks_before_file_pr(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
     run_id = "aggregate-missing-invocation"
     transport = RecordingTransport()
     plan = WorkPlan(
@@ -11675,6 +11731,8 @@ def test_aggregate_file_pr_timeout_continue_reconciles_without_duplicate(
     monkeypatch: pytest.MonkeyPatch,
     publication_available: bool,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
+
     class CrashAfterPublishTransport(RecordingTransport):
         crashed = False
 
@@ -11766,6 +11824,7 @@ def test_plan_reconciliation_revision_and_aggregate_adoption_preserve_ordered_ru
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"architecture"})
     run_id = "root"
     architecture = replace(_plan(), workers=())
     architecture = replace(
@@ -12484,6 +12543,8 @@ def test_aggregate_recovery_refuses_unresolved_or_mismatched_publications(
     failure_mode: str,
     expected_reason: str,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
+
     class RefusalTransport(RecordingTransport):
         def __init__(self) -> None:
             super().__init__()
@@ -12661,6 +12722,7 @@ def test_aggregate_recovery_adopts_authorized_resume_without_replaying_leaf(
     resume_prior: str,
     publication_succession: tuple[str, ...],
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
     original_prepare = driver_module._prepare_sub_tl_stage
     prior_invocation = "aggregate-child-invocation"
     resumed_invocation = "aggregate-child-resume"
@@ -12782,7 +12844,9 @@ def test_aggregate_recovery_adopts_authorized_resume_without_replaying_leaf(
 
 def test_rejected_aggregate_publication_parks_one_slice_and_retries_after_approval(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child", "sibling-child"})
     child_plan = _plan()
     parent_dir = tmp_path / "blocked-aggregate-run"
     for child_name in ("aggregate-child", "sibling-child"):
@@ -12956,6 +13020,7 @@ def test_parent_serializes_aggregate_merge_after_base_recheck(
     monkeypatch: pytest.MonkeyPatch,
     crash_after_approval: bool,
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "serialized-run"
@@ -13575,6 +13640,7 @@ def test_head_or_patch_mismatch_opens_conflict_gate(
 def test_integration_conflict_repairs_same_aggregate_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "conflict-run"
@@ -13718,6 +13784,7 @@ def test_integration_conflict_repairs_same_aggregate_owner(
 def test_exhausted_integration_conflict_opens_human_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _install_completed_scope_fixture(monkeypatch, {"aggregate-child"})
     _install_ordered_invocation(monkeypatch, "aggregate-child-invocation")
     child_plan = _plan()
     parent_dir = tmp_path / "gate-run"
@@ -14665,6 +14732,126 @@ def test_ordered_recovery_preserves_valid_completed_leaf_receipt(tmp_path: Path)
 
     assert isinstance(reopened.recursive_fsm, driver_module.RecursiveTLAllMerged)
     assert reopened.recursive_fsm.completed_children["leaf-a"] == receipt
+
+
+def test_completed_scope_returns_after_replay_drains_last_event(tmp_path: Path) -> None:
+    plan = _plan()
+    config, store = _seed_nonroot_failed_scope(tmp_path, "completed-scope-terminal-drain", plan)
+    _complete_ordered_child_receipts(store, "terminal-drain")
+    state = store.load()
+    receipt = state.slices["leaf-a"].post_merge
+    assert receipt is not None
+    complete = RecursiveTLAllMerged(
+        scope_path=("outer-controller", "completed-scope-terminal-drain"),
+        plan_digest=state.plan_manifest.digest,
+        completed_children={
+            name: current.post_merge
+            for name, current in state.slices.items()
+            if current.post_merge is not None
+        },
+    )
+    store.checkpoint(
+        complete,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    unrelated = _event(1, "unrelated", "foreign-scope", run_id="other-ledger-run")
+    source = SyntheticQueue([unrelated])
+    cancel = threading.Event()
+    config = replace(
+        config,
+        cancel_event=cancel,
+        keep_alive_on_waiting=True,
+        poll_interval=0.001,
+    )
+    transport = RecordingTransport()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            run_tl_loop,
+            store.run_id,
+            plan,
+            source,
+            EffectClient(transport),
+            config=config,
+            root_dir=tmp_path,
+        )
+        try:
+            result = future.result(timeout=1.0)
+        except TimeoutError:
+            cancel.set()
+            with pytest.raises(LoopCancelled):
+                future.result(timeout=1.0)
+            pytest.fail("completed subTL kept waiting after its last catch-up event was drained")
+
+    assert result.final_state.recursive_fsm == complete
+    assert source.acknowledged == [1]
+    assert store.load().slices["leaf-a"].post_merge == receipt
+    assert not any(
+        name in {"spawn_leaf", "spawn_worker", "merge_pr"} for name, _ in transport.calls
+    )
+
+
+def test_stale_all_merged_receipt_does_not_release_in_review_child(tmp_path: Path) -> None:
+    plan = _plan()
+    _config_value, store = _seed_nonroot_failed_scope(tmp_path, "stale-all-merged-child", plan)
+    _complete_ordered_child_receipts(store, "stale-all-merged")
+    state = store.load()
+    receipt = state.slices["leaf-a"].post_merge
+    assert receipt is not None
+    complete = RecursiveTLAllMerged(
+        scope_path=("outer-controller", "stale-all-merged-child"),
+        plan_digest=state.plan_manifest.digest,
+        completed_children={
+            name: current.post_merge
+            for name, current in state.slices.items()
+            if current.post_merge is not None
+        },
+    )
+    in_review = replace(state.slices["leaf-a"], status=SliceStatus.IN_REVIEW)
+    state = store.checkpoint(
+        complete,
+        {**state.slices, "leaf-a": in_review},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    assert not driver_module._child_handoff_ready(state, "outer-controller")
+    assert not driver_module._scope_declared_completion_matches(state)
+    assert state.slices["leaf-a"].status is SliceStatus.IN_REVIEW
+    assert state.slices["leaf-a"].post_merge == receipt
+
+
+def test_legacy_all_merged_marker_is_corroborated_by_current_slice_receipts(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    _config_value, store = _seed_nonroot_failed_scope(
+        tmp_path, "legacy-all-merged-current-receipts", plan
+    )
+    _complete_ordered_child_receipts(store, "current-receipts")
+    state = store.load()
+    legacy = RecursiveTLAllMerged(
+        scope_path=("outer-controller", store.run_id),
+        plan_digest=state.plan_manifest.digest,
+        completed_children={
+            "leaf-a": PostMergeState(
+                PostMergePhase.NOT_REQUIRED, {"leaf_result": "legacy-completion"}
+            ),
+            "worker-a": PostMergeState(
+                PostMergePhase.NOT_REQUIRED, {"worker_result": "legacy-completion"}
+            ),
+        },
+    )
+    state = store.checkpoint(
+        legacy,
+        state.slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    assert driver_module._child_handoff_ready(state, "outer-controller")
+    assert state.recursive_fsm == legacy
 
 
 @pytest.mark.parametrize(

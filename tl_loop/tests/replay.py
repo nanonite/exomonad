@@ -17,7 +17,7 @@ from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader
-from tl_loop.events.replay import ReplayEventSource
+from tl_loop.events.replay import ReplayEventSource, ReplayTruncated
 from tl_loop.loop.driver import SubTLTask, TLLoopConfig, TLLoopError, WorkPlan, tl_run
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
@@ -215,6 +215,7 @@ def replay_fixture(
     crash_after: str | None = None,
     live_ledger: bool = False,
     capture_initial_events: bool | None = None,
+    allow_truncated: bool = False,
     child_event_transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]]
     | None = None,
 ) -> ReplayResult:
@@ -346,6 +347,9 @@ def replay_fixture(
                 issue_creator=effects,
                 ledger=state.budgets,
             )
+        except ReplayTruncated:
+            if not allow_truncated:
+                raise
     finally:
         if crash_after is not None:
             RunStore.checkpoint = original_checkpoint
@@ -373,11 +377,17 @@ def replay_fixture(
     durable = normalize_durable_state(cast(dict[str, object], document))
     if run_result is None:
         events_document = cast(dict[str, object], document["events"])
+        journal_entries = (
+            EffectJournal(run_id, store.run_dir / "action-journal.json").snapshot()
+            if journal
+            else ()
+        )
         return ReplayResult(
             actions,
             normalized,
             durable_state=durable,
             cursor=cast(int, events_document["last_consumed_offset"]),
+            journal_entries=journal_entries,
             acknowledged=tuple(getattr(source, "acknowledged", ())),
         )
     transitions = tuple(

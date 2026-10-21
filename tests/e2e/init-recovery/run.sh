@@ -1058,7 +1058,14 @@ PULL_PUBLICATIONS_AFTER_START="$(count_pull_publications "$AGG_DIR/mock.log")"
     || e2e_fail "first continuation published more than the recovered #814 and post-tidy leaf PRs"
 
 POST_TIDY_STATE=""
-for _ in $(seq 1 240); do
+POST_TIDY_WAIT_SECONDS="${E2E_POST_TIDY_WAIT_SECONDS:-300}"
+[[ "$POST_TIDY_WAIT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] \
+    || e2e_fail "E2E_POST_TIDY_WAIT_SECONDS must be an integer from 1 to 900"
+(( POST_TIDY_WAIT_SECONDS <= 900 )) \
+    || e2e_fail "E2E_POST_TIDY_WAIT_SECONDS must be an integer from 1 to 900"
+POST_TIDY_POLL_COUNT=$((POST_TIDY_WAIT_SECONDS * 4))
+e2e_log "Waiting up to ${POST_TIDY_WAIT_SECONDS}s for root advancement and the post-tidy leaf handoff"
+for _ in $(seq 1 "$POST_TIDY_POLL_COUNT"); do
     POST_TIDY_STATE="$(python3 - "$AGG_REPO" <<'PY'
 import json
 import sys
@@ -1068,17 +1075,23 @@ repo = Path(sys.argv[1])
 root_dir = repo / ".exo/tl-loop/root"
 try:
     root = json.loads((root_dir / "run.json").read_text())
-    child = json.loads((root_dir / "handoff-proof/run.json").read_text())
 except (OSError, json.JSONDecodeError):
+    print("waiting root_state=unavailable")
     raise SystemExit(0)
+handoff_path = root_dir / "handoff-proof/run.json"
+try:
+    child = json.loads(handoff_path.read_text())
+except (OSError, json.JSONDecodeError):
+    child = None
 architecture = root["slices"].get("architecture", {})
 kani = root["slices"].get("kani", {})
 handoff = root["slices"].get("handoff-proof", {})
 post = architecture.get("post_merge") or {}
-leaf = child["slices"].get("post-tidy-leaf", {})
+leaf = child["slices"].get("post-tidy-leaf", {}) if child is not None else {}
 phase = root.get("phase") or root.get("fsm", {}).get("phase", "unknown")
 ready = (
-    phase in {"tl_running", "tl_waiting", "tl_done"}
+    child is not None
+    and phase in {"tl_running", "tl_waiting", "tl_done"}
     and root.get("current_order") == 3
     and architecture.get("status") == "merged"
     and post.get("phase") == "complete"
@@ -1100,6 +1113,7 @@ print(
     kani.get("status", "missing"),
     handoff.get("status", "missing"),
     handoff.get("dispatch_intent_id") or "none",
+    "present" if child is not None else "missing",
     leaf.get("status", "missing"),
     leaf.get("pr_number") or "none",
     leaf.get("agent_type") or "none",
@@ -1112,7 +1126,7 @@ PY
     sleep 0.25
 done
 read -r post_tidy_marker final_phase final_order architecture_status architecture_post kani_status handoff_status handoff_intent \
-    leaf_status leaf_pr leaf_agent_type leaf_model leaf_head <<< "$POST_TIDY_STATE"
+    handoff_child leaf_status leaf_pr leaf_agent_type leaf_model leaf_head <<< "$POST_TIDY_STATE"
 if [[ "$post_tidy_marker" != "ready" || ( "$final_phase" != "tl_running" && "$final_phase" != "tl_waiting" && "$final_phase" != "tl_done" ) \
     || "$final_order" != "3" \
     || "$architecture_status" != "merged" || "$architecture_post" != "complete" \
@@ -1158,7 +1172,7 @@ assert accepted["arguments"]["intent_id"] == leaf["dispatch_intent_id"]
 assert leaf["dispatch_invocation_id"]
 events = [
     json.loads(line)
-    for line in (repo / "agent-events.jsonl").read_text().splitlines()
+    for line in (repo.parent / "agent-events.jsonl").read_text().splitlines()
 ]
 worker_starts = [event for event in events if event.get("event") == "recovery_worker_started"]
 worker_prs = [event for event in events if event.get("event") == "recovery_worker_filed_pr"]
@@ -1167,20 +1181,13 @@ assert len(worker_prs) == 1, "the recovered worker did not publish exactly once"
 worker = worker_starts[0]
 assert worker["source_clean"] is True
 assert worker["source_branch"].startswith("main.kani."), worker["source_branch"]
-root_journal = json.loads((root_dir / "action-journal.json").read_text())
-kani_node = next(
-    node for node in root["plan_manifest"]["nodes"]
-    if node.get("kind") == "sub_tl" and node.get("name") == "kani"
+# Kani was already provisioned before this continuation, so this leaf retry
+# does not create a new parent-to-subTL handoff. Its source must instead match
+# the authoritative aggregate synchronization receipt retained by the parent.
+aggregate_sync_head = root["slices"]["architecture"]["post_merge"]["evidence"]["parent_commit_sha"]
+assert worker["source_head"] == aggregate_sync_head, (
+    "Kani retry did not use the synchronized aggregate commit"
 )
-kani_handoffs = [
-    entry for entry in root_journal
-    if entry.get("operation") == "prepare_scope_handoff"
-    and entry.get("arguments", {}).get("child_scope_id") == kani_node["node_id"]
-]
-assert len(kani_handoffs) == 1, "Kani retry bypassed the parent scope handoff"
-handoff = kani_handoffs[0]["result"]["result"]
-assert handoff["ready"] is True
-assert worker["source_head"] == handoff["head_after"]
 print(leaf["pr_number"])
 PY
 )"

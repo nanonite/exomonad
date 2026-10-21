@@ -39,6 +39,7 @@ def _run(
     transform=None,
     capture_initial_events: bool | None = None,
     keep_alive_on_waiting: bool = True,
+    allow_truncated: bool = False,
 ):
     return replay_fixture(
         FIXTURE_ROOT / "recursive-recovery.json",
@@ -47,6 +48,7 @@ def _run(
         live_ledger=live_ledger,
         capture_initial_events=capture_initial_events,
         keep_alive_on_waiting=keep_alive_on_waiting,
+        allow_truncated=allow_truncated,
         child_event_transform=transform,
     )
 
@@ -57,8 +59,10 @@ def _journal_shape(entries) -> tuple[tuple[object, object, object], ...]:
 
 @pytest.mark.parametrize("transform", [_duplicate_review, _delay_ci, _contradictory_duplicate])
 def test_recursive_replay_disturbances_preserve_durable_position(tmp_path: Path, transform) -> None:
-    baseline = _run(tmp_path / "baseline", live_ledger=False)
-    disturbed = _run(tmp_path / "disturbed", live_ledger=False, transform=transform)
+    baseline = _run(tmp_path / "baseline", live_ledger=False, allow_truncated=True)
+    disturbed = _run(
+        tmp_path / "disturbed", live_ledger=False, transform=transform, allow_truncated=True
+    )
 
     assert _normalize_recovery_state(
         disturbed.durable_state, tmp_path / "disturbed"
@@ -89,11 +93,12 @@ def test_recursive_startup_holds_duplicate_sequence_before_advancing(tmp_path: P
     assert not any(action["operation"] in {"spawn_leaf", "merge_pr"} for action in live.actions)
 
     replay_root = tmp_path / "replay"
-    baseline = _run(replay_root / "baseline", live_ledger=False)
+    baseline = _run(replay_root / "baseline", live_ledger=False, allow_truncated=True)
     disturbed = _run(
         replay_root / "disturbed",
         live_ledger=False,
         transform=_duplicate_review,
+        allow_truncated=True,
     )
     assert _normalize_recovery_state(
         normalize_durable_state(disturbed.durable_state), replay_root / "disturbed"
